@@ -225,6 +225,15 @@ pub struct RemoteConfig {
     /// load-bearing stage (judge/verify) exhausting is an honest degraded
     /// run; probe exhaustion is a reduced-coverage warning.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens_per_execution: Option<u64>,
+    /// (#1230 Packet 1) Max CONCURRENT remote (hosted-endpoint) dispatches
+    /// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once — remote
+    /// jobs aren't RAM-bound (gestalt's wave scheduler only governs LOCAL
+    /// co-residency), so they run in their own separately-capped batch
+    /// instead of being serialized behind local waves. Default 4 is a
+    /// placeholder pending an operator call informed by real Azure/hosted
+    /// rate-limit tiers — unlike `max_tokens_per_execution` this is not yet
+    /// empirically tuned.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub concurrent_cap: Option<u32>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -336,6 +345,7 @@ impl DarkmuxConfig {
             }),
             remote: Some(RemoteConfig {
                 max_tokens_per_execution: Some(500_000),
+                concurrent_cap: Some(4),
                 extras: Default::default(),
             }),
             extras: Default::default(),
@@ -460,12 +470,16 @@ mod tests {
         // token allowance populated — no `enabled` gate, since remote staffing
         // is enabled by the profile's own endpoint declaration (contract 1).
         assert_eq!(cfg.remote.as_ref().unwrap().max_tokens_per_execution, Some(500_000));
+        // (#1230 Packet 1) The concurrent-dispatch remote cap, same
+        // visible-default treatment as its token-allowance sibling.
+        assert_eq!(cfg.remote.as_ref().unwrap().concurrent_cap, Some(4));
         // Lossless round-trip.
         let back: DarkmuxConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.redis.as_ref().unwrap().enabled, Some(false));
         assert_eq!(back.audit.as_ref().unwrap().dir.as_deref(), Some("~/.darkmux/audit"));
         assert_eq!(back.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
         assert_eq!(back.remote.as_ref().unwrap().max_tokens_per_execution, Some(500_000));
+        assert_eq!(back.remote.as_ref().unwrap().concurrent_cap, Some(4));
     }
 
     /// (#933) `FleetMode::parse` is lenient (trim + case-insensitive) and

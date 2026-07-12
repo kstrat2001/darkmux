@@ -337,7 +337,6 @@ dependencies = [
  "darkmux-eureka",
  "darkmux-fleet",
  "darkmux-flow",
- "darkmux-gestalt",
  "darkmux-hardware",
  "darkmux-heuristics",
  "darkmux-lab",
@@ -377,6 +376,7 @@ version = "1.18.5"
 dependencies = [
  "anyhow",
  "darkmux-flow",
+ "darkmux-gestalt",
  "darkmux-profiles",
  "darkmux-types",
  "dirs",
@@ -489,6 +489,7 @@ dependencies = [
  "darkmux-crew",
  "darkmux-eureka",
  "darkmux-flow",
+ "darkmux-gestalt",
  "darkmux-hardware",
  "darkmux-profiles",
  "darkmux-types",

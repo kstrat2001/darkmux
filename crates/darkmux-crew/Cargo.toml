@@ -13,6 +13,10 @@ rust-version = "1.80"
 darkmux-types = { path = "../darkmux-types" }
 darkmux-flow = { path = "../darkmux-flow" }
 darkmux-profiles = { path = "../darkmux-profiles" }
+# (#1230 Packet 1) The bounded concurrent-dispatch executor
+# (concurrent_dispatch.rs) calls gestalt's pure `plan_waves` once up front to
+# partition local jobs into co-resident-safe waves before executing them.
+darkmux-gestalt = { path = "../darkmux-gestalt" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

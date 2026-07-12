@@ -83,11 +83,6 @@ ureq = { version = "2.10", default-features = false }
 # binary's test build. Feature-unification turns this on only for tests/
 # examples/benches, not for a plain `cargo build` of the release binary.
 darkmux-flow = { path = "crates/darkmux-flow", features = ["test-support"] }
-# (#1274 packet 1) Consumed by tests/gestalt_parity.rs — the anti-fork guard
-# asserting gestalt's ownership/residency semantics agree with swap.rs and
-# the funnel's decide_residency fixtures. The packet-3 call-site cutover
-# promotes this to a real [dependencies] entry.
-darkmux-gestalt = { path = "crates/darkmux-gestalt" }
 tempfile = "3.10"
 assert_cmd = "2.0"
 tower = "0.5"

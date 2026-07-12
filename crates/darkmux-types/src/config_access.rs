@@ -265,6 +265,16 @@ pub fn remote_max_tokens_per_execution() -> u64 {
     let cfg = config().remote.as_ref().and_then(|r| r.max_tokens_per_execution);
     pick_parsed("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", cfg, Some(500_000)).unwrap()
 }
+/// (#1230 Packet 1) Max CONCURRENT remote dispatches
+/// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once. Resolves
+/// `env(DARKMUX_REMOTE_CONCURRENT_CAP) > config.remote.concurrent_cap > 4`
+/// — mirrors `remote_max_tokens_per_execution`'s wiring exactly. A
+/// placeholder default (see `RemoteConfig::concurrent_cap`'s doc), not yet
+/// empirically tuned against real hosted-endpoint rate limits.
+pub fn remote_concurrent_cap() -> u32 {
+    let cfg = config().remote.as_ref().and_then(|r| r.concurrent_cap);
+    pick_parsed("DARKMUX_REMOTE_CONCURRENT_CAP", cfg, Some(4)).unwrap()
+}
 pub fn default_role() -> Option<String> {
     let cfg = config().runtime.as_ref().and_then(|r| r.default_role.as_deref());
     pick_string("DARKMUX_DEFAULT_ROLE", cfg, None)
@@ -930,6 +940,28 @@ mod tests {
         // An unparseable env value falls through to the default, never panics.
         unsafe { std::env::set_var(k, "half-a-million"); }
         assert_eq!(remote_max_tokens_per_execution(), 500_000);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── remote_concurrent_cap (#1230 Packet 1): env > config > 4 ──
+    #[serial_test::serial]
+    #[test]
+    fn remote_concurrent_cap_env_then_default() {
+        let k = "DARKMUX_REMOTE_CONCURRENT_CAP";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+        // No env + the empty test config (#811) → the built-in placeholder 4.
+        assert_eq!(remote_concurrent_cap(), 4);
+        unsafe { std::env::set_var(k, "8"); }
+        assert_eq!(remote_concurrent_cap(), 8, "env tier wins live");
+        // An unparseable env value falls through to the default, never panics.
+        unsafe { std::env::set_var(k, "lots"); }
+        assert_eq!(remote_concurrent_cap(), 4);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

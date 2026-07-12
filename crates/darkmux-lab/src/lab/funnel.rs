@@ -121,8 +121,14 @@
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::single_shot::SingleShotReply;
 use darkmux_crew::telemetry_sampler::{sample_host, HostSample};
+// (#1230 Packet 1) LmsCycler's residency mechanism now routes through
+// gestalt's pure planner, executed via the real LmsHost/MacProbe port
+// adapters (their first production call site) — see the "model cycling"
+// section below.
+use darkmux_gestalt::{AcquireOpts, AcquireScope, Action, CallerIntent, Facts, ModelHost, Placement, ResourceProbe, V1Estimator};
 use darkmux_profiles::crews::{ResolvedCrew, ResolvedSeatStaffing};
-use darkmux_profiles::{lms, swap};
+use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
+use darkmux_profiles::swap;
 use darkmux_types::{BundleSelector, ModelEndpoint, ProfileModel};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1132,140 +1138,134 @@ pub trait ModelCycler {
     fn release(&mut self, pm: &ProfileModel) -> Result<()>;
 }
 
-/// Production [`ModelCycler`]: real `lms` calls, namespaced under
-/// `darkmux:` (the same operator-sovereignty guard `swap::swap` uses — a
-/// model NOT in the namespace is user state and is never unloaded) and
-/// context-sufficiency aware (a model already loaded with >= the wanted
-/// context is left in place, mirroring `swap::ctx_sufficient` — no
-/// needless reload-down).
+/// Production [`ModelCycler`] (#1230 Packet 1 cutover): every residency
+/// decision now routes through `darkmux_gestalt::plan_acquire`/
+/// `plan_release` — the pure planner `darkmux swap` and the crew dispatch
+/// preflight are converging on — executed via the real `LmsHost`/`MacProbe`
+/// port adapters (`darkmux_profiles::gestalt_host`). Those adapters existed
+/// fully built and unit-tested but had ZERO production callers before this
+/// cutover; this is their first one.
+///
+/// This retires the funnel's own private `ResidencyDecision`/
+/// `decide_residency` (the pre-cutover duplicate `tests/gestalt_parity.rs`
+/// existed only to keep the two from silently forking) and the
+/// `resolve_auto` hardware-tier table (see `resolve_mode` below) in favor
+/// of ONE canonical arbiter.
+///
+/// Namespaced under `darkmux:` and context-sufficiency aware exactly as
+/// before — that logic now lives in `darkmux_gestalt::decide_residency`
+/// rather than being re-derived here. One deliberate behavior divergence,
+/// named in `darkmux_gestalt::planner`'s "Cutover behavior changes" module
+/// doc: a foreign (non-darkmux) resident sharing the model key no longer
+/// hard-blocks the seat. The planner loads darkmux's own namespaced copy
+/// ALONGSIDE it when the facts show room (absolute namespace ownership,
+/// operator decision 2026-07-10, #1274) — still never reusing or unloading
+/// user state, just no longer refusing to proceed around it.
 pub struct LmsCycler;
 
-/// (#1271) What [`LmsCycler::ensure_loaded`] should do about a seat's model,
-/// given the CURRENT `lms ps` residents. Factored out as a pure function so
-/// the reconciliation logic is unit-testable without shelling to a real
-/// `lms` binary — same "pure decision, impure execution" split the rest of
-/// this module favors (`resolve_mode`, `dedup_flags`, etc.).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ResidencyDecision {
-    /// No resident shares this model's modelKey — load fresh.
-    LoadFresh,
-    /// A resident darkmux may manage already satisfies the ctx requirement —
-    /// nothing to load. Carries the resident's identity + actual ctx so the
-    /// caller can leave a declared-vs-actual breadcrumb when they diverge
-    /// (interim provenance until #1257 lands).
-    Reuse { identifier: String, resident_ctx: u64 },
-    /// A resident darkmux may manage shares the modelKey but is loaded at an
-    /// insufficient ctx — unload it, then load fresh at the required ctx.
-    /// Silently reusing the wrong ctx is the #1135 bug class and is not an
-    /// option; attempting a second concurrent `lms load` of the same
-    /// weights is the #1271 bug class (OOM) and isn't either.
-    Reconcile { stale_identifier: String, stale_ctx: u64 },
-    /// A resident shares the modelKey but is NOT one darkmux may manage —
-    /// operator state the cycler must never touch. Fail loud before
-    /// spending a load attempt LMStudio's own guardrail would refuse anyway.
-    Blocked { resident_identifier: String },
+/// Per-call [`Facts`] for [`LmsCycler`] (#1230 Packet 1): observed residents
+/// from a real `LmsHost::list_resident()`, and pool facts from a real
+/// `MacProbe::pools()` — both port adapters constructed HERE, their first
+/// production call site.
+///
+/// `catalog: None` — the funnel has never run the #1276 existence
+/// fast-fail (an unknown model key fails at the real `lms load` call the
+/// same way it always has), and wiring `list_catalog()` here would cost
+/// every `ensure_loaded` an extra `lms ls --json` round-trip for a check
+/// this call site doesn't use. `budget: None` — the #1243 AI-RAM-budget
+/// config knob (`runtime.max_model_ram_gb`) isn't plumbed anywhere in the
+/// codebase yet; inventing it as a side effect of this cutover is out of
+/// scope. A `MacProbe` failure (including its documented non-macOS v1
+/// scope) degrades to empty pools — "no known constraint," the same
+/// leniency the planner's budget/pool arms already document.
+fn gather_facts(host: &mut LmsHost) -> Result<Facts> {
+    let residents = host
+        .list_resident()
+        .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}"))?;
+    let pools = MacProbe.pools().unwrap_or_default();
+    Ok(Facts { residents, pools, ..Default::default() })
 }
 
-/// Inspect `loaded` for a resident sharing `pm`'s modelKey (`LoadedModel::model`,
-/// the `lms ps` field derived from `modelKey`/`model`/`id` — see
-/// `lms::model_from_json`) and decide what `ensure_loaded` should do.
-/// Matching on modelKey rather than the darkmux-namespaced identifier is the
-/// point: two different profiles/crews can reference the SAME catalog model
-/// under different identifiers (or different `n_ctx`), and LMStudio can't
-/// hold two full concurrent loads of the same weights on a RAM-constrained
-/// machine — the identifier-only check missed that collision and let a
-/// doomed second `lms load` reach LMStudio's own OOM guardrail (#1271).
-///
-/// A resident counts as darkmux's own when its identifier is in the
-/// `darkmux:` namespace OR equals the exact identifier THIS call would load
-/// under — the second arm covers a `ProfileModel.identifier` explicit alias,
-/// the documented namespace opt-out (`swap::namespaced_identifier` passes it
-/// through verbatim), whose resident must not misclassify as foreign user
-/// state and get Blocked against darkmux's own load.
-///
-/// Multiple residents sharing the modelKey: the FIRST match (in `lms ps`
-/// order) decides. A first-match user-owned resident blocks even when a
-/// darkmux-owned instance also sits further down the list — the operator's
-/// copy of the weights is resident either way, and any load attempt in that
-/// state still risks the double-footprint LMStudio's guardrail refuses.
-/// (#1282) `n_ctx` is the seat's REQUIRED context — resolved by the caller
-/// via `ProfileModel::require_n_ctx` (LOCAL seats must declare a window, so
-/// a missing one is a resolution error before any residency decision is
-/// made; REMOTE seats, #1260, never reach the cycler at all).
-fn decide_residency(
-    loaded: &[darkmux_types::LoadedModel],
-    pm: &ProfileModel,
-    n_ctx: u32,
-) -> ResidencyDecision {
-    let Some(found) = loaded.iter().find(|l| l.model == pm.id) else {
-        return ResidencyDecision::LoadFresh;
-    };
-    let own_identifier = swap::namespaced_identifier(pm);
-    let ours = swap::is_darkmux_owned(&found.identifier) || found.identifier == own_identifier;
-    if !ours {
-        return ResidencyDecision::Blocked { resident_identifier: found.identifier.clone() };
-    }
-    if swap::ctx_sufficient(found.context, n_ctx) {
-        ResidencyDecision::Reuse {
-            identifier: found.identifier.clone(),
-            resident_ctx: found.context,
-        }
-    } else {
-        ResidencyDecision::Reconcile {
-            stale_identifier: found.identifier.clone(),
-            stale_ctx: found.context,
-        }
-    }
+/// Non-load-bearing placeholder: `Facts.catalog = None` in `gather_facts`
+/// means every `V1Estimator::estimate_bytes` call returns `None` (unknown)
+/// regardless of `kv_bytes_per_ctx_token` — this cutover doesn't wire
+/// catalog sizing, so the estimator is structurally inert here today. A
+/// concrete estimator is still required because `plan_acquire`/`plan_waves`
+/// take one by signature; `0` documents "not yet meaningful," not a tuned
+/// value.
+fn inert_estimator() -> V1Estimator {
+    V1Estimator { kv_bytes_per_ctx_token: 0 }
 }
 
 impl ModelCycler for LmsCycler {
     fn ensure_loaded(&mut self, pm: &ProfileModel) -> Result<()> {
         let n_ctx = pm.require_n_ctx()?;
-        let identifier = swap::namespaced_identifier(pm);
-        let loaded = lms::list_loaded()?;
-        match decide_residency(&loaded, pm, n_ctx) {
-            ResidencyDecision::Reuse { identifier: resident, resident_ctx } => {
-                if resident_ctx > u64::from(n_ctx) {
-                    // (#1271 review round) Declared-vs-actual ctx divergence
-                    // now happens ACROSS profiles (a bigger load from another
-                    // profile satisfies this seat's minimum) — leave a trace
-                    // until #1257's full load-config provenance lands.
-                    println!(
-                        "cycler: reusing {resident} at ctx={resident_ctx} (declared {n_ctx})"
-                    );
+        let identifier = darkmux_gestalt::namespaced_identifier(&pm.id, pm.identifier.as_deref());
+        let mut host = LmsHost::new();
+        let facts = gather_facts(&mut host)?;
+        let placement =
+            Placement { model_key: pm.id.clone(), identifier, min_ctx: n_ctx, seat: "funnel".to_string() };
+        let opts = AcquireOpts { intent: CallerIntent::Auto, scope: AcquireScope::Additive };
+        let plan =
+            darkmux_gestalt::plan_acquire(std::slice::from_ref(&placement), &facts, opts, &inert_estimator());
+        let deadline = resolved_load_deadline();
+        for planned in &plan.actions {
+            match &planned.action {
+                Action::Reuse { identifier, resident_ctx, min_ctx } => {
+                    if *resident_ctx > u64::from(*min_ctx) {
+                        // (#1271 review round) Declared-vs-actual ctx
+                        // divergence can happen ACROSS profiles (a bigger
+                        // load from another profile satisfies this seat's
+                        // minimum) — leave a trace until #1257's full
+                        // load-config provenance lands.
+                        println!(
+                            "cycler: reusing {identifier} at ctx={resident_ctx} (declared {min_ctx})"
+                        );
+                    }
                 }
-                Ok(())
+                Action::Unload { target } => {
+                    // (#1271) Reconcile rather than attempt a doomed second
+                    // load: the stale instance's free-phase unload always
+                    // precedes its reload in `plan.actions` (the planner's
+                    // free-then-load ordering contract), matching the style
+                    // of `swap::swap`'s own unload-then-load logging.
+                    println!("cycler: unload {} — reconciling for {}", target.identifier(), pm.id);
+                    host.unload(target, deadline).map_err(|e| {
+                        anyhow!("darkmux: unload failed for \"{}\": {e}", target.identifier())
+                    })?;
+                }
+                Action::Load { model_key, identifier, min_ctx } => {
+                    host.load(model_key, identifier, *min_ctx, deadline).map_err(|e| {
+                        anyhow!("darkmux: load failed for \"{model_key}\" (\"{identifier}\"): {e}")
+                    })?;
+                }
+                Action::Block { model_key, .. } => {
+                    bail!("darkmux: cannot load \"{model_key}\" for the review funnel — {}", planned.reason)
+                }
             }
-            ResidencyDecision::LoadFresh => lms::load_with_identifier(&pm.id, n_ctx, &identifier, true),
-            ResidencyDecision::Reconcile { stale_identifier, stale_ctx } => {
-                // (#1271) Reconcile rather than attempt a doomed second load:
-                // unload the stale-ctx darkmux instance first, matching the
-                // style of `swap::swap`'s own unload-then-load logging.
-                println!(
-                    "cycler: unload {stale_identifier} (was ctx={stale_ctx}) — reconciling to ctx={n_ctx} for {}",
-                    pm.id
-                );
-                lms::unload(&stale_identifier)?;
-                lms::load_with_identifier(&pm.id, n_ctx, &identifier, true)
-            }
-            ResidencyDecision::Blocked { resident_identifier } => bail!(
-                "darkmux: model \"{}\" is already resident under \"{}\", which is NOT darkmux-owned \
-                 (user/operator state) — darkmux won't unload it. Free it yourself first: \
-                 `darkmux model eject` (if it's actually stale darkmux state under a legacy \
-                 identifier) or `lms unload {}`, then re-run.",
-                pm.id,
-                resident_identifier,
-                resident_identifier
-            ),
         }
+        Ok(())
     }
 
     fn release(&mut self, pm: &ProfileModel) -> Result<()> {
-        let identifier = swap::namespaced_identifier(pm);
-        if !swap::is_darkmux_owned(&identifier) {
-            return Ok(());
+        let identifier = darkmux_gestalt::namespaced_identifier(&pm.id, pm.identifier.as_deref());
+        let mut host = LmsHost::new();
+        let facts = gather_facts(&mut host)?;
+        let placement = Placement {
+            model_key: pm.id.clone(),
+            identifier,
+            min_ctx: pm.n_ctx.unwrap_or(0),
+            seat: "funnel".to_string(),
+        };
+        let plan = darkmux_gestalt::plan_release(std::slice::from_ref(&placement), &[], &facts);
+        let deadline = resolved_load_deadline();
+        for planned in &plan.actions {
+            if let Action::Unload { target } = &planned.action {
+                host.unload(target, deadline)
+                    .map_err(|e| anyhow!("darkmux: unload failed for \"{}\": {e}", target.identifier()))?;
+            }
         }
-        lms::unload(&identifier)
+        Ok(())
     }
 }
 
@@ -1301,22 +1301,59 @@ fn resolve_seat_max_tokens(s: &ResolvedSeatStaffing, local_default: u32) -> u32 
     }
 }
 
-/// A hardware-tier concurrency budget for [`resolve_auto`]: the review
-/// funnel is a light, occasional dispatch (not throughput-critical
-/// infrastructure), so a coarse rule beats a tuned cost model — KISS per
-/// CLAUDE.md doctrine. `distinct_models` counts unique model ids across
-/// every probe staffing plus the judge — the number that would need to be
-/// simultaneously resident under `Parallel`.
-fn resolve_auto(distinct_models: usize, hw: &darkmux_hardware::HardwareSpec) -> ExecMode {
-    let budget = match hw.ram_tier() {
-        darkmux_hardware::RamTier::Xl | darkmux_hardware::RamTier::Large => 3,
-        darkmux_hardware::RamTier::Medium => 2,
-        darkmux_hardware::RamTier::Small => 1,
-    };
-    if distinct_models <= budget {
+/// (#1230 Packet 1 cutover) Auto-resolution: `Parallel` iff gestalt's
+/// co-residency wave scheduler ([`darkmux_gestalt::plan_waves`],
+/// `WaveMode::Auto`) packs every distinct LOCAL model (probe seats + judge,
+/// deduped) into ONE wave — i.e. the same arithmetic `plan_acquire`'s
+/// budget/pool-headroom arms use judges them safe to hold resident
+/// together, against REAL facts (a live `MacProbe` pool snapshot, and the
+/// #1243 AI-RAM budget when an operator has configured one). More than one
+/// wave means they don't fit — the same shape `Sequential` always meant,
+/// now DERIVED from live facts instead of a static hardware-tier lookup
+/// table.
+///
+/// Replaces the deleted `resolve_auto` tier table. `darkmux_gestalt::waves`'s
+/// own module doc already claimed the hardware-tier-threshold concept "was
+/// removed end-to-end in #602/#604/#605" — that claim was aspirational until
+/// this function, the funnel's last holdout, stopped re-deriving one.
+fn wave_schedule_to_exec_mode(schedule: &darkmux_gestalt::WaveSchedule) -> ExecMode {
+    if schedule.waves.len() <= 1 {
         ExecMode::Parallel
     } else {
         ExecMode::Sequential
+    }
+}
+
+/// Gathers real facts and asks gestalt's wave scheduler whether `placements`
+/// fit one wave. Separated from [`wave_schedule_to_exec_mode`] (the pure
+/// projection, directly unit-testable against a scripted `WaveSchedule`) so
+/// the I/O — `LmsHost::list_resident` + `MacProbe::pools`, the SAME adapters
+/// [`LmsCycler`] wires — lives in exactly one place. A residency-read
+/// failure degrades to `Sequential` (never guess `Parallel` without knowing
+/// what's already resident) with a loud stderr line, never a silent
+/// downgrade to a riskier mode.
+fn resolve_auto_via_waves(placements: &[Placement]) -> ExecMode {
+    if placements.is_empty() {
+        return ExecMode::Parallel;
+    }
+    let mut host = LmsHost::new();
+    let facts = match gather_facts(&mut host) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "darkmux: could not resolve auto exec mode from live LMStudio state, \
+                 defaulting to sequential: {e}"
+            );
+            return ExecMode::Sequential;
+        }
+    };
+    match darkmux_gestalt::plan_waves(placements, &facts, &inert_estimator(), darkmux_gestalt::WaveMode::Auto)
+    {
+        Ok(schedule) => wave_schedule_to_exec_mode(&schedule),
+        // `Auto` mode never refuses (only `ForceParallel` can, per
+        // `plan_waves`'s own doc) — kept for exhaustiveness rather than an
+        // unwrap on a real dispatch path.
+        Err(_) => ExecMode::Sequential,
     }
 }
 
@@ -1326,17 +1363,21 @@ fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &Resolve
             // (#1260) Only LOCAL models count toward the residency budget —
             // a remote seat is a zero-footprint placement (nothing loaded,
             // no pool bytes), so it never forces Sequential.
-            let mut ids: Vec<&str> = probes
-                .iter()
-                .filter(|s| !s.pm.is_remote())
-                .map(|s| s.pm.id.as_str())
-                .collect();
-            if !judge.pm.is_remote() {
-                ids.push(judge.pm.id.as_str());
+            let mut placements: Vec<Placement> = Vec::new();
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for s in probes.iter().chain(std::iter::once(judge)).filter(|s| !s.pm.is_remote()) {
+                let identifier = darkmux_gestalt::namespaced_identifier(&s.pm.id, s.pm.identifier.as_deref());
+                if !seen.insert(identifier.clone()) {
+                    continue; // dedup — a repeated model needs one placement, not one per seat
+                }
+                placements.push(Placement {
+                    model_key: s.pm.id.clone(),
+                    identifier,
+                    min_ctx: s.pm.n_ctx.unwrap_or(0),
+                    seat: "funnel-auto".to_string(),
+                });
             }
-            ids.sort_unstable();
-            ids.dedup();
-            resolve_auto(ids.len(), &darkmux_hardware::detect())
+            resolve_auto_via_waves(&placements)
         }
         other => other,
     }
@@ -5585,24 +5626,42 @@ mod tests {
         assert_eq!(env.mode, "parallel", "a judge-only re-run of a parallel funnel keeps its provenance");
     }
 
-    // ── ExecMode auto-resolution ──────────────────────────────────────
+    // ── ExecMode auto-resolution (#1230 Packet 1: gestalt wave scheduler) ──
+
+    /// A minimal, valid `WaveSchedule` for [`wave_schedule_to_exec_mode`]'s
+    /// pure-projection tests — the wave PARTITIONING itself is already
+    /// covered by `darkmux-gestalt`'s own `plan_waves` table tests; this
+    /// only pins the wave-count → `ExecMode` mapping this module owns.
+    fn schedule_with_waves(n: usize) -> darkmux_gestalt::WaveSchedule {
+        let placement = |i: usize| darkmux_gestalt::Placement {
+            model_key: format!("m{i}"),
+            identifier: format!("darkmux:m{i}"),
+            min_ctx: 8_000,
+            seat: "probe".to_string(),
+        };
+        darkmux_gestalt::WaveSchedule {
+            waves: (0..n).map(|i| vec![placement(i)]).collect(),
+            refusals: Vec::new(),
+            mode: darkmux_gestalt::WaveMode::Auto,
+            effective_limit_bytes: None,
+            warnings: Vec::new(),
+        }
+    }
 
     #[test]
-    fn resolve_auto_stays_parallel_within_budget_and_falls_back_sequential_over() {
-        let hw_small = darkmux_hardware::HardwareSpec {
-            platform: darkmux_hardware::Platform::AppleSilicon,
-            arch: "aarch64".into(),
-            total_ram_gb: 16,
-            physical_cores: 8,
-            performance_cores: None,
-            efficiency_cores: None,
-            has_unified_memory: true,
-        };
-        assert_eq!(resolve_auto(1, &hw_small), ExecMode::Parallel);
-        assert_eq!(resolve_auto(2, &hw_small), ExecMode::Sequential, "small tier budget is 1");
-        let hw_xl = darkmux_hardware::HardwareSpec { total_ram_gb: 128, ..hw_small };
-        assert_eq!(resolve_auto(3, &hw_xl), ExecMode::Parallel, "xl tier budget is 3");
-        assert_eq!(resolve_auto(4, &hw_xl), ExecMode::Sequential);
+    fn wave_schedule_to_exec_mode_one_wave_is_parallel_more_is_sequential() {
+        assert_eq!(wave_schedule_to_exec_mode(&schedule_with_waves(0)), ExecMode::Parallel);
+        assert_eq!(wave_schedule_to_exec_mode(&schedule_with_waves(1)), ExecMode::Parallel);
+        assert_eq!(wave_schedule_to_exec_mode(&schedule_with_waves(2)), ExecMode::Sequential);
+        assert_eq!(wave_schedule_to_exec_mode(&schedule_with_waves(3)), ExecMode::Sequential);
+    }
+
+    #[test]
+    fn resolve_auto_via_waves_empty_placements_is_parallel_without_touching_lms() {
+        // No distinct local models (e.g. every probe + the judge are
+        // remote) short-circuits to Parallel without any `LmsHost`/
+        // `MacProbe` I/O — nothing to co-reside.
+        assert_eq!(resolve_auto_via_waves(&[]), ExecMode::Parallel);
     }
 
     // ── judge_prompt shape ─────────────────────────────────────────────
@@ -6126,26 +6185,29 @@ mod tests {
     }
 
     /// (c) a resident sharing the modelKey that is NOT darkmux-owned (no
-    /// `darkmux:` prefix) — operator state. The cycler must fail BEFORE
-    /// attempting any load, naming the colliding resident instance and a
-    /// fix command, never unload it itself (operator sovereignty).
+    /// `darkmux:` prefix) — operator state. (#1230 Packet 1 cutover — a
+    /// deliberate behavior change, see `darkmux_gestalt::planner`'s "Cutover
+    /// behavior changes" doc): the cycler no longer hard-blocks around it.
+    /// The foreign resident's load configuration is unknown (the #1135
+    /// ghost) — never reused, never touched — but darkmux loads its OWN
+    /// namespaced copy ALONGSIDE it (absolute namespace ownership, operator
+    /// decision 2026-07-10, #1274) instead of refusing outright.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn lms_cycler_user_owned_same_model_key_blocks_before_any_load() {
+    fn lms_cycler_user_owned_same_model_key_loads_alongside_not_blocked() {
         let env = LmsStubEnv::new(
             r#"[{"identifier":"devstral-manual","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960}]"#,
         );
         let mut cycler = LmsCycler;
         let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
-        let err = cycler.ensure_loaded(&model).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("devstral-manual"), "error names the resident instance: {msg}");
+        cycler.ensure_loaded(&model).expect("loads darkmux's own copy alongside the foreign resident");
+        let log = env.log();
         assert!(
-            msg.contains("darkmux model eject") && msg.contains("lms unload devstral-manual"),
-            "error names both fix commands: {msg}"
+            log.contains("load devstral --context-length 32768 --identifier darkmux:devstral"),
+            "darkmux's own copy loads: {log}"
         );
-        assert_eq!(env.log(), "", "no load or unload attempted against user state");
+        assert!(!log.contains("unload"), "the foreign resident is never touched: {log}");
     }
 
     /// (d) no resident shares the modelKey — plain load, unchanged.
@@ -6217,14 +6279,19 @@ mod tests {
         assert!(unload_pos < load_pos, "unload precedes the reload: {log}");
     }
 
-    /// (#1271 review round) Multi-resident, FIRST match decides: user-owned
-    /// listed ahead of a darkmux-stale instance → Blocked, and neither
-    /// instance is touched. Pins the `.find()` order-dependence as asserted
-    /// behavior rather than an implicit implementation detail.
+    /// (#1230 Packet 1 cutover — a deliberate behavior change) Multi-resident,
+    /// user-owned listed AHEAD of a darkmux-stale instance: under gestalt's
+    /// `decide_residency`, ownership partitions BEFORE position-matching (see
+    /// `darkmux_gestalt::planner`'s "Cutover behavior changes" doc — "a
+    /// foreign copy listed ahead of a darkmux copy also no longer shadows
+    /// it"), so listing order no longer decides the outcome the way the old
+    /// funnel-private `.find()` did. The owned-but-stale instance is found
+    /// regardless of position → Reconcile, exactly like the mirror-ordering
+    /// case below; the foreign resident is never touched either way.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn lms_cycler_multi_resident_user_owned_first_blocks() {
+    fn lms_cycler_multi_resident_user_owned_first_still_reconciles_owned_stale() {
         let env = LmsStubEnv::new(
             r#"[
                 {"identifier":"devstral-manual","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960},
@@ -6233,12 +6300,14 @@ mod tests {
         );
         let mut cycler = LmsCycler;
         let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
-        let err = cycler.ensure_loaded(&model).unwrap_err();
+        cycler.ensure_loaded(&model).expect("reconciles the owned-but-stale instance regardless of listing order");
+        let log = env.log();
+        assert!(log.contains("unload darkmux:devstral"), "the owned stale instance reconciles: {log}");
+        assert!(!log.contains("unload devstral-manual"), "the foreign resident is never touched: {log}");
         assert!(
-            err.to_string().contains("devstral-manual"),
-            "error names the first-match user-owned resident: {err}"
+            log.contains("load devstral --context-length 32768 --identifier darkmux:devstral"),
+            "{log}"
         );
-        assert_eq!(env.log(), "", "no load or unload issued when a user-owned resident is first");
     }
 
     /// Multi-resident, mirror ordering: darkmux-stale listed ahead of a

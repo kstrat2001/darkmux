@@ -17,6 +17,10 @@ darkmux-eureka = { path = "../darkmux-eureka" }
 darkmux-flow = { path = "../darkmux-flow" }
 darkmux-hardware = { path = "../darkmux-hardware" }
 darkmux-profiles = { path = "../darkmux-profiles" }
+# (#1230 Packet 1) The funnel's model-cycling now routes through gestalt's
+# pure planner (plan_acquire/plan_release) instead of a private
+# decide_residency/resolve_auto — see lab/funnel.rs's LmsCycler.
+darkmux-gestalt = { path = "../darkmux-gestalt" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
