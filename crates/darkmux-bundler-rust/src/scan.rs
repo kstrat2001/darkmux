@@ -25,24 +25,41 @@
 //!   unnamed hunk-level bundle.
 
 /// Strip string/char literal CONTENTS (replaced with a single space each
-/// so identifier boundaries on either side stay intact) and everything
-/// from a `//` line comment onward. Shared by [`brace_delta`] (braces
-/// inside a format string must not count) and `facts::extract_calls`
-/// (call-shaped text inside a string literal must not register as a real
-/// call site) — one sanitizer, so the string/lifetime disambiguation
-/// logic lives in exactly one place.
+/// so identifier boundaries on either side stay intact), block-comment
+/// contents, and everything from a `//` line comment onward. Shared by
+/// [`brace_delta`] (braces inside a format string or a commented-out
+/// code fragment must not count) and `facts::extract_calls` (call-shaped
+/// text inside a string literal must not register as a real call site)
+/// — one sanitizer, so the string/lifetime/comment disambiguation logic
+/// lives in exactly one place.
+///
+/// `in_block_comment` is CALLER-OWNED and threaded across every line of
+/// a scan — a `/* ... */` block comment can span multiple lines, and a
+/// brace inside one (e.g. commented-out code like `/* if x { */`) must
+/// not corrupt the count on ANY of the lines it spans, not just the one
+/// where it opens. Pass `&mut false` for a scan that's known to start
+/// outside any comment (every current caller does).
 ///
 /// Distinguishes a char literal (`'x'`, `'\n'`) from a lifetime (`'a`,
 /// `'static`) by lookahead — lifetimes are far more common in real Rust
 /// source, so an ambiguous `'` defaults to "not a literal" (left alone)
 /// rather than the reverse, which would silently eat the rest of the
 /// line on every generic-lifetime signature.
-pub fn sanitize_line(line: &str) -> String {
+pub fn sanitize_line(line: &str, in_block_comment: &mut bool) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(chars.len());
     let mut i = 0usize;
     let mut in_string = false;
     while i < chars.len() {
+        if *in_block_comment {
+            if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                *in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
         let c = chars[i];
         if in_string {
             if c == '\\' {
@@ -53,6 +70,11 @@ pub fn sanitize_line(line: &str) -> String {
                 in_string = false;
             }
             i += 1;
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            *in_block_comment = true;
+            i += 2;
             continue;
         }
         match c {
@@ -88,10 +110,12 @@ pub fn sanitize_line(line: &str) -> String {
 }
 
 /// One brace-matched line delta over the sanitized text — a `{`/`}`
-/// inside a format string or comment never corrupts the count.
-pub fn brace_delta(line: &str) -> i32 {
+/// inside a format string or a (possibly multi-line) comment never
+/// corrupts the count. `in_block_comment` is threaded exactly like
+/// [`sanitize_line`]'s.
+pub fn brace_delta(line: &str, in_block_comment: &mut bool) -> i32 {
     let mut delta = 0i32;
-    for c in sanitize_line(line).chars() {
+    for c in sanitize_line(line, in_block_comment).chars() {
         match c {
             '{' => delta += 1,
             '}' => delta -= 1,
@@ -102,13 +126,31 @@ pub fn brace_delta(line: &str) -> i32 {
 }
 
 /// Strip leading `fn`-declaration modifiers (`pub`, `pub(crate)`,
-/// `const`, `async`, `unsafe`, `extern "C"`, in any combination/order a
-/// real signature can carry) and return what's left. Loops until no
-/// modifier matches, so `pub(crate) async unsafe fn` strips cleanly.
+/// `pub(in <path>)`, `const`, `async`, `unsafe`, `extern "C"`, in any
+/// combination/order a real signature can carry) and return what's left.
+/// Loops until no modifier matches, so `pub(crate) async unsafe fn`
+/// strips cleanly.
 fn strip_fn_modifiers(line: &str) -> &str {
     let mut rest = line.trim_start();
     loop {
         let mut advanced = false;
+        // `pub(in <path>)` is checked BEFORE the bare "pub" fallback below
+        // — a dynamic-length path, not a fixed keyword, so it needs its
+        // own closing-paren search rather than a fixed-prefix match. If
+        // this weren't tried first, the bare "pub" branch would still
+        // strip (its guard accepts a following `(`), leaving `(in
+        // crate::foo)` unconsumed — which nothing else in this loop
+        // recognizes, so the signature would fail to resolve at all
+        // (previously a silent function drop, not just a mislocation).
+        if let Some(r) = rest.strip_prefix("pub(in ") {
+            if let Some(close_idx) = r.find(')') {
+                rest = r[close_idx + 1..].trim_start();
+                advanced = true;
+            }
+        }
+        if advanced {
+            continue;
+        }
         for prefix in ["pub(crate)", "pub(super)", "pub(self)", "pub"] {
             if let Some(r) = rest.strip_prefix(prefix) {
                 if r.is_empty() || r.starts_with(char::is_whitespace) || r.starts_with('(') {
@@ -203,8 +245,9 @@ fn extent_start(lines: &[String], sig_idx: usize) -> usize {
 fn find_fn_extent_end(lines: &[String], sig_idx: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut seen_open = false;
+    let mut in_block_comment = false;
     for (i, line) in lines.iter().enumerate().skip(sig_idx) {
-        let d = brace_delta(line);
+        let d = brace_delta(line, &mut in_block_comment);
         if d != 0 {
             seen_open = true;
         }
@@ -255,7 +298,20 @@ pub fn find_all_fns_in_lines(lines: &[String]) -> Vec<FnSpan> {
     while i < lines.len() {
         if is_fn_signature(&lines[i]) {
             if let Some(span) = resolve_span_from_signature(lines, i) {
-                let next = span.end0 + 1;
+                // Blast-radius containment for a brace miscount (defense
+                // in depth alongside `sanitize_line`'s block-comment
+                // handling above): an unclosed span resumes at `i + 1`,
+                // NOT `end0 + 1`. A genuinely truncated function is
+                // always the last one in a diff-only window — nothing
+                // valid follows it, so resuming at `i + 1` costs
+                // nothing there. But if `closed: false` came from a
+                // brace-counting error rather than a real truncation,
+                // `end0` can run all the way to the end of `lines`,
+                // and jumping there would silently skip every real
+                // sibling that follows. A mislocated span is an
+                // acceptable heuristic error; a silently dropped
+                // function is not.
+                let next = if span.closed { span.end0 + 1 } else { i + 1 };
                 spans.push(span);
                 i = next.max(i + 1);
                 continue;
@@ -309,18 +365,41 @@ mod tests {
 
     #[test]
     fn brace_delta_ignores_string_contents() {
-        assert_eq!(brace_delta(r#"    let s = "{ not a brace }";"#), 0);
+        assert_eq!(brace_delta(r#"    let s = "{ not a brace }";"#, &mut false), 0);
     }
 
     #[test]
     fn brace_delta_ignores_line_comments() {
-        assert_eq!(brace_delta("    // this { comment } has braces"), 0);
+        assert_eq!(brace_delta("    // this { comment } has braces", &mut false), 0);
     }
 
     #[test]
     fn brace_delta_distinguishes_lifetime_from_char_literal() {
-        assert_eq!(brace_delta("fn foo<'a>(x: &'a str) {"), 1, "lifetime must not eat the real brace");
-        assert_eq!(brace_delta("let c = '{';"), 0, "a char literal brace must not count");
+        assert_eq!(
+            brace_delta("fn foo<'a>(x: &'a str) {", &mut false),
+            1,
+            "lifetime must not eat the real brace"
+        );
+        assert_eq!(brace_delta("let c = '{';", &mut false), 0, "a char literal brace must not count");
+    }
+
+    #[test]
+    fn brace_delta_ignores_single_line_block_comment() {
+        assert_eq!(brace_delta("    /* if x { */ real_code();", &mut false), 0);
+    }
+
+    #[test]
+    fn brace_delta_threads_block_comment_state_across_lines() {
+        // A multi-line block comment containing an unbalanced brace must
+        // not corrupt the count on ANY line it spans, not just the one
+        // where it opens.
+        let mut state = false;
+        assert_eq!(brace_delta("/* commented out:", &mut state), 0);
+        assert!(state, "still inside the block comment after line 1");
+        assert_eq!(brace_delta("   while cond {", &mut state), 0, "the brace is still inside the comment");
+        assert!(state, "still inside the block comment after line 2");
+        assert_eq!(brace_delta("*/ fn real() {", &mut state), 1, "the comment closes, then a real brace counts");
+        assert!(!state, "the block comment has closed");
     }
 
     #[test]
@@ -333,6 +412,14 @@ mod tests {
         assert_eq!(extract_fn_name("fn generic<T: Clone>(x: T) {"), Some("generic".to_string()));
         assert_eq!(extract_fn_name("    let x = 1;"), None);
         assert_eq!(extract_fn_name("struct Foo { field: u32 }"), None);
+        // QA-caught regression: `pub(in <path>)` used to leave `(in
+        // crate::foo)` unconsumed after the bare "pub" branch matched
+        // it too eagerly — the signature never resolved at all (a
+        // silent drop, not just a mislocation).
+        assert_eq!(
+            extract_fn_name("pub(in crate::foo) fn restricted() {"),
+            Some("restricted".to_string())
+        );
     }
 
     #[test]
@@ -362,6 +449,44 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert!(!spans[0].closed, "the window never showed a closing brace");
         assert_eq!(spans[0].end0, l.len() - 1);
+    }
+
+    /// QA-caught regression (PR #1333 review): a commented-out brace used
+    /// to corrupt `brace_delta`'s count, mark the enclosing function
+    /// `closed: false`, and then `find_all_fns_in_lines` jumped past the
+    /// WHOLE window (`end0 + 1`, which for an unclosed span is
+    /// `lines.len()`) — silently dropping every real sibling that
+    /// followed. Two independent fixes now cover this: the root cause
+    /// (`sanitize_line` understands block comments, so the brace never
+    /// miscounts in the first place) and a containment backstop (an
+    /// unclosed span resumes at `i + 1`, not `end0 + 1`, so even a
+    /// hypothetical FUTURE miscount couldn't silently swallow siblings
+    /// again). This test proves the root-cause fix specifically: `first`
+    /// must resolve CLOSED (not truncated) despite its unbalanced-looking
+    /// commented-out brace, and both siblings must still be found.
+    #[test]
+    fn find_all_fns_in_lines_survives_a_commented_out_brace() {
+        let l = lines(
+            "fn first() {\n    /* if x { */\n    1\n}\n\nfn second() {\n    2\n}\n\nfn third() {\n    3\n}\n",
+        );
+        let spans = find_all_fns_in_lines(&l);
+        assert_eq!(spans.len(), 3, "all three siblings must be found, not just the first");
+        assert_eq!(spans[0].name, "first");
+        assert!(spans[0].closed, "the commented-out brace must not corrupt the count");
+        assert_eq!(spans[1].name, "second");
+        assert_eq!(spans[2].name, "third");
+    }
+
+    #[test]
+    fn find_all_fns_in_lines_survives_a_multiline_block_comment() {
+        let l = lines(
+            "fn alpha() {\n    /* a comment\n       spanning multiple lines\n       with a { brace */\n    1\n}\n\nfn beta() {\n    2\n}\n",
+        );
+        let spans = find_all_fns_in_lines(&l);
+        assert_eq!(spans.len(), 2, "both functions must be found across the multi-line comment");
+        assert_eq!(spans[0].name, "alpha");
+        assert!(spans[0].closed);
+        assert_eq!(spans[1].name, "beta");
     }
 
     #[test]

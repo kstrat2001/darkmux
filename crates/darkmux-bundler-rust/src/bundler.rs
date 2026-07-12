@@ -18,7 +18,7 @@ use crate::scan;
 use anyhow::{Context, Result};
 use darkmux_lab::lab::bundle::diff::{parse_diff, Hunk};
 use darkmux_lab::lab::bundle::{Bundle, BundleRef, BundleSet};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 fn is_rust_file(path: &str) -> bool {
@@ -52,7 +52,18 @@ fn added_call_pool(hunks: &[Hunk]) -> HashSet<String> {
 /// guessing at an enclosing function it can't see.
 fn bundle_file_diff_only(path: &str, hunks: &[Hunk]) -> Vec<Bundle> {
     let pool = added_call_pool(hunks);
-    let mut bundles = Vec::with_capacity(hunks.len());
+    // id -> index into `bundles`. Two SEPARATE hunks resolving to the
+    // same function name is rare in diff-only mode (git coalesces nearby
+    // edits into one hunk; this needs a short function with two edits
+    // each independently within the OTHER hunk's narrow context window)
+    // but not impossible — dedup rather than emit two bundles the
+    // downstream funnel would have to reconcile itself. Each hunk's own
+    // window may capture a different slice, so the merge takes the
+    // UNION of both spans (an honest superset, not a guess at which is
+    // "more complete") and merges facts, same principle as the worktree
+    // path.
+    let mut seen_ids: HashMap<String, usize> = HashMap::new();
+    let mut bundles: Vec<Bundle> = Vec::with_capacity(hunks.len());
     for h in hunks {
         let line_nums = new_line_numbers(h);
         if line_nums.is_empty() {
@@ -71,8 +82,23 @@ fn bundle_file_diff_only(path: &str, hunks: &[Hunk]) -> Vec<Bundle> {
             for s in &all_spans {
                 let start = line_nums.get(s.start0).copied().unwrap_or(h.new_start);
                 let end = line_nums.get(s.end0).copied().unwrap_or(*line_nums.last().unwrap());
+                let id = format!("{}@{path}", s.name);
+                if let Some(&idx) = seen_ids.get(&id) {
+                    let existing = &mut bundles[idx];
+                    let r = &mut existing.code[0];
+                    r.start = r.start.min(start);
+                    r.end = r.end.max(end);
+                    existing.truncated = existing.truncated || !s.closed;
+                    for f in &diff_facts {
+                        if !existing.facts.contains(f) {
+                            existing.facts.push(f.clone());
+                        }
+                    }
+                    continue;
+                }
+                seen_ids.insert(id.clone(), bundles.len());
                 bundles.push(Bundle {
-                    id: format!("{}@{path}", s.name),
+                    id,
                     code: vec![BundleRef { path: path.to_string(), start, end }],
                     facts: diff_facts.clone(),
                     fact_family: "differential".to_string(),
@@ -109,18 +135,22 @@ fn bundle_file_diff_only(path: &str, hunks: &[Hunk]) -> Vec<Bundle> {
 
 /// Worktree-available bundling: full-file context, so `find_enclosing_fn`
 /// resolves reliably and rarely truncates. Multiple hunks resolving to
-/// the SAME function are deduped to one bundle (first hunk wins the
-/// differential-facts computation for that function — a v1 simplification;
-/// each hunk's own dropped-call check still ran against the FILE-wide pool,
-/// so nothing is lost, just not re-emitted per hunk).
+/// the SAME function dedup to ONE bundle (its code span was already
+/// resolved from the first hunk that found it, so re-resolving costs
+/// nothing new) — but each hunk's OWN differential facts are still
+/// merged in, not discarded. A call dropped only in a later hunk's
+/// pre-image is a real finding; silently keeping just the first hunk's
+/// facts would lose it.
 fn bundle_file_with_worktree(worktree: &Path, path: &str, hunks: &[Hunk]) -> Result<Vec<Bundle>> {
     let full_path = worktree.join(path);
     let content = std::fs::read_to_string(&full_path)
         .with_context(|| format!("reading {} from the worktree", full_path.display()))?;
     let file_lines: Vec<String> = content.lines().map(str::to_string).collect();
     let pool = added_call_pool(hunks);
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut bundles = Vec::with_capacity(hunks.len());
+    // id -> index into `bundles`, so a dedup hit can merge facts into the
+    // EXISTING bundle rather than just discarding the new hunk's findings.
+    let mut seen_ids: HashMap<String, usize> = HashMap::new();
+    let mut bundles: Vec<Bundle> = Vec::with_capacity(hunks.len());
     for h in hunks {
         if h.new_lines.is_empty() {
             continue;
@@ -136,9 +166,16 @@ fn bundle_file_with_worktree(worktree: &Path, path: &str, hunks: &[Hunk]) -> Res
         let (id, start_line, end_line, truncated, manifest) = match &span {
             Some(s) => {
                 let id = format!("{}@{path}", s.name);
-                if !seen_ids.insert(id.clone()) {
+                if let Some(&idx) = seen_ids.get(&id) {
+                    let existing = &mut bundles[idx];
+                    for f in diff_facts {
+                        if !existing.facts.contains(&f) {
+                            existing.facts.push(f);
+                        }
+                    }
                     continue;
                 }
+                seen_ids.insert(id.clone(), bundles.len());
                 (id, (s.start0 + 1) as u32, (s.end0 + 1) as u32, !s.closed, Vec::new())
             }
             None => {
@@ -245,6 +282,37 @@ mod tests {
         assert!(b.id.starts_with("hunk-L50@"));
         assert!(b.truncated);
         assert!(!b.manifest.is_empty());
+    }
+
+    #[test]
+    fn diff_only_mode_dedupes_two_hunks_resolving_the_same_function() {
+        // Two separate hunks, each independently capturing the SAME
+        // `fn shared()` signature in its own context window (hand-built —
+        // real git diffs coalesce nearby edits, but this exercises the
+        // dedup+union path directly rather than depending on git's own
+        // hunk-splitting heuristics).
+        let d = diff(&[
+            "+++ b/src/lib.rs",
+            "@@ -1,6 +1,6 @@",
+            " fn shared() {",
+            "-    let a = 1;",
+            "+    let a = 10;",
+            "     let b = 2;",
+            "     let c = 3;",
+            "     a + b + c",
+            " }",
+            "@@ -1,6 +1,6 @@",
+            " fn shared() {",
+            "     let a = 10;",
+            "     let b = 2;",
+            "-    let c = 3;",
+            "+    let c = 30;",
+            "     a + b + c",
+            " }",
+        ]);
+        let set = build_bundles(None, &d).unwrap();
+        assert_eq!(set.bundles.len(), 1, "both hunks resolve to the same function, must dedup to one bundle");
+        assert_eq!(set.bundles[0].id, "shared@src/lib.rs");
     }
 
     #[test]

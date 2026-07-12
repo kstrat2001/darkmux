@@ -26,8 +26,12 @@ const RUST_KEYWORDS: &[&str] = &[
 /// itself) are filtered by name.
 pub fn extract_calls(text: &str) -> HashSet<String> {
     let mut calls = HashSet::new();
+    // Threaded across every line — a `/* ... */` block comment can span
+    // multiple lines, and call-shaped text inside one (commented-out
+    // code) must not register on ANY line it spans, not just the first.
+    let mut in_block_comment = false;
     for line in text.lines() {
-        let sanitized = sanitize_line(line);
+        let sanitized = sanitize_line(line, &mut in_block_comment);
         let chars: Vec<char> = sanitized.chars().collect();
         let mut i = 0usize;
         // Tracks the previous identifier seen (across intervening

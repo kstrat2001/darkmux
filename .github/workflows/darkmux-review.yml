@@ -87,7 +87,7 @@ jobs:
           # reference bundler runs through the SAME public `--bundler
           # <cmd>` seam a third-party plugin author would use, not a
           # special-cased internal path.
-          cargo build --release -p darkmux-bundler-rust
+          cargo build --release --locked -p darkmux-bundler-rust
           echo "BUNDLER_RUST_BIN=$PWD/target/release/darkmux-bundler-rust" >> "$GITHUB_ENV"
 
       - name: Fetch PR diff + head SHA (API only — no PR checkout, no code execution)
