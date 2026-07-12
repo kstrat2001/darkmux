@@ -375,29 +375,33 @@ mod tests {
     use super::*;
 
     /// (#1323) The config seam's self-defending conformance test: a project-local
-    /// `.darkmux/` (created for missions/sprints/lessons) must NEVER shadow the
-    /// user-scope `config.json`. If `load_resolved` ever regresses to
-    /// `ResolveScope::Auto`, this fails — the project `.darkmux/` has no
-    /// config.json, so the user's `machine_id` marker comes back `None`.
+    /// `.darkmux/config.json` (created for missions/sprints/lessons) must NEVER
+    /// shadow the user-scope config. `DARKMUX_HOME` is UNSET on purpose — with it
+    /// set, `paths::resolve` short-circuits to the same root for every scope, so
+    /// Auto and ForceUser wouldn't diverge and this guard would be hollow. If
+    /// `load_resolved` regresses to `ResolveScope::Auto`, it reads the project
+    /// shadow → the marker → this fails.
     #[serial_test::serial]
     #[test]
     fn config_load_resolved_ignores_project_darkmux_shadow() {
         use std::env;
-        let user_home = tempfile::TempDir::new().unwrap();
         let proj = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(proj.path().join(".darkmux")).unwrap();
         std::fs::write(
-            user_home.path().join("config.json"),
-            r#"{"machine_id":"user-scope-marker"}"#,
+            proj.path().join(".darkmux").join("config.json"),
+            r#"{"machine_id":"PROJECT-SHADOW-MUST-NOT-LOAD"}"#,
         )
         .unwrap();
-        // A project-local `.darkmux/` that WOULD flip `Auto` to Project scope:
-        std::fs::create_dir_all(proj.path().join(".darkmux")).unwrap();
 
         let prev_home = env::var("DARKMUX_HOME").ok();
         let prev_cwd = env::current_dir().unwrap();
-        unsafe { env::set_var("DARKMUX_HOME", user_home.path()) };
+        unsafe { env::remove_var("DARKMUX_HOME") };
         env::set_current_dir(proj.path()).unwrap();
 
+        // Sanity: in THIS setup Auto and ForceUser genuinely diverge (Auto sees
+        // the project shadow), so the guard below actually exercises the choice.
+        let auto = crate::paths::resolve(crate::paths::ResolveScope::Auto).config;
+        let force_user = crate::paths::resolve(crate::paths::ResolveScope::ForceUser).config;
         let cfg = DarkmuxConfig::load_resolved();
 
         // Restore env FIRST so a failed assert can't poison other serial tests.
@@ -407,10 +411,16 @@ mod tests {
             None => unsafe { env::remove_var("DARKMUX_HOME") },
         }
 
-        assert_eq!(
+        assert_ne!(
+            auto, force_user,
+            "sanity: with a project .darkmux/ and no DARKMUX_HOME, Auto must diverge from ForceUser"
+        );
+        // The real guard: under the pre-#1323 `Auto`, load_resolved reads the
+        // project shadow → the marker → FAIL. Under `ForceUser` it never does.
+        assert_ne!(
             cfg.machine_id.as_deref(),
-            Some("user-scope-marker"),
-            "#1323: config.json must resolve to USER scope even when a project-local .darkmux/ exists"
+            Some("PROJECT-SHADOW-MUST-NOT-LOAD"),
+            "#1323: load_resolved must ignore a project-local .darkmux/config.json"
         );
     }
 
