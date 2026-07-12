@@ -15,23 +15,20 @@
 //! results, recompute readiness, repeat until nothing is ready and
 //! nothing is left `Planned`.
 //!
-//! # Residency (a deliberate Packet 2 scope cut)
+//! # Residency (resolved for real in Packet 4)
 //!
 //! `run_bounded` wants to know, per job, whether it needs a local model
 //! resident (`Residency::Local(Placement)`, gestalt-wave-planned) or is
-//! remote/unbound (`Residency::Remote`, cap-bounded only). Resolving
-//! *which* local model (if any) a `dispatch.internal`/`dispatch.
-//! single_shot` step's config ultimately targets is entangled with
-//! role/profile resolution that Packets 3 and 4 own (mission_run's
-//! migration onto this engine, and the funnel's migration, respectively)
-//! — Packet 2 ships storage + scheduler only, no CLI verb, no production
-//! caller wiring a real dispatch chain through this graph yet. So every
-//! Step here runs through `run_bounded`'s `Residency::Remote` track,
-//! which still gives real bounded concurrency (the diamond-shape
-//! acceptance case) without gestalt RAM-safety reasoning. Local-model
-//! contention protection for `dispatch.*` steps is Packet 3/4's job once
-//! real dispatch data flows through this graph — tracked forward here
-//! rather than silently assumed solved.
+//! remote/unbound (`Residency::Remote`, cap-bounded only). Packet 2 shipped
+//! this hardcoded to `Residency::Remote` for every step. Packet 4 resolves
+//! it for real via `StepKind::residency` (`step_kinds::types`): each ready
+//! step's registered kind is asked which local model (if any) it needs,
+//! best-effort (see that trait method's doc — a resolution miss fails OPEN
+//! to `Remote`, never a hard error). The review funnel's `dispatch.
+//! funnel_probe`/`dispatch.funnel_judge_*` step kinds (`darkmux-lab`)
+//! implement it directly from their own resolved `ProfileModel` config —
+//! this is the first real caller that benefits from genuine wave-planned
+//! concurrency (multiple probe seats resident and dispatched at once).
 
 use crate::step_kinds::StepKindRegistry;
 use crate::types::{NodeStatus, Sprint, SprintStatus, Step};
@@ -293,6 +290,14 @@ pub fn run_step_graph(
             let kind = kinds
                 .get(&step_snapshot.kind)
                 .with_context_step(&step_snapshot)?;
+            // (#1230 Packet 4) Per-step residency classification — see the
+            // trait doc on `StepKind::residency`. Best-effort: `None`
+            // (every kind's behavior before this hook existed, and every
+            // non-dispatch kind today) schedules Remote.
+            let residency = match kind.residency(&step_snapshot) {
+                Some(placement) => crate::concurrent_dispatch::Residency::Local(placement),
+                None => crate::concurrent_dispatch::Residency::Remote,
+            };
             let job: crate::concurrent_dispatch::DispatchJob<StepJobResult> =
                 Box::new(move || {
                     let outcome = kind.run(&step_snapshot, &input)?;
@@ -305,7 +310,7 @@ pub fn run_step_graph(
                 });
             jobs.push(crate::concurrent_dispatch::QueuedJob {
                 index: idx,
-                residency: crate::concurrent_dispatch::Residency::Remote,
+                residency,
                 job,
             });
         }

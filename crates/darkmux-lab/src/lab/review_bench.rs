@@ -961,12 +961,15 @@ fn run_funnel_case(
         // one precedence home (`env > config.remote.* > 500000`).
         remote_max_tokens_per_execution:
             darkmux_types::config_access::remote_max_tokens_per_execution(),
+        // (#1230 Packet 4) Bench runs stay per-run-local — the lab-vs-fleet
+        // scope boundary — never a mission/task/step write.
+        mission: None,
     };
 
     // (#1260) Same seat routing as `darkmux pr-review run`: an
     // endpoint-bearing call goes through the hosted dialect; a local call
     // through LMStudio. Texts identical either way (contract 6).
-    let chat = |call: &funnel::ChatCall| -> Result<darkmux_crew::single_shot::SingleShotReply> {
+    let chat = move |call: &funnel::ChatCall| -> Result<darkmux_crew::single_shot::SingleShotReply> {
         match call.endpoint {
             Some(endpoint) => darkmux_crew::single_shot::single_shot_chat_hosted(
                 &darkmux_crew::single_shot::HostedSingleShotRequest {
@@ -991,8 +994,7 @@ fn run_funnel_case(
             ),
         }
     };
-    let mut cycler = funnel::LmsCycler;
-    let env = funnel::run_funnel(&inputs, chat, &mut cycler, emitter)
+    let env = funnel::run_funnel(&inputs, chat, funnel::LmsCycler, emitter)
         .with_context(|| format!("running review funnel for case {}", c.id))?;
     let review = review_from_funnel(&env);
     Ok((review, env))
@@ -3020,10 +3022,11 @@ mod tests {
 
         assert_eq!(env.bundles, 0, "README.md isn't a TS/TSX file — build_bundles finds nothing");
         assert!(env.degenerate.is_some(), "a zero-bundle run must be LOUD, never a silent pass");
-        assert_eq!(
-            env.mode, "sequential",
-            "opts.exec_mode threads through FunnelCtx -> FunnelInputs -> the resolved envelope"
-        );
+        // (#1230 Packet 4) `env.mode` is now the constant "concurrent" every
+        // run reports — `ExecMode`/`FunnelCtx::exec_mode` is vestigial (see
+        // its doc comment on `funnel::ExecMode`); the caller's choice no
+        // longer changes this value.
+        assert_eq!(env.mode, "concurrent");
         assert!(!review.parsed, "the mapped Review must not read as a real pass");
 
         let s = score(&case.label, &review);
@@ -3066,15 +3069,25 @@ mod tests {
         let mut emitter = LocalJsonlEmitter::new(events_path.clone());
 
         let (_, env) = run_funnel_case(&case, workdir.path(), &ctx, 30, &mut emitter).unwrap();
-        assert!(env.degenerate.is_some(), "zero-bundle case still emits a funnel.task terminal record");
+        // (#1230 Packet 4) `funnel.task` is retired — the scheduler's own
+        // generic "step start"/"step complete" records (one pair for the
+        // "bundle" Step, which always runs for real even on a zero-bundle
+        // degenerate case — see `run_probe_and_dedup`'s doc comment on "no
+        // blind runs") are the replacement observability surface.
+        assert!(env.degenerate.is_some(), "zero-bundle case is still a real, observable degenerate run");
 
-        let content = fs::read_to_string(&events_path).expect("the degenerate run still emits funnel.task");
+        let content = fs::read_to_string(&events_path)
+            .expect("the degenerate run still emits real step-lifecycle records for its bundle Step");
         let actions: Vec<String> = content
             .lines()
             .filter_map(|l| serde_json::from_str::<darkmux_flow::FlowRecord>(l).ok())
             .map(|r| r.action)
             .collect();
-        assert!(!actions.is_empty(), "the bench path must still emit its own funnel.* records");
+        assert!(!actions.is_empty(), "the bench path must still emit its own step-lifecycle records");
+        assert!(
+            actions.iter().any(|a| a == "step start" || a == "step complete"),
+            "the bundle Step's own scheduler-emitted lifecycle records: got {actions:?}"
+        );
         assert!(
             actions.iter().all(|a| !a.starts_with("dispatch")),
             "the bench-path LocalJsonlEmitter must never see a dispatch.*/\"dispatch \" bookend \

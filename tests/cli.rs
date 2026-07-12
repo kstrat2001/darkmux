@@ -1878,7 +1878,14 @@ fn review_bench_funnel_degenerate_run_completes_offline_with_console_line_and_ar
         serde_json::from_str(&fs::read_to_string(&scores_out).unwrap()).unwrap();
     assert_eq!(scores["mode"], serde_json::json!("funnel"));
     assert_eq!(scores["crew"], serde_json::json!("review-funnel"));
-    assert_eq!(scores["exec_mode"], serde_json::json!("sequential"));
+    // (#1230 Packet 4) `exec_mode` in scores.json is sourced from the
+    // funnel envelope's OWN `mode` field (real observed behavior), not
+    // `--exec-mode`'s requested value — `ExecMode` is now vestigial (see
+    // `darkmux_lab::lab::funnel::ExecMode`'s doc comment): every run
+    // schedules through gestalt's wave planner regardless of what's
+    // requested, so the honest provenance value is "concurrent" even
+    // though this invocation passed `--exec-mode sequential`.
+    assert_eq!(scores["exec_mode"], serde_json::json!("concurrent"));
     assert_eq!(scores["k"], serde_json::json!("(profile default)"));
 
     // funnels.json: one envelope, degenerate reason set, zero dispatches.
@@ -1888,7 +1895,10 @@ fn review_bench_funnel_degenerate_run_completes_offline_with_console_line_and_ar
     let env = &funnels[0];
     assert_eq!(env["case_id"], serde_json::json!("c1"));
     assert_eq!(env["crew"], serde_json::json!("review-funnel"));
-    assert_eq!(env["mode"], serde_json::json!("sequential"));
+    // (#1230 Packet 4) See the `scores["exec_mode"]` assertion above — the
+    // envelope's own `mode` field is real observed behavior, not the
+    // requested `--exec-mode`.
+    assert_eq!(env["mode"], serde_json::json!("concurrent"));
     assert_eq!(env["bundles"], serde_json::json!(0));
     assert!(
         env["degenerate"].as_str().unwrap().contains("no bundles"),
