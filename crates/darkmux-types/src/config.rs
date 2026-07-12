@@ -342,13 +342,21 @@ impl DarkmuxConfig {
         }
     }
 
-    /// Load the config.json at the resolved location (`<root>/config.json`
-    /// via `paths::resolve`). Missing or malformed → default-empty (loud
-    /// validation belongs to `darkmux doctor`, not the hot load path; a bad
-    /// config must never brick the CLI — accessors fall through to env/
-    /// built-in defaults).
+    /// Load the config.json at the USER-scope location (`~/.darkmux/config.json`
+    /// or `$DARKMUX_HOME`), never a project-local one. Missing or malformed →
+    /// default-empty (loud validation belongs to `darkmux doctor`, not the hot
+    /// load path; a bad config must never brick the CLI — accessors fall through
+    /// to env/built-in defaults).
+    ///
+    /// (#1323) `ForceUser`, NOT `Auto`: config.json carries user/machine-level
+    /// state (redis/audit/lms/machine_id) — there is no legitimate per-project
+    /// config. Under `Auto`, the mere existence of a `<cwd>/.darkmux/` created
+    /// for an unrelated purpose (project-tier missions/sprints/lessons) silently
+    /// resolved the "home" to the project dir, defaulting redis+audit OFF — a
+    /// real audit-trail hole on a self-hosted-runner checkout. Same shadowing
+    /// class as #1012/#1016; this is the config/flow-sink resolution path.
     pub fn load_resolved() -> Self {
-        let path = crate::paths::resolve(crate::paths::ResolveScope::Auto).config;
+        let path = crate::paths::resolve(crate::paths::ResolveScope::ForceUser).config;
         Self::load_from(&path)
     }
 
@@ -365,6 +373,56 @@ impl DarkmuxConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#1323) The config seam's self-defending conformance test: a project-local
+    /// `.darkmux/config.json` (created for missions/sprints/lessons) must NEVER
+    /// shadow the user-scope config. `DARKMUX_HOME` is UNSET on purpose — with it
+    /// set, `paths::resolve` short-circuits to the same root for every scope, so
+    /// Auto and ForceUser wouldn't diverge and this guard would be hollow. If
+    /// `load_resolved` regresses to `ResolveScope::Auto`, it reads the project
+    /// shadow → the marker → this fails.
+    #[serial_test::serial]
+    #[test]
+    fn config_load_resolved_ignores_project_darkmux_shadow() {
+        use std::env;
+        let proj = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(proj.path().join(".darkmux")).unwrap();
+        std::fs::write(
+            proj.path().join(".darkmux").join("config.json"),
+            r#"{"machine_id":"PROJECT-SHADOW-MUST-NOT-LOAD"}"#,
+        )
+        .unwrap();
+
+        let prev_home = env::var("DARKMUX_HOME").ok();
+        let prev_cwd = env::current_dir().unwrap();
+        unsafe { env::remove_var("DARKMUX_HOME") };
+        env::set_current_dir(proj.path()).unwrap();
+
+        // Sanity: in THIS setup Auto and ForceUser genuinely diverge (Auto sees
+        // the project shadow), so the guard below actually exercises the choice.
+        let auto = crate::paths::resolve(crate::paths::ResolveScope::Auto).config;
+        let force_user = crate::paths::resolve(crate::paths::ResolveScope::ForceUser).config;
+        let cfg = DarkmuxConfig::load_resolved();
+
+        // Restore env FIRST so a failed assert can't poison other serial tests.
+        env::set_current_dir(prev_cwd).unwrap();
+        match prev_home {
+            Some(h) => unsafe { env::set_var("DARKMUX_HOME", h) },
+            None => unsafe { env::remove_var("DARKMUX_HOME") },
+        }
+
+        assert_ne!(
+            auto, force_user,
+            "sanity: with a project .darkmux/ and no DARKMUX_HOME, Auto must diverge from ForceUser"
+        );
+        // The real guard: under the pre-#1323 `Auto`, load_resolved reads the
+        // project shadow → the marker → FAIL. Under `ForceUser` it never does.
+        assert_ne!(
+            cfg.machine_id.as_deref(),
+            Some("PROJECT-SHADOW-MUST-NOT-LOAD"),
+            "#1323: load_resolved must ignore a project-local .darkmux/config.json"
+        );
+    }
 
     /// `with_defaults()` is the full, self-documenting config `init` writes:
     /// feature blocks present + gated off, scalar defaults explicit, derived/

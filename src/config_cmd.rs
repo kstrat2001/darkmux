@@ -111,7 +111,12 @@ const SECRET_KEYS: &[(&str, &str)] = &[
 ];
 
 pub fn run(cmd: ConfigCmd) -> Result<()> {
-    let path = resolve(ResolveScope::Auto).config;
+    // (#1323) ForceUser, not Auto — `darkmux config get/set/list` operates on
+    // the user-scope config.json, matching `DarkmuxConfig::load_resolved`. Under
+    // Auto a stray project-local `.darkmux/` (missions/sprints/lessons) would
+    // silently redirect reads/writes to the wrong file. Config is user/machine-
+    // level; there is no legitimate per-project config.
+    let path = resolve(ResolveScope::ForceUser).config;
     match cmd {
         ConfigCmd::Set { key, value } => {
             let msg = set_at(&path, &key, &value)?;
