@@ -335,6 +335,87 @@ pub struct Sprint {
     /// state machine treats `Abandoned → Running` as a legal restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abandoned_ts: Option<u64>,
+    /// (#1230 Packet 2) IDs of the DAG-native `Task`s that make up this
+    /// sprint's actual execution graph. Additive-only field — everything
+    /// else about `Sprint`'s own lifecycle (`status`, `depends_on`,
+    /// `*_ts`) is unchanged; a Sprint stays the real operator-gated unit
+    /// it always was. `#[serde(default)]` so every pre-#1230 sprint JSON
+    /// on disk continues to parse with an empty `task_ids` (no Task/Step
+    /// graph underneath it yet).
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+}
+
+/// (#1230 Packet 2) Status of a DAG node (`Step`, and — via the
+/// `DependencyNode` adapter in `scheduler.rs` — `Sprint` too). Distinct
+/// from `SprintStatus`: a Sprint is an operator-gated planning unit
+/// (`start`/`complete`/`abandon` are explicit operator verbs); a `Step` is
+/// scheduler-driven (`Planned` → `Running` → `Complete`/`Error` happens
+/// automatically as `run_step_graph` walks the graph). `Error` has no
+/// `SprintStatus` analog — a Sprint either completes or is abandoned by
+/// the operator; a Step can fail its own execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeStatus {
+    #[default]
+    Planned,
+    Running,
+    Complete,
+    Abandoned,
+    Error,
+}
+
+/// (#1230 Packet 2) The smallest executable unit in the flow graph — one
+/// dispatch, one native function, or one shell command. `kind` names a
+/// registered `step_kinds::StepKind` id (e.g. `"dispatch.internal"`,
+/// `"procedural.shell"`); `config` is kind-specific (flat-extras-bag
+/// pattern, matching `ProfileModel`'s `#[serde(flatten)] extras`).
+///
+/// `depends_on` lists sibling Step ids the graph knows about that must
+/// reach `NodeStatus::Complete` before this Step becomes ready — see the
+/// generic `DependencyNode`/`is_ready`/`reachable` machinery in
+/// `scheduler.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Step {
+    pub id: String,
+    pub task_id: String,
+    /// step-kind registry id, e.g. `"dispatch.internal"` |
+    /// `"dispatch.single_shot"` | `"procedural.shell"` | `"procedural.noop"`.
+    pub kind: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub status: NodeStatus,
+    /// Kind-specific config. `serde_json::Value::Null` (the `Default`) for
+    /// step kinds that need none (e.g. `procedural.noop` with no `output`
+    /// override).
+    #[serde(default)]
+    pub config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ts: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_ts: Option<u64>,
+    /// The step kind's own output text on success (or an error summary on
+    /// `NodeStatus::Error`). Generalizes the one-hop
+    /// `<sprint-id>-output.txt` context file `dispatch.rs`'s `sprint_id`
+    /// plumbing already writes — downstream Steps read a completed
+    /// dependency's `output` as their own input (see
+    /// `scheduler::gather_inputs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
+/// (#1230 Packet 2) A real (not synthesized) grouping of Steps within a
+/// Sprint — operators reference a Task directly (e.g. "the coder task"),
+/// so it's a first-class schema level, not just a derived view over Step
+/// edges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: String,
+    pub sprint_id: String,
+    pub description: String,
+    #[serde(default)]
+    pub step_ids: Vec<String>,
 }
 
 #[cfg(test)]

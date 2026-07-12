@@ -116,6 +116,129 @@ pub fn sprint_path(mission_id: &str, sprint_id: &str) -> PathBuf {
     sprints_dir(mission_id).join(format!("{sprint_id}.json"))
 }
 
+// ─── Task / Step storage (#1230 Packet 2) ──────────────────────────────
+//
+// Mirrors the sprint layout above, nested one level deeper under the
+// owning sprint so a Task/Step id only has to be unique WITHIN its
+// sprint (matching `Task.sprint_id` / `Step.task_id`'s own scoping):
+//
+//   <crew_root>/
+//     missions/
+//       <mission-id>/
+//         mission.json
+//         sprints/
+//           <sprint-id>.json
+//         tasks/
+//           <sprint-id>/
+//             <task-id>.json
+//         steps/
+//           <sprint-id>/
+//             <step-id>.json
+//
+// One file per Task and one file per Step — never a combined DAG blob —
+// so a scheduler status flip (`Planned` → `Running` → `Complete`/`Error`)
+// is a small atomic `save_json` write, not a read-modify-write of the
+// whole graph. Uses the same atomic-rename `save_json` every other
+// entity in this module uses.
+
+/// Directory holding a sprint's Task JSONs.
+pub fn tasks_dir(mission_id: &str, sprint_id: &str) -> PathBuf {
+    mission_dir(mission_id).join("tasks").join(sprint_id)
+}
+
+/// Path to a single Task JSON within a sprint.
+pub fn task_path(mission_id: &str, sprint_id: &str, task_id: &str) -> PathBuf {
+    tasks_dir(mission_id, sprint_id).join(format!("{task_id}.json"))
+}
+
+/// Directory holding a sprint's Step JSONs.
+pub fn steps_dir(mission_id: &str, sprint_id: &str) -> PathBuf {
+    mission_dir(mission_id).join("steps").join(sprint_id)
+}
+
+/// Path to a single Step JSON within a sprint.
+pub fn step_path(mission_id: &str, sprint_id: &str, step_id: &str) -> PathBuf {
+    steps_dir(mission_id, sprint_id).join(format!("{step_id}.json"))
+}
+
+/// Persist a Task via the same atomic-rename `save_json` every other
+/// entity uses.
+pub fn save_task(mission_id: &str, task: &crate::types::Task) -> Result<()> {
+    save_json(&task_path(mission_id, &task.sprint_id, &task.id), task)
+}
+
+/// Load a single Task by its fully-qualified (mission, sprint, task)
+/// coordinates.
+pub fn load_task(mission_id: &str, sprint_id: &str, task_id: &str) -> Result<crate::types::Task> {
+    let path = task_path(mission_id, sprint_id, task_id);
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Load every Task under a sprint. Missing `tasks/<sprint-id>/` dir
+/// (a sprint with no Task/Step graph yet) is NOT an error — returns
+/// an empty `Vec`, matching the additive/backward-compatible nature of
+/// the Task/Step schema (a pre-#1230 sprint has none).
+pub fn load_tasks_for_sprint(mission_id: &str, sprint_id: &str) -> Result<Vec<crate::types::Task>> {
+    load_json_dir(&tasks_dir(mission_id, sprint_id))
+}
+
+/// Persist a Step via the same atomic-rename `save_json` every other
+/// entity uses. The caller resolves `sprint_id` (a `Step` doesn't carry
+/// its own sprint id directly — only `task_id`; callers hold the sprint
+/// id from context, e.g. the scheduler loop or the Task the step
+/// belongs to) since `step_path` is scoped by sprint, mirroring
+/// `task_path`.
+pub fn save_step(mission_id: &str, sprint_id: &str, step: &crate::types::Step) -> Result<()> {
+    save_json(&step_path(mission_id, sprint_id, &step.id), step)
+}
+
+/// Load a single Step by its fully-qualified (mission, sprint, step)
+/// coordinates.
+pub fn load_step(mission_id: &str, sprint_id: &str, step_id: &str) -> Result<crate::types::Step> {
+    let path = step_path(mission_id, sprint_id, step_id);
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Load every Step under a sprint (across all of that sprint's Tasks —
+/// `steps_dir` is scoped by sprint, not by task). Missing dir → empty
+/// `Vec`, same convention as `load_tasks_for_sprint`.
+pub fn load_steps_for_sprint(mission_id: &str, sprint_id: &str) -> Result<Vec<crate::types::Step>> {
+    load_json_dir(&steps_dir(mission_id, sprint_id))
+}
+
+/// Shared "read every `*.json` file directly in `dir`, deserialize as
+/// `T`" helper backing `load_tasks_for_sprint`/`load_steps_for_sprint`.
+/// A missing directory is NOT an error (empty `Vec`) — the normal state
+/// for any sprint that predates the Task/Step schema or simply has no
+/// graph yet.
+fn load_json_dir<T: serde::de::DeserializeOwned>(dir: &std::path::Path) -> Result<Vec<T>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("reading dir {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    // Deterministic order (byte comparison over the path string):
+    // downstream consumers (e.g. cycle-detection error messages) should
+    // not depend on filesystem readdir ordering, which is unspecified.
+    entries.sort();
+    for path in entries {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let value: T = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        out.push(value);
+    }
+    Ok(out)
+}
+
 /// Pre-#148 flat mission path: `<missions_dir>/<id>.json`. Two layers
 /// of "legacy" stack here: this describes pre-#148 flat *content shape*,
 /// while the parent `missions_dir()` itself resolves the Beat-33 dual-
@@ -710,6 +833,7 @@ pub fn add_sprint_to_mission_with_reasoning(
         started_ts: None,
         completed_ts: None,
         abandoned_ts: None,
+        task_ids: Vec::new(),
     };
     save_json(&sprint_path(mission_id, sprint_id), &sprint)?;
 
@@ -823,6 +947,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             abandoned_ts: None,
+            task_ids: Vec::new(),
         };
         save_json(&sprint_path("test-mission", id), &s).unwrap();
         s
@@ -1318,5 +1443,153 @@ mod path_helper_tests {
             assert_eq!(legacy_missions_dir(), root.join("missions"));
             assert_eq!(legacy_sprints_dir(), root.join("sprints"));
         });
+    }
+
+    #[test]
+    #[serial]
+    fn task_step_resolvers() {
+        with_test_root(|root| {
+            assert_eq!(tasks_dir("m", "s"), root.join("missions/m/tasks/s"));
+            assert_eq!(task_path("m", "s", "t"), root.join("missions/m/tasks/s/t.json"));
+            assert_eq!(steps_dir("m", "s"), root.join("missions/m/steps/s"));
+            assert_eq!(step_path("m", "s", "st"), root.join("missions/m/steps/s/st.json"));
+        });
+    }
+}
+
+#[cfg(test)]
+mod task_step_storage_tests {
+    //! (#1230 Packet 2) Round-trip storage tests for the Task/Step
+    //! per-mission-nested JSON layout — one file per Step, atomic-rename
+    //! `save_json`, same conventions as Sprint/Mission storage above.
+    use super::*;
+    use crate::types::{NodeStatus, Step, Task};
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    struct CrewGuard {
+        _tmp: TempDir,
+        prev: Option<String>,
+    }
+
+    impl CrewGuard {
+        fn new() -> Self {
+            let tmp = TempDir::new().unwrap();
+            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+            Self { _tmp: tmp, prev }
+        }
+    }
+
+    impl Drop for CrewGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    fn task(id: &str, sprint_id: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            sprint_id: sprint_id.to_string(),
+            description: format!("task {id}"),
+            step_ids: Vec::new(),
+        }
+    }
+
+    fn step(id: &str, task_id: &str) -> Step {
+        Step {
+            id: id.to_string(),
+            task_id: task_id.to_string(),
+            kind: "procedural.noop".to_string(),
+            depends_on: Vec::new(),
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn save_and_load_task_round_trips() {
+        let _g = CrewGuard::new();
+        let t = task("t1", "s1");
+        save_task("m1", &t).unwrap();
+        let loaded = load_task("m1", "s1", "t1").unwrap();
+        assert_eq!(loaded.id, "t1");
+        assert_eq!(loaded.sprint_id, "s1");
+        assert_eq!(loaded.description, "task t1");
+    }
+
+    #[test]
+    #[serial]
+    fn load_tasks_for_sprint_missing_dir_is_empty_not_error() {
+        let _g = CrewGuard::new();
+        let tasks = load_tasks_for_sprint("ghost-mission", "ghost-sprint").unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn load_tasks_for_sprint_returns_every_task_in_deterministic_order() {
+        let _g = CrewGuard::new();
+        save_task("m1", &task("t-b", "s1")).unwrap();
+        save_task("m1", &task("t-a", "s1")).unwrap();
+        // A different sprint's task must NOT show up in s1's listing.
+        save_task("m1", &task("t-other", "s2")).unwrap();
+
+        let tasks = load_tasks_for_sprint("m1", "s1").unwrap();
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["t-a", "t-b"], "sorted by filename, s2's task excluded");
+    }
+
+    #[test]
+    #[serial]
+    fn save_and_load_step_round_trips() {
+        let _g = CrewGuard::new();
+        let mut s = step("st1", "t1");
+        s.status = NodeStatus::Complete;
+        s.output = Some("done".to_string());
+        save_step("m1", "s1", &s).unwrap();
+
+        let loaded = load_step("m1", "s1", "st1").unwrap();
+        assert_eq!(loaded.id, "st1");
+        assert_eq!(loaded.status, NodeStatus::Complete);
+        assert_eq!(loaded.output.as_deref(), Some("done"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_steps_for_sprint_missing_dir_is_empty_not_error() {
+        let _g = CrewGuard::new();
+        let steps = load_steps_for_sprint("ghost-mission", "ghost-sprint").unwrap();
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn load_steps_for_sprint_returns_every_step_across_tasks() {
+        let _g = CrewGuard::new();
+        save_step("m1", "s1", &step("st-b", "t1")).unwrap();
+        save_step("m1", "s1", &step("st-a", "t2")).unwrap();
+        save_step("m1", "s2", &step("st-other", "t3")).unwrap();
+
+        let steps = load_steps_for_sprint("m1", "s1").unwrap();
+        let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["st-a", "st-b"], "sorted by filename, s2's step excluded");
+    }
+
+    #[test]
+    #[serial]
+    fn save_step_is_a_small_atomic_write_no_tmp_left_behind() {
+        let _g = CrewGuard::new();
+        let s = step("st1", "t1");
+        save_step("m1", "s1", &s).unwrap();
+        let tmp_path = step_path("m1", "s1", "st1").with_extension("json.tmp");
+        assert!(!tmp_path.exists());
     }
 }

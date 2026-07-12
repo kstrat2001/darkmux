@@ -2433,17 +2433,28 @@ fn cmd_mission_dispatch(
         anyhow::bail!("role `{role_id}` not found");
     }
 
-    // 3. Filter sprints: this mission + depends_on=[] + status=Planned.
-    //    `Running` is NOT included — PR-D.1 filter-level guard. Wave-E.3
-    //    adds the state-machine gate: each filtered sprint goes through
+    // 3. Filter sprints: this mission + ready + status=Planned. Ready
+    //    (#1230 Packet 2) means `crew::scheduler::is_ready` via the
+    //    `SprintNode` adapter — Planned AND every `depends_on` entry
+    //    resolves to a Complete sprint — replacing the historical flat
+    //    `depends_on.is_empty()` filter, which only ever fanned out
+    //    sprints with NO dependencies at all and never actually checked
+    //    whether a sprint's dependencies had been satisfied.
+    //    `Running` is NOT included — PR-D.1 filter-level guard (subsumed
+    //    by `is_ready` requiring `Planned`). Wave-E.3 adds the
+    //    state-machine gate: each filtered sprint goes through
     //    `lifecycle::sprint_start` BEFORE publish, flipping Planned →
     //    Running. A second `mission dispatch` invocation finds 0
     //    dispatchable sprints (all Running now) and bails with exit 2.
     let sprints = load_sprints()?;
+    let sprint_nodes: Vec<crew::scheduler::SprintNode> =
+        sprints.iter().map(crew::scheduler::SprintNode).collect();
+    let sprint_by_id: std::collections::BTreeMap<String, &crew::scheduler::SprintNode> =
+        sprint_nodes.iter().map(|n| (n.0.id.clone(), n)).collect();
     let initial: Vec<_> = sprints
         .iter()
-        .filter(|s| s.mission_id == mission_id && s.depends_on.is_empty())
-        .filter(|s| matches!(s.status, crew::types::SprintStatus::Planned))
+        .filter(|s| s.mission_id == mission_id)
+        .filter(|s| crew::scheduler::is_ready(&crew::scheduler::SprintNode(s), &sprint_by_id))
         .collect();
 
     if initial.is_empty() {
