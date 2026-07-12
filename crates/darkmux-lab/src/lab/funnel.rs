@@ -606,23 +606,41 @@ impl Drop for HostTelemetrySampler {
     }
 }
 
-/// (#1247 review round) Bookend guard for the funnel's flow-record
-/// lifecycle — same class of problem `darkmux-crew`'s
-/// `DispatchBookendGuard` (#717) solves for `dispatch.start`: once
-/// `funnel.task started` is emitted, the driver can still `?`-return before
-/// the clean `finished` bookend (a probe dispatch error, a cycler
-/// load/release failure) — or panic. Without a terminal record that leaves
-/// an orphaned task (rendering as perpetually in-flight to any consumer)
-/// plus whatever step-`started` records were open at the abort point.
+/// Adapts a [`FunnelEmitter`] to `darkmux_flow`'s generic
+/// [`darkmux_flow::BookendSink`] (#1230 Packet 0) so [`FunnelBookendGuard`]
+/// can wrap `darkmux_flow::BookendGuard` without `darkmux-flow` (a
+/// dependency LEAF) knowing this crate's own emitter trait exists. A local
+/// type implementing a foreign trait — no orphan-rule friction.
+struct EmitterSink<'a>(&'a mut dyn FunnelEmitter);
+
+impl darkmux_flow::BookendSink for EmitterSink<'_> {
+    fn emit(&mut self, record: darkmux_flow::FlowRecord) {
+        self.0.emit(record);
+    }
+}
+
+/// (#1247 review round, unified onto `darkmux_flow::BookendGuard` in #1230
+/// Packet 0) Bookend guard for the funnel's flow-record lifecycle — same
+/// class of problem `darkmux-crew`'s `DispatchBookendGuard` (#717) solves
+/// for `dispatch.start`: once `funnel.task started` is emitted, the driver
+/// can still `?`-return before the clean `finished` bookend (a probe
+/// dispatch error, a cycler load/release failure) — or panic. Without a
+/// terminal record that leaves an orphaned task (rendering as perpetually
+/// in-flight to any consumer) plus whatever step-`started` records were
+/// open at the abort point.
 ///
-/// All driver emission routes THROUGH this guard so it can track the task
-/// bookend and the stack of currently-open steps: on `Drop` while still
-/// armed, it closes each open step innermost-first with a `funnel.step`
-/// record carrying `status: "error"`, then emits a terminal `funnel.task`
-/// record with `status: "error"` — every `started` gets a matching terminal
-/// event, on every path. The clean finish (`task_finished`, which every
-/// success/degenerate return point calls) disarms it, so a run that reached
-/// its own terminal record is never double-counted.
+/// All driver emission routes THROUGH this guard, which delegates the
+/// task/step open-stack bookkeeping to the shared `darkmux_flow::BookendGuard`
+/// (`inner`) — the task itself is pushed as one open unit (`kind == "task"`)
+/// and each step nests inside it as another (`kind` = the step's own kind,
+/// `"dispatch"`/`"procedural"`), so `inner`'s Drop pops every still-open
+/// unit innermost-first (steps before the task) and builds the right
+/// `funnel.step`- or `funnel.task`-shaped abort record via its `on_abort`
+/// closure — every `started` gets a matching terminal event, on every path.
+/// The clean finish (`task_finished`, which every success/degenerate return
+/// point calls) closes the task unit, disarming `inner` once the stack
+/// empties — a run that reached its own terminal record is never
+/// double-counted.
 ///
 /// Emission on `Drop` is best-effort by construction — [`FunnelEmitter`]
 /// impls are already infallible (`emit` returns nothing), so a sink problem
@@ -633,23 +651,27 @@ impl Drop for HostTelemetrySampler {
 /// stopped by its own `Drop` — which Rust runs automatically as a field of
 /// this struct, right after `FunnelBookendGuard`'s own `Drop::drop` body
 /// returns, so the sampler thread never outlives the guard on any exit
-/// path.
+/// path. This telemetry-draining half is genuinely funnel-specific (it
+/// doesn't belong in `darkmux-flow`) — only the open/close stack moved.
 struct FunnelBookendGuard<'a> {
-    emitter: &'a mut dyn FunnelEmitter,
     case_id: String,
     crew: String,
-    armed: bool,
-    /// `(step_id, kind)` of every step with a `started` record and no
-    /// `finished` yet — a stack, since seat-level `probe:<name>` steps nest
-    /// inside the phase-level `probe` step.
-    open_steps: Vec<(String, String)>,
+    inner: darkmux_flow::BookendGuard<'a, EmitterSink<'a>>,
     telemetry: HostTelemetrySampler,
 }
 
+/// The fixed unit id/kind [`FunnelBookendGuard::task_started`]/
+/// [`FunnelBookendGuard::task_finished`] open/close under — the funnel has
+/// exactly one task per run, so this is a constant rather than something
+/// derived per-call. `inner`'s `on_abort` closure matches on `kind == this`
+/// to decide whether a still-open unit at Drop time needs a `funnel.task`-
+/// or `funnel.step`-shaped abort record.
+const FUNNEL_TASK_UNIT_KIND: &str = "task";
+
 impl<'a> FunnelBookendGuard<'a> {
-    fn new(emitter: &'a mut dyn FunnelEmitter, case_id: &str, crew: &str) -> Self {
+    fn new(sink: &'a mut EmitterSink<'a>, case_id: &str, crew: &str) -> Self {
         Self::new_with_telemetry(
-            emitter,
+            sink,
             case_id,
             crew,
             FUNNEL_TELEMETRY_INTERVAL,
@@ -666,13 +688,39 @@ impl<'a> FunnelBookendGuard<'a> {
     /// `new`, which fixes the cadence at [`FUNNEL_TELEMETRY_INTERVAL`]
     /// and the sampler at the real `sample_host`.
     fn new_with_telemetry(
-        emitter: &'a mut dyn FunnelEmitter,
+        sink: &'a mut EmitterSink<'a>,
         case_id: &str,
         crew: &str,
         telemetry_interval: Duration,
         telemetry_poll: Duration,
         sample_fn: fn() -> HostSample,
     ) -> Self {
+        let case_id_owned = case_id.to_string();
+        let crew_owned = crew.to_string();
+        let on_abort = move |id: &str, kind: &str| -> darkmux_flow::FlowRecord {
+            if kind == FUNNEL_TASK_UNIT_KIND {
+                funnel_flow_record(
+                    &case_id_owned,
+                    &crew_owned,
+                    FUNNEL_TASK_ACTION,
+                    darkmux_flow::Level::Error,
+                    json!({
+                        "status": "error",
+                        "case_id": case_id_owned,
+                        "crew": crew_owned,
+                        "error": "funnel terminated before completion (early return or panic)",
+                    }),
+                )
+            } else {
+                funnel_flow_record(
+                    &case_id_owned,
+                    &crew_owned,
+                    FUNNEL_STEP_ACTION,
+                    darkmux_flow::Level::Error,
+                    json!({ "step_id": id, "kind": kind, "status": "error" }),
+                )
+            }
+        };
         Self {
             telemetry: HostTelemetrySampler::start(
                 case_id.to_string(),
@@ -681,60 +729,59 @@ impl<'a> FunnelBookendGuard<'a> {
                 telemetry_poll,
                 sample_fn,
             ),
-            emitter,
             case_id: case_id.to_string(),
             crew: crew.to_string(),
-            armed: false,
-            open_steps: Vec::new(),
+            inner: darkmux_flow::BookendGuard::new(sink, on_abort),
         }
     }
 
     /// Drain every telemetry sample buffered since the last drain and emit
-    /// each through the same [`FunnelEmitter`] the driver's own records go
-    /// through — called immediately before every record this guard emits
-    /// (see [`Self::emit_now`]) so telemetry streams alongside the run
-    /// rather than batching at the end.
+    /// each through the same sink the driver's own records go through —
+    /// called immediately before every record this guard emits (see
+    /// [`Self::emit_now`]) so telemetry streams alongside the run rather
+    /// than batching at the end.
     fn drain_telemetry(&mut self) {
         let records: Vec<darkmux_flow::FlowRecord> = self.telemetry.rx.try_iter().collect();
         for record in records {
-            self.emitter.emit(record);
+            self.inner.emit_now(record);
         }
     }
 
-    /// Drain pending telemetry, then emit `record`. Every direct emission
-    /// in this guard routes through here (instead of calling
-    /// `self.emitter.emit` directly) so telemetry ordering stays close to
-    /// wall-clock without needing the sampler thread to touch the emitter
-    /// itself.
+    /// Drain pending telemetry, then emit `record` with no open/close
+    /// bookend of its own. Every direct emission in this guard routes
+    /// through here so telemetry ordering stays close to wall-clock
+    /// without needing the sampler thread to touch the sink itself.
     fn emit_now(&mut self, record: darkmux_flow::FlowRecord) {
         self.drain_telemetry();
-        self.emitter.emit(record);
+        self.inner.emit_now(record);
     }
 
     /// Emit the `funnel.task started` bookend and ARM the guard — from here
     /// until `task_finished`, an early return or panic fires the Drop path.
     fn task_started(&mut self, payload: serde_json::Value) {
-        self.armed = true;
-        self.emit_now(funnel_flow_record(
+        self.drain_telemetry();
+        let started = funnel_flow_record(
             &self.case_id,
             &self.crew,
             FUNNEL_TASK_ACTION,
             darkmux_flow::Level::Info,
             payload,
-        ));
+        );
+        self.inner.open(FUNNEL_TASK_UNIT_KIND, FUNNEL_TASK_UNIT_KIND, started);
     }
 
     /// Emit a `funnel.step` `status: "started"` record and track the step
     /// as open until [`Self::step_finished`] closes it.
     fn step_started(&mut self, step_id: &str, kind: &str, payload: serde_json::Value) {
-        self.open_steps.push((step_id.to_string(), kind.to_string()));
-        self.emit_now(funnel_flow_record(
+        self.drain_telemetry();
+        let started = funnel_flow_record(
             &self.case_id,
             &self.crew,
             FUNNEL_STEP_ACTION,
             darkmux_flow::Level::Info,
             payload,
-        ));
+        );
+        self.inner.open(step_id, kind, started);
     }
 
     /// Emit a `funnel.step` `status: "finished"` record and close the step.
@@ -742,14 +789,15 @@ impl<'a> FunnelBookendGuard<'a> {
     /// prior `started` (`bundle`, `dedup` — instantaneous procedural steps);
     /// the close is then a no-op on the open-step stack.
     fn step_finished(&mut self, step_id: &str, payload: serde_json::Value) {
-        self.open_steps.retain(|(id, _)| id != step_id);
-        self.emit_now(funnel_flow_record(
+        self.drain_telemetry();
+        let finished = funnel_flow_record(
             &self.case_id,
             &self.crew,
             FUNNEL_STEP_ACTION,
             darkmux_flow::Level::Info,
             payload,
-        ));
+        );
+        self.inner.close(step_id, finished);
     }
 
     /// Emit a `funnel.ruling` ticker record (no open/close semantics).
@@ -764,23 +812,27 @@ impl<'a> FunnelBookendGuard<'a> {
     }
 
     /// Emit the terminal `funnel.task` record for `env` (finished, or
-    /// degenerate-finished — see [`task_finished_record`]) and DISARM the
-    /// guard: this run reached its own terminal record.
+    /// degenerate-finished — see [`task_finished_record`]) and close the
+    /// task unit: this run reached its own terminal record, so `inner`
+    /// disarms once the stack empties (every real call site already closed
+    /// its own steps before calling this, so the stack is just `[task]`).
     fn task_finished(&mut self, env: &FunnelEnvelope) {
-        self.armed = false;
-        self.open_steps.clear();
-        self.emit_now(task_finished_record(env));
+        self.drain_telemetry();
+        self.inner.close(FUNNEL_TASK_UNIT_KIND, task_finished_record(env));
     }
 }
 
 impl Drop for FunnelBookendGuard<'_> {
     fn drop(&mut self) {
-        // Flush any sample the sampler produced since the last drain —
-        // even on the clean-finish path (`task_finished` already disarmed
-        // `self.armed`), a sample can land in the brief window between
-        // that drain and this `Drop` running. The sampler thread itself
-        // stops right after, via `HostTelemetrySampler`'s own `Drop`
-        // (a field of this struct, torn down once this function returns).
+        // Flush any sample the sampler produced since the last drain — even
+        // on the clean-finish path (`task_finished` already closed `inner`'s
+        // task unit), a sample can land in the brief window between that
+        // drain and this `Drop` running. `inner`'s own Drop (a field of this
+        // struct, run automatically right after this function returns) then
+        // emits abort records for any still-open units through the same
+        // sink if it's still armed. The sampler thread itself stops right
+        // after, via `HostTelemetrySampler`'s own `Drop` (also a field,
+        // torn down last), so it never outlives the guard on any exit path.
         //
         // Known, accepted loss window: a sample the sampler thread sends
         // AFTER this final drain but BEFORE the join in the sampler's
@@ -789,32 +841,6 @@ impl Drop for FunnelBookendGuard<'_> {
         // framing (telemetry never blocks or extends teardown to chase
         // one more data point).
         self.drain_telemetry();
-        if !self.armed {
-            return;
-        }
-        // Close every still-open step, innermost-first, so the stream's
-        // start/terminal pairing stays consistent even on the abort path.
-        while let Some((step_id, kind)) = self.open_steps.pop() {
-            self.emit_now(funnel_flow_record(
-                &self.case_id,
-                &self.crew,
-                FUNNEL_STEP_ACTION,
-                darkmux_flow::Level::Error,
-                json!({ "step_id": step_id, "kind": kind, "status": "error" }),
-            ));
-        }
-        self.emit_now(funnel_flow_record(
-            &self.case_id,
-            &self.crew,
-            FUNNEL_TASK_ACTION,
-            darkmux_flow::Level::Error,
-            json!({
-                "status": "error",
-                "case_id": self.case_id,
-                "crew": self.crew,
-                "error": "funnel terminated before completion (early return or panic)",
-            }),
-        ));
     }
 }
 
@@ -3505,8 +3531,9 @@ fn run_funnel_impl(
     // `?`-return or panic below fires its Drop path (open steps closed with
     // `status: "error"`, then a terminal error task record) so no consumer
     // ever sees an orphaned `started`.
+    let mut sink = EmitterSink(emitter);
     let mut guard = FunnelBookendGuard::new_with_telemetry(
-        emitter,
+        &mut sink,
         &inputs.case_id,
         &inputs.crew.name,
         telemetry_interval,
@@ -3641,7 +3668,8 @@ pub fn run_judge_only(
     };
     // Same guard discipline as `run_funnel` — see its comment at the
     // matching site.
-    let mut guard = FunnelBookendGuard::new(emitter, &inputs.case_id, &inputs.crew.name);
+    let mut sink = EmitterSink(emitter);
+    let mut guard = FunnelBookendGuard::new(&mut sink, &inputs.case_id, &inputs.crew.name);
     guard.task_started(json!({
         "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
         "exec_mode": mode_label(mode), "bundles": bundles.len(),
@@ -5049,8 +5077,9 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut emitter = RecordingEmitter::new();
+            let mut sink = EmitterSink(&mut emitter);
             let mut guard = FunnelBookendGuard::new_with_telemetry(
-                &mut emitter,
+                &mut sink,
                 "case-1",
                 "crew-1",
                 Duration::from_millis(5),
@@ -5083,8 +5112,9 @@ mod tests {
         thread::spawn(move || {
             let mut emitter = RecordingEmitter::new();
             {
+                let mut sink = EmitterSink(&mut emitter);
                 let mut guard = FunnelBookendGuard::new_with_telemetry(
-                    &mut emitter,
+                    &mut sink,
                     "case-2",
                     "crew-2",
                     Duration::from_millis(5),

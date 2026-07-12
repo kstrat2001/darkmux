@@ -635,9 +635,10 @@ fn inactivity_timeout_seconds() -> u64 {
     darkmux_types::config_access::inactivity_timeout_seconds()
 }
 
-/// (#717) Bookend guard for the internal dispatch lifecycle. Once
-/// `dispatch.start` is emitted, the dispatch can still `?`-return before the
-/// clean `dispatch.complete` (runtime-binary extraction, container spawn, or
+/// (#717, unified onto `darkmux_flow::BookendGuard` in #1230 Packet 0)
+/// Bookend guard for the internal dispatch lifecycle. Once `dispatch.start`
+/// is emitted, the dispatch can still `?`-return before the clean
+/// `dispatch.complete` (runtime-binary extraction, container spawn, or
 /// `wait_with_output` failing) — or panic. Without a terminal record that
 /// leaves an orphaned start; since #714 stamped `mission_id` on it, the
 /// orphan now groups under its mission and would render as perpetually
@@ -646,42 +647,78 @@ fn inactivity_timeout_seconds() -> u64 {
 /// path (and the container-ran-but-failed path, which already emits its own
 /// `dispatch.error`) calls `disarm()` after that emit, so the guard never
 /// double-counts a dispatch that reached its own terminal record.
-struct DispatchBookendGuard {
-    armed: bool,
-    role_id: String,
-    session_id: String,
-    model: String,
-    mission_id: Option<String>,
-    sprint_id: Option<String>,
+///
+/// A thin wrapper: this is a flat, depth-≤1 case of the generic
+/// `darkmux_flow::BookendGuard` stack (one dispatch, one open unit) — the
+/// `open`/`close` bookkeeping and the Drop-time abort emission both live in
+/// `darkmux-flow` now, shared with `FunnelBookendGuard`
+/// (`darkmux-lab::lab::funnel`) and `pr_review.rs`'s funnel→dispatch bridge.
+/// Emits through the process-wide default sink (`darkmux_flow::record`) —
+/// same as every other record on this dispatch path — so, unlike the
+/// funnel guards, there's no injected `FunnelEmitter` to bridge and no
+/// re-lending concern (see `darkmux_flow::bookend`'s module doc for why
+/// that matters elsewhere).
+struct DispatchBookendGuard<'a> {
+    inner: darkmux_flow::DynBookendGuard<'a>,
 }
 
-impl DispatchBookendGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
+/// The unit id/kind this guard always opens/closes under — a flat guard
+/// only ever has one open unit, so the id is a constant rather than
+/// something derived per-call.
+const DISPATCH_BOOKEND_UNIT: &str = "dispatch";
+
+impl<'a> DispatchBookendGuard<'a> {
+    fn new(
+        sink: &'a mut dyn darkmux_flow::BookendSink,
+        role_id: String,
+        session_id: String,
+        model: String,
+        mission_id: Option<String>,
+        sprint_id: Option<String>,
+    ) -> Self {
+        let on_abort = move |_id: &str, _kind: &str| {
+            // Best-effort, same as every other emit on this path: a
+            // flow-sink write problem must not mask the original error
+            // propagating out.
+            crate::dispatch::build_dispatch_record_with_payload(
+                darkmux_flow::Level::Error,
+                "dispatch error",
+                &role_id,
+                &session_id,
+                Some(&model),
+                mission_id.as_deref(),
+                sprint_id.as_deref(),
+                Some(serde_json::json!({
+                    "runtime": "internal",
+                    "result_class": "error",
+                    "error": "dispatch terminated before completion (early return or panic)",
+                })),
+            )
+        };
+        Self { inner: darkmux_flow::BookendGuard::new(sink, on_abort) }
     }
-}
 
-impl Drop for DispatchBookendGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Best-effort, same as every other emit on this path: a flow-sink
-        // write problem must not mask the original error propagating out.
-        let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
-            darkmux_flow::Level::Error,
-            "dispatch error",
-            &self.role_id,
-            &self.session_id,
-            Some(&self.model),
-            self.mission_id.as_deref(),
-            self.sprint_id.as_deref(),
-            Some(serde_json::json!({
-                "runtime": "internal",
-                "result_class": "error",
-                "error": "dispatch terminated before completion (early return or panic)",
-            })),
-        ));
+    /// Arm the guard and emit `started` (the `dispatch.start` record).
+    fn open(&mut self, started: darkmux_flow::FlowRecord) {
+        self.inner.open(DISPATCH_BOOKEND_UNIT, DISPATCH_BOOKEND_UNIT, started);
+    }
+
+    /// Emit `finished` (the `dispatch.complete`/`dispatch.error` record)
+    /// and disarm — the guard's Drop backstop never double-counts a
+    /// dispatch that reached this call.
+    fn close(&mut self, finished: darkmux_flow::FlowRecord) {
+        self.inner.close(DISPATCH_BOOKEND_UNIT, finished);
+    }
+
+    /// Kept for a caller that emits its own terminal record through a
+    /// different path and just needs to silence the Drop backstop — no
+    /// production call site needs this anymore (`close()` now disarms
+    /// itself), but the test suite exercises this path directly to prove
+    /// the disarm-suppresses-the-backstop behavior still holds through the
+    /// wrapper.
+    #[allow(dead_code)]
+    fn disarm(&mut self) {
+        self.inner.disarm();
     }
 }
 
@@ -946,7 +983,12 @@ pub(crate) fn remote_chat_url(ep: &darkmux_types::ModelEndpoint) -> String {
 
 /// A short human label for the endpoint, for the flow record payload
 /// (e.g. `azure:finherogpt.cognitiveservices.azure.com/gpt-4o`). Host + the
-/// model — never the full URL, never any auth.
+/// model — never the full URL, never any auth. `dispatch_internal` owns
+/// extracting the host from `ModelEndpoint` (`darkmux-flow` — a dependency
+/// LEAF w.r.t. this crate — shouldn't know about that type); the actual
+/// string formatting delegates to `darkmux_flow::remote_route_label`
+/// (#1230 Packet 0) so this shape has one source of truth shared with the
+/// funnel→dispatch bookend bridge in `src/pr_review.rs`.
 fn remote_endpoint_label(ep: &darkmux_types::ModelEndpoint, model_id: &str) -> String {
     let url = ep.base_url();
     let host = url
@@ -954,8 +996,7 @@ fn remote_endpoint_label(ep: &darkmux_types::ModelEndpoint, model_id: &str) -> S
         .nth(1)
         .and_then(|s| s.split('/').next())
         .unwrap_or("remote");
-    let kind = if url.contains("azure") { "azure" } else { "openai" };
-    format!("{kind}:{host}/{model_id}")
+    darkmux_flow::remote_route_label(host, model_id)
 }
 
 /// Read the endpoint's auth secret from the Keychain and build the header
@@ -1343,21 +1384,27 @@ pub(crate) fn parse_hosted_response(
     Ok(resp)
 }
 
-/// Emit a dispatch flow record for a hosted call. Same builder + tier as the
-/// container path — a dispatched model is a WORKER regardless of where it runs,
-/// so the tier is NOT changed. A remote endpoint may serve a frontier model OR
-/// an OSS service (opencode, a remote vLLM); darkmux never infers a capability
-/// tier from remoteness. The only remote signal is the `endpoint` in the
-/// payload — location + service live on the endpoint axis, never in the tier.
-fn emit_remote_record(
+/// Build a dispatch flow record for a hosted call (#1230 Packet 0: split out
+/// of the former `emit_remote_record` so the bookend guard's `open`/`close`
+/// can emit it instead of this function emitting directly). Same builder +
+/// tier as the container path — a dispatched model is a WORKER regardless
+/// of where it runs, so the tier is NOT changed. A remote endpoint may
+/// serve a frontier model OR an OSS service (opencode, a remote vLLM);
+/// darkmux never infers a capability tier from remoteness. The only remote
+/// signal is the `endpoint` in the payload — location + service live on the
+/// endpoint axis, never in the tier. Always `Level::Info`, matching the
+/// original `emit_remote_record`'s behavior on every action including
+/// `"dispatch error"` — a hosted-call failure surfaces via
+/// `payload.result_class`/`payload.error`, not the record level.
+fn build_remote_record(
     role_id: &str,
     session_id: &str,
     model: &str,
     sprint_id: Option<&str>,
     action: &str,
     payload: serde_json::Value,
-) {
-    let rec = crate::dispatch::build_dispatch_record_with_payload(
+) -> darkmux_flow::FlowRecord {
+    crate::dispatch::build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
         action,
         role_id,
@@ -1366,8 +1413,7 @@ fn emit_remote_record(
         None, // (#1177) mission_id — resolved from sprint in a follow-up
         sprint_id,
         Some(payload),
-    );
-    let _ = darkmux_flow::record(rec);
+    )
 }
 
 /// The hosted single-shot dispatch (#1177). Precondition: `pm.endpoint` is remote.
@@ -1402,20 +1448,56 @@ fn dispatch_remote(
     let auth = remote_auth_header(ep)?;
     let sprint = opts.sprint_id.as_deref();
 
+    // (#1230 Packet 0) `dispatch_remote` previously had NO bookend guard at
+    // all — a panic mid-hosted-call (or any future early return added
+    // between `open` and the terminal records below) could orphan a
+    // `dispatch start` with no terminal. Same shared guard as the container
+    // path (`DispatchBookendGuard`), through the process-wide default sink.
+    let mut remote_flow_sink = |r: darkmux_flow::FlowRecord| {
+        let _ = darkmux_flow::record(r);
+    };
+    let role_id_for_abort = opts.role_id.clone();
+    let session_id_for_abort = session_id.clone();
+    let model_for_abort = pm.id.clone();
+    let sprint_for_abort = sprint.map(str::to_string);
+    let label_for_abort = label.clone();
+    let on_abort = move |_id: &str, _kind: &str| {
+        crate::dispatch::build_dispatch_record_with_payload(
+            darkmux_flow::Level::Error,
+            "dispatch error",
+            &role_id_for_abort,
+            &session_id_for_abort,
+            Some(&model_for_abort),
+            None,
+            sprint_for_abort.as_deref(),
+            Some(serde_json::json!({
+                "runtime": "direct",
+                "endpoint": label_for_abort,
+                "result_class": "error",
+                "error": "dispatch terminated before completion (early return or panic)",
+            })),
+        )
+    };
+    let mut bookend = darkmux_flow::BookendGuard::new(&mut remote_flow_sink, on_abort);
+
     // (#1177) Cap the prompt in the record (a brief can be KB-long) — capped
     // text + full `prompt_chars`, matching the container path.
-    emit_remote_record(
-        &opts.role_id,
-        &session_id,
-        &pm.id,
-        sprint,
-        "dispatch start",
-        serde_json::json!({
-            "runtime": "direct",
-            "endpoint": label,
-            "prompt": crate::dispatch::capped_prompt(&opts.message),
-            "prompt_chars": opts.message.chars().count(),
-        }),
+    bookend.open(
+        "dispatch",
+        "dispatch",
+        build_remote_record(
+            &opts.role_id,
+            &session_id,
+            &pm.id,
+            sprint,
+            "dispatch start",
+            serde_json::json!({
+                "runtime": "direct",
+                "endpoint": label,
+                "prompt": crate::dispatch::capped_prompt(&opts.message),
+                "prompt_chars": opts.message.chars().count(),
+            }),
+        ),
     );
 
     let req_body = single_shot_body(
@@ -1435,13 +1517,16 @@ fn dispatch_remote(
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {
-            emit_remote_record(
-                &opts.role_id,
-                &session_id,
-                &pm.id,
-                sprint,
-                "dispatch error",
-                serde_json::json!({ "runtime": "direct", "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
+            bookend.close(
+                "dispatch",
+                build_remote_record(
+                    &opts.role_id,
+                    &session_id,
+                    &pm.id,
+                    sprint,
+                    "dispatch error",
+                    serde_json::json!({ "runtime": "direct", "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
+                ),
             );
             return Err(e);
         }
@@ -1466,26 +1551,29 @@ fn dispatch_remote(
         .and_then(|v| v.as_u64())
         .unwrap_or(ptok + ctok);
 
-    emit_remote_record(
-        &opts.role_id,
-        &session_id,
-        &pm.id,
-        sprint,
-        "dispatch complete",
-        serde_json::json!({
-            "result_class": "ok",
-            "exit_code": 0,
-            "runtime": "direct",
-            "endpoint": label,
-            "prompt_tokens": ptok,
-            "completion_tokens": ctok,
-            "total_tokens": ttok,
-            "total_turns": 1,
-            "total_tools": 0,
-            "total_compactions": 0,
-            "wall_ms": wall_ms,
-            "stdout_chars": content.len(),
-        }),
+    bookend.close(
+        "dispatch",
+        build_remote_record(
+            &opts.role_id,
+            &session_id,
+            &pm.id,
+            sprint,
+            "dispatch complete",
+            serde_json::json!({
+                "result_class": "ok",
+                "exit_code": 0,
+                "runtime": "direct",
+                "endpoint": label,
+                "prompt_tokens": ptok,
+                "completion_tokens": ctok,
+                "total_tokens": ttok,
+                "total_turns": 1,
+                "total_tools": 0,
+                "total_compactions": 0,
+                "wall_ms": wall_ms,
+                "stdout_chars": content.len(),
+            }),
+        ),
     );
 
     let stdout = if opts.json {
@@ -1848,7 +1936,25 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     if let Some(label) = &remote_endpoint_raw_label {
         dispatch_start_payload["endpoint"] = serde_json::json!(label);
     }
-    let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
+    // (#717, #1230 Packet 0) Emit dispatch.start THROUGH the bookend guard's
+    // `open()` — arms it, so any `?`-return or panic before the clean
+    // `dispatch.complete` below emits a `dispatch.error` terminal so the
+    // start is never left orphaned (and mission-grouped-but-in-flight).
+    // Emits via the process-wide default sink (`darkmux_flow::record`),
+    // same as every other record on this path.
+    let mut dispatch_flow_sink =
+        |r: darkmux_flow::FlowRecord| {
+            let _ = darkmux_flow::record(r);
+        };
+    let mut bookend = DispatchBookendGuard::new(
+        &mut dispatch_flow_sink,
+        opts.role_id.clone(),
+        session_id.clone(),
+        model.clone(),
+        mission_id.clone(),
+        sprint_id.clone(),
+    );
+    bookend.open(crate::dispatch::build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
         "dispatch start",
         &opts.role_id,
@@ -1858,17 +1964,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         sprint_id.as_deref(),
         Some(dispatch_start_payload),
     ));
-    // (#717) Arm the bookend guard: from here, any `?`-return or panic before
-    // the clean `dispatch.complete` below emits a `dispatch.error` terminal so
-    // the start is never left orphaned (and mission-grouped-but-in-flight).
-    let mut bookend = DispatchBookendGuard {
-        armed: true,
-        role_id: opts.role_id.clone(),
-        session_id: session_id.clone(),
-        model: model.clone(),
-        mission_id: mission_id.clone(),
-        sprint_id: sprint_id.clone(),
-    };
     let dispatch_start_instant = std::time::Instant::now();
 
     // (#638) Session liveness heartbeat. While THIS dispatch process lives,
@@ -2319,7 +2414,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     } else {
         ("dispatch error", darkmux_flow::Level::Error)
     };
-    let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
+    // (#717, #1230 Packet 0) Emit the terminal record through the bookend
+    // guard's `close()` — this both writes the record and disarms the
+    // guard, so it never emits a second terminal on the function's normal
+    // return (clean complete, or the container-ran-but-failed
+    // `dispatch.error` above are both covered the same way).
+    bookend.close(crate::dispatch::build_dispatch_record_with_payload(
         level,
         action,
         &opts.role_id,
@@ -2329,10 +2429,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         sprint_id.as_deref(),
         Some(dispatch_complete_payload),
     ));
-    // (#717) Terminal record emitted (clean complete, or the container-ran-
-    // but-failed `dispatch.error` above) — disarm so the guard doesn't emit a
-    // second terminal on the function's normal return.
-    bookend.disarm();
     // (#888) The container ran to its terminal record — retain the auto
     // workspace for inspection (status quo). Only error/panic exits BEFORE
     // this point reclaim it.
@@ -6734,15 +6830,28 @@ mod tests {
         }
 
         {
-            let _guard = DispatchBookendGuard {
-                armed: true,
-                role_id: "coder".into(),
-                session_id: "sess-orphan".into(),
-                model: "darkmux:qwen3.6".into(),
-                mission_id: Some("pre-1.0-compat-sweep".into()),
-                sprint_id: Some("s694".into()),
+            let mut sink = |r: darkmux_flow::FlowRecord| {
+                let _ = darkmux_flow::record(r);
             };
-            // drop here (end of scope) — no disarm
+            let mut guard = DispatchBookendGuard::new(
+                &mut sink,
+                "coder".into(),
+                "sess-orphan".into(),
+                "darkmux:qwen3.6".into(),
+                Some("pre-1.0-compat-sweep".into()),
+                Some("s694".into()),
+            );
+            guard.open(crate::dispatch::build_dispatch_record_with_payload(
+                darkmux_flow::Level::Info,
+                "dispatch start",
+                "coder",
+                "sess-orphan",
+                Some("darkmux:qwen3.6"),
+                Some("pre-1.0-compat-sweep"),
+                Some("s694"),
+                None,
+            ));
+            // drop here (end of scope) — no close/disarm
         }
 
         unsafe {
@@ -6781,14 +6890,27 @@ mod tests {
         }
 
         {
-            let mut guard = DispatchBookendGuard {
-                armed: true,
-                role_id: "coder".into(),
-                session_id: "sess-clean".into(),
-                model: "darkmux:qwen3.6".into(),
-                mission_id: None,
-                sprint_id: None,
+            let mut sink = |r: darkmux_flow::FlowRecord| {
+                let _ = darkmux_flow::record(r);
             };
+            let mut guard = DispatchBookendGuard::new(
+                &mut sink,
+                "coder".into(),
+                "sess-clean".into(),
+                "darkmux:qwen3.6".into(),
+                None,
+                None,
+            );
+            guard.open(crate::dispatch::build_dispatch_record_with_payload(
+                darkmux_flow::Level::Info,
+                "dispatch start",
+                "coder",
+                "sess-clean",
+                Some("darkmux:qwen3.6"),
+                None,
+                None,
+                None,
+            ));
             guard.disarm();
         }
 
@@ -6827,14 +6949,27 @@ mod tests {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(|| {
-            let _guard = DispatchBookendGuard {
-                armed: true,
-                role_id: "coder".into(),
-                session_id: "sess-panic".into(),
-                model: "darkmux:qwen3.6".into(),
-                mission_id: Some("pre-1.0-compat-sweep".into()),
-                sprint_id: None,
+            let mut sink = |r: darkmux_flow::FlowRecord| {
+                let _ = darkmux_flow::record(r);
             };
+            let mut guard = DispatchBookendGuard::new(
+                &mut sink,
+                "coder".into(),
+                "sess-panic".into(),
+                "darkmux:qwen3.6".into(),
+                Some("pre-1.0-compat-sweep".into()),
+                None,
+            );
+            guard.open(crate::dispatch::build_dispatch_record_with_payload(
+                darkmux_flow::Level::Info,
+                "dispatch start",
+                "coder",
+                "sess-panic",
+                Some("darkmux:qwen3.6"),
+                Some("pre-1.0-compat-sweep"),
+                None,
+                None,
+            ));
             panic!("simulated mid-dispatch panic");
         });
         std::panic::set_hook(prev_hook);

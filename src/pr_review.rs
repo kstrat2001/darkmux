@@ -1048,38 +1048,30 @@ fn funnel_bookend_record(
     record
 }
 
-/// (#1272) Panic/early-return backstop for [`with_dispatch_bookends`] —
-/// same RAII shape as `darkmux-crew`'s `DispatchBookendGuard` (#717): once
-/// armed, a `Drop` while still armed means the wrapped call unwound (a
-/// panic) before either terminal branch in `with_dispatch_bookends` ran, so
-/// this fires a `dispatch error` terminal itself. The normal Ok/Err paths
-/// disarm before emitting their own terminal record, so a clean run is
-/// never double-counted — matching `DispatchBookendGuard`'s own discipline.
-struct FunnelDispatchBookendGuard<'a> {
-    armed: bool,
-    emitter: &'a mut dyn FunnelEmitter,
-    case_id: String,
-    crew_name: String,
-    model: Option<String>,
+/// (#1272, unified onto `darkmux_flow::BookendGuard` in #1230 Packet 0)
+/// Adapts a [`FunnelEmitter`] to `darkmux_flow`'s generic
+/// `BookendSink` — same bridging pattern `darkmux-lab`'s `FunnelBookendGuard`
+/// uses (`darkmux_lab::lab::funnel::EmitterSink`, not reused directly since
+/// it's private to that crate). ALSO implements `FunnelEmitter` itself
+/// (trivial forward) so `with_dispatch_bookends` can re-borrow the guard's
+/// sink as a `&mut dyn FunnelEmitter` via `BookendGuard::sink_mut()` and
+/// hand that to `f` (`run_funnel`/`run_judge_only`) — those need the raw
+/// `FunnelEmitter` view, not the `BookendSink` one, so this concrete
+/// adapter type (not a type-erased `dyn BookendSink`) is what makes that
+/// re-lending possible without an unsafe downcast; see
+/// `darkmux_flow::bookend`'s module doc for why the guard can't do that
+/// lending itself.
+struct EmitterSink<'a>(&'a mut dyn FunnelEmitter);
+
+impl darkmux_flow::BookendSink for EmitterSink<'_> {
+    fn emit(&mut self, record: darkmux_flow::FlowRecord) {
+        self.0.emit(record);
+    }
 }
 
-impl Drop for FunnelDispatchBookendGuard<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.emitter.emit(funnel_bookend_record(
-            darkmux_flow::Level::Error,
-            "dispatch error",
-            &self.crew_name,
-            &self.case_id,
-            self.model.as_deref(),
-            json!({
-                "runtime": "funnel",
-                "result_class": "error",
-                "error": "funnel dispatch terminated before completion (early return or panic)",
-            }),
-        ));
+impl FunnelEmitter for EmitterSink<'_> {
+    fn emit(&mut self, record: darkmux_flow::FlowRecord) {
+        self.0.emit(record);
     }
 }
 
@@ -1099,15 +1091,27 @@ impl Drop for FunnelDispatchBookendGuard<'_> {
 ///
 /// `f` (the funnel dispatch itself — `run_funnel` or `run_judge_only`) is
 /// injected so a test can drive a scripted stand-in instead of a real crew
-/// and LMStudio round trip, and receives the SAME [`FunnelEmitter`] the
-/// bookend records go through (production: [`FleetFlowEmitter`]) — one
-/// sink for the whole `pr-review run` invocation, so `dispatch start`
-/// always precedes every `funnel.*` record and the terminal record always
-/// follows them, in the SAME emitter's observed sequence.
+/// and LMStudio round trip, and receives the SAME sink the bookend records
+/// go through (production: [`FleetFlowEmitter`]) — one sink for the whole
+/// `pr-review run` invocation, so `dispatch start` always precedes every
+/// `funnel.*` record and the terminal record always follows them, in the
+/// SAME emitter's observed sequence.
 ///
-/// Terminal-on-all-paths: see [`FunnelDispatchBookendGuard`] for the
-/// panic backstop; the `?`-return case is simply `f` returning `Err`,
-/// handled by the `Err` arm below like any other early exit.
+/// Terminal-on-all-paths via `darkmux_flow::BookendGuard`'s RAII Drop
+/// backstop (#1230 Packet 0, same shared mechanism `DispatchBookendGuard`
+/// and `FunnelBookendGuard` use) — the `?`-return case is simply `f`
+/// returning `Err`, handled by the `Err` arm below like any other early
+/// exit; a panic mid-`f` fires the guard's Drop path instead.
+///
+/// **The actual bug fix (#1230 Packet 0):** on `Ok(env)`, a remote-seat
+/// member previously stamped `payload.remote_tokens` alone — never
+/// `payload.endpoint`, the ONLY field the viewer's `tokensOffMeter()`
+/// reads to classify a session as cloud vs. local, so a funnel run with a
+/// remote-endpoint seat silently reported 100% of its tokens as local
+/// savings. Now stamps both via `darkmux_flow::stamp_remote_classification`,
+/// built from `darkmux_flow::remote_route_label` against the first remote
+/// member's endpoint host + declared model id — the same canonical shape
+/// `dispatch_internal::remote_endpoint_label` produces.
 fn with_dispatch_bookends(
     emitter: &mut dyn FunnelEmitter,
     case_id: &str,
@@ -1115,61 +1119,97 @@ fn with_dispatch_bookends(
     model: Option<&str>,
     f: impl FnOnce(&mut dyn FunnelEmitter) -> Result<FunnelEnvelope>,
 ) -> Result<FunnelEnvelope> {
-    emitter.emit(funnel_bookend_record(
-        darkmux_flow::Level::Info,
-        "dispatch start",
-        crew_name,
-        case_id,
-        model,
-        json!({ "runtime": "funnel" }),
-    ));
-    let mut guard = FunnelDispatchBookendGuard {
-        armed: true,
-        emitter,
-        case_id: case_id.to_string(),
-        crew_name: crew_name.to_string(),
-        model: model.map(str::to_string),
+    let mut sink = EmitterSink(emitter);
+    let case_id_owned = case_id.to_string();
+    let crew_owned = crew_name.to_string();
+    let model_owned = model.map(str::to_string);
+    let on_abort = move |_id: &str, _kind: &str| {
+        funnel_bookend_record(
+            darkmux_flow::Level::Error,
+            "dispatch error",
+            &crew_owned,
+            &case_id_owned,
+            model_owned.as_deref(),
+            json!({
+                "runtime": "funnel",
+                "result_class": "error",
+                "error": "funnel dispatch terminated before completion (early return or panic)",
+            }),
+        )
     };
-    let result = f(&mut *guard.emitter);
-    // The wrapped call returned (rather than unwinding) — disarm the panic
-    // backstop before emitting our own terminal record below, so a clean
-    // Ok/Err return is never double-counted by `FunnelDispatchBookendGuard`'s
-    // Drop (same discipline as `DispatchBookendGuard::disarm`).
-    guard.armed = false;
+    let mut guard = darkmux_flow::BookendGuard::new(&mut sink, on_abort);
+    guard.open(
+        "dispatch",
+        "dispatch",
+        funnel_bookend_record(
+            darkmux_flow::Level::Info,
+            "dispatch start",
+            crew_name,
+            case_id,
+            model,
+            json!({ "runtime": "funnel" }),
+        ),
+    );
+
+    // Re-borrow the guard's sink as a `&mut dyn FunnelEmitter` for `f` — the
+    // SAME underlying sink the bookend records go through, so `dispatch
+    // start` always precedes every `funnel.*` record `f` emits. This
+    // reborrow ends when `f` returns (ordinary NLL scoping), so `guard`
+    // itself is free to be used again right after; a panic mid-`f` still
+    // fires the guard's own Drop, since `guard` is a local in THIS frame
+    // and Rust drops it during unwind once the reborrow's shorter lifetime
+    // has already ended.
+    let result = f(guard.sink_mut());
+
     match result {
         Ok(env) => {
             let mut payload = json!({ "runtime": "funnel", "result_class": "ok" });
-            // (#1260/#1186) Remote-seat tokens ride the dispatch bookend too,
-            // so downstream token-accounting surfaces can EXCLUDE cloud
-            // tokens from local-savings math without opening the envelope.
-            if env.members.iter().any(|m| m.remote) {
+            // (#1260/#1186/#1230) Remote-seat tokens ride the dispatch
+            // bookend too, so downstream token-accounting surfaces can
+            // EXCLUDE cloud tokens from local-savings math without opening
+            // the envelope — and (the actual bug fix) `endpoint` rides
+            // alongside it, the field the viewer actually keys its
+            // cloud-vs-local classification on.
+            if let Some(member) = env.members.iter().find(|m| m.remote) {
                 let remote_tokens: u64 =
                     env.members.iter().filter(|m| m.remote).map(|m| m.total_tokens).sum();
-                payload["remote_tokens"] = remote_tokens.into();
+                let host = member.endpoint.as_deref().unwrap_or("remote");
+                let endpoint_label = darkmux_flow::remote_route_label(host, &member.model);
+                darkmux_flow::stamp_remote_classification(
+                    &mut payload,
+                    Some(&endpoint_label),
+                    Some(remote_tokens),
+                );
             }
-            guard.emitter.emit(funnel_bookend_record(
-                darkmux_flow::Level::Info,
-                "dispatch complete",
-                crew_name,
-                case_id,
-                model,
-                payload,
-            ));
+            guard.close(
+                "dispatch",
+                funnel_bookend_record(
+                    darkmux_flow::Level::Info,
+                    "dispatch complete",
+                    crew_name,
+                    case_id,
+                    model,
+                    payload,
+                ),
+            );
             Ok(env)
         }
         Err(e) => {
-            guard.emitter.emit(funnel_bookend_record(
-                darkmux_flow::Level::Error,
-                "dispatch error",
-                crew_name,
-                case_id,
-                model,
-                json!({
-                    "runtime": "funnel",
-                    "result_class": "error",
-                    "error": e.to_string(),
-                }),
-            ));
+            guard.close(
+                "dispatch",
+                funnel_bookend_record(
+                    darkmux_flow::Level::Error,
+                    "dispatch error",
+                    crew_name,
+                    case_id,
+                    model,
+                    json!({
+                        "runtime": "funnel",
+                        "result_class": "error",
+                        "error": e.to_string(),
+                    }),
+                ),
+            );
             Err(e)
         }
     }
@@ -3282,6 +3322,99 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("early return or panic"));
+    }
+
+    /// (#1230 Packet 0 — the actual bug fix) A funnel run with a
+    /// remote-endpoint member must stamp BOTH `payload.remote_tokens` AND
+    /// `payload.endpoint` on the `dispatch complete` terminal record —
+    /// before this fix, only `remote_tokens` landed, so the viewer's
+    /// `tokensOffMeter()` (which reads `payload.endpoint` alone to classify
+    /// a session as cloud vs. local) silently counted every remote-seat
+    /// token as local savings. `endpoint` must match
+    /// `darkmux_flow::remote_route_label`'s canonical
+    /// `{azure|openai}:{host}/{model}` shape — the SAME shape
+    /// `dispatch_internal::remote_endpoint_label` produces for the
+    /// container/direct dispatch paths, so the viewer's route parser (which
+    /// splits on the first `:`) works identically regardless of which path
+    /// produced the record.
+    #[test]
+    fn with_dispatch_bookends_stamps_endpoint_and_remote_tokens_for_a_remote_member() {
+        let mut emitter = RecordingEmitter::default();
+        let result = with_dispatch_bookends(&mut emitter, "case-4", "test-crew", Some("darkmux:judge-model"), |em| {
+            em.emit(fake_funnel_record("funnel.task"));
+            Ok(FunnelEnvelope {
+                members: vec![
+                    MemberRecord {
+                        model: "darkmux:probe-model".into(),
+                        seat: "review-probe".into(),
+                        draws: 3,
+                        wall_ms: 1200,
+                        total_tokens: 900,
+                        remote: false,
+                        endpoint: None,
+                        served_model: None,
+                    },
+                    MemberRecord {
+                        model: "gpt-4o".into(),
+                        seat: "review-judge".into(),
+                        draws: 2,
+                        wall_ms: 800,
+                        total_tokens: 777,
+                        remote: true,
+                        endpoint: Some("myorg.cognitiveservices.azure.com".into()),
+                        served_model: None,
+                    },
+                ],
+                ..Default::default()
+            })
+        });
+        assert!(result.is_ok(), "{result:?}");
+
+        let terminal = emitter
+            .records
+            .iter()
+            .find(|r| r.action == "dispatch complete")
+            .expect("dispatch complete terminal record");
+        let payload = terminal.payload.as_ref().unwrap();
+        assert_eq!(
+            payload["endpoint"], "azure:myorg.cognitiveservices.azure.com/gpt-4o",
+            "endpoint must be present and match dispatch_internal::remote_endpoint_label's shape: {payload}"
+        );
+        assert_eq!(
+            payload["remote_tokens"], 777,
+            "remote_tokens sums only the remote member(s), never the local probe seat: {payload}"
+        );
+    }
+
+    /// The local-only mirror of the test above: no remote member ⇒ neither
+    /// `endpoint` nor `remote_tokens` appears on the terminal payload — the
+    /// fully-local case is byte-identical to calling
+    /// `stamp_remote_classification(&mut payload, None, None)` (a no-op),
+    /// so a local-only run's savings math is unaffected by this fix.
+    #[test]
+    fn with_dispatch_bookends_omits_endpoint_and_remote_tokens_when_fully_local() {
+        let mut emitter = RecordingEmitter::default();
+        let result = with_dispatch_bookends(&mut emitter, "case-5", "test-crew", None, |_em| {
+            Ok(FunnelEnvelope {
+                members: vec![MemberRecord {
+                    model: "darkmux:probe-model".into(),
+                    seat: "review-probe".into(),
+                    remote: false,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        });
+        assert!(result.is_ok());
+
+        let terminal = emitter
+            .records
+            .iter()
+            .find(|r| r.action == "dispatch complete")
+            .expect("dispatch complete terminal record");
+        let payload = terminal.payload.as_ref().unwrap();
+        assert!(payload.get("endpoint").is_none(), "local-only omits endpoint: {payload}");
+        assert!(payload.get("remote_tokens").is_none(), "local-only omits remote_tokens: {payload}");
     }
 
     #[test]
