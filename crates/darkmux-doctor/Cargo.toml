@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-doctor"
-version = "1.18.3"
+version = "1.18.4"
 edition = "2021"
 description = "darkmux doctor — environment + harness self-checks (the eureka roll-up surface)"
 license = "MIT"
