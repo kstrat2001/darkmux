@@ -11,6 +11,15 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.18.5] - 2026-07-12
+
+Two fixes surfaced by a real production 37-flag funnel run on a private repo, plus a provenance gap found on the very first Azure review.
+
+### Fixed
+
+- **The funnel's run-level `degenerate` gate no longer over-fires on a minority remote-judge dispatch error** (#1329) — a transient dispatch failure on even ONE flag out of many (e.g. 1 of 37) was forcing the ENTIRE run degenerate, discarding every other flag's real, valid adjudication and posting "no review signal" on a run that actually completed correctly. The per-flag outcome was always handled safely (a pass-1 failure archives just that flag, a pass-2 failure demotes it to NeedsCheck — never a silent fake confirm); only the run-level gate over-reacted, and did so asymmetrically — the same failure class via `Unparsed` (garbage output surviving its retry) was already exempt and rendered fine. Fixed by folding the dispatch-error reason into the existing `usable == 0` gate `Unparsed` already relies on — a consistency fix, not new policy. A minority dispatch error is now surfaced as an `env.warnings` entry (matching the probe stage's existing precedent) rather than going fully silent on an otherwise-healthy run.
+- **Funnel provenance now stamps the model an endpoint actually SERVED, not just the requested deployment name** (#1300) — an Azure deployment named e.g. `gpt-4o` can alias to a different underlying model; every downstream provenance surface (the posted footer, the audit envelope) previously inherited only the declared/requested id, discarding `SingleShotReply.model` (the response body's ground truth) entirely. `MemberRecord` gains `served_model: Option<String>`, threaded through all three seats (probe/judge/verify) and gated to remote seats only (a local LMStudio response is also OpenAI-compatible and echoes a `model` field — `lms ps` stays the only ground truth for local dispatch). The posted footer now surfaces both when they differ ("requested gpt-4o, served gpt-4o-2026-08-01"); agreement (the common case) still shows just the one name.
+
 ## [1.18.4] - 2026-07-12
 
 Two fixes surfaced by running the funnel on a private production repo.
@@ -105,6 +114,7 @@ funnel, fixed same-day.
   exit paths, `source: "funnel"`) so a live PR review is visible as a running dispatch in the
   viewer's fleet and machine views (#1272, #1277).
 
+[1.18.5]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.5
 [1.18.4]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.4
 [1.18.3]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.3
 [1.18.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.2
