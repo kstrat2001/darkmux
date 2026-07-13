@@ -312,7 +312,20 @@ pub enum PhaseStatus {
     Abandoned,
 }
 
-/// A phase — a time-boxed work unit within a mission.
+/// A phase — a time-boxed work unit within a mission. **Strictly linear
+/// (#1341, verified against real NASA mission-phase documentation: Launch
+/// → Cruise → Encounter → Extended Operations, each explicitly bounded by
+/// its neighbors, no branching)** — ordered PURELY by position in
+/// `Mission::phase_ids`, with zero scheduling semantics of its own (no
+/// `depends_on` field). All real dependency/concurrency/data-flow lives
+/// one level down, at `Task::depends_on` — a Task in one Phase may depend
+/// on a Task in an EARLIER Phase (this is how cross-phase data actually
+/// flows, e.g. `adjudicate`'s `judge` Task depending on `investigate`'s
+/// `dedup` Task); Phase itself carries no dependency semantics to check.
+/// "The phase before this one" (needed by `dispatch::
+/// augment_message_with_phase_context`'s one-hop context injection and
+/// `mission_run::select_phase`'s "next runnable phase" scan) is simply
+/// `Mission::phase_ids[i - 1]` for a phase at index `i`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Phase {
     pub id: String,
@@ -320,9 +333,6 @@ pub struct Phase {
     pub description: String,
     #[serde(default)]
     pub status: PhaseStatus,
-    /// IDs of other phases this depends on (must complete before running).
-    #[serde(default)]
-    pub depends_on: Vec<String>,
     pub created_ts: u64,
     /// When the phase first transitioned to `Running` (or last transitioned
     /// to `Running` after being `Abandoned` and restarted). None until
@@ -342,11 +352,11 @@ pub struct Phase {
     pub abandoned_ts: Option<u64>,
     /// (#1230 Packet 2) IDs of the DAG-native `Task`s that make up this
     /// phase's actual execution graph. Additive-only field — everything
-    /// else about `Phase`'s own lifecycle (`status`, `depends_on`,
-    /// `*_ts`) is unchanged; a Phase stays the real operator-gated unit
-    /// it always was. `#[serde(default)]` so every pre-#1230 phase JSON
-    /// on disk continues to parse with an empty `task_ids` (no Task/Step
-    /// graph underneath it yet).
+    /// else about `Phase`'s own lifecycle (`status`, `*_ts`) is unchanged;
+    /// a Phase stays the real operator-gated unit it always was.
+    /// `#[serde(default)]` so every pre-#1230 phase JSON on disk continues
+    /// to parse with an empty `task_ids` (no Task/Step graph underneath it
+    /// yet).
     #[serde(default)]
     pub task_ids: Vec<String>,
 }
@@ -370,16 +380,21 @@ pub enum NodeStatus {
     Error,
 }
 
-/// (#1230 Packet 2) The smallest executable unit in the flow graph — one
-/// dispatch, one native function, or one shell command. `kind` names a
-/// registered `step_kinds::StepKind` id (e.g. `"dispatch.internal"`,
+/// (#1230 Packet 2, revised #1341) The smallest executable unit in the flow
+/// graph — one dispatch, one native function, or one shell command. `kind`
+/// names a registered `step_kinds::StepKind` id (e.g. `"dispatch.internal"`,
 /// `"procedural.shell"`); `config` is kind-specific (flat-extras-bag
 /// pattern, matching `ProfileModel`'s `#[serde(flatten)] extras`).
 ///
-/// `depends_on` lists sibling Step ids the graph knows about that must
-/// reach `NodeStatus::Complete` before this Step becomes ready — see the
-/// generic `DependencyNode`/`is_ready`/`reachable` machinery in
-/// `scheduler.rs`.
+/// **No `depends_on` field (#1341).** Step ordering is implied PURELY by
+/// position in the owning `Task.step_ids: Vec<String>` — the step at index
+/// `i` (if any) depends on the step at index `i-1`; index `0` has no
+/// intra-task predecessor. This makes a branching/multi-predecessor Step
+/// structurally UNREPRESENTABLE rather than something a runtime check has
+/// to catch — "can't be written wrong" beats "gets rejected if written
+/// wrong." All cross-Step dependency/concurrency/data-flow lives ONE level
+/// up, on `Task.depends_on` — see that field's doc and
+/// `scheduler::run_step_graph`'s Task-aware readiness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub id: String,
@@ -387,8 +402,6 @@ pub struct Step {
     /// step-kind registry id, e.g. `"dispatch.internal"` |
     /// `"dispatch.single_shot"` | `"procedural.shell"` | `"procedural.noop"`.
     pub kind: String,
-    #[serde(default)]
-    pub depends_on: Vec<String>,
     #[serde(default)]
     pub status: NodeStatus,
     /// Kind-specific config. `serde_json::Value::Null` (the `Default`) for
@@ -403,17 +416,23 @@ pub struct Step {
     /// The step kind's own output text on success (or an error summary on
     /// `NodeStatus::Error`). Generalizes the one-hop
     /// `<phase-id>-output.txt` context file `dispatch.rs`'s `phase_id`
-    /// plumbing already writes — downstream Steps read a completed
-    /// dependency's `output` as their own input (see
-    /// `scheduler::gather_inputs`).
+    /// plumbing already writes — a downstream Step (same-task successor, or
+    /// the first step of a Task naming this one's Task in its own
+    /// `Task.depends_on`) reads a completed dependency's `output` as its
+    /// own input (see `scheduler::gather_inputs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
 }
 
-/// (#1230 Packet 2) A real (not synthesized) grouping of Steps within a
-/// Phase — operators reference a Task directly (e.g. "the coder task"),
-/// so it's a first-class schema level, not just a derived view over Step
-/// edges.
+/// (#1230 Packet 2, revised #1341) A real (not synthesized) grouping of
+/// Steps within a Phase — operators reference a Task directly (e.g. "the
+/// coder task"), so it's a first-class schema level, not just a derived
+/// view over Step edges. A Task is the ASSIGNABLE unit — like a Jira
+/// ticket assigned to one crew member: `role_id`/`profile_name`/
+/// `workdir`/`image` are properties of the whole job, fixed for its
+/// duration; `depends_on` is the ONLY place dependency/concurrency/
+/// data-flow is declared above the Step level (Steps within one Task are
+/// ordered purely by `step_ids` position — see `Step`'s doc).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -425,8 +444,54 @@ pub struct Task {
     #[serde(alias = "sprint_id")]
     pub phase_id: String,
     pub description: String,
+    /// Ordered — step at index `i` depends on the step at index `i-1` (see
+    /// `Step`'s doc). A Task with 0 or 1 steps has nothing to order.
     #[serde(default)]
     pub step_ids: Vec<String>,
+    /// (#1341) Task ids this Task depends on — governs BOTH which Tasks
+    /// can run concurrently (unrelated Tasks, no edge between them
+    /// directly or transitively, run concurrently; dependent ones run in
+    /// order) AND the output→input wiring for merge points: when Task B
+    /// depends on Task A, Task B's FIRST step receives Task A's LAST
+    /// step's `output` in its `input` map, keyed by Task A's id (see
+    /// `scheduler::gather_inputs`). **Settled design**: an upstream Task's
+    /// output reaches ONLY the downstream Task's FIRST step — a later step
+    /// in a multi-step Task sees only the immediately-previous SAME-TASK
+    /// step's output; it's that first step's job to carry forward anything
+    /// from an upstream Task a later same-task step still needs (into its
+    /// own `output`, which the next step then reads as ITS input — the
+    /// same step-to-step handoff every same-task pair already uses, no
+    /// separate mechanism). Every Task built by this codebase today is
+    /// single-step, so the distinction has no observable effect yet — it
+    /// applies only once a real multi-step Task exists.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// (#1230/#1341) A Task is the ASSIGNABLE unit — like a Jira ticket
+    /// assigned to one crew member, the assignee/environment/profile are
+    /// properties of the whole job, fixed for its duration, not
+    /// re-declared at every Step. `role_id` names the crew role dispatched
+    /// for this Task (e.g. `"coder"`); `None` on purely-procedural Tasks
+    /// (dedup, bundle, synthesis) that carry no crew assignment at all.
+    /// Step-level dispatch kinds (`DispatchInternalStepKind`) source
+    /// `role_id`/`profile_name`/`workdir`/`image` from the OWNING Task
+    /// first, falling back to `Step.config` only when the Task doesn't set
+    /// a field — see `scheduler::run_step_graph`'s Task lookup and
+    /// `StepKind::run`'s `task` parameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_id: Option<String>,
+    /// The swap-profile this Task's dispatch(es) resolve models against.
+    /// `None` ⇒ the default registry (no `--profiles-file` override).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+    /// The working directory a dispatch runs in (e.g. a mission phase's
+    /// git worktree). `None` ⇒ no fixed workdir (a role-default dispatch,
+    /// or a Task with no filesystem dependency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<PathBuf>,
+    /// The container image a dispatch runs in. `None` ⇒ the runtime's
+    /// default image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 #[cfg(test)]

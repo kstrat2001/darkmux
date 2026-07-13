@@ -918,9 +918,13 @@ pub fn worktree_contained(
     canon_wt.starts_with(&canon_base)
 }
 
-/// Resolve a session_id from flow records: find the LAST `mission.run.start`
-/// record matching that session across the two lexicographically last
-/// `.jsonl` day files, and extract payload.worktree/base/branch.
+/// Resolve a session_id from flow records: find the LAST `"step result"`
+/// record with `payload.kind == "mission.worktree"` matching that session
+/// across the two lexicographically last `.jsonl` day files, and extract
+/// payload.worktree/base/branch. (#1230 Packet 4: migrated off the retired
+/// `mission.run.start` action — the worktree step now emits this generic
+/// `"step result"` companion record instead; see `mission_run.rs`'s
+/// `emit_step_result` doc.)
 pub fn resolve_session(
     session_id: &str,
     flows_dir: &StdPath,
@@ -974,7 +978,12 @@ pub fn resolve_session(
                 continue;
             };
             let action = record.get("action").and_then(|a| a.as_str()).unwrap_or("");
-            if action != "mission.run.start" {
+            if action != "step result" {
+                continue;
+            }
+            let payload = record.get("payload");
+            let kind = payload.and_then(|p| p.get("kind")).and_then(|k| k.as_str());
+            if kind != Some("mission.worktree") {
                 continue;
             }
             let sid = record
@@ -984,7 +993,6 @@ pub fn resolve_session(
             if sid != session_id {
                 continue;
             }
-            let payload = record.get("payload");
             if let Some(p) = payload {
                 let wt = p.get("worktree").and_then(|w| w.as_str()).unwrap_or("");
                 let base = p.get("base").and_then(|b| b.as_str()).unwrap_or("");
@@ -5848,9 +5856,11 @@ mod tests {
     fn resolve_session_finds_matching_record() {
         let tmp = TempDir::new().unwrap();
         let record = serde_json::json!({
-            "action": "mission.run.start",
+            "action": "step result",
             "session_id": "abc123",
             "payload": {
+                "step_id": "s1-worktree-step",
+                "kind": "mission.worktree",
                 "worktree": "/tmp/wt",
                 "base": "main",
                 "branch": "darkmux/abc123"
@@ -5875,7 +5885,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("2026-01-15.jsonl"),
-            r#"{"action":"mission.run.start","session_id":"other","payload":{"worktree":"/tmp/wt","base":"main","branch":"x"}}\n"#,
+            r#"{"action":"step result","session_id":"other","payload":{"step_id":"s1-worktree-step","kind":"mission.worktree","worktree":"/tmp/wt","base":"main","branch":"x"}}\n"#,
         )
         .unwrap();
 
@@ -6040,9 +6050,11 @@ mod tests {
         // Create a flows dir with a day file pointing at this worktree.
         let flows_dir = TempDir::new().unwrap();
         let record = serde_json::json!({
-            "action": "mission.run.start",
+            "action": "step result",
             "session_id": "test-session-1",
             "payload": {
+                "step_id": "s1-worktree-step",
+                "kind": "mission.worktree",
                 "worktree": wt_dir.to_str().unwrap(),
                 "base": &base_ref,
                 "branch": "darkmux/test"

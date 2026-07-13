@@ -95,7 +95,7 @@ fn list_inner(map: &HashMap<String, Arc<dyn StepKind>>) -> String {
 mod tests {
     use super::*;
     use crate::step_kinds::StepOutcome;
-    use crate::types::Step;
+    use crate::types::{Step, Task};
     use std::collections::BTreeMap;
 
     struct StubKind(&'static str);
@@ -103,7 +103,7 @@ mod tests {
         fn id(&self) -> &'static str {
             self.0
         }
-        fn run(&self, _step: &Step, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+        fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
             Ok(StepOutcome {
                 output: "stub".to_string(),
                 flow_records: Vec::new(),

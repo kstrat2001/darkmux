@@ -742,10 +742,13 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
 ///
 /// Behavior:
 ///   - Writes a new Phase JSON at `<crew_root>/phases/<phase-id>.json`
-///     with `status: Planned`, `mission_id`, `description`, `depends_on`,
+///     with `status: Planned`, `mission_id`, `description`,
 ///     `created_ts: now()`.
-///   - Appends the phase id to the Mission's `phase_ids` array (atomic
-///     write per the existing `save_json` semantics).
+///   - Inserts the phase id into the Mission's `phase_ids` array at
+///     `after`'s position (or appends — see `resolve_insert_position`),
+///     atomic write per the existing `save_json` semantics. (#1341)
+///     Phases are strictly linear — list POSITION is the only ordering;
+///     there is no separate dependency declaration.
 ///   - Emits a `phase added` flow record (tier=operator, source=
 ///     mission_lifecycle) so the addition is observable in the viewer.
 ///
@@ -762,23 +765,15 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
 ///   - Phase id is in use under SAME mission but with different
 ///     description (operator probably meant a different id or wants to
 ///     explicitly edit; either way, don't paper over the conflict).
-///   - Any `depends_on` id doesn't resolve to an existing phase.
+///   - `after` names a phase id not already in the mission's `phase_ids`.
 #[allow(dead_code)]
 pub(crate) fn add_phase_to_mission(
     mission_id: &str,
     phase_id: &str,
     description: &str,
-    depends_on: Vec<String>,
     after: Option<&str>,
 ) -> Result<Phase> {
-    add_phase_to_mission_with_reasoning(
-        mission_id,
-        phase_id,
-        description,
-        depends_on,
-        after,
-        None,
-    )
+    add_phase_to_mission_with_reasoning(mission_id, phase_id, description, after, None)
 }
 
 /// `add_phase_to_mission` with operator-supplied reasoning for the
@@ -788,7 +783,6 @@ pub fn add_phase_to_mission_with_reasoning(
     mission_id: &str,
     phase_id: &str,
     description: &str,
-    depends_on: Vec<String>,
     after: Option<&str>,
     reasoning: Option<&str>,
 ) -> Result<Phase> {
@@ -825,16 +819,6 @@ pub fn add_phase_to_mission_with_reasoning(
         return Ok(existing.clone());
     }
 
-    // depends_on dangling check — every referenced phase must exist.
-    for dep in &depends_on {
-        if !all_phases.iter().any(|s| s.id.as_str() == dep.as_str()) {
-            bail!(
-                "depends_on references unknown phase `{}`; add it first or correct the id",
-                dep
-            );
-        }
-    }
-
     // Pre-validate the `--after` target BEFORE writing any state, so a
     // typo'd `--after` doesn't leave a phase JSON on disk that's not
     // referenced from any mission. Resolve to the insertion index now,
@@ -846,7 +830,6 @@ pub fn add_phase_to_mission_with_reasoning(
         mission_id: mission_id.to_string(),
         description: description.to_string(),
         status: PhaseStatus::Planned,
-        depends_on,
         created_ts: now_unix(),
         started_ts: None,
         completed_ts: None,
@@ -960,7 +943,6 @@ mod tests {
             mission_id: "test-mission".to_string(),
             description: "test phase".to_string(),
             status,
-            depends_on: Vec::new(),
             created_ts: 1_700_000_000,
             started_ts: None,
             completed_ts: None,
@@ -1223,7 +1205,6 @@ mod tests {
             mission_id: "legacy-mission".to_string(),
             description: "pre-rename phase".to_string(),
             status: PhaseStatus::Planned,
-            depends_on: Vec::new(),
             created_ts: 1_700_000_000,
             started_ts: None,
             completed_ts: None,
@@ -1275,7 +1256,6 @@ mod tests {
             "test-mission",
             "new-phase",
             "discovered mid-flight",
-            Vec::new(),
             None,
         )
         .unwrap();
@@ -1297,8 +1277,8 @@ mod tests {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
 
-        let first = add_phase_to_mission("m1", "s-once", "same desc", Vec::new(), None).unwrap();
-        let second = add_phase_to_mission("m1", "s-once", "same desc", Vec::new(), None).unwrap();
+        let first = add_phase_to_mission("m1", "s-once", "same desc", None).unwrap();
+        let second = add_phase_to_mission("m1", "s-once", "same desc", None).unwrap();
 
         // Same created_ts on the second call — we returned the existing phase, not a fresh one.
         assert_eq!(first.created_ts, second.created_ts);
@@ -1313,9 +1293,9 @@ mod tests {
         let _g = CrewGuard::new();
         seed_mission("m-a", MissionStatus::Active);
         seed_mission("m-b", MissionStatus::Active);
-        add_phase_to_mission("m-a", "shared", "first", Vec::new(), None).unwrap();
+        add_phase_to_mission("m-a", "shared", "first", None).unwrap();
 
-        let err = add_phase_to_mission("m-b", "shared", "second", Vec::new(), None).unwrap_err();
+        let err = add_phase_to_mission("m-b", "shared", "second", None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("already in use under mission `m-a`"), "got: {msg}");
     }
@@ -1325,9 +1305,9 @@ mod tests {
     fn add_phase_errors_when_same_id_has_different_description() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        add_phase_to_mission("m1", "s1", "original", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "s1", "original", None).unwrap();
 
-        let err = add_phase_to_mission("m1", "s1", "different", Vec::new(), None).unwrap_err();
+        let err = add_phase_to_mission("m1", "s1", "different", None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("different description"), "got: {msg}");
     }
@@ -1340,7 +1320,6 @@ mod tests {
             "ghost-mission",
             "new-phase",
             "desc",
-            Vec::new(),
             None,
         )
         .unwrap_err();
@@ -1351,46 +1330,11 @@ mod tests {
         );
     }
 
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_errors_when_depends_on_dangles() {
-        let _g = CrewGuard::new();
-        seed_mission("m1", MissionStatus::Active);
-        let err = add_phase_to_mission(
-            "m1",
-            "new-phase",
-            "desc",
-            vec!["nonexistent".to_string()],
-            None,
-        )
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("depends_on references unknown phase `nonexistent`"),
-            "got: {msg}",
-        );
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_resolves_depends_on_against_existing_phases() {
-        let _g = CrewGuard::new();
-        seed_mission("m1", MissionStatus::Active);
-        seed_phase("dep-phase", PhaseStatus::Planned);
-
-        // Note: seed_phase hard-codes mission_id="test-mission"; the dep
-        // doesn't have to live in the same mission for the resolution
-        // check (cross-mission deps are unusual but not invalid).
-        let s = add_phase_to_mission(
-            "m1",
-            "new-phase",
-            "desc",
-            vec!["dep-phase".to_string()],
-            None,
-        )
-        .unwrap();
-        assert_eq!(s.depends_on, vec!["dep-phase".to_string()]);
-    }
+    /// (#1341) Phases are strictly linear now — no separate `depends_on`
+    /// declaration to dangle-check; `resolve_insert_position` (called
+    /// below, in the real add-phase path) already errors loud when
+    /// `--after` names a phase id not in the mission's `phase_ids`, which
+    /// is the equivalent "reference an unknown phase" failure mode.
 
     // ─── --after positioning (insert-in-middle) ─────────────────────────
 
@@ -1399,12 +1343,12 @@ mod tests {
     fn add_phase_with_after_inserts_in_middle_not_at_end() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        add_phase_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
-        add_phase_to_mission("m1", "beta", "second", Vec::new(), None).unwrap();
-        add_phase_to_mission("m1", "gamma", "third", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "alpha", "first", None).unwrap();
+        add_phase_to_mission("m1", "beta", "second", None).unwrap();
+        add_phase_to_mission("m1", "gamma", "third", None).unwrap();
 
         // Insert `delta` between `alpha` and `beta`.
-        add_phase_to_mission("m1", "delta", "inserted", Vec::new(), Some("alpha")).unwrap();
+        add_phase_to_mission("m1", "delta", "inserted", Some("alpha")).unwrap();
 
         let m = load_mission("m1").unwrap();
         assert_eq!(
@@ -1425,10 +1369,10 @@ mod tests {
         // Edge case: --after the last phase should append (not error).
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        add_phase_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
-        add_phase_to_mission("m1", "beta", "second", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "alpha", "first", None).unwrap();
+        add_phase_to_mission("m1", "beta", "second", None).unwrap();
 
-        add_phase_to_mission("m1", "gamma", "third", Vec::new(), Some("beta")).unwrap();
+        add_phase_to_mission("m1", "gamma", "third", Some("beta")).unwrap();
 
         let m = load_mission("m1").unwrap();
         assert_eq!(m.phase_ids, vec!["alpha", "beta", "gamma"]);
@@ -1439,13 +1383,12 @@ mod tests {
     fn add_phase_with_after_unknown_id_errors_loudly() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        add_phase_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "alpha", "first", None).unwrap();
 
         let err = add_phase_to_mission(
             "m1",
             "beta",
             "second",
-            Vec::new(),
             Some("nonexistent-id"),
         )
         .unwrap_err();
@@ -1466,7 +1409,7 @@ mod tests {
     fn add_phase_emits_phase_added_flow_record() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        add_phase_to_mission("m1", "new-phase", "desc", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "new-phase", "desc", None).unwrap();
 
         // Read the day's flow file from the temp DARKMUX_FLOWS_DIR.
         let flows_dir = env::var("DARKMUX_FLOWS_DIR").unwrap();
@@ -1610,6 +1553,11 @@ mod task_step_storage_tests {
             phase_id: phase_id.to_string(),
             description: format!("task {id}"),
             step_ids: Vec::new(),
+            depends_on: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
         }
     }
 
@@ -1618,7 +1566,6 @@ mod task_step_storage_tests {
             id: id.to_string(),
             task_id: task_id.to_string(),
             kind: "procedural.noop".to_string(),
-            depends_on: Vec::new(),
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,

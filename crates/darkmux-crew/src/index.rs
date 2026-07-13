@@ -608,7 +608,12 @@ fn populate(conn: &mut Connection) -> Result<()> {
 
     // Phases.
     for phase in &phases {
-        let depends_on_json = serde_json::to_string(&phase.depends_on)?;
+        // (#1341) `Phase` no longer carries `depends_on` — Phases are
+        // strictly linear, ordered by `Mission.phase_ids` position; real
+        // dependency data lives on `Task.depends_on` instead. The column
+        // stays (schema stability) but is now always the empty array —
+        // vestigial, not read by any consumer.
+        let depends_on_json = "[]";
         tx.execute(
             "INSERT INTO phases (id, mission_id, description, status, depends_on_json, created_ts, started_ts, completed_ts, abandoned_ts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",

@@ -865,8 +865,10 @@ enum MissionCmd {
     /// Operator-sovereign scope growth — alternative to either hand-
     /// editing JSON or filing a separate Mission for work that
     /// composes with the in-flight arc. Idempotent on exact-match
-    /// (same id + mission + description); errors on collision or
-    /// dangling depends_on.
+    /// (same id + mission + description); errors on collision. Phases
+    /// are strictly linear (#1341) — `--after` places the new phase in
+    /// `Mission.phase_ids` order; there is no separate dependency
+    /// declaration.
     AddPhase {
         /// Mission id to extend (must exist).
         mission_id: String,
@@ -877,10 +879,6 @@ enum MissionCmd {
         /// Description of the new Phase's scope.
         #[arg(long)]
         description: String,
-        /// Optional dependencies — other phase ids that should
-        /// complete first. Each must reference an existing phase.
-        #[arg(long = "depends-on")]
-        depends_on: Vec<String>,
         /// Insert the new phase immediately after this existing
         /// phase id (insert-in-middle). When omitted, the new
         /// phase is appended to the end of the mission's phase
@@ -2309,7 +2307,6 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             mission_id,
             phase_id,
             description,
-            depends_on,
             after,
             reasoning,
         } => {
@@ -2317,7 +2314,6 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
                 &mission_id,
                 &phase_id,
                 &description,
-                depends_on,
                 after.as_deref(),
                 reasoning.as_deref(),
             )?;
@@ -2433,35 +2429,45 @@ fn cmd_mission_dispatch(
         anyhow::bail!("role `{role_id}` not found");
     }
 
-    // 3. Filter phases: this mission + ready + status=Planned. Ready
-    //    (#1230 Packet 2) means `crew::scheduler::is_ready` via the
-    //    `PhaseNode` adapter — Planned AND every `depends_on` entry
-    //    resolves to a Complete phase — replacing the historical flat
-    //    `depends_on.is_empty()` filter, which only ever fanned out
-    //    phases with NO dependencies at all and never actually checked
-    //    whether a phase's dependencies had been satisfied.
-    //    `Running` is NOT included — PR-D.1 filter-level guard (subsumed
-    //    by `is_ready` requiring `Planned`). Wave-E.3 adds the
-    //    state-machine gate: each filtered phase goes through
+    // 3. Find the next runnable phase in THIS mission. (#1341) Phases are
+    //    strictly linear — ordered purely by position in
+    //    `Mission.phase_ids`, no `depends_on` of their own — so "ready"
+    //    is a linear scan: the FIRST phase in that order whose status is
+    //    `Planned` AND every phase before it is `Complete`. Replaces the
+    //    historical `crew::scheduler::is_ready`/`PhaseNode` graph check
+    //    (itself a replacement for the even older flat
+    //    `depends_on.is_empty()` filter) — a strictly-linear Phase list
+    //    has at most ONE next-runnable phase per mission, so `initial`
+    //    below holds 0 or 1 entries, never a real "fan-out" across
+    //    parallel phases (that capability lives at the Task level now,
+    //    within `mission run`'s own graph — see `types::Phase`'s doc).
+    //    `Running` phases are naturally excluded (not `Planned`). Wave-E.3
+    //    state-machine gate unchanged: the filtered phase goes through
     //    `lifecycle::phase_start` BEFORE publish, flipping Planned →
-    //    Running. A second `mission dispatch` invocation finds 0
-    //    dispatchable phases (all Running now) and bails with exit 2.
+    //    Running, so a second `mission dispatch` invocation finds nothing
+    //    dispatchable and bails with exit 2.
     let phases = load_phases()?;
-    let phase_nodes: Vec<crew::scheduler::PhaseNode> =
-        phases.iter().map(crew::scheduler::PhaseNode).collect();
-    let phase_by_id: std::collections::BTreeMap<String, &crew::scheduler::PhaseNode> =
-        phase_nodes.iter().map(|n| (n.0.id.clone(), n)).collect();
-    let initial: Vec<_> = phases
-        .iter()
-        .filter(|s| s.mission_id == mission_id)
-        .filter(|s| crew::scheduler::is_ready(&crew::scheduler::PhaseNode(s), &phase_by_id))
-        .collect();
+    let phase_by_id: std::collections::BTreeMap<String, &crew::types::Phase> =
+        phases.iter().map(|p| (p.id.clone(), p)).collect();
+    let mut initial: Vec<&crew::types::Phase> = Vec::new();
+    let mut all_prior_complete = true;
+    for phase_id in &mission.phase_ids {
+        let Some(phase) = phase_by_id.get(phase_id) else { continue };
+        if all_prior_complete && phase.status == crew::types::PhaseStatus::Planned {
+            initial.push(phase);
+            break;
+        }
+        if phase.status != crew::types::PhaseStatus::Complete {
+            all_prior_complete = false;
+        }
+    }
 
     if initial.is_empty() {
         eprintln!(
-            "darkmux mission dispatch: no phases with depends_on=[] in mission `{mission_id}` \
-             in Planned status. Nothing to fan out. (Running phases from a previous \
-             dispatch must be `darkmux phase complete` or `phase abandon` before \
+            "darkmux mission dispatch: no runnable phase in mission `{mission_id}` — either \
+             every phase is already Running/Complete/Abandoned, or the next Planned phase is \
+             blocked on an incomplete predecessor. Nothing to fan out. (Running phases from a \
+             previous dispatch must be `darkmux phase complete` or `phase abandon` before \
              they're eligible again.)"
         );
         return Ok(2);

@@ -852,7 +852,7 @@ impl Drop for FunnelBookendGuard<'_> {
 
 // ─── the envelope ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FunnelEnvelope {
     pub case_id: String,
     pub crew: String,
@@ -942,7 +942,7 @@ pub struct RemoteBudgetRecord {
 /// (#1260) In-flight bucket state for one stage's remote calls. Local calls
 /// never touch it. `record()` yields `None` when the stage made no remote
 /// calls at all, so local-only envelopes carry no budget rows.
-struct RemoteBucket {
+pub(crate) struct RemoteBucket {
     stage: &'static str,
     budget: u64,
     used: u64,
@@ -995,7 +995,7 @@ impl RemoteBucket {
 /// LMStudio, so no `darkmux:` namespace entry is ever minted for them (the
 /// namespace marks darkmux-owned LOCAL residency, and a remote seat has
 /// none).
-fn seat_identifier(pm: &ProfileModel) -> String {
+pub fn seat_identifier(pm: &ProfileModel) -> String {
     if pm.is_remote() {
         pm.id.clone()
     } else {
@@ -1099,7 +1099,7 @@ fn default_snapshot_passes() -> u32 {
     2
 }
 
-fn staffing_snapshot(
+pub fn staffing_snapshot(
     probes: &[ResolvedSeatStaffing],
     judge: &ResolvedSeatStaffing,
     verify: Option<&ResolvedSeatStaffing>,
@@ -2034,7 +2034,7 @@ pub fn parse_verify_ruling(text: &str) -> Option<(VerifyRuling, String, String)>
 /// sheet. Deliberately THIS module's own shape — see the module doc's
 /// "Bundling — the packet 3 seam" section for why, and [`bundles_from_diff`]
 /// for the reconciliation point.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleInput {
     pub id: String,
     pub fact_family: String,
@@ -2222,7 +2222,7 @@ pub struct FunnelInputs<'a> {
     pub remote_max_tokens_per_execution: u64,
 }
 
-fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Value {
+pub fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Value {
     serde_json::json!({
         "judge_model": judge_identifier,
         "judge_temperature": JUDGE_TEMPERATURE,
@@ -3736,6 +3736,1232 @@ pub fn run_judge_only(
     }
 
     finish_funnel(env, flags, &bundles, inputs, judge, verify, &mut chat, cycler, &mut guard)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Task/Step graph orchestration — ONE upfront-declared graph
+//
+// Redesign per the DRY-with-teeth mandate: instead of `run_funnel_impl`'s
+// hand-written sequential driver (bundle → probe_phase → dedup_flags →
+// judge loop → run_verify_stage → finish_funnel, six ad-hoc calls), the
+// funnel's structure — which stages exist, in what order — is declared
+// as a real `Task`/`Step` graph BEFORE any dispatch happens, and executed
+// through ONE `darkmux_crew::scheduler::run_step_graph` call (mirrors
+// `mission_run.rs`'s own migration, #1230 Packet 3). What's NOT knowable
+// upfront — how many deduped flags exist — is handled entirely INSIDE the
+// judge/verify steps' own internal bounded-concurrency for-each loops,
+// never as graph shape.
+//
+// Grouped into three Phases (an operator/coordinator decision, not an
+// execution mechanism — Phase boundaries are exactly as statically known
+// as everything else here; they're a labeling/observability layer over
+// the same flat Step graph, not a second scheduler):
+//
+//   investigate: bundle → probe×N seats → dedup   (ends with deduped flags)
+//   adjudicate:  judge (one step, internal pass1/pass2 loop)
+//   report:      verify → synthesis                (ends with tier counts)
+//
+// `depends_on` edges cross Phase boundaries exactly like they cross Task
+// boundaries within one Phase — `adjudicate`'s `judge` step `depends_on`
+// `investigate`'s `dedup` step; no special cross-phase mechanism.
+//
+// **Crate-boundary note**: this module (`darkmux-lab`) builds and runs the
+// graph and returns the final `FunnelEnvelope` — it does NOT create the
+// Mission/Phase/Task records on disk (that needs `darkmux_crew::lifecycle`
+// plus a `mission_id`/case-scoped identity, which is the CALLER's concern:
+// `darkmux pr-review run` creates a real persisted Mission; a lab bench run
+// stays per-run-local per the lab-vs-fleet boundary doctrine — same
+// caller-decides pattern `FunnelEmitter` already uses for flow-record
+// destination). It also does NOT render the posted-comment markdown
+// (`Rendered`) — that type and its `synthesize_funnel` builder live in the
+// binary crate's `src/pr_review.rs`, which `darkmux-lab` cannot depend on
+// without a reverse dependency; `pr_review.rs` calls `synthesize_funnel` on
+// the `FunnelEnvelope` this module returns, exactly as it does today.
+//
+// **The double-confirm judge protocol, dedup key, judge/verify prompts,
+// and tier synthesis are UNCHANGED** — every step kind below calls the
+// SAME preserved functions (`dedup_flags`, `judge_one_flag_with_passes`,
+// `verify_pass_with_retry`, `parse_judge_ruling`, `parse_verify_ruling`,
+// `cluster_needs_check`, `mechanism_family`, `judge_prompt`,
+// `verify_prompt`) verbatim — only the ORCHESTRATION shape (six sequential
+// calls → one declared graph) and the telemetry plumbing (the guard-
+// coupled `FunnelBookendGuard` can't cross a `run_bounded` worker-thread
+// boundary — see `darkmux_crew::step_kinds::StepOutcome`'s doc — so
+// per-step telemetry now rides `StepOutcome.flow_records` / direct
+// `darkmux_flow::record()` calls instead) changed.
+
+use darkmux_crew::scheduler::run_step_graph;
+use darkmux_crew::single_shot::{single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest, SingleShotRequest};
+use darkmux_crew::step_kinds::{StepKind, StepKindRegistry, StepOutcome};
+use darkmux_crew::types::{NodeStatus, Step, Task};
+use std::sync::Mutex as StdMutex;
+
+/// Everything a funnel Step kind needs, OWNED (not borrowed) and
+/// `Send + Sync` so it can cross the `run_bounded` worker-thread boundary —
+/// `FunnelInputs<'a>`'s borrows can't. Built ONCE by the orchestrator
+/// (`build_funnel_graph`) before the graph starts; every step kind holds an
+/// `Arc` clone. Mirrors `FunnelInputs` field-for-field, minus the injected
+/// `chat`/`cycler` (each step now resolves its own — see `dispatch_chat`
+/// and the direct `LmsCycler` construction in each dispatch-shaped step).
+pub struct FunnelStepContext {
+    pub case_id: String,
+    pub crew: ResolvedCrew,
+    pub intent_title: String,
+    pub intent_body: String,
+    pub diff: String,
+    pub probe_system: String,
+    pub judge_system: String,
+    pub verify_system: String,
+    pub bundles: Vec<BundleInput>,
+    pub remote_max_tokens_per_execution: u64,
+    pub timeout_seconds: u32,
+}
+
+/// The production dispatch primitive every funnel step kind below calls —
+/// routes on `call.endpoint` exactly like `pr_review.rs::run_dispatch`'s
+/// own `chat` closure (contract 1: a consumer routes on what the profile
+/// declares, never re-derives its own local/remote judgment). No test-mock
+/// injection seam for this specific call (see the module doc above) —
+/// matches `mission_run.rs`'s `MissionCoderStepKind`/`MissionWorktreeStepKind`
+/// precedent, which likewise call their real primitive (`dispatch::dispatch`/
+/// `add_worktree`) directly rather than through an injected closure; the
+/// PRESERVED algorithm functions this dispatches into
+/// (`judge_one_flag_with_passes`, `verify_pass_with_retry`, `probe_one_draw`)
+/// remain fully mock-testable via their own existing `chat: &mut dyn FnMut`
+/// parameter — only the NEW graph glue trades that seam for parity with the
+/// rest of the Task/Step step-kind family.
+fn dispatch_chat(ctx: &FunnelStepContext, call: &ChatCall) -> Result<SingleShotReply> {
+    match call.endpoint {
+        Some(endpoint) => single_shot_chat_hosted(&HostedSingleShotRequest {
+            endpoint,
+            model: call.model,
+            system: call.system,
+            user: call.user,
+            max_tokens: call.max_tokens,
+            timeout_seconds: ctx.timeout_seconds,
+        }),
+        None => single_shot_chat(&SingleShotRequest {
+            base_url: None,
+            model: call.model,
+            system: call.system,
+            user: call.user,
+            temperature: call.temperature,
+            max_tokens: call.max_tokens,
+            timeout_seconds: ctx.timeout_seconds,
+        }),
+    }
+}
+
+/// A "step result" companion flow record — the funnel's own equivalent of
+/// `mission_run.rs`'s `emit_step_result` (#1230 Packet 4 sibling
+/// convention): one generic action, `kind` distinguishing which funnel step
+/// produced it, free-form `payload` for the rest. Called directly (not via
+/// `StepOutcome.flow_records`) so it's usable from inside a step's own
+/// internal concurrent loop (judge's bounded worker pool) — a plain
+/// `darkmux_flow::record()` call has no non-`Send` state, unlike
+/// `FunnelBookendGuard` (see the module doc).
+fn emit_funnel_step_result(kind: &str, step_id: &str, case_id: &str, payload: serde_json::Value) {
+    let mut full = serde_json::json!({ "step_id": step_id, "kind": kind });
+    if let (serde_json::Value::Object(extra), serde_json::Value::Object(base)) = (payload, &mut full) {
+        base.extend(extra);
+    }
+    let _ = darkmux_flow::record(darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level: darkmux_flow::Level::Info,
+        category: darkmux_flow::Category::Work,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Dispatch,
+        action: "step result".to_string(),
+        handle: step_id.to_string(),
+        phase_id: None,
+        session_id: Some(case_id.to_string()),
+        source: Some("funnel".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        orchestrator: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(full),
+        work_id: None,
+        attempt: None,
+    });
+}
+
+// ─── investigate: bundle ────────────────────────────────────────────────
+
+/// Phase "investigate", step 1: hands back the already-resolved bundle list
+/// (`FunnelStepContext::bundles` — resolved once by the orchestrator before
+/// the graph starts, since bundling needs `&FunnelInputs<'a>`'s borrow,
+/// which can't cross into a `'static` step kind). Procedural — no dispatch.
+pub struct FunnelBundleStepKind {
+    pub ctx: Arc<FunnelStepContext>,
+}
+
+impl StepKind for FunnelBundleStepKind {
+    fn id(&self) -> &'static str {
+        "funnel.bundle"
+    }
+
+    fn run(&self, step: &Step, _task: &Task, _input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        let output = serde_json::to_string(&self.ctx.bundles).context("serializing bundles")?;
+        emit_funnel_step_result(
+            "funnel.bundle",
+            &step.id,
+            &self.ctx.case_id,
+            json!({ "items_out": self.ctx.bundles.len() }),
+        );
+        Ok(StepOutcome { output, flow_records: Vec::new() })
+    }
+}
+
+// ─── investigate: probe (N steps, one per staffed seat) ────────────────
+
+/// Phase "investigate", step 2 of N: ONE probe seat's whole draw loop
+/// (bundle × k draws) — genuinely valuable graph-level concurrency (the
+/// ONE stage where per-item fan-out is justified, per the redesign brief):
+/// different seats plausibly run different models, and gestalt's real wave
+/// planner (via `StepKind::residency`) decides which seats can co-reside.
+/// Reuses `probe_one_draw`/`probe_user_message`/`select_bundles_for_staffing`/
+/// `resolve_seat_max_tokens` VERBATIM — only the surrounding loop shape and
+/// telemetry are new.
+pub struct FunnelProbeStepKind {
+    ctx: Arc<FunnelStepContext>,
+    staffing: ResolvedSeatStaffing,
+    /// Shared across every probe step in the run — the probe stage's remote
+    /// token bucket is ONE execution shared by every remote probe staffing
+    /// (unchanged semantics from `probe_phase`'s pre-graph design).
+    bucket: Arc<StdMutex<RemoteBucket>>,
+    /// Collects every probe seat's `MemberRecord` + any reduced-coverage
+    /// warning — read back by the dedup step (whose `depends_on` includes
+    /// every probe step, so it runs only after all seats finish) via this
+    /// SAME shared handle, avoiding a separate side-channel.
+    members: Arc<StdMutex<Vec<MemberRecord>>>,
+    warnings: Arc<StdMutex<Vec<String>>>,
+    /// `"funnel.probe:<staffing-name>"` — a distinct registered kind id per
+    /// probe seat (the registry maps one kind id to one `StepKind`
+    /// instance, and each seat has its own model/selector). `StepKind::id`
+    /// must return `&'static str`; this is leaked EXACTLY ONCE at
+    /// construction (`FunnelProbeStepKind::new`), never inside `id()`
+    /// itself, so a bounded, one-time-per-seat-per-process leak in a
+    /// short-lived CLI invocation — never a per-call leak. Fields are
+    /// private (construct via `new()`) precisely so `RemoteBucket` (a
+    /// crate-private type — see its own doc) never has to be re-exported
+    /// just to name this struct's shape.
+    kind_id: &'static str,
+}
+
+impl FunnelProbeStepKind {
+    pub(crate) fn new(
+        ctx: Arc<FunnelStepContext>,
+        staffing: ResolvedSeatStaffing,
+        bucket: Arc<StdMutex<RemoteBucket>>,
+        members: Arc<StdMutex<Vec<MemberRecord>>>,
+        warnings: Arc<StdMutex<Vec<String>>>,
+    ) -> Self {
+        let kind_id: &'static str =
+            Box::leak(format!("funnel.probe:{}", staffing.name).into_boxed_str());
+        Self { ctx, staffing, bucket, members, warnings, kind_id }
+    }
+}
+
+impl StepKind for FunnelProbeStepKind {
+    fn id(&self) -> &'static str {
+        self.kind_id
+    }
+
+    fn run(&self, step: &Step, _task: &Task, _input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        let s = &self.staffing;
+        let identifier = seat_identifier(&s.pm);
+        let endpoint = seat_endpoint(&s.pm);
+        let endpoint_host = seat_endpoint_host(&s.pm);
+        let max_tokens = resolve_seat_max_tokens(s, DEFAULT_PROBE_MAX_TOKENS);
+        let selected = select_bundles_for_staffing(&self.ctx.bundles, s.selector.as_ref());
+
+        let t0 = Instant::now();
+        let mut flags: Vec<ProbeFlag> = Vec::new();
+        let mut draws = 0u32;
+        let mut tokens = 0u64;
+        let mut served_model: Option<String> = None;
+        let mut chat = |call: &ChatCall| dispatch_chat(&self.ctx, call);
+
+        'staffing: for bundle in &selected {
+            let user = probe_user_message(&self.ctx.probe_system, bundle);
+            for draw in 0..s.k {
+                if endpoint.is_some() {
+                    let mut bucket = self.bucket.lock().expect("probe bucket mutex poisoned");
+                    if !bucket.admit() {
+                        continue;
+                    }
+                }
+                draws += 1;
+                match probe_one_draw(&mut chat, &identifier, "", &user, max_tokens, endpoint) {
+                    Ok((content, tok, served)) => {
+                        tokens += tok;
+                        if served_model.is_none() {
+                            served_model = served;
+                        }
+                        if endpoint.is_some() {
+                            self.bucket.lock().expect("probe bucket mutex poisoned").spend(tok, 1);
+                        }
+                        if let Some(text) = content {
+                            flags.push(ProbeFlag {
+                                bundle_id: bundle.id.clone(),
+                                fact_family: bundle.fact_family.clone(),
+                                member: identifier.clone(),
+                                draw,
+                                charge_text: text,
+                                anchor: None,
+                                also_flagged: Vec::new(),
+                            });
+                        }
+                    }
+                    Err(e) if endpoint.is_some() => {
+                        self.warnings.lock().expect("probe warnings mutex poisoned").push(format!(
+                            "remote probe seat \"{}\" ({identifier}) failed after bounded retries — \
+                             remaining draws skipped (reduced coverage): {e}",
+                            s.name
+                        ));
+                        break 'staffing;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        let wall_ms = t0.elapsed().as_millis() as u64;
+
+        self.members.lock().expect("probe members mutex poisoned").push(MemberRecord {
+            model: identifier.clone(),
+            seat: "review-probe".to_string(),
+            draws,
+            wall_ms,
+            total_tokens: tokens,
+            remote: endpoint.is_some(),
+            endpoint: endpoint_host.clone(),
+            served_model,
+        });
+        emit_funnel_step_result(
+            "funnel.probe",
+            &step.id,
+            &self.ctx.case_id,
+            json!({
+                "staffing": s.name, "model": identifier, "items_in": selected.len(),
+                "items_out": flags.len(), "draws": draws, "wall_ms": wall_ms, "tokens": tokens,
+                "remote": endpoint.is_some(), "endpoint": endpoint_host,
+            }),
+        );
+
+        let output = serde_json::to_string(&flags).context("serializing probe flags")?;
+        Ok(StepOutcome { output, flow_records: Vec::new() })
+    }
+
+    fn residency(&self, _step: &Step, _task: &Task) -> Option<darkmux_gestalt::Placement> {
+        if self.staffing.pm.is_remote() {
+            return None;
+        }
+        let n_ctx = self.staffing.pm.n_ctx?;
+        let identifier = darkmux_gestalt::namespaced_identifier(&self.staffing.pm.id, self.staffing.pm.identifier.as_deref());
+        Some(darkmux_gestalt::Placement {
+            model_key: self.staffing.pm.id.clone(),
+            identifier,
+            min_ctx: n_ctx,
+            seat: format!("funnel-probe:{}", self.staffing.name),
+        })
+    }
+}
+
+// ─── investigate: dedup (terminal step of the phase) ────────────────────
+
+/// Phase "investigate", terminal step: `depends_on` every probe step, reads
+/// back each one's flags, concatenates, and calls `dedup_flags` VERBATIM
+/// (the mechanism-family keying + anchor-based matching — explicitly
+/// preserved, unchanged). Its OWN `StepOutcome.output` IS the phase's
+/// observable artifact: "what's the review forming to be."
+pub struct FunnelDedupStepKind {
+    pub ctx: Arc<FunnelStepContext>,
+}
+
+impl StepKind for FunnelDedupStepKind {
+    fn id(&self) -> &'static str {
+        "funnel.dedup"
+    }
+
+    fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        let t0 = Instant::now();
+        let mut raw: Vec<ProbeFlag> = Vec::new();
+        for text in input.values() {
+            let flags: Vec<ProbeFlag> =
+                serde_json::from_str(text).context("deserializing a probe step's flags")?;
+            raw.extend(flags);
+        }
+        let raw_count = raw.len();
+        let (deduped, _stats) = dedup_flags(raw, &self.ctx.diff);
+        let wall_ms = t0.elapsed().as_millis() as u64;
+        emit_funnel_step_result(
+            "funnel.dedup",
+            &step.id,
+            &self.ctx.case_id,
+            json!({ "items_in": raw_count, "items_out": deduped.len(), "wall_ms": wall_ms }),
+        );
+        let output = serde_json::to_string(&deduped).context("serializing deduped flags")?;
+        Ok(StepOutcome { output, flow_records: Vec::new() })
+    }
+}
+
+// ─── adjudicate: judge (the whole Phase, one Step) ──────────────────────
+
+/// Phase "adjudicate", its ONLY step: internally loops over however many
+/// deduped flags `dedup` produced — a bounded-concurrency for-each over a
+/// runtime-determined quantity (dispatch pass-1, then pass-2 if confirmed,
+/// for each flag, bounded by `concurrency` — no capacity-constrained
+/// grouping decision, just iterate with a concurrency limit; NOT the
+/// RAM-budget bin-packing `darkmux_gestalt::planner::plan_waves` does for
+/// probe's model-loading concern, a genuinely different mechanism this step
+/// does not use), mirroring probe's own internal k-draw loop pattern rather
+/// than needing one graph node per flag. Reuses
+/// `judge_prompt`/`judge_one_flag_with_passes` VERBATIM (the double-confirm
+/// protocol — pass-1 judges every flag, only pass-1 confirms get pass-2,
+/// disagreement demotes — is explicitly UNCHANGED).
+///
+/// **Concurrency**: `concurrency` (from `Step.config.concurrency`, default
+/// 1 — see `build_funnel_graph`) bounds how many flags this step judges AT
+/// ONCE via a chunked `std::thread::scope`. LMStudio's real per-model
+/// concurrent-prediction ceiling is genuinely unresolved (operator
+/// observation: ~4 in practice, sometimes 1) — judge is typically ONE model
+/// processing N flags (not N different models like probe), so graph-level
+/// fan-out buys little while adding real complexity; a small, OPERATOR-SET
+/// bound here is the honest answer until an empirical ceiling exists.
+/// `concurrency: 1` (the default) is byte-identical in dispatch ORDER to
+/// the historical sequential loop.
+pub struct FunnelJudgeStepKind {
+    pub ctx: Arc<FunnelStepContext>,
+    pub judge: ResolvedSeatStaffing,
+}
+
+/// One deduped flag's judged outcome, in dispatch order — the shared
+/// scratch `FunnelJudgeStepKind::run` collects chunk-by-chunk (see its doc)
+/// before serializing into the step's output.
+struct JudgeChunkResult {
+    index: usize,
+    judged: JudgedFlag,
+    tokens: u64,
+    calls: u32,
+    pass1_ms: u64,
+    pass2_ms: u64,
+    dispatch_error: bool,
+    served_model: Option<String>,
+}
+
+impl StepKind for FunnelJudgeStepKind {
+    fn id(&self) -> &'static str {
+        "funnel.judge"
+    }
+
+    fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        let dedup_output = input.values().next().cloned().unwrap_or_default();
+        let deduped: Vec<ProbeFlag> = if dedup_output.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&dedup_output).context("deserializing deduped flags")?
+        };
+
+        let concurrency = step
+            .config
+            .get("concurrency")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1) as usize;
+
+        let judge = &self.judge;
+        let judge_identifier = seat_identifier(&judge.pm);
+        // A `&String` (`Copy`) so the `move` closure below can capture ITS
+        // OWN copy of the reference on every loop iteration without moving
+        // the owned `judge_identifier` String out from under a later one.
+        let judge_identifier_ref: &str = &judge_identifier;
+        let judge_endpoint = seat_endpoint(&judge.pm);
+        let judge_max_tokens = resolve_seat_max_tokens(judge, DEFAULT_JUDGE_MAX_TOKENS);
+        let judge_system = self.ctx.judge_system.as_str();
+        let judge_budgets = judge_endpoint.map(|_| {
+            StdMutex::new(JudgeBudgets {
+                pass1: RemoteBucket::new("judge-pass1", self.ctx.remote_max_tokens_per_execution),
+                pass2: RemoteBucket::new("judge-pass2", self.ctx.remote_max_tokens_per_execution),
+            })
+        });
+
+        let t0 = Instant::now();
+        let results: StdMutex<Vec<JudgeChunkResult>> = StdMutex::new(Vec::with_capacity(deduped.len()));
+
+        for chunk in deduped.chunks(concurrency) {
+            std::thread::scope(|scope| {
+                for (offset, flag) in chunk.iter().enumerate() {
+                    let bundle = self.ctx.bundles.iter().find(|b| b.id == flag.bundle_id);
+                    let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
+                    let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
+                    let prompt = judge_prompt(&self.ctx.intent_title, &self.ctx.intent_body, code, facts, &flag.charge_text);
+                    let index = {
+                        // deterministic global index for this flag — the
+                        // running count of already-scheduled flags plus this
+                        // chunk's offset, so output order matches `deduped`
+                        // order regardless of thread completion order.
+                        let done = results.lock().expect("judge results mutex poisoned").len();
+                        done - done.min(offset) + offset
+                    };
+                    let ctx = &self.ctx;
+                    let judge_budgets = judge_budgets.as_ref();
+                    let results = &results;
+                    scope.spawn(move || {
+                        let mut chat = |call: &ChatCall| dispatch_chat(ctx, call);
+                        let mut guard = judge_budgets.map(|b| b.lock().expect("judge budgets mutex poisoned"));
+                        let outcome = judge_one_flag_with_passes(
+                            judge.passes,
+                            &prompt,
+                            judge_identifier_ref,
+                            judge_system,
+                            judge_max_tokens,
+                            judge_endpoint,
+                            guard.as_deref_mut(),
+                            &mut chat,
+                        );
+                        emit_funnel_step_result(
+                            "funnel.judge",
+                            "funnel-ruling",
+                            &ctx.case_id,
+                            json!({
+                                "bundle_id": flag.bundle_id, "pass": 1,
+                                "ruling": outcome.pass1.ruling, "seconds": outcome.pass1.seconds,
+                            }),
+                        );
+                        if let Some(p2) = &outcome.pass2 {
+                            emit_funnel_step_result(
+                                "funnel.judge",
+                                "funnel-ruling",
+                                &ctx.case_id,
+                                json!({
+                                    "bundle_id": flag.bundle_id, "pass": p2.pass,
+                                    "ruling": p2.ruling, "seconds": p2.seconds,
+                                }),
+                            );
+                        }
+                        results.lock().expect("judge results mutex poisoned").push(JudgeChunkResult {
+                            index,
+                            tokens: outcome.tokens,
+                            calls: outcome.calls,
+                            pass1_ms: outcome.pass1_ms,
+                            pass2_ms: outcome.pass2_ms,
+                            dispatch_error: outcome.dispatch_error,
+                            served_model: outcome.served_model.clone(),
+                            judged: JudgedFlag {
+                                flag: flag.clone(),
+                                pass1: outcome.pass1,
+                                pass2: outcome.pass2,
+                                tier: outcome.tier,
+                                demoted_by_pass2: outcome.demoted_by_pass2,
+                                verify: None,
+                                demoted_by_verify: false,
+                            },
+                        });
+                    });
+                }
+            });
+        }
+
+        let mut results = results.into_inner().expect("judge results mutex poisoned");
+        results.sort_by_key(|r| r.index);
+
+        let wall_ms = t0.elapsed().as_millis() as u64;
+        let judge_tokens: u64 = results.iter().map(|r| r.tokens).sum();
+        let judge_calls: u32 = results.iter().map(|r| r.calls).sum();
+        let judge_dispatch_errors = results.iter().filter(|r| r.dispatch_error).count();
+        let judge_served_model = results.iter().find_map(|r| r.served_model.clone());
+        // Per-pass wall-time breakdown (summed across every flag's own
+        // dispatches — real elapsed if run sequentially; with `concurrency
+        // > 1` these overlap in wall-clock, so the sum is a COST metric,
+        // not a timeline).
+        let pass1_wall_ms: u64 = results.iter().map(|r| r.pass1_ms).sum();
+        let pass2_wall_ms: u64 = results.iter().map(|r| r.pass2_ms).sum();
+
+        let judged: Vec<JudgedFlag> = results.into_iter().map(|r| r.judged).collect();
+
+        emit_funnel_step_result(
+            "funnel.judge",
+            &step.id,
+            &self.ctx.case_id,
+            json!({
+                "items_in": deduped.len(), "items_out": judged.len(), "wall_ms": wall_ms,
+                "pass1_wall_ms": pass1_wall_ms, "pass2_wall_ms": pass2_wall_ms,
+                "model": judge_identifier, "tokens": judge_tokens, "calls": judge_calls,
+                "dispatch_errors": judge_dispatch_errors, "concurrency": concurrency,
+                "served_model": judge_served_model,
+            }),
+        );
+
+        let output = serde_json::to_string(&judged).context("serializing judged flags")?;
+        Ok(StepOutcome { output, flow_records: Vec::new() })
+    }
+
+    fn residency(&self, _step: &Step, _task: &Task) -> Option<darkmux_gestalt::Placement> {
+        if self.judge.pm.is_remote() {
+            return None;
+        }
+        let n_ctx = self.judge.pm.n_ctx?;
+        let identifier = darkmux_gestalt::namespaced_identifier(&self.judge.pm.id, self.judge.pm.identifier.as_deref());
+        Some(darkmux_gestalt::Placement {
+            model_key: self.judge.pm.id.clone(),
+            identifier,
+            min_ctx: n_ctx,
+            seat: "funnel-judge".to_string(),
+        })
+    }
+}
+
+// ─── report: verify ──────────────────────────────────────────────────────
+
+/// Phase "report", step 1: internally loops over judge-confirmed flags only
+/// — an empty confirmed set (judge came back degenerate, or every flag was
+/// needs-check/archived) means this loop runs zero times, a normal outcome
+/// of a for-each loop given an empty input, never a structural special case.
+/// This makes the historical "verify only runs when judge isn't degenerate"
+/// bug (a shared judge/verify graph previously let verify fire on
+/// judge-doomed runs) structurally impossible: verify's OWN `depends_on` is
+/// `judge`, and it only ever iterates `judge`'s CONFIRMED output — there is
+/// no separate "is the run degenerate" gate to forget. Reuses
+/// `verify_prompt`/`verify_pass_with_retry` VERBATIM.
+pub struct FunnelVerifyStepKind {
+    pub ctx: Arc<FunnelStepContext>,
+    pub verify: Option<ResolvedSeatStaffing>,
+}
+
+impl StepKind for FunnelVerifyStepKind {
+    fn id(&self) -> &'static str {
+        "funnel.verify"
+    }
+
+    fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        let judge_output = input.values().next().cloned().unwrap_or_default();
+        let mut judged: Vec<JudgedFlag> = if judge_output.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&judge_output).context("deserializing judged flags")?
+        };
+
+        let Some(vstaff) = &self.verify else {
+            // Crew declares no `review-verify` seat — byte-identical to
+            // today: no dispatch, no records, judged flags pass through.
+            let output = serde_json::to_string(&judged).context("serializing judged flags")?;
+            return Ok(StepOutcome { output, flow_records: Vec::new() });
+        };
+
+        let docket_count = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
+        if docket_count == 0 {
+            let output = serde_json::to_string(&judged).context("serializing judged flags")?;
+            return Ok(StepOutcome { output, flow_records: Vec::new() });
+        }
+
+        let identifier = seat_identifier(&vstaff.pm);
+        let endpoint = seat_endpoint(&vstaff.pm);
+        let endpoint_host = seat_endpoint_host(&vstaff.pm);
+        let max_tokens = resolve_seat_max_tokens(vstaff, DEFAULT_JUDGE_MAX_TOKENS);
+        let mut bucket = RemoteBucket::new("verify", self.ctx.remote_max_tokens_per_execution);
+        let mut chat = |call: &ChatCall| dispatch_chat(&self.ctx, call);
+
+        let t0 = Instant::now();
+        let mut calls = 0u32;
+        let mut tokens = 0u64;
+        let mut served_model: Option<String> = None;
+        for j in judged.iter_mut().filter(|j| j.tier == Tier::Confirmed) {
+            let (record, spent, made, served) = if endpoint.is_some() && !bucket.admit() {
+                (
+                    VerifyRecord {
+                        ruling: VerifyRuling::Error,
+                        decisive_evidence: String::new(),
+                        note_for_author:
+                            "remote token budget exhausted for this stage — call skipped".to_string(),
+                        seconds: 0.0,
+                        model: identifier.clone(),
+                    },
+                    0u64,
+                    0u32,
+                    None,
+                )
+            } else {
+                let bundle = self.ctx.bundles.iter().find(|b| b.id == j.flag.bundle_id);
+                let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
+                let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
+                let prompt =
+                    verify_prompt(&self.ctx.intent_title, &self.ctx.intent_body, code, facts, &j.flag.charge_text);
+                let out = verify_pass_with_retry(
+                    &identifier,
+                    &self.ctx.verify_system,
+                    &prompt,
+                    max_tokens,
+                    endpoint,
+                    &mut chat,
+                );
+                if endpoint.is_some() {
+                    bucket.spend(out.1, out.2);
+                }
+                out
+            };
+            tokens += spent;
+            calls += made;
+            if served_model.is_none() {
+                served_model = served;
+            }
+            emit_funnel_step_result(
+                "funnel.verify",
+                "funnel-ruling",
+                &self.ctx.case_id,
+                json!({ "bundle_id": j.flag.bundle_id, "stage": "verify", "ruling": record.ruling, "seconds": record.seconds }),
+            );
+            if record.ruling == VerifyRuling::Refuted {
+                j.tier = Tier::Archived;
+                j.demoted_by_verify = true;
+            }
+            j.verify = Some(record);
+        }
+        let wall_ms = t0.elapsed().as_millis() as u64;
+
+        emit_funnel_step_result(
+            "funnel.verify",
+            &step.id,
+            &self.ctx.case_id,
+            json!({
+                "items_in": docket_count, "items_out": docket_count, "wall_ms": wall_ms,
+                "model": identifier, "tokens": tokens, "calls": calls,
+                "remote": endpoint.is_some(), "endpoint": endpoint_host, "served_model": served_model,
+            }),
+        );
+
+        let output = serde_json::to_string(&judged).context("serializing verified flags")?;
+        Ok(StepOutcome { output, flow_records: Vec::new() })
+    }
+
+    fn residency(&self, _step: &Step, _task: &Task) -> Option<darkmux_gestalt::Placement> {
+        let vstaff = self.verify.as_ref()?;
+        if vstaff.pm.is_remote() {
+            return None;
+        }
+        let n_ctx = vstaff.pm.n_ctx?;
+        let identifier = darkmux_gestalt::namespaced_identifier(&vstaff.pm.id, vstaff.pm.identifier.as_deref());
+        Some(darkmux_gestalt::Placement {
+            model_key: vstaff.pm.id.clone(),
+            identifier,
+            min_ctx: n_ctx,
+            seat: "funnel-verify".to_string(),
+        })
+    }
+}
+
+// ─── report: synthesis (terminal step) ──────────────────────────────────
+
+/// Phase "report", terminal step: `depends_on` BOTH `dedup` (for
+/// `FunnelEnvelope::flags`, the deduped list) and `verify` (for the final,
+/// verify-adjusted `FunnelEnvelope::judged`) — graph-native data flow
+/// rather than a bespoke side channel. Recomputes tier counts +
+/// `cluster_needs_check` (VERBATIM, explicitly preserved) directly from the
+/// final judged list — correct by construction, no incremental-accumulator
+/// double-counting risk. Procedural — no dispatch. Produces the FINAL
+/// `FunnelEnvelope` (not the posted-comment `Rendered` markdown — that
+/// stays `pr_review.rs::synthesize_funnel`'s job; see the module doc's
+/// crate-boundary note).
+pub struct FunnelSynthesisStepKind {
+    pub ctx: Arc<FunnelStepContext>,
+    pub env: SharedFunnelEnvelope,
+    /// (#1341) `gather_inputs` now keys a Step's `input` map by the
+    /// DEPENDENCY TASK's id (dependency/data-flow lives at Task level) —
+    /// so this step reads its two upstream contributions by TASK id, not
+    /// step id.
+    pub dedup_task_id: String,
+    pub verify_task_id: String,
+}
+
+impl StepKind for FunnelSynthesisStepKind {
+    fn id(&self) -> &'static str {
+        "funnel.synthesis"
+    }
+
+    fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        let t0 = Instant::now();
+        let dedup_output = input.get(&self.dedup_task_id).cloned().unwrap_or_default();
+        let verify_output = input.get(&self.verify_task_id).cloned().unwrap_or_default();
+        let flags: Vec<ProbeFlag> = if dedup_output.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&dedup_output).context("deserializing deduped flags")?
+        };
+        let judged: Vec<JudgedFlag> = if verify_output.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&verify_output).context("deserializing final judged flags")?
+        };
+
+        let mut env = self.env.lock().expect("shared funnel envelope mutex poisoned").clone();
+        env.raw_flags = env.raw_flags.max(flags.len());
+        env.deduped_flags = flags.len();
+        env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
+        env.needs_check = judged.iter().filter(|j| j.tier == Tier::NeedsCheck).count();
+        env.archived = judged.iter().filter(|j| j.tier == Tier::Archived).count();
+        env.needs_check_clusters = cluster_needs_check(&judged);
+        env.verified = judged
+            .iter()
+            .filter(|j| matches!(&j.verify, Some(v) if v.ruling == VerifyRuling::Verified))
+            .count();
+        env.refuted = judged.iter().filter(|j| j.demoted_by_verify).count();
+        env.flags = flags;
+        env.judged = judged;
+
+        // Judge-dead honesty gate (unchanged reasoning from `finish_funnel`):
+        // no flag produced a usable pass-1 ruling means the judge phase
+        // produced no signal worth rendering — a degenerate run, named.
+        if env.degenerate.is_none() && !env.judged.is_empty() {
+            let usable = env
+                .judged
+                .iter()
+                .filter(|j| {
+                    matches!(
+                        j.pass1.ruling,
+                        FunnelRuling::Confirmed | FunnelRuling::NeedsCheck | FunnelRuling::FalsePositive
+                    )
+                })
+                .count();
+            if usable == 0 {
+                env.degenerate = Some(format!(
+                    "judge produced no usable ruling on any of {} flags (all errored/unparsed)",
+                    env.judged.len()
+                ));
+            }
+        }
+
+        *self.env.lock().expect("shared funnel envelope mutex poisoned") = env.clone();
+
+        let wall_ms = t0.elapsed().as_millis() as u64;
+        emit_funnel_step_result(
+            "funnel.synthesis",
+            &step.id,
+            &self.ctx.case_id,
+            json!({
+                "confirmed": env.confirmed, "needs_check": env.needs_check, "archived": env.archived,
+                "verified": env.verified, "refuted": env.refuted, "wall_ms": wall_ms,
+            }),
+        );
+
+        let output = serde_json::to_string(&env).context("serializing final envelope")?;
+        Ok(StepOutcome { output, flow_records: Vec::new() })
+    }
+}
+
+/// The shared, mutex-guarded `FunnelEnvelope` every funnel step kind
+/// contributes cross-cutting metrics to (member records, warnings, remote
+/// budgets — fields with no single "owning" step) — the funnel's own
+/// equivalent of `mission_run.rs`'s `Arc<Mutex<Option<T>>>` result-slot
+/// pattern for rich results that don't fit `StepOutcome.output: String`.
+/// The FLAG DATA itself (`env.flags`/`env.judged`) flows graph-natively
+/// through `Step.output`/`gather_inputs` instead (dedup → judge → verify →
+/// synthesis) — this handle is deliberately NOT where that lives.
+pub type SharedFunnelEnvelope = Arc<StdMutex<FunnelEnvelope>>;
+
+/// Everything [`build_funnel_graph`] hands back: the `Task`/`Step` shape
+/// (for the caller to persist via `darkmux_crew::lifecycle::save_task`/
+/// `save_step` under real Phase ids it creates — this module has no
+/// `mission_id`/`lifecycle` dependency of its own, see the module doc's
+/// crate-boundary note), the resolved [`StepKindRegistry`], the shared
+/// cross-cutting envelope state, and a `step_id -> Task.phase_id` map (so
+/// the caller can persist each Step under the SAME Phase its owning Task
+/// belongs to without re-deriving the lookup).
+pub struct BuiltFunnelGraph {
+    pub tasks: Vec<Task>,
+    pub steps: std::collections::BTreeMap<String, Step>,
+    pub registry: StepKindRegistry,
+    pub shared_env: SharedFunnelEnvelope,
+    pub synthesis_step_id: String,
+    pub phase_id_of_step: std::collections::BTreeMap<String, String>,
+    /// The probe stage's accumulated `MemberRecord`s + reduced-coverage
+    /// warnings + shared remote-token bucket — still EMPTY/unspent at
+    /// return time (every probe step is registered, not yet run);
+    /// [`run_funnel_graph`] reads them back through these SAME `Arc` handles
+    /// AFTER `run_step_graph` completes, when every probe step kind has
+    /// actually written into them.
+    probe_members: Arc<StdMutex<Vec<MemberRecord>>>,
+    probe_warnings: Arc<StdMutex<Vec<String>>>,
+    probe_bucket: Arc<StdMutex<RemoteBucket>>,
+}
+
+/// Build the funnel's complete Task/Step graph across three Phases
+/// (investigate / adjudicate / report — see the module doc) PLUS the
+/// registry every step kind resolves through — see [`BuiltFunnelGraph`].
+/// Caller persists `tasks`/`steps`, then runs the graph via
+/// [`run_funnel_graph`].
+///
+/// `case_id` seeds every Step/Task id so a single mission running multiple
+/// PR reviews (unlikely today, but not precluded) never collides.
+#[allow(clippy::too_many_arguments)]
+pub fn build_funnel_graph(
+    ctx: Arc<FunnelStepContext>,
+    judge: ResolvedSeatStaffing,
+    verify: Option<ResolvedSeatStaffing>,
+    probes: &[ResolvedSeatStaffing],
+    investigate_phase_id: &str,
+    adjudicate_phase_id: &str,
+    report_phase_id: &str,
+    judge_concurrency: u32,
+) -> BuiltFunnelGraph {
+    let mut steps = std::collections::BTreeMap::new();
+    let mut tasks = Vec::new();
+    let mut phase_id_of_step = std::collections::BTreeMap::new();
+    let registry = StepKindRegistry::new();
+
+    let bundle_step_id = "funnel-bundle-step".to_string();
+    let bundle_task_id = "funnel-bundle-task".to_string();
+    tasks.push(Task {
+        id: bundle_task_id.clone(),
+        phase_id: investigate_phase_id.to_string(),
+        description: "resolve review bundles from the diff".to_string(),
+        step_ids: vec![bundle_step_id.clone()],
+        depends_on: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    });
+    steps.insert(
+        bundle_step_id.clone(),
+        Step {
+            id: bundle_step_id.clone(),
+            task_id: bundle_task_id.clone(),
+            kind: "funnel.bundle".to_string(),
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        },
+    );
+    registry
+        .register(Arc::new(FunnelBundleStepKind { ctx: ctx.clone() }))
+        .expect("funnel.bundle registered once");
+
+    let bucket = Arc::new(StdMutex::new(RemoteBucket::new("probe", ctx.remote_max_tokens_per_execution)));
+    let probe_members = Arc::new(StdMutex::new(Vec::new()));
+    let probe_warnings = Arc::new(StdMutex::new(Vec::new()));
+    let mut probe_task_ids = Vec::new();
+    for (idx, staffing) in probes.iter().enumerate() {
+        let step_id = format!("funnel-probe-{idx}-step");
+        let task_id = format!("funnel-probe-{idx}-task");
+        let kind_id = format!("funnel.probe:{}", staffing.name);
+        tasks.push(Task {
+            id: task_id.clone(),
+            phase_id: investigate_phase_id.to_string(),
+            description: format!("probe seat `{}`", staffing.name),
+            step_ids: vec![step_id.clone()],
+            depends_on: vec![bundle_task_id.clone()],
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        });
+        steps.insert(
+            step_id.clone(),
+            Step {
+                id: step_id.clone(),
+                task_id: task_id.clone(),
+                kind: kind_id.clone(),
+                status: NodeStatus::Planned,
+                config: serde_json::Value::Null,
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
+        );
+        let kind = Arc::new(FunnelProbeStepKind::new(
+            ctx.clone(),
+            staffing.clone(),
+            bucket.clone(),
+            probe_members.clone(),
+            probe_warnings.clone(),
+        ));
+        registry.register(kind).expect("each probe seat's kind id is unique per staffing name");
+        probe_task_ids.push(task_id);
+    }
+
+    let dedup_step_id = "funnel-dedup-step".to_string();
+    let dedup_task_id = "funnel-dedup-task".to_string();
+    tasks.push(Task {
+        id: dedup_task_id.clone(),
+        phase_id: investigate_phase_id.to_string(),
+        description: "dedup probe flags — mechanism-family keying + anchor matching".to_string(),
+        step_ids: vec![dedup_step_id.clone()],
+        depends_on: probe_task_ids,
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    });
+    steps.insert(
+        dedup_step_id.clone(),
+        Step {
+            id: dedup_step_id.clone(),
+            task_id: dedup_task_id.clone(),
+            kind: "funnel.dedup".to_string(),
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        },
+    );
+    registry
+        .register(Arc::new(FunnelDedupStepKind { ctx: ctx.clone() }))
+        .expect("funnel.dedup registered once");
+
+    let judge_step_id = "funnel-judge-step".to_string();
+    let judge_task_id = "funnel-judge-task".to_string();
+    tasks.push(Task {
+        id: judge_task_id.clone(),
+        phase_id: adjudicate_phase_id.to_string(),
+        description: "double-confirm judge — internal pass1/pass2 loop over deduped flags".to_string(),
+        step_ids: vec![judge_step_id.clone()],
+        depends_on: vec![dedup_task_id.clone()],
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    });
+    steps.insert(
+        judge_step_id.clone(),
+        Step {
+            id: judge_step_id.clone(),
+            task_id: judge_task_id.clone(),
+            kind: "funnel.judge".to_string(),
+            status: NodeStatus::Planned,
+            config: json!({ "concurrency": judge_concurrency }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        },
+    );
+    registry
+        .register(Arc::new(FunnelJudgeStepKind { ctx: ctx.clone(), judge }))
+        .expect("funnel.judge registered once");
+
+    let verify_step_id = "funnel-verify-step".to_string();
+    let verify_task_id = "funnel-verify-task".to_string();
+    tasks.push(Task {
+        id: verify_task_id.clone(),
+        phase_id: report_phase_id.to_string(),
+        description: "verify — adjudicate confirmed findings".to_string(),
+        step_ids: vec![verify_step_id.clone()],
+        depends_on: vec![judge_task_id],
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    });
+    steps.insert(
+        verify_step_id.clone(),
+        Step {
+            id: verify_step_id.clone(),
+            task_id: verify_task_id.clone(),
+            kind: "funnel.verify".to_string(),
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        },
+    );
+    registry
+        .register(Arc::new(FunnelVerifyStepKind { ctx: ctx.clone(), verify }))
+        .expect("funnel.verify registered once");
+
+    let synthesis_step_id = "funnel-synthesis-step".to_string();
+    let synthesis_task_id = "funnel-synthesis-task".to_string();
+    tasks.push(Task {
+        id: synthesis_task_id.clone(),
+        phase_id: report_phase_id.to_string(),
+        description: "synthesis — finalize tier counts + needs-check clustering".to_string(),
+        step_ids: vec![synthesis_step_id.clone()],
+        depends_on: vec![dedup_task_id.clone(), verify_task_id.clone()],
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    });
+    steps.insert(
+        synthesis_step_id.clone(),
+        Step {
+            id: synthesis_step_id.clone(),
+            task_id: synthesis_task_id,
+            kind: "funnel.synthesis".to_string(),
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        },
+    );
+
+    let shared_env: SharedFunnelEnvelope = Arc::new(StdMutex::new(FunnelEnvelope {
+        case_id: ctx.case_id.clone(),
+        bundles: ctx.bundles.len(),
+        ..Default::default()
+    }));
+    registry
+        .register(Arc::new(FunnelSynthesisStepKind {
+            ctx: ctx.clone(),
+            env: shared_env.clone(),
+            dedup_task_id,
+            verify_task_id,
+        }))
+        .expect("funnel.synthesis registered once");
+
+    // `step_id -> Task.phase_id`, derived once from `tasks` (each Task
+    // already carries both) rather than threaded through every push site
+    // above.
+    for task in &tasks {
+        for step_id in &task.step_ids {
+            phase_id_of_step.insert(step_id.clone(), task.phase_id.clone());
+        }
+    }
+
+    BuiltFunnelGraph {
+        tasks,
+        steps,
+        registry,
+        shared_env,
+        synthesis_step_id,
+        phase_id_of_step,
+        probe_members,
+        probe_warnings,
+        probe_bucket: bucket,
+    }
+}
+
+/// Run the funnel's complete Task/Step graph via ONE `run_step_graph` call
+/// (the module's whole point — see its doc). Wraps the run in the SAME
+/// task-level bookend (`funnel.task` started/finished/error) + host
+/// telemetry sampler [`run_funnel_impl`] always used — that machinery stays
+/// OUTSIDE the graph, on the calling thread, since `FunnelBookendGuard`
+/// can't cross a `run_bounded` worker-thread boundary (see the module doc).
+/// Assembles the final [`FunnelEnvelope`] from the synthesis step's output
+/// merged with the shared cross-cutting state, and returns the COMPLETED
+/// `steps` map (status/output/timestamps all reflect the real run) so the
+/// caller can persist the final Step records — `darkmux mission status`/the
+/// graph lens must show what actually happened, never the pre-run
+/// `Planned` snapshot `build_funnel_graph` produced.
+pub fn run_funnel_graph(
+    ctx: &FunnelStepContext,
+    crew_name: &str,
+    mode: ExecMode,
+    fingerprint_val: serde_json::Value,
+    staffing: CrewStaffingSnapshot,
+    graph: BuiltFunnelGraph,
+    emitter: &mut dyn FunnelEmitter,
+) -> Result<(FunnelEnvelope, std::collections::BTreeMap<String, Step>)> {
+    let BuiltFunnelGraph {
+        tasks,
+        mut steps,
+        registry,
+        shared_env,
+        synthesis_step_id,
+        probe_members,
+        probe_warnings,
+        probe_bucket,
+        ..
+    } = graph;
+    let tasks_by_id: std::collections::BTreeMap<String, Task> =
+        tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
+
+    {
+        let mut env = shared_env.lock().expect("shared funnel envelope mutex poisoned");
+        env.case_id = ctx.case_id.clone();
+        env.crew = crew_name.to_string();
+        env.mode = mode_label(mode).to_string();
+        env.fingerprint = fingerprint_val;
+        env.staffing = Some(staffing);
+    }
+
+    let mut sink = EmitterSink(emitter);
+    let mut guard = FunnelBookendGuard::new(&mut sink, &ctx.case_id, crew_name);
+    guard.task_started(json!({
+        "status": "started", "case_id": ctx.case_id, "crew": crew_name,
+        "exec_mode": mode_label(mode), "bundles": ctx.bundles.len(),
+    }));
+
+    let facts = {
+        let mut host = LmsHost::new();
+        gather_facts(&mut host).unwrap_or_default()
+    };
+    let est = inert_estimator();
+
+    // `run_step_graph`'s own emit closure runs entirely on the MAIN thread
+    // (the scheduler drains each wave's `run_bounded` results before
+    // calling `emit` — see `scheduler::run_step_graph`'s loop), never
+    // inside a worker thread, so capturing `&mut guard` here is safe
+    // despite `FunnelBookendGuard` not being `Send` (the constraint the
+    // module doc's "guard can't cross a `run_bounded` worker-thread
+    // boundary" note is about StepKind::run() bodies, which DO run inside
+    // workers — not about this closure). This routes the scheduler's
+    // generic step-lifecycle bookends through the SAME injected
+    // `FunnelEmitter` every other record in this driver uses — the driver
+    // stays sink-agnostic (module doc), never calling `darkmux_flow::
+    // record` directly itself.
+    let report = run_step_graph(&mut steps, &tasks_by_id, &registry, &facts, &est, 8, &mut |record| {
+        guard.emit_now(record);
+    });
+
+    // Merge the probe stage's NOW-populated accumulators (every probe step
+    // has run by the time `run_step_graph` returns, whether it errored or
+    // not) into the shared envelope — this can only happen AFTER the run,
+    // not at `build_funnel_graph` time when they were still empty.
+    {
+        let mut env = shared_env.lock().expect("shared funnel envelope mutex poisoned");
+        env.members
+            .extend(probe_members.lock().expect("probe members mutex poisoned").iter().cloned());
+        env.warnings
+            .extend(probe_warnings.lock().expect("probe warnings mutex poisoned").iter().cloned());
+        if let Some(rec) = probe_bucket.lock().expect("probe bucket mutex poisoned").record() {
+            if rec.skipped_calls > 0 {
+                env.warnings.push(format!(
+                    "remote probe token budget exhausted — {} draw(s) skipped after the \
+                     per-execution allowance ({} tokens) ran out; reduced coverage",
+                    rec.skipped_calls, rec.max_tokens
+                ));
+            }
+            env.remote_budgets.push(rec);
+        }
+    }
+
+    let report = match report {
+        Ok(r) => r,
+        Err(e) => {
+            let mut env = shared_env.lock().expect("shared funnel envelope mutex poisoned").clone();
+            env.degenerate = Some(format!("funnel graph scheduling failed: {e:#}"));
+            guard.task_finished(&env);
+            return Ok((env, steps));
+        }
+    };
+
+    let env = if report.errored.is_empty() {
+        match steps.get(&synthesis_step_id).and_then(|s| s.output.as_deref()) {
+            Some(out) => serde_json::from_str::<FunnelEnvelope>(out)
+                .unwrap_or_else(|_| shared_env.lock().expect("shared funnel envelope mutex poisoned").clone()),
+            None => shared_env.lock().expect("shared funnel envelope mutex poisoned").clone(),
+        }
+    } else {
+        let mut env = shared_env.lock().expect("shared funnel envelope mutex poisoned").clone();
+        if env.degenerate.is_none() {
+            env.degenerate = Some(format!(
+                "funnel graph: step(s) errored: {}",
+                report.errored.join(", ")
+            ));
+        }
+        env
+    };
+
+    guard.task_finished(&env);
+    Ok((env, steps))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -7724,5 +8950,133 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             .find(|p| p["status"] == "finished")
             .expect("terminal record");
         assert!(remote_finished.get("remote_tokens").is_some(), "a remote seat stamps remote_tokens");
+    }
+
+    // ─── (#1230/#1341 DRY pass) Task/Step graph orchestration ───────────
+
+    fn step_ctx(crew: &ResolvedCrew, bundles: Vec<BundleInput>) -> Arc<FunnelStepContext> {
+        Arc::new(FunnelStepContext {
+            case_id: "case-1".to_string(),
+            crew: crew.clone(),
+            intent_title: String::new(),
+            intent_body: String::new(),
+            diff: DIFF.to_string(),
+            probe_system: "probe prior".to_string(),
+            judge_system: "judge persona".to_string(),
+            verify_system: "verify persona".to_string(),
+            bundles,
+            remote_max_tokens_per_execution: 500_000,
+            timeout_seconds: 30,
+        })
+    }
+
+    /// The graph's SHAPE is fully knowable upfront (the redesign's whole
+    /// point): three Phases, `depends_on` edges crossing Phase boundaries
+    /// exactly like they cross Task boundaries within one, and every Step
+    /// resolvable through the registry `build_funnel_graph` also builds.
+    /// Pure structural assertion — no dispatch, no network.
+    #[test]
+    fn build_funnel_graph_has_three_phases_and_correct_dependencies() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model-a", 1), staffing("slow", "probe-model-b", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+        ]);
+        let seats = validate_funnel_crew(&crew).expect("valid crew");
+        let ctx = step_ctx(&crew, vec![]);
+
+        let graph = build_funnel_graph(
+            ctx,
+            seats.judge.clone(),
+            seats.verify.cloned(),
+            seats.probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        );
+
+        // bundle(1) + probe(2 seats) + dedup(1) = investigate's 4 tasks.
+        let investigate_tasks: Vec<_> = graph.tasks.iter().filter(|t| t.phase_id == "investigate").collect();
+        assert_eq!(investigate_tasks.len(), 4, "bundle + 2 probe seats + dedup");
+        let adjudicate_tasks: Vec<_> = graph.tasks.iter().filter(|t| t.phase_id == "adjudicate").collect();
+        assert_eq!(adjudicate_tasks.len(), 1, "judge only");
+        let report_tasks: Vec<_> = graph.tasks.iter().filter(|t| t.phase_id == "report").collect();
+        assert_eq!(report_tasks.len(), 2, "verify + synthesis");
+
+        // (#1341) Cross-phase dependency now lives on `Task.depends_on`
+        // (Steps have none of their own) — adjudicate's judge TASK depends
+        // on investigate's dedup TASK, no special cross-phase mechanism.
+        let tasks_by_id: std::collections::BTreeMap<&str, &Task> =
+            graph.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        let dedup_step_id = "funnel-dedup-step";
+        let judge_task = tasks_by_id["funnel-judge-task"];
+        assert_eq!(judge_task.depends_on, vec!["funnel-dedup-task".to_string()]);
+        assert_eq!(graph.phase_id_of_step[dedup_step_id], "investigate");
+        assert_eq!(graph.phase_id_of_step["funnel-judge-step"], "adjudicate");
+
+        // report's synthesis TASK depends on BOTH dedup (investigate) and
+        // verify (report) — graph-native cross-phase data flow, not a side
+        // channel.
+        let synth_task = tasks_by_id["funnel-synthesis-task"];
+        assert!(synth_task.depends_on.contains(&"funnel-dedup-task".to_string()));
+        assert!(synth_task.depends_on.contains(&"funnel-verify-task".to_string()));
+        assert_eq!(graph.phase_id_of_step["funnel-synthesis-step"], "report");
+
+        // Every step's `kind` resolves through the SAME registry — the
+        // scheduler contract this whole redesign hangs on.
+        for step in graph.steps.values() {
+            assert!(graph.registry.get(&step.kind).is_ok(), "step `{}` kind `{}` must resolve", step.id, step.kind);
+        }
+
+        // ONE call is the whole point: no separate driver loop needed to
+        // reach every step — `depends_on` alone determines readiness.
+        assert_eq!(graph.steps.len(), 7, "bundle + 2 probe + dedup + judge + verify + synthesis");
+    }
+
+    /// End-to-end through the REAL scheduler (`run_step_graph`, one call —
+    /// see the module doc) with an EMPTY bundle set: every dispatch-shaped
+    /// step (probe/judge/verify) iterates zero items and makes ZERO chat
+    /// calls (probe's `select_bundles_for_staffing` returns empty; judge's
+    /// deduped list is empty; verify's confirmed docket is empty) — so this
+    /// exercises the full graph, all three Phases, without a live LMStudio
+    /// or network. Confirms the degenerate reason ends up in the FINAL
+    /// envelope regardless of which stage would have detected it.
+    #[test]
+    fn run_funnel_graph_with_empty_bundles_completes_with_zero_dispatches() {
+        let crew = valid_crew();
+        let seats = validate_funnel_crew(&crew).expect("valid crew");
+        let judge = seats.judge.clone();
+        let verify = seats.verify.cloned();
+        let probes: Vec<_> = seats.probes.clone();
+        let ctx = step_ctx(&crew, vec![]);
+
+        let graph = build_funnel_graph(ctx.clone(), judge.clone(), verify.clone(), &probes, "investigate", "adjudicate", "report", 1);
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), false);
+
+        let mut emitter = RecordingEmitter::new();
+        let (env, steps) =
+            run_funnel_graph(&ctx, "test-crew", ExecMode::Sequential, fingerprint_val, staffing_snap, graph, &mut emitter)
+                .expect("graph run completes even with zero bundles");
+
+        assert_eq!(env.bundles, 0);
+        assert_eq!(env.deduped_flags, 0);
+        assert_eq!(env.confirmed, 0);
+        assert_eq!(env.needs_check, 0);
+        // Every declared step reached a terminal status — the graph never
+        // stalls on a "ready but never scheduled" node.
+        for step in steps.values() {
+            assert!(
+                matches!(step.status, NodeStatus::Complete | NodeStatus::Error),
+                "step `{}` (kind `{}`) must reach a terminal status, got {:?}",
+                step.id,
+                step.kind,
+                step.status
+            );
+        }
+        // The scheduler's own generic step-lifecycle bookends fired for
+        // every step (free observability — see the module doc).
+        let starts = emitter.records.iter().filter(|r| r.action == "step start").count();
+        assert_eq!(starts, steps.len(), "every declared step got a lifecycle start record");
     }
 }

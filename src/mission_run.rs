@@ -29,13 +29,13 @@ use crate::fleet;
 use crate::flow;
 use darkmux_types::style;
 
-/// Emit a mission-run lifecycle flow record so the frontier orchestrator can
-/// **track** the run as a unit on the stream (`mission.run.*`), bracketing the
-/// inner coder + reviewer dispatch records. This is the "track" half of the
-/// hybrid contract: the verb runs the mechanical loop, but every step is
-/// observable (tail the stream / watch the viewer), the gate is a hard pause,
-/// and `mission abort` is the explicit teardown — the operator/frontier stays
-/// in control of a CLI verb. Best-effort (observability, never loop-failing).
+/// Emit a mission-run lifecycle flow record for the mission-level events
+/// OUTSIDE the worktree→coder→verify Task/Step graph — `mission abort`'s
+/// teardown and `mission ship`'s commit→PR→merge sequence (#1230 Packet 4:
+/// the graph's own three steps retired their bespoke `mission.run.*`
+/// vocabulary in favor of the scheduler's generic step-lifecycle bookends
+/// plus [`emit_step_result`]'s companion payload — see that function's doc).
+/// Best-effort (observability, never loop-failing).
 fn emit_run_record(
     level: flow::Level,
     action: &str,
@@ -53,6 +53,48 @@ fn emit_run_record(
         Some(mission_id),
         Some(phase_id),
         Some(payload),
+    ));
+}
+
+/// (#1230 Packet 4) Emit a `"step result"` flow record — the rich,
+/// kind-specific companion to the scheduler's generic step-lifecycle
+/// bookends (`"step start"`/`"step complete"`/`"step error"`, emitted for
+/// free by `run_step_graph` itself). Retires the bespoke per-purpose
+/// `mission.run.start`/`mission.run.error`/`mission.run.verification`/
+/// `mission.run.qa-unavailable`/`mission.run.blocked`/`mission.run.gate`
+/// vocabulary those three step kinds and `run()`'s own post-graph gate
+/// logic used to emit directly — ONE generic action name now, with `kind`
+/// (`"mission.worktree"` | `"mission.coder"` | `"mission.verify"`) plus a
+/// free-form `payload` object distinguishing WHICH step and WHAT happened,
+/// mirroring the funnel module's own `funnel.step`/`funnel.ruling`
+/// generic-action-plus-payload convention. Consumers: the viewer's
+/// `cycleStage()`, `darkmux-serve`'s `resolve_session` (the `/diff`
+/// endpoint), and `session_failed_verifiers` below all filter on `kind`
+/// rather than a per-purpose action string now.
+fn emit_step_result(
+    level: flow::Level,
+    kind: &str,
+    step_id: &str,
+    mission_id: &str,
+    phase_id: &str,
+    session_id: &str,
+    payload: serde_json::Value,
+) {
+    let mut full = serde_json::json!({ "step_id": step_id, "kind": kind });
+    if let (serde_json::Value::Object(extra), serde_json::Value::Object(base)) =
+        (payload, &mut full)
+    {
+        base.extend(extra);
+    }
+    let _ = flow::record(crew::dispatch::build_dispatch_record_with_payload(
+        level,
+        "step result",
+        "mission-run",
+        session_id,
+        None,
+        Some(mission_id),
+        Some(phase_id),
+        Some(full),
     ));
 }
 
@@ -266,21 +308,23 @@ fn conventions_branch(
 }
 
 /// Choose which phase to run. Explicit `--phase` wins (validated to belong
-/// to the mission and not be terminal). Otherwise auto-select the single
-/// ready phase — `Planned` AND every `depends_on` entry resolves to a
-/// `Complete` phase (`crew::scheduler::is_ready` via the `PhaseNode`
-/// adapter, #1230 Packet 2 — replaces the historical flat
-/// `depends_on.is_empty()` "is this a root" filter, which only ever
-/// auto-selected phases with NO dependencies at all and never actually
-/// checked whether a phase's dependencies had been satisfied). 0 or >1
-/// ready is ambiguous and bails with guidance rather than guessing — the
-/// operator stays in the loop.
+/// to the mission and not be terminal). Otherwise auto-select the mission's
+/// single next-runnable phase. (#1341) Phases are strictly linear — ordered
+/// purely by position in `Mission.phase_ids`, no `depends_on` of their own
+/// — so "runnable" is a linear scan: the FIRST phase in that order whose
+/// status is `Planned` AND every phase before it is `Complete` (replaces
+/// the historical `crew::scheduler::is_ready`/`PhaseNode` graph check,
+/// itself a replacement for the even older flat `depends_on.is_empty()`
+/// filter). A strictly-linear list has at most ONE next-runnable phase, so
+/// the "0 or >1 ready is ambiguous" bail below only ever fires on the
+/// EMPTY case now (kept as a real branch for defensiveness — a
+/// hand-edited mission JSON could still produce an unexpected shape).
 fn select_phase(
     phases: &[crew::types::Phase],
+    mission_phase_ids: &[String],
     mission_id: &str,
     explicit: Option<&str>,
 ) -> Result<crew::types::Phase> {
-    use crew::scheduler::{is_ready, PhaseNode};
     use crew::types::PhaseStatus;
 
     if let Some(id) = explicit {
@@ -300,31 +344,35 @@ fn select_phase(
         return Ok(s.clone());
     }
 
-    // `by_id` covers every loaded phase (not just this mission's) since
-    // `depends_on` cross-mission references are unusual but not invalid
-    // (see `lifecycle::add_phase_to_mission`'s own doc comment).
-    let nodes: Vec<PhaseNode> = phases.iter().map(PhaseNode).collect();
-    let by_id: std::collections::BTreeMap<String, &PhaseNode> =
-        nodes.iter().map(|n| (n.0.id.clone(), n)).collect();
+    let phase_by_id: std::collections::BTreeMap<&str, &crew::types::Phase> =
+        phases.iter().map(|p| (p.id.as_str(), p)).collect();
 
-    let ready: Vec<&crew::types::Phase> = phases
-        .iter()
-        .filter(|s| s.mission_id == mission_id)
-        .filter(|s| is_ready(&PhaseNode(s), &by_id))
-        .collect();
+    let mut ready: Vec<&crew::types::Phase> = Vec::new();
+    let mut all_prior_complete = true;
+    for phase_id in mission_phase_ids {
+        let Some(phase) = phase_by_id.get(phase_id.as_str()) else { continue };
+        if all_prior_complete && phase.status == PhaseStatus::Planned {
+            ready.push(phase);
+            break;
+        }
+        if phase.status != PhaseStatus::Complete {
+            all_prior_complete = false;
+        }
+    }
 
     match ready.as_slice() {
         [] => bail!(
-            "mission `{mission_id}` has no ready phase to run (need a Planned phase with \
-             no unmet dependencies). Pass `--phase <id>` to target one explicitly, or check \
-             `darkmux mission show {mission_id}`."
+            "mission `{mission_id}` has no ready phase to run (need a Planned phase whose \
+             predecessor in mission order is Complete). Pass `--phase <id>` to target one \
+             explicitly, or check `darkmux mission show {mission_id}`."
         ),
         [one] => Ok((*one).clone()),
         many => {
             let ids: Vec<&str> = many.iter().map(|s| s.id.as_str()).collect();
             bail!(
-                "mission `{mission_id}` has {} ready phases ({}). `mission run` does one phase \
-                 at a time — pass `--phase <id>` to choose.",
+                "mission `{mission_id}` has {} ready phases ({}) — unexpected for a strictly \
+                 linear mission (hand-edited JSON?). `mission run` does one phase at a time — \
+                 pass `--phase <id>` to choose.",
                 many.len(),
                 ids.join(", ")
             )
@@ -409,7 +457,23 @@ use std::sync::{Arc, Mutex};
 /// ids the caller's `StepKindRegistry` resolves at scheduling time; this
 /// function only builds the graph SHAPE, not the registry (production vs.
 /// test registries wire different implementations behind the same ids).
-fn default_phase_graph(phase_id: &str, role: &str) -> (Vec<Task>, std::collections::BTreeMap<String, crew::types::Step>) {
+///
+/// (#1230/#1341) A Task is the ASSIGNABLE unit — the coder Task carries
+/// `role_id`/`workdir`/`image` (the assignee + environment for the whole
+/// job, fixed for its duration) rather than these being re-declared at
+/// Step level; the verify Task carries `role_id` too (`code-reviewer` is
+/// hardcoded inside `phase_review_output_at`, but the Task still records
+/// WHO is assigned for inspection — `darkmux mission status`/the graph
+/// lens read this, even though `MissionVerifyStepKind` itself dispatches
+/// directly rather than through `task.role_id`). The worktree Task is
+/// purely procedural (git plumbing, no crew assignment) — its resource
+/// fields stay `None`.
+fn default_phase_graph(
+    phase_id: &str,
+    role: &str,
+    wt_path: &Path,
+    image: Option<&str>,
+) -> (Vec<Task>, std::collections::BTreeMap<String, crew::types::Step>) {
     let worktree_task_id = format!("{phase_id}-worktree");
     let coder_task_id = format!("{phase_id}-coder");
     let verify_task_id = format!("{phase_id}-verify");
@@ -423,18 +487,35 @@ fn default_phase_graph(phase_id: &str, role: &str) -> (Vec<Task>, std::collectio
             phase_id: phase_id.to_string(),
             description: "prepare the phase worktree".to_string(),
             step_ids: vec![worktree_step_id.clone()],
+            depends_on: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
         },
         Task {
             id: coder_task_id.clone(),
             phase_id: phase_id.to_string(),
             description: format!("dispatch `{role}` into the worktree"),
             step_ids: vec![coder_step_id.clone()],
+            depends_on: vec![worktree_task_id.clone()],
+            role_id: Some(role.to_string()),
+            // (#984) mission run uses the default registry — no
+            // --profiles-file support on this verb.
+            profile_name: None,
+            workdir: Some(wt_path.to_path_buf()),
+            image: image.map(String::from),
         },
         Task {
             id: verify_task_id.clone(),
             phase_id: phase_id.to_string(),
             description: "local QA — mechanical verify (code-reviewer)".to_string(),
             step_ids: vec![verify_step_id.clone()],
+            depends_on: vec![coder_task_id.clone()],
+            role_id: Some("code-reviewer".to_string()),
+            profile_name: None,
+            workdir: Some(wt_path.to_path_buf()),
+            image: None,
         },
     ];
 
@@ -445,7 +526,6 @@ fn default_phase_graph(phase_id: &str, role: &str) -> (Vec<Task>, std::collectio
             id: worktree_step_id.clone(),
             task_id: worktree_task_id,
             kind: "mission.worktree".to_string(),
-            depends_on: Vec::new(),
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,
@@ -459,7 +539,6 @@ fn default_phase_graph(phase_id: &str, role: &str) -> (Vec<Task>, std::collectio
             id: coder_step_id.clone(),
             task_id: coder_task_id,
             kind: "mission.coder".to_string(),
-            depends_on: vec![worktree_step_id],
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,
@@ -473,7 +552,6 @@ fn default_phase_graph(phase_id: &str, role: &str) -> (Vec<Task>, std::collectio
             id: verify_step_id,
             task_id: verify_task_id,
             kind: "mission.verify".to_string(),
-            depends_on: vec![coder_step_id],
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,
@@ -487,9 +565,11 @@ fn default_phase_graph(phase_id: &str, role: &str) -> (Vec<Task>, std::collectio
 /// Wraps the worktree-creation half of the old hand-written sequence
 /// (moved here verbatim from the pre-migration `add_worktree` free
 /// function, deleted below — this was its only caller). Printing + the
-/// `mission.run.start` flow record happen HERE, at the same point in the
-/// sequence `run()` always emitted them (right after worktree creation
-/// succeeds).
+/// `"step result"` flow record (`kind: "mission.worktree"`) happen HERE, at
+/// the same point in the sequence `run()` always emitted them (right after
+/// worktree creation succeeds). `darkmux-serve`'s `resolve_session` (the
+/// `/diff` endpoint) reads this exact record for its worktree/base/branch
+/// payload — see [`emit_step_result`]'s doc.
 struct MissionWorktreeStepKind {
     repo_root: PathBuf,
     wt_path: PathBuf,
@@ -508,7 +588,8 @@ impl StepKind for MissionWorktreeStepKind {
 
     fn run(
         &self,
-        _step: &crew::types::Step,
+        step: &crew::types::Step,
+        _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
     ) -> Result<StepOutcome> {
         add_worktree(&self.repo_root, &self.wt_path, &self.branch, &self.base)?;
@@ -517,9 +598,10 @@ impl StepKind for MissionWorktreeStepKind {
             "{}",
             style::success(&format!("✓ worktree ready at {}", self.wt_path.display()))
         );
-        emit_run_record(
+        emit_step_result(
             flow::Level::Info,
-            "mission.run.start",
+            "mission.worktree",
+            &step.id,
             &self.mission_id,
             &self.phase_id,
             &self.session_id,
@@ -544,7 +626,7 @@ impl StepKind for MissionWorktreeStepKind {
 /// `run_step_graph` returns to reconstruct the exact detail the
 /// pre-migration inline code had at hand.
 struct CoderStepResult {
-    failed_verifiers: Vec<FailedVerifier>,
+    failed_verifiers: Vec<crew::step_kinds::FailedVerifier>,
     tokens_total: u32,
 }
 
@@ -584,7 +666,8 @@ impl StepKind for MissionCoderStepKind {
 
     fn run(
         &self,
-        _step: &crew::types::Step,
+        step: &crew::types::Step,
+        _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
     ) -> Result<StepOutcome> {
         let opts = self
@@ -620,9 +703,10 @@ impl StepKind for MissionCoderStepKind {
                 ))
             );
             print_token_line(&tokens);
-            emit_run_record(
+            emit_step_result(
                 flow::Level::Error,
-                "mission.run.error",
+                "mission.coder",
+                &step.id,
                 &self.mission_id,
                 &self.phase_id,
                 &self.session_id,
@@ -639,17 +723,22 @@ impl StepKind for MissionCoderStepKind {
         print_token_line(&tokens);
 
         let failed_verifiers = parse_failed_verifiers(&result.stdout);
-        emit_run_record(
+        emit_step_result(
             if failed_verifiers.is_empty() {
                 flow::Level::Info
             } else {
                 flow::Level::Warn
             },
-            "mission.run.verification",
+            "mission.coder",
+            &step.id,
             &self.mission_id,
             &self.phase_id,
             &self.session_id,
-            serde_json::json!({ "failed": failed_verifiers, "count": failed_verifiers.len() }),
+            serde_json::json!({
+                "failed_verifiers": failed_verifiers,
+                "count": failed_verifiers.len(),
+                "total_tokens": tokens.total(),
+            }),
         );
 
         let stdout = result.stdout.clone();
@@ -665,7 +754,7 @@ impl StepKind for MissionCoderStepKind {
         })
     }
 
-    fn residency(&self, _step: &crew::types::Step) -> Option<crew::step_kinds::Placement> {
+    fn residency(&self, _step: &crew::types::Step, _task: &crew::types::Task) -> Option<crew::step_kinds::Placement> {
         resolve_local_placement(&self.role_id, None, None, &format!("mission-coder:{}", self.phase_id))
     }
 }
@@ -690,6 +779,7 @@ impl StepKind for MissionVerifyStepKind {
     fn run(
         &self,
         _step: &crew::types::Step,
+        _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
     ) -> Result<StepOutcome> {
         println!(
@@ -722,7 +812,7 @@ impl StepKind for MissionVerifyStepKind {
         }
     }
 
-    fn residency(&self, _step: &crew::types::Step) -> Option<crew::step_kinds::Placement> {
+    fn residency(&self, _step: &crew::types::Step, _task: &crew::types::Task) -> Option<crew::step_kinds::Placement> {
         resolve_local_placement("code-reviewer", None, None, &format!("mission-verify:{}", self.phase_id))
     }
 }
@@ -778,7 +868,7 @@ pub fn run(
 
     // 2. Select the phase to run.
     let phases = load_phases()?;
-    let phase = select_phase(&phases, mission_id, phase_id)?;
+    let phase = select_phase(&phases, &mission.phase_ids, mission_id, phase_id)?;
 
     // Shared session id for every record this run emits — the frontier
     // tails the stream on this id to track the run end to end.
@@ -961,7 +1051,7 @@ pub fn run(
     // observability (the graph lens, #1230 Packet 6) — best-effort, not
     // load-bearing for this run's own control flow, which reads the
     // in-memory `steps` map below.
-    let (tasks, mut steps) = default_phase_graph(&phase.id, role);
+    let (tasks, mut steps) = default_phase_graph(&phase.id, role, &wt_path, image);
     for task in &tasks {
         if let Err(e) = crew::lifecycle::save_task(mission_id, task) {
             eprintln!(
@@ -1019,7 +1109,9 @@ pub fn run(
     // Packet 1's own production caller uses.
     let facts = crew::step_kinds::Facts::default();
     let est = crew::step_kinds::FixedEstimator::default();
-    run_step_graph(&mut steps, &registry, &facts, &est, 1, &mut |record| {
+    let tasks_by_id: std::collections::BTreeMap<String, Task> =
+        tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
+    run_step_graph(&mut steps, &tasks_by_id, &registry, &facts, &est, 1, &mut |record| {
         let _ = flow::record(record);
     })?;
 
@@ -1081,9 +1173,10 @@ pub fn run(
             Some(Err(msg)) => msg,
             _ => "QA dispatch failed".to_string(),
         };
-        emit_run_record(
+        emit_step_result(
             flow::Level::Warn,
-            "mission.run.qa-unavailable",
+            "mission.verify",
+            &verify_step_id,
             mission_id,
             &phase.id,
             &session_id,
@@ -1153,9 +1246,10 @@ pub fn run(
                 phase.id
             ))
         );
-        emit_run_record(
+        emit_step_result(
             flow::Level::Warn,
-            "mission.run.blocked",
+            "mission.verify",
+            &verify_step_id,
             mission_id,
             &phase.id,
             &session_id,
@@ -1192,14 +1286,16 @@ pub fn run(
              --text \"<verdict · what you overrode · why>\" --source adjudication",
         ))
     );
-    emit_run_record(
+    emit_step_result(
         flow::Level::Info,
-        "mission.run.gate",
+        "mission.verify",
+        &verify_step_id,
         mission_id,
         &phase.id,
         &session_id,
         serde_json::json!({
             "verdict": review.verdict,
+            "blockers": 0,
             "flags": review.by_severity.flag,
             "nits": review.by_severity.nit,
             "total_tokens": tokens_total,
@@ -1231,7 +1327,7 @@ pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
     // Explicit `--phase` resolves by id (any status — a Running phase, the
     // common abort case after a `run`, resolves); auto-path requires a ready
     // Planned phase. So to abort a Running phase, pass `--phase`.
-    let phase = resolve_phase(&phases, mission_id, phase_id)?;
+    let phase = resolve_phase(&phases, &mission.phase_ids, mission_id, phase_id)?;
 
     let root = repo_root()?;
     let wt_path = worktree_path(&root, &phase.id);
@@ -1317,6 +1413,7 @@ pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
 /// `select_phase`'s ready-Planned auto-pick.
 fn resolve_phase(
     phases: &[crew::types::Phase],
+    mission_phase_ids: &[String],
     mission_id: &str,
     explicit: Option<&str>,
 ) -> Result<crew::types::Phase> {
@@ -1326,7 +1423,7 @@ fn resolve_phase(
             .find(|s| s.id == id && s.mission_id == mission_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("phase `{id}` not found in mission `{mission_id}`")),
-        None => select_phase(phases, mission_id, None),
+        None => select_phase(phases, mission_phase_ids, mission_id, None),
     }
 }
 
@@ -2322,46 +2419,17 @@ fn nudge_missing_adjudication_note(session_id: &str) {
 
 /// (#799) A bash verifier command the runtime classified as FAILED TO RUN —
 /// the binary was missing (exit 127), not executable (exit 126), or its
-/// toolchain failed to load — so it never actually verified anything. Parsed
-/// from the dispatch envelope's `failed_tool_invocations` (stamped by the
-/// runtime in #799 part 1). A non-empty list means a coder SIGNOFF claiming
-/// "tests pass" may rest on a command that never ran. SOFT signal end to end:
-/// surfaced for the adjudicator, never an auto-fail (operator sovereignty #44).
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct FailedVerifier {
-    #[serde(default)]
-    command: String,
-    #[serde(default)]
-    reason: String,
-}
-
-/// Best-effort parse of `failed_tool_invocations` from the internal runtime's
-/// `--json` envelope (the dispatch's stdout). In `--json` mode the runtime
-/// prints a single-line JSON envelope to stdout (status goes to stderr), so the
-/// whole buffer is the envelope; the last-non-empty-line fallback is pure
-/// defense against an unexpected leading line. Returns EMPTY on any parse miss
-/// or absent field — a soft signal must never fire a FALSE alarm, so "couldn't
-/// tell" reads as "nothing failed."
-fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedVerifier> {
-    let as_json = |s: &str| serde_json::from_str::<serde_json::Value>(s.trim()).ok();
-    let Some(v) = as_json(envelope_stdout).or_else(|| {
-        envelope_stdout
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .and_then(as_json)
-    }) else {
-        return Vec::new();
-    };
-    v.get("failed_tool_invocations")
-        .and_then(|a| a.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| serde_json::from_value::<FailedVerifier>(e.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
+/// toolchain failed to load — so it never actually verified anything. A
+/// non-empty list means a coder SIGNOFF claiming "tests pass" may rest on a
+/// command that never ran. SOFT signal end to end: surfaced for the
+/// adjudicator, never an auto-fail (operator sovereignty #44).
+///
+/// (#1230 Packet 4 DRY pass) `FailedVerifier`/`parse_failed_verifiers`
+/// moved to `crew::step_kinds::builtins` so ANY `dispatch.internal`-shaped
+/// step can opt into this parse (`config.parse_verifiers: true`), not just
+/// `mission.coder` — re-exported here under their original names via `use`
+/// so every call site below is unchanged.
+use crew::step_kinds::{parse_failed_verifiers, FailedVerifier};
 
 /// (#799) Prominent gate banner naming the verifier commands that FAILED TO
 /// RUN. No-op on an honest run (empty list). Soft — it informs the adjudicator
@@ -2398,19 +2466,22 @@ fn print_unverified_banner(failed: &[FailedVerifier]) {
     );
 }
 
-/// (#799) The verifier commands the LATEST run's coder FAILED TO RUN, read back
-/// from the flow trail by the run's deterministic session id
-/// (`mission-run-<mission>-<phase>`). `mission run` emits a
-/// `mission.run.verification` record (payload `{ failed: [{command, reason}] }`)
-/// on EVERY run — empty `failed` on an honest run — so `ship` reads the latest
-/// run's status and HOLDs an auto-merge only when that run had failures. The
-/// run is a separate process, so the flow trail is the durable handoff (the
-/// runtime's out-dir is an ephemeral per-dispatch tempdir ship can't
-/// reconstruct). Scans the last 2 days oldest→newest and OVERWRITES `latest` on
-/// each match, so a clean re-run's empty record correctly clears a prior dirty
-/// run's (latest-wins on a resumed phase). Best effort: any IO/parse problem,
-/// or no record in the recent window, reads as "none" — this soft backstop
-/// fails OPEN (the run-time banner is the primary surface). Mirrors
+/// (#799) The verifier commands the LATEST run's coder FAILED TO RUN, read
+/// back from the flow trail by the run's deterministic session id
+/// (`mission-run-<mission>-<phase>`). The coder step emits a `"step
+/// result"` record (`payload.kind: "mission.coder"`,
+/// `payload.failed_verifiers: [{command, reason}]`) on EVERY run — empty on
+/// an honest run — so `ship` reads the latest run's status and HOLDs an
+/// auto-merge only when that run had failures (#1230 Packet 4: migrated
+/// off the retired `mission.run.verification` action — see
+/// [`emit_step_result`]'s doc). The run is a separate process, so the flow
+/// trail is the durable handoff (the runtime's out-dir is an ephemeral
+/// per-dispatch tempdir ship can't reconstruct). Scans the last 2 days
+/// oldest→newest and OVERWRITES `latest` on each match, so a clean re-run's
+/// empty record correctly clears a prior dirty run's (latest-wins on a
+/// resumed phase). Best effort: any IO/parse problem, or no record in the
+/// recent window, reads as "none" — this soft backstop fails OPEN (the
+/// run-time banner is the primary surface). Mirrors
 /// `session_has_orchestrator_note`.
 fn session_failed_verifiers(session_id: &str) -> Vec<FailedVerifier> {
     let flows_dir = darkmux_types::config_access::flows_dir();
@@ -2423,7 +2494,7 @@ fn session_failed_verifiers(session_id: &str) -> Vec<FailedVerifier> {
         .collect();
     days.sort();
     // Last 2 days, iterated oldest→newest, so a later record overwrites an
-    // earlier one and the most recent `mission.run.unverified` for this
+    // earlier one and the most recent coder `"step result"` for this
     // session wins.
     let recent: Vec<PathBuf> = days.iter().rev().take(2).rev().cloned().collect();
     let mut latest: Vec<FailedVerifier> = Vec::new();
@@ -2435,12 +2506,14 @@ fn session_failed_verifiers(session_id: &str) -> Vec<FailedVerifier> {
             let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            if r.get("action").and_then(|v| v.as_str()) == Some("mission.run.verification")
+            let payload = r.get("payload");
+            let kind = payload.and_then(|p| p.get("kind")).and_then(|k| k.as_str());
+            if r.get("action").and_then(|v| v.as_str()) == Some("step result")
+                && kind == Some("mission.coder")
                 && r.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
             {
-                if let Some(arr) = r
-                    .get("payload")
-                    .and_then(|p| p.get("failed"))
+                if let Some(arr) = payload
+                    .and_then(|p| p.get("failed_verifiers"))
                     .and_then(|f| f.as_array())
                 {
                     latest = arr
@@ -2665,7 +2738,7 @@ pub fn ship(
         .ok_or_else(|| anyhow::anyhow!("mission `{mission_id}` not found"))?
         .clone();
     let phases = load_phases()?;
-    let phase = resolve_phase(&phases, mission_id, phase_id)?;
+    let phase = resolve_phase(&phases, &mission.phase_ids, mission_id, phase_id)?;
 
     // A Complete phase is terminal — a prior `--merge` already shipped it
     // (and tore down its worktree). Re-shipping would duplicate-PR or churn;
@@ -3135,7 +3208,7 @@ mod tests {
     /// fallback, never an error).
     #[test]
     fn conventions_branch_expands_and_falls_back() {
-        let s = phase("s1-fix", "m1", &[], PhaseStatus::Planned);
+        let s = phase("s1-fix", "m1", PhaseStatus::Planned);
         let mut m = mission("m1", "desc");
         let conv: crate::conventions::Conventions =
             serde_json::from_str(r#"{"branch_template":"{ticket}/{phase}"}"#).unwrap();
@@ -3158,7 +3231,7 @@ mod tests {
     /// missions) the brief is the bare description, unchanged.
     #[test]
     fn coder_brief_appends_verbatim_source_when_present() {
-        let s = phase("s1", "m1", &[], PhaseStatus::Planned);
+        let s = phase("s1", "m1", PhaseStatus::Planned);
         let mut m = mission("m1", "compiled summary");
         m.source_input = Some("EXACT placeholder: 'APIM Key Name'. Do NOT rename fields.".into());
         let brief = coder_brief(&s, &m, &[], &[], &[]);
@@ -3178,7 +3251,7 @@ mod tests {
 
     #[test]
     fn coder_brief_is_bare_description_without_source() {
-        let s = phase("s1", "m1", &[], PhaseStatus::Planned);
+        let s = phase("s1", "m1", PhaseStatus::Planned);
         let m = mission("m1", "compiled summary");
         assert_eq!(coder_brief(&s, &m, &[], &[], &[]), "desc s1");
         // Whitespace-only source_input behaves as absent.
@@ -3189,7 +3262,7 @@ mod tests {
 
     #[test]
     fn coder_brief_injects_prior_corrections() {
-        let s = phase("s1", "m1", &[], PhaseStatus::Planned);
+        let s = phase("s1", "m1", PhaseStatus::Planned);
         let m = mission("m1", "compiled summary");
         let corrections = vec![
             "Do NOT rename the APIM key field.".to_string(),
@@ -3229,7 +3302,7 @@ mod tests {
     /// orders authored corrections before auto-detected cautions.
     #[test]
     fn coder_brief_injects_detected_cautions() {
-        let s = phase("s1", "m1", &[], PhaseStatus::Planned);
+        let s = phase("s1", "m1", PhaseStatus::Planned);
         let m = mission("m1", "compiled summary");
         let cautions = vec![
             "- [cycle] `edit` called 3× in the last 10 tool calls (in `src/x.rs`)".to_string(),
@@ -3269,7 +3342,7 @@ mod tests {
     /// base → lessons → corrections → cautions.
     #[test]
     fn coder_brief_injects_lessons_authoritative_and_first() {
-        let s = phase("s1", "m1", &[], PhaseStatus::Planned);
+        let s = phase("s1", "m1", PhaseStatus::Planned);
         let m = mission("m1", "compiled summary");
         let lessons =
             vec!["- American English: house style across all work, no British spellings.".to_string()];
@@ -3891,13 +3964,12 @@ mod tests {
         assert!(adjudication_tag, "the adjudication audit-trail tag must satisfy the scan");
     }
 
-    fn phase(id: &str, mission: &str, deps: &[&str], status: PhaseStatus) -> Phase {
+    fn phase(id: &str, mission: &str, status: PhaseStatus) -> Phase {
         Phase {
             id: id.to_string(),
             mission_id: mission.to_string(),
             description: format!("desc {id}"),
             status,
-            depends_on: deps.iter().map(|s| s.to_string()).collect(),
             created_ts: 0,
             started_ts: None,
             completed_ts: None,
@@ -3906,76 +3978,85 @@ mod tests {
         }
     }
 
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A no-assignment Task fixture for `StepKind::run` tests that don't
+    /// exercise Task-sourced `role_id`/`profile_name`/`workdir`/`image`
+    /// (#1230/#1341) — `default_phase_graph_has_the_expected_shape` covers
+    /// the real assignment-carrying shape.
+    fn test_task(id: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            phase_id: "s1".to_string(),
+            description: "test task".to_string(),
+            step_ids: vec![format!("{id}-step")],
+            depends_on: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        }
+    }
+
     #[test]
     fn select_phase_explicit_must_belong_to_mission() {
-        let phases = vec![phase("s1", "m1", &[], PhaseStatus::Planned)];
-        let err = select_phase(&phases, "m2", Some("s1")).unwrap_err();
+        let phases = vec![phase("s1", "m1", PhaseStatus::Planned)];
+        let err = select_phase(&phases, &ids(&["s1"]), "m2", Some("s1")).unwrap_err();
         assert!(err.to_string().contains("belongs to mission"), "{err}");
     }
 
     #[test]
     fn select_phase_explicit_rejects_complete() {
-        let phases = vec![phase("s1", "m1", &[], PhaseStatus::Complete)];
-        let err = select_phase(&phases, "m1", Some("s1")).unwrap_err();
+        let phases = vec![phase("s1", "m1", PhaseStatus::Complete)];
+        let err = select_phase(&phases, &ids(&["s1"]), "m1", Some("s1")).unwrap_err();
         assert!(err.to_string().contains("already Complete"), "{err}");
     }
 
     #[test]
     fn select_phase_auto_picks_single_ready() {
+        // (#1341) Phases are strictly linear — `s2` sits after `s1` in
+        // `phase_ids` order, so it's blocked until `s1` completes; `s3`
+        // belongs to a different mission (`phases`' own `mission_id`
+        // scopes it out regardless of list order).
         let phases = vec![
-            phase("s1", "m1", &[], PhaseStatus::Planned),
-            phase("s2", "m1", &["s1"], PhaseStatus::Planned), // has unmet dep
-            phase("s3", "m2", &[], PhaseStatus::Planned),     // other mission
+            phase("s1", "m1", PhaseStatus::Planned),
+            phase("s2", "m1", PhaseStatus::Planned),
+            phase("s3", "m2", PhaseStatus::Planned),
         ];
-        let chosen = select_phase(&phases, "m1", None).unwrap();
+        let chosen = select_phase(&phases, &ids(&["s1", "s2"]), "m1", None).unwrap();
         assert_eq!(chosen.id, "s1");
     }
 
     #[test]
     fn select_phase_auto_bails_on_zero_ready() {
-        let phases = vec![phase("s1", "m1", &[], PhaseStatus::Running)];
-        let err = select_phase(&phases, "m1", None).unwrap_err();
+        let phases = vec![phase("s1", "m1", PhaseStatus::Running)];
+        let err = select_phase(&phases, &ids(&["s1"]), "m1", None).unwrap_err();
         assert!(err.to_string().contains("no ready phase"), "{err}");
     }
 
+    /// (#1230 Packet 2, revised #1341) A phase whose predecessor in
+    /// `phase_ids` order has already completed is auto-selected.
     #[test]
-    fn select_phase_auto_bails_ambiguous() {
+    fn select_phase_auto_picks_phase_whose_predecessor_is_complete() {
         let phases = vec![
-            phase("s1", "m1", &[], PhaseStatus::Planned),
-            phase("s2", "m1", &[], PhaseStatus::Planned),
+            phase("s1", "m1", PhaseStatus::Complete),
+            phase("s2", "m1", PhaseStatus::Planned),
         ];
-        let err = select_phase(&phases, "m1", None).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("2 ready phases"), "{msg}");
-        assert!(msg.contains("--phase"), "{msg}");
+        let chosen = select_phase(&phases, &ids(&["s1", "s2"]), "m1", None).unwrap();
+        assert_eq!(chosen.id, "s2", "s2's predecessor (s1) is Complete — it's ready");
     }
 
-    /// (#1230 Packet 2) The actual fix this packet ships for
-    /// `select_phase`: a phase whose sole dependency has already
-    /// completed is now auto-selected. Under the OLD flat
-    /// `depends_on.is_empty()` filter this phase would NEVER have been
-    /// selectable except via explicit `--phase` — it has a non-empty
-    /// `depends_on`, so the old filter excluded it unconditionally
-    /// regardless of whether that dependency was satisfied.
-    #[test]
-    fn select_phase_auto_picks_phase_whose_dependency_is_complete() {
-        let phases = vec![
-            phase("s1", "m1", &[], PhaseStatus::Complete),
-            phase("s2", "m1", &["s1"], PhaseStatus::Planned),
-        ];
-        let chosen = select_phase(&phases, "m1", None).unwrap();
-        assert_eq!(chosen.id, "s2", "s2's only dependency (s1) is Complete — it's ready");
-    }
-
-    /// Companion negative case: same shape, but the dependency is only
+    /// Companion negative case: same shape, but the predecessor is only
     /// `Running` (not yet `Complete`) — s2 must NOT be selected.
     #[test]
-    fn select_phase_auto_excludes_phase_whose_dependency_is_still_running() {
+    fn select_phase_auto_excludes_phase_whose_predecessor_is_still_running() {
         let phases = vec![
-            phase("s1", "m1", &[], PhaseStatus::Running),
-            phase("s2", "m1", &["s1"], PhaseStatus::Planned),
+            phase("s1", "m1", PhaseStatus::Running),
+            phase("s2", "m1", PhaseStatus::Planned),
         ];
-        let err = select_phase(&phases, "m1", None).unwrap_err();
+        let err = select_phase(&phases, &ids(&["s1", "s2"]), "m1", None).unwrap_err();
         assert!(err.to_string().contains("no ready phase"), "{err}");
     }
 
@@ -4112,14 +4193,14 @@ mod tests {
 
     #[test]
     fn commit_subject_takes_first_line() {
-        let s = phase("s1", "m1", &[], PhaseStatus::Running);
+        let s = phase("s1", "m1", PhaseStatus::Running);
         // phase() sets description = "desc s1"
         assert_eq!(commit_subject(&s), "desc s1");
     }
 
     #[test]
     fn commit_subject_truncates_long_and_takes_only_first_line() {
-        let mut s = phase("s1", "m1", &[], PhaseStatus::Running);
+        let mut s = phase("s1", "m1", PhaseStatus::Running);
         s.description = format!("{}\nsecond line ignored", "x".repeat(100));
         let subj = commit_subject(&s);
         assert!(subj.chars().count() <= 72, "len {}", subj.chars().count());
@@ -4129,7 +4210,7 @@ mod tests {
 
     #[test]
     fn commit_subject_falls_back_on_empty_description() {
-        let mut s = phase("s1", "m1", &[], PhaseStatus::Running);
+        let mut s = phase("s1", "m1", PhaseStatus::Running);
         s.description = String::new();
         assert_eq!(commit_subject(&s), "darkmux phase s1");
     }
@@ -4137,7 +4218,7 @@ mod tests {
     #[test]
     fn pr_body_names_mission_and_phase_no_currency() {
         let m = mission("m1", "ship the thing");
-        let s = phase("s1", "m1", &[], PhaseStatus::Running);
+        let s = phase("s1", "m1", PhaseStatus::Running);
         let body = pr_body(&m, &s);
         assert!(body.contains("`m1`"), "{body}");
         assert!(body.contains("`s1`"), "{body}");
@@ -4215,10 +4296,10 @@ mod tests {
             tmp.path().join("2026-06-21.jsonl"),
             concat!(
                 // session A: dirty run #1, then a clean re-run #2 (later line wins).
-                r#"{"ts":"2026-06-21T10:00:00Z","action":"mission.run.verification","session_id":"mission-run-mA-s1","payload":{"failed":[{"command":"cargo test","reason":"command not found (exit 127) — the verifier never ran"}],"count":1}}"#, "\n",
-                r#"{"ts":"2026-06-21T10:30:00Z","action":"mission.run.verification","session_id":"mission-run-mA-s1","payload":{"failed":[],"count":0}}"#, "\n",
+                r#"{"ts":"2026-06-21T10:00:00Z","action":"step result","session_id":"mission-run-mA-s1","payload":{"step_id":"s1-coder-step","kind":"mission.coder","failed_verifiers":[{"command":"cargo test","reason":"command not found (exit 127) — the verifier never ran"}],"count":1}}"#, "\n",
+                r#"{"ts":"2026-06-21T10:30:00Z","action":"step result","session_id":"mission-run-mA-s1","payload":{"step_id":"s1-coder-step","kind":"mission.coder","failed_verifiers":[],"count":0}}"#, "\n",
                 // session B: a single dirty run — stays held.
-                r#"{"ts":"2026-06-21T11:00:00Z","action":"mission.run.verification","session_id":"mission-run-mB-s1","payload":{"failed":[{"command":"pytest","reason":"toolchain failed to load"}],"count":1}}"#, "\n",
+                r#"{"ts":"2026-06-21T11:00:00Z","action":"step result","session_id":"mission-run-mB-s1","payload":{"step_id":"s1-coder-step","kind":"mission.coder","failed_verifiers":[{"command":"pytest","reason":"toolchain failed to load"}],"count":1}}"#, "\n",
             ),
         )
         .unwrap();
@@ -4249,7 +4330,8 @@ mod tests {
 
     #[test]
     fn default_phase_graph_has_the_expected_shape() {
-        let (tasks, steps) = default_phase_graph("s1", "coder");
+        let wt_path = std::path::Path::new("/tmp/wt-s1");
+        let (tasks, steps) = default_phase_graph("s1", "coder", wt_path, None);
 
         assert_eq!(tasks.len(), 3, "worktree, coder, verify — one Task each");
         for t in &tasks {
@@ -4266,9 +4348,16 @@ mod tests {
         assert_eq!(coder.kind, "mission.coder");
         assert_eq!(verify.kind, "mission.verify");
 
-        assert!(worktree.depends_on.is_empty(), "worktree is the root");
-        assert_eq!(coder.depends_on, vec!["s1-worktree-step".to_string()]);
-        assert_eq!(verify.depends_on, vec!["s1-coder-step".to_string()]);
+        // (#1341) Dependency now lives on Task, not Step.
+        let by_id: std::collections::BTreeMap<&str, &Task> =
+            tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        assert!(by_id["s1-worktree"].depends_on.is_empty(), "worktree is the root");
+        assert_eq!(by_id["s1-coder"].depends_on, vec!["s1-worktree".to_string()]);
+        assert_eq!(by_id["s1-verify"].depends_on, vec!["s1-coder".to_string()]);
+        // The coder/verify Tasks carry the resource assignment (#1341).
+        assert_eq!(by_id["s1-coder"].role_id.as_deref(), Some("coder"));
+        assert_eq!(by_id["s1-coder"].workdir.as_deref(), Some(wt_path));
+        assert_eq!(by_id["s1-verify"].role_id.as_deref(), Some("code-reviewer"));
 
         for s in steps.values() {
             assert_eq!(s.status, NodeStatus::Planned);
@@ -4310,22 +4399,22 @@ mod tests {
             id: "s1-worktree-step".to_string(),
             task_id: "s1-worktree".to_string(),
             kind: "mission.worktree".to_string(),
-            depends_on: Vec::new(),
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,
             completed_ts: None,
             output: None,
         };
+        let task = test_task("s1-worktree");
 
-        let outcome = kind.run(&step, &std::collections::BTreeMap::new()).unwrap();
+        let outcome = kind.run(&step, &task, &std::collections::BTreeMap::new()).unwrap();
         assert!(wt_path.is_dir(), "worktree dir must exist after a clean run");
         assert_eq!(outcome.output, wt_path.display().to_string());
 
         // A second run against the SAME phase (the resumed-run case) must
         // fail loud, not silently clobber — same contract `add_worktree`
         // always had.
-        let err = kind.run(&step, &std::collections::BTreeMap::new()).unwrap_err();
+        let err = kind.run(&step, &task, &std::collections::BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
     }
 
@@ -4370,14 +4459,14 @@ mod tests {
             id: "s1-verify-step".to_string(),
             task_id: "s1-verify".to_string(),
             kind: "mission.verify".to_string(),
-            depends_on: vec!["s1-coder-step".to_string()],
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,
             completed_ts: None,
             output: None,
         };
-        let outcome = kind.run(&step, &std::collections::BTreeMap::new());
+        let task = test_task("s1-verify");
+        let outcome = kind.run(&step, &task, &std::collections::BTreeMap::new());
 
         unsafe {
             match prev {
