@@ -49,6 +49,13 @@ pub struct SingleShotRequest<'a> {
 pub struct SingleShotReply {
     pub content: String,
     pub total_tokens: Option<u64>,
+    /// (#1361) `usage.prompt_tokens` / `usage.completion_tokens`, alongside
+    /// `total_tokens` — needed so callers can emit a `telemetry.tokens`
+    /// record shaped like `dispatch_internal.rs`'s per-turn one (the fleet
+    /// dashboard's `tokensOffMeter()` sums that family's `prompt_tokens`/
+    /// `completion_tokens` fields, not just the total).
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
     pub model: Option<String>,
 }
 
@@ -243,6 +250,8 @@ fn extract_reply(resp: &serde_json::Value) -> SingleShotReply {
         .unwrap_or("")
         .to_string();
     let total_tokens = resp.pointer("/usage/total_tokens").and_then(|v| v.as_u64());
+    let prompt_tokens = resp.pointer("/usage/prompt_tokens").and_then(|v| v.as_u64());
+    let completion_tokens = resp.pointer("/usage/completion_tokens").and_then(|v| v.as_u64());
     let model = resp
         .get("model")
         .and_then(|m| m.as_str())
@@ -250,6 +259,8 @@ fn extract_reply(resp: &serde_json::Value) -> SingleShotReply {
     SingleShotReply {
         content,
         total_tokens,
+        prompt_tokens,
+        completion_tokens,
         model,
     }
 }
@@ -586,12 +597,14 @@ mod tests {
     #[test]
     fn extract_reply_pulls_content_tokens_and_model() {
         let resp = parse_hosted_response(
-            br#"{"model":"darkmux:qwen3.6-35b-a3b","choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":42}}"#,
+            br#"{"model":"darkmux:qwen3.6-35b-a3b","choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":42,"prompt_tokens":30,"completion_tokens":12}}"#,
         )
         .expect("well-formed success body classifies as Ok");
         let reply = extract_reply(&resp);
         assert_eq!(reply.content, "ok");
         assert_eq!(reply.total_tokens, Some(42));
+        assert_eq!(reply.prompt_tokens, Some(30));
+        assert_eq!(reply.completion_tokens, Some(12));
         assert_eq!(reply.model.as_deref(), Some("darkmux:qwen3.6-35b-a3b"));
     }
 
@@ -633,6 +646,8 @@ mod tests {
         let reply = extract_reply(&resp);
         assert_eq!(reply.content, "hi");
         assert_eq!(reply.total_tokens, None);
+        assert_eq!(reply.prompt_tokens, None);
+        assert_eq!(reply.completion_tokens, None);
         assert_eq!(reply.model, None);
     }
 
