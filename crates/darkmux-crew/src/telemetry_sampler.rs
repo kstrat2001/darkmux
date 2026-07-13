@@ -59,7 +59,13 @@ use std::process::Command;
 /// Empty when `prev` and `cur` carry the same set of model ids. Pure:
 /// no IO, no global sink, so the load/unload-diff rule is unit-testable
 /// without touching LMStudio.
-pub(crate) fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<serde_json::Value> {
+///
+/// `pub` (not `pub(crate)`) so `darkmux-lab`'s review driver can reuse it
+/// too (#1247 doctrine surface, mirroring [`sample_host`]'s reuse) — the
+/// review pipeline's own `HostTelemetrySampler` needs the exact same
+/// load/unload-diff rule to emit `telemetry.lms` records, not just the
+/// host cpu/mem/gpu family this module already shares.
+pub fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
 
     // Loads: in `cur`, not in `prev`.
