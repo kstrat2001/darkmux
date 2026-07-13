@@ -1,7 +1,7 @@
 # darkmux self-review — darkmux reviews its own PRs, in public, on a local
 # crew of models.
 #
-# darkmux dogfooding itself: a PR diff is dispatched to a **review funnel**
+# darkmux dogfooding itself: a PR diff is dispatched to a **review pipeline**
 # (#1222 Phase B) — a saved crew of local LMStudio models, staffed per
 # `~/.darkmux/profiles.json`, that probes the diff and hands its findings to
 # a judge seat — running on a self-hosted runner. No cloud API is involved.
@@ -13,7 +13,7 @@
 # launches it (`gh workflow run darkmux-review.yml -f pr=<n>`), and even then the
 # job NEVER checks out the reviewed PR's code: it reads only the PR *diff* via
 # the API (data, not executed) and feeds it to the sandboxed, network-isolated
-# internal runtime. The funnel's `--github` file source (inside the `darkmux
+# internal runtime. The review pipeline's `--github` file source (inside the `darkmux
 # pr-review run` dispatch below) fetches changed-file + one-hop-import
 # CONTENTS via the same GitHub API — also read as data and never executed,
 # the same trust class as the diff. The repo checkout below is of trusted
@@ -38,7 +38,7 @@ on:
         default: ""
         type: string
       mode:
-        description: "Funnel dispatch mode: sequential (one seat model loaded at a time — the 32GB-tier default), parallel (multiple seat models resident at once), or auto (darkmux picks)."
+        description: "Review dispatch mode: sequential (one seat model loaded at a time — the 32GB-tier default), parallel (multiple seat models resident at once), or auto (darkmux picks)."
         required: false
         default: "auto"
         type: string
@@ -72,7 +72,7 @@ jobs:
         uses: actions/checkout@v4
         # Brings the review/posting script from this repo at the dispatch ref
         # (main). The reviewed PR's code is never checked out — only its diff
-        # (and, inside the funnel dispatch, individual file contents via the
+        # (and, inside the review dispatch, individual file contents via the
         # API) are read — so untrusted PR code never lands on the runner.
 
       - name: Build the Rust bundler plugin (#1319 reference --bundler implementation)
@@ -103,7 +103,7 @@ jobs:
           # digits so only a valid PR number ever reaches the gh/API calls below.
           case "$PR" in ''|*[!0-9]*) echo "pr input must be a number"; exit 1 ;; esac
           mkdir -p "$RUNNER_TEMP/qa"
-          # The funnel dispatch (below) reads this FULL diff directly — it caps
+          # The review dispatch (below) reads this FULL diff directly — it caps
           # what it sends to each seat's model internally (the same 80KB model
           # budget the old single-reviewer prompt used) while keeping the full
           # diff on disk for anchor-line resolution when rendering the review.
@@ -126,7 +126,7 @@ jobs:
           set -euo pipefail
           # #1053: a reviewer that doesn't know the change's INTENT flags the
           # very bug the PR fixes (the "restate-the-fix" false positive). The
-          # funnel binary now assembles each seat's prompt itself (rubric +
+          # review binary now assembles each seat's prompt itself (rubric +
           # intent + diff); this step's only job is handing it the author's
           # stated intent as plain data — NO AI in the loop here, just a `gh`
           # fetch, so it stays within the runner's no-LLM-API constraint.
@@ -146,7 +146,7 @@ jobs:
             fi
           } > "$RUNNER_TEMP/qa/intent.txt"
 
-      - name: darkmux review funnel dispatch (local crew — no LLM API)
+      - name: darkmux PR-review dispatch (local crew — no LLM API)
         if: steps.diff.outputs.has_diff == 'true'
         run: |
           set -euo pipefail
@@ -165,7 +165,7 @@ jobs:
           # staffing profiles/models are defined in the runner's
           # ~/.darkmux/profiles.json. This workflow never names a model.
           #
-          # Resilient: a hiccup leaves no/empty envelope; the funnel's own
+          # Resilient: a hiccup leaves no/empty envelope; the review dispatch's own
           # degraded-mode handling (below) turns that into a loud comment plus
           # a failed run rather than a silent green check.
           # --bundler: darkmux-public's own source is Rust, not the
@@ -182,7 +182,7 @@ jobs:
             --mode "$MODE" \
             --bundler "$BUNDLER_RUST_BIN" \
             ${K:+--k "$K"} \
-            --envelope-out "$RUNNER_TEMP/qa/funnel.json" \
+            --envelope-out "$RUNNER_TEMP/qa/envelope.json" \
             --emit "$RUNNER_TEMP/qa/rendered.json" \
             --timeout 3600 || true
 
@@ -195,8 +195,8 @@ jobs:
             # crashed before its own degraded-mode fallback could run). Same
             # "never read as a green check" contract as mode=degraded (#1113).
             gh pr comment "$PR" --repo "$REPO" --body \
-              ":warning: darkmux review funnel produced no output (crew=\`$CREW\` mode=\`$MODE\`) — see workflow logs."
-            echo "::error::review funnel dispatch produced no rendered payload"
+              ":warning: darkmux PR review produced no output (crew=\`$CREW\` mode=\`$MODE\`) — see workflow logs."
+            echo "::error::review dispatch produced no rendered payload"
             exit 1
           fi
           MODE_RESULT=$(jq -r .mode "$RUNNER_TEMP/qa/rendered.json")
@@ -217,11 +217,11 @@ jobs:
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md" ;;
           esac
 
-      - name: Upload funnel envelope (debugging + audit)
+      - name: Upload review envelope (debugging + audit)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: review-funnel-envelope
-          path: ${{ runner.temp }}/qa/funnel.json
+          name: review-envelope
+          path: ${{ runner.temp }}/qa/envelope.json
           if-no-files-found: ignore
           retention-days: 14

@@ -92,6 +92,8 @@ const KEYS: &[(&str, Ty)] = &[
     ("remote.concurrent_cap", Ty::Uint),
     // (#1230 Packet 5) `mission status`'s stale-active drift threshold.
     ("mission.stale_active_days", Ty::Uint),
+    // (#1349) The PR-review pipeline's judge-step bounded-concurrency cap.
+    ("review.judge_concurrency", Ty::Uint),
     ("dirs.flows", Ty::Str),
     ("dirs.audit", Ty::Str),
     ("dirs.notebook", Ty::Str),

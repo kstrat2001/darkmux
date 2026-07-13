@@ -32,8 +32,8 @@
 //! feeds their output through the parsers above. `sample_host` is `pub`
 //! (not `pub(crate)`) so a second sampler thread outside this crate can
 //! reuse the exact host-reading mechanism instead of re-deriving it —
-//! `darkmux-lab`'s funnel driver does this (#1247 doctrine surface) to
-//! sample host load during review-funnel runs, which bypass
+//! `darkmux-lab`'s review driver does this (#1247 doctrine surface) to
+//! sample host load during review runs, which bypass
 //! `dispatch_internal` entirely and previously had no host telemetry at
 //! all. The live lms + host sampler THREAD (which additionally diffs
 //! `list_loaded()` snapshots and owns the stop-flag/poll loop) still lives
@@ -177,7 +177,7 @@ pub(crate) fn gpu_percent_from_ioreg(ioreg: &str) -> Option<u64> {
 /// `None` on any spawn/exit failure. Keeps the host-load sampler's three
 /// best-effort reads terse. (#1064; moved from `dispatch_internal.rs` when
 /// [`sample_host`] was extracted so both sampler call sites — the
-/// dispatch-internal thread and `darkmux-lab`'s funnel driver — share one
+/// dispatch-internal thread and `darkmux-lab`'s review driver — share one
 /// copy of the shell-out mechanism.)
 fn run_ok(cmd: &mut Command) -> Option<String> {
     let out = cmd.output().ok()?;
@@ -200,7 +200,7 @@ pub struct HostSample {
 /// `None` for that field only, never an `Err` — see the individual parse
 /// helpers' docs for the exact commands and formats). Extracted out of
 /// `dispatch_internal::run_telemetry_sampler` (#1064's original site) so
-/// the funnel driver's sampler (#1247 doctrine surface) reads host load
+/// the review driver's sampler (#1247 doctrine surface) reads host load
 /// through the exact same mechanism rather than re-deriving it — the two
 /// sampler THREADS differ (poll cadence, stop-flag ownership, sink), but
 /// "what a host sample looks like" is one function.
@@ -223,7 +223,7 @@ mod tests {
     /// `sysctl hw.memsize`, `ioreg`) is macOS-only; on Linux the shells
     /// all fail and every field is `None`, which would make this assert
     /// meaningless there. Consumers that need `sample_host` in a
-    /// cross-platform test (e.g. `darkmux-lab`'s funnel telemetry tests)
+    /// cross-platform test (e.g. `darkmux-lab`'s review telemetry tests)
     /// inject a fake sampling function instead — this test is where the
     /// real path keeps its coverage. Costs one real `top -l 1` call
     /// (~600-900ms); kept to a single invocation for that reason.

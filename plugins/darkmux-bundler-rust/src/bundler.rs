@@ -56,7 +56,7 @@ fn bundle_file_diff_only(path: &str, hunks: &[Hunk]) -> Vec<Bundle> {
     // edits into one hunk; this needs a short function with two edits
     // each independently within the OTHER hunk's narrow context window)
     // but not impossible — dedup rather than emit two bundles the
-    // downstream funnel would have to reconcile itself. Each hunk's own
+    // downstream review pipeline would have to reconcile itself. Each hunk's own
     // window may capture a different slice, so the merge takes the
     // UNION of both spans (an honest superset, not a guess at which is
     // "more complete") and merges facts, same principle as the worktree

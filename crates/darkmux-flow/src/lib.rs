@@ -2378,10 +2378,14 @@ mod tests {
         //   1.16.0 — dispatch.tool payload gains `args` (the actual tool
         //           arguments, capped) so the operator can recall what each
         //           call did. Minor + additive — older readers ignore it.
-        //   1.17.0 — new action values for the review-funnel driver's run
+        //   1.17.0 — new action values for the review-pipeline driver's run
         //           observability (#1247 Part 1): funnel.task/funnel.step/
         //           funnel.ruling. Minor + additive — older readers ignore
         //           the unknown actions; no struct/field change.
+        //   (code-internal, no FLOW_SCHEMA_VERSION bump) — #1349: the above
+        //           three actions renamed review.task/review.step/review.ruling
+        //           (module renamed funnel -> review; see schema.rs's fuller
+        //           changelog entry). Action STRING only, same payload shapes.
         assert_eq!(FLOW_SCHEMA_VERSION, "1.17.0");
     }
 

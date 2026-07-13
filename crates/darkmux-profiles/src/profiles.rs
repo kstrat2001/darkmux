@@ -159,7 +159,7 @@ fn validate_registry(reg: &ProfileRegistry, path: &Path) -> Result<()> {
     // `crate::crews::resolve_crew` is the single place a crew's semantic
     // validity (profile refs, remote-endpoint rejection, k bounds) is
     // decided — callers that need a specific crew resolve it themselves
-    // (funnel preflight, `darkmux doctor`'s per-crew check) and get the same
+    // (review preflight, `darkmux doctor`'s per-crew check) and get the same
     // named error `validate_crew` used to produce, just scoped to that one
     // crew instead of the whole file.
     Ok(())

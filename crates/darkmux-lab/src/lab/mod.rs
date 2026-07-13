@@ -11,9 +11,6 @@ pub mod dialectic;
 pub mod doctor;
 pub mod fixture;
 pub mod fixture_cli;
-// (#1222 Phase B packet 4) Review funnel — bundles → probe (k draws) →
-// dedup → double-confirm judge → envelope.
-pub mod funnel;
 pub mod inspect;
 pub mod list;
 pub mod loop_report;
@@ -23,6 +20,11 @@ pub mod profile_check;
 // re-export keeps all existing `crate::lab::paths::*` paths resolving unchanged.
 pub use darkmux_types::paths;
 pub mod registry;
+// (#1222 Phase B packet 4; renamed from `funnel` in #1349 — the earlier
+// name described a retired bespoke execution mechanism this driver no
+// longer needs) The PR-review pipeline driver — bundles → probe (k draws)
+// → dedup → double-confirm judge → envelope.
+pub mod review;
 pub mod review_bench;
 pub mod run;
 pub mod sandbox_hash;

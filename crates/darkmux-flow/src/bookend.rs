@@ -2,27 +2,34 @@
 //!
 //! Three structurally-identical guards grew independently before this
 //! module existed: `darkmux-crew`'s `DispatchBookendGuard` (flat, one
-//! `dispatch.start` → `dispatch.complete`/`dispatch.error`),
-//! `darkmux-lab`'s `FunnelBookendGuard` (a stack — one `funnel.task`
-//! nesting `funnel.step`s), and `src/pr_review.rs`'s
-//! `FunnelDispatchBookendGuard` (flat, bridging a funnel run into the
-//! `dispatch.*` vocabulary). Same shape every time: emit a `started`
+//! `dispatch start` → `dispatch complete`/`dispatch error`), `darkmux-lab`'s
+//! per-run driver guard (a stack — one task-level bookend nesting
+//! per-step ones; originally `funnel.rs`'s `FunnelBookendGuard`, renamed to
+//! `review.rs`'s `ReviewRunGuard` in #1349), and `src/pr_review.rs`'s
+//! `with_dispatch_bookends` (flat, bridging a review-pipeline run into the
+//! `dispatch *` vocabulary). Same shape every time: emit a `started`
 //! record, arm a guard, and guarantee a matching terminal record fires no
 //! matter how the covered code exits — clean return, early `?`-return, or
 //! panic. A flat one-shot guard is just a stack of depth ≤ 1, so one type
 //! subsumes both shapes.
 //!
-//! The duplication is why the concrete bug this packet fixes (a funnel run
+//! The duplication is why the concrete bug this packet fixes (a review run
 //! with a remote-endpoint seat silently reporting 0 cloud tokens — see
 //! [`stamp_remote_classification`]) went unnoticed: `pr_review.rs`'s
 //! independently-reinvented terminal-record payload never got the
-//! `payload.endpoint` field the other two paths already carried.
+//! `payload.endpoint` field the other two paths already carried. #1349
+//! later found a SECOND instance of the same duplication-shaped bug: the
+//! driver's own task-level bookend (by then already unified onto this
+//! module's `BookendGuard`) still emitted competing vocabulary from
+//! INSIDE `run_review_graph`, nested inside `with_dispatch_bookends`'s
+//! own already-correct outer wrap — retired in favor of that outer wrap
+//! alone (see `run_review_graph`'s doc in `darkmux-lab::lab::review`).
 //!
 //! This module intentionally knows nothing about `FlowRecord`'s domain
 //! meaning beyond its existence — callers build every `started`/`finished`/
 //! abort record themselves (via their own crate's record builders,
 //! `darkmux-crew::dispatch::build_dispatch_record_with_payload` or
-//! `darkmux-lab`'s `funnel_flow_record`) and hand the guard a fully-built
+//! `darkmux-lab`'s `review_flow_record`) and hand the guard a fully-built
 //! [`FlowRecord`]. `darkmux-flow` is a dependency LEAF w.r.t. both
 //! `darkmux-crew` and `darkmux-lab` (neither of those crates' record
 //! builders can be called from here without introducing a cycle), so this
@@ -36,7 +43,7 @@ use crate::FlowRecord;
 /// type — construct the guard with a closure directly. A caller that also
 /// needs to hand the SAME underlying sink to code the guard doesn't own
 /// (see `src/pr_review.rs`'s `with_dispatch_bookends`, which must lend its
-/// sink to the wrapped funnel dispatch as a `&mut dyn FunnelEmitter`) can
+/// sink to the wrapped review-pipeline dispatch as a `&mut dyn ReviewEmitter`) can
 /// implement this trait on its own adapter type and construct
 /// `BookendGuard` generically over that concrete type instead of a trait
 /// object — see [`BookendGuard::sink_mut`].
@@ -53,8 +60,8 @@ impl<F: FnMut(FlowRecord)> BookendSink for F {
 /// One open (started, not yet finished) unit on a [`BookendGuard`]'s stack.
 /// `kind` is opaque to the guard — callers use it purely to decide, inside
 /// their `on_abort` closure, which record shape to build for a given open
-/// unit (e.g. the funnel guard's `on_abort` builds a `funnel.task`-shaped
-/// abort record when `kind == "task"`, a `funnel.step`-shaped one
+/// unit (e.g. the review driver's `on_abort` builds a `review.task`-shaped
+/// abort record when `kind == "task"`, a `review.step`-shaped one
 /// otherwise).
 struct OpenUnit {
     id: String,
@@ -72,7 +79,7 @@ type OnAbort<'a> = Box<dyn Fn(&str, &str) -> FlowRecord + 'a>;
 /// disarming once the stack empties. A guard dropped while still armed
 /// (an early `?`-return or a panic between `open()` and its matching
 /// `close()`) pops every still-open unit **innermost-first** (LIFO — the
-/// same order a nested funnel task/step pipeline needs: the deepest open
+/// same order a nested review task/step pipeline needs: the deepest open
 /// step closes before its enclosing phase, which closes before the task),
 /// emitting `on_abort(id, kind)` for each — so every `started` gets a
 /// matching terminal event on every exit path.
@@ -372,7 +379,7 @@ mod tests {
 
     #[test]
     fn stamp_remote_classification_sets_both_fields_when_present() {
-        let mut payload = serde_json::json!({ "runtime": "funnel", "result_class": "ok" });
+        let mut payload = serde_json::json!({ "runtime": "review", "result_class": "ok" });
         stamp_remote_classification(&mut payload, Some("azure:host/model"), Some(42));
         assert_eq!(payload["endpoint"], "azure:host/model");
         assert_eq!(payload["remote_tokens"], 42);
@@ -380,7 +387,7 @@ mod tests {
 
     #[test]
     fn stamp_remote_classification_no_op_when_both_none() {
-        let mut payload = serde_json::json!({ "runtime": "funnel", "result_class": "ok" });
+        let mut payload = serde_json::json!({ "runtime": "review", "result_class": "ok" });
         let before = payload.clone();
         stamp_remote_classification(&mut payload, None, None);
         assert_eq!(payload, before);

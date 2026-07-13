@@ -396,7 +396,7 @@ enum RecommendationsCmd {
 // variant would require pattern-match adjustments throughout the
 // dispatch handler; the variant is constructed once per CLI invocation
 // so the stack-size hit doesn't matter at runtime.
-// `Run`'s field count (source + crew + funnel knobs + I/O paths) crosses
+// `Run`'s field count (source + crew + review-pipeline knobs + I/O paths) crosses
 // clippy's large-enum-variant threshold relative to the much smaller
 // `Render` variant — same rationale as `CrewCmd::Dispatch` below; boxing
 // would ripple through every match arm for a per-invocation, not hot-path,
@@ -463,7 +463,7 @@ enum PrReviewCmd {
         /// Override every review-probe staffing's draw count (k).
         #[arg(long)]
         k: Option<u32>,
-        /// Write the full funnel envelope (pretty JSON) here.
+        /// Write the full review envelope (pretty JSON) here.
         #[arg(long = "envelope-out")]
         envelope_out: Option<std::path::PathBuf>,
         /// Write the rendered `{mode, review, comment}` payload here. `-`

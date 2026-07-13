@@ -31,7 +31,7 @@
 //!   artifacts and debugging only; `Reason` variant names are not frozen.
 //!
 //! Absorption lineage: [`residency::decide_residency`] is a fact-typed port
-//! of the review funnel's validated miniature (`darkmux-lab` funnel.rs,
+//! of the review's validated miniature (`darkmux-lab` review.rs,
 //! PR #1275); [`ownership`] duplicates `darkmux_profiles::swap`'s canonical
 //! ownership helpers under golden parity tests (the root-crate
 //! `tests/gestalt_parity.rs` guards the duplication window until packet 3

@@ -11,8 +11,8 @@
 //! registry LOAD is deliberately lenient on crew content — one bad crew
 //! must not fail the whole registry and take unrelated `--profile`
 //! dispatch down with it). Every consumer that needs a specific crew calls
-//! through here directly: `crew dispatch`, the funnel preflight
-//! (`resolve_funnel_ctx`), `pr_review`, and `darkmux doctor`'s per-crew
+//! through here directly: `crew dispatch`, the review-bench `--funnel`
+//! preflight (`resolve_funnel_ctx`), `pr_review`, and `darkmux doctor`'s per-crew
 //! validation check. This mirrors `get_profile`'s loud-named-error style:
 //! every failure names the crew, the seat, the staffing position, and the
 //! specific problem.
@@ -61,7 +61,7 @@ pub struct ResolvedSeatStaffing {
 pub struct ResolvedCrew {
     pub name: String,
     pub seats: BTreeMap<String, Vec<ResolvedSeatStaffing>>,
-    /// (#1302) Whether confirmed review-funnel findings render as a blocking
+    /// (#1302) Whether confirmed review findings render as a blocking
     /// `REQUEST_CHANGES` review (`true`) or a non-blocking `COMMENT` review
     /// (`false`, the default). Carried verbatim from the source
     /// [`Crew::request_changes`](darkmux_types::Crew::request_changes) — see
@@ -88,7 +88,7 @@ pub struct ResolvedCrew {
 /// crew-side legislation of which profiles are allowed. The v1
 /// "crews are local-only" rejection was a deadline fence around
 /// unimplemented executor branches, not a design position — the executor
-/// (the review funnel, `crew dispatch`) now routes on what the profile
+/// (the review, `crew dispatch`) now routes on what the profile
 /// declares: endpoint present ⇒ hosted dialect, no cycling, remote token
 /// accounting. Remote models carry no `n_ctx` (#1282 — nothing is loaded
 /// locally), so the `require_n_ctx` gate applies to local staffing only.
@@ -153,7 +153,7 @@ pub fn resolve_crew(reg: &ProfileRegistry, name: &str) -> Result<ResolvedCrew> {
         name: name.to_string(),
         seats,
         // (#1302) Carried verbatim — resolution doesn't legislate the review
-        // event; the funnel/render path reads it to pick COMMENT vs
+        // event; the review/render path reads it to pick COMMENT vs
         // REQUEST_CHANGES.
         request_changes: crew.request_changes,
     })

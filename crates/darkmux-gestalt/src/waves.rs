@@ -1,11 +1,11 @@
 //! Budget-driven co-residency wave scheduling (#1285): partition desired
 //! placements into the largest co-resident sets that fit, replacing the
-//! funnel's hardware-tier-threshold Auto (the last machine-tier residue —
+//! review's hardware-tier-threshold Auto (the last machine-tier residue —
 //! the concept was removed end-to-end in #602/#604/#605) with arithmetic
 //! over the same facts the planner reasons on.
 //!
 //! Pure, like everything else in this crate: `(placements, facts, estimator,
-//! mode)` in ⇒ identical [`WaveSchedule`] out, always. The funnel's
+//! mode)` in ⇒ identical [`WaveSchedule`] out, always. The review's
 //! `LmsCycler` consumes waves at the packet-3 cutover, and the #1243 budget
 //! doubles as a hardware-tier emulator: set `budget = 24GB` on a 128GB
 //! machine and the schedule is the one a 32GB box would derive.

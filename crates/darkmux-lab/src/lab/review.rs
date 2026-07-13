@@ -1,4 +1,7 @@
-//! (#1222 Phase B packet 4) Review funnel — the validated review pipeline:
+//! (#1222 Phase B packet 4; module renamed from "funnel" to "review" in
+//! #1349 — the earlier name described a retired bespoke execution
+//! mechanism this pipeline no longer needs) The validated PR-review
+//! pipeline:
 //! bundles → probe seats ×k draws → dedup → double-confirm judge → a
 //! three-tier envelope.
 //!
@@ -9,7 +12,7 @@
 //!
 //! This module is the DRIVER: given a resolved crew (packet 1's
 //! `darkmux_profiles::crews::resolve_crew`), a diff, and an intent, it runs
-//! the whole pipeline and returns a [`FunnelEnvelope`]. Dispatch itself goes
+//! the whole pipeline and returns a [`ReviewEnvelope`]. Dispatch itself goes
 //! through a caller-injected `chat` closure (the container-free single-shot
 //! primitive from packet 2, `darkmux_crew::single_shot::single_shot_chat`,
 //! in production) and a caller-injected [`ModelCycler`] (real `lms` calls in
@@ -39,9 +42,9 @@
 //!
 //! **Reconciled in packet 5** (`darkmux pr-review run`, `src/pr_review.rs`
 //! in the binary crate): rather than editing `bundles_from_diff`'s body
-//! in place, [`FunnelInputs::bundles`] is the injection seam — packet 5
+//! in place, [`ReviewInputs::bundles`] is the injection seam — packet 5
 //! builds real bundles via `build_bundles`/`external_bundles` + `slice_code`
-//! and passes `Some(..)`; [`run_funnel`]/[`run_judge_only`] use those
+//! and passes `Some(..)`; [`run_review`]/[`run_judge_only`] use those
 //! directly and never call the provisional bundler. `bundles_from_diff`
 //! survives only as the `None` fallback this module's own pre-packet-3
 //! tests still rely on — no production caller uses it.
@@ -53,30 +56,30 @@
 //!
 //! ## Flow-record emission (#1247 Part 1)
 //!
-//! The driver (`run_funnel`/`run_judge_only`/`finish_funnel`/`probe_phase`/
+//! The driver (`run_review`/`run_judge_only`/`finish_review`/`probe_phase`/
 //! `dispatch_probe_staffing`) emits [`darkmux_flow::FlowRecord`]s through a
-//! caller-injected [`FunnelEmitter`] — same injection discipline as `chat`/
+//! caller-injected [`ReviewEmitter`] — same injection discipline as `chat`/
 //! `cycler` above, so a scripted test can assert the exact record SEQUENCE
 //! via a recording mock. The driver is deliberately SINK-AGNOSTIC: it never
 //! calls `darkmux_flow::record` itself and has no idea whether the records
 //! land on the real engagement-scoped flow stream or a per-run-local file —
 //! that choice belongs to the caller (`darkmux pr-review run` wires the real
-//! stream; `darkmux lab review-bench --funnel` wires a per-run-local JSONL
+//! stream; `darkmux lab review-bench --review` wires a per-run-local JSONL
 //! file, per the lab-vs-fleet scope boundary — a bench's hundreds of
 //! per-flag ruling records must never spam an operator's engagement
 //! stream). Three action families, vocabulary aligned with #1230/#1240's
 //! Mission → Phase → Task → Step hierarchy so the records forward-port to
 //! the generic mission-flow graph view unchanged:
 //!
-//! - `funnel.task` — one funnel RUN's bookends (`payload.status` = `started`
+//! - `review.task` — one review RUN's bookends (`payload.status` = `started`
 //!   | `finished` | `error`): case id, crew, exec mode, bundle count on
 //!   start; confirmed/needs_check/archived counts + `degenerate` reason
-//!   (when set) on finish. `error` is the [`FunnelBookendGuard`]'s Drop-path
+//!   (when set) on finish. `error` is the [`ReviewRunGuard`]'s Drop-path
 //!   terminal record — emitted when the driver `?`-returns or panics after
 //!   `started`, so no consumer ever sees an orphaned, perpetually-in-flight
 //!   run (the same guarantee `darkmux-crew`'s `DispatchBookendGuard`, #717,
 //!   gives `dispatch.start`).
-//! - `funnel.step` — a step transition, payload shape matching #1230's
+//! - `review.step` — a step transition, payload shape matching #1230's
 //!   named substrate exactly: `{step_id, kind: "procedural"|"dispatch",
 //!   items_in, items_out, status: "started"|"finished", wall_ms}` (plus
 //!   `status: "error"` from the guard's Drop path, closing any step still
@@ -92,26 +95,26 @@
 //!   opens the moment the FIRST pass-2 ruling actually fires (`items_in` is
 //!   the running count at that point, not the final docket size), rather
 //!   than waiting for the whole loop to finish. Opening it late let a live
-//!   observer see `funnel.ruling{pass:2}` records stream in while the
+//!   observer see `review.ruling{pass:2}` records stream in while the
 //!   `judge-pass2` step still read "not started" — a real contradiction
 //!   caught live in the lab lens. `finished` closes once the loop
 //!   completes, carrying the real final docket size and elapsed `wall_ms`.
-//! - `funnel.ruling` — the live ticker: one record per judge ruling (every
+//! - `review.ruling` — the live ticker: one record per judge ruling (every
 //!   pass-1, plus pass-2 when it ran) with `bundle_id`/`pass`/`ruling`/
 //!   `seconds`.
 //!
 //! Emission happens ONLY in the driver — never inside the pure protocol
 //! functions (`dedup_flags`, `mechanism_family`, `parse_judge_ruling`,
 //! `judge_prompt`, etc.) or the per-flag dispatch helper `judge_one_flag`
-//! (its [`JudgeOutcome`] is emitted from by the caller in `finish_funnel`'s
+//! (its [`JudgeOutcome`] is emitted from by the caller in `finish_review`'s
 //! loop, after the call returns).
 //!
 //! ## Host telemetry sampling (#1247 doctrine surface — "No blind runs")
 //!
-//! `run_funnel`/`run_judge_only` also start a background host cpu/ram/gpu
-//! sampler for the run's whole lifetime — see [`FunnelBookendGuard`] and
+//! `run_review`/`run_judge_only` also start a background host cpu/ram/gpu
+//! sampler for the run's whole lifetime — see [`ReviewRunGuard`] and
 //! [`HostTelemetrySampler`]. Samples emit as `telemetry.process` records
-//! through the SAME injected [`FunnelEmitter`] the `funnel.*` action family
+//! through the SAME injected [`ReviewEmitter`] the `review.*` action family
 //! above uses (so a bench run's samples stay per-run-local and a
 //! `pr-review run`'s samples ride the fleet stream, same split), with the
 //! identical field shape `darkmux_crew::dispatch_internal`'s always-on
@@ -140,10 +143,10 @@ use std::time::{Duration, Instant};
 
 // ─── execution mode ───────────────────────────────────────────────────────
 
-/// How probe/judge models are cycled through LMStudio across the funnel's
+/// How probe/judge models are cycled through LMStudio across the review's
 /// dispatches. `Auto` resolves once, up front, to `Sequential` or
 /// `Parallel` (see [`resolve_mode`]) — the resolved choice is what
-/// `FunnelEnvelope::mode` records, so an operator reading the envelope
+/// `ReviewEnvelope::mode` records, so an operator reading the envelope
 /// never has to wonder which one actually ran.
 ///
 /// This governs LMStudio RESIDENCY (which models stay loaded), not
@@ -213,7 +216,7 @@ pub struct DedupStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FunnelRuling {
+pub enum JudgeRuling {
     Confirmed,
     NeedsCheck,
     FalsePositive,
@@ -232,7 +235,7 @@ pub enum FunnelRuling {
 /// see `judge_pass_with_retry`'s doc for why that's honest).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgeRecord {
-    pub ruling: FunnelRuling,
+    pub ruling: JudgeRuling,
     pub decisive_evidence: String,
     pub note_for_author: String,
     pub pass: u8,
@@ -249,7 +252,7 @@ pub enum Tier {
 }
 
 /// (#1260/#1177) The verify (adjudication) seat's ruling vocabulary — the
-/// optional fourth funnel stage, run once per double-confirmed finding.
+/// optional fourth review stage, run once per double-confirmed finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifyRuling {
@@ -341,9 +344,9 @@ pub struct MemberRecord {
 }
 
 /// One pipeline step's in/out counts + wall time — the issue #1230 bridge:
-/// a future flow-record consumer can render the funnel as a step timeline
+/// a future flow-record consumer can render the review as a step timeline
 /// without re-deriving it from the envelope's nested arrays. Realized by
-/// the `funnel.step` flow record (#1247 Part 1, see the module doc) — the
+/// the `review.step` flow record (#1247 Part 1, see the module doc) — the
 /// live-run counterpart of this end-of-run summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecord {
@@ -359,39 +362,39 @@ pub struct StepRecord {
 
 // ─── flow-record emission (#1247 Part 1 — see the module doc) ───────────
 
-/// Sink for the funnel driver's run-observability records. The driver only
+/// Sink for the review driver's run-observability records. The driver only
 /// knows how to build [`darkmux_flow::FlowRecord`]s and hand them to
 /// `emit` — it never decides where they land. See the module doc's
 /// "Flow-record emission" section for the action/payload vocabulary and
 /// why the driver stays sink-agnostic (lab-vs-fleet scope boundary).
-pub trait FunnelEmitter {
+pub trait ReviewEmitter {
     fn emit(&mut self, record: darkmux_flow::FlowRecord);
 }
 
 /// No-op emitter — the "at minimum a no-op-able sink" default for callers
 /// (and this module's own tests that don't assert on flow records) that
-/// don't want funnel observability output.
+/// don't want review observability output.
 pub struct NullEmitter;
 
-impl FunnelEmitter for NullEmitter {
+impl ReviewEmitter for NullEmitter {
     fn emit(&mut self, _record: darkmux_flow::FlowRecord) {}
 }
 
-const FUNNEL_TASK_ACTION: &str = "funnel.task";
-const FUNNEL_STEP_ACTION: &str = "funnel.step";
-const FUNNEL_RULING_ACTION: &str = "funnel.ruling";
+const REVIEW_TASK_ACTION: &str = "review.task";
+const REVIEW_STEP_ACTION: &str = "review.step";
+const REVIEW_RULING_ACTION: &str = "review.ruling";
 
-/// Build one funnel observability record. `handle` = the crew name (this
-/// funnel's addressable identity, the role `handle` plays for `crew
-/// dispatch`'s per-role records); `session_id` = the case id (one funnel
+/// Build one review observability record. `handle` = the crew name (this
+/// review's addressable identity, the role `handle` plays for `crew
+/// dispatch`'s per-role records); `session_id` = the case id (one review
 /// RUN's identity, the role `session_id` plays for a single dispatch).
-/// `source = "funnel"` distinguishes these from `crew_dispatch`/
+/// `source = "review"` distinguishes these from `crew_dispatch`/
 /// `phase_review` records that may share the same sink. `category = Work`
 /// / `tier = Local` / `stage = Dispatch` mirror `crew dispatch`'s own
-/// per-turn records (`dispatch.tool`, `dispatch.turn`) — the funnel is,
+/// per-turn records (`dispatch.tool`, `dispatch.turn`) — the review is,
 /// mechanically, a multi-dispatch alternative shape of the same "produce a
 /// local review" job.
-fn funnel_flow_record(
+fn review_flow_record(
     case_id: &str,
     crew_name: &str,
     action: &str,
@@ -408,7 +411,7 @@ fn funnel_flow_record(
         handle: crew_name.to_string(),
         phase_id: None,
         session_id: Some(case_id.to_string()),
-        source: Some("funnel".to_string()),
+        source: Some("review".to_string()),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -423,13 +426,13 @@ fn funnel_flow_record(
     }
 }
 
-/// The `funnel.task` "finished" record's payload + level, shared by every
-/// return point (`run_funnel`'s two early degenerate returns,
-/// `run_judge_only`'s one, and `finish_funnel`'s normal end) so the shape
+/// The `review.task` "finished" record's payload + level, shared by every
+/// return point (`run_review`'s two early degenerate returns,
+/// `run_judge_only`'s one, and `finish_review`'s normal end) so the shape
 /// can't drift between call sites. `Level::Warn` when `env.degenerate` is
 /// set — a degenerate run is a loud, scoreable outcome, never quietly
 /// `Info`.
-fn task_finished_record(env: &FunnelEnvelope) -> darkmux_flow::FlowRecord {
+fn task_finished_record(env: &ReviewEnvelope) -> darkmux_flow::FlowRecord {
     let mut payload = json!({
         "status": "finished",
         "case_id": env.case_id,
@@ -454,7 +457,7 @@ fn task_finished_record(env: &FunnelEnvelope) -> darkmux_flow::FlowRecord {
         );
     }
     let level = if env.degenerate.is_some() { darkmux_flow::Level::Warn } else { darkmux_flow::Level::Info };
-    funnel_flow_record(&env.case_id, &env.crew, FUNNEL_TASK_ACTION, level, payload)
+    review_flow_record(&env.case_id, &env.crew, REVIEW_TASK_ACTION, level, payload)
 }
 
 // ─── host telemetry sampling (#1247 doctrine surface) ────────────────────
@@ -464,15 +467,15 @@ fn task_finished_record(env: &FunnelEnvelope) -> darkmux_flow::FlowRecord {
 /// is the time between samples; `poll` is how often the sampler thread
 /// re-checks the stop flag while sleeping out `interval`, so teardown is
 /// prompt (≤`poll`) instead of blocking for a full tick.
-const FUNNEL_TELEMETRY_INTERVAL: Duration = Duration::from_millis(2000);
-const FUNNEL_TELEMETRY_POLL: Duration = Duration::from_millis(500);
+const REVIEW_TELEMETRY_INTERVAL: Duration = Duration::from_millis(2000);
+const REVIEW_TELEMETRY_POLL: Duration = Duration::from_millis(500);
 
 /// (#1247 doctrine surface — "No blind runs") Best-effort host cpu/ram/gpu
-/// sampler for the funnel driver. The container dispatch path
+/// sampler for the review driver. The container dispatch path
 /// (`darkmux_crew::dispatch_internal`) has always sampled host load at
-/// ~2s cadence; the funnel path bypasses `dispatch_internal` entirely
+/// ~2s cadence; the review path bypasses `dispatch_internal` entirely
 /// (it dispatches through the container-free single-shot primitive) and
-/// so, until now, produced zero host telemetry — a funnel envelope
+/// so, until now, produced zero host telemetry — a review envelope
 /// recorded per-step wall-clock with no visibility into concurrent
 /// machine load. Measured motivation (#1247 host-telemetry comment): a
 /// 35B judge's tok/s dropped ~12–15% exactly when concurrent
@@ -487,13 +490,13 @@ const FUNNEL_TELEMETRY_POLL: Duration = Duration::from_millis(500);
 /// payload `{cpu, mem, gpu}`), so the run-monitor/viewer code that already
 /// renders `telemetry.process` records applies unchanged. `handle`/
 /// `session_id` carry the crew name / case id — the same identity fields
-/// `funnel_flow_record` stamps on the `funnel.*` action family, so a
+/// `review_flow_record` stamps on the `review.*` action family, so a
 /// telemetry record for this run groups with its other records under the
 /// same `session_id`.
 ///
 /// The sampling FUNCTION is injected (`sample_fn`, a plain fn pointer
 /// defaulting to `sample_host` at every production call site — see
-/// [`FunnelBookendGuard::new`]) so tests can drive the sampler with an
+/// [`ReviewRunGuard::new`]) so tests can drive the sampler with an
 /// instant fake instead of racing real `top -l 1` subprocess latency
 /// (~600-900ms per call) against a scripted deadline on a shared CI
 /// runner — the same injection discipline as `chat`/`cycler`/`emitter`.
@@ -502,13 +505,13 @@ const FUNNEL_TELEMETRY_POLL: Duration = Duration::from_millis(500);
 /// macOS-only).
 ///
 /// Samples land on an `mpsc` channel rather than being emitted directly
-/// from the background thread: the funnel driver's [`FunnelEmitter`] is a
+/// from the background thread: the review driver's [`ReviewEmitter`] is a
 /// caller-injected `&mut dyn` trait object — not thread-safe, and
 /// deliberately not wrapped in a `Mutex` (that would force every
-/// `FunnelEmitter` impl and every existing emission call site in this file
+/// `ReviewEmitter` impl and every existing emission call site in this file
 /// through lock-guarded access for a feature this narrow). Instead,
-/// [`FunnelBookendGuard`] drains the channel immediately before every
-/// record it already emits (`funnel.task`/`funnel.step`/`funnel.ruling`)
+/// [`ReviewRunGuard`] drains the channel immediately before every
+/// record it already emits (`review.task`/`review.step`/`review.ruling`)
 /// and once more in its own `Drop`, so telemetry interleaves with the
 /// run's other records close to when it was sampled — never batched at
 /// end-of-run, which is exactly the failure the doctrine calls out
@@ -523,7 +526,7 @@ impl HostTelemetrySampler {
     /// Spawn the sampler thread. Uses `Builder::spawn` (which returns
     /// `io::Result`, unlike the panicking `thread::spawn`) so an OS-level
     /// spawn failure degrades to "no samples" — sampling must never affect
-    /// the funnel run it's observing.
+    /// the review run it's observing.
     fn start(
         case_id: String,
         crew: String,
@@ -535,15 +538,15 @@ impl HostTelemetrySampler {
         let (tx, rx) = mpsc::channel();
         let stop_thread = Arc::clone(&stop);
         let handle = thread::Builder::new()
-            .name("funnel-telemetry".to_string())
+            .name("review-telemetry".to_string())
             .spawn(move || loop {
                 // Sleep out `interval` FIRST, THEN sample — deliberately
-                // NOT sample-then-sleep. A funnel run's own dispatches
+                // NOT sample-then-sleep. A review run's own dispatches
                 // (bundling, probe draws, judge passes) are real LMStudio
                 // round trips that take real wall-clock, so a run genuinely
                 // running past one `interval` gets its first sample right
                 // on schedule. The load-bearing side effect: at the
-                // PRODUCTION cadence ([`FUNNEL_TELEMETRY_INTERVAL`], 2s),
+                // PRODUCTION cadence ([`REVIEW_TELEMETRY_INTERVAL`], 2s),
                 // this makes it structurally impossible for a synchronous,
                 // sub-millisecond MOCKED test run (of which this file has
                 // 20+) to race a sample into its `RecordingEmitter` — the
@@ -596,7 +599,7 @@ impl HostTelemetrySampler {
 
     /// Signal the stop flag and join the thread. Called from `Drop` — the
     /// RAII tie-in that guarantees no orphaned sampler thread outlives a
-    /// [`FunnelBookendGuard`], on every exit path (clean finish, early
+    /// [`ReviewRunGuard`], on every exit path (clean finish, early
     /// `?`-return, or panic).
     fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -612,12 +615,12 @@ impl Drop for HostTelemetrySampler {
     }
 }
 
-/// Adapts a [`FunnelEmitter`] to `darkmux_flow`'s generic
-/// [`darkmux_flow::BookendSink`] (#1230 Packet 0) so [`FunnelBookendGuard`]
+/// Adapts a [`ReviewEmitter`] to `darkmux_flow`'s generic
+/// [`darkmux_flow::BookendSink`] (#1230 Packet 0) so [`ReviewRunGuard`]
 /// can wrap `darkmux_flow::BookendGuard` without `darkmux-flow` (a
 /// dependency LEAF) knowing this crate's own emitter trait exists. A local
 /// type implementing a foreign trait — no orphan-rule friction.
-struct EmitterSink<'a>(&'a mut dyn FunnelEmitter);
+struct EmitterSink<'a>(&'a mut dyn ReviewEmitter);
 
 impl darkmux_flow::BookendSink for EmitterSink<'_> {
     fn emit(&mut self, record: darkmux_flow::FlowRecord) {
@@ -626,9 +629,9 @@ impl darkmux_flow::BookendSink for EmitterSink<'_> {
 }
 
 /// (#1247 review round, unified onto `darkmux_flow::BookendGuard` in #1230
-/// Packet 0) Bookend guard for the funnel's flow-record lifecycle — same
+/// Packet 0) Bookend guard for the review's flow-record lifecycle — same
 /// class of problem `darkmux-crew`'s `DispatchBookendGuard` (#717) solves
-/// for `dispatch.start`: once `funnel.task started` is emitted, the driver
+/// for `dispatch.start`: once `review.task started` is emitted, the driver
 /// can still `?`-return before the clean `finished` bookend (a probe
 /// dispatch error, a cycler load/release failure) — or panic. Without a
 /// terminal record that leaves an orphaned task (rendering as perpetually
@@ -641,47 +644,47 @@ impl darkmux_flow::BookendSink for EmitterSink<'_> {
 /// and each step nests inside it as another (`kind` = the step's own kind,
 /// `"dispatch"`/`"procedural"`), so `inner`'s Drop pops every still-open
 /// unit innermost-first (steps before the task) and builds the right
-/// `funnel.step`- or `funnel.task`-shaped abort record via its `on_abort`
+/// `review.step`- or `review.task`-shaped abort record via its `on_abort`
 /// closure — every `started` gets a matching terminal event, on every path.
 /// The clean finish (`task_finished`, which every success/degenerate return
 /// point calls) closes the task unit, disarming `inner` once the stack
 /// empties — a run that reached its own terminal record is never
 /// double-counted.
 ///
-/// Emission on `Drop` is best-effort by construction — [`FunnelEmitter`]
+/// Emission on `Drop` is best-effort by construction — [`ReviewEmitter`]
 /// impls are already infallible (`emit` returns nothing), so a sink problem
 /// can't mask the original error propagating out.
 ///
 /// Also owns the run's [`HostTelemetrySampler`] (#1247 doctrine surface):
 /// started in [`Self::new`]/[`Self::new_with_telemetry`] and
 /// stopped by its own `Drop` — which Rust runs automatically as a field of
-/// this struct, right after `FunnelBookendGuard`'s own `Drop::drop` body
+/// this struct, right after `ReviewRunGuard`'s own `Drop::drop` body
 /// returns, so the sampler thread never outlives the guard on any exit
-/// path. This telemetry-draining half is genuinely funnel-specific (it
+/// path. This telemetry-draining half is genuinely review-specific (it
 /// doesn't belong in `darkmux-flow`) — only the open/close stack moved.
-struct FunnelBookendGuard<'a> {
+struct ReviewRunGuard<'a> {
     case_id: String,
     crew: String,
     inner: darkmux_flow::BookendGuard<'a, EmitterSink<'a>>,
     telemetry: HostTelemetrySampler,
 }
 
-/// The fixed unit id/kind [`FunnelBookendGuard::task_started`]/
-/// [`FunnelBookendGuard::task_finished`] open/close under — the funnel has
+/// The fixed unit id/kind [`ReviewRunGuard::task_started`]/
+/// [`ReviewRunGuard::task_finished`] open/close under — the review has
 /// exactly one task per run, so this is a constant rather than something
 /// derived per-call. `inner`'s `on_abort` closure matches on `kind == this`
-/// to decide whether a still-open unit at Drop time needs a `funnel.task`-
-/// or `funnel.step`-shaped abort record.
-const FUNNEL_TASK_UNIT_KIND: &str = "task";
+/// to decide whether a still-open unit at Drop time needs a `review.task`-
+/// or `review.step`-shaped abort record.
+const REVIEW_TASK_UNIT_KIND: &str = "task";
 
-impl<'a> FunnelBookendGuard<'a> {
+impl<'a> ReviewRunGuard<'a> {
     fn new(sink: &'a mut EmitterSink<'a>, case_id: &str, crew: &str) -> Self {
         Self::new_with_telemetry(
             sink,
             case_id,
             crew,
-            FUNNEL_TELEMETRY_INTERVAL,
-            FUNNEL_TELEMETRY_POLL,
+            REVIEW_TELEMETRY_INTERVAL,
+            REVIEW_TELEMETRY_POLL,
             sample_host,
         )
     }
@@ -691,7 +694,7 @@ impl<'a> FunnelBookendGuard<'a> {
     /// observe deterministic samples without a multi-second sleep and
     /// without shelling to the real (macOS-only, ~600-900ms-per-call)
     /// `top`/`vm_stat`/`ioreg` commands. Production always goes through
-    /// `new`, which fixes the cadence at [`FUNNEL_TELEMETRY_INTERVAL`]
+    /// `new`, which fixes the cadence at [`REVIEW_TELEMETRY_INTERVAL`]
     /// and the sampler at the real `sample_host`.
     fn new_with_telemetry(
         sink: &'a mut EmitterSink<'a>,
@@ -704,24 +707,24 @@ impl<'a> FunnelBookendGuard<'a> {
         let case_id_owned = case_id.to_string();
         let crew_owned = crew.to_string();
         let on_abort = move |id: &str, kind: &str| -> darkmux_flow::FlowRecord {
-            if kind == FUNNEL_TASK_UNIT_KIND {
-                funnel_flow_record(
+            if kind == REVIEW_TASK_UNIT_KIND {
+                review_flow_record(
                     &case_id_owned,
                     &crew_owned,
-                    FUNNEL_TASK_ACTION,
+                    REVIEW_TASK_ACTION,
                     darkmux_flow::Level::Error,
                     json!({
                         "status": "error",
                         "case_id": case_id_owned,
                         "crew": crew_owned,
-                        "error": "funnel terminated before completion (early return or panic)",
+                        "error": "review terminated before completion (early return or panic)",
                     }),
                 )
             } else {
-                funnel_flow_record(
+                review_flow_record(
                     &case_id_owned,
                     &crew_owned,
-                    FUNNEL_STEP_ACTION,
+                    REVIEW_STEP_ACTION,
                     darkmux_flow::Level::Error,
                     json!({ "step_id": id, "kind": kind, "status": "error" }),
                 )
@@ -762,73 +765,73 @@ impl<'a> FunnelBookendGuard<'a> {
         self.inner.emit_now(record);
     }
 
-    /// Emit the `funnel.task started` bookend and ARM the guard — from here
+    /// Emit the `review.task started` bookend and ARM the guard — from here
     /// until `task_finished`, an early return or panic fires the Drop path.
     fn task_started(&mut self, payload: serde_json::Value) {
         self.drain_telemetry();
-        let started = funnel_flow_record(
+        let started = review_flow_record(
             &self.case_id,
             &self.crew,
-            FUNNEL_TASK_ACTION,
+            REVIEW_TASK_ACTION,
             darkmux_flow::Level::Info,
             payload,
         );
-        self.inner.open(FUNNEL_TASK_UNIT_KIND, FUNNEL_TASK_UNIT_KIND, started);
+        self.inner.open(REVIEW_TASK_UNIT_KIND, REVIEW_TASK_UNIT_KIND, started);
     }
 
-    /// Emit a `funnel.step` `status: "started"` record and track the step
+    /// Emit a `review.step` `status: "started"` record and track the step
     /// as open until [`Self::step_finished`] closes it.
     fn step_started(&mut self, step_id: &str, kind: &str, payload: serde_json::Value) {
         self.drain_telemetry();
-        let started = funnel_flow_record(
+        let started = review_flow_record(
             &self.case_id,
             &self.crew,
-            FUNNEL_STEP_ACTION,
+            REVIEW_STEP_ACTION,
             darkmux_flow::Level::Info,
             payload,
         );
         self.inner.open(step_id, kind, started);
     }
 
-    /// Emit a `funnel.step` `status: "finished"` record and close the step.
+    /// Emit a `review.step` `status: "finished"` record and close the step.
     /// Also the entry point for one-shot steps that emit `finished` with no
     /// prior `started` (`bundle`, `dedup` — instantaneous procedural steps);
     /// the close is then a no-op on the open-step stack.
     fn step_finished(&mut self, step_id: &str, payload: serde_json::Value) {
         self.drain_telemetry();
-        let finished = funnel_flow_record(
+        let finished = review_flow_record(
             &self.case_id,
             &self.crew,
-            FUNNEL_STEP_ACTION,
+            REVIEW_STEP_ACTION,
             darkmux_flow::Level::Info,
             payload,
         );
         self.inner.close(step_id, finished);
     }
 
-    /// Emit a `funnel.ruling` ticker record (no open/close semantics).
+    /// Emit a `review.ruling` ticker record (no open/close semantics).
     fn ruling(&mut self, payload: serde_json::Value) {
-        self.emit_now(funnel_flow_record(
+        self.emit_now(review_flow_record(
             &self.case_id,
             &self.crew,
-            FUNNEL_RULING_ACTION,
+            REVIEW_RULING_ACTION,
             darkmux_flow::Level::Info,
             payload,
         ));
     }
 
-    /// Emit the terminal `funnel.task` record for `env` (finished, or
+    /// Emit the terminal `review.task` record for `env` (finished, or
     /// degenerate-finished — see [`task_finished_record`]) and close the
     /// task unit: this run reached its own terminal record, so `inner`
     /// disarms once the stack empties (every real call site already closed
     /// its own steps before calling this, so the stack is just `[task]`).
-    fn task_finished(&mut self, env: &FunnelEnvelope) {
+    fn task_finished(&mut self, env: &ReviewEnvelope) {
         self.drain_telemetry();
-        self.inner.close(FUNNEL_TASK_UNIT_KIND, task_finished_record(env));
+        self.inner.close(REVIEW_TASK_UNIT_KIND, task_finished_record(env));
     }
 }
 
-impl Drop for FunnelBookendGuard<'_> {
+impl Drop for ReviewRunGuard<'_> {
     fn drop(&mut self) {
         // Flush any sample the sampler produced since the last drain — even
         // on the clean-finish path (`task_finished` already closed `inner`'s
@@ -853,7 +856,7 @@ impl Drop for FunnelBookendGuard<'_> {
 // ─── the envelope ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FunnelEnvelope {
+pub struct ReviewEnvelope {
     pub case_id: String,
     pub crew: String,
     pub mode: String,
@@ -886,7 +889,7 @@ pub struct FunnelEnvelope {
     pub fingerprint: serde_json::Value,
     /// The RESOLVED per-seat staffing this run actually used — post any
     /// `--k` override the caller applied to the crew before dispatch.
-    /// `FunnelEnvelope::crew` is only the crew's NAME; if the operator
+    /// `ReviewEnvelope::crew` is only the crew's NAME; if the operator
     /// edits or renames that crew's staffing between runs, a series
     /// comparison keyed on the name alone silently corrupts. This snapshot
     /// makes the run's knob config self-contained in its own artifact — an
@@ -924,7 +927,7 @@ fn usize_is_zero(n: &usize) -> bool {
 }
 
 /// (#1260) One pipeline stage's remote token-bucket outcome — see
-/// [`FunnelEnvelope::remote_budgets`]. An "execution" is one stage (the
+/// [`ReviewEnvelope::remote_budgets`]. An "execution" is one stage (the
 /// probe pass, each judge pass, the verify pass), each drawing from its own
 /// `remote.max_tokens_per_execution` allowance so a runaway stage is caught
 /// at the cap without starving later stages.
@@ -1026,7 +1029,7 @@ fn seat_endpoint(pm: &ProfileModel) -> Option<&ModelEndpoint> {
 }
 
 /// One seat staffing's resolved config, snapshotted as ACTUALLY used —
-/// see [`FunnelEnvelope::staffing`].
+/// see [`ReviewEnvelope::staffing`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaffingSnapshot {
     pub name: String,
@@ -1073,7 +1076,7 @@ pub struct StaffingSnapshot {
 
 /// Per-seat resolved staffing snapshot — `review-probe` (one or more
 /// staffings) + `review-judge` (exactly one) + the optional `review-verify`
-/// seat (#1260). See [`FunnelEnvelope::staffing`].
+/// seat (#1260). See [`ReviewEnvelope::staffing`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrewStaffingSnapshot {
     pub probes: Vec<StaffingSnapshot>,
@@ -1146,7 +1149,7 @@ pub trait ModelCycler {
 /// fully built and unit-tested but had ZERO production callers before this
 /// cutover; this is their first one.
 ///
-/// This retires the funnel's own private `ResidencyDecision`/
+/// This retires the review's own private `ResidencyDecision`/
 /// `decide_residency` (the pre-cutover duplicate `tests/gestalt_parity.rs`
 /// existed only to keep the two from silently forking) and the
 /// `resolve_auto` hardware-tier table (see `resolve_mode` below) in favor
@@ -1168,7 +1171,7 @@ pub struct LmsCycler;
 /// `MacProbe::pools()` — both port adapters constructed HERE, their first
 /// production call site.
 ///
-/// `catalog: None` — the funnel has never run the #1276 existence
+/// `catalog: None` — the review has never run the #1276 existence
 /// fast-fail (an unknown model key fails at the real `lms load` call the
 /// same way it always has), and wiring `list_catalog()` here would cost
 /// every `ensure_loaded` an extra `lms ls --json` round-trip for a check
@@ -1204,7 +1207,7 @@ impl ModelCycler for LmsCycler {
         let mut host = LmsHost::new();
         let facts = gather_facts(&mut host)?;
         let placement =
-            Placement { model_key: pm.id.clone(), identifier, min_ctx: n_ctx, seat: "funnel".to_string() };
+            Placement { model_key: pm.id.clone(), identifier, min_ctx: n_ctx, seat: "review".to_string() };
         let opts = AcquireOpts { intent: CallerIntent::Auto, scope: AcquireScope::Additive };
         let plan =
             darkmux_gestalt::plan_acquire(std::slice::from_ref(&placement), &facts, opts, &inert_estimator());
@@ -1240,7 +1243,7 @@ impl ModelCycler for LmsCycler {
                     })?;
                 }
                 Action::Block { model_key, .. } => {
-                    bail!("darkmux: cannot load \"{model_key}\" for the review funnel — {}", planned.reason)
+                    bail!("darkmux: cannot load \"{model_key}\" for the review — {}", planned.reason)
                 }
             }
         }
@@ -1255,7 +1258,7 @@ impl ModelCycler for LmsCycler {
             model_key: pm.id.clone(),
             identifier,
             min_ctx: pm.n_ctx.unwrap_or(0),
-            seat: "funnel".to_string(),
+            seat: "review".to_string(),
         };
         let plan = darkmux_gestalt::plan_release(std::slice::from_ref(&placement), &[], &facts);
         let deadline = resolved_load_deadline();
@@ -1286,7 +1289,7 @@ const DEFAULT_JUDGE_MAX_TOKENS: u32 = 20_000;
 /// staffing `max_tokens` always wins verbatim (operator sovereignty — the
 /// operator may know their task is short). Local seats are unaffected.
 const REMOTE_REASONING_MAX_TOKENS_FLOOR: u32 = 16_384;
-const FUNNEL_PROTOCOL: &str = "double-confirm-v1";
+const REVIEW_PROTOCOL: &str = "double-confirm-v1";
 
 /// (#1260) Resolve one seat's completion cap: an explicit staffing
 /// `max_tokens` always wins verbatim; otherwise a REMOTE seat floors at
@@ -1315,7 +1318,7 @@ fn resolve_seat_max_tokens(s: &ResolvedSeatStaffing, local_default: u32) -> u32 
 /// Replaces the deleted `resolve_auto` tier table. `darkmux_gestalt::waves`'s
 /// own module doc already claimed the hardware-tier-threshold concept "was
 /// removed end-to-end in #602/#604/#605" — that claim was aspirational until
-/// this function, the funnel's last holdout, stopped re-deriving one.
+/// this function, the review's last holdout, stopped re-deriving one.
 fn wave_schedule_to_exec_mode(schedule: &darkmux_gestalt::WaveSchedule) -> ExecMode {
     if schedule.waves.len() <= 1 {
         ExecMode::Parallel
@@ -1374,7 +1377,7 @@ fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &Resolve
                     model_key: s.pm.id.clone(),
                     identifier,
                     min_ctx: s.pm.n_ctx.unwrap_or(0),
-                    seat: "funnel-auto".to_string(),
+                    seat: "review-auto".to_string(),
                 });
             }
             resolve_auto_via_waves(&placements)
@@ -1383,36 +1386,36 @@ fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &Resolve
     }
 }
 
-// ─── crew validation (funnel-owned seat requirements) ───────────────────
+// ─── crew validation (review-owned seat requirements) ───────────────────
 
-/// The funnel's validated seat set — what [`validate_funnel_crew`] hands
+/// The review's validated seat set — what [`validate_review_crew`] hands
 /// back. `verify` is the OPTIONAL fourth seat (#1260): when a crew declares
 /// `review-verify` (exactly one staffing, like the judge), every
 /// double-confirmed finding gets one adjudication call after pass-2; a crew
 /// without it behaves byte-identically to today.
 #[derive(Debug)]
-pub struct FunnelSeats<'a> {
+pub struct ReviewSeats<'a> {
     pub probes: &'a Vec<ResolvedSeatStaffing>,
     pub judge: &'a ResolvedSeatStaffing,
     pub verify: Option<&'a ResolvedSeatStaffing>,
 }
 
-/// Validate `crew` carries what the funnel needs: seat `"review-probe"`
+/// Validate `crew` carries what the review needs: seat `"review-probe"`
 /// with >= 1 staffing, seat `"review-judge"` with EXACTLY 1 staffing, and
 /// — when declared — seat `"review-verify"` with EXACTLY 1 staffing
 /// (#1260; the seat is optional, its shape is not).
 /// `resolve_crew` (packet 1) validates the crew schema is well-formed and
 /// every model resolvable; it deliberately does NOT know about
 /// pipeline-specific seat requirements — that's this function's job, and
-/// it runs at funnel start so a misconfigured crew fails loud before any
+/// it runs at review start so a misconfigured crew fails loud before any
 /// dispatch spends a token.
 ///
 /// `pub` (not private) since #1222 Phase B packet 7 review round: the
-/// `review-bench --funnel` preflight (`darkmux_lab::lab::review_bench::
-/// resolve_funnel_ctx`) calls this directly, ahead of `run_funnel`'s own
+/// `review-bench --review` preflight (`darkmux_lab::lab::review_bench::
+/// resolve_review_ctx`) calls this directly, ahead of `run_review`'s own
 /// internal call, so a misconfigured crew fails at bench START (before the
 /// per-case loop even begins) rather than at the first case's dispatch.
-pub fn validate_funnel_crew(crew: &ResolvedCrew) -> Result<FunnelSeats<'_>> {
+pub fn validate_review_crew(crew: &ResolvedCrew) -> Result<ReviewSeats<'_>> {
     let probes = crew
         .seats
         .get("review-probe")
@@ -1420,7 +1423,7 @@ pub fn validate_funnel_crew(crew: &ResolvedCrew) -> Result<FunnelSeats<'_>> {
         .ok_or_else(|| {
             anyhow!(
                 "darkmux: crew \"{}\" is missing seat \"review-probe\" (the review \
-                 funnel needs >= 1 staffing) — add one under crews.\"{}\".seats.\"review-probe\"",
+                 review needs >= 1 staffing) — add one under crews.\"{}\".seats.\"review-probe\"",
                 crew.name,
                 crew.name
             )
@@ -1428,7 +1431,7 @@ pub fn validate_funnel_crew(crew: &ResolvedCrew) -> Result<FunnelSeats<'_>> {
     let judges = crew.seats.get("review-judge").ok_or_else(|| {
         anyhow!(
             "darkmux: crew \"{}\" is missing seat \"review-judge\" (the review \
-             funnel needs exactly 1 staffing)",
+             review needs exactly 1 staffing)",
             crew.name
         )
     })?;
@@ -1451,7 +1454,7 @@ pub fn validate_funnel_crew(crew: &ResolvedCrew) -> Result<FunnelSeats<'_>> {
             v.len()
         ),
     };
-    Ok(FunnelSeats { probes, judge: &judges[0], verify })
+    Ok(ReviewSeats { probes, judge: &judges[0], verify })
 }
 
 // ─── mechanism-family keyword table (for dedup) ──────────────────────────
@@ -1888,7 +1891,7 @@ const JUDGE_TAIL_INSTRUCTION: &str = "Investigate the flagged item against the c
 /// the flagged item, then the frozen fenced-JSON instruction tail.
 ///
 /// Phase A has no MANIFEST section (`bundler.py`'s bundles carry no such
-/// field and `judge_one` never renders one) — the Rust funnel's `manifest`
+/// field and `judge_one` never renders one) — the Rust review's `manifest`
 /// input is Rust-only and, per the "match Phase A exactly" operator
 /// decision (#1256), is DROPPED from this prompt entirely, not silently
 /// kept. `BundleInput.manifest` still exists (available to a future
@@ -1992,14 +1995,14 @@ fn judge_json_candidates(text: &str) -> Vec<String> {
 
 /// Parse a judge reply into `(ruling, decisive_evidence, note_for_author)`.
 /// `None` when no candidate carries a recognized `ruling` value — the
-/// caller treats that as [`FunnelRuling::Unparsed`].
-pub fn parse_judge_ruling(text: &str) -> Option<(FunnelRuling, String, String)> {
+/// caller treats that as [`JudgeRuling::Unparsed`].
+pub fn parse_judge_ruling(text: &str) -> Option<(JudgeRuling, String, String)> {
     for cand in judge_json_candidates(text) {
         if let Ok(raw) = serde_json::from_str::<RawJudgeRuling>(&cand) {
             let ruling = match raw.ruling.trim().to_ascii_lowercase().as_str() {
-                "confirmed" => FunnelRuling::Confirmed,
-                "needs_check" => FunnelRuling::NeedsCheck,
-                "false_positive" => FunnelRuling::FalsePositive,
+                "confirmed" => JudgeRuling::Confirmed,
+                "needs_check" => JudgeRuling::NeedsCheck,
+                "false_positive" => JudgeRuling::FalsePositive,
                 _ => continue,
             };
             return Some((ruling, raw.decisive_evidence, raw.note_for_author));
@@ -2113,8 +2116,8 @@ fn bundles_from_diff(diff: &str) -> Vec<BundleInput> {
 
 /// (#1222 Phase B packet 5 reconciliation) `inputs.bundles` when the caller
 /// supplied real ones (production), else the provisional [`bundles_from_diff`]
-/// (this module's own pre-packet-3 tests only — see [`FunnelInputs::bundles`]).
-fn resolve_bundles(inputs: &FunnelInputs) -> Vec<BundleInput> {
+/// (this module's own pre-packet-3 tests only — see [`ReviewInputs::bundles`]).
+fn resolve_bundles(inputs: &ReviewInputs) -> Vec<BundleInput> {
     match &inputs.bundles {
         Some(b) => b.clone(),
         None => bundles_from_diff(inputs.diff),
@@ -2146,7 +2149,7 @@ fn select_bundles_for_staffing<'a>(
 
 // ─── dispatch primitive ───────────────────────────────────────────────────
 
-/// One single-shot chat call the funnel wants dispatched. Test closures
+/// One single-shot chat call the review wants dispatched. Test closures
 /// assert on these fields directly; production wiring turns this into a
 /// `darkmux_crew::single_shot::SingleShotRequest` (the caller resolves
 /// `base_url`) — or, when `endpoint` is `Some` (#1260), a
@@ -2165,16 +2168,16 @@ pub struct ChatCall<'a> {
     pub endpoint: Option<&'a ModelEndpoint>,
 }
 
-// ─── funnel inputs ────────────────────────────────────────────────────────
+// ─── review inputs ────────────────────────────────────────────────────────
 
-/// Everything [`run_funnel`]/[`run_judge_only`] need beyond the injected
+/// Everything [`run_review`]/[`run_judge_only`] need beyond the injected
 /// `chat`/`cycler`. Role-prompt resolution (`review-probe.md` /
 /// `review-judge.md`) is the caller's job — `darkmux-lab` already depends
 /// on `darkmux-crew`, but pulling role-manifest resolution INTO this
 /// module would couple the pure pipeline to `darkmux_crew::loader`'s
 /// filesystem/embedded-role search order for no benefit the caller
 /// couldn't provide more simply.
-pub struct FunnelInputs<'a> {
+pub struct ReviewInputs<'a> {
     pub case_id: String,
     pub crew: &'a ResolvedCrew,
     /// The author's stated case (PR title). Fed into [`judge_prompt`] only
@@ -2227,7 +2230,7 @@ pub fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Va
         "judge_model": judge_identifier,
         "judge_temperature": JUDGE_TEMPERATURE,
         "judge_persona_blake3": blake3::hash(judge_system.as_bytes()).to_hex().to_string(),
-        "protocol": FUNNEL_PROTOCOL,
+        "protocol": REVIEW_PROTOCOL,
     })
 }
 
@@ -2244,7 +2247,7 @@ pub fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Va
 /// distinct from the judge's `// path` raw format in `bundle.code`), then
 /// IF facts: a blank line, the fact-sheet header, a blank line, `- fact`
 /// lines. Deliberately NO intent anywhere in this prompt — Phase A's
-/// `build_prompt` never saw one; `FunnelInputs::intent_title`/
+/// `build_prompt` never saw one; `ReviewInputs::intent_title`/
 /// `intent_body` are dropped here on purpose (kept for [`judge_prompt`]
 /// only), not silently threaded through.
 fn probe_user_message(prior: &str, bundle: &BundleInput) -> String {
@@ -2307,7 +2310,7 @@ fn probe_one_draw(
     Ok((None, tokens, served))
 }
 
-/// One probe seat's dispatch — a `funnel.step` pair (`step_id =
+/// One probe seat's dispatch — a `review.step` pair (`step_id =
 /// "probe:<staffing-name>"`, #1247 Part 1) brackets the seat's whole
 /// draw loop so a live ticker sees per-seat progress inside a multi-seat
 /// probe phase, not just the phase-level aggregate `probe_phase` records.
@@ -2321,15 +2324,15 @@ fn probe_one_draw(
 ///   a WARNING + reduced coverage, not a run abort — the remaining seats
 ///   and the judge still run (`warnings` carries the named reason). Local
 ///   seats keep the propagate-and-abort behavior unchanged;
-/// - its `funnel.step` records carry `remote: true` + the endpoint host.
+/// - its `review.step` records carry `remote: true` + the endpoint host.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_probe_staffing(
     s: &ResolvedSeatStaffing,
     bundles: &[BundleInput],
-    inputs: &FunnelInputs,
+    inputs: &ReviewInputs,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     flags: &mut Vec<ProbeFlag>,
-    guard: &mut FunnelBookendGuard<'_>,
+    guard: &mut ReviewRunGuard<'_>,
     bucket: &mut RemoteBucket,
     warnings: &mut Vec<String>,
 ) -> Result<MemberRecord> {
@@ -2453,12 +2456,12 @@ fn dispatch_probe_staffing(
 fn probe_phase(
     bundles: &[BundleInput],
     probes: &[ResolvedSeatStaffing],
-    inputs: &FunnelInputs,
+    inputs: &ReviewInputs,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
     members: &mut Vec<MemberRecord>,
     mode: ExecMode,
-    guard: &mut FunnelBookendGuard<'_>,
+    guard: &mut ReviewRunGuard<'_>,
     bucket: &mut RemoteBucket,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<ProbeFlag>> {
@@ -2534,7 +2537,7 @@ fn run_judge_pass(
                 ),
                 None => (
                     JudgeRecord {
-                        ruling: FunnelRuling::Unparsed,
+                        ruling: JudgeRuling::Unparsed,
                         decisive_evidence: String::new(),
                         note_for_author: String::new(),
                         pass,
@@ -2546,12 +2549,12 @@ fn run_judge_pass(
             }
         }
         // A dispatch-level failure is recorded as `Error`, not propagated —
-        // one bad judge call must not abort the whole docket (the funnel's
+        // one bad judge call must not abort the whole docket (the review's
         // job is to be loud PER-FLAG, not to be fragile). No reply body, so
         // no served model to report.
         Err(_) => (
             JudgeRecord {
-                ruling: FunnelRuling::Error,
+                ruling: JudgeRuling::Error,
                 decisive_evidence: String::new(),
                 note_for_author: String::new(),
                 pass,
@@ -2577,7 +2580,7 @@ struct PassOutcome {
     /// dispatch-level `Err` (a chat failure surviving the transport's bounded
     /// retries), NOT from a parse failure or a budget denial. A REMOTE judge
     /// with any such failure marks the run degraded (honest-fail — the
-    /// affected flag carries no real adjudication); see `finish_funnel`.
+    /// affected flag carries no real adjudication); see `finish_review`.
     dispatch_error: bool,
     /// (#1300) The served model reported by this pass's response, if any
     /// (`None` on a dispatch error or a budget-denied call — no response
@@ -2585,7 +2588,7 @@ struct PassOutcome {
     served_model: Option<String>,
 }
 
-/// One judge pass, retried ONCE if the reply was [`FunnelRuling::Unparsed`]
+/// One judge pass, retried ONCE if the reply was [`JudgeRuling::Unparsed`]
 /// (the retry keeps the same `pass` number — a retried pass-1 is still
 /// pass-1, just a second attempt at it). Still unparsed after the retry:
 /// the retry's record survives (the first attempt's record is discarded,
@@ -2603,13 +2606,13 @@ fn judge_pass_with_retry(
 ) -> PassOutcome {
     let t0 = Instant::now();
     let (r1, t1, served1) = run_judge_pass(pass, model, system, prompt, max_tokens, endpoint, chat);
-    if r1.ruling == FunnelRuling::Unparsed {
+    if r1.ruling == JudgeRuling::Unparsed {
         let (r2, t2, served2) = run_judge_pass(pass, model, system, prompt, max_tokens, endpoint, chat);
-        // `run_judge_pass` only ever yields `FunnelRuling::Error` from its
+        // `run_judge_pass` only ever yields `JudgeRuling::Error` from its
         // dispatch-`Err` arm (a parse miss is `Unparsed`, and the budget-denied
         // record is built by the caller, never here) — so the surviving
         // ruling being `Error` is exactly the dispatch-failure signal (#1260).
-        let dispatch_error = r2.ruling == FunnelRuling::Error;
+        let dispatch_error = r2.ruling == JudgeRuling::Error;
         PassOutcome {
             record: r2,
             tokens: t1 + t2,
@@ -2619,7 +2622,7 @@ fn judge_pass_with_retry(
             served_model: served2.or(served1),
         }
     } else {
-        let dispatch_error = r1.ruling == FunnelRuling::Error;
+        let dispatch_error = r1.ruling == JudgeRuling::Error;
         PassOutcome {
             record: r1,
             tokens: t1,
@@ -2668,10 +2671,10 @@ struct JudgeBudgets {
 /// refused — ruled `Error` (never silently `confirmed`), with the reason in
 /// `note_for_author` so the envelope carries it per-flag; the run itself
 /// then goes DEGRADED (the judge is a load-bearing stage), see
-/// `finish_funnel`.
+/// `finish_review`.
 fn budget_exhausted_record(pass: u8) -> JudgeRecord {
     JudgeRecord {
-        ruling: FunnelRuling::Error,
+        ruling: JudgeRuling::Error,
         decisive_evidence: String::new(),
         note_for_author: "remote token budget exhausted for this stage — call skipped".to_string(),
         pass,
@@ -2688,7 +2691,7 @@ fn budget_exhausted_outcome(pass: u8) -> PassOutcome {
         wall_ms: 0,
         calls: 0,
         // A budget denial is NOT a dispatch failure — it's metered
-        // separately (the judge-budget degeneracy in `finish_funnel`).
+        // separately (the judge-budget degeneracy in `finish_review`).
         dispatch_error: false,
         served_model: None,
     }
@@ -2790,9 +2793,9 @@ fn judge_one_flag_with_passes(
     let mut served_model = p1.served_model.clone();
 
     // A non-confirmed pass-1 short-circuits identically for EVERY `passes`.
-    if p1.record.ruling != FunnelRuling::Confirmed {
+    if p1.record.ruling != JudgeRuling::Confirmed {
         let tier = match p1.record.ruling {
-            FunnelRuling::NeedsCheck => Tier::NeedsCheck,
+            JudgeRuling::NeedsCheck => Tier::NeedsCheck,
             // false_positive | unparsed | error
             _ => Tier::Archived,
         };
@@ -2853,7 +2856,7 @@ fn judge_one_flag_with_passes(
         if served_model.is_none() {
             served_model = pn.served_model.clone();
         }
-        let confirmed = pn.record.ruling == FunnelRuling::Confirmed;
+        let confirmed = pn.record.ruling == JudgeRuling::Confirmed;
         last = Some(pn.record);
         if !confirmed {
             // One disagreement breaks unanimity — demote and stop (the same
@@ -2986,7 +2989,7 @@ fn verify_pass_with_retry(
 ///
 /// - `verified` — tier stays `Confirmed`; the posted review drops the
 ///   manual-verification marker for a "verified by <model> adjudication"
-///   line (rendering lives in `synthesize_funnel`).
+///   line (rendering lives in `synthesize_review`).
 /// - `refuted` — demoted to [`Tier::Archived`], `demoted_by_verify` set,
 ///   the refutation recorded on the flag.
 /// - `uncertain` (and `unparsed`/`error` — an inconclusive adjudication
@@ -2995,20 +2998,20 @@ fn verify_pass_with_retry(
 /// A crew without the seat never reaches here — byte-identical behavior
 /// to today. Zero confirms ⇒ no stage at all (no dispatch, no records).
 /// The stage is its own EXECUTION for the remote token bucket; exhausting
-/// it is load-bearing (degraded run — see the caller in `finish_funnel`).
-/// Emits its own `funnel.step`/`funnel.ruling` records under `step_id =
+/// it is load-bearing (degraded run — see the caller in `finish_review`).
+/// Emits its own `review.step`/`review.ruling` records under `step_id =
 /// "verify"` through the same bookend guard (contract 2 — the stage runs
 /// inside the run's existing liveness envelope).
 #[allow(clippy::too_many_arguments)]
 fn run_verify_stage(
-    env: &mut FunnelEnvelope,
+    env: &mut ReviewEnvelope,
     judged: &mut [JudgedFlag],
     bundles: &[BundleInput],
-    inputs: &FunnelInputs,
+    inputs: &ReviewInputs,
     vstaff: &ResolvedSeatStaffing,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    guard: &mut FunnelBookendGuard<'_>,
+    guard: &mut ReviewRunGuard<'_>,
 ) -> Result<()> {
     let docket = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
     if docket == 0 {
@@ -3130,7 +3133,7 @@ fn run_verify_stage(
             // still post as frontier-verified, and each flag whose
             // adjudication was SKIPPED keeps its `Confirmed` tier WITH the
             // manual-verification marker (recorded per-flag as `Error` in the
-            // loop above, honored by `synthesize_funnel`). The posted review +
+            // loop above, honored by `synthesize_review`). The posted review +
             // envelope carry a loud warning naming the exhaustion. It NEVER
             // sets run-level `degenerate` — routing the whole run to
             // "degraded" would discard findings already verified and read as
@@ -3153,17 +3156,17 @@ fn run_verify_stage(
 // ─── shared finish (probe→dedup→judge→envelope), reused by run_judge_only ─
 
 #[allow(clippy::too_many_arguments)]
-fn finish_funnel(
-    mut env: FunnelEnvelope,
+fn finish_review(
+    mut env: ReviewEnvelope,
     raw_flags: Vec<ProbeFlag>,
     bundles: &[BundleInput],
-    inputs: &FunnelInputs,
+    inputs: &ReviewInputs,
     judge: &ResolvedSeatStaffing,
     verify: Option<&ResolvedSeatStaffing>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    guard: &mut FunnelBookendGuard<'_>,
-) -> Result<FunnelEnvelope> {
+    guard: &mut ReviewRunGuard<'_>,
+) -> Result<ReviewEnvelope> {
     env.raw_flags = raw_flags.len();
 
     let t_dedup = Instant::now();
@@ -3260,7 +3263,7 @@ fn finish_funnel(
                 // doc) — so the `judge-pass2` step must open the moment the
                 // FIRST pass-2 ruling actually fires, not once the whole
                 // docket is known. Opening it only after the loop finishes
-                // (the prior behavior) let `funnel.ruling{pass:2}` records
+                // (the prior behavior) let `review.ruling{pass:2}` records
                 // stream to a live observer while the `judge-pass2` step
                 // still read "not started" — a contradiction observed live
                 // in the lab lens. `items_in` here is the running count (1
@@ -3428,7 +3431,7 @@ fn finish_funnel(
         .filter(|j| {
             matches!(
                 j.pass1.ruling,
-                FunnelRuling::Confirmed | FunnelRuling::NeedsCheck | FunnelRuling::FalsePositive
+                JudgeRuling::Confirmed | JudgeRuling::NeedsCheck | JudgeRuling::FalsePositive
             )
         })
         .count();
@@ -3483,7 +3486,7 @@ fn finish_funnel(
 
 // ─── the driver ───────────────────────────────────────────────────────────
 
-/// Run the full funnel: bundles → probe(k draws × seat) → dedup →
+/// Run the full review: bundles → probe(k draws × seat) → dedup →
 /// double-confirm judge → envelope. `chat` performs one single-shot
 /// dispatch and returns its reply (the closure owns model/base-URL
 /// resolution — tests script it; production wiring calls
@@ -3492,66 +3495,66 @@ fn finish_funnel(
 /// recording mock).
 ///
 /// Also starts the run's host telemetry sampler (#1247 doctrine surface) —
-/// see [`FunnelBookendGuard`]/[`HostTelemetrySampler`] — at the production
-/// cadence ([`FUNNEL_TELEMETRY_INTERVAL`]) with the real
+/// see [`ReviewRunGuard`]/[`HostTelemetrySampler`] — at the production
+/// cadence ([`REVIEW_TELEMETRY_INTERVAL`]) with the real
 /// `darkmux_crew::telemetry_sampler::sample_host`.
-/// [`run_funnel_with_telemetry`] is the test-only seam for a faster
+/// [`run_review_with_telemetry`] is the test-only seam for a faster
 /// cadence and an injected sampling function.
-pub fn run_funnel(
-    inputs: &FunnelInputs,
+pub fn run_review(
+    inputs: &ReviewInputs,
     mut chat: impl FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    emitter: &mut dyn FunnelEmitter,
-) -> Result<FunnelEnvelope> {
-    run_funnel_impl(
+    emitter: &mut dyn ReviewEmitter,
+) -> Result<ReviewEnvelope> {
+    run_review_impl(
         inputs,
         &mut chat,
         cycler,
         emitter,
-        FUNNEL_TELEMETRY_INTERVAL,
-        FUNNEL_TELEMETRY_POLL,
+        REVIEW_TELEMETRY_INTERVAL,
+        REVIEW_TELEMETRY_POLL,
         sample_host,
     )
 }
 
-/// Test-only seam: identical pipeline to [`run_funnel`], but with a
+/// Test-only seam: identical pipeline to [`run_review`], but with a
 /// caller-chosen telemetry cadence AND sampling function, so a scripted
 /// test can observe deterministic host-telemetry samples without a
 /// multi-second sleep and without shelling to the real macOS-only host
 /// commands (hermetic — no subprocess timing to race on a CI runner).
-/// No production caller uses this — `run_funnel` always fixes the cadence
-/// at [`FUNNEL_TELEMETRY_INTERVAL`] and the sampler at the real
+/// No production caller uses this — `run_review` always fixes the cadence
+/// at [`REVIEW_TELEMETRY_INTERVAL`] and the sampler at the real
 /// `sample_host`.
 #[cfg(test)]
-fn run_funnel_with_telemetry(
-    inputs: &FunnelInputs,
+fn run_review_with_telemetry(
+    inputs: &ReviewInputs,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    emitter: &mut dyn FunnelEmitter,
+    emitter: &mut dyn ReviewEmitter,
     telemetry_interval: Duration,
     telemetry_poll: Duration,
     sample_fn: fn() -> HostSample,
-) -> Result<FunnelEnvelope> {
-    run_funnel_impl(inputs, chat, cycler, emitter, telemetry_interval, telemetry_poll, sample_fn)
+) -> Result<ReviewEnvelope> {
+    run_review_impl(inputs, chat, cycler, emitter, telemetry_interval, telemetry_poll, sample_fn)
 }
 
-fn run_funnel_impl(
-    inputs: &FunnelInputs,
+fn run_review_impl(
+    inputs: &ReviewInputs,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    emitter: &mut dyn FunnelEmitter,
+    emitter: &mut dyn ReviewEmitter,
     telemetry_interval: Duration,
     telemetry_poll: Duration,
     sample_fn: fn() -> HostSample,
-) -> Result<FunnelEnvelope> {
-    let FunnelSeats { probes, judge, verify } = validate_funnel_crew(inputs.crew)?;
+) -> Result<ReviewEnvelope> {
+    let ReviewSeats { probes, judge, verify } = validate_review_crew(inputs.crew)?;
     let mode = resolve_mode(inputs.mode, probes, judge);
 
     let t_bundle = Instant::now();
     let bundles = resolve_bundles(inputs);
     let bundle_ms = t_bundle.elapsed().as_millis() as u64;
 
-    let mut env = FunnelEnvelope {
+    let mut env = ReviewEnvelope {
         case_id: inputs.case_id.clone(),
         crew: inputs.crew.name.clone(),
         mode: mode_label(mode).to_string(),
@@ -3562,18 +3565,18 @@ fn run_funnel_impl(
         // record untraceable to its judge config.
         fingerprint: fingerprint(&seat_identifier(&judge.pm), inputs.judge_system),
         // (#1247) The resolved staffing this run actually used, post any
-        // caller-applied `--k` override — see `FunnelEnvelope::staffing`.
+        // caller-applied `--k` override — see `ReviewEnvelope::staffing`.
         staffing: Some(staffing_snapshot(probes, judge, verify, inputs.crew.request_changes)),
         ..Default::default()
     };
-    // `funnel.task` started (#1247 Part 1) — run started: case id, crew
+    // `review.task` started (#1247 Part 1) — run started: case id, crew
     // name, exec mode, bundle count. From here every emission routes
     // through the bookend guard, which ARMS on this record: an early
     // `?`-return or panic below fires its Drop path (open steps closed with
     // `status: "error"`, then a terminal error task record) so no consumer
     // ever sees an orphaned `started`.
     let mut sink = EmitterSink(emitter);
-    let mut guard = FunnelBookendGuard::new_with_telemetry(
+    let mut guard = ReviewRunGuard::new_with_telemetry(
         &mut sink,
         &inputs.case_id,
         &inputs.crew.name,
@@ -3631,7 +3634,7 @@ fn run_funnel_impl(
         &mut probe_bucket,
         &mut probe_warnings,
     )
-    .context("review funnel: probe phase")?;
+    .context("review: probe phase")?;
     env.warnings.append(&mut probe_warnings);
     if let Some(rec) = probe_bucket.record() {
         if rec.skipped_calls > 0 {
@@ -3668,7 +3671,7 @@ fn run_funnel_impl(
         return Ok(env);
     }
 
-    finish_funnel(env, raw_flags, &bundles, inputs, judge, verify, chat, cycler, &mut guard)
+    finish_review(env, raw_flags, &bundles, inputs, judge, verify, chat, cycler, &mut guard)
 }
 
 /// Re-judge a previously-recorded flag list without re-running the probe
@@ -3678,15 +3681,15 @@ fn run_funnel_impl(
 /// flag's `bundle_id` refers to, and flags alone don't carry it.
 pub fn run_judge_only(
     flags: Vec<ProbeFlag>,
-    inputs: &FunnelInputs,
+    inputs: &ReviewInputs,
     mut chat: impl FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    emitter: &mut dyn FunnelEmitter,
-) -> Result<FunnelEnvelope> {
-    let FunnelSeats { probes, judge, verify } = validate_funnel_crew(inputs.crew)?;
+    emitter: &mut dyn ReviewEmitter,
+) -> Result<ReviewEnvelope> {
+    let ReviewSeats { probes, judge, verify } = validate_review_crew(inputs.crew)?;
     // Judge-only runs one model, so the mode is telemetry, not behavior —
     // but the envelope still records the CALLER's resolved mode rather
-    // than a hardcoded label, so a judge-only re-run of a parallel funnel
+    // than a hardcoded label, so a judge-only re-run of a parallel review
     // doesn't misreport its provenance.
     let mode = resolve_mode(inputs.mode, probes, judge);
 
@@ -3694,23 +3697,23 @@ pub fn run_judge_only(
     let bundles = resolve_bundles(inputs);
     let bundle_ms = t_bundle.elapsed().as_millis() as u64;
 
-    let mut env = FunnelEnvelope {
+    let mut env = ReviewEnvelope {
         case_id: inputs.case_id.clone(),
         crew: inputs.crew.name.clone(),
         mode: mode_label(mode).to_string(),
         bundles: bundles.len(),
-        // Same up-front stamp as `run_funnel` — degenerate (zero-flag)
+        // Same up-front stamp as `run_review` — degenerate (zero-flag)
         // envelopes carry the comparability key too.
         fingerprint: fingerprint(&seat_identifier(&judge.pm), inputs.judge_system),
         // (#1247) The resolved staffing this run actually used, post any
-        // caller-applied `--k` override — see `FunnelEnvelope::staffing`.
+        // caller-applied `--k` override — see `ReviewEnvelope::staffing`.
         staffing: Some(staffing_snapshot(probes, judge, verify, inputs.crew.request_changes)),
         ..Default::default()
     };
-    // Same guard discipline as `run_funnel` — see its comment at the
+    // Same guard discipline as `run_review` — see its comment at the
     // matching site.
     let mut sink = EmitterSink(emitter);
-    let mut guard = FunnelBookendGuard::new(&mut sink, &inputs.case_id, &inputs.crew.name);
+    let mut guard = ReviewRunGuard::new(&mut sink, &inputs.case_id, &inputs.crew.name);
     guard.task_started(json!({
         "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
         "exec_mode": mode_label(mode), "bundles": bundles.len(),
@@ -3735,16 +3738,16 @@ pub fn run_judge_only(
         return Ok(env);
     }
 
-    finish_funnel(env, flags, &bundles, inputs, judge, verify, &mut chat, cycler, &mut guard)
+    finish_review(env, flags, &bundles, inputs, judge, verify, &mut chat, cycler, &mut guard)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Task/Step graph orchestration — ONE upfront-declared graph
 //
-// Redesign per the DRY-with-teeth mandate: instead of `run_funnel_impl`'s
+// Redesign per the DRY-with-teeth mandate: instead of `run_review_impl`'s
 // hand-written sequential driver (bundle → probe_phase → dedup_flags →
-// judge loop → run_verify_stage → finish_funnel, six ad-hoc calls), the
-// funnel's structure — which stages exist, in what order — is declared
+// judge loop → run_verify_stage → finish_review, six ad-hoc calls), the
+// review's structure — which stages exist, in what order — is declared
 // as a real `Task`/`Step` graph BEFORE any dispatch happens, and executed
 // through ONE `darkmux_crew::scheduler::run_step_graph` call (mirrors
 // `mission_run.rs`'s own migration, #1230 Packet 3). What's NOT knowable
@@ -3766,17 +3769,17 @@ pub fn run_judge_only(
 // `investigate`'s `dedup` step; no special cross-phase mechanism.
 //
 // **Crate-boundary note**: this module (`darkmux-lab`) builds and runs the
-// graph and returns the final `FunnelEnvelope` — it does NOT create the
+// graph and returns the final `ReviewEnvelope` — it does NOT create the
 // Mission/Phase/Task records on disk (that needs `darkmux_crew::lifecycle`
 // plus a `mission_id`/case-scoped identity, which is the CALLER's concern:
 // `darkmux pr-review run` creates a real persisted Mission; a lab bench run
 // stays per-run-local per the lab-vs-fleet boundary doctrine — same
-// caller-decides pattern `FunnelEmitter` already uses for flow-record
+// caller-decides pattern `ReviewEmitter` already uses for flow-record
 // destination). It also does NOT render the posted-comment markdown
-// (`Rendered`) — that type and its `synthesize_funnel` builder live in the
+// (`Rendered`) — that type and its `synthesize_review` builder live in the
 // binary crate's `src/pr_review.rs`, which `darkmux-lab` cannot depend on
-// without a reverse dependency; `pr_review.rs` calls `synthesize_funnel` on
-// the `FunnelEnvelope` this module returns, exactly as it does today.
+// without a reverse dependency; `pr_review.rs` calls `synthesize_review` on
+// the `ReviewEnvelope` this module returns, exactly as it does today.
 //
 // **The double-confirm judge protocol, dedup key, judge/verify prompts,
 // and tier synthesis are UNCHANGED** — every step kind below calls the
@@ -3785,7 +3788,7 @@ pub fn run_judge_only(
 // `cluster_needs_check`, `mechanism_family`, `judge_prompt`,
 // `verify_prompt`) verbatim — only the ORCHESTRATION shape (six sequential
 // calls → one declared graph) and the telemetry plumbing (the guard-
-// coupled `FunnelBookendGuard` can't cross a `run_bounded` worker-thread
+// coupled `ReviewRunGuard` can't cross a `run_bounded` worker-thread
 // boundary — see `darkmux_crew::step_kinds::StepOutcome`'s doc — so
 // per-step telemetry now rides `StepOutcome.flow_records` / direct
 // `darkmux_flow::record()` calls instead) changed.
@@ -3796,14 +3799,14 @@ use darkmux_crew::step_kinds::{StepKind, StepKindRegistry, StepOutcome};
 use darkmux_crew::types::{NodeStatus, Step, Task};
 use std::sync::Mutex as StdMutex;
 
-/// Everything a funnel Step kind needs, OWNED (not borrowed) and
+/// Everything a review Step kind needs, OWNED (not borrowed) and
 /// `Send + Sync` so it can cross the `run_bounded` worker-thread boundary —
-/// `FunnelInputs<'a>`'s borrows can't. Built ONCE by the orchestrator
-/// (`build_funnel_graph`) before the graph starts; every step kind holds an
-/// `Arc` clone. Mirrors `FunnelInputs` field-for-field, minus the injected
+/// `ReviewInputs<'a>`'s borrows can't. Built ONCE by the orchestrator
+/// (`build_review_graph`) before the graph starts; every step kind holds an
+/// `Arc` clone. Mirrors `ReviewInputs` field-for-field, minus the injected
 /// `chat`/`cycler` (each step now resolves its own — see `dispatch_chat`
 /// and the direct `LmsCycler` construction in each dispatch-shaped step).
-pub struct FunnelStepContext {
+pub struct ReviewStepContext {
     pub case_id: String,
     pub crew: ResolvedCrew,
     pub intent_title: String,
@@ -3817,7 +3820,7 @@ pub struct FunnelStepContext {
     pub timeout_seconds: u32,
 }
 
-/// The production dispatch primitive every funnel step kind below calls —
+/// The production dispatch primitive every review step kind below calls —
 /// routes on `call.endpoint` exactly like `pr_review.rs::run_dispatch`'s
 /// own `chat` closure (contract 1: a consumer routes on what the profile
 /// declares, never re-derives its own local/remote judgment). No test-mock
@@ -3830,7 +3833,7 @@ pub struct FunnelStepContext {
 /// remain fully mock-testable via their own existing `chat: &mut dyn FnMut`
 /// parameter — only the NEW graph glue trades that seam for parity with the
 /// rest of the Task/Step step-kind family.
-fn dispatch_chat(ctx: &FunnelStepContext, call: &ChatCall) -> Result<SingleShotReply> {
+fn dispatch_chat(ctx: &ReviewStepContext, call: &ChatCall) -> Result<SingleShotReply> {
     match call.endpoint {
         Some(endpoint) => single_shot_chat_hosted(&HostedSingleShotRequest {
             endpoint,
@@ -3852,15 +3855,15 @@ fn dispatch_chat(ctx: &FunnelStepContext, call: &ChatCall) -> Result<SingleShotR
     }
 }
 
-/// A "step result" companion flow record — the funnel's own equivalent of
+/// A "step result" companion flow record — the review's own equivalent of
 /// `mission_run.rs`'s `emit_step_result` (#1230 Packet 4 sibling
-/// convention): one generic action, `kind` distinguishing which funnel step
+/// convention): one generic action, `kind` distinguishing which review step
 /// produced it, free-form `payload` for the rest. Called directly (not via
 /// `StepOutcome.flow_records`) so it's usable from inside a step's own
 /// internal concurrent loop (judge's bounded worker pool) — a plain
 /// `darkmux_flow::record()` call has no non-`Send` state, unlike
-/// `FunnelBookendGuard` (see the module doc).
-fn emit_funnel_step_result(kind: &str, step_id: &str, case_id: &str, payload: serde_json::Value) {
+/// `ReviewRunGuard` (see the module doc).
+fn emit_review_step_result(kind: &str, step_id: &str, case_id: &str, payload: serde_json::Value) {
     let mut full = serde_json::json!({ "step_id": step_id, "kind": kind });
     if let (serde_json::Value::Object(extra), serde_json::Value::Object(base)) = (payload, &mut full) {
         base.extend(extra);
@@ -3875,7 +3878,7 @@ fn emit_funnel_step_result(kind: &str, step_id: &str, case_id: &str, payload: se
         handle: step_id.to_string(),
         phase_id: None,
         session_id: Some(case_id.to_string()),
-        source: Some("funnel".to_string()),
+        source: Some("review".to_string()),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -3893,22 +3896,22 @@ fn emit_funnel_step_result(kind: &str, step_id: &str, case_id: &str, payload: se
 // ─── investigate: bundle ────────────────────────────────────────────────
 
 /// Phase "investigate", step 1: hands back the already-resolved bundle list
-/// (`FunnelStepContext::bundles` — resolved once by the orchestrator before
-/// the graph starts, since bundling needs `&FunnelInputs<'a>`'s borrow,
+/// (`ReviewStepContext::bundles` — resolved once by the orchestrator before
+/// the graph starts, since bundling needs `&ReviewInputs<'a>`'s borrow,
 /// which can't cross into a `'static` step kind). Procedural — no dispatch.
-pub struct FunnelBundleStepKind {
-    pub ctx: Arc<FunnelStepContext>,
+pub struct ReviewBundleStepKind {
+    pub ctx: Arc<ReviewStepContext>,
 }
 
-impl StepKind for FunnelBundleStepKind {
+impl StepKind for ReviewBundleStepKind {
     fn id(&self) -> &'static str {
-        "funnel.bundle"
+        "review.bundle"
     }
 
     fn run(&self, step: &Step, _task: &Task, _input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
         let output = serde_json::to_string(&self.ctx.bundles).context("serializing bundles")?;
-        emit_funnel_step_result(
-            "funnel.bundle",
+        emit_review_step_result(
+            "review.bundle",
             &step.id,
             &self.ctx.case_id,
             json!({ "items_out": self.ctx.bundles.len() }),
@@ -3927,8 +3930,8 @@ impl StepKind for FunnelBundleStepKind {
 /// Reuses `probe_one_draw`/`probe_user_message`/`select_bundles_for_staffing`/
 /// `resolve_seat_max_tokens` VERBATIM — only the surrounding loop shape and
 /// telemetry are new.
-pub struct FunnelProbeStepKind {
-    ctx: Arc<FunnelStepContext>,
+pub struct ReviewProbeStepKind {
+    ctx: Arc<ReviewStepContext>,
     staffing: ResolvedSeatStaffing,
     /// Shared across every probe step in the run — the probe stage's remote
     /// token bucket is ONE execution shared by every remote probe staffing
@@ -3940,11 +3943,11 @@ pub struct FunnelProbeStepKind {
     /// SAME shared handle, avoiding a separate side-channel.
     members: Arc<StdMutex<Vec<MemberRecord>>>,
     warnings: Arc<StdMutex<Vec<String>>>,
-    /// `"funnel.probe:<staffing-name>"` — a distinct registered kind id per
+    /// `"review.probe:<staffing-name>"` — a distinct registered kind id per
     /// probe seat (the registry maps one kind id to one `StepKind`
     /// instance, and each seat has its own model/selector). `StepKind::id`
     /// must return `&'static str`; this is leaked EXACTLY ONCE at
-    /// construction (`FunnelProbeStepKind::new`), never inside `id()`
+    /// construction (`ReviewProbeStepKind::new`), never inside `id()`
     /// itself, so a bounded, one-time-per-seat-per-process leak in a
     /// short-lived CLI invocation — never a per-call leak. Fields are
     /// private (construct via `new()`) precisely so `RemoteBucket` (a
@@ -3953,21 +3956,21 @@ pub struct FunnelProbeStepKind {
     kind_id: &'static str,
 }
 
-impl FunnelProbeStepKind {
+impl ReviewProbeStepKind {
     pub(crate) fn new(
-        ctx: Arc<FunnelStepContext>,
+        ctx: Arc<ReviewStepContext>,
         staffing: ResolvedSeatStaffing,
         bucket: Arc<StdMutex<RemoteBucket>>,
         members: Arc<StdMutex<Vec<MemberRecord>>>,
         warnings: Arc<StdMutex<Vec<String>>>,
     ) -> Self {
         let kind_id: &'static str =
-            Box::leak(format!("funnel.probe:{}", staffing.name).into_boxed_str());
+            Box::leak(format!("review.probe:{}", staffing.name).into_boxed_str());
         Self { ctx, staffing, bucket, members, warnings, kind_id }
     }
 }
 
-impl StepKind for FunnelProbeStepKind {
+impl StepKind for ReviewProbeStepKind {
     fn id(&self) -> &'static str {
         self.kind_id
     }
@@ -4042,8 +4045,8 @@ impl StepKind for FunnelProbeStepKind {
             endpoint: endpoint_host.clone(),
             served_model,
         });
-        emit_funnel_step_result(
-            "funnel.probe",
+        emit_review_step_result(
+            "review.probe",
             &step.id,
             &self.ctx.case_id,
             json!({
@@ -4067,7 +4070,7 @@ impl StepKind for FunnelProbeStepKind {
             model_key: self.staffing.pm.id.clone(),
             identifier,
             min_ctx: n_ctx,
-            seat: format!("funnel-probe:{}", self.staffing.name),
+            seat: format!("review-probe:{}", self.staffing.name),
         })
     }
 }
@@ -4079,13 +4082,13 @@ impl StepKind for FunnelProbeStepKind {
 /// (the mechanism-family keying + anchor-based matching — explicitly
 /// preserved, unchanged). Its OWN `StepOutcome.output` IS the phase's
 /// observable artifact: "what's the review forming to be."
-pub struct FunnelDedupStepKind {
-    pub ctx: Arc<FunnelStepContext>,
+pub struct ReviewDedupStepKind {
+    pub ctx: Arc<ReviewStepContext>,
 }
 
-impl StepKind for FunnelDedupStepKind {
+impl StepKind for ReviewDedupStepKind {
     fn id(&self) -> &'static str {
-        "funnel.dedup"
+        "review.dedup"
     }
 
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
@@ -4099,8 +4102,8 @@ impl StepKind for FunnelDedupStepKind {
         let raw_count = raw.len();
         let (deduped, _stats) = dedup_flags(raw, &self.ctx.diff);
         let wall_ms = t0.elapsed().as_millis() as u64;
-        emit_funnel_step_result(
-            "funnel.dedup",
+        emit_review_step_result(
+            "review.dedup",
             &step.id,
             &self.ctx.case_id,
             json!({ "items_in": raw_count, "items_out": deduped.len(), "wall_ms": wall_ms }),
@@ -4126,7 +4129,7 @@ impl StepKind for FunnelDedupStepKind {
 /// disagreement demotes — is explicitly UNCHANGED).
 ///
 /// **Concurrency**: `concurrency` (from `Step.config.concurrency`, default
-/// 1 — see `build_funnel_graph`) bounds how many flags this step judges AT
+/// 1 — see `build_review_graph`) bounds how many flags this step judges AT
 /// ONCE via a chunked `std::thread::scope`. LMStudio's real per-model
 /// concurrent-prediction ceiling is genuinely unresolved (operator
 /// observation: ~4 in practice, sometimes 1) — judge is typically ONE model
@@ -4135,13 +4138,13 @@ impl StepKind for FunnelDedupStepKind {
 /// bound here is the honest answer until an empirical ceiling exists.
 /// `concurrency: 1` (the default) is byte-identical in dispatch ORDER to
 /// the historical sequential loop.
-pub struct FunnelJudgeStepKind {
-    pub ctx: Arc<FunnelStepContext>,
+pub struct ReviewJudgeStepKind {
+    pub ctx: Arc<ReviewStepContext>,
     pub judge: ResolvedSeatStaffing,
 }
 
 /// One deduped flag's judged outcome, in dispatch order — the shared
-/// scratch `FunnelJudgeStepKind::run` collects chunk-by-chunk (see its doc)
+/// scratch `ReviewJudgeStepKind::run` collects chunk-by-chunk (see its doc)
 /// before serializing into the step's output.
 struct JudgeChunkResult {
     index: usize,
@@ -4154,9 +4157,9 @@ struct JudgeChunkResult {
     served_model: Option<String>,
 }
 
-impl StepKind for FunnelJudgeStepKind {
+impl StepKind for ReviewJudgeStepKind {
     fn id(&self) -> &'static str {
-        "funnel.judge"
+        "review.judge"
     }
 
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
@@ -4224,9 +4227,9 @@ impl StepKind for FunnelJudgeStepKind {
                             guard.as_deref_mut(),
                             &mut chat,
                         );
-                        emit_funnel_step_result(
-                            "funnel.judge",
-                            "funnel-ruling",
+                        emit_review_step_result(
+                            "review.judge",
+                            "review-ruling",
                             &ctx.case_id,
                             json!({
                                 "bundle_id": flag.bundle_id, "pass": 1,
@@ -4234,9 +4237,9 @@ impl StepKind for FunnelJudgeStepKind {
                             }),
                         );
                         if let Some(p2) = &outcome.pass2 {
-                            emit_funnel_step_result(
-                                "funnel.judge",
-                                "funnel-ruling",
+                            emit_review_step_result(
+                                "review.judge",
+                                "review-ruling",
                                 &ctx.case_id,
                                 json!({
                                     "bundle_id": flag.bundle_id, "pass": p2.pass,
@@ -4284,8 +4287,8 @@ impl StepKind for FunnelJudgeStepKind {
 
         let judged: Vec<JudgedFlag> = results.into_iter().map(|r| r.judged).collect();
 
-        emit_funnel_step_result(
-            "funnel.judge",
+        emit_review_step_result(
+            "review.judge",
             &step.id,
             &self.ctx.case_id,
             json!({
@@ -4311,7 +4314,7 @@ impl StepKind for FunnelJudgeStepKind {
             model_key: self.judge.pm.id.clone(),
             identifier,
             min_ctx: n_ctx,
-            seat: "funnel-judge".to_string(),
+            seat: "review-judge".to_string(),
         })
     }
 }
@@ -4328,14 +4331,14 @@ impl StepKind for FunnelJudgeStepKind {
 /// `judge`, and it only ever iterates `judge`'s CONFIRMED output — there is
 /// no separate "is the run degenerate" gate to forget. Reuses
 /// `verify_prompt`/`verify_pass_with_retry` VERBATIM.
-pub struct FunnelVerifyStepKind {
-    pub ctx: Arc<FunnelStepContext>,
+pub struct ReviewVerifyStepKind {
+    pub ctx: Arc<ReviewStepContext>,
     pub verify: Option<ResolvedSeatStaffing>,
 }
 
-impl StepKind for FunnelVerifyStepKind {
+impl StepKind for ReviewVerifyStepKind {
     fn id(&self) -> &'static str {
-        "funnel.verify"
+        "review.verify"
     }
 
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
@@ -4409,9 +4412,9 @@ impl StepKind for FunnelVerifyStepKind {
             if served_model.is_none() {
                 served_model = served;
             }
-            emit_funnel_step_result(
-                "funnel.verify",
-                "funnel-ruling",
+            emit_review_step_result(
+                "review.verify",
+                "review-ruling",
                 &self.ctx.case_id,
                 json!({ "bundle_id": j.flag.bundle_id, "stage": "verify", "ruling": record.ruling, "seconds": record.seconds }),
             );
@@ -4423,8 +4426,8 @@ impl StepKind for FunnelVerifyStepKind {
         }
         let wall_ms = t0.elapsed().as_millis() as u64;
 
-        emit_funnel_step_result(
-            "funnel.verify",
+        emit_review_step_result(
+            "review.verify",
             &step.id,
             &self.ctx.case_id,
             json!({
@@ -4449,7 +4452,7 @@ impl StepKind for FunnelVerifyStepKind {
             model_key: vstaff.pm.id.clone(),
             identifier,
             min_ctx: n_ctx,
-            seat: "funnel-verify".to_string(),
+            seat: "review-verify".to_string(),
         })
     }
 }
@@ -4457,18 +4460,18 @@ impl StepKind for FunnelVerifyStepKind {
 // ─── report: synthesis (terminal step) ──────────────────────────────────
 
 /// Phase "report", terminal step: `depends_on` BOTH `dedup` (for
-/// `FunnelEnvelope::flags`, the deduped list) and `verify` (for the final,
-/// verify-adjusted `FunnelEnvelope::judged`) — graph-native data flow
+/// `ReviewEnvelope::flags`, the deduped list) and `verify` (for the final,
+/// verify-adjusted `ReviewEnvelope::judged`) — graph-native data flow
 /// rather than a bespoke side channel. Recomputes tier counts +
 /// `cluster_needs_check` (VERBATIM, explicitly preserved) directly from the
 /// final judged list — correct by construction, no incremental-accumulator
 /// double-counting risk. Procedural — no dispatch. Produces the FINAL
-/// `FunnelEnvelope` (not the posted-comment `Rendered` markdown — that
-/// stays `pr_review.rs::synthesize_funnel`'s job; see the module doc's
+/// `ReviewEnvelope` (not the posted-comment `Rendered` markdown — that
+/// stays `pr_review.rs::synthesize_review`'s job; see the module doc's
 /// crate-boundary note).
-pub struct FunnelSynthesisStepKind {
-    pub ctx: Arc<FunnelStepContext>,
-    pub env: SharedFunnelEnvelope,
+pub struct ReviewSynthesisStepKind {
+    pub ctx: Arc<ReviewStepContext>,
+    pub env: SharedReviewEnvelope,
     /// (#1341) `gather_inputs` now keys a Step's `input` map by the
     /// DEPENDENCY TASK's id (dependency/data-flow lives at Task level) —
     /// so this step reads its two upstream contributions by TASK id, not
@@ -4477,9 +4480,9 @@ pub struct FunnelSynthesisStepKind {
     pub verify_task_id: String,
 }
 
-impl StepKind for FunnelSynthesisStepKind {
+impl StepKind for ReviewSynthesisStepKind {
     fn id(&self) -> &'static str {
-        "funnel.synthesis"
+        "review.synthesis"
     }
 
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
@@ -4497,7 +4500,7 @@ impl StepKind for FunnelSynthesisStepKind {
             serde_json::from_str(&verify_output).context("deserializing final judged flags")?
         };
 
-        let mut env = self.env.lock().expect("shared funnel envelope mutex poisoned").clone();
+        let mut env = self.env.lock().expect("shared review envelope mutex poisoned").clone();
         env.raw_flags = env.raw_flags.max(flags.len());
         env.deduped_flags = flags.len();
         env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
@@ -4512,7 +4515,7 @@ impl StepKind for FunnelSynthesisStepKind {
         env.flags = flags;
         env.judged = judged;
 
-        // Judge-dead honesty gate (unchanged reasoning from `finish_funnel`):
+        // Judge-dead honesty gate (unchanged reasoning from `finish_review`):
         // no flag produced a usable pass-1 ruling means the judge phase
         // produced no signal worth rendering — a degenerate run, named.
         if env.degenerate.is_none() && !env.judged.is_empty() {
@@ -4522,7 +4525,7 @@ impl StepKind for FunnelSynthesisStepKind {
                 .filter(|j| {
                     matches!(
                         j.pass1.ruling,
-                        FunnelRuling::Confirmed | FunnelRuling::NeedsCheck | FunnelRuling::FalsePositive
+                        JudgeRuling::Confirmed | JudgeRuling::NeedsCheck | JudgeRuling::FalsePositive
                     )
                 })
                 .count();
@@ -4534,11 +4537,11 @@ impl StepKind for FunnelSynthesisStepKind {
             }
         }
 
-        *self.env.lock().expect("shared funnel envelope mutex poisoned") = env.clone();
+        *self.env.lock().expect("shared review envelope mutex poisoned") = env.clone();
 
         let wall_ms = t0.elapsed().as_millis() as u64;
-        emit_funnel_step_result(
-            "funnel.synthesis",
+        emit_review_step_result(
+            "review.synthesis",
             &step.id,
             &self.ctx.case_id,
             json!({
@@ -4552,17 +4555,17 @@ impl StepKind for FunnelSynthesisStepKind {
     }
 }
 
-/// The shared, mutex-guarded `FunnelEnvelope` every funnel step kind
+/// The shared, mutex-guarded `ReviewEnvelope` every review step kind
 /// contributes cross-cutting metrics to (member records, warnings, remote
-/// budgets — fields with no single "owning" step) — the funnel's own
+/// budgets — fields with no single "owning" step) — the review's own
 /// equivalent of `mission_run.rs`'s `Arc<Mutex<Option<T>>>` result-slot
 /// pattern for rich results that don't fit `StepOutcome.output: String`.
 /// The FLAG DATA itself (`env.flags`/`env.judged`) flows graph-natively
 /// through `Step.output`/`gather_inputs` instead (dedup → judge → verify →
 /// synthesis) — this handle is deliberately NOT where that lives.
-pub type SharedFunnelEnvelope = Arc<StdMutex<FunnelEnvelope>>;
+pub type SharedReviewEnvelope = Arc<StdMutex<ReviewEnvelope>>;
 
-/// Everything [`build_funnel_graph`] hands back: the `Task`/`Step` shape
+/// Everything [`build_review_graph`] hands back: the `Task`/`Step` shape
 /// (for the caller to persist via `darkmux_crew::lifecycle::save_task`/
 /// `save_step` under real Phase ids it creates — this module has no
 /// `mission_id`/`lifecycle` dependency of its own, see the module doc's
@@ -4570,17 +4573,17 @@ pub type SharedFunnelEnvelope = Arc<StdMutex<FunnelEnvelope>>;
 /// cross-cutting envelope state, and a `step_id -> Task.phase_id` map (so
 /// the caller can persist each Step under the SAME Phase its owning Task
 /// belongs to without re-deriving the lookup).
-pub struct BuiltFunnelGraph {
+pub struct BuiltReviewGraph {
     pub tasks: Vec<Task>,
     pub steps: std::collections::BTreeMap<String, Step>,
     pub registry: StepKindRegistry,
-    pub shared_env: SharedFunnelEnvelope,
+    pub shared_env: SharedReviewEnvelope,
     pub synthesis_step_id: String,
     pub phase_id_of_step: std::collections::BTreeMap<String, String>,
     /// The probe stage's accumulated `MemberRecord`s + reduced-coverage
     /// warnings + shared remote-token bucket — still EMPTY/unspent at
     /// return time (every probe step is registered, not yet run);
-    /// [`run_funnel_graph`] reads them back through these SAME `Arc` handles
+    /// [`run_review_graph`] reads them back through these SAME `Arc` handles
     /// AFTER `run_step_graph` completes, when every probe step kind has
     /// actually written into them.
     probe_members: Arc<StdMutex<Vec<MemberRecord>>>,
@@ -4588,17 +4591,17 @@ pub struct BuiltFunnelGraph {
     probe_bucket: Arc<StdMutex<RemoteBucket>>,
 }
 
-/// Build the funnel's complete Task/Step graph across three Phases
+/// Build the review's complete Task/Step graph across three Phases
 /// (investigate / adjudicate / report — see the module doc) PLUS the
-/// registry every step kind resolves through — see [`BuiltFunnelGraph`].
+/// registry every step kind resolves through — see [`BuiltReviewGraph`].
 /// Caller persists `tasks`/`steps`, then runs the graph via
-/// [`run_funnel_graph`].
+/// [`run_review_graph`].
 ///
 /// `case_id` seeds every Step/Task id so a single mission running multiple
 /// PR reviews (unlikely today, but not precluded) never collides.
 #[allow(clippy::too_many_arguments)]
-pub fn build_funnel_graph(
-    ctx: Arc<FunnelStepContext>,
+pub fn build_review_graph(
+    ctx: Arc<ReviewStepContext>,
     judge: ResolvedSeatStaffing,
     verify: Option<ResolvedSeatStaffing>,
     probes: &[ResolvedSeatStaffing],
@@ -4606,14 +4609,14 @@ pub fn build_funnel_graph(
     adjudicate_phase_id: &str,
     report_phase_id: &str,
     judge_concurrency: u32,
-) -> BuiltFunnelGraph {
+) -> BuiltReviewGraph {
     let mut steps = std::collections::BTreeMap::new();
     let mut tasks = Vec::new();
     let mut phase_id_of_step = std::collections::BTreeMap::new();
     let registry = StepKindRegistry::new();
 
-    let bundle_step_id = "funnel-bundle-step".to_string();
-    let bundle_task_id = "funnel-bundle-task".to_string();
+    let bundle_step_id = "review-bundle-step".to_string();
+    let bundle_task_id = "review-bundle-task".to_string();
     tasks.push(Task {
         id: bundle_task_id.clone(),
         phase_id: investigate_phase_id.to_string(),
@@ -4630,7 +4633,7 @@ pub fn build_funnel_graph(
         Step {
             id: bundle_step_id.clone(),
             task_id: bundle_task_id.clone(),
-            kind: "funnel.bundle".to_string(),
+            kind: "review.bundle".to_string(),
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,
@@ -4638,18 +4641,23 @@ pub fn build_funnel_graph(
             output: None,
         },
     );
+    let bundle_kind = Arc::new(ReviewBundleStepKind { ctx: ctx.clone() });
+    registry.register(bundle_kind.clone()).expect("review.bundle registered once");
+    // (#1349) Legacy alias — a `Step.kind` persisted before the funnel->review
+    // rename must still resolve if anything ever re-reads it back through a
+    // fresh registry (see `StepKindRegistry::register_alias`'s doc).
     registry
-        .register(Arc::new(FunnelBundleStepKind { ctx: ctx.clone() }))
-        .expect("funnel.bundle registered once");
+        .register_alias("funnel.bundle", bundle_kind)
+        .expect("funnel.bundle legacy alias registered once");
 
     let bucket = Arc::new(StdMutex::new(RemoteBucket::new("probe", ctx.remote_max_tokens_per_execution)));
     let probe_members = Arc::new(StdMutex::new(Vec::new()));
     let probe_warnings = Arc::new(StdMutex::new(Vec::new()));
     let mut probe_task_ids = Vec::new();
     for (idx, staffing) in probes.iter().enumerate() {
-        let step_id = format!("funnel-probe-{idx}-step");
-        let task_id = format!("funnel-probe-{idx}-task");
-        let kind_id = format!("funnel.probe:{}", staffing.name);
+        let step_id = format!("review-probe-{idx}-step");
+        let task_id = format!("review-probe-{idx}-task");
+        let kind_id = format!("review.probe:{}", staffing.name);
         tasks.push(Task {
             id: task_id.clone(),
             phase_id: investigate_phase_id.to_string(),
@@ -4674,19 +4682,23 @@ pub fn build_funnel_graph(
                 output: None,
             },
         );
-        let kind = Arc::new(FunnelProbeStepKind::new(
+        let kind = Arc::new(ReviewProbeStepKind::new(
             ctx.clone(),
             staffing.clone(),
             bucket.clone(),
             probe_members.clone(),
             probe_warnings.clone(),
         ));
-        registry.register(kind).expect("each probe seat's kind id is unique per staffing name");
+        registry.register(kind.clone()).expect("each probe seat's kind id is unique per staffing name");
+        // (#1349) Legacy alias — see the bundle step's registration above.
+        registry
+            .register_alias(&format!("funnel.probe:{}", staffing.name), kind)
+            .expect("each probe seat's legacy funnel alias id is unique per staffing name");
         probe_task_ids.push(task_id);
     }
 
-    let dedup_step_id = "funnel-dedup-step".to_string();
-    let dedup_task_id = "funnel-dedup-task".to_string();
+    let dedup_step_id = "review-dedup-step".to_string();
+    let dedup_task_id = "review-dedup-task".to_string();
     tasks.push(Task {
         id: dedup_task_id.clone(),
         phase_id: investigate_phase_id.to_string(),
@@ -4703,7 +4715,7 @@ pub fn build_funnel_graph(
         Step {
             id: dedup_step_id.clone(),
             task_id: dedup_task_id.clone(),
-            kind: "funnel.dedup".to_string(),
+            kind: "review.dedup".to_string(),
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,
@@ -4711,12 +4723,15 @@ pub fn build_funnel_graph(
             output: None,
         },
     );
+    let dedup_kind = Arc::new(ReviewDedupStepKind { ctx: ctx.clone() });
+    registry.register(dedup_kind.clone()).expect("review.dedup registered once");
+    // (#1349) Legacy alias — see the bundle step's registration above.
     registry
-        .register(Arc::new(FunnelDedupStepKind { ctx: ctx.clone() }))
-        .expect("funnel.dedup registered once");
+        .register_alias("funnel.dedup", dedup_kind)
+        .expect("funnel.dedup legacy alias registered once");
 
-    let judge_step_id = "funnel-judge-step".to_string();
-    let judge_task_id = "funnel-judge-task".to_string();
+    let judge_step_id = "review-judge-step".to_string();
+    let judge_task_id = "review-judge-task".to_string();
     tasks.push(Task {
         id: judge_task_id.clone(),
         phase_id: adjudicate_phase_id.to_string(),
@@ -4733,7 +4748,7 @@ pub fn build_funnel_graph(
         Step {
             id: judge_step_id.clone(),
             task_id: judge_task_id.clone(),
-            kind: "funnel.judge".to_string(),
+            kind: "review.judge".to_string(),
             status: NodeStatus::Planned,
             config: json!({ "concurrency": judge_concurrency }),
             started_ts: None,
@@ -4741,12 +4756,15 @@ pub fn build_funnel_graph(
             output: None,
         },
     );
+    let judge_kind = Arc::new(ReviewJudgeStepKind { ctx: ctx.clone(), judge });
+    registry.register(judge_kind.clone()).expect("review.judge registered once");
+    // (#1349) Legacy alias — see the bundle step's registration above.
     registry
-        .register(Arc::new(FunnelJudgeStepKind { ctx: ctx.clone(), judge }))
-        .expect("funnel.judge registered once");
+        .register_alias("funnel.judge", judge_kind)
+        .expect("funnel.judge legacy alias registered once");
 
-    let verify_step_id = "funnel-verify-step".to_string();
-    let verify_task_id = "funnel-verify-task".to_string();
+    let verify_step_id = "review-verify-step".to_string();
+    let verify_task_id = "review-verify-task".to_string();
     tasks.push(Task {
         id: verify_task_id.clone(),
         phase_id: report_phase_id.to_string(),
@@ -4763,7 +4781,7 @@ pub fn build_funnel_graph(
         Step {
             id: verify_step_id.clone(),
             task_id: verify_task_id.clone(),
-            kind: "funnel.verify".to_string(),
+            kind: "review.verify".to_string(),
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,
@@ -4771,12 +4789,15 @@ pub fn build_funnel_graph(
             output: None,
         },
     );
+    let verify_kind = Arc::new(ReviewVerifyStepKind { ctx: ctx.clone(), verify });
+    registry.register(verify_kind.clone()).expect("review.verify registered once");
+    // (#1349) Legacy alias — see the bundle step's registration above.
     registry
-        .register(Arc::new(FunnelVerifyStepKind { ctx: ctx.clone(), verify }))
-        .expect("funnel.verify registered once");
+        .register_alias("funnel.verify", verify_kind)
+        .expect("funnel.verify legacy alias registered once");
 
-    let synthesis_step_id = "funnel-synthesis-step".to_string();
-    let synthesis_task_id = "funnel-synthesis-task".to_string();
+    let synthesis_step_id = "review-synthesis-step".to_string();
+    let synthesis_task_id = "review-synthesis-task".to_string();
     tasks.push(Task {
         id: synthesis_task_id.clone(),
         phase_id: report_phase_id.to_string(),
@@ -4793,7 +4814,7 @@ pub fn build_funnel_graph(
         Step {
             id: synthesis_step_id.clone(),
             task_id: synthesis_task_id,
-            kind: "funnel.synthesis".to_string(),
+            kind: "review.synthesis".to_string(),
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,
@@ -4802,19 +4823,22 @@ pub fn build_funnel_graph(
         },
     );
 
-    let shared_env: SharedFunnelEnvelope = Arc::new(StdMutex::new(FunnelEnvelope {
+    let shared_env: SharedReviewEnvelope = Arc::new(StdMutex::new(ReviewEnvelope {
         case_id: ctx.case_id.clone(),
         bundles: ctx.bundles.len(),
         ..Default::default()
     }));
+    let synthesis_kind = Arc::new(ReviewSynthesisStepKind {
+        ctx: ctx.clone(),
+        env: shared_env.clone(),
+        dedup_task_id,
+        verify_task_id,
+    });
+    registry.register(synthesis_kind.clone()).expect("review.synthesis registered once");
+    // (#1349) Legacy alias — see the bundle step's registration above.
     registry
-        .register(Arc::new(FunnelSynthesisStepKind {
-            ctx: ctx.clone(),
-            env: shared_env.clone(),
-            dedup_task_id,
-            verify_task_id,
-        }))
-        .expect("funnel.synthesis registered once");
+        .register_alias("funnel.synthesis", synthesis_kind)
+        .expect("funnel.synthesis legacy alias registered once");
 
     // `step_id -> Task.phase_id`, derived once from `tasks` (each Task
     // already carries both) rather than threaded through every push site
@@ -4825,7 +4849,7 @@ pub fn build_funnel_graph(
         }
     }
 
-    BuiltFunnelGraph {
+    BuiltReviewGraph {
         tasks,
         steps,
         registry,
@@ -4838,28 +4862,39 @@ pub fn build_funnel_graph(
     }
 }
 
-/// Run the funnel's complete Task/Step graph via ONE `run_step_graph` call
-/// (the module's whole point — see its doc). Wraps the run in the SAME
-/// task-level bookend (`funnel.task` started/finished/error) + host
-/// telemetry sampler [`run_funnel_impl`] always used — that machinery stays
-/// OUTSIDE the graph, on the calling thread, since `FunnelBookendGuard`
-/// can't cross a `run_bounded` worker-thread boundary (see the module doc).
-/// Assembles the final [`FunnelEnvelope`] from the synthesis step's output
+/// Run the review's complete Task/Step graph via ONE `run_step_graph` call
+/// (the module's whole point — see its doc). Runs the host telemetry
+/// sampler [`run_review_impl`] always used, but — as of #1349 — does NOT
+/// wrap the call in its own task-level liveness bookend. Every production
+/// caller of this function (`src/pr_review.rs`'s `run_dispatch`) already
+/// invokes it from INSIDE `with_dispatch_bookends`, which opens/closes the
+/// canonical `dispatch start`/`dispatch complete`/`dispatch error` record
+/// (`darkmux_flow::bookend::BookendGuard`, #1230 Packet 0) around the whole
+/// call — the SAME liveness edge #1272 fixed the viewer's running-dispatch
+/// surfaces to key on. A second, review-scoped `review.task` bookend here
+/// was pure duplication of that outer wrap, not an independent liveness
+/// fix, and its competing vocabulary is exactly the "bespoke top-level
+/// record instead of the generic mechanism" bug #1349 retires — see
+/// `with_dispatch_bookends`'s payload construction in `pr_review.rs` for
+/// where this function's former `review.task` payload fields (exec mode,
+/// bundle count, confirmed/needs_check/archived, degenerate reason) now
+/// ride instead, so no data is lost, only the redundant vocabulary.
+/// Assembles the final [`ReviewEnvelope`] from the synthesis step's output
 /// merged with the shared cross-cutting state, and returns the COMPLETED
 /// `steps` map (status/output/timestamps all reflect the real run) so the
 /// caller can persist the final Step records — `darkmux mission status`/the
 /// graph lens must show what actually happened, never the pre-run
-/// `Planned` snapshot `build_funnel_graph` produced.
-pub fn run_funnel_graph(
-    ctx: &FunnelStepContext,
+/// `Planned` snapshot `build_review_graph` produced.
+pub fn run_review_graph(
+    ctx: &ReviewStepContext,
     crew_name: &str,
     mode: ExecMode,
     fingerprint_val: serde_json::Value,
     staffing: CrewStaffingSnapshot,
-    graph: BuiltFunnelGraph,
-    emitter: &mut dyn FunnelEmitter,
-) -> Result<(FunnelEnvelope, std::collections::BTreeMap<String, Step>)> {
-    let BuiltFunnelGraph {
+    graph: BuiltReviewGraph,
+    emitter: &mut dyn ReviewEmitter,
+) -> Result<(ReviewEnvelope, std::collections::BTreeMap<String, Step>)> {
+    let BuiltReviewGraph {
         tasks,
         mut steps,
         registry,
@@ -4874,7 +4909,7 @@ pub fn run_funnel_graph(
         tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
 
     {
-        let mut env = shared_env.lock().expect("shared funnel envelope mutex poisoned");
+        let mut env = shared_env.lock().expect("shared review envelope mutex poisoned");
         env.case_id = ctx.case_id.clone();
         env.crew = crew_name.to_string();
         env.mode = mode_label(mode).to_string();
@@ -4882,12 +4917,18 @@ pub fn run_funnel_graph(
         env.staffing = Some(staffing);
     }
 
-    let mut sink = EmitterSink(emitter);
-    let mut guard = FunnelBookendGuard::new(&mut sink, &ctx.case_id, crew_name);
-    guard.task_started(json!({
-        "status": "started", "case_id": ctx.case_id, "crew": crew_name,
-        "exec_mode": mode_label(mode), "bundles": ctx.bundles.len(),
-    }));
+    // (#1349) Host telemetry only — no bookend struct. The caller already
+    // owns the run's liveness bookend (see this function's doc); this
+    // sampler's samples are drained and forwarded to `emitter` alongside
+    // `run_step_graph`'s own step-lifecycle records, same interleaving
+    // discipline `HostTelemetrySampler`'s doc describes.
+    let telemetry = HostTelemetrySampler::start(
+        ctx.case_id.clone(),
+        crew_name.to_string(),
+        REVIEW_TELEMETRY_INTERVAL,
+        REVIEW_TELEMETRY_POLL,
+        sample_host,
+    );
 
     let facts = {
         let mut host = LmsHost::new();
@@ -4898,25 +4939,24 @@ pub fn run_funnel_graph(
     // `run_step_graph`'s own emit closure runs entirely on the MAIN thread
     // (the scheduler drains each wave's `run_bounded` results before
     // calling `emit` — see `scheduler::run_step_graph`'s loop), never
-    // inside a worker thread, so capturing `&mut guard` here is safe
-    // despite `FunnelBookendGuard` not being `Send` (the constraint the
-    // module doc's "guard can't cross a `run_bounded` worker-thread
-    // boundary" note is about StepKind::run() bodies, which DO run inside
-    // workers — not about this closure). This routes the scheduler's
-    // generic step-lifecycle bookends through the SAME injected
-    // `FunnelEmitter` every other record in this driver uses — the driver
-    // stays sink-agnostic (module doc), never calling `darkmux_flow::
-    // record` directly itself.
+    // inside a worker thread, so capturing `&mut telemetry`/`emitter` here
+    // is safe. This routes the scheduler's generic step-lifecycle bookends
+    // through the SAME injected `ReviewEmitter` every other record in this
+    // driver uses — the driver stays sink-agnostic (module doc), never
+    // calling `darkmux_flow::record` directly itself.
     let report = run_step_graph(&mut steps, &tasks_by_id, &registry, &facts, &est, 8, &mut |record| {
-        guard.emit_now(record);
+        for sample in telemetry.rx.try_iter().collect::<Vec<_>>() {
+            emitter.emit(sample);
+        }
+        emitter.emit(record);
     });
 
     // Merge the probe stage's NOW-populated accumulators (every probe step
     // has run by the time `run_step_graph` returns, whether it errored or
     // not) into the shared envelope — this can only happen AFTER the run,
-    // not at `build_funnel_graph` time when they were still empty.
+    // not at `build_review_graph` time when they were still empty.
     {
-        let mut env = shared_env.lock().expect("shared funnel envelope mutex poisoned");
+        let mut env = shared_env.lock().expect("shared review envelope mutex poisoned");
         env.members
             .extend(probe_members.lock().expect("probe members mutex poisoned").iter().cloned());
         env.warnings
@@ -4936,31 +4976,39 @@ pub fn run_funnel_graph(
     let report = match report {
         Ok(r) => r,
         Err(e) => {
-            let mut env = shared_env.lock().expect("shared funnel envelope mutex poisoned").clone();
-            env.degenerate = Some(format!("funnel graph scheduling failed: {e:#}"));
-            guard.task_finished(&env);
+            let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();
+            env.degenerate = Some(format!("review graph scheduling failed: {e:#}"));
+            for sample in telemetry.rx.try_iter().collect::<Vec<_>>() {
+                emitter.emit(sample);
+            }
             return Ok((env, steps));
         }
     };
 
     let env = if report.errored.is_empty() {
         match steps.get(&synthesis_step_id).and_then(|s| s.output.as_deref()) {
-            Some(out) => serde_json::from_str::<FunnelEnvelope>(out)
-                .unwrap_or_else(|_| shared_env.lock().expect("shared funnel envelope mutex poisoned").clone()),
-            None => shared_env.lock().expect("shared funnel envelope mutex poisoned").clone(),
+            Some(out) => serde_json::from_str::<ReviewEnvelope>(out)
+                .unwrap_or_else(|_| shared_env.lock().expect("shared review envelope mutex poisoned").clone()),
+            None => shared_env.lock().expect("shared review envelope mutex poisoned").clone(),
         }
     } else {
-        let mut env = shared_env.lock().expect("shared funnel envelope mutex poisoned").clone();
+        let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();
         if env.degenerate.is_none() {
             env.degenerate = Some(format!(
-                "funnel graph: step(s) errored: {}",
+                "review graph: step(s) errored: {}",
                 report.errored.join(", ")
             ));
         }
         env
     };
 
-    guard.task_finished(&env);
+    // Final drain before `telemetry` drops (its own `Drop` then stops the
+    // sampler thread) — same "known, accepted loss window" the retired
+    // bookend guard documented: at most one final-tick sample can land in
+    // the brief window between this drain and the thread join completing.
+    for sample in telemetry.rx.try_iter().collect::<Vec<_>>() {
+        emitter.emit(sample);
+    }
     Ok((env, steps))
 }
 
@@ -5057,7 +5105,7 @@ mod tests {
     fn parse_judge_ruling_last_fence_wins() {
         let text = "Weighing the flag: the code quotes\n```\nconst days = Math.min(raw, 30)\n```\nwhich looks relevant.\n\n```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"the clamp is bypassed\", \"note_for_author\": \"real bug\"}\n```\n";
         let (ruling, evidence, note) = parse_judge_ruling(text).expect("parses");
-        assert_eq!(ruling, FunnelRuling::Confirmed);
+        assert_eq!(ruling, JudgeRuling::Confirmed);
         assert_eq!(evidence, "the clamp is bypassed");
         assert_eq!(note, "real bug");
     }
@@ -5066,14 +5114,14 @@ mod tests {
     fn parse_judge_ruling_prose_wrapped_still_parses() {
         let text = "Some long reasoning about the code goes here, spanning several\nsentences before the verdict.\n```json\n{\"ruling\": \"false_positive\", \"decisive_evidence\": \"input is clamped upstream\", \"note_for_author\": \"no action needed\"}\n```";
         let (ruling, ..) = parse_judge_ruling(text).expect("parses");
-        assert_eq!(ruling, FunnelRuling::FalsePositive);
+        assert_eq!(ruling, JudgeRuling::FalsePositive);
     }
 
     #[test]
     fn parse_judge_ruling_needs_check_and_case_insensitive() {
         let text = "```json\n{\"ruling\": \"NEEDS_CHECK\", \"decisive_evidence\": \"outside the bundle\", \"note_for_author\": \"verify manually\"}\n```";
         let (ruling, ..) = parse_judge_ruling(text).expect("parses");
-        assert_eq!(ruling, FunnelRuling::NeedsCheck);
+        assert_eq!(ruling, JudgeRuling::NeedsCheck);
     }
 
     #[test]
@@ -5429,7 +5477,7 @@ mod tests {
         JudgedFlag {
             flag: flag(bundle_id, "gpt-4o", 0, charge_text),
             pass1: JudgeRecord {
-                ruling: FunnelRuling::NeedsCheck,
+                ruling: JudgeRuling::NeedsCheck,
                 decisive_evidence: "e".into(),
                 note_for_author: "n".into(),
                 pass: 1,
@@ -5470,7 +5518,7 @@ mod tests {
         // Confirmed flags must be ignored by the clusterer.
         let mut confirmed = nc_flag(IHS_FILE, "a real confirmed bug");
         confirmed.tier = Tier::Confirmed;
-        confirmed.pass1.ruling = FunnelRuling::Confirmed;
+        confirmed.pass1.ruling = JudgeRuling::Confirmed;
         judged.push(confirmed);
 
         let clusters = cluster_needs_check(&judged);
@@ -5512,8 +5560,8 @@ mod tests {
     fn double_confirm_confirm_then_confirm_is_confirmed_tier() {
         let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, CONFIRM_JSON]));
         let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
-        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
-        assert_eq!(o.pass2.unwrap().ruling, FunnelRuling::Confirmed);
+        assert_eq!(o.pass1.ruling, JudgeRuling::Confirmed);
+        assert_eq!(o.pass2.unwrap().ruling, JudgeRuling::Confirmed);
         assert_eq!(o.tier, Tier::Confirmed);
         assert!(!o.demoted_by_pass2);
         assert_eq!(o.calls, 2, "one clean dispatch per pass");
@@ -5523,8 +5571,8 @@ mod tests {
     fn double_confirm_confirm_then_false_positive_demotes_to_needs_check() {
         let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, FP_JSON]));
         let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
-        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
-        assert_eq!(o.pass2.unwrap().ruling, FunnelRuling::FalsePositive);
+        assert_eq!(o.pass1.ruling, JudgeRuling::Confirmed);
+        assert_eq!(o.pass2.unwrap().ruling, JudgeRuling::FalsePositive);
         assert_eq!(o.tier, Tier::NeedsCheck, "disagreement demotes, never ships as confirmed");
         assert!(o.demoted_by_pass2);
     }
@@ -5533,7 +5581,7 @@ mod tests {
     fn double_confirm_pass1_needs_check_skips_pass2() {
         let mut chat = scripted_chat(RefCell::new(vec![NEEDS_CHECK_JSON]));
         let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
-        assert_eq!(o.pass1.ruling, FunnelRuling::NeedsCheck);
+        assert_eq!(o.pass1.ruling, JudgeRuling::NeedsCheck);
         assert!(o.pass2.is_none());
         assert_eq!(o.tier, Tier::NeedsCheck);
         assert!(!o.demoted_by_pass2);
@@ -5545,7 +5593,7 @@ mod tests {
     fn double_confirm_pass1_false_positive_archives_without_pass2() {
         let mut chat = scripted_chat(RefCell::new(vec![FP_JSON]));
         let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
-        assert_eq!(o.pass1.ruling, FunnelRuling::FalsePositive);
+        assert_eq!(o.pass1.ruling, JudgeRuling::FalsePositive);
         assert!(o.pass2.is_none());
         assert_eq!(o.tier, Tier::Archived);
     }
@@ -5555,7 +5603,7 @@ mod tests {
         // Two garbage replies: pass-1 attempt, retry — still unparsed.
         let mut chat = scripted_chat(RefCell::new(vec!["no verdict here", "still nothing"]));
         let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
-        assert_eq!(o.pass1.ruling, FunnelRuling::Unparsed);
+        assert_eq!(o.pass1.ruling, JudgeRuling::Unparsed);
         assert!(o.pass2.is_none());
         assert_eq!(o.tier, Tier::Archived);
         assert!(!o.demoted_by_pass2);
@@ -5567,8 +5615,8 @@ mod tests {
         // First attempt garbage, retry succeeds — the retry's ruling wins.
         let mut chat = scripted_chat(RefCell::new(vec!["garbage", CONFIRM_JSON, CONFIRM_JSON]));
         let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
-        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed, "the retry's clean ruling survives");
-        assert_eq!(o.pass2.unwrap().ruling, FunnelRuling::Confirmed);
+        assert_eq!(o.pass1.ruling, JudgeRuling::Confirmed, "the retry's clean ruling survives");
+        assert_eq!(o.pass2.unwrap().ruling, JudgeRuling::Confirmed);
         assert_eq!(o.tier, Tier::Confirmed);
         assert_eq!(o.calls, 3, "pass-1 attempt + retry + pass-2 = three real dispatches");
     }
@@ -5588,7 +5636,7 @@ mod tests {
         };
         let o =
             judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
-        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
+        assert_eq!(o.pass1.ruling, JudgeRuling::Confirmed);
         assert!(o.pass2.is_none(), "passes: 1 never runs a confirmation pass");
         assert_eq!(o.tier, Tier::Confirmed, "the single pass IS the tier directly");
         assert!(!o.demoted_by_pass2);
@@ -5606,7 +5654,7 @@ mod tests {
         };
         let o =
             judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
-        assert_eq!(o.pass1.ruling, FunnelRuling::NeedsCheck);
+        assert_eq!(o.pass1.ruling, JudgeRuling::NeedsCheck);
         assert_eq!(o.tier, Tier::NeedsCheck, "pass-1's needs_check IS the tier");
         assert!(o.pass2.is_none());
         assert_eq!(calls, 1, "a non-confirmed pass-1 earns no second call under any passes");
@@ -5617,7 +5665,7 @@ mod tests {
         let mut chat = scripted_chat(RefCell::new(vec![FP_JSON]));
         let o =
             judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
-        assert_eq!(o.pass1.ruling, FunnelRuling::FalsePositive);
+        assert_eq!(o.pass1.ruling, JudgeRuling::FalsePositive);
         assert_eq!(o.tier, Tier::Archived, "pass-1's false_positive tiers out directly");
         assert!(o.pass2.is_none());
         assert_eq!(o.calls, 1);
@@ -5638,11 +5686,11 @@ mod tests {
             judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
         assert_eq!(o.tier, Tier::Confirmed, "unanimous confirms hold the bar");
         assert!(!o.demoted_by_pass2);
-        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
+        assert_eq!(o.pass1.ruling, JudgeRuling::Confirmed);
         // The decisive `pass2` slot holds the LAST confirmation pass (pass-3),
         // carrying its real pass number.
         let last = o.pass2.as_ref().expect("a later confirmation pass survives into the slot");
-        assert_eq!(last.ruling, FunnelRuling::Confirmed);
+        assert_eq!(last.ruling, JudgeRuling::Confirmed);
         assert_eq!(last.pass, 3, "the decisive slot carries the real pass number, not a hardcoded 2");
         assert_eq!(o.calls, 3);
         assert_eq!(calls, 3, "pass-1 + two confirmation passes");
@@ -5661,7 +5709,7 @@ mod tests {
             judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
         assert_eq!(o.tier, Tier::NeedsCheck, "one disagreement breaks unanimity, never ships confirmed");
         assert!(o.demoted_by_pass2);
-        assert_eq!(o.pass2.as_ref().unwrap().ruling, FunnelRuling::FalsePositive);
+        assert_eq!(o.pass2.as_ref().unwrap().ruling, JudgeRuling::FalsePositive);
         assert_eq!(o.calls, 3);
         assert_eq!(calls, 3, "all three passes ran before the late disagreement");
     }
@@ -5790,44 +5838,44 @@ mod tests {
     // ── crew seat-requirement validation ────────────────────────────
 
     #[test]
-    fn validate_funnel_crew_happy_path() {
+    fn validate_review_crew_happy_path() {
         let crew = valid_crew();
-        let FunnelSeats { probes, judge, verify: _ } = validate_funnel_crew(&crew).expect("valid");
+        let ReviewSeats { probes, judge, verify: _ } = validate_review_crew(&crew).expect("valid");
         assert_eq!(probes.len(), 1);
         assert_eq!(judge.pm.id, "judge-model");
     }
 
     #[test]
-    fn validate_funnel_crew_missing_probe_seat_rejected() {
+    fn validate_review_crew_missing_probe_seat_rejected() {
         let crew = crew_with(vec![("review-judge", vec![staffing("fast", "j", 1)])]);
-        let err = validate_funnel_crew(&crew).unwrap_err();
+        let err = validate_review_crew(&crew).unwrap_err();
         assert!(err.to_string().contains("review-probe"));
     }
 
     #[test]
-    fn validate_funnel_crew_empty_probe_staffing_rejected() {
+    fn validate_review_crew_empty_probe_staffing_rejected() {
         let crew = crew_with(vec![
             ("review-probe", vec![]),
             ("review-judge", vec![staffing("fast", "j", 1)]),
         ]);
-        let err = validate_funnel_crew(&crew).unwrap_err();
+        let err = validate_review_crew(&crew).unwrap_err();
         assert!(err.to_string().contains("review-probe"));
     }
 
     #[test]
-    fn validate_funnel_crew_missing_judge_seat_rejected() {
+    fn validate_review_crew_missing_judge_seat_rejected() {
         let crew = crew_with(vec![("review-probe", vec![staffing("fast", "p", 1)])]);
-        let err = validate_funnel_crew(&crew).unwrap_err();
+        let err = validate_review_crew(&crew).unwrap_err();
         assert!(err.to_string().contains("review-judge"));
     }
 
     #[test]
-    fn validate_funnel_crew_multiple_judge_staffings_rejected() {
+    fn validate_review_crew_multiple_judge_staffings_rejected() {
         let crew = crew_with(vec![
             ("review-probe", vec![staffing("fast", "p", 1)]),
             ("review-judge", vec![staffing("fast", "j1", 1), staffing("fast", "j2", 1)]),
         ]);
-        let err = validate_funnel_crew(&crew).unwrap_err();
+        let err = validate_review_crew(&crew).unwrap_err();
         assert!(err.to_string().contains("EXACTLY 1"));
     }
 
@@ -5842,7 +5890,7 @@ mod tests {
             ),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -5857,7 +5905,7 @@ mod tests {
         };
         let mut cycler = RecordingCycler::new();
         let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
         assert!(env.confirmed + env.needs_check + env.archived > 0 || env.deduped_flags == 0);
         let log = &cycler.log;
         let a_load = log.iter().position(|s| s == "load:member-a").unwrap();
@@ -5876,7 +5924,7 @@ mod tests {
     #[test]
     fn envelope_counts_and_steps_are_internally_consistent() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -5900,7 +5948,7 @@ mod tests {
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
         assert!(env.degenerate.is_none());
         assert_eq!(env.bundles, 1, "one changed file in the fixture diff");
         assert_eq!(env.raw_flags, 2, "k=2 draws, both non-empty");
@@ -5923,7 +5971,7 @@ mod tests {
 
     // ── flow-record emission (#1247 Part 1) ───────────────────────────
 
-    /// Recording [`FunnelEmitter`] mock — pushes every emitted record into
+    /// Recording [`ReviewEmitter`] mock — pushes every emitted record into
     /// a shared `Vec` so a test can assert the exact SEQUENCE (action +
     /// payload), same discipline as `RecordingCycler` above.
     struct RecordingEmitter {
@@ -5934,7 +5982,7 @@ mod tests {
             Self { records: Vec::new() }
         }
     }
-    impl FunnelEmitter for RecordingEmitter {
+    impl ReviewEmitter for RecordingEmitter {
         fn emit(&mut self, record: darkmux_flow::FlowRecord) {
             self.records.push(record);
         }
@@ -5946,7 +5994,7 @@ mod tests {
         // one probe seat, k=2 draws both finding the same defect (dedup
         // collapses to 1 flag), a judge that confirms both passes.
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -5970,18 +6018,18 @@ mod tests {
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut emitter).expect("review runs");
         assert!(env.degenerate.is_none());
 
         let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
         assert_eq!(
             actions.first(),
-            Some(&"funnel.task"),
+            Some(&"review.task"),
             "the run's first emitted record is the task-started bookend: {actions:?}"
         );
         assert_eq!(
             actions.last(),
-            Some(&"funnel.task"),
+            Some(&"review.task"),
             "the run's last emitted record is the task-finished bookend: {actions:?}"
         );
         assert_eq!(
@@ -5994,10 +6042,10 @@ mod tests {
         );
 
         // Every step_id named in the envelope's own `steps` shows up as a
-        // `funnel.step` record too (the live-run counterpart of the
+        // `review.step` record too (the live-run counterpart of the
         // end-of-run summary), plus one seat-level `probe:<name>` record.
         let step_records: Vec<&darkmux_flow::FlowRecord> =
-            emitter.records.iter().filter(|r| r.action == "funnel.step").collect();
+            emitter.records.iter().filter(|r| r.action == "review.step").collect();
         let step_ids: Vec<String> = step_records
             .iter()
             .map(|r| r.payload.as_ref().unwrap()["step_id"].as_str().unwrap().to_string())
@@ -6012,7 +6060,7 @@ mod tests {
         // The per-ruling ticker: one flag, pass-1 AND pass-2 both confirm ->
         // exactly two ruling records.
         let rulings: Vec<&darkmux_flow::FlowRecord> =
-            emitter.records.iter().filter(|r| r.action == "funnel.ruling").collect();
+            emitter.records.iter().filter(|r| r.action == "review.ruling").collect();
         assert_eq!(rulings.len(), 2, "one deduped flag, pass1 confirms so pass2 also runs");
         let passes: Vec<i64> =
             rulings.iter().map(|r| r.payload.as_ref().unwrap()["pass"].as_i64().unwrap()).collect();
@@ -6028,7 +6076,7 @@ mod tests {
             .records
             .iter()
             .position(|r| {
-                r.action == "funnel.step"
+                r.action == "review.step"
                     && r.payload.as_ref().unwrap()["step_id"] == json!("judge-pass2")
                     && r.payload.as_ref().unwrap()["status"] == json!("started")
             })
@@ -6036,7 +6084,7 @@ mod tests {
         let first_pass2_ruling_idx = emitter
             .records
             .iter()
-            .position(|r| r.action == "funnel.ruling" && r.payload.as_ref().unwrap()["pass"] == json!(2))
+            .position(|r| r.action == "review.ruling" && r.payload.as_ref().unwrap()["pass"] == json!(2))
             .expect("a pass-2 ruling record emitted");
         assert!(
             pass2_started_idx < first_pass2_ruling_idx,
@@ -6049,13 +6097,13 @@ mod tests {
         // handle=role_id / session_id=dispatch-identity convention.
         assert!(emitter.records.iter().all(|r| r.session_id.as_deref() == Some("c1")));
         assert!(emitter.records.iter().all(|r| r.handle == crew.name));
-        assert!(emitter.records.iter().all(|r| r.source.as_deref() == Some("funnel")));
+        assert!(emitter.records.iter().all(|r| r.source.as_deref() == Some("review")));
     }
 
     #[test]
     fn flow_emission_degenerate_zero_bundles_emits_only_task_and_bundle_step() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "",
@@ -6071,13 +6119,13 @@ mod tests {
         let mut cycler = RecordingCycler::new();
         let mut emitter = RecordingEmitter::new();
         let mut chat = |_call: &ChatCall| Ok(reply("unused"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut emitter).expect("review runs");
         assert!(env.degenerate.is_some());
 
         // Zero bundles short-circuits before any probe/judge work: task
         // started, bundle step finished, task finished — nothing else.
         let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
-        assert_eq!(actions, vec!["funnel.task", "funnel.step", "funnel.task"], "{actions:?}");
+        assert_eq!(actions, vec!["review.task", "review.step", "review.task"], "{actions:?}");
         let finished = emitter.records.last().unwrap();
         assert!(
             matches!(finished.level, darkmux_flow::Level::Warn),
@@ -6088,8 +6136,8 @@ mod tests {
 
     // ── bookend guard (#1247 review round) — no orphaned started records ──
 
-    /// A probe dispatch error propagates out of `run_funnel` via `?` AFTER
-    /// `funnel.task started`, `probe started`, and `probe:<seat> started`
+    /// A probe dispatch error propagates out of `run_review` via `?` AFTER
+    /// `review.task started`, `probe started`, and `probe:<seat> started`
     /// were emitted. Without the guard those three would dangle forever;
     /// with it, the Drop path must close each open step (innermost-first,
     /// `status: "error"`) and emit a terminal error task record — every
@@ -6097,7 +6145,7 @@ mod tests {
     #[test]
     fn bookend_guard_probe_dispatch_error_closes_open_steps_and_emits_terminal_task_record() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6114,7 +6162,7 @@ mod tests {
         let mut emitter = RecordingEmitter::new();
         let mut chat =
             |_call: &ChatCall| -> Result<SingleShotReply> { Err(anyhow!("network down")) };
-        let err = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).unwrap_err();
+        let err = run_review(&inputs, &mut chat, &mut cycler, &mut emitter).unwrap_err();
         assert!(err.to_string().contains("probe phase"), "the original error still propagates: {err:#}");
 
         // The record stream stays pair-consistent: the seat step closes
@@ -6135,9 +6183,9 @@ mod tests {
         assert_eq!(
             tail,
             vec![
-                ("funnel.task".to_string(), "error".to_string()),
-                ("funnel.step".to_string(), "probe".to_string()),
-                ("funnel.step".to_string(), "probe:fast".to_string()),
+                ("review.task".to_string(), "error".to_string()),
+                ("review.step".to_string(), "probe".to_string()),
+                ("review.step".to_string(), "probe:fast".to_string()),
             ],
             "reading backwards: terminal task record last, preceded by probe then probe:<seat> error-closes"
         );
@@ -6152,7 +6200,7 @@ mod tests {
             .records
             .iter()
             .filter(|r| {
-                r.action == "funnel.task"
+                r.action == "review.task"
                     && r.payload.as_ref().unwrap()["status"].as_str() != Some("started")
             })
             .count();
@@ -6161,7 +6209,7 @@ mod tests {
 
     /// The reviewer-named scenario: a chat closure that errors mid-JUDGE-
     /// docket. Judge dispatch errors are deliberately swallowed per-flag
-    /// (`FunnelRuling::Error` → `Tier::Archived` — one bad call must not
+    /// (`JudgeRuling::Error` → `Tier::Archived` — one bad call must not
     /// abort the docket), so the run COMPLETES and the terminal task record
     /// is the ordinary `finished` one (degenerate-marked by the judge-dead
     /// honesty gate, since NO flag got a usable ruling). Either way the
@@ -6170,7 +6218,7 @@ mod tests {
     #[test]
     fn bookend_guard_chat_error_mid_judge_docket_still_yields_terminal_task_record() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6193,12 +6241,12 @@ mod tests {
                 Err(anyhow!("judge endpoint down"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter)
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut emitter)
             .expect("judge dispatch errors are swallowed per-flag, never abort the run");
         assert!(env.degenerate.is_some(), "the judge-dead honesty gate marks the envelope");
 
         let last = emitter.records.last().unwrap();
-        assert_eq!(last.action, "funnel.task");
+        assert_eq!(last.action, "review.task");
         assert_eq!(
             last.payload.as_ref().unwrap()["status"].as_str(),
             Some("finished"),
@@ -6207,7 +6255,7 @@ mod tests {
         assert!(last.payload.as_ref().unwrap()["degenerate"].is_string());
         // The judge-pass1 step still closed normally.
         assert!(emitter.records.iter().any(|r| {
-            r.action == "funnel.step"
+            r.action == "review.step"
                 && r.payload.as_ref().unwrap()["step_id"].as_str() == Some("judge-pass1")
                 && r.payload.as_ref().unwrap()["status"].as_str() == Some("finished")
         }));
@@ -6239,7 +6287,7 @@ mod tests {
             }
         }
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6263,17 +6311,17 @@ mod tests {
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let err = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).unwrap_err();
+        let err = run_review(&inputs, &mut chat, &mut cycler, &mut emitter).unwrap_err();
         assert!(err.to_string().contains("release failure"), "{err:#}");
 
         let last = emitter.records.last().unwrap();
-        assert_eq!(last.action, "funnel.task");
+        assert_eq!(last.action, "review.task");
         assert_eq!(last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
         // Innermost-first: `judge-pass2` (opened last, mid-loop, once its
         // first pass-2 ruling fired) closes before `judge-pass1` (opened
         // first, before the loop).
         let second_to_last = &emitter.records[emitter.records.len() - 2];
-        assert_eq!(second_to_last.action, "funnel.step");
+        assert_eq!(second_to_last.action, "review.step");
         assert_eq!(
             second_to_last.payload.as_ref().unwrap()["step_id"].as_str(),
             Some("judge-pass1"),
@@ -6281,7 +6329,7 @@ mod tests {
         );
         assert_eq!(second_to_last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
         let third_to_last = &emitter.records[emitter.records.len() - 3];
-        assert_eq!(third_to_last.action, "funnel.step");
+        assert_eq!(third_to_last.action, "review.step");
         assert_eq!(
             third_to_last.payload.as_ref().unwrap()["step_id"].as_str(),
             Some("judge-pass2"),
@@ -6290,7 +6338,7 @@ mod tests {
         assert_eq!(third_to_last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
         // The rulings the docket DID produce before the abort are on the
         // stream — partial progress is preserved, not retconned.
-        assert!(emitter.records.iter().any(|r| r.action == "funnel.ruling"));
+        assert!(emitter.records.iter().any(|r| r.action == "review.ruling"));
     }
 
     // ── host telemetry sampler (#1247 doctrine surface) ─────────────────
@@ -6333,7 +6381,7 @@ mod tests {
             .expect("sampler thread did not stop within 5s — thread leak");
     }
 
-    /// `FunnelBookendGuard` owns the sampler's whole-run lifecycle (see its
+    /// `ReviewRunGuard` owns the sampler's whole-run lifecycle (see its
     /// doc). Clean finish: `task_started` -> `task_finished` -> the guard
     /// drops — the sampler thread must already be stopped by the time that
     /// drop returns. Same bounded-timeout discipline as the sampler-only
@@ -6345,7 +6393,7 @@ mod tests {
         thread::spawn(move || {
             let mut emitter = RecordingEmitter::new();
             let mut sink = EmitterSink(&mut emitter);
-            let mut guard = FunnelBookendGuard::new_with_telemetry(
+            let mut guard = ReviewRunGuard::new_with_telemetry(
                 &mut sink,
                 "case-1",
                 "crew-1",
@@ -6354,7 +6402,7 @@ mod tests {
                 fake_sample,
             );
             guard.task_started(json!({"status": "started"}));
-            let env = FunnelEnvelope {
+            let env = ReviewEnvelope {
                 case_id: "case-1".to_string(),
                 crew: "crew-1".to_string(),
                 ..Default::default()
@@ -6380,7 +6428,7 @@ mod tests {
             let mut emitter = RecordingEmitter::new();
             {
                 let mut sink = EmitterSink(&mut emitter);
-                let mut guard = FunnelBookendGuard::new_with_telemetry(
+                let mut guard = ReviewRunGuard::new_with_telemetry(
                     &mut sink,
                     "case-2",
                     "crew-2",
@@ -6399,8 +6447,8 @@ mod tests {
             .expect("guard drop (error path) did not stop the telemetry sampler thread within 5s — thread leak");
     }
 
-    /// End-to-end: a scripted `run_funnel` (via the test-only
-    /// `run_funnel_with_telemetry` seam) with a fast sampler cadence, an
+    /// End-to-end: a scripted `run_review` (via the test-only
+    /// `run_review_with_telemetry` seam) with a fast sampler cadence, an
     /// injected instant fake sampler (hermetic — no real subprocess
     /// timing), and a small sleep per scripted dispatch (so the run's own
     /// wall-clock comfortably exceeds several sample intervals) must show
@@ -6408,13 +6456,13 @@ mod tests {
     /// with the same field shape `dispatch_internal`'s sampler already
     /// produces (`category=telemetry, source="process"`) plus this run's
     /// own identity (`session_id=case_id`, `handle=crew name`) — the
-    /// convention `funnel_flow_record` already uses for the `funnel.*`
+    /// convention `review_flow_record` already uses for the `review.*`
     /// action family, so a telemetry record groups with a run's other
     /// records under the same `session_id`.
     #[test]
     fn flow_emission_includes_host_telemetry_when_sampler_cadence_is_fast() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c-telemetry".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6446,7 +6494,7 @@ mod tests {
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let env = run_funnel_with_telemetry(
+        let env = run_review_with_telemetry(
             &inputs,
             &mut chat,
             &mut cycler,
@@ -6455,7 +6503,7 @@ mod tests {
             Duration::from_millis(2),
             fake_sample,
         )
-        .expect("funnel runs");
+        .expect("review runs");
         assert!(env.degenerate.is_none());
 
         let telemetry: Vec<&darkmux_flow::FlowRecord> =
@@ -6473,7 +6521,7 @@ mod tests {
             assert_eq!(
                 r.session_id.as_deref(),
                 Some("c-telemetry"),
-                "session_id must match the funnel's case_id — same convention funnel_flow_record uses"
+                "session_id must match the review's case_id — same convention review_flow_record uses"
             );
             assert_eq!(r.handle, crew.name);
             // The injected fake sampler returns fixed values, so the
@@ -6492,13 +6540,13 @@ mod tests {
     fn staffing_snapshot_round_trips_and_reflects_the_callers_resolved_k_not_a_registry_default() {
         // `k: 9` here stands in for a `--k` override the caller (review-bench
         // or `pr-review run`) already applied to the crew BEFORE building
-        // `FunnelInputs` — `run_funnel` never re-reads a registry, so the
+        // `ReviewInputs` — `run_review` never re-reads a registry, so the
         // snapshot can only ever reflect what it was actually handed.
         let crew = crew_with(vec![
             ("review-probe", vec![staffing("fast", "probe-model", 9)]),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6513,7 +6561,7 @@ mod tests {
         };
         let mut cycler = RecordingCycler::new();
         let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
 
         let snapshot = env.staffing.as_ref().expect("staffing snapshot present on a normal run");
         assert_eq!(snapshot.probes.len(), 1);
@@ -6530,7 +6578,7 @@ mod tests {
         assert_eq!(snapshot.probes[0].n_ctx, Some(32_000));
         assert_eq!(judge.n_ctx, Some(32_000));
 
-        // The shape `funnels.json` persists — a JSON round trip must
+        // The shape `reviews.json` persists — a JSON round trip must
         // preserve the snapshot exactly, same discipline as the envelope's
         // own full serde-round-trip test.
         let json = serde_json::to_string(&env).expect("envelope serializes");
@@ -6554,7 +6602,7 @@ mod tests {
             ("review-probe", vec![staffing("fast", "probe-model", 2)]),
             ("review-judge", vec![judge]),
         ]);
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c-passes".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6569,7 +6617,7 @@ mod tests {
         };
         let mut cycler = RecordingCycler::new();
         let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
 
         let snapshot = env.staffing.as_ref().expect("staffing snapshot present on a normal run");
         assert_eq!(
@@ -6582,7 +6630,7 @@ mod tests {
             "a probe seat omitting passes carries the visible default"
         );
 
-        // Survives the JSON round trip `funnels.json` persists.
+        // Survives the JSON round trip `reviews.json` persists.
         let json = serde_json::to_string(&env).expect("envelope serializes");
         let value: serde_json::Value = serde_json::from_str(&json).expect("envelope parses back");
         assert_eq!(value["staffing"]["judge"]["passes"], json!(3));
@@ -6601,7 +6649,7 @@ mod tests {
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
         crew.request_changes = true; // opt into the blocking review event
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c-rc".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6616,7 +6664,7 @@ mod tests {
         };
         let mut cycler = RecordingCycler::new();
         let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
 
         let snapshot = env.staffing.as_ref().expect("staffing snapshot present on a normal run");
         assert!(snapshot.request_changes, "the crew's request_changes flag is snapshotted");
@@ -6632,9 +6680,9 @@ mod tests {
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
         advisory.request_changes = false; // the default — advisory
-        let inputs2 = FunnelInputs { case_id: "c-adv".to_string(), crew: &advisory, ..inputs };
+        let inputs2 = ReviewInputs { case_id: "c-adv".to_string(), crew: &advisory, ..inputs };
         let mut cycler2 = RecordingCycler::new();
-        let env2 = run_funnel(&inputs2, &mut chat, &mut cycler2, &mut NullEmitter).expect("funnel runs");
+        let env2 = run_review(&inputs2, &mut chat, &mut cycler2, &mut NullEmitter).expect("review runs");
         let json2 = serde_json::to_string(&env2).expect("envelope serializes");
         let value2: serde_json::Value = serde_json::from_str(&json2).expect("envelope parses back");
         assert!(
@@ -6656,14 +6704,14 @@ mod tests {
             "confirmed": 0, "needs_check": 0, "archived": 0,
             "fingerprint": {}
         }"#;
-        let env: FunnelEnvelope = serde_json::from_str(legacy).expect("legacy envelope without staffing parses");
+        let env: ReviewEnvelope = serde_json::from_str(legacy).expect("legacy envelope without staffing parses");
         assert!(env.staffing.is_none());
     }
 
     #[test]
     fn degenerate_zero_bundles_never_silently_passes() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "",
@@ -6678,7 +6726,7 @@ mod tests {
         };
         let mut cycler = RecordingCycler::new();
         let mut chat = |_call: &ChatCall| Ok(reply("unused"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
         assert!(env.degenerate.is_some());
         assert_eq!(env.bundles, 0);
         assert_eq!(env.confirmed, 0);
@@ -6693,7 +6741,7 @@ mod tests {
     #[test]
     fn degenerate_zero_flags_never_silently_passes() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6709,7 +6757,7 @@ mod tests {
         let mut cycler = RecordingCycler::new();
         // Every probe draw comes back empty — retried, then skipped.
         let mut chat = |_call: &ChatCall| Ok(reply(""));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
         assert!(env.degenerate.is_some());
         assert_eq!(env.raw_flags, 0);
         assert_eq!(env.judged.len(), 0);
@@ -6728,7 +6776,7 @@ mod tests {
         // from a genuinely clean "none confirmed" run. Flags judged but
         // ZERO usable pass-1 rulings must mark the envelope degenerate.
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6751,7 +6799,7 @@ mod tests {
                 Ok(reply("I could not reach a verdict on this."))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
         assert_eq!(env.judged.len(), 1, "the flag WAS judged (archived), not dropped");
         assert_eq!(env.confirmed, 0);
         assert_eq!(env.needs_check, 0);
@@ -6767,7 +6815,7 @@ mod tests {
         // flag produced real signal — zero confirms is then an honest
         // outcome, not a degenerate one.
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6788,7 +6836,7 @@ mod tests {
                 Ok(reply(FP_JSON))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
         assert_eq!(env.confirmed, 0);
         assert_eq!(env.archived, 1);
         assert!(
@@ -6803,7 +6851,7 @@ mod tests {
     #[test]
     fn run_judge_only_skips_probe_and_judges_supplied_flags() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6832,7 +6880,7 @@ mod tests {
     #[test]
     fn run_judge_only_records_the_callers_parallel_mode() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -6849,7 +6897,7 @@ mod tests {
         let mut cycler = RecordingCycler::new();
         let mut chat = |_call: &ChatCall| Ok(reply(FP_JSON));
         let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
-        assert_eq!(env.mode, "parallel", "a judge-only re-run of a parallel funnel keeps its provenance");
+        assert_eq!(env.mode, "parallel", "a judge-only re-run of a parallel review keeps its provenance");
     }
 
     // ── ExecMode auto-resolution (#1230 Packet 1: gestalt wave scheduler) ──
@@ -7061,7 +7109,7 @@ mod tests {
     fn parse_judge_ruling_multiple_valid_fences_last_wins() {
         let text = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"first pass\", \"note_for_author\": \"n1\"}\n```\nOn reflection, revising the verdict:\n```json\n{\"ruling\": \"false_positive\", \"decisive_evidence\": \"second pass\", \"note_for_author\": \"n2\"}\n```";
         let (ruling, evidence, note) = parse_judge_ruling(text).expect("parses");
-        assert_eq!(ruling, FunnelRuling::FalsePositive, "the LAST fenced JSON wins, not the first");
+        assert_eq!(ruling, JudgeRuling::FalsePositive, "the LAST fenced JSON wins, not the first");
         assert_eq!(evidence, "second pass", "the first fence's evidence must be ignored");
         assert_eq!(note, "n2");
     }
@@ -7073,7 +7121,7 @@ mod tests {
     fn parse_judge_ruling_tolerates_unknown_extra_fields() {
         let text = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"e\", \"note_for_author\": \"n\", \"confidence\": 0.87, \"extra\": {\"nested\": true}}\n```";
         let (ruling, evidence, note) = parse_judge_ruling(text).expect("unknown fields must not break parsing");
-        assert_eq!(ruling, FunnelRuling::Confirmed);
+        assert_eq!(ruling, JudgeRuling::Confirmed);
         assert_eq!(evidence, "e");
         assert_eq!(note, "n");
     }
@@ -7179,8 +7227,8 @@ mod tests {
     fn double_confirm_confirm_then_pass2_unparsed_demotes_to_needs_check() {
         let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, "no verdict here", "still nothing"]));
         let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
-        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
-        assert_eq!(o.pass2.as_ref().unwrap().ruling, FunnelRuling::Unparsed);
+        assert_eq!(o.pass1.ruling, JudgeRuling::Confirmed);
+        assert_eq!(o.pass2.as_ref().unwrap().ruling, JudgeRuling::Unparsed);
         assert_eq!(o.tier, Tier::NeedsCheck, "an unparsed pass-2 must demote, never silently confirm");
         assert!(o.demoted_by_pass2);
         assert_eq!(o.calls, 3, "pass-1 (1 call) + pass-2 attempt + pass-2's own unparsed-retry (2 calls)");
@@ -7217,7 +7265,7 @@ mod tests {
     /// Sequential mode loads/dispatches/releases one member fully before
     /// moving to the next. A load failure on the SECOND member aborts the
     /// whole probe phase via `?` — the first member's already-gathered
-    /// flags are discarded (never surfaced, since `run_funnel` returns
+    /// flags are discarded (never surfaced, since `run_review` returns
     /// `Err` and the partially-built envelope is dropped), the failed
     /// member is never released, and the judge never loads at all.
     #[test]
@@ -7229,7 +7277,7 @@ mod tests {
             ),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -7244,10 +7292,10 @@ mod tests {
         };
         let mut cycler = FailingLoadCycler::new("member-b");
         let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
-        let err = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).unwrap_err();
+        let err = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).unwrap_err();
         assert!(
             err.to_string().contains("probe phase"),
-            "run_funnel wraps the propagated load error with phase context"
+            "run_review wraps the propagated load error with phase context"
         );
         assert_eq!(
             cycler.log,
@@ -7269,7 +7317,7 @@ mod tests {
             ),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -7288,7 +7336,7 @@ mod tests {
             dispatch_count += 1;
             Ok(reply("a real defect `const end = start.plus(30)`"))
         };
-        let err = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).unwrap_err();
+        let err = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).unwrap_err();
         assert!(err.to_string().contains("probe phase"));
         assert_eq!(
             dispatch_count, 0,
@@ -7511,7 +7559,7 @@ mod tests {
     /// `darkmux_gestalt::planner`'s "Cutover behavior changes" doc — "a
     /// foreign copy listed ahead of a darkmux copy also no longer shadows
     /// it"), so listing order no longer decides the outcome the way the old
-    /// funnel-private `.find()` did. The owned-but-stale instance is found
+    /// review-private `.find()` did. The owned-but-stale instance is found
     /// regardless of position → Reconcile, exactly like the mirror-ordering
     /// case below; the foreign resident is never touched either way.
     #[cfg(unix)]
@@ -7610,7 +7658,7 @@ mod tests {
     #[test]
     fn step_telemetry_probe_wall_ms_encompasses_member_wall_ms() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -7634,7 +7682,7 @@ mod tests {
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
         let probe_step = env.steps.iter().find(|s| s.step_id == "probe").expect("probe step recorded");
         let probe_member_ms: u64 = env
             .members
@@ -7651,7 +7699,7 @@ mod tests {
     }
 
     /// The judge's `MemberRecord.wall_ms` is set to EXACTLY `pass1_ms +
-    /// pass2_ms` (`finish_funnel`), and the `judge-pass1`/`judge-pass2`
+    /// pass2_ms` (`finish_review`), and the `judge-pass1`/`judge-pass2`
     /// step rows carry those same two values — so their sum must equal the
     /// judge member's wall_ms EXACTLY, not just approximately (both are
     /// derived from the same accumulator variables, so this holds
@@ -7659,7 +7707,7 @@ mod tests {
     #[test]
     fn step_telemetry_judge_steps_sum_equals_judge_member_wall_ms() {
         let crew = valid_crew();
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -7684,7 +7732,7 @@ mod tests {
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("review runs");
         let judge_member = env
             .members
             .iter()
@@ -7704,8 +7752,8 @@ mod tests {
 
     // ── envelope serde round trip through a file ─────────────────────
 
-    /// `FunnelEnvelope` derives `Serialize` only (no `Deserialize`), so a
-    /// literal `FunnelEnvelope -> FunnelEnvelope` round trip isn't
+    /// `ReviewEnvelope` derives `Serialize` only (no `Deserialize`), so a
+    /// literal `ReviewEnvelope -> ReviewEnvelope` round trip isn't
     /// expressible. This writes a fully-populated envelope (covering all
     /// three `Tier` variants) to a real file, reads it back, and checks
     /// value-level equality through `serde_json::Value` — the strongest
@@ -7722,14 +7770,14 @@ mod tests {
             JudgedFlag {
                 flag: flag_confirmed.clone(),
                 pass1: JudgeRecord {
-                    ruling: FunnelRuling::Confirmed,
+                    ruling: JudgeRuling::Confirmed,
                     decisive_evidence: "e1".into(),
                     note_for_author: "n1".into(),
                     pass: 1,
                     seconds: 0.5,
                 },
                 pass2: Some(JudgeRecord {
-                    ruling: FunnelRuling::Confirmed,
+                    ruling: JudgeRuling::Confirmed,
                     decisive_evidence: "e1b".into(),
                     note_for_author: "n1b".into(),
                     pass: 2,
@@ -7743,14 +7791,14 @@ mod tests {
             JudgedFlag {
                 flag: flag_needs_check.clone(),
                 pass1: JudgeRecord {
-                    ruling: FunnelRuling::Confirmed,
+                    ruling: JudgeRuling::Confirmed,
                     decisive_evidence: "e2".into(),
                     note_for_author: "n2".into(),
                     pass: 1,
                     seconds: 0.3,
                 },
                 pass2: Some(JudgeRecord {
-                    ruling: FunnelRuling::FalsePositive,
+                    ruling: JudgeRuling::FalsePositive,
                     decisive_evidence: "e2b".into(),
                     note_for_author: "n2b".into(),
                     pass: 2,
@@ -7764,7 +7812,7 @@ mod tests {
             JudgedFlag {
                 flag: flag_archived.clone(),
                 pass1: JudgeRecord {
-                    ruling: FunnelRuling::FalsePositive,
+                    ruling: JudgeRuling::FalsePositive,
                     decisive_evidence: "e3".into(),
                     note_for_author: "n3".into(),
                     pass: 1,
@@ -7778,7 +7826,7 @@ mod tests {
             },
         ];
 
-        let env = FunnelEnvelope {
+        let env = ReviewEnvelope {
             case_id: "case-42".to_string(),
             crew: "test-crew".to_string(),
             mode: "sequential".to_string(),
@@ -7873,7 +7921,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     // ── manifest is dropped from the judge prompt (#1256) ──────────────
 
     /// `judge-runner.py`'s `judge_one` has no MANIFEST section at all —
-    /// `bundler.py`'s bundles carry no such field. The Rust funnel's
+    /// `bundler.py`'s bundles carry no such field. The Rust review's
     /// `BundleInput.manifest` is a Rust-only addition; per the "match
     /// Phase A exactly" operator decision it's dropped from the judge
     /// prompt entirely (not silently threaded through) even though the
@@ -7894,7 +7942,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             facts: vec![],
             manifest: vec!["helperFn".to_string()],
         }];
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id: "c1".to_string(),
             crew: &crew,
             intent_title: "add a feature",
@@ -7976,8 +8024,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         }
     }
 
-    fn inputs_for<'a>(crew: &'a ResolvedCrew, budget: u64) -> FunnelInputs<'a> {
-        FunnelInputs {
+    fn inputs_for<'a>(crew: &'a ResolvedCrew, budget: u64) -> ReviewInputs<'a> {
+        ReviewInputs {
             case_id: "remote-case".to_string(),
             crew,
             intent_title: "t",
@@ -8018,7 +8066,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
 
         // (1) Cycler saw ONLY the local probe — remote seats have no residency.
         assert!(!cycler.log.is_empty(), "the local seat still cycles");
@@ -8089,7 +8137,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 model: Some("gpt-4o-2026-08-01".to_string()),
             })
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
 
         let probe = env.members.iter().find(|m| m.seat == "review-probe").expect("probe member");
         assert_eq!(probe.model, "gpt-4o", "requested id is unchanged");
@@ -8146,7 +8194,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 model: Some(call.model.to_string()),
             })
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
 
         assert_eq!(env.members.len(), 3, "probe + judge + verify all dispatched");
         for m in &env.members {
@@ -8182,7 +8230,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
         };
         let mut emitter = RecordingEmitter::new();
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
 
         assert!(env.degenerate.is_none(), "probe exhaustion never degrades the run");
         assert_eq!(env.raw_flags, 1, "only the pre-exhaustion draw landed");
@@ -8212,7 +8260,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let finished = emitter
             .records
             .iter()
-            .filter(|r| r.action == "funnel.task")
+            .filter(|r| r.action == "review.task")
             .filter_map(|r| r.payload.as_ref())
             .find(|p| p["status"] == "finished")
             .expect("terminal task record");
@@ -8246,7 +8294,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
 
         let reason = env.degenerate.as_deref().expect("judge exhaustion degrades the run");
         assert!(reason.contains("remote judge token budget exhausted"), "got: {reason}");
@@ -8258,7 +8306,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let skipped = env
             .judged
             .iter()
-            .find(|j| j.pass1.ruling == FunnelRuling::Error)
+            .find(|j| j.pass1.ruling == JudgeRuling::Error)
             .expect("the post-exhaustion flag is ruled Error, never silently confirmed");
         assert!(skipped.pass1.note_for_author.contains("remote token budget exhausted"));
         let p1 = env
@@ -8300,7 +8348,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter)
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter)
             .expect("a remote probe failure must not abort the run");
         assert!(
             env.warnings.iter().any(|w| w.contains("reduced coverage") && w.contains("endpoint 401")),
@@ -8381,7 +8429,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
         };
         let mut emitter = RecordingEmitter::new();
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
 
         assert_eq!(env.judged.len(), 3);
         // verified: stays confirmed, record present.
@@ -8441,7 +8489,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         assert!(env.judged.iter().all(|j| j.verify.is_none()));
         assert!(!env.steps.iter().any(|s| s.step_id == "verify"));
         assert!(!env.members.iter().any(|m| m.seat == "review-verify"));
@@ -8474,7 +8522,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         assert_eq!(env.confirmed, 0);
         assert!(!env.steps.iter().any(|s| s.step_id == "verify"));
         assert!(!env.members.iter().any(|m| m.seat == "review-verify"));
@@ -8512,7 +8560,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         assert!(env.degenerate.is_none(), "verify exhaustion NEVER degrades the whole run");
         let warning = env
             .warnings
@@ -8545,24 +8593,24 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// The verify seat's staffing shape is validated like the judge's:
     /// exactly one staffing when declared; absent is fine (optional seat).
     #[test]
-    fn validate_funnel_crew_verify_seat_shape() {
+    fn validate_review_crew_verify_seat_shape() {
         let ok = crew_with(vec![
             ("review-probe", vec![staffing("fast", "a", 1)]),
             ("review-judge", vec![staffing("fast", "b", 1)]),
             ("review-verify", vec![staffing("frontier", "c", 1)]),
         ]);
-        let seats = validate_funnel_crew(&ok).expect("verify seat accepted");
+        let seats = validate_review_crew(&ok).expect("verify seat accepted");
         assert!(seats.verify.is_some());
 
         let absent = valid_crew();
-        assert!(validate_funnel_crew(&absent).expect("optional").verify.is_none());
+        assert!(validate_review_crew(&absent).expect("optional").verify.is_none());
 
         let two = crew_with(vec![
             ("review-probe", vec![staffing("fast", "a", 1)]),
             ("review-judge", vec![staffing("fast", "b", 1)]),
             ("review-verify", vec![staffing("frontier", "c", 1), staffing("frontier", "d", 1)]),
         ]);
-        let err = validate_funnel_crew(&two).unwrap_err().to_string();
+        let err = validate_review_crew(&two).unwrap_err().to_string();
         assert!(err.contains("review-verify"), "{err}");
         assert!(err.contains("EXACTLY 1"), "{err}");
     }
@@ -8581,7 +8629,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         let value = serde_json::to_value(&env).unwrap();
         assert!(value.get("warnings").is_none(), "empty warnings never serialize");
         assert!(value.get("remote_budgets").is_none(), "no budget rows on a local-only run");
@@ -8622,7 +8670,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
         };
         let mut emitter = RecordingEmitter::new();
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
 
         // Zero content ⇒ zero flags ⇒ the run is a degenerate zero-flag run,
         // but the SPEND is still fully accounted.
@@ -8635,7 +8683,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let finished = emitter
             .records
             .iter()
-            .filter(|r| r.action == "funnel.task")
+            .filter(|r| r.action == "review.task")
             .filter_map(|r| r.payload.as_ref())
             .find(|p| p["status"] == "finished")
             .expect("terminal task record");
@@ -8664,7 +8712,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         let reason = env.degenerate.as_deref().expect("remote judge dispatch failure degrades the run");
         assert!(reason.contains("remote judge dispatch failed on 1 of 1 flag"), "got: {reason}");
     }
@@ -8705,7 +8753,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
 
         assert!(
             env.degenerate.is_none(),
@@ -8747,7 +8795,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         // Degenerate via the JUDGE-DEAD gate (all rulings unusable), NOT the
         // remote honest-fail reason — local semantics are untouched.
         let reason = env.degenerate.as_deref().expect("a fully-dead local judge is degenerate (judge-dead gate)");
@@ -8777,7 +8825,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         assert!(env.degenerate.as_deref().unwrap().contains("remote judge token budget exhausted"));
         assert!(!env.steps.iter().any(|s| s.step_id == "verify"), "no verify step on a doomed run");
         assert!(!env.members.iter().any(|m| m.seat == "review-verify"), "no verify member on a doomed run");
@@ -8833,7 +8881,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let _ = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let _ = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         assert_eq!(*seen_cap.borrow(), REMOTE_REASONING_MAX_TOKENS_FLOOR);
     }
 
@@ -8868,7 +8916,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_review(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         assert!(env.degenerate.is_none(), "an inconclusive verify never degrades the run");
         assert_eq!(env.confirmed, 2, "both stay confirmed (marker downstream)");
         assert_eq!(env.verified, 0, "an inconclusive adjudication never promotes");
@@ -8903,7 +8951,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(over.exhausted(), "over budget: 101 >= 100");
     }
 
-    /// (CONSIDER e) The terminal `funnel.task` record carries `remote_tokens`
+    /// (CONSIDER e) The terminal `review.task` record carries `remote_tokens`
     /// when a seat dispatched remotely, and OMITS it entirely on a local-only
     /// run — the separated cloud figure never counts as savings (#1186).
     #[test]
@@ -8916,11 +8964,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             if call.model == "darkmux:judge-model" { Ok(reply(CONFIRM_JSON)) } else { Ok(reply("a real defect")) }
         };
         let mut em1 = RecordingEmitter::new();
-        let _ = run_funnel(&local_inputs, &mut chat1, &mut cyc1, &mut em1).expect("runs");
+        let _ = run_review(&local_inputs, &mut chat1, &mut cyc1, &mut em1).expect("runs");
         let local_finished = em1
             .records
             .iter()
-            .filter(|r| r.action == "funnel.task")
+            .filter(|r| r.action == "review.task")
             .filter_map(|r| r.payload.as_ref())
             .find(|p| p["status"] == "finished")
             .expect("terminal record");
@@ -8941,11 +8989,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
         };
         let mut em2 = RecordingEmitter::new();
-        let _ = run_funnel(&remote_inputs, &mut chat2, &mut cyc2, &mut em2).expect("runs");
+        let _ = run_review(&remote_inputs, &mut chat2, &mut cyc2, &mut em2).expect("runs");
         let remote_finished = em2
             .records
             .iter()
-            .filter(|r| r.action == "funnel.task")
+            .filter(|r| r.action == "review.task")
             .filter_map(|r| r.payload.as_ref())
             .find(|p| p["status"] == "finished")
             .expect("terminal record");
@@ -8954,8 +9002,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
     // ─── (#1230/#1341 DRY pass) Task/Step graph orchestration ───────────
 
-    fn step_ctx(crew: &ResolvedCrew, bundles: Vec<BundleInput>) -> Arc<FunnelStepContext> {
-        Arc::new(FunnelStepContext {
+    fn step_ctx(crew: &ResolvedCrew, bundles: Vec<BundleInput>) -> Arc<ReviewStepContext> {
+        Arc::new(ReviewStepContext {
             case_id: "case-1".to_string(),
             crew: crew.clone(),
             intent_title: String::new(),
@@ -8973,18 +9021,18 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// The graph's SHAPE is fully knowable upfront (the redesign's whole
     /// point): three Phases, `depends_on` edges crossing Phase boundaries
     /// exactly like they cross Task boundaries within one, and every Step
-    /// resolvable through the registry `build_funnel_graph` also builds.
+    /// resolvable through the registry `build_review_graph` also builds.
     /// Pure structural assertion — no dispatch, no network.
     #[test]
-    fn build_funnel_graph_has_three_phases_and_correct_dependencies() {
+    fn build_review_graph_has_three_phases_and_correct_dependencies() {
         let crew = crew_with(vec![
             ("review-probe", vec![staffing("fast", "probe-model-a", 1), staffing("slow", "probe-model-b", 1)]),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
-        let seats = validate_funnel_crew(&crew).expect("valid crew");
+        let seats = validate_review_crew(&crew).expect("valid crew");
         let ctx = step_ctx(&crew, vec![]);
 
-        let graph = build_funnel_graph(
+        let graph = build_review_graph(
             ctx,
             seats.judge.clone(),
             seats.verify.cloned(),
@@ -9008,24 +9056,40 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // on investigate's dedup TASK, no special cross-phase mechanism.
         let tasks_by_id: std::collections::BTreeMap<&str, &Task> =
             graph.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-        let dedup_step_id = "funnel-dedup-step";
-        let judge_task = tasks_by_id["funnel-judge-task"];
-        assert_eq!(judge_task.depends_on, vec!["funnel-dedup-task".to_string()]);
+        let dedup_step_id = "review-dedup-step";
+        let judge_task = tasks_by_id["review-judge-task"];
+        assert_eq!(judge_task.depends_on, vec!["review-dedup-task".to_string()]);
         assert_eq!(graph.phase_id_of_step[dedup_step_id], "investigate");
-        assert_eq!(graph.phase_id_of_step["funnel-judge-step"], "adjudicate");
+        assert_eq!(graph.phase_id_of_step["review-judge-step"], "adjudicate");
 
         // report's synthesis TASK depends on BOTH dedup (investigate) and
         // verify (report) — graph-native cross-phase data flow, not a side
         // channel.
-        let synth_task = tasks_by_id["funnel-synthesis-task"];
-        assert!(synth_task.depends_on.contains(&"funnel-dedup-task".to_string()));
-        assert!(synth_task.depends_on.contains(&"funnel-verify-task".to_string()));
-        assert_eq!(graph.phase_id_of_step["funnel-synthesis-step"], "report");
+        let synth_task = tasks_by_id["review-synthesis-task"];
+        assert!(synth_task.depends_on.contains(&"review-dedup-task".to_string()));
+        assert!(synth_task.depends_on.contains(&"review-verify-task".to_string()));
+        assert_eq!(graph.phase_id_of_step["review-synthesis-step"], "report");
 
         // Every step's `kind` resolves through the SAME registry — the
         // scheduler contract this whole redesign hangs on.
         for step in graph.steps.values() {
             assert!(graph.registry.get(&step.kind).is_ok(), "step `{}` kind `{}` must resolve", step.id, step.kind);
+        }
+
+        // (#1349) The pre-rename `funnel.*` kind ids also resolve — a
+        // `Step.kind` persisted before this rename shipped must not become
+        // "unknown step kind" if anything ever re-reads it back through a
+        // fresh registry (see `StepKindRegistry::register_alias`'s doc).
+        for legacy in [
+            "funnel.bundle",
+            "funnel.probe:fast",
+            "funnel.probe:slow",
+            "funnel.dedup",
+            "funnel.judge",
+            "funnel.verify",
+            "funnel.synthesis",
+        ] {
+            assert!(graph.registry.get(legacy).is_ok(), "legacy kind id `{legacy}` must still resolve");
         }
 
         // ONE call is the whole point: no separate driver loop needed to
@@ -9042,21 +9106,21 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// or network. Confirms the degenerate reason ends up in the FINAL
     /// envelope regardless of which stage would have detected it.
     #[test]
-    fn run_funnel_graph_with_empty_bundles_completes_with_zero_dispatches() {
+    fn run_review_graph_with_empty_bundles_completes_with_zero_dispatches() {
         let crew = valid_crew();
-        let seats = validate_funnel_crew(&crew).expect("valid crew");
+        let seats = validate_review_crew(&crew).expect("valid crew");
         let judge = seats.judge.clone();
         let verify = seats.verify.cloned();
         let probes: Vec<_> = seats.probes.clone();
         let ctx = step_ctx(&crew, vec![]);
 
-        let graph = build_funnel_graph(ctx.clone(), judge.clone(), verify.clone(), &probes, "investigate", "adjudicate", "report", 1);
+        let graph = build_review_graph(ctx.clone(), judge.clone(), verify.clone(), &probes, "investigate", "adjudicate", "report", 1);
         let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
         let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), false);
 
         let mut emitter = RecordingEmitter::new();
         let (env, steps) =
-            run_funnel_graph(&ctx, "test-crew", ExecMode::Sequential, fingerprint_val, staffing_snap, graph, &mut emitter)
+            run_review_graph(&ctx, "test-crew", ExecMode::Sequential, fingerprint_val, staffing_snap, graph, &mut emitter)
                 .expect("graph run completes even with zero bundles");
 
         assert_eq!(env.bundles, 0);
@@ -9078,5 +9142,17 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // every step (free observability — see the module doc).
         let starts = emitter.records.iter().filter(|r| r.action == "step start").count();
         assert_eq!(starts, steps.len(), "every declared step got a lifecycle start record");
+        // (#1349) `run_review_graph` itself must emit NO task-level bookend
+        // at all — that liveness edge belongs entirely to the caller's
+        // `with_dispatch_bookends` wrap (`src/pr_review.rs`), which brackets
+        // the WHOLE call in the canonical `dispatch start`/`dispatch
+        // complete` record. A `review.task` (or any `dispatch *`) record
+        // emitted from inside this function would be the exact redundant,
+        // competing-vocabulary bug #1349 retired.
+        assert!(
+            emitter.records.iter().all(|r| r.action != "review.task" && !r.action.starts_with("dispatch ")),
+            "run_review_graph must not emit its own task-level bookend: {:?}",
+            emitter.records.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
+        );
     }
 }

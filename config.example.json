@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.3",
+  "schema_version": "1.4",
   "machine_id": "my-machine",
   "orchestrator": "",
   "lms_bin": "lms",
@@ -33,5 +33,8 @@
   },
   "mission": {
     "stale_active_days": 14
+  },
+  "review": {
+    "judge_concurrency": 1
   }
 }

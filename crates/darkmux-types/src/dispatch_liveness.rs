@@ -58,7 +58,7 @@ pub fn liveness(phase: &str) {
 }
 
 /// [`liveness`] with an explicit `case` id threaded in (e.g. `repo@sha` or the
-/// worktree path — the same handle the dispatch bookends and funnel records
+/// worktree path — the same handle the dispatch bookends and review-pipeline records
 /// carry, so the floor trail lines up with the flow records once flow exists).
 pub fn liveness_case(phase: &str, case: &str) {
     emit(phase, case, "");

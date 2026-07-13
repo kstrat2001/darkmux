@@ -46,14 +46,14 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("dialectic-prosecutor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-prosecutor.json"))),
     ("dialectic-defender", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-defender.json"))),
     ("dialectic-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-judge.json"))),
-    // (#1222 Phase B packet 4) Review-funnel seats: probe (k-draw, per-bundle
+    // (#1222 Phase B packet 4) Review seats: probe (k-draw, per-bundle
     // defect-finding) and judge (double-confirm ruling on each surviving
     // flag). Both mirror dialectic-judge's tool-less, no-output_schema,
-    // bail-with-explanation shape — the funnel dispatches both through the
+    // bail-with-explanation shape — the review dispatches both through the
     // container-free single-shot chat primitive, never the agent loop.
     ("review-probe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe.json"))),
     ("review-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-judge.json"))),
-    // (#1260/#1177) Optional fourth funnel seat: one adjudication call per
+    // (#1260/#1177) Optional fourth review seat: one adjudication call per
     // double-confirmed finding (in practice staffed by a frontier endpoint).
     // Same tool-less, no-output_schema, bail-with-explanation shape as
     // review-judge — dispatched through the single-shot chat primitive.
@@ -106,13 +106,13 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("dialectic-prosecutor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-prosecutor.md"))),
     ("dialectic-defender", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-defender.md"))),
     ("dialectic-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-judge.md"))),
-    // (#1222 Phase B packet 4) Review-funnel seat prompts — frozen texts
+    // (#1222 Phase B packet 4) Review seat prompts — frozen texts
     // (see the role JSON descriptions above for provenance).
     ("review-probe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe.md"))),
     ("review-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-judge.md"))),
     // (#1260) The verify seat's persona — frozen text (contract 6): the
-    // byte-lock golden lives beside the other funnel-seat goldens in
-    // `darkmux-lab`'s funnel tests (`verify_prompt_matches_frozen_golden`).
+    // byte-lock golden lives beside the other review-seat goldens in
+    // `darkmux-lab`'s review tests (`verify_prompt_matches_frozen_golden`).
     ("review-verify", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-verify.md"))),
     ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.md"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.md"))),

@@ -1,7 +1,7 @@
 # darkmux self-review runner
 
 `.github/workflows/darkmux-review.yml` lets darkmux review its own PRs on a
-**local review funnel** — a crew of local models, not a single reviewer — in
+**local review pipeline** — a crew of local models, not a single reviewer — in
 public, darkmux dogfooding itself (#1222 Phase B). This doc is the one-time
 setup for the self-hosted runner that powers it.
 
@@ -13,7 +13,7 @@ write access launches it:
 
 ```bash
 gh workflow run darkmux-review.yml -f pr=<PR_NUMBER>
-# optional overrides, for testing the funnel against another setup:
+# optional overrides, for testing the review pipeline against another setup:
 #   -f crew=<name>   review crew to dispatch (default: the DARKMUX_REVIEW_CREW
 #                    repo variable, falling back to "review-deep")
 #   -f mode=<mode>   sequential | parallel | auto (default: auto)
@@ -25,11 +25,11 @@ reads the PR **diff** plus its **title and description** via the GitHub API —
 all data, never checked out or executed — and dispatches them to `darkmux
 pr-review run`, which drives the named crew's seats (a `review-probe` seat
 that argues the diff, then a `review-judge` seat that weighs the probes'
-findings) in the sandboxed, network-isolated internal runtime. The funnel's
+findings) in the sandboxed, network-isolated internal runtime. The pipeline's
 own GitHub file source (used when a probe or the judge wants to see more of a
 changed file than the diff shows) also reads file contents via the API as
 data, never executed — same trust class as the diff. (The title + description
-give the funnel the change's stated intent, so it assesses the diff against
+give the review its stated intent, so it assesses the diff against
 its purpose instead of flagging the bug a fix removes — #1053.) The findings
 post back as native inline review comments. The only checkout is of trusted
 `main` (the review tooling), not the PR.
@@ -71,8 +71,8 @@ comment launches it — still maintainer-only.
 
 ## Studio migration checklist (moving from the single-reviewer setup)
 
-If your runner is still on the pre-funnel `diff-review` profile + `pr-reviewer`
-role setup, here's the path to the crew-based funnel:
+If your runner is still on the pre-crew `diff-review` profile + `pr-reviewer`
+role setup, here's the path to the crew-based review pipeline:
 
 **(a) Update darkmux.**
 
@@ -109,7 +109,7 @@ a whole file:
 
   "crews": {
     "review-deep": {
-      "description": "32GB-tier review funnel: a wide instruct pair on the probe seat plus a fast MoE judge — the measured reference configuration.",
+      "description": "32GB-tier review pipeline: a wide instruct pair on the probe seat plus a fast MoE judge — the measured reference configuration.",
       "seats": {
         "review-probe": [
           { "profile": "devstral", "k": 3, "max_tokens": 3000 },
@@ -177,7 +177,7 @@ every future dispatch with no PR against this repo.
 
 ## Notes
 
-- The review is **advisory** (no merge gate). Funnel quality depends on the
+- The review is **advisory** (no merge gate). Review quality depends on the
   crew you staff: a probe seat surfaces candidates, the judge seat weighs
   them — pair it with a human/frontier pass on substantive PRs regardless of
   crew composition.

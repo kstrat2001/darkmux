@@ -256,7 +256,7 @@ pub fn max_tokens_per_call() -> Option<u32> {
 
 // ── Remote (hosted-endpoint) dispatch (#1260/#1177) ──
 /// The per-EXECUTION remote token allowance — an execution is one pipeline
-/// stage (the funnel's probe pass, each judge pass, the verify pass; a bare
+/// stage (the review pipeline's probe pass, each judge pass, the verify pass; a bare
 /// crew dispatch is one execution). Only REMOTE (endpoint-staffed) calls
 /// draw from it. Resolves `env(DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) >
 /// config.remote.max_tokens_per_execution > 500000` (operator decision on
@@ -275,6 +275,21 @@ pub fn remote_concurrent_cap() -> u32 {
     let cfg = config().remote.as_ref().and_then(|r| r.concurrent_cap);
     pick_parsed("DARKMUX_REMOTE_CONCURRENT_CAP", cfg, Some(4)).unwrap()
 }
+// ── Review pipeline (#1349) ──
+/// (#1349) The PR-review pipeline's judge step internal bounded-concurrency
+/// for-each cap. Resolves `env(DARKMUX_REVIEW_JUDGE_CONCURRENCY) >
+/// config.review.judge_concurrency > 1` (fully sequential) — mirrors
+/// `remote_concurrent_cap`'s wiring exactly. Was a bare
+/// `std::env::var("DARKMUX_FUNNEL_JUDGE_CONCURRENCY")` read before this;
+/// moved onto the standard precedence chain as part of the funnel->review
+/// rename (renaming the var anyway was the natural point to fix it).
+pub fn review_judge_concurrency() -> u32 {
+    let cfg = config().review.as_ref().and_then(|r| r.judge_concurrency);
+    pick_parsed("DARKMUX_REVIEW_JUDGE_CONCURRENCY", cfg, Some(1))
+        .unwrap()
+        .max(1)
+}
+
 pub fn default_role() -> Option<String> {
     let cfg = config().runtime.as_ref().and_then(|r| r.default_role.as_deref());
     pick_string("DARKMUX_DEFAULT_ROLE", cfg, None)
@@ -973,6 +988,34 @@ mod tests {
         // An unparseable env value falls through to the default, never panics.
         unsafe { std::env::set_var(k, "lots"); }
         assert_eq!(remote_concurrent_cap(), 4);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── review_judge_concurrency (#1349): env > config > 1, min-clamped ──
+    #[serial_test::serial]
+    #[test]
+    fn review_judge_concurrency_env_then_default_then_min_clamp() {
+        let k = "DARKMUX_REVIEW_JUDGE_CONCURRENCY";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+        // No env + the empty test config (#811) → the built-in default 1
+        // (fully sequential — same conservative default the pre-#1349 bare
+        // env read used).
+        assert_eq!(review_judge_concurrency(), 1);
+        unsafe { std::env::set_var(k, "4"); }
+        assert_eq!(review_judge_concurrency(), 4, "env tier wins live");
+        // Zero (and any unparseable value) never disables the judge step —
+        // clamped up to the sequential floor, same as the retired
+        // `.filter(|n| *n >= 1)` guard.
+        unsafe { std::env::set_var(k, "0"); }
+        assert_eq!(review_judge_concurrency(), 1);
+        unsafe { std::env::set_var(k, "not-a-number"); }
+        assert_eq!(review_judge_concurrency(), 1);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

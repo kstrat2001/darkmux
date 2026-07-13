@@ -1,5 +1,5 @@
 {
-  "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-funnel-dedicated profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_crews_comment` below) that staff the `review-deep` crew, plus one hosted endpoint example (hosted-frontier). A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models (#1282). Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
+  "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-pipeline-dedicated profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_crews_comment` below) that staff the `review-deep` crew, plus one hosted endpoint example (hosted-frontier). A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models (#1282). Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
 
   "schema_version": "1.5",
 
@@ -33,21 +33,21 @@
     },
 
     "devstral": {
-      "description": "Review funnel — probe seat, plain draws. Dense wide-instruct model, no reasoning trace.",
+      "description": "Review pipeline — probe seat, plain draws. Dense wide-instruct model, no reasoning trace.",
       "models": [
         { "id": "mistralai/devstral-small-2507", "n_ctx": 32000 }
       ]
     },
 
     "qwen3.6-27b-review": {
-      "description": "Review funnel — probe seat, bundle-scoped draws. A second, distinct dense wide-instruct model so the probe seat isn't a single point of view.",
+      "description": "Review pipeline — probe seat, bundle-scoped draws. A second, distinct dense wide-instruct model so the probe seat isn't a single point of view.",
       "models": [
         { "id": "qwen/qwen3.6-27b", "n_ctx": 32000 }
       ]
     },
 
     "judge-35b-moe": {
-      "description": "Review funnel — judge seat. MoE reasoner weighing the probe seat's findings; deliberately its own profile/model so it never doubles as a probe.",
+      "description": "Review pipeline — judge seat. MoE reasoner weighing the probe seat's findings; deliberately its own profile/model so it never doubles as a probe.",
       "models": [
         { "id": "qwen/qwen3.6-35b-a3b", "n_ctx": 32000 }
       ]
@@ -73,7 +73,7 @@
     "utility": "qwen/qwen3-4b-instruct-2507"
   },
 
-  "_crews_comment": "crews[] (#1222) — saved crew assignments: which models staff which crew-role seats, for multi-seat pipelines (e.g. a review funnel's probe + judge seats). `seats` is keyed by crew role id (crates/darkmux-crew's role vocabulary). Each seat's value is a list of staffings — a profile + optional explicit model id (absent = that profile's default model), draws-per-item `k` (default 3), and an optional bundle_selector scoping which fact families a staffing draws from. The judge seat also takes `passes` (#1266) — its consensus depth: 1 = single pass (pass-1's ruling is the tier; the frontier cost lever), 2 = double-confirm (default, shown here), N = unanimous consensus over N passes with early-exit. `k` is probe breadth, `passes` is judge depth — distinct axes. Local-only in v1: a staffing naming a model with a remote endpoint fails validation.",
+  "_crews_comment": "crews[] (#1222) — saved crew assignments: which models staff which crew-role seats, for multi-seat pipelines (e.g. a review pipeline's probe + judge seats). `seats` is keyed by crew role id (crates/darkmux-crew's role vocabulary). Each seat's value is a list of staffings — a profile + optional explicit model id (absent = that profile's default model), draws-per-item `k` (default 3), and an optional bundle_selector scoping which fact families a staffing draws from. The judge seat also takes `passes` (#1266) — its consensus depth: 1 = single pass (pass-1's ruling is the tier; the frontier cost lever), 2 = double-confirm (default, shown here), N = unanimous consensus over N passes with early-exit. `k` is probe breadth, `passes` is judge depth — distinct axes. Local-only in v1: a staffing naming a model with a remote endpoint fails validation.",
   "crews": {
     "review-deep": {
       "description": "Deep review lineup, three distinct models: two probe staffings (one plain, one bundle-scoped) on their own dense wide-instruct profiles, plus a judge staffing on its own MoE-reasoner profile. Mirrors the runner example in .github/DARKMUX_REVIEW_RUNNER.md.",

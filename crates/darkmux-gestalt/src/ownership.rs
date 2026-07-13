@@ -3,7 +3,7 @@
 //! Canonical home going forward for the namespace helpers that today also
 //! live in `darkmux_profiles::swap` (the #52 namespace convention). Packet 3
 //! re-points swap.rs at this module (a thin delegating wrapper for the
-//! `&ProfileModel` form, `pub use` for the rest) so the funnel's `LmsCycler`
+//! `&ProfileModel` form, `pub use` for the rest) so the review's `LmsCycler`
 //! and the crew dispatch path keep exactly ONE definition — the #1271
 //! discipline. Until that cutover lands, the root-crate
 //! `tests/gestalt_parity.rs` asserts these functions agree with swap's over

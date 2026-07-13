@@ -741,7 +741,7 @@ mod tests {
     // tests). The env resolution itself is covered by `new_honors_env_bin`.
 
     /// Write an executable shell stub standing in for `lms` (the
-    /// `write_stub_lms` pattern from `darkmux-lab`'s funnel tests), with a
+    /// `write_stub_lms` pattern from `darkmux-lab`'s review tests), with a
     /// caller-supplied body dispatching on `$1`.
     #[cfg(unix)]
     fn write_stub(dir: &std::path::Path, body: &str) -> std::path::PathBuf {

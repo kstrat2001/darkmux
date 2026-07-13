@@ -211,7 +211,7 @@ pub enum Stance {
     Mitigate,
     Concede,
     /// A well-shaped marker with an off-contract stance word — kept (the
-    /// judge reads the raw word) but tallied separately in funnel metrics.
+    /// judge reads the raw word) but tallied separately in review-pipeline metrics.
     Other,
 }
 
@@ -458,7 +458,7 @@ fn judge_json_candidates(text: &str) -> Vec<String> {
 
 /// The content of a unified-diff line: one leading `+`/`-`/space stripped.
 ///
-/// `pub(crate)`: reused by `super::funnel`'s anchor extraction (#1222 Phase
+/// `pub(crate)`: reused by `super::review`'s anchor extraction (#1222 Phase
 /// B packet 4) so both charge-anchor matchers share ONE normalization
 /// discipline rather than re-deriving the same wrapped-line / marker-strip
 /// fixes twice.
@@ -527,7 +527,7 @@ pub fn validate_charge_anchors(charges: &mut [Charge], diff: &str) -> usize {
 
 /// Minimum length for a quoted span to be treated as verifiable evidence —
 /// shorter spans (`x`, `?？`, `}`) are inline code styling, not citations.
-/// `pub(crate)`: `super::funnel`'s anchor extraction applies the same floor
+/// `pub(crate)`: `super::review`'s anchor extraction applies the same floor
 /// so a trivial span (`0`, `}`) can never become an anchor / dedup key.
 pub(crate) const MIN_EVIDENCE_SPAN: usize = 8;
 
