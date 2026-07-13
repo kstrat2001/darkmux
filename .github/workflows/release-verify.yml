@@ -1,0 +1,80 @@
+name: Release verification (full release-mode gate)
+
+# workflow_dispatch-only — this is NOT a PR gate. `ci.yml` runs dev-profile
+# test+clippy on every PR/push (fast; see that file's header for why). This
+# workflow runs the FULL release-mode pipeline (`cargo build/test/clippy
+# --release --all-targets`, workspace + the standalone runtime/ crate) that
+# ci.yml used to run on every PR before it became a chronic near-timeout
+# (routinely 13m26s+ against a 15-minute cap, with zero margin).
+#
+# Run this by hand on the last PR/commit before cutting a release — the
+# `darkmux-point-release` skill's step 0 preconditions name it. It catches
+# the narrow class of issue dev-profile CI can't: an LTO/codegen-unit
+# interaction, a `#[cfg(not(debug_assertions))]`-only code path, or any
+# other release-mode-only compile/test/lint break. It does NOT replace the
+# point-release skill's own dogfood smoke (§2.5, a REAL dispatch against the
+# tagged commit) — this only proves the code compiles/tests/lints clean in
+# release mode; the dogfood smoke proves the shipped binary actually works.
+#
+# `gh workflow run release-verify.yml --ref <branch-or-sha>` — targets
+# whatever ref you point it at, no extra inputs needed.
+
+on:
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  release-verify-workspace:
+    name: release verify — workspace (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release (whole workspace, no warnings allowed)
+        run: cargo build --workspace --release --all-targets
+
+      - name: Test release (whole workspace)
+        run: cargo test --workspace --release
+
+      - name: Clippy release (whole workspace, all targets, no warnings allowed)
+        run: cargo clippy --workspace --release --all-targets -- -D warnings
+
+  release-verify-runtime:
+    name: release verify — runtime crate (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime
+
+      - name: Build release (runtime crate, no warnings allowed)
+        run: cargo build --manifest-path runtime/Cargo.toml --release --all-targets
+
+      - name: Test release (runtime crate)
+        run: cargo test --manifest-path runtime/Cargo.toml --release
+
+      - name: Clippy release (runtime crate, all targets, no warnings allowed)
+        run: cargo clippy --manifest-path runtime/Cargo.toml --release --all-targets -- -D warnings

@@ -4,17 +4,37 @@ name: CI
 # on ANY warning — see `RUSTFLAGS: "-D warnings"` and `cargo clippy -D warnings`
 # below. Tested locally via the same commands.
 #
-# Two performance notes (#523):
+# Performance notes (#523, revised — CI timeout flake, 2026-07-13):
 #   * Caching is via Swatinem/rust-cache — it keys on the lockfile + rustc
 #     version, scopes per-job, and prunes the stale `target/` artifacts that
 #     made the old hand-rolled actions/cache grow slower over time.
 #   * The heavy build/test/lint steps are gated behind a paths-filter so a
 #     docs-only / viewer-only PR reports green in seconds instead of paying
-#     the full ~15-min Rust pipeline. We deliberately do NOT split this into
-#     per-crate test jobs: a change to a foundational crate (e.g. darkmux-flow)
-#     must still exercise its reverse-dependents, so any Rust change runs the
-#     full workspace build+test+clippy. The filter only distinguishes
-#     "Rust-relevant changed" from "nothing Rust-relevant changed".
+#     the full Rust pipeline. We deliberately do NOT split by CRATE: a change
+#     to a foundational crate (e.g. darkmux-flow) must still exercise its
+#     reverse-dependents, so any Rust change runs the full workspace
+#     test+clippy. The filter only distinguishes "Rust-relevant changed" from
+#     "nothing Rust-relevant changed".
+#   * DEV profile, not release: PR-gating CI dropped `--release` from both
+#     `cargo test` and `cargo clippy` (and dropped the separate `cargo build
+#     --release` step entirely — `cargo clippy --all-targets` already compiles
+#     every target, catching build breaks as a side effect). Release-mode
+#     optimization doesn't change test/lint CORRECTNESS, only compile time —
+#     and it was the single biggest cost driver, routinely pushing this job
+#     past its 15-minute cap even on a successful run (13m26s measured on a
+#     clean pass, no margin left). A genuinely release-mode-only issue (an
+#     LTO/codegen-unit interaction, a `#[cfg(not(debug_assertions))]` path)
+#     is a real but rare gap this trades away — covered instead by
+#     `release-verify.yml` (workflow_dispatch-only, full `--release` gate),
+#     run by hand on the last PR before cutting a release; see that
+#     workflow's own header and the `darkmux-point-release` skill.
+#   * The runtime/ crate (excluded from the parent workspace, own Cargo.lock —
+#     #463) now runs as its OWN parallel job instead of appending to this
+#     one's sequential steps, with its OWN paths-filter scoped to `runtime/**`
+#     — it has zero dependency on the parent workspace's sources (confirmed:
+#     its `include_str!`s only ever resolve within `runtime/`), so a
+#     workspace-only PR skips it entirely and a runtime-only PR skips the
+#     (much heavier) workspace job.
 
 on:
   pull_request:
@@ -42,11 +62,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Decide whether this change touches anything that can affect the build,
-      # tests, or lints. `templates/**` is included because workload/role/skill
-      # assets are `include_str!`'d into the binary, so editing them changes
-      # compiled output and the tests that assert on it. The workflow file
-      # itself is included so CI changes always self-test.
+      # Decide whether this change touches anything that can affect the
+      # PARENT WORKSPACE's build, tests, or lints. `templates/**` is included
+      # because workload/role/skill assets are `include_str!`'d into the
+      # binary, so editing them changes compiled output and the tests that
+      # assert on it. The workflow file itself is included so CI changes
+      # always self-test. `runtime/**` is EXCLUDED — that crate is its own
+      # workspace root (#463) with zero dependency on these sources, and now
+      # runs as its own parallel job below with its own scoped filter, so a
+      # runtime-only PR doesn't also pay for this (heavier) job.
       - name: Detect Rust-relevant changes
         uses: dorny/paths-filter@v3
         id: filter
@@ -58,6 +82,7 @@ jobs:
               - '**/Cargo.lock'
               - 'templates/**'
               - '.github/workflows/ci.yml'
+              - '!runtime/**'
 
       - name: Install Rust stable toolchain
         if: steps.filter.outputs.rust == 'true'
@@ -74,33 +99,75 @@ jobs:
       # lints. Tracked as a follow-up (`cargo fmt --all` once, then
       # re-enable here).
 
-      - name: Build release (whole workspace, no warnings allowed)
+      # DEV profile (see this file's header) — no separate `cargo build`
+      # step: `cargo clippy --all-targets` below already compiles every
+      # target (bins/examples/tests), so a plain build-only check would be
+      # redundant work, not extra coverage.
+      - name: Test (whole workspace)
         if: steps.filter.outputs.rust == 'true'
-        run: cargo build --workspace --release --all-targets
-
-      - name: Test release (whole workspace)
-        if: steps.filter.outputs.rust == 'true'
-        run: cargo test --workspace --release
+        run: cargo test --workspace
 
       - name: Clippy (whole workspace, all targets, no warnings allowed)
         if: steps.filter.outputs.rust == 'true'
-        run: cargo clippy --workspace --release --all-targets -- -D warnings
-
-      # The runtime crate is EXCLUDED from the cargo workspace (#463 — it builds
-      # against musl in the darkmux-runtime Docker image), so `--workspace` above
-      # does NOT cover it. Build + test + lint it explicitly so its suite + lints
-      # gate CI too. (Image build itself needs a Docker daemon — deferred to a
-      # follow-up Linux job; macOS runners don't ship a working Docker.)
-      - name: Runtime crate — build + test + lint
-        if: steps.filter.outputs.rust == 'true'
-        run: |
-          cargo build --manifest-path runtime/Cargo.toml --release --all-targets
-          cargo test --manifest-path runtime/Cargo.toml --release
-          cargo clippy --manifest-path runtime/Cargo.toml --release --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: No Rust-relevant changes — pipeline skipped
         if: steps.filter.outputs.rust != 'true'
-        run: echo "No Rust / Cargo / template / workflow changes detected; build+test+lint skipped (reports green)."
+        run: echo "No Rust / Cargo / template / workflow changes detected; test+lint skipped (reports green)."
+
+  runtime-test-lint:
+    name: runtime crate — test + lint (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The runtime crate is EXCLUDED from the parent cargo workspace (#463 —
+      # it builds against musl in the darkmux-runtime Docker image) and is its
+      # own workspace root with its own Cargo.lock. Its `include_str!`s only
+      # ever resolve within `runtime/` (confirmed 2026-07-13) — zero
+      # dependency on the parent workspace's sources — so this job's filter
+      # is scoped to `runtime/**` alone, letting it run IN PARALLEL with
+      # `build-test-lint` above instead of appending to that job's sequential
+      # steps (the change that fixed this job's chronic near-timeout).
+      - name: Detect runtime-relevant changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            runtime:
+              - 'runtime/**'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust stable toolchain
+        if: steps.filter.outputs.runtime == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build artifacts
+        if: steps.filter.outputs.runtime == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime
+
+      # DEV profile — see ci.yml's header for the reasoning (shared with the
+      # parent-workspace job above). Image build itself needs a Docker
+      # daemon — deferred to a follow-up Linux job; macOS runners don't ship
+      # a working Docker.
+      - name: Test (runtime crate)
+        if: steps.filter.outputs.runtime == 'true'
+        run: cargo test --manifest-path runtime/Cargo.toml
+
+      - name: Clippy (runtime crate, all targets, no warnings allowed)
+        if: steps.filter.outputs.runtime == 'true'
+        run: cargo clippy --manifest-path runtime/Cargo.toml --all-targets -- -D warnings
+
+      - name: No runtime-relevant changes — pipeline skipped
+        if: steps.filter.outputs.runtime != 'true'
+        run: echo "No runtime/ changes detected; test+lint skipped (reports green)."
 
   cargo-audit:
     name: cargo audit (RUSTSEC advisories)
