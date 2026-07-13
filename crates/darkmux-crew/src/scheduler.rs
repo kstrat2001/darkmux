@@ -37,7 +37,7 @@ use crate::step_kinds::StepKindRegistry;
 use crate::types::{NodeStatus, Step, Task};
 use anyhow::{anyhow, Result};
 use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
-use darkmux_gestalt::{Facts, FootprintEstimator};
+use darkmux_gestalt::{Facts, FootprintEstimator, ModelHost};
 use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -305,13 +305,21 @@ pub struct SchedulerReport {
 ///
 /// Rejects a cyclic Task graph up front via `detect_cycles` rather than
 /// looping forever on a Task that can never become ready.
+///
+/// Argument count exceeds clippy's default threshold (8 vs 7) since #1360's
+/// `host_factory` addition — mirrors the same accepted trade-off as
+/// `WorkloadProvider::run()`'s own `#[allow(clippy::too_many_arguments)]`:
+/// each parameter is inherent to the call (graph state, planning inputs,
+/// the emission sink, now the injectable host), not incidental bloat.
+#[allow(clippy::too_many_arguments)]
 pub fn run_step_graph(
     steps: &mut BTreeMap<String, Step>,
     tasks: &BTreeMap<String, Task>,
     kinds: &StepKindRegistry,
     facts: &Facts,
-    est: &dyn FootprintEstimator,
+    est: &(dyn FootprintEstimator + Sync),
     remote_cap: usize,
+    host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
     emit: &mut dyn FnMut(FlowRecord),
 ) -> Result<SchedulerReport> {
     detect_cycles(tasks)?;
@@ -383,7 +391,7 @@ pub fn run_step_graph(
             });
         }
 
-        let results = crate::concurrent_dispatch::run_bounded(jobs, facts, est, remote_cap)?;
+        let results = crate::concurrent_dispatch::run_bounded(jobs, facts, est, remote_cap, host_factory)?;
 
         let finished_at = now_unix();
         for (idx, outcome) in results {
@@ -498,8 +506,15 @@ fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
 mod tests {
     use super::*;
     use crate::step_kinds::StepKindRegistry;
-    use darkmux_gestalt::FixedEstimator;
+    use darkmux_gestalt::{mock::MockHost, FixedEstimator};
     use serde_json::json;
+
+    /// Hermetic `host_factory` for `run_step_graph`'s own scheduling tests
+    /// — these fixtures never intend to touch a real LMStudio, matching
+    /// `concurrent_dispatch.rs`'s own test discipline (#1360 follow-up).
+    fn mock_host_factory() -> Box<dyn ModelHost> {
+        Box::new(MockHost::new())
+    }
 
     // ─── fixtures (#1341 Task-level model) ─────────────────────────────
 
@@ -815,7 +830,7 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let mut emitted = Vec::new();
-        run_step_graph(steps, tasks, &kinds, &facts, &est, 8, &mut |r| emitted.push(r)).unwrap()
+        run_step_graph(steps, tasks, &kinds, &facts, &est, 8, &mock_host_factory, &mut |r| emitted.push(r)).unwrap()
     }
 
     #[test]
@@ -914,7 +929,7 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let mut emitted = Vec::new();
-        let err = run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &mut |r| emitted.push(r))
+        let err = run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &mock_host_factory, &mut |r| emitted.push(r))
             .unwrap_err();
         assert!(err.to_string().contains("cycle detected"));
         assert!(emitted.is_empty(), "no step-lifecycle records before the cycle check fires");
@@ -931,7 +946,7 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let mut emitted: Vec<FlowRecord> = Vec::new();
-        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &mut |r| emitted.push(r)).unwrap();
+        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &mock_host_factory, &mut |r| emitted.push(r)).unwrap();
 
         let actions: Vec<&str> = emitted.iter().map(|r| r.action.as_str()).collect();
         assert!(actions.contains(&"step start"));

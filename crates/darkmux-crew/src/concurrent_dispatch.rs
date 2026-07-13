@@ -81,9 +81,13 @@
 //! `desired::ingest`'s dedup precedent) and this executor runs them
 //! concurrently against it.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use darkmux_flow::FlowRecord;
-use darkmux_gestalt::{Facts, FootprintEstimator, Placement, WaveMode, WaveSchedule};
+use darkmux_gestalt::{
+    plan_acquire, Action, AcquireOpts, AcquireScope, CallerIntent, Facts, FootprintEstimator,
+    ModelHost, Placement, ResourceProbe, WaveMode, WaveSchedule,
+};
+use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -122,6 +126,17 @@ pub struct QueuedJob<T> {
     pub job: DispatchJob<T>,
 }
 
+/// The canonical production [`ModelHost`] factory for [`run_bounded`]'s
+/// `host_factory` parameter — a real `LmsHost` per call. A plain `fn`, not a
+/// closure, so callers pass it directly as `&concurrent_dispatch::
+/// lms_host_factory` with no allocation. Tests exercising `run_bounded`'s
+/// wave-partitioning logic in isolation (synthetic `Facts`/placements, no
+/// real LMStudio intended) pass a `darkmux_gestalt::mock::MockHost`-backed
+/// factory instead — see [`ensure_wave_loaded`]'s doc.
+pub fn lms_host_factory() -> Box<dyn ModelHost> {
+    Box::new(LmsHost::new())
+}
+
 /// Run `jobs` to completion, honoring gestalt's co-residency wave packing
 /// for every [`Residency::Local`] job and a separate `remote_cap`-bounded
 /// concurrent batch for every [`Residency::Remote`] job (see the module
@@ -140,8 +155,9 @@ pub struct QueuedJob<T> {
 pub fn run_bounded<T: Send + 'static>(
     jobs: Vec<QueuedJob<T>>,
     facts: &Facts,
-    est: &dyn FootprintEstimator,
+    est: &(dyn FootprintEstimator + Sync),
     remote_cap: usize,
+    host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
 ) -> Result<Vec<(usize, JobOutcome<T>)>> {
     // ── partition + stamp local placements with a job-unique seat label ──
     // `plan_waves` returns `Vec<Placement>` BY VALUE; two jobs wanting
@@ -175,7 +191,7 @@ pub fn run_bounded<T: Send + 'static>(
         // Sibling scoped threads — genuinely interleaved wall-clock windows
         // (module doc: "interleaved with, never blocked behind").
         let local_track = (!local_by_seat.is_empty() || !schedule.refusals.is_empty())
-            .then(|| scope.spawn(|| run_local_waves(schedule, local_by_seat, &results)));
+            .then(|| scope.spawn(|| run_local_waves(schedule, local_by_seat, &results, est, host_factory)));
         let remote_track =
             (!remote_jobs.is_empty()).then(|| scope.spawn(|| run_remote_batches(remote_jobs, remote_cap.max(1), &results)));
 
@@ -199,11 +215,26 @@ pub fn run_bounded<T: Send + 'static>(
 /// to the next — the wave IS the "safe to co-reside" unit gestalt already
 /// computed. `schedule.refusals` never run at all; each comes back as an
 /// `Err` naming the refusal reason via `Reason`'s `Display`.
+///
+/// (#1360) Before dispatching a wave's jobs, [`ensure_wave_loaded`] makes
+/// its placements ACTUALLY resident — `plan_waves` above only decided which
+/// placements are SAFE to co-reside, it performs no I/O. A wave whose
+/// load-ensure fails never dispatches at all; every job in it comes back as
+/// the same attributable `Err` instead of each one independently hitting a
+/// confusing "Invalid model identifier" from LMStudio's own auto-load
+/// fallback (which cannot resolve darkmux's namespaced alias).
 fn run_local_waves<T: Send + 'static>(
     schedule: WaveSchedule,
     mut by_seat: HashMap<String, (usize, DispatchJob<T>)>,
     results: &ResultsSink<T>,
+    est: &(dyn FootprintEstimator + Sync),
+    host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
 ) {
+    // One host instance for this whole local track — waves within it run
+    // strictly sequentially (the `for wave in &schedule.waves` loop below),
+    // so a single mutable host handles every `ensure_wave_loaded` call
+    // safely without needing to reconstruct one per wave.
+    let mut host = host_factory();
     for refusal in &schedule.refusals {
         if let Some((index, _job)) = by_seat.remove(&refusal.placement.seat) {
             results.lock().expect("results mutex poisoned").push((
@@ -217,6 +248,17 @@ fn run_local_waves<T: Send + 'static>(
         }
     }
     for wave in &schedule.waves {
+        if let Err(e) = ensure_wave_loaded(wave, est, host.as_mut()) {
+            for placement in wave {
+                if let Some((index, _job)) = by_seat.remove(&placement.seat) {
+                    results.lock().expect("results mutex poisoned").push((
+                        index,
+                        Err(anyhow!("darkmux: could not load \"{}\" for this wave: {e:#}", placement.model_key)),
+                    ));
+                }
+            }
+            continue;
+        }
         std::thread::scope(|wave_scope| {
             for placement in wave {
                 let Some((index, job)) = by_seat.remove(&placement.seat) else { continue };
@@ -227,6 +269,66 @@ fn run_local_waves<T: Send + 'static>(
             }
         });
     }
+}
+
+/// Make every placement in one wave actually resident before its jobs
+/// dispatch. `plan_waves` (called once, up front, in [`run_bounded`]) only
+/// PARTITIONS placements into co-resident-safe groups — it performs no I/O.
+/// Without this, a cold model's job silently depended on LMStudio's own
+/// auto-load-on-request fallback, which only resolves BARE catalog
+/// identifiers, never darkmux's namespaced alias — and fails loud with
+/// "Invalid model identifier" the moment a wave's model isn't already warm
+/// from some earlier, unrelated dispatch (#1360, reproduced live twice,
+/// identically, via a 3-seat concurrent probe wave where one seat's model
+/// was cold).
+///
+/// Facts are gathered FRESH here on every call — never reused from
+/// [`run_bounded`]'s caller-supplied snapshot — because a later wave in the
+/// same `run_bounded` invocation can only trust residency state as of right
+/// before ITS OWN dispatch: an earlier wave's loads/unloads have already
+/// changed what's actually resident by then. Mirrors
+/// `darkmux_lab::lab::review::LmsCycler::ensure_loaded`'s per-call
+/// fresh-facts discipline, generalized here to a whole wave's placements in
+/// one `plan_acquire` call instead of one placement at a time.
+///
+/// `host` is CALLER-INJECTED (via `run_bounded`'s `host_factory`), never
+/// constructed here — production passes a real `LmsHost`; hermetic tests of
+/// `run_bounded`'s wave-partitioning logic (which construct `Facts`/
+/// synthetic placements directly, never intending any real LMStudio
+/// interaction) pass `darkmux_gestalt::mock::MockHost` instead. Matches
+/// `plan_waves`/`plan_acquire` themselves already being pure snapshot-in
+/// functions — this keeps the one place that DOES real host I/O equally
+/// injectable rather than silently reaching past the caller's test double.
+fn ensure_wave_loaded(
+    placements: &[Placement],
+    est: &(dyn FootprintEstimator + Sync),
+    host: &mut dyn ModelHost,
+) -> Result<()> {
+    let residents = host
+        .list_resident()
+        .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}"))?;
+    let pools = MacProbe.pools().unwrap_or_default();
+    let facts = Facts { residents, pools, ..Default::default() };
+    let opts = AcquireOpts { intent: CallerIntent::Auto, scope: AcquireScope::Additive };
+    let plan = plan_acquire(placements, &facts, opts, est);
+    let deadline = resolved_load_deadline();
+    for planned in &plan.actions {
+        match &planned.action {
+            Action::Reuse { .. } => {}
+            Action::Unload { target } => {
+                host.unload(target, deadline)
+                    .map_err(|e| anyhow!("darkmux: unload failed for \"{}\": {e}", target.identifier()))?;
+            }
+            Action::Load { model_key, identifier, min_ctx } => {
+                host.load(model_key, identifier, *min_ctx, deadline)
+                    .map_err(|e| anyhow!("darkmux: load failed for \"{model_key}\" (\"{identifier}\"): {e}"))?;
+            }
+            Action::Block { model_key, .. } => {
+                bail!("darkmux: cannot load \"{model_key}\" for this wave — {}", planned.reason)
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The remote track: chunk `remote_jobs` into `cap`-sized batches (in input
@@ -263,10 +365,18 @@ fn run_remote_batches<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkmux_gestalt::{Budget, FixedEstimator, ResidentFact};
+    use darkmux_gestalt::{mock::MockHost, Budget, FixedEstimator, ResidentFact};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    /// Hermetic `host_factory` for these fixtures — synthetic `Facts`/
+    /// placements (fake model keys like "m"/"small-a") were never intended
+    /// to touch a real LMStudio; `ensure_wave_loaded`'s host is injected
+    /// (#1360 follow-up) specifically so this stays true.
+    fn mock_host_factory() -> Box<dyn ModelHost> {
+        Box::new(MockHost::new())
+    }
 
     fn placement(model_key: &str, min_ctx: u32) -> Placement {
         Placement {
@@ -304,7 +414,7 @@ mod tests {
             QueuedJob { index: 1, residency: Residency::Local(placement("small-b", 8_000)), job: ok_job(1, marker.clone()) },
             QueuedJob { index: 2, residency: Residency::Local(placement("big-c", 8_000)), job: ok_job(2, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 3, "every job ran (none refused — pool-less budget-only case never blocks)");
         assert_eq!(marker.load(Ordering::SeqCst), 3, "every job's body actually executed");
         let mut indices: Vec<usize> = results.iter().map(|(i, _)| *i).collect();
@@ -330,7 +440,7 @@ mod tests {
             QueuedJob { index: 0, residency: Residency::Local(placement("fits", 8_000)), job: ok_job(0, marker.clone()) },
             QueuedJob { index: 1, residency: Residency::Local(placement("too-big", 8_000)), job: ok_job(1, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2);
         assert_eq!(marker.load(Ordering::SeqCst), 1, "only the fitting job's body ran");
         let refused = results.iter().find(|(i, _)| *i == 1).expect("index 1 present");
@@ -362,7 +472,7 @@ mod tests {
             QueuedJob { index: 0, residency: Residency::Local(placement("shared", 8_000)), job: ok_job(0, marker.clone()) },
             QueuedJob { index: 1, residency: Residency::Local(placement("shared", 8_000)), job: ok_job(1, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2);
         assert_eq!(marker.load(Ordering::SeqCst), 2, "both jobs ran despite sharing one resident placement");
     }
@@ -378,7 +488,7 @@ mod tests {
         let jobs = (0..5)
             .map(|i| QueuedJob { index: i, residency: Residency::Remote, job: ok_job(i, marker.clone()) })
             .collect();
-        let results = run_bounded(jobs, &facts, &est, 2).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 2, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 5);
         assert_eq!(marker.load(Ordering::SeqCst), 5);
         let mut indices: Vec<usize> = results.iter().map(|(i, _)| *i).collect();
@@ -397,7 +507,7 @@ mod tests {
             residency: Residency::Remote,
             job: Box::new(|| Err(anyhow!("boom"))),
         }];
-        let results = run_bounded(jobs, &facts, &est, 4).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 1);
         let (idx, outcome) = &results[0];
         assert_eq!(*idx, 0);

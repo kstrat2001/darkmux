@@ -1111,9 +1111,18 @@ pub fn run(
     let est = crew::step_kinds::FixedEstimator::default();
     let tasks_by_id: std::collections::BTreeMap<String, Task> =
         tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
-    run_step_graph(&mut steps, &tasks_by_id, &registry, &facts, &est, 1, &mut |record| {
-        let _ = flow::record(record);
-    })?;
+    run_step_graph(
+        &mut steps,
+        &tasks_by_id,
+        &registry,
+        &facts,
+        &est,
+        1,
+        &crew::concurrent_dispatch::lms_host_factory,
+        &mut |record| {
+            let _ = flow::record(record);
+        },
+    )?;
 
     for step in steps.values() {
         if let Err(e) = crew::lifecycle::save_step(mission_id, &phase.id, step) {

@@ -67,8 +67,9 @@ use std::sync::Arc;
 // gone from both paths; the "no cloud API" claim survives ONLY here because
 // this path has no envelope to derive from and the workflow that knows where
 // the model ran passes the truthful `--attribution` (the review does derive).
-const FOOTER: &str = "\n\n---\n<sub>Automated review by darkmux, running on a \
-local model (no cloud API) via a self-hosted runner. Advisory, not a merge gate.</sub>";
+const FOOTER: &str = "\n\n---\n<sub>Automated review — running on a \
+local model (no cloud API) via a self-hosted runner. Advisory, not a merge gate. \
+· [Powered by darkmux](https://darkmux.com)</sub>";
 
 /// (#1298/#1186) Default tagline for the review's posted footer — the
 /// operator-owned "why this comment exists" half. The operator overrides it
@@ -242,7 +243,7 @@ pub fn resolve_anchor(
         }
     }
     // (#1299) Fragment fallback (the mis-anchor half; dedup half shipped 1.18.1).
-    // The review review stores a backtick SPAN as the anchor
+    // The review stores a backtick SPAN as the anchor
     // (`extract_new_side_anchor` in the lab crate) — frequently a sub-expression
     // of a changed line, not the whole line — so it matched the diff by SUBSTRING
     // at extraction time but the whole-line lookup above misses it, and the
@@ -513,7 +514,7 @@ fn comment_fallback(reply: &str, attribution: Option<&str>) -> Rendered {
         mode: "comment",
         review: None,
         comment: Some(format!(
-            "### 🤖 darkmux PR review\n\n{text}{}",
+            "### 🤖 PR review\n\n{text}{}",
             footer_for(attribution)
         )),
     }
@@ -540,7 +541,7 @@ fn degraded_with_footer(note: &str, footer: &str) -> Rendered {
         mode: "degraded",
         review: None,
         comment: Some(format!(
-            "### 🤖 darkmux PR review — ⚠️ no review signal\n\n{note} \
+            "### 🤖 PR review — ⚠️ no review signal\n\n{note} \
              **This is not a clean pass** — the automated reviewer produced \
              no usable review, so this pull request has had no automated \
              review. Human review (or a re-run) required.{footer}"
@@ -616,7 +617,7 @@ pub fn render_with_attribution(
     // Neutral header — where the model ran is the footer attribution's job
     // (the old "(local model)" suffix here became false once a dispatch could
     // route to a remote endpoint).
-    let mut body = vec!["### 🤖 darkmux PR review".to_string(), String::new()];
+    let mut body = vec!["### 🤖 PR review".to_string(), String::new()];
     if !summary.is_empty() {
         body.push(summary.to_string());
         body.push(String::new());
@@ -669,7 +670,7 @@ fn footer_for(attribution: Option<&str>) -> String {
 /// DERIVED from the envelope's member records — never a hardcoded claim that
 /// can contradict the run. The prior static footer asserted "`pr-reviewer`
 /// role, running on a local model (no cloud API)" unconditionally; on the
-/// first all-remote (Azure) review review that was three lies in the most
+/// first all-remote (Azure) review that was three lies in the most
 /// visible place — a public comment saying "no cloud API" about a cloud
 /// review (#1186 "never off the meter"). The operator's `--attribution`
 /// supplies only the tagline; WHERE the models ran is computed from what
@@ -680,7 +681,8 @@ fn review_footer(env: &ReviewEnvelope, attribution: Option<&str>) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(REVIEW_TAGLINE);
     format!(
-        "\n\n---\n<sub>Automated review by darkmux's review review, {} — {tagline}</sub>",
+        "\n\n---\n<sub>Automated review — {} — {tagline} \
+         · [Powered by darkmux](https://darkmux.com)</sub>",
         dispatch_provenance(env)
     )
 }
@@ -761,7 +763,7 @@ pub fn cmd_render(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// `darkmux pr-review run` — the review review verb (#1222 Phase B packet 5)
+// `darkmux pr-review run` — the review verb (#1222 Phase B packet 5)
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Parsed `darkmux pr-review run` CLI surface. Mirrors the clap variant's
@@ -817,7 +819,7 @@ pub struct RunOpts {
     pub from_envelope: Option<PathBuf>,
 }
 
-/// `darkmux pr-review run` handler: drive the review review end-to-end (or
+/// `darkmux pr-review run` handler: drive the review end-to-end (or
 /// synthesis-only, via `--from-envelope`) and emit the same
 /// `{mode, review, comment}` payload `render`/`cmd_render` do.
 pub fn cmd_run(opts: RunOpts) -> Result<i32> {
@@ -1676,13 +1678,20 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<ReviewEnvelope> {
             darkmux_lab::lab::review::staffing_snapshot(&probes, &judge, verify.as_ref(), request_changes);
         let mission_id = mission.mission_id.clone();
         let phase_id_of_step = graph.phase_id_of_step.clone();
+        // Cloned before `mission` moves into the closure below — needed
+        // afterward for the (#1354) terminal-status transition, which runs
+        // once the closure (and the `mission` it captured) has returned.
+        let investigate_phase_id = mission.investigate_phase_id.clone();
+        let adjudicate_phase_id = mission.adjudicate_phase_id.clone();
+        let report_phase_id = mission.report_phase_id.clone();
+        let mission_id_for_status = mission.mission_id.clone();
         // Cloned for the `move` closure's own use — `with_dispatch_bookends`
         // ALSO borrows `crew_name_for_bookends` (as its 3rd argument) for the
         // duration of the call, so the closure can't move the original out
         // from under that borrow.
         let crew_name_for_closure = crew_name_for_bookends.clone();
 
-        with_dispatch_bookends(
+        let result = with_dispatch_bookends(
             &mut emitter,
             &case_id_for_bookends,
             &crew_name_for_bookends,
@@ -1701,7 +1710,34 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<ReviewEnvelope> {
                         env
                     })
             },
-        )
+        );
+
+        // (#1354) The Mission/Phases `build_mission_for_review` created
+        // above start life Active/Running and, without this, never reach a
+        // terminal status regardless of outcome — every PR review, clean or
+        // errored, was left permanently "stuck" in `darkmux mission
+        // status`. Best-effort, same discipline as `build_mission_for_review`
+        // itself: a persistence hiccup here must never fail the review.
+        let phase_ids = [&investigate_phase_id, &adjudicate_phase_id, &report_phase_id];
+        if result.is_ok() {
+            for phase_id in phase_ids {
+                let _ = darkmux_crew::lifecycle::phase_complete(phase_id);
+            }
+            let _ = darkmux_crew::lifecycle::mission_close_with_reasoning(
+                &mission_id_for_status,
+                Some("review completed"),
+            );
+        } else {
+            for phase_id in phase_ids {
+                let _ = darkmux_crew::lifecycle::phase_abandon(phase_id);
+            }
+            let _ = darkmux_crew::lifecycle::mission_close_with_reasoning(
+                &mission_id_for_status,
+                Some("review errored"),
+            );
+        }
+
+        result
     }
 }
 
@@ -1753,7 +1789,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
         // (#1298) Even a degenerate run posts the envelope-derived footer, so a
         // remote crew that produced no signal never claims "no cloud API".
         return degraded_with_footer(
-            &format!("The review review produced no signal: {note}."),
+            &format!("The review produced no signal: {note}."),
             &review_footer(env, attribution),
         );
     }
@@ -1811,17 +1847,17 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
     let confirmed_total = inline.len() + confirmed_general.len();
 
     if confirmed_total == 0 {
-        let mut lines = vec!["### 🤖 darkmux PR review".to_string(), String::new()];
+        let mut lines = vec!["### 🤖 PR review".to_string(), String::new()];
         if needs_check_count == 0 {
             lines.push(format!(
-                "review review ran: {} flags investigated across {} bundles, none confirmed. _{}_",
+                "review ran: {} flags investigated across {} bundles, none confirmed. _{}_",
                 env.deduped_flags,
                 env.bundles,
                 member_summary(env)
             ));
         } else {
             lines.push(format!(
-                "review review ran: {} flags investigated across {} bundles, none confirmed — \
+                "review ran: {} flags investigated across {} bundles, none confirmed — \
                  {} worth a double check (not merge-blocking). _{}_",
                 env.deduped_flags,
                 env.bundles,
@@ -1840,7 +1876,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
         };
     }
 
-    let mut body = vec!["### 🤖 darkmux PR review".to_string(), String::new()];
+    let mut body = vec!["### 🤖 PR review".to_string(), String::new()];
     body.push(format!(
         "**Verdict: flag** · {} confirmed ({} inline, {} general)",
         confirmed_total,
@@ -2104,7 +2140,7 @@ mod tests {
         let envelope = json!({ "final_assistant": "the model rambled with no json" }).to_string();
         let r = render(&envelope, DIFF);
         assert_eq!(r.mode, "comment");
-        assert!(r.comment.unwrap().contains("darkmux PR review"));
+        assert!(r.comment.unwrap().contains("PR review"));
     }
 
     // ── new_side_index: hunk + file structure edge cases ──────────────────
@@ -2855,7 +2891,7 @@ mod tests {
         assert_eq!(r.mode, "comment");
         let c = r.comment.unwrap();
         assert!(
-            c.contains("review review ran: 3 flags investigated across 2 bundles, none confirmed"),
+            c.contains("review ran: 3 flags investigated across 2 bundles, none confirmed"),
             "{c}"
         );
         assert!(c.contains("darkmux:probe-a"), "member attribution: {c}");
@@ -3003,7 +3039,7 @@ mod tests {
             judge_member("darkmux:qwen-judge", false),
         ]);
         assert!(!body.contains("pr-reviewer"), "the stale role name must be gone: {body}");
-        assert!(body.contains("review review"), "names the crew/review instead: {body}");
+        assert!(body.contains("Powered by darkmux"), "names the crew/review instead: {body}");
     }
 
     // ─── #1300: served model surfaces an aliased deployment, never hides it ─
@@ -3761,15 +3797,13 @@ mod tests {
         assert_eq!(payload["confirmed"], 0);
         assert_eq!(payload["needs_check"], 0);
         assert_eq!(payload["archived"], 0);
-        // (Not a #1349 assertion — a pre-existing, separate behavior of the
-        // graph-based driver: zero bundles never reaches the judge-dead
-        // honesty gate (`env.judged` stays empty, so that gate's own
-        // `!env.judged.is_empty()` guard never fires), so `env.degenerate`
-        // stays `None` here — unlike the old sequential driver, which
-        // explicitly marks a zero-bundle run degenerate. Out of scope for
-        // this fix; asserting the ACTUAL behavior so this test doesn't
-        // silently mask that gap if it's ever revisited.)
-        assert!(payload.get("degenerate").is_none(), "{payload}");
+        // (#1355 follow-up) Revisited: `ReviewSynthesisStepKind` now ports
+        // the old sequential driver's "no bundles produced from the diff"
+        // gate — a zero-bundle run IS degenerate, matching `run_review_impl`
+        // and the `ReviewEnvelope::degenerate` doc comment's own promise
+        // ("never a silent pass"). This was the exact gap the prior version
+        // of this assertion flagged as "out of scope, revisit later."
+        assert_eq!(payload["degenerate"], "no bundles produced from the diff", "{payload}");
     }
 
     #[test]
