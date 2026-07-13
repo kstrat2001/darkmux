@@ -4035,16 +4035,23 @@ impl StepKind for ReviewProbeStepKind {
         }
         let wall_ms = t0.elapsed().as_millis() as u64;
 
-        self.members.lock().expect("probe members mutex poisoned").push(MemberRecord {
-            model: identifier.clone(),
-            seat: "review-probe".to_string(),
-            draws,
-            wall_ms,
-            total_tokens: tokens,
-            remote: endpoint.is_some(),
-            endpoint: endpoint_host.clone(),
-            served_model,
-        });
+        // (#1355 follow-up) Only record a member when this seat actually
+        // dispatched at least once — a seat with zero selected bundles
+        // (e.g. a zero-bundle degenerate run) never called out, and
+        // `member_summary()`'s "probed by ..." attribution would otherwise
+        // credit it with work it didn't do.
+        if draws > 0 {
+            self.members.lock().expect("probe members mutex poisoned").push(MemberRecord {
+                model: identifier.clone(),
+                seat: "review-probe".to_string(),
+                draws,
+                wall_ms,
+                total_tokens: tokens,
+                remote: endpoint.is_some(),
+                endpoint: endpoint_host.clone(),
+                served_model,
+            });
+        }
         emit_review_step_result(
             "review.probe",
             &step.id,
@@ -4141,6 +4148,10 @@ impl StepKind for ReviewDedupStepKind {
 pub struct ReviewJudgeStepKind {
     pub ctx: Arc<ReviewStepContext>,
     pub judge: ResolvedSeatStaffing,
+    /// (#1354 follow-up) The same shared accumulator `ReviewProbeStepKind`
+    /// writes its `MemberRecord`s to — one collector for every dispatching
+    /// step kind, merged into `shared_env` once `run_step_graph` returns.
+    pub members: Arc<StdMutex<Vec<MemberRecord>>>,
 }
 
 /// One deduped flag's judged outcome, in dispatch order — the shared
@@ -4294,11 +4305,36 @@ impl StepKind for ReviewJudgeStepKind {
             json!({
                 "items_in": deduped.len(), "items_out": judged.len(), "wall_ms": wall_ms,
                 "pass1_wall_ms": pass1_wall_ms, "pass2_wall_ms": pass2_wall_ms,
-                "model": judge_identifier, "tokens": judge_tokens, "calls": judge_calls,
+                "model": judge_identifier.clone(), "tokens": judge_tokens, "calls": judge_calls,
                 "dispatch_errors": judge_dispatch_errors, "concurrency": concurrency,
-                "served_model": judge_served_model,
+                "served_model": judge_served_model.clone(),
             }),
         );
+
+        // (#1354 follow-up) Unlike `ReviewProbeStepKind`, this step never
+        // recorded a `MemberRecord` at all — the judge's real dispatch cost
+        // (tokens/calls/wall-time/model identity) was computed above and
+        // emitted into the flow-record stream but never landed in the
+        // envelope, so `member_summary()`'s "judged by ..." attribution
+        // fell back to "unknown" on every run. Same shared accumulator
+        // `ReviewProbeStepKind` writes to, merged into `shared_env` once
+        // `run_step_graph` returns.
+        // (#1355 follow-up) Only record a member when the judge actually
+        // dispatched — zero deduped flags means an empty `deduped` slice and
+        // the loop above never ran, so there's nothing to credit "judged
+        // by" with.
+        if judge_calls > 0 {
+            self.members.lock().expect("members mutex poisoned").push(MemberRecord {
+                model: judge_identifier,
+                seat: "review-judge".to_string(),
+                draws: judge_calls,
+                wall_ms: pass1_wall_ms + pass2_wall_ms,
+                total_tokens: judge_tokens,
+                remote: judge_endpoint.is_some(),
+                endpoint: seat_endpoint_host(&self.judge.pm),
+                served_model: judge_served_model,
+            });
+        }
 
         let output = serde_json::to_string(&judged).context("serializing judged flags")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
@@ -4334,6 +4370,9 @@ impl StepKind for ReviewJudgeStepKind {
 pub struct ReviewVerifyStepKind {
     pub ctx: Arc<ReviewStepContext>,
     pub verify: Option<ResolvedSeatStaffing>,
+    /// (#1354 follow-up) Same shared accumulator as `ReviewJudgeStepKind`'s
+    /// — see its doc.
+    pub members: Arc<StdMutex<Vec<MemberRecord>>>,
 }
 
 impl StepKind for ReviewVerifyStepKind {
@@ -4432,10 +4471,31 @@ impl StepKind for ReviewVerifyStepKind {
             &self.ctx.case_id,
             json!({
                 "items_in": docket_count, "items_out": docket_count, "wall_ms": wall_ms,
-                "model": identifier, "tokens": tokens, "calls": calls,
-                "remote": endpoint.is_some(), "endpoint": endpoint_host, "served_model": served_model,
+                "model": identifier.clone(), "tokens": tokens, "calls": calls,
+                "remote": endpoint.is_some(), "endpoint": endpoint_host.clone(), "served_model": served_model.clone(),
             }),
         );
+
+        // (#1354 follow-up) Same gap as `ReviewJudgeStepKind` — this step
+        // computed its own real dispatch cost above but never recorded a
+        // `MemberRecord`, so a crew with a verify seat still reported no
+        // verify attribution in the posted review. (#1355 follow-up) Guarded
+        // on `calls > 0` — the two early returns above already skip the "no
+        // verify seat" / "zero confirmed docket" cases, but every item in
+        // the docket could still hit remote-budget exhaustion (`made: 0`
+        // each), leaving `calls == 0` despite a non-empty docket.
+        if calls > 0 {
+            self.members.lock().expect("members mutex poisoned").push(MemberRecord {
+                model: identifier,
+                seat: "review-verify".to_string(),
+                draws: calls,
+                wall_ms,
+                total_tokens: tokens,
+                remote: endpoint.is_some(),
+                endpoint: endpoint_host,
+                served_model,
+            });
+        }
 
         let output = serde_json::to_string(&judged).context("serializing verified flags")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
@@ -4514,6 +4574,25 @@ impl StepKind for ReviewSynthesisStepKind {
         env.refuted = judged.iter().filter(|j| j.demoted_by_verify).count();
         env.flags = flags;
         env.judged = judged;
+
+        // (#1355 follow-up) The two most fundamental "no signal" gates from
+        // the old `run_review_impl` driver (`bundles.is_empty()` / early
+        // `raw_flags.is_empty()`) were never ported when the graph engine
+        // replaced it — the graph never early-returns; every step just runs
+        // on whatever (possibly empty) data it's handed and synthesis is the
+        // only place with full visibility to catch this. Without these, a
+        // diff that produces zero bundles (or zero probe draws) silently
+        // renders as a clean pass instead of the LOUD degenerate outcome
+        // `ReviewEnvelope::degenerate`'s own doc comment promises ("never a
+        // silent pass") — confirmed as a real, live regression via the
+        // review-bench migration's degenerate-fixture test.
+        if env.degenerate.is_none() {
+            if env.bundles == 0 {
+                env.degenerate = Some("no bundles produced from the diff".to_string());
+            } else if env.deduped_flags == 0 {
+                env.degenerate = Some("zero flags from all probe draws — never a silent pass".to_string());
+            }
+        }
 
         // Judge-dead honesty gate (unchanged reasoning from `finish_review`):
         // no flag produced a usable pass-1 ruling means the judge phase
@@ -4651,6 +4730,10 @@ pub fn build_review_graph(
         .expect("funnel.bundle legacy alias registered once");
 
     let bucket = Arc::new(StdMutex::new(RemoteBucket::new("probe", ctx.remote_max_tokens_per_execution)));
+    // (#1354 follow-up) Named for its original probe-only scope, but now
+    // shared with the judge/verify step kinds below too — one accumulator
+    // for every dispatching step kind, merged into `shared_env` once
+    // `run_step_graph` returns.
     let probe_members = Arc::new(StdMutex::new(Vec::new()));
     let probe_warnings = Arc::new(StdMutex::new(Vec::new()));
     let mut probe_task_ids = Vec::new();
@@ -4756,7 +4839,7 @@ pub fn build_review_graph(
             output: None,
         },
     );
-    let judge_kind = Arc::new(ReviewJudgeStepKind { ctx: ctx.clone(), judge });
+    let judge_kind = Arc::new(ReviewJudgeStepKind { ctx: ctx.clone(), judge, members: probe_members.clone() });
     registry.register(judge_kind.clone()).expect("review.judge registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
     registry
@@ -4789,7 +4872,7 @@ pub fn build_review_graph(
             output: None,
         },
     );
-    let verify_kind = Arc::new(ReviewVerifyStepKind { ctx: ctx.clone(), verify });
+    let verify_kind = Arc::new(ReviewVerifyStepKind { ctx: ctx.clone(), verify, members: probe_members.clone() });
     registry.register(verify_kind.clone()).expect("review.verify registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
     registry
@@ -4986,11 +5069,24 @@ pub fn run_review_graph(
     };
 
     let env = if report.errored.is_empty() {
-        match steps.get(&synthesis_step_id).and_then(|s| s.output.as_deref()) {
+        let mut env = match steps.get(&synthesis_step_id).and_then(|s| s.output.as_deref()) {
             Some(out) => serde_json::from_str::<ReviewEnvelope>(out)
                 .unwrap_or_else(|_| shared_env.lock().expect("shared review envelope mutex poisoned").clone()),
             None => shared_env.lock().expect("shared review envelope mutex poisoned").clone(),
-        }
+        };
+        // The synthesis step's own serialized `output` was captured DURING
+        // the graph run — before the post-run merge above populated
+        // `shared_env`'s members/warnings/remote_budgets from the probe
+        // dispatch accumulators, which only land in `shared_env` after
+        // `run_step_graph` returns. Pulling from the synthesis step's
+        // snapshot alone silently drops real dispatch-provenance data (the
+        // posted review's "probed by ...; judged by ..." attribution and
+        // remote-budget warnings) even on a clean, fully-successful run.
+        let shared = shared_env.lock().expect("shared review envelope mutex poisoned");
+        env.members = shared.members.clone();
+        env.warnings = shared.warnings.clone();
+        env.remote_budgets = shared.remote_budgets.clone();
+        env
     } else {
         let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();
         if env.degenerate.is_none() {

@@ -939,62 +939,65 @@ fn run_funnel_case(
         .collect::<Result<_>>()
         .with_context(|| format!("slicing bundle code for case {}", c.id))?;
 
-    let inputs = review::ReviewInputs {
+    // (#1355 follow-up) Dispatches through the SAME `build_review_graph` +
+    // `run_review_graph` engine `darkmux pr-review run` uses in production
+    // — not the old sequential `run_review`/`run_review_impl` driver. Bench
+    // was already doing REAL dispatch (its retired `chat` closure was a
+    // byte-for-byte duplicate of `dispatch_chat`, per its own "Texts
+    // identical either way (contract 6)" comment) — the only thing this
+    // migration changes is which orchestration code runs the dispatches,
+    // so what bench measures is finally what production actually executes.
+    let seats = review::validate_review_crew(&ctx.crew)
+        .with_context(|| format!("validating crew for case {}", c.id))?;
+    let probes: Vec<_> = seats.probes.clone();
+    let judge = seats.judge.clone();
+    let verify = seats.verify.cloned();
+    let judge_identifier = review::seat_identifier(&judge.pm);
+
+    let step_ctx = std::sync::Arc::new(review::ReviewStepContext {
         case_id: c.id.clone(),
-        crew: &ctx.crew,
+        crew: ctx.crew.clone(),
         // Passed through raw — `judge_prompt` does the per-field
         // default/strip itself now (byte-matching judge-runner.py's
         // `judge_one`, #1256), so this caller no longer pre-joins
         // title+body or pre-defaults the body.
-        intent_title: &c.label.intent_title,
-        intent_body: &c.label.intent_body,
-        diff: &c.diff,
-        mode: ctx.exec_mode,
-        probe_system: &ctx.probe_system,
-        judge_system: &ctx.judge_system,
-        verify_system: &ctx.verify_system,
-        // (#1222 Phase B packet 5 reconciliation) The real bundler's output,
-        // via the injection seam `ReviewInputs::bundles` — `run_review`
-        // never falls back to the provisional `bundles_from_diff` when this
-        // is `Some`.
-        bundles: Some(bundles),
+        intent_title: c.label.intent_title.clone(),
+        intent_body: c.label.intent_body.clone(),
+        diff: c.diff.clone(),
+        probe_system: ctx.probe_system.clone(),
+        judge_system: ctx.judge_system.clone(),
+        verify_system: ctx.verify_system.clone(),
+        bundles,
         // (#1260) Per-execution remote token allowance, resolved through the
         // one precedence home (`env > config.remote.* > 500000`).
-        remote_max_tokens_per_execution:
-            darkmux_types::config_access::remote_max_tokens_per_execution(),
-    };
+        remote_max_tokens_per_execution: darkmux_types::config_access::remote_max_tokens_per_execution(),
+        timeout_seconds,
+    });
 
-    // (#1260) Same seat routing as `darkmux pr-review run`: an
-    // endpoint-bearing call goes through the hosted dialect; a local call
-    // through LMStudio. Texts identical either way (contract 6).
-    let chat = |call: &review::ChatCall| -> Result<darkmux_crew::single_shot::SingleShotReply> {
-        match call.endpoint {
-            Some(endpoint) => darkmux_crew::single_shot::single_shot_chat_hosted(
-                &darkmux_crew::single_shot::HostedSingleShotRequest {
-                    endpoint,
-                    model: call.model,
-                    system: call.system,
-                    user: call.user,
-                    max_tokens: call.max_tokens,
-                    timeout_seconds,
-                },
-            ),
-            None => darkmux_crew::single_shot::single_shot_chat(
-                &darkmux_crew::single_shot::SingleShotRequest {
-                    base_url: None,
-                    model: call.model,
-                    system: call.system,
-                    user: call.user,
-                    temperature: call.temperature,
-                    max_tokens: call.max_tokens,
-                    timeout_seconds,
-                },
-            ),
-        }
-    };
-    let mut cycler = review::LmsCycler;
-    let env = review::run_review(&inputs, chat, &mut cycler, emitter)
-        .with_context(|| format!("running review funnel for case {}", c.id))?;
+    let graph = review::build_review_graph(
+        step_ctx.clone(),
+        judge.clone(),
+        verify.clone(),
+        &probes,
+        "investigate",
+        "adjudicate",
+        "report",
+        darkmux_types::config_access::review_judge_concurrency(),
+    );
+    let fingerprint_val = review::fingerprint(&judge_identifier, &step_ctx.judge_system);
+    let staffing_snapshot =
+        review::staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.crew.request_changes);
+
+    let (env, _steps) = review::run_review_graph(
+        &step_ctx,
+        &ctx.crew.name,
+        ctx.exec_mode,
+        fingerprint_val,
+        staffing_snapshot,
+        graph,
+        emitter,
+    )
+    .with_context(|| format!("running review graph for case {}", c.id))?;
     let review = review_from_funnel(&env);
     Ok((review, env))
 }
