@@ -3,7 +3,7 @@
 **Status:** living reference · **Last verified against code:** 2026-06-01 (`main`)
 
 This is the canonical model of *what darkmux is made of*: role families, the
-mission/sprint lifecycle, the internal runtime, telemetry, and the flow stream.
+mission/phase lifecycle, the internal runtime, telemetry, and the flow stream.
 Guides, the README, and agent doctrine should defer to this doc when they
 describe a concept; if another doc contradicts it, this doc (and the code it
 cites) wins, and the other doc is the bug.
@@ -36,7 +36,7 @@ It does three things:
    records timing + trajectory + verify outcome, so empirical claims are
    reproducible.
 3. **AI-first local-AI orchestrator.** darkmux dispatches local *utility* and
-   *specialist* agents internally (compaction, mission proposal, sprint
+   *specialist* agents internally (compaction, mission proposal, phase
    estimation, code review) and records every dispatch to an auditable flow
    stream.
 
@@ -50,7 +50,7 @@ division of labor concrete.
 ## 2. Role families — specialist vs utility
 
 darkmux defines exactly **two** crew role families. The defining axis is
-**scope**: a *specialist* works the **mission/sprints** (the deliverable); a
+**scope**: a *specialist* works the **mission/phases** (the deliverable); a
 *utility* role supports the **runtime**, outside mission scope (compaction,
 mission-compiling, estimation). The family also governs **how a role is
 dispatched** (the table below). Bias toward utility for as much outside-mission
@@ -59,7 +59,7 @@ tasks.
 
 | Family | What it is | Dispatch shape |
 |---|---|---|
-| **specialist** | Works the mission/sprints; judgment-dependent, multi-turn agent-loop roles (coder, code-reviewer, analyst). Free-form output. | Runs the full agent loop; the autonomous-dispatch preamble (`templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md`) is prepended to the system prompt. |
+| **specialist** | Works the mission/phases; judgment-dependent, multi-turn agent-loop roles (coder, code-reviewer, analyst). Free-form output. | Runs the full agent loop; the autonomous-dispatch preamble (`templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md`) is prepended to the system prompt. |
 | **utility** | Supports the runtime, outside mission scope: `mission-compiler` today, with `compactor`/`estimator`/`scribe` joining (#590). Bounded I/O, structured output, no agent loop. | A single bounded transform; no preamble. |
 
 - The family is carried by the optional `role_family` field on a role manifest
@@ -78,7 +78,7 @@ tasks.
 A utility role is defined by its **scope** (supporting the runtime outside
 mission work) and typically carries a bounded work shape (structured I/O, low
 per-call failure cost). The mission-compiler turns unstructured intent into a
-structured Mission + Sprint proposal; the same family is home to estimation,
+structured Mission + Phase proposal; the same family is home to estimation,
 scribe, and (in transition, #590) compaction. The util tier is a baked-in
 runtime **affordance**: the runtime can always summon a util model for these
 built-in tasks. Which model is config; whether it's resident is
@@ -115,7 +115,7 @@ loader keeps rejecting the retired name for forward-compat.
 
 ---
 
-## 3. Mission → Crew → Sprint
+## 3. Mission → Crew → Phase
 
 The structured-work model. **Note the actual field shapes** — this is where
 informal summaries tend to drift.
@@ -127,7 +127,7 @@ A mission groups a body of work. Its fields
 
 - `id`, `description`
 - `status` — `Active` / `Paused` / `Closed` (default `Active`)
-- `sprint_ids: Vec<String>`
+- `phase_ids: Vec<String>`
 - timestamps: `created_ts`, `started_ts`, `paused_ts`, `closed_ts`
 
 There is **no `scope` field and no `goal` field**: a mission carries a
@@ -148,37 +148,37 @@ indexed and queryable.
 
 **Crews are not dynamically composed per mission today.** A mission has no
 `crew_id` field; `darkmux mission dispatch` takes an explicit `role` and fans the
-mission's ready sprints onto the single global work stream, where the first
+mission's ready phases onto the single global work stream, where the first
 available runner claims each one (#590). The operator names the role per
 dispatch; dynamic per-mission crew assembly is
 [planned](#8-planned--not-yet-shipped), not shipped.
 
-### Sprint
+### Phase
 
-A sprint is one unit of work within a mission. Its fields
+A phase is one unit of work within a mission. Its fields
 (`crates/darkmux-crew/src/types.rs:339-366`):
 
 - `id`, `mission_id`, `description`
 - `status` — `Planned` / `Running` / `Complete` / `Abandoned` (default `Planned`)
-- `depends_on: Vec<String>`: sprint ids this one waits on
+- `depends_on: Vec<String>`: phase ids this one waits on
 - timestamps: `created_ts`, `started_ts`, `completed_ts`, `abandoned_ts`
 
-There is **no `estimate`, `assignee`, or `burn-down` field** on a sprint.
-Estimation is a *pre-dispatch verb* (`darkmux sprint estimate`, §4), not a stored
-sprint attribute; burn-down/remaining-work tracking is
+There is **no `estimate`, `assignee`, or `burn-down` field** on a phase.
+Estimation is a *pre-dispatch verb* (`darkmux phase estimate`, §4), not a stored
+phase attribute; burn-down/remaining-work tracking is
 [planned](#8-planned--not-yet-shipped).
 
 ### Lifecycle state machines
 
-Both lifecycles are implemented (`src/main.rs:1321-1392` — sprint verbs at
+Both lifecycles are implemented (`src/main.rs:1321-1392` — phase verbs at
 `1321-1349`, mission verbs at `1355-1392`):
 
 - **Mission:** `Active ⇄ Paused → Closed` (terminal). Verbs: `start`, `pause`,
   `resume`, `close`, each persisted with operator reasoning.
-- **Sprint:** `Planned → Running → Complete | Abandoned`. Verbs: `start`,
+- **Phase:** `Planned → Running → Complete | Abandoned`. Verbs: `start`,
   `complete`, `abandon`.
 
-`darkmux mission add-sprint` inserts a sprint with cross-reference validation
+`darkmux mission add-phase` inserts a phase with cross-reference validation
 (mission exists, `depends_on` ids resolve, no id collision)
 (`src/main.rs:584-611`).
 
@@ -191,10 +191,10 @@ All of the following are **shipped**:
 
 | Verb | What it does | Where |
 |---|---|---|
-| `darkmux mission propose` | Reads unstructured intent → dispatches the **mission-compiler** utility role → renders a Mission + Sprints proposal → **mandatory operator approve/edit/reject/regenerate gate** → persists only on approval (atomic rollback on partial write). | `src/mission_propose.rs`; `src/main.rs:542-577` |
-| `darkmux sprint estimate` | Reads a `WorkloadSpec` → deterministic per-turn token math → recommends the smallest adequate profile → optional 4B narration. | `src/sprint_cli.rs:233-310, 500-514`; `src/main.rs:459-471` |
-| `darkmux sprint review` | Auto-detects base branch → computes the git diff → dispatches the **code-reviewer** role → parses the `QA-REVIEW-SIGNOFF` block (`BLOCK`/`FLAG`/`NIT`) → emits a verdict (`clean` / `flags-only` / `blockers`, or `indeterminate` when the reviewer output doesn't match the expected format). | `src/sprint_cli.rs:683-970`; `src/main.rs:472-485` |
-| `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, fans out its ready sprints (`depends_on == []`) as work jobs onto the single global fleet work queue (`darkmux:work`); waits or returns session ids. | `src/main.rs:642-662`, `1453-1721` |
+| `darkmux mission propose` | Reads unstructured intent → dispatches the **mission-compiler** utility role → renders a Mission + Phases proposal → **mandatory operator approve/edit/reject/regenerate gate** → persists only on approval (atomic rollback on partial write). | `src/mission_propose.rs`; `src/main.rs:542-577` |
+| `darkmux phase estimate` | Reads a `WorkloadSpec` → deterministic per-turn token math → recommends the smallest adequate profile → optional 4B narration. | `src/phase_cli.rs:233-310, 500-514`; `src/main.rs:459-471` |
+| `darkmux phase review` | Auto-detects base branch → computes the git diff → dispatches the **code-reviewer** role → parses the `QA-REVIEW-SIGNOFF` block (`BLOCK`/`FLAG`/`NIT`) → emits a verdict (`clean` / `flags-only` / `blockers`, or `indeterminate` when the reviewer output doesn't match the expected format). | `src/phase_cli.rs:683-970`; `src/main.rs:472-485` |
+| `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, fans out its ready phases (`depends_on == []`) as work jobs onto the single global fleet work queue (`darkmux:work`); waits or returns session ids. | `src/main.rs:642-662`, `1453-1721` |
 | `darkmux crew dispatch <role>` | Single-turn dispatch to a named role through the internal runtime (default) or `--runtime openclaw`. | see `CLAUDE.md` → operator-facing commands |
 
 The **operator-approval gate on `mission propose`** is the sovereignty contract
@@ -331,7 +331,7 @@ and coordination substrate. The schema version is **`1.9.0`**
 
 - **Core (always present):** `ts`, `level`, `category`, `tier`, `stage`,
   `action`, `handle`.
-- **Correlation:** `sprint_id`, `session_id`, `mission_id`, `source`.
+- **Correlation:** `phase_id`, `session_id`, `mission_id`, `source`.
 - **Provenance (env-stamped at write time):** `model`, `machine_id` (from
   `DARKMUX_MACHINE_ID`), `orchestrator` (from `DARKMUX_ORCHESTRATOR`). *(The
   `machine_tier` provenance field was removed in schema 1.9.0, #587: the
@@ -360,7 +360,7 @@ optional fields are minor bumps that older viewers safely ignore (the
 
 ```
 /health   /flow/:date   /flow/:date/stream   /flow-status
-/model/status   /machine/specs   /missions   /sprints
+/model/status   /machine/specs   /missions   /phases
 ```
 
 - `/flow/:date` aggregates fleet-wide records from Redis (`XRANGE`) with a
@@ -398,7 +398,7 @@ behavior. The observability items are the
 | **darkmux.com demo** as an explicit badged playback fixture (live at `darkmux.com/demo`). | live on the website | [#559](https://github.com/kstrat2001/darkmux/issues/559) |
 | **`select_model` capability scoring** — per-role-optimal model routing. Today a Phase-1 stub returns the Primary model (`crates/darkmux-crew/src/select.rs:60-74`). | stub | — |
 | **Dynamic per-mission crew composition** — assemble a crew for a dispatch. Today the operator names one role explicitly. | not started | — |
-| **Mission-level scope / sprint burn-down / per-sprint estimate tracking** — stored attributes for the above (intentionally absent today). | not started | — |
+| **Mission-level scope / phase burn-down / per-phase estimate tracking** — stored attributes for the above (intentionally absent today). | not started | — |
 | **Context-usage as % of window** as a captured telemetry signal (today: derived from absolute counts). | not started | — |
 | **Detector-driven behavior change** — bail/escalate on cycle, etc. (today: observability-only). | not started | — |
 | **Tier-1 access-pattern eviction + operator-tunable per-slot compaction caps.** | schema only | [#352](https://github.com/kstrat2001/darkmux/issues/352) |

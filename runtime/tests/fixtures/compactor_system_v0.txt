@@ -16,7 +16,7 @@ You are a conversation compactor. You will be given a conversation excerpt and y
   "errors_to_preserve": <string, optional>,
   "next_concrete_actions": <string, optional>,
   "verify_criteria": <string, optional>,
-  "sprint_id": <string, optional>
+  "phase_id": <string, optional>
   }
 
 Output JSON ONLY. No prose. No markdown fences. The metadata fields (schema_version, generation, source_message_count) are provided in the user message — copy them into your output exactly.

@@ -184,7 +184,7 @@ If re-configuring, continue from the step the operator names. If a different mac
 
 - **Install darkmux** — that's the Quick Start in the README; this skill picks up after `darkmux --version` works.
 - **Set up Tailscale or any other mesh VPN** — that's the operator's tailnet, separate from darkmux. The skill assumes the operator already has a tailnet that reaches the coordinator.
-- **Replicate operator state across machines** — profiles, missions, sprints, audit logs all stay local. Cross-machine state is the [#280](https://github.com/kstrat2001/darkmux/issues/280) work.
+- **Replicate operator state across machines** — profiles, missions, phases, audit logs all stay local. Cross-machine state is the [#280](https://github.com/kstrat2001/darkmux/issues/280) work.
 - **Configure LMStudio or download models** — that's a sibling story; the operator does this from their normal LMStudio workflow.
 
 ## Composes with

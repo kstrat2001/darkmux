@@ -37,7 +37,7 @@
     <h2>The big picture</h2>
     <p>Three pieces work together:</p>
     <ul>
-      <li><strong>Flow records on disk.</strong> Every dispatch, every sprint transition, every QA verdict appends a JSON line to <code>~/.darkmux/flows/&lt;date&gt;.jsonl</code> via the <code>LocalFileSink</code>. Each record carries provenance fields (<code>machine_id</code>, <code>orchestrator</code>) auto-populated at write time. The CLI writes these; no daemon required. Two opt-in sinks compose alongside via <code>TeeSink</code>: <code>AuditFileSink</code> (a BLAKE3 hash-chained log whose edits <code>darkmux flow integrity-check</code> surfaces by walking the chain, which is un-anchored, so it detects edits absent a full re-chain rather than giving an OS append-only guarantee; enable via <code>DARKMUX_AUDIT_DIR</code>) and <code>RedisSink</code> (the cross-machine coordination stream; enable via <code>DARKMUX_REDIS_URL</code> or <code>config.redis</code>).</li>
+      <li><strong>Flow records on disk.</strong> Every dispatch, every phase transition, every QA verdict appends a JSON line to <code>~/.darkmux/flows/&lt;date&gt;.jsonl</code> via the <code>LocalFileSink</code>. Each record carries provenance fields (<code>machine_id</code>, <code>orchestrator</code>) auto-populated at write time. The CLI writes these; no daemon required. Two opt-in sinks compose alongside via <code>TeeSink</code>: <code>AuditFileSink</code> (a BLAKE3 hash-chained log whose edits <code>darkmux flow integrity-check</code> surfaces by walking the chain, which is un-anchored, so it detects edits absent a full re-chain rather than giving an OS append-only guarantee; enable via <code>DARKMUX_AUDIT_DIR</code>) and <code>RedisSink</code> (the cross-machine coordination stream; enable via <code>DARKMUX_REDIS_URL</code> or <code>config.redis</code>).</li>
       <li><strong>The <code>darkmux serve</code> daemon.</strong> A small HTTP server (default <code>127.0.0.1:8765</code>) that reads those JSONL files and exposes them via REST endpoints plus an SSE tail, plus a <code>/flow-status</code> endpoint that introspects the sink composition, Redis health, and schema drift.</li>
       <li><strong>The web viewer.</strong> The daemon serves a single drillable viewer at its own root, <code>http://127.0.0.1:8765/</code>: live timeline, filters, run drill-down. It is a static page whose JavaScript fetches from your local daemon. Nothing is uploaded. (<a href="../demo/">darkmux.com/demo</a> is the same viewer in playback mode over a recorded session, which is why it works with no daemon.)</li>
     </ul>
@@ -53,9 +53,9 @@
     <p>Because the page is served by your local daemon, it is same-origin with the data it reads: it loads your records directly, with no "connect" step, no account, and nothing uploaded. (The <code>darkmux.com/flow</code> URL from older docs now redirects to the playback <a href="../demo/">demo</a>; for your <em>live</em> data, use the daemon's own address above. Loading a remote page like <code>darkmux.com</code> against your local daemon would be blocked by the daemon's default CORS policy anyway, which is the safe default.)</p>
     <p>This guide intentionally ships without static screenshots: the viewer is iterating fast in this phase. Open it next to a real dispatch to see the live shape. Each card shows:</p>
     <ul>
-      <li><strong>Tier stripe</strong>: the colored bar on the left. Cyan = operator (manual mission/sprint actions), violet = frontier (orchestrator narrative), green = local (model work).</li>
-      <li><strong>Action + handle</strong>: what happened ("dispatch start", "sprint complete", "verdict: clean") and which entity it acted on (the role id, sprint id, or mission id).</li>
-      <li><strong>Meta pills</strong>: category, tier, stage, source, model (if known), sprint, session id. The <code>model</code> pill on dispatch cards shows which LMStudio model handled the work.</li>
+      <li><strong>Tier stripe</strong>: the colored bar on the left. Cyan = operator (manual mission/phase actions), violet = frontier (orchestrator narrative), green = local (model work).</li>
+      <li><strong>Action + handle</strong>: what happened ("dispatch start", "phase complete", "verdict: clean") and which entity it acted on (the role id, phase id, or mission id).</li>
+      <li><strong>Meta pills</strong>: category, tier, stage, source, model (if known), phase, session id. The <code>model</code> pill on dispatch cards shows which LMStudio model handled the work.</li>
       <li><strong>Wall-clock graphic</strong>: for dispatch records, an SVG ring shows the duration, sweeping while the dispatch is mid-flight and frozen at the final duration once complete.</li>
     </ul>
     <p>A <strong>source pill</strong> in the toolbar tells you the truth about the data path: <code>live</code> (reading your daemon, Redis-aggregated if configured), <code>no daemon</code> (can't reach the daemon), or <code>replay</code> (a static fixture, as on the demo).</p>
@@ -67,11 +67,11 @@
     <h2>Reading a live dispatch</h2>
     <p>Run something that emits records and watch them land:</p>
     <pre><code>darkmux mission start &lt;your-mission-id&gt;    <span class="comment"># cyan: mission start record</span>
-darkmux sprint start &lt;your-sprint-id&gt;      <span class="comment"># cyan: sprint start record</span>
+darkmux phase start &lt;your-phase-id&gt;      <span class="comment"># cyan: phase start record</span>
 darkmux crew dispatch coder --message "..."<span class="comment"># green: dispatch start + (later) dispatch complete</span>
-darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: sprint complete + duration arc</span></code></pre>
+darkmux phase complete &lt;your-phase-id&gt;   <span class="comment"># cyan: phase complete + duration arc</span></code></pre>
 
-    <p>With the viewer open as you run those commands, the records appear in order: two cyan operator-tier records bracketing a green local-tier dispatch pair (with the model pill visible on each green card), followed by the cyan sprint-complete with its duration arc.</p>
+    <p>With the viewer open as you run those commands, the records appear in order: two cyan operator-tier records bracketing a green local-tier dispatch pair (with the model pill visible on each green card), followed by the cyan phase-complete with its duration arc.</p>
 
     <p>The records pair via <code>session_id</code>: dispatch start and dispatch complete share the same session id, which is how the wall-clock graphic computes duration. The viewer joins them automatically.</p>
   </div>
@@ -98,7 +98,7 @@ darkmux serve --port 9000 --bind 127.0.0.1   <span class="comment"># override th
 
     <div class="callout warn">
       <strong>Keep the bind on loopback.</strong>
-      <p style="margin: 6px 0 0;">The daemon's data surface (flow records + the mission/sprint state of whatever you're working on) is fleet-wide. Don't bind it to <code>0.0.0.0</code>. To reach the viewer from another device on your tailnet, keep the daemon on <code>127.0.0.1</code> and put Tailscale Serve in front of it (HTTPS terminated at the tailnet node, daemon untouched): see the <a href="always-on-hub.html#viewer">secure hub guide</a>. A non-loopback bind also trips darkmux's remote-auth gate, which a browser page-load can't satisfy.</p>
+      <p style="margin: 6px 0 0;">The daemon's data surface (flow records + the mission/phase state of whatever you're working on) is fleet-wide. Don't bind it to <code>0.0.0.0</code>. To reach the viewer from another device on your tailnet, keep the daemon on <code>127.0.0.1</code> and put Tailscale Serve in front of it (HTTPS terminated at the tailnet node, daemon untouched): see the <a href="always-on-hub.html#viewer">secure hub guide</a>. A non-loopback bind also trips darkmux's remote-auth gate, which a browser page-load can't satisfy.</p>
     </div>
 
     <h3>Verify it's up</h3>
@@ -124,7 +124,7 @@ darkmux serve --port 9000 --bind 127.0.0.1   <span class="comment"># override th
 <section>
   <div class="wrap">
     <h2>The pre-dispatch nudge</h2>
-    <p>When you run <code>darkmux crew dispatch</code> or <code>darkmux sprint review</code> while the daemon is off, darkmux prints a one-line stderr nudge: the daemon isn't reachable, your flow records still write to disk, and you won't see them live until you start it (<code>brew services start darkmux</code> on Homebrew, or <code>darkmux serve</code> from source).</p>
+    <p>When you run <code>darkmux crew dispatch</code> or <code>darkmux phase review</code> while the daemon is off, darkmux prints a one-line stderr nudge: the daemon isn't reachable, your flow records still write to disk, and you won't see them live until you start it (<code>brew services start darkmux</code> on Homebrew, or <code>darkmux serve</code> from source).</p>
     <p>The dispatch proceeds either way: this is situational awareness, not consent-gating. You won't commit to a multi-minute dispatch only to realize the viewer would have been empty.</p>
     <p>If you started the daemon mid-dispatch, the records that landed before you started it are still visible. The viewer fetches the whole day's file first, then opens an SSE stream for new records. No data lost.</p>
   </div>
@@ -153,11 +153,11 @@ darkmux serve --port 9000 --bind 127.0.0.1   <span class="comment"># override th
       </tr>
       <tr>
         <td><code>GET /missions</code></td>
-        <td>All missions from <code>~/.darkmux/missions/</code> (status, sprint_ids, timestamps).</td>
+        <td>All missions from <code>~/.darkmux/missions/</code> (status, phase_ids, timestamps).</td>
       </tr>
       <tr>
-        <td><code>GET /sprints</code></td>
-        <td>All sprints from <code>~/.darkmux/sprints/</code> (status, mission_id, depends_on, timestamps).</td>
+        <td><code>GET /phases</code></td>
+        <td>All phases from <code>~/.darkmux/phases/</code> (status, mission_id, depends_on, timestamps).</td>
       </tr>
       <tr>
         <td><code>GET /flow-status</code></td>

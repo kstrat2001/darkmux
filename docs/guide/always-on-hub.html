@@ -197,7 +197,7 @@ brew services restart redis</code></pre>
 <section id="phase-2">
   <div class="wrap">
     <h2>Phase 2: Run the daemon as a managed service</h2>
-    <p><code>darkmux serve</code> is the local HTTP daemon: flow records, mission/sprint state, model status, the bundled live viewer. For a 24/7 hub you want it under a service manager so it auto-starts at boot and respawns on crash.</p>
+    <p><code>darkmux serve</code> is the local HTTP daemon: flow records, mission/phase state, model status, the bundled live viewer. For a 24/7 hub you want it under a service manager so it auto-starts at boot and respawns on crash.</p>
 
     <h3>The easy path: brew services</h3>
     <p>If you installed via Homebrew, the formula already ships a launchd-managed service. Because your Redis is password-less, there's nothing to wire up: the daemon resolves its Redis connection from the <code>config.redis</code> you set in the quick path:</p>

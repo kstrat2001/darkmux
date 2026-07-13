@@ -153,7 +153,7 @@ Every model-facing prompt defaults to **AI-convention terminology** the model al
 ## Engagements (operator-defined dreamscapes)
 
 An engagement is operator-defined, never system-defined. The system doesn't impose a directory shape or config format.
-* **The orchestrator's bridging role:** Read the engagement context, translate soft free-form context into structured concepts (Mission, Sprint, role tilts, preferences), and don't pry for structure the operator didn't volunteer.
+* **The orchestrator's bridging role:** Read the engagement context, translate soft free-form context into structured concepts (Mission, Phase, role tilts, preferences), and don't pry for structure the operator didn't volunteer.
 * **Engagement never enters CLI arg surface:** Engagement context lives in the frontier orchestrator layer (`AGENTS.md` files, skills, conversation). It never becomes a `--engagement <hint>`-style CLI arg on any `darkmux` verb.
 
 ## Project posture

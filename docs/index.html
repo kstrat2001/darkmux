@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>darkmux — AI-first local-AI orchestrator for Apple Silicon</title>
-<meta name="description" content="AI-first local-AI orchestrator. Uses local-AI internally to manage your local-AI workflows: profile multiplexing, utility-agent verbs, live observability, mission/sprint lifecycle. Built on real benchmarks.">
+<meta name="description" content="AI-first local-AI orchestrator. Uses local-AI internally to manage your local-AI workflows: profile multiplexing, utility-agent verbs, live observability, mission/phase lifecycle. Built on real benchmarks.">
 <meta property="og:title" content="Own your AI workforce. Local AI, no API bill.">
 <meta property="og:description" content="Open-source orchestrator for Apple Silicon. Local models handle the routine work so your frontier agent saves its tokens for the hard problems.">
 <meta property="og:url" content="https://darkmux.com">
@@ -289,13 +289,13 @@
 <section>
   <div class="wrap">
     <h2>Watch it work</h2>
-    <h3>A daemon + viewer for live observability of dispatches, sprints, and verdicts.</h3>
-    <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes the flow records written by every dispatch and mission/sprint transition. The <a href="demo/">observability viewer</a> renders those records as one drillable view of your fleet: drill fleet → machine → subsystem, with the event stream as a log lens at any level. A <a href="demo/">live demo with sample data</a> runs on this site. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
+    <h3>A daemon + viewer for live observability of dispatches, phases, and verdicts.</h3>
+    <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes the flow records written by every dispatch and mission/phase transition. The <a href="demo/">observability viewer</a> renders those records as one drillable view of your fleet: drill fleet → machine → subsystem, with the event stream as a log lens at any level. A <a href="demo/">live demo with sample data</a> runs on this site. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
     <ul class="plain">
       <li><code>darkmux serve</code> — start the daemon in a separate terminal tab</li>
       <li><code>darkmux doctor</code> — pre-flight checks including <code>daemon: reachable</code></li>
       <li><a href="demo/">darkmux.com/demo/</a> — interactive demo, sample fleet data (no install required)</li>
-      <li><code>darkmux crew dispatch</code> / <code>sprint review</code> — emit flow records as they run</li>
+      <li><code>darkmux crew dispatch</code> / <code>phase review</code> — emit flow records as they run</li>
     </ul>
     <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/observability.html">observability section of the user guide</a>.</p>
   </div>
@@ -319,14 +319,14 @@
 
 <section>
   <div class="wrap">
-    <h2>Advanced: missions, sprints, crew</h2>
+    <h2>Advanced: missions, phases, crew</h2>
     <h3>Structured agentic work, for operators using darkmux as the local-AI tier of an orchestrator workflow.</h3>
-    <p>Beyond the swap/lab CLI surface, darkmux ships a <em>crew</em> abstraction: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts, plus a <em>mission/sprint</em> lifecycle that tracks multi-step plans as JSON files the operator owns. Optional — none of this is required to use darkmux as a CLI.</p>
+    <p>Beyond the swap/lab CLI surface, darkmux ships a <em>crew</em> abstraction: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts, plus a <em>mission/phase</em> lifecycle that tracks multi-step plans as JSON files the operator owns. Optional — none of this is required to use darkmux as a CLI.</p>
     <ul class="plain">
       <li><code>darkmux crew dispatch coder --message "..."</code> — invoke a named role; emits flow records</li>
-      <li><code>darkmux sprint review</code> — QA pass against the current branch's diff; dispatches code-reviewer, parses the SIGNOFF block</li>
-      <li><code>darkmux mission start/close/pause/resume</code> + <code>sprint start/complete/abandon</code> — drive lifecycle state</li>
-      <li><code>darkmux mission add-sprint --after &lt;s&gt;</code> — insert scope mid-mission without restructuring</li>
+      <li><code>darkmux phase review</code> — QA pass against the current branch's diff; dispatches code-reviewer, parses the SIGNOFF block</li>
+      <li><code>darkmux mission start/close/pause/resume</code> + <code>phase start/complete/abandon</code> — drive lifecycle state</li>
+      <li><code>darkmux mission add-phase --after &lt;s&gt;</code> — insert scope mid-mission without restructuring</li>
     </ul>
     <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/missions.html">missions section of the user guide</a>.</p>
   </div>
