@@ -4071,6 +4071,17 @@ impl StepKind for ReviewProbeStepKind {
         if self.staffing.pm.is_remote() {
             return None;
         }
+        // (#1360 follow-up) A seat whose selector matches zero of the
+        // review's bundles never dispatches at all (`run()`'s own
+        // `select_bundles_for_staffing` call would come back empty too) —
+        // declaring a residency need here would make `ensure_wave_loaded`
+        // load (or fail loud trying to load) a model this step will never
+        // actually use. Both inputs are already fully known before any step
+        // runs (`ctx.bundles` is fixed at graph-build time), so this mirrors
+        // `run()`'s own check rather than guessing.
+        if select_bundles_for_staffing(&self.ctx.bundles, self.staffing.selector.as_ref()).is_empty() {
+            return None;
+        }
         let n_ctx = self.staffing.pm.n_ctx?;
         let identifier = darkmux_gestalt::namespaced_identifier(&self.staffing.pm.id, self.staffing.pm.identifier.as_deref());
         Some(darkmux_gestalt::Placement {
@@ -4344,6 +4355,17 @@ impl StepKind for ReviewJudgeStepKind {
         if self.judge.pm.is_remote() {
             return None;
         }
+        // (#1360 follow-up) Unlike probe, judge can't know upfront whether
+        // dedup will hand it any flags — that's genuinely data-dependent on
+        // an earlier step's real output, not knowable at graph-build time.
+        // But a TRULY empty bundle set is a safe, conservative exception:
+        // every probe seat's selector operates on `ctx.bundles`, so if that
+        // set is empty, dedup's output is guaranteed empty too, transitively
+        // — no seat's selector matters. Skips loading a model this step is
+        // certain not to use.
+        if self.ctx.bundles.is_empty() {
+            return None;
+        }
         let n_ctx = self.judge.pm.n_ctx?;
         let identifier = darkmux_gestalt::namespaced_identifier(&self.judge.pm.id, self.judge.pm.identifier.as_deref());
         Some(darkmux_gestalt::Placement {
@@ -4504,6 +4526,13 @@ impl StepKind for ReviewVerifyStepKind {
     fn residency(&self, _step: &Step, _task: &Task) -> Option<darkmux_gestalt::Placement> {
         let vstaff = self.verify.as_ref()?;
         if vstaff.pm.is_remote() {
+            return None;
+        }
+        // (#1360 follow-up) Same reasoning as ReviewJudgeStepKind's own
+        // residency() — a truly empty bundle set means every upstream
+        // step's output is transitively guaranteed empty too, so verify is
+        // certain to have nothing confirmed to check.
+        if self.ctx.bundles.is_empty() {
             return None;
         }
         let n_ctx = vstaff.pm.n_ctx?;
@@ -5027,12 +5056,21 @@ pub fn run_review_graph(
     // through the SAME injected `ReviewEmitter` every other record in this
     // driver uses — the driver stays sink-agnostic (module doc), never
     // calling `darkmux_flow::record` directly itself.
-    let report = run_step_graph(&mut steps, &tasks_by_id, &registry, &facts, &est, 8, &mut |record| {
-        for sample in telemetry.rx.try_iter().collect::<Vec<_>>() {
-            emitter.emit(sample);
-        }
-        emitter.emit(record);
-    });
+    let report = run_step_graph(
+        &mut steps,
+        &tasks_by_id,
+        &registry,
+        &facts,
+        &est,
+        8,
+        &darkmux_crew::concurrent_dispatch::lms_host_factory,
+        &mut |record| {
+            for sample in telemetry.rx.try_iter().collect::<Vec<_>>() {
+                emitter.emit(sample);
+            }
+            emitter.emit(record);
+        },
+    );
 
     // Merge the probe stage's NOW-populated accumulators (every probe step
     // has run by the time `run_step_graph` returns, whether it errored or
