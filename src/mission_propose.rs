@@ -234,6 +234,7 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        model_base_url_override: None,
     };
     let dispatch_result = crate::fleet::dispatch_routed(opts);
 

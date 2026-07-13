@@ -951,6 +951,7 @@ pub fn run(
         force_container: false,
         max_completion_tokens: None,
         image: image.map(String::from),
+        model_base_url_override: None,
     };
 
     // (#1230 Packet 3) Build the data-defined Task/Step graph — worktree →

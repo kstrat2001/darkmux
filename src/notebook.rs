@@ -212,6 +212,7 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        model_base_url_override: None,
     };
     let result = crate::fleet::dispatch_routed(opts)
         .context("internal-runtime dispatch for notebook draft")?;

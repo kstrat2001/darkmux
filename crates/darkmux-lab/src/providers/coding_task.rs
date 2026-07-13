@@ -855,6 +855,7 @@ fn dispatch_via_internal(
         force_container: false,
         max_completion_tokens: None,
         image: image.map(str::to_string),
+        model_base_url_override: None,
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     // `out_dir` is the host path where the runtime wrote its

@@ -685,6 +685,7 @@ fn dispatch_case(
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        model_base_url_override: None,
     };
     let r = dispatch(d).context("pr-review-bench internal-runtime dispatch")?;
     Ok(r.stdout)

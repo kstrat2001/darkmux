@@ -3242,6 +3242,11 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 // (#703) operator-selected dispatch image; darkmux injects
                 // its runtime binary into it when it's not the default.
                 image,
+                // Mock-model harness (v1): no CLI surface yet (deliberately —
+                // see darkmux's CLAUDE.md doctrine on shipping the underlying
+                // mechanism before the CLI verb). `None` on every operator-
+                // facing dispatch.
+                model_base_url_override: None,
             };
             let result = fleet::dispatch_routed(opts)?;
             // Announce the resolved session id on stderr so operators see
