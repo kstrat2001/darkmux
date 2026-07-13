@@ -3,7 +3,7 @@
 // these specs use the `index-lab.html` variant (playwright.config.js) which
 // injects `darkmux-lab-runs-src` pointing at a committed fixture
 // (tests/fixtures/lab-runs-fixture.json), the same static-fixture-override
-// pattern the missions/sprints lens already uses. The run-DETAIL endpoints
+// pattern the missions/phases lens already uses. The run-DETAIL endpoints
 // (`/lab/run/detail` + `/lab/run/events`) have no meta override, so specs
 // that drill into a run route-mock them (the catalog.spec pattern).
 const { test, expect } = require('@playwright/test');

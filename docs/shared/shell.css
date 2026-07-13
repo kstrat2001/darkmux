@@ -122,7 +122,7 @@ dx-shell .dx-shell-pills {
 }
 
 /* ─── shared pill base (used by the store-status pill in <dx-shell>) — */
-/* Existing per-page pills (conn-status, model-pill, sprint-progress) keep
+/* Existing per-page pills (conn-status, model-pill, phase-progress) keep
  * their original classes; .dx-pill is the new shared shape. */
 .dx-pill {
   display: inline-flex;

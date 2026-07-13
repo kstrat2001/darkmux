@@ -56,7 +56,7 @@ const PORT = 47823;
   // (#1247 Part 3) Lab observer lens smoke harness: the static XSS harness
   // above has no daemon behind it, so `/lab/runs` would 404 — this variant
   // injects `darkmux-lab-runs-src` (the same static-fixture-override pattern
-  // `darkmux-missions-src`/`darkmux-sprints-src` already use) pointing at a
+  // `darkmux-missions-src`/`darkmux-phases-src` already use) pointing at a
   // committed fixture, so `viewer-lab.spec.js` can drive the real lens
   // end-to-end without a live daemon. Same render path as a real
   // `/lab/runs` response; no viewer fork.
