@@ -1,4 +1,4 @@
-//! Load crew architecture manifests (roles, crews, missions, sprints) by id.
+//! Load crew architecture manifests (roles, crews, missions, phases) by id.
 //!
 //! Search order: user dir → binary-embedded built-ins.
 
@@ -171,14 +171,14 @@ pub fn builtin_role_prompt_ids() -> Vec<&'static str> {
 /// Missions compiled into the binary at build time.
 const BUILTIN_MISSIONS: &[(&str, &str)] = &[];
 
-/// Sprints compiled into the binary at build time.
-const BUILTIN_SPRINTS: &[(&str, &str)] = &[];
+/// Phases compiled into the binary at build time.
+const BUILTIN_PHASES: &[(&str, &str)] = &[];
 
 /// The user-side crew root: `DARKMUX_CREW_DIR` if set, else `<paths.crew>`
 /// from the active workspace.
 ///
 /// **Deprecated direction (Beat 33):** prefer the per-subdir helpers
-/// `roles_dir()`, `missions_dir()`, `sprints_dir()`, `crews_dir()`,
+/// `roles_dir()`, `missions_dir()`, `phases_dir()`, `crews_dir()`,
 /// `skills_dir()`, and `role_pins_path()` for new code. They
 /// resolve the post-flatten `<root>/<subdir>/` layout with a backward-
 /// compatibility fallback to the legacy `<root>/crew/<subdir>/` layout.
@@ -202,7 +202,7 @@ pub(crate) fn crew_root() -> PathBuf {
 pub fn user_state_root() -> PathBuf {
     // Same override as crew_root, but the no-override default is the bare root
     // (no `crew/` nesting). env(DARKMUX_CREW_DIR) > config.dirs.crew > <root>.
-    // (#1012) ForceUser, NOT Auto — missions/sprints are operator-level work
+    // (#1012) ForceUser, NOT Auto — missions/phases are operator-level work
     // tracking (the operator's board lives in ~/.darkmux), never a project's
     // stray `.darkmux/`. Auto made them VANISH from the CLI + viewer the moment
     // a repo got a bare `.darkmux/` (from `lessons add` / lab runs). DARKMUX_HOME
@@ -250,10 +250,10 @@ pub fn missions_dir() -> PathBuf {
     resolve_user_subdir("missions")
 }
 
-/// User-side sprints directory. Post-Beat-33: `<root>/sprints/`. Falls
-/// back to `<root>/crew/sprints/` for operators on the legacy layout.
-pub fn sprints_dir() -> PathBuf {
-    resolve_user_subdir("sprints")
+/// User-side phases directory. Post-Beat-33: `<root>/phases/`. Falls
+/// back to `<root>/crew/phases/` for operators on the legacy layout.
+pub fn phases_dir() -> PathBuf {
+    resolve_user_subdir("phases")
 }
 
 /// User-side crews directory (operator overrides). Post-Beat-33:
@@ -321,7 +321,7 @@ pub fn role_prompt(role_id: &str) -> Option<String> {
 }
 
 /// (#906) Defense-in-depth cap on a single manifest file. Role / mission /
-/// sprint / crew manifests are small (a few KB); a multi-MB file is either
+/// phase / crew manifests are small (a few KB); a multi-MB file is either
 /// corrupt or hostile, and an unbounded `read_to_string` + `from_str` is a
 /// needless memory-amplification surface. 1 MiB is far above any real
 /// manifest while still bounding the blast radius.
@@ -473,7 +473,7 @@ enum RoleSource {
 }
 
 /// Validate a role's `role_family` field. The family is a validated
-/// **two-value axis** (#590): `"specialist"` (works the mission/sprints)
+/// **two-value axis** (#590): `"specialist"` (works the mission/phases)
 /// or `"utility"` (supports the runtime outside mission scope), or absent
 /// (defaults to specialist). Anything else loud-fails at the loader
 /// boundary:
@@ -516,7 +516,7 @@ fn validate_role_family(role: &Role, source: RoleSource) -> Result<()> {
         Some(other) => Err(match source {
             RoleSource::User => anyhow::anyhow!(
                 "role `{}` has `role_family: \"{}\"`, which is not a recognized family. \
-                 Valid values are \"specialist\" (works the mission/sprints) or \"utility\" \
+                 Valid values are \"specialist\" (works the mission/phases) or \"utility\" \
                  (supports the runtime outside mission scope); omit the field to default to \
                  \"specialist\". Update your role manifest at `{}/{}.json`.",
                 role.id,
@@ -595,21 +595,21 @@ pub fn load_missions() -> Result<Vec<Mission>> {
     Ok(out)
 }
 
-/// Load all sprints from the new per-mission nested layout.
+/// Load all phases from the new per-mission nested layout.
 ///
-/// Walks every `<crew_root>/missions/<mission-id>/sprints/*.json`.  The
-/// Sprint JSON already carries `mission_id`, so no inference from the dir
-/// name is needed.  Legacy flat sprint files under `<crew_root>/sprints/`
+/// Walks every `<crew_root>/missions/<mission-id>/phases/*.json`.  The
+/// Phase JSON already carries `mission_id`, so no inference from the dir
+/// name is needed.  Legacy flat phase files under `<crew_root>/phases/`
 /// are silently ignored — the migration verb is the bridge.
-pub fn load_sprints() -> Result<Vec<Sprint>> {
+pub fn load_phases() -> Result<Vec<Phase>> {
     use crate::lifecycle;
     let missions_root = missions_dir();
     if !missions_root.is_dir() {
         return Ok(Vec::new());
     }
-    // Key by (mission_id, sprint_id) so the same sprint id is allowed across
+    // Key by (mission_id, phase_id) so the same phase id is allowed across
     // different missions — that's the composite-PK invariant #148 establishes.
-    let mut map: BTreeMap<(String, String), Sprint> = BTreeMap::new();
+    let mut map: BTreeMap<(String, String), Phase> = BTreeMap::new();
     for entry in fs::read_dir(&missions_root)
         .with_context(|| format!("reading {}", missions_root.display()))?
     {
@@ -622,39 +622,39 @@ pub fn load_sprints() -> Result<Vec<Sprint>> {
             Some(s) => s.to_string(),
             None => continue,
         };
-        let sprints_dir = lifecycle::sprints_dir(&mission_id);
-        if !sprints_dir.is_dir() {
+        let phases_dir = lifecycle::phases_dir(&mission_id);
+        if !phases_dir.is_dir() {
             continue;
         }
-        for sprint_entry in fs::read_dir(&sprints_dir)
-            .with_context(|| format!("reading {}", sprints_dir.display()))?
+        for phase_entry in fs::read_dir(&phases_dir)
+            .with_context(|| format!("reading {}", phases_dir.display()))?
         {
-            let sprint_entry = sprint_entry?;
-            let sprint_path = sprint_entry.path();
-            if !sprint_path.is_file() {
+            let phase_entry = phase_entry?;
+            let phase_path = phase_entry.path();
+            if !phase_path.is_file() {
                 continue;
             }
-            if sprint_path.extension().and_then(|s| s.to_str()) != Some("json") {
+            if phase_path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let text = fs::read_to_string(&sprint_path)
-                .with_context(|| format!("reading {}", sprint_path.display()))?;
-            match serde_json::from_str::<Sprint>(&text) {
+            let text = fs::read_to_string(&phase_path)
+                .with_context(|| format!("reading {}", phase_path.display()))?;
+            match serde_json::from_str::<Phase>(&text) {
                 Ok(s) => { map.insert((s.mission_id.clone(), s.id.clone()), s); }
-                Err(e) => eprintln!("warning: failed to parse sprint at {}: {e}", sprint_path.display()),
+                Err(e) => eprintln!("warning: failed to parse phase at {}: {e}", phase_path.display()),
             }
         }
     }
 
-    // Built-in sprints (currently empty — future-proofing).
-    for (_id, json) in BUILTIN_SPRINTS {
-        match serde_json::from_str::<Sprint>(json) {
+    // Built-in phases (currently empty — future-proofing).
+    for (_id, json) in BUILTIN_PHASES {
+        match serde_json::from_str::<Phase>(json) {
             Ok(s) => { map.entry((s.mission_id.clone(), s.id.clone())).or_insert(s); }
-            Err(e) => eprintln!("warning: failed to parse builtin sprint \"{_id}\": {e}"),
+            Err(e) => eprintln!("warning: failed to parse builtin phase \"{_id}\": {e}"),
         }
     }
 
-    let mut out: Vec<Sprint> = map.into_values().collect();
+    let mut out: Vec<Phase> = map.into_values().collect();
     out.sort_by(|a, b| (&a.mission_id, &a.id).cmp(&(&b.mission_id, &b.id)));
     Ok(out)
 }
@@ -1273,7 +1273,7 @@ mod tests {
         // `edit` only modifies existing files; `write` is what the coder uses
         // to create them. A dispatch with the previous palette
         // (`read`/`edit`/`exec`/`process` — no `write`) dead-ends mid-task on
-        // any new-file step. Verified empirically on Sprint 2 of #113 (PR #123).
+        // any new-file step. Verified empirically on Phase 2 of #113 (PR #123).
         let _guard = CrewDirGuard::new(TempDir::new().unwrap());
         let roles = load_roles().unwrap();
         let coder = roles.iter().find(|r| r.id == "coder").expect("builtin coder should load");
@@ -1378,7 +1378,7 @@ mod load_per_mission_tests {
         let mission = serde_json::json!({
             "id": id,
             "description": format!("test mission {id}"),
-            "sprint_ids": [],
+            "phase_ids": [],
             "created_ts": 1_700_000_000u64,
         });
         std::fs::write(
@@ -1388,19 +1388,19 @@ mod load_per_mission_tests {
         .unwrap();
     }
 
-    fn seed_sprint(root: &std::path::Path, mission_id: &str, sprint_id: &str) {
-        let sdir = root.join("missions").join(mission_id).join("sprints");
+    fn seed_phase(root: &std::path::Path, mission_id: &str, phase_id: &str) {
+        let sdir = root.join("missions").join(mission_id).join("phases");
         std::fs::create_dir_all(&sdir).unwrap();
-        let sprint = serde_json::json!({
-            "id": sprint_id,
+        let phase = serde_json::json!({
+            "id": phase_id,
             "mission_id": mission_id,
-            "description": format!("test sprint {sprint_id}"),
+            "description": format!("test phase {phase_id}"),
             "depends_on": [],
             "created_ts": 1_700_000_000u64,
         });
         std::fs::write(
-            sdir.join(format!("{sprint_id}.json")),
-            serde_json::to_string_pretty(&sprint).unwrap(),
+            sdir.join(format!("{phase_id}.json")),
+            serde_json::to_string_pretty(&phase).unwrap(),
         )
         .unwrap();
     }
@@ -1414,21 +1414,21 @@ mod load_per_mission_tests {
 
     #[test]
     #[serial]
-    fn load_sprints_empty_root() {
+    fn load_phases_empty_root() {
         let _guard = TestCrewRoot::new();
-        assert_eq!(load_sprints().unwrap().len(), 0);
+        assert_eq!(load_phases().unwrap().len(), 0);
     }
 
     #[test]
     #[serial]
-    fn load_missions_two_missions_one_sprint_each() {
+    fn load_missions_two_missions_one_phase_each() {
         let guard = TestCrewRoot::new();
         let root = guard.path();
 
         seed_mission(root, "alpha");
         seed_mission(root, "beta");
-        seed_sprint(root, "alpha", "s1");
-        seed_sprint(root, "beta", "s2");
+        seed_phase(root, "alpha", "s1");
+        seed_phase(root, "beta", "s2");
 
         let missions = load_missions().unwrap();
         assert_eq!(missions.len(), 2);
@@ -1436,12 +1436,12 @@ mod load_per_mission_tests {
         assert_eq!(missions[0].id, "alpha");
         assert_eq!(missions[1].id, "beta");
 
-        let sprints = load_sprints().unwrap();
-        assert_eq!(sprints.len(), 2);
-        let alpha_sprint = sprints.iter().find(|s| s.id == "s1").expect("sprint s1 missing");
-        let beta_sprint = sprints.iter().find(|s| s.id == "s2").expect("sprint s2 missing");
-        assert_eq!(alpha_sprint.mission_id, "alpha");
-        assert_eq!(beta_sprint.mission_id, "beta");
+        let phases = load_phases().unwrap();
+        assert_eq!(phases.len(), 2);
+        let alpha_phase = phases.iter().find(|s| s.id == "s1").expect("phase s1 missing");
+        let beta_phase = phases.iter().find(|s| s.id == "s2").expect("phase s2 missing");
+        assert_eq!(alpha_phase.mission_id, "alpha");
+        assert_eq!(beta_phase.mission_id, "beta");
     }
 
     #[test]
@@ -1460,18 +1460,18 @@ mod load_per_mission_tests {
             serde_json::to_string_pretty(&serde_json::json!({
                 "id": "old",
                 "description": "legacy",
-                "sprint_ids": [],
+                "phase_ids": [],
                 "created_ts": 1u64,
             }))
             .unwrap(),
         )
         .unwrap();
 
-        // Legacy flat sprint at <crew_root>/sprints/x.json — should be IGNORED.
-        let legacy_sprints = root.join("sprints");
-        std::fs::create_dir_all(&legacy_sprints).unwrap();
+        // Legacy flat phase at <crew_root>/phases/x.json — should be IGNORED.
+        let legacy_phases = root.join("phases");
+        std::fs::create_dir_all(&legacy_phases).unwrap();
         std::fs::write(
-            legacy_sprints.join("x.json"),
+            legacy_phases.join("x.json"),
             serde_json::to_string_pretty(&serde_json::json!({
                 "id": "x",
                 "mission_id": "old",
@@ -1487,9 +1487,9 @@ mod load_per_mission_tests {
         assert_eq!(missions.len(), 1, "legacy flat file must be ignored; got {:?}", missions.iter().map(|m| &m.id).collect::<Vec<_>>());
         assert_eq!(missions[0].id, "current");
 
-        // current has no sprints; legacy x.json under <crew_root>/sprints/ is ignored.
-        let sprints = load_sprints().unwrap();
-        assert_eq!(sprints.len(), 0, "legacy flat sprint must be ignored; got {:?}", sprints.iter().map(|s| &s.id).collect::<Vec<_>>());
+        // current has no phases; legacy x.json under <crew_root>/phases/ is ignored.
+        let phases = load_phases().unwrap();
+        assert_eq!(phases.len(), 0, "legacy flat phase must be ignored; got {:?}", phases.iter().map(|s| &s.id).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1512,20 +1512,20 @@ mod load_per_mission_tests {
 
     #[test]
     #[serial]
-    fn load_sprints_skips_non_json_files() {
+    fn load_phases_skips_non_json_files() {
         let guard = TestCrewRoot::new();
         let root = guard.path();
 
         seed_mission(root, "mymission");
-        seed_sprint(root, "mymission", "s-real");
+        seed_phase(root, "mymission", "s-real");
 
-        // Drop a non-JSON file into the sprints dir — should be ignored.
-        let sprints_dir = root.join("missions").join("mymission").join("sprints");
-        std::fs::write(sprints_dir.join("notes.txt"), "just a note").unwrap();
+        // Drop a non-JSON file into the phases dir — should be ignored.
+        let phases_dir = root.join("missions").join("mymission").join("phases");
+        std::fs::write(phases_dir.join("notes.txt"), "just a note").unwrap();
 
-        let sprints = load_sprints().unwrap();
-        assert_eq!(sprints.len(), 1);
-        assert_eq!(sprints[0].id, "s-real");
+        let phases = load_phases().unwrap();
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0].id, "s-real");
     }
 
     // ─── Beat-33 dual-read fallback tests ────────────────────────────────
@@ -1576,10 +1576,10 @@ mod load_per_mission_tests {
         // returned so a subsequent write creates the new layout
         // (operator-sovereignty: no silent migration of legacy state).
         let guard = TestCrewRoot::new();
-        let canonical = guard.path().join("sprints");
+        let canonical = guard.path().join("phases");
         assert!(!canonical.exists());
-        assert!(!guard.path().join("crew").join("sprints").exists());
-        assert_eq!(sprints_dir(), canonical);
+        assert!(!guard.path().join("crew").join("phases").exists());
+        assert_eq!(phases_dir(), canonical);
     }
 
     #[serial]
@@ -1829,7 +1829,7 @@ mod load_per_mission_tests {
     fn embedded_roles_declare_expected_families() {
         // Pin the specialist/utility split across the built-in roster (#590):
         // utility = supports the runtime outside mission scope; specialist =
-        // works the mission/sprints. Every built-in declares the family
+        // works the mission/phases. Every built-in declares the family
         // EXPLICITLY (no implicit default), and a retag must be a conscious
         // edit here. The preamble-prepend logic depends on this split.
         let _guard = TestCrewRoot::new();
@@ -1854,7 +1854,7 @@ mod load_per_mission_tests {
                 assert_eq!(
                     r.role_family.as_deref(),
                     Some("specialist"),
-                    "role `{}` must be specialist (works the mission/sprints)",
+                    "role `{}` must be specialist (works the mission/phases)",
                     r.id
                 );
                 assert!(r.is_specialist());

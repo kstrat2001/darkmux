@@ -1028,7 +1028,7 @@ fn dispatch_task(
         json: true,
         watch_paths: Vec::new(),
         workdir: Some(workdir),
-        sprint_id: None,
+        phase_id: None,
         runtime: Runtime::Internal,
         runtime_cmd: "openclaw".to_string(),
         machine: None,

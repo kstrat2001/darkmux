@@ -164,7 +164,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // is suspected to involve the streaming layer specifically.
     let mut streaming: bool = true;
     // `--json` flips stdout to a single structured envelope at end of
-    // dispatch (Sprint-A). Default stays human-readable for direct CLI
+    // dispatch (Phase-A). Default stays human-readable for direct CLI
     // use; JSON is opt-in for consumers like the qa-review skill that
     // need machine-parseable output. All progress/status lines go to
     // stderr when JSON is set so stdout is clean for `jq`.

@@ -2,11 +2,11 @@
 //!
 //! Generic over a `DependencyNode` trait so ONE readiness function
 //! (`is_ready`) and one reachability function (`reachable`) serve both
-//! Steps within a Task/Sprint AND Sprints within a Mission — the latter
-//! via the `SprintNode` adapter at the bottom of this file, which is what
-//! finally makes `Sprint.depends_on` dependency-aware instead of the
+//! Steps within a Task/Phase AND Phases within a Mission — the latter
+//! via the `PhaseNode` adapter at the bottom of this file, which is what
+//! finally makes `Phase.depends_on` dependency-aware instead of the
 //! historical flat `depends_on.is_empty()` "is this a root" filter (see
-//! `src/mission_run.rs::select_sprint` and `src/main.rs`'s `mission
+//! `src/mission_run.rs::select_phase` and `src/main.rs`'s `mission
 //! dispatch` fan-out, both migrated to `is_ready` via this adapter).
 //!
 //! `run_step_graph` is the actual DAG executor: compute every currently-
@@ -38,7 +38,7 @@
 //! classification is correctness/observability, not a measured speedup.
 
 use crate::step_kinds::StepKindRegistry;
-use crate::types::{NodeStatus, Sprint, SprintStatus, Step};
+use crate::types::{NodeStatus, Phase, PhaseStatus, Step};
 use anyhow::{anyhow, Result};
 use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
 use darkmux_gestalt::{Facts, FootprintEstimator};
@@ -48,7 +48,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ─── DependencyNode + readiness/reachability ───────────────────────────
 
 /// A node in a dependency graph — implemented by `Step` directly and, via
-/// `SprintNode`, by `Sprint` too (see module doc).
+/// `PhaseNode`, by `Phase` too (see module doc).
 pub trait DependencyNode {
     fn node_id(&self) -> &str;
     fn node_depends_on(&self) -> &[String];
@@ -67,16 +67,16 @@ impl DependencyNode for Step {
     }
 }
 
-/// `Sprint → DependencyNode` adapter. Maps `SprintStatus` onto
+/// `Phase → DependencyNode` adapter. Maps `PhaseStatus` onto
 /// `NodeStatus` (`Complete → Complete`, `Abandoned → Abandoned`,
-/// `Planned`/`Running` passthrough — `SprintStatus` has no `Error`
+/// `Planned`/`Running` passthrough — `PhaseStatus` has no `Error`
 /// variant, so that arm is unreachable from this mapping direction).
-/// `Copy` (just wraps a `&Sprint`) so building the `by_id` map the
+/// `Copy` (just wraps a `&Phase`) so building the `by_id` map the
 /// generic functions need is cheap.
 #[derive(Clone, Copy)]
-pub struct SprintNode<'a>(pub &'a Sprint);
+pub struct PhaseNode<'a>(pub &'a Phase);
 
-impl<'a> DependencyNode for SprintNode<'a> {
+impl<'a> DependencyNode for PhaseNode<'a> {
     fn node_id(&self) -> &str {
         &self.0.id
     }
@@ -85,10 +85,10 @@ impl<'a> DependencyNode for SprintNode<'a> {
     }
     fn node_status(&self) -> NodeStatus {
         match self.0.status {
-            SprintStatus::Planned => NodeStatus::Planned,
-            SprintStatus::Running => NodeStatus::Running,
-            SprintStatus::Complete => NodeStatus::Complete,
-            SprintStatus::Abandoned => NodeStatus::Abandoned,
+            PhaseStatus::Planned => NodeStatus::Planned,
+            PhaseStatus::Running => NodeStatus::Running,
+            PhaseStatus::Complete => NodeStatus::Complete,
+            PhaseStatus::Abandoned => NodeStatus::Abandoned,
         }
     }
 }
@@ -385,9 +385,9 @@ fn now_unix() -> u64 {
 
 /// One `FlowRecord` for a step-lifecycle transition (`"step start"` /
 /// `"step complete"` / `"step error"`). Mirrors `lifecycle.rs`'s
-/// `emit_sprint_transition_record` shape (`Category::Work`,
+/// `emit_phase_transition_record` shape (`Category::Work`,
 /// `Tier::Local` since these are scheduler-driven, not operator-explicit
-/// like a Sprint transition; `Stage::Dispatch` since a Step is
+/// like a Phase transition; `Stage::Dispatch` since a Step is
 /// dispatch-shaped work).
 fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
     FlowRecord {
@@ -398,7 +398,7 @@ fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
         stage: Stage::Dispatch,
         action: action.to_string(),
         handle: step.id.clone(),
-        sprint_id: None,
+        phase_id: None,
         session_id: Some(format!("task:{}", step.task_id)),
         source: Some("scheduler".to_string()),
         model: None,
@@ -546,11 +546,11 @@ mod tests {
     /// still `Planned`.
     #[test]
     fn doom_loop_m4_fixture_validate_cure_is_unreachable() {
-        let runtime_capture = crate::types::Sprint {
+        let runtime_capture = crate::types::Phase {
             id: "runtime-capture".to_string(),
             mission_id: "doom-loop-m4".to_string(),
             description: "runtime-side firing-time capture".to_string(),
-            status: SprintStatus::Planned,
+            status: PhaseStatus::Planned,
             depends_on: vec![],
             created_ts: 1_782_141_824,
             started_ts: None,
@@ -558,11 +558,11 @@ mod tests {
             abandoned_ts: None,
             task_ids: Vec::new(),
         };
-        let file_match = crate::types::Sprint {
+        let file_match = crate::types::Phase {
             id: "file-match".to_string(),
             mission_id: "doom-loop-m4".to_string(),
             description: "file-match precision".to_string(),
-            status: SprintStatus::Abandoned,
+            status: PhaseStatus::Abandoned,
             depends_on: vec![],
             created_ts: 1_782_141_824,
             started_ts: Some(1_782_141_937),
@@ -570,11 +570,11 @@ mod tests {
             abandoned_ts: Some(1_782_147_136),
             task_ids: Vec::new(),
         };
-        let sovereignty_verbs = crate::types::Sprint {
+        let sovereignty_verbs = crate::types::Phase {
             id: "sovereignty-verbs".to_string(),
             mission_id: "doom-loop-m4".to_string(),
             description: "lessons sovereignty verbs".to_string(),
-            status: SprintStatus::Planned,
+            status: PhaseStatus::Planned,
             depends_on: vec![],
             created_ts: 1_782_141_824,
             started_ts: None,
@@ -582,11 +582,11 @@ mod tests {
             abandoned_ts: None,
             task_ids: Vec::new(),
         };
-        let validate_cure = crate::types::Sprint {
+        let validate_cure = crate::types::Phase {
             id: "validate-cure".to_string(),
             mission_id: "doom-loop-m4".to_string(),
             description: "validate the cure".to_string(),
-            status: SprintStatus::Planned,
+            status: PhaseStatus::Planned,
             depends_on: vec![
                 "runtime-capture".to_string(),
                 "file-match".to_string(),
@@ -599,13 +599,13 @@ mod tests {
             task_ids: Vec::new(),
         };
 
-        let nodes: Vec<SprintNode> = vec![
-            SprintNode(&runtime_capture),
-            SprintNode(&file_match),
-            SprintNode(&sovereignty_verbs),
-            SprintNode(&validate_cure),
+        let nodes: Vec<PhaseNode> = vec![
+            PhaseNode(&runtime_capture),
+            PhaseNode(&file_match),
+            PhaseNode(&sovereignty_verbs),
+            PhaseNode(&validate_cure),
         ];
-        let by_id: BTreeMap<String, &SprintNode> = nodes
+        let by_id: BTreeMap<String, &PhaseNode> = nodes
             .iter()
             .map(|n| (n.node_id().to_string(), n))
             .collect();
@@ -615,10 +615,10 @@ mod tests {
             "validate-cure must be unreachable — file-match (a dependency) is abandoned"
         );
         assert!(
-            !is_ready(&SprintNode(&validate_cure), &by_id),
+            !is_ready(&PhaseNode(&validate_cure), &by_id),
             "validate-cure must not be ready either — file-match never completes"
         );
-        // The healthy sprints (no abandoned ancestors) remain reachable —
+        // The healthy phases (no abandoned ancestors) remain reachable —
         // this fixture isn't accidentally flagging the whole mission.
         assert!(reachable("runtime-capture", &by_id));
         assert!(reachable("sovereignty-verbs", &by_id));

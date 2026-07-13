@@ -232,7 +232,7 @@ mod tests {
             stage: crate::Stage::Dispatch,
             action: action.to_string(),
             handle: "test".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: Some("sess".to_string()),
             source: None,
             model: None,

@@ -65,7 +65,7 @@
 //! file, per the lab-vs-fleet scope boundary — a bench's hundreds of
 //! per-flag ruling records must never spam an operator's engagement
 //! stream). Three action families, vocabulary aligned with #1230/#1240's
-//! Mission → Sprint → Task → Step hierarchy so the records forward-port to
+//! Mission → Phase → Task → Step hierarchy so the records forward-port to
 //! the generic mission-flow graph view unchanged:
 //!
 //! - `funnel.task` — one funnel RUN's bookends (`payload.status` = `started`
@@ -386,7 +386,7 @@ const FUNNEL_RULING_ACTION: &str = "funnel.ruling";
 /// dispatch`'s per-role records); `session_id` = the case id (one funnel
 /// RUN's identity, the role `session_id` plays for a single dispatch).
 /// `source = "funnel"` distinguishes these from `crew_dispatch`/
-/// `sprint_review` records that may share the same sink. `category = Work`
+/// `phase_review` records that may share the same sink. `category = Work`
 /// / `tier = Local` / `stage = Dispatch` mirror `crew dispatch`'s own
 /// per-turn records (`dispatch.tool`, `dispatch.turn`) — the funnel is,
 /// mechanically, a multi-dispatch alternative shape of the same "produce a
@@ -406,7 +406,7 @@ fn funnel_flow_record(
         stage: darkmux_flow::Stage::Dispatch,
         action: action.to_string(),
         handle: crew_name.to_string(),
-        sprint_id: None,
+        phase_id: None,
         session_id: Some(case_id.to_string()),
         source: Some("funnel".to_string()),
         model: None,

@@ -249,7 +249,7 @@ pub(crate) fn build_router_full(
         .route("/machine/specs", get(machine_specs_handler))
         .route("/machine/memory", get(machine_memory_handler))
         .route("/missions", get(missions_handler))
-        .route("/sprints", get(sprints_handler))
+        .route("/phases", get(phases_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .route("/fleet/machines/live", get(fleet_machines_live_handler))
         .route("/lab/runs", get(lab_runs_handler))
@@ -590,8 +590,8 @@ const _: () = assert!(
 /// Build the lines of the startup banner. Factored out so tests can
 /// assert content without spawning the daemon.
 ///
-/// `mission_count` and `sprint_count` are loaded via
-/// `darkmux_crew::loader::load_missions`/`load_sprints` in production;
+/// `mission_count` and `phase_count` are loaded via
+/// `darkmux_crew::loader::load_missions`/`load_phases` in production;
 /// tests pass synthetic counts.
 #[allow(clippy::too_many_arguments)]
 fn build_startup_banner(
@@ -600,10 +600,10 @@ fn build_startup_banner(
     flows_dir_exists: bool,
     missions_dir: &std::path::Path,
     missions_dir_exists: bool,
-    sprints_dir: &std::path::Path,
-    sprints_dir_exists: bool,
+    phases_dir: &std::path::Path,
+    phases_dir_exists: bool,
     mission_count: usize,
-    sprint_count: usize,
+    phase_count: usize,
     lab_dir: Option<&std::path::Path>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
@@ -625,8 +625,8 @@ fn build_startup_banner(
         darkmux_types::style::dim(&mission_count.to_string())
     ));
     lines.push(format!(
-        "  sprints:        {} loaded",
-        darkmux_types::style::dim(&sprint_count.to_string())
+        "  phases:        {} loaded",
+        darkmux_types::style::dim(&phase_count.to_string())
     ));
 
     // CORS allowlist surface (#273) — operators with a localhost dev
@@ -690,10 +690,10 @@ fn build_startup_banner(
             missions_dir.display()
         )));
     }
-    if !sprints_dir_exists {
+    if !phases_dir_exists {
         lines.push(darkmux_types::style::warn(&format!(
-            "  ! sprints dir not found at {} (/sprints endpoint returns empty)",
-            sprints_dir.display()
+            "  ! phases dir not found at {} (/phases endpoint returns empty)",
+            phases_dir.display()
         )));
     }
 
@@ -756,12 +756,12 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         }
 
         // Print the startup panel (viewer URL, counts, warnings).
-        let sprints_dir = darkmux_crew::loader::sprints_dir();
-        let sprints_dir_exists = sprints_dir.exists();
+        let phases_dir = darkmux_crew::loader::phases_dir();
+        let phases_dir_exists = phases_dir.exists();
         let mission_count = darkmux_crew::loader::load_missions()
             .map(|v| v.len())
             .unwrap_or(0);
-        let sprint_count = darkmux_crew::loader::load_sprints()
+        let phase_count = darkmux_crew::loader::load_phases()
             .map(|v| v.len())
             .unwrap_or(0);
         for line in build_startup_banner(
@@ -770,10 +770,10 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             flows_dir_exists,
             &missions_dir,
             missions_dir_exists,
-            &sprints_dir,
-            sprints_dir_exists,
+            &phases_dir,
+            phases_dir_exists,
             mission_count,
-            sprint_count,
+            phase_count,
             lab_dir.as_deref(),
         ) {
             println!("{line}");
@@ -876,7 +876,7 @@ async fn health() -> axum::Json<serde_json::Value> {
     }))
 }
 
-/// Resolve the base directory holding per-sprint worktrees:
+/// Resolve the base directory holding per-phase worktrees:
 /// `~/.darkmux/worktrees` (HOME-less fallback `/tmp/darkmux/worktrees`).
 fn worktrees_base_dir() -> PathBuf {
     std::env::var("HOME")
@@ -1266,7 +1266,7 @@ pub(crate) async fn diff_handler(
 /// GET /missions — list of all missions from the JSON source-of-truth
 /// (`~/.darkmux/crew/missions/`). Includes status + transition timestamps
 /// (started_ts/closed_ts/paused_ts) so the viewer can render wall-clock
-/// durations and the sprint-progress widget. Empty array on no missions
+/// durations and the phase-progress widget. Empty array on no missions
 /// or unreachable crew root; never errors.
 async fn missions_handler() -> axum::Json<serde_json::Value> {
     let result = tokio::task::spawn_blocking(darkmux_crew::loader::load_missions).await;
@@ -1280,19 +1280,19 @@ async fn missions_handler() -> axum::Json<serde_json::Value> {
     }))
 }
 
-/// GET /sprints — list of all sprints from the JSON source-of-truth
-/// (`~/.darkmux/crew/sprints/`). Includes status + transition timestamps
+/// GET /phases — list of all phases from the JSON source-of-truth
+/// (`~/.darkmux/crew/phases/`). Includes status + transition timestamps
 /// (started_ts/completed_ts/abandoned_ts) so the viewer's wall-clock
-/// graphic can render Running sprints' live elapsed time + Complete
-/// sprints' frozen durations. Empty array on no sprints; never errors.
-async fn sprints_handler() -> axum::Json<serde_json::Value> {
-    let result = tokio::task::spawn_blocking(darkmux_crew::loader::load_sprints).await;
-    let sprints = match result {
+/// graphic can render Running phases' live elapsed time + Complete
+/// phases' frozen durations. Empty array on no phases; never errors.
+async fn phases_handler() -> axum::Json<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(darkmux_crew::loader::load_phases).await;
+    let phases = match result {
         Ok(Ok(s)) => s,
         _ => Vec::new(),
     };
     axum::Json(serde_json::json!({
-        "sprints": sprints,
+        "phases": phases,
         "generated_at_ms": current_millis(),
     }))
 }
@@ -5133,9 +5133,9 @@ mod tests {
     fn startup_banner_contains_core_info() {
         let flows = PathBuf::from("/tmp/darkmux-flows-banner-test");
         let missions = PathBuf::from("/tmp/darkmux-missions-banner-test");
-        let sprints = PathBuf::from("/tmp/darkmux-sprints-banner-test");
+        let phases = PathBuf::from("/tmp/darkmux-phases-banner-test");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &sprints, true, 3, 9, None,
+            &sample_addr(), &flows, true, &missions, true, &phases, true, 3, 9, None,
         );
 
         // Title carries the binary version that operators bump via cargo install.
@@ -5150,7 +5150,7 @@ mod tests {
         assert!(joined.contains(darkmux_flow::FLOW_SCHEMA_VERSION), "schema version shown");
         assert!(joined.contains("/tmp/darkmux-flows-banner-test"), "flows dir shown");
         assert!(joined.contains("missions:       3 loaded"), "mission count rendered");
-        assert!(joined.contains("sprints:        9 loaded"), "sprint count rendered");
+        assert!(joined.contains("phases:        9 loaded"), "phase count rendered");
         assert!(joined.contains("ready"), "ready line present");
         assert!(joined.contains("Ctrl-C"), "Ctrl-C hint present");
     }
@@ -5159,9 +5159,9 @@ mod tests {
     fn startup_banner_warns_on_missing_flows_dir() {
         let flows = PathBuf::from("/tmp/darkmux-banner-missing-flows");
         let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
-        let sprints = PathBuf::from("/tmp/darkmux-banner-present-sprints");
+        let phases = PathBuf::from("/tmp/darkmux-banner-present-phases");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, false, &missions, true, &sprints, true, 0, 0, None,
+            &sample_addr(), &flows, false, &missions, true, &phases, true, 0, 0, None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -5173,8 +5173,8 @@ mod tests {
             "should not warn about missions when missions dir exists"
         );
         assert!(
-            !joined.contains("sprints dir not found"),
-            "should not warn about sprints when sprints dir exists"
+            !joined.contains("phases dir not found"),
+            "should not warn about phases when phases dir exists"
         );
     }
 
@@ -5182,9 +5182,9 @@ mod tests {
     fn startup_banner_warns_on_missing_missions_dir() {
         let flows = PathBuf::from("/tmp/darkmux-banner-present-flows");
         let missions = PathBuf::from("/tmp/darkmux-banner-missing-missions");
-        let sprints = PathBuf::from("/tmp/darkmux-banner-present-sprints");
+        let phases = PathBuf::from("/tmp/darkmux-banner-present-phases");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, false, &sprints, true, 0, 0, None,
+            &sample_addr(), &flows, true, &missions, false, &phases, true, 0, 0, None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -5196,27 +5196,27 @@ mod tests {
             "missions warning should include the path"
         );
         assert!(
-            !joined.contains("sprints dir not found"),
-            "should not warn about sprints when sprints dir exists"
+            !joined.contains("phases dir not found"),
+            "should not warn about phases when phases dir exists"
         );
     }
 
     #[test]
-    fn startup_banner_warns_on_missing_sprints_dir() {
+    fn startup_banner_warns_on_missing_phases_dir() {
         let flows = PathBuf::from("/tmp/darkmux-banner-present-flows");
         let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
-        let sprints = PathBuf::from("/tmp/darkmux-banner-missing-sprints");
+        let phases = PathBuf::from("/tmp/darkmux-banner-missing-phases");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &sprints, false, 0, 0, None,
+            &sample_addr(), &flows, true, &missions, true, &phases, false, 0, 0, None,
         );
         let joined = lines.join("\n");
         assert!(
-            joined.contains("sprints dir not found"),
-            "expected sprints warning; got: {joined}"
+            joined.contains("phases dir not found"),
+            "expected phases warning; got: {joined}"
         );
         assert!(
-            joined.contains("/tmp/darkmux-banner-missing-sprints"),
-            "sprints warning should include the path"
+            joined.contains("/tmp/darkmux-banner-missing-phases"),
+            "phases warning should include the path"
         );
     }
 
@@ -5224,14 +5224,14 @@ mod tests {
     fn startup_banner_no_warnings_when_state_is_clean() {
         let flows = PathBuf::from("/some/flows");
         let missions = PathBuf::from("/some/missions");
-        let sprints = PathBuf::from("/some/sprints");
+        let phases = PathBuf::from("/some/phases");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &sprints, true, 1, 4, None,
+            &sample_addr(), &flows, true, &missions, true, &phases, true, 1, 4, None,
         );
         let joined = lines.join("\n");
         assert!(!joined.contains("doesn't exist yet"), "no flows warning");
         assert!(!joined.contains("missions dir not found"), "no missions warning");
-        assert!(!joined.contains("sprints dir not found"), "no sprints warning");
+        assert!(!joined.contains("phases dir not found"), "no phases warning");
     }
 
     /// (#1247 Part 3) The banner names whichever lab-dir state is true —
@@ -5241,9 +5241,9 @@ mod tests {
     fn startup_banner_reports_lab_dir_state() {
         let flows = PathBuf::from("/some/flows");
         let missions = PathBuf::from("/some/missions");
-        let sprints = PathBuf::from("/some/sprints");
+        let phases = PathBuf::from("/some/phases");
         let unconfigured = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &sprints, true, 0, 0, None,
+            &sample_addr(), &flows, true, &missions, true, &phases, true, 0, 0, None,
         )
         .join("\n");
         assert!(
@@ -5253,7 +5253,7 @@ mod tests {
 
         let lab = PathBuf::from("/some/lab-runs");
         let configured = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &sprints, true, 0, 0, Some(&lab),
+            &sample_addr(), &flows, true, &missions, true, &phases, true, 0, 0, Some(&lab),
         )
         .join("\n");
         assert!(
@@ -5983,7 +5983,7 @@ mod tests {
         let wt_base = TempDir::new().unwrap();
 
         // Create a real git repo inside the base.
-        let wt_dir = wt_base.path().join("myrepo").join("sprint1");
+        let wt_dir = wt_base.path().join("myrepo").join("phase1");
         std::fs::create_dir_all(&wt_dir).unwrap();
 
         // Initialize git repo.

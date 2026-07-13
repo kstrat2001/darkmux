@@ -1,4 +1,4 @@
-//! `darkmux sprint estimate` — pre-dispatch budget oracle.
+//! `darkmux phase estimate` — pre-dispatch budget oracle.
 //!
 //! Deterministic Rust function: parse a workload spec, compute predicted
 //! token consumption across the planned turn count, pick the smallest
@@ -38,7 +38,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-/// Build a `FlowRecord` for sprint review verbs.
+/// Build a `FlowRecord` for phase review verbs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_review_record(
     level: crate::flow::Level,
@@ -48,7 +48,7 @@ pub(crate) fn build_review_record(
     action: String,
     handle: String,
     session_id: &str,
-    sprint_id: Option<&str>,
+    phase_id: Option<&str>,
 ) -> crate::flow::FlowRecord {
     use crate::flow::ts_utc_now;
     crate::flow::FlowRecord {
@@ -59,10 +59,10 @@ pub(crate) fn build_review_record(
         stage,
         action,
         handle,
-        sprint_id: sprint_id.map(String::from),
-        source: Some("sprint_review".to_string()),
+        phase_id: phase_id.map(String::from),
+        source: Some("phase_review".to_string()),
         session_id: Some(session_id.to_string()),
-        // Sprint review records describe the review verb's lifecycle —
+        // Phase review records describe the review verb's lifecycle —
         // they don't represent a single model's work. The inner crew
         // dispatch (`code-reviewer`) emits its own dispatch records via
         // crew::dispatch::build_dispatch_record with model stamped.
@@ -200,7 +200,7 @@ fn collect_profile_capacities(
             // (#590) The compactor signal is the machine-level internal.utility
             // binding now, not a role in the profile's models[].
             let has_compactor = reg.utility_model_id().is_some();
-            // Resolve the compaction ratio for sprint budget projections.
+            // Resolve the compaction ratio for phase budget projections.
             // Precedence: typed `threshold_ratio` (#368 clean-break
             // primary surface) → 0.35 default.
             // (#394) Schema-isolation doctrine — the internal runtime reads ONLY
@@ -514,9 +514,9 @@ pub fn estimate(spec_path: &Path, narrate: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// Structured output for `sprint review` (stdout JSON).
+/// Structured output for `phase review` (stdout JSON).
 #[derive(Debug, Clone, Serialize)]
-pub struct SprintReviewOutput {
+pub struct PhaseReviewOutput {
     pub branch: String,
     pub base: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -548,7 +548,7 @@ pub struct ReviewFinding {
 
 /// Parsed result from a QA-REVIEW-SIGNOFF block (internal, not serialized).
 /// Fields are module-private — `parse_signoff` returns the value; callers
-/// within `sprint_cli` read the fields directly. External `pub` was excessive.
+/// within `phase_cli` read the fields directly. External `pub` was excessive.
 pub(crate) struct SignoffParse {
     block: usize,
     flag: usize,
@@ -724,18 +724,18 @@ fn count_files_changed(path: &Path, base: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Internal entry for `sprint review` taking an explicit repo path.
-/// Core of `sprint review`: run the reviewer dispatch against `path`'s diff
-/// vs `base` and return the structured [`SprintReviewOutput`] (verdict +
+/// Internal entry for `phase review` taking an explicit repo path.
+/// Core of `phase review`: run the reviewer dispatch against `path`'s diff
+/// vs `base` and return the structured [`PhaseReviewOutput`] (verdict +
 /// findings). Does NOT print or map an exit code — callers decide how to
-/// surface it. `sprint_review_at` is the thin CLI wrapper (JSON + exit code);
+/// surface it. `phase_review_at` is the thin CLI wrapper (JSON + exit code);
 /// `mission run` (#782b) consumes the struct directly for a colorized
 /// at-the-gate summary.
-pub(crate) fn sprint_review_output_at(
+pub(crate) fn phase_review_output_at(
     path: &Path,
     base: Option<&str>,
-    sprint_id: Option<&str>,
-) -> Result<SprintReviewOutput> {
+    phase_id: Option<&str>,
+) -> Result<PhaseReviewOutput> {
     // Capture branch name.
     let branch = Command::new("git")
         .args(["branch", "--show-current"])
@@ -751,7 +751,7 @@ pub(crate) fn sprint_review_output_at(
         .unwrap_or_else(|| "unknown".to_string());
 
     let session_id = format!(
-        "sprint-review-{}",
+        "phase-review-{}",
         std::time::UNIX_EPOCH
             .elapsed()
             .unwrap_or_default()
@@ -764,15 +764,15 @@ pub(crate) fn sprint_review_output_at(
         crate::flow::Category::Review,
         crate::flow::Tier::Frontier,
         crate::flow::Stage::Review,
-        "sprint review begin".to_string(),
+        "phase review begin".to_string(),
         branch.clone(),
         &session_id,
-        sprint_id,
+        phase_id,
     ));
 
     // Run `git diff <base>` (working-tree-inclusive). NOT `<base>..HEAD` —
     // that would only see committed changes, missing the pre-PR review case
-    // (the whole point of `sprint review` is to review work before it ships,
+    // (the whole point of `phase review` is to review work before it ships,
     // which is by definition uncommitted at the moment of review).
     let base_ref = base.unwrap_or("main");
     let diff_output = Command::new("git")
@@ -785,7 +785,7 @@ pub(crate) fn sprint_review_output_at(
 
     // Empty diff → no dispatch needed.
     if diff.trim().is_empty() {
-        let output = SprintReviewOutput {
+        let output = PhaseReviewOutput {
             branch: branch.clone(),
             base: base_ref.to_string(),
             reviewer_session_id: Some(session_id.clone()),
@@ -808,7 +808,7 @@ pub(crate) fn sprint_review_output_at(
             "verdict: clean".to_string(),
             "0B / 0F / 0N".to_string(),
             &session_id,
-            sprint_id,
+            phase_id,
         ));
         return Ok(output);
     }
@@ -854,33 +854,33 @@ pub(crate) fn sprint_review_output_at(
         session_id: Some(session_id.clone()),
         timeout_seconds: 600,
         skip_preflight: false,
-        // Sprint review parses the SIGNOFF text from the dispatch's
+        // Phase review parses the SIGNOFF text from the dispatch's
         // human-readable stdout — no JSON envelope needed.
         json: false,
-        // Sprint review doesn't ask the reviewer to write files — it
+        // Phase review doesn't ask the reviewer to write files — it
         // parses the SIGNOFF text from the dispatch's stdout. Skip the
-        // watched-state echo to keep sprint review output focused.
+        // watched-state echo to keep phase review output focused.
         watch_paths: Vec::new(),
-        // Sprint review reads operator-supplied diffs; no scope override.
+        // Phase review reads operator-supplied diffs; no scope override.
         workdir: None,
-        // Sprint review is a code-reviewer dispatch on the sprint's diff,
-        // not on the sprint's own work. No cross-sprint context needed.
-        sprint_id: None,
-        // Sprint review dispatches through the internal Docker-bounded
+        // Phase review is a code-reviewer dispatch on the phase's diff,
+        // not on the phase's own work. No cross-phase context needed.
+        phase_id: None,
+        // Phase review dispatches through the internal Docker-bounded
         // runtime — same default as `darkmux crew dispatch` (#309).
         // Operators who prefer openclaw can run the underlying
         // `darkmux crew dispatch code-reviewer --runtime openclaw` by
-        // hand; sprint review itself goes through DM's substrate so
+        // hand; phase review itself goes through DM's substrate so
         // openclaw is genuinely optional (Beat 36).
         runtime: crate::crew::dispatch::Runtime::Internal,
-        // Sprint review pins Runtime::Internal; runtime_cmd is unused
+        // Phase review pins Runtime::Internal; runtime_cmd is unused
         // by the internal path. Default to "openclaw" for parity with
-        // the rest of the codebase post-Sprint-E.
+        // the rest of the codebase post-Phase-E.
         runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
-        // Sprint dispatch defaults to runtime's built-in compaction;
-        // sprint context isn't tied to a profile in this entry path.
+        // Phase dispatch defaults to runtime's built-in compaction;
+        // phase context isn't tied to a profile in this entry path.
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
         // (#549) No `--profile` override; fall back to `default_profile`.
         profile_name: None,
@@ -903,7 +903,7 @@ pub(crate) fn sprint_review_output_at(
         "dispatch code-reviewer".to_string(),
         session_id.clone(),
         &session_id,
-        sprint_id,
+        phase_id,
     ));
 
     let dispatch_result = match crate::fleet::dispatch_routed(dispatch_opts) {
@@ -917,7 +917,7 @@ pub(crate) fn sprint_review_output_at(
                 "dispatch failed".to_string(),
                 truncate(&format!("{e}"), 200),
                 &session_id,
-                sprint_id,
+                phase_id,
             ));
             eprintln!("warning: crew dispatch failed ({e}); emitting empty review");
             return Err(anyhow::anyhow!("crew dispatch failed: {e}"));
@@ -927,12 +927,12 @@ pub(crate) fn sprint_review_output_at(
     // Unwrap the openclaw JSON envelope FIRST — the SIGNOFF text lives inside
     // .payloads[].text, escaped. Without unwrapping, parse_signoff sees JSON
     // keys instead of the actual newline-separated SIGNOFF lines and finds
-    // zero matches. Recursive bug from sprint A's own dogfood. See
+    // zero matches. Recursive bug from phase A's own dogfood. See
     // unwrap_envelope_text.
     let unwrapped = unwrap_envelope_text(&dispatch_result.stdout);
     let signoff = parse_signoff(&unwrapped);
 
-    let output = SprintReviewOutput {
+    let output = PhaseReviewOutput {
         branch,
         base: base_ref.to_string(),
         reviewer_session_id: Some(session_id.clone()),
@@ -956,22 +956,22 @@ pub(crate) fn sprint_review_output_at(
         format!("verdict: {}", signoff.verdict.clone()),
         format!("{}B / {}F / {}N", signoff.block, signoff.flag, signoff.nit),
         &session_id,
-        sprint_id,
+        phase_id,
     ));
 
     Ok(output)
 }
 
-/// Thin CLI wrapper over [`sprint_review_output_at`]: prints the JSON output
+/// Thin CLI wrapper over [`phase_review_output_at`]: prints the JSON output
 /// and maps to an exit code (`1` when `require_clean` and blockers exist,
-/// else `0`). Preserves the original `sprint review` CLI contract.
-pub(crate) fn sprint_review_at(
+/// else `0`). Preserves the original `phase review` CLI contract.
+pub(crate) fn phase_review_at(
     path: &Path,
     base: Option<&str>,
     require_clean: bool,
-    sprint_id: Option<&str>,
+    phase_id: Option<&str>,
 ) -> Result<i32> {
-    let output = sprint_review_output_at(path, base, sprint_id)?;
+    let output = phase_review_output_at(path, base, phase_id)?;
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(if require_clean && output.by_severity.block > 0 {
         1
@@ -980,20 +980,20 @@ pub(crate) fn sprint_review_at(
     })
 }
 
-/// Public entry for `sprint review` — delegates to `sprint_review_at`.
-pub fn sprint_review(
+/// Public entry for `phase review` — delegates to `phase_review_at`.
+pub fn phase_review(
     base: Option<&str>,
     require_clean: bool,
-    sprint_id: Option<&str>,
+    phase_id: Option<&str>,
 ) -> Result<i32> {
-    // Pre-flight: nudge if the daemon isn't reachable. Sprint review
+    // Pre-flight: nudge if the daemon isn't reachable. Phase review
     // dispatches code-reviewer internally and emits Review-category
     // flow records; both surfaces are invisible in the viewer when
     // the daemon is down. Non-blocking — review still runs (#104 S3).
-    crate::serve::nudge_if_daemon_unreachable("sprint review");
+    crate::serve::nudge_if_daemon_unreachable("phase review");
 
     let path = std::env::current_dir()?;
-    sprint_review_at(&path, base, require_clean, sprint_id)
+    phase_review_at(&path, base, require_clean, phase_id)
 }
 
 #[cfg(test)]
@@ -1433,7 +1433,7 @@ mod tests {
         assert_eq!(output.recommendation.target_profile, "deep");
     }
 
-    // ── sprint review tests ─────────────────────────────────────────────
+    // ── phase review tests ─────────────────────────────────────────────
 
     fn sample_signoff() -> String {
         "QA-REVIEW-SIGNOFF\n\
@@ -1491,7 +1491,7 @@ mod tests {
     #[test]
     fn parse_signoff_accepts_markdown_bold_marker() {
         // Reviewers (especially Claude/Llama) often emit `- **FLAG**` instead
-        // of `- [FLAG]`. Empirically caught during Sprint 1 of #66's dogfood
+        // of `- [FLAG]`. Empirically caught during Phase 1 of #66's dogfood
         // — the verb returned `indeterminate` despite reviewer producing real
         // findings, because the parser only accepted bracketed markers.
         let input = "QA-REVIEW-SIGNOFF\n\
@@ -1562,7 +1562,7 @@ mod tests {
         assert_eq!(result.verdict, "blockers");
     }
 
-    // ── sprint review flow record tests ───────────────────────────────────
+    // ── phase review flow record tests ───────────────────────────────────
 
     struct FlowsDirGuard {
         prev: Option<String>,
@@ -1610,7 +1610,7 @@ mod tests {
             .output()
             .ok();
 
-        crate::sprint_cli::sprint_review_at(repo.path(), None, false, Some("66")).unwrap();
+        crate::phase_cli::phase_review_at(repo.path(), None, false, Some("66")).unwrap();
 
         // Read all jsonl files; expect 2 records (start + verdict).
         let files: Vec<_> = std::fs::read_dir(guard.path())
@@ -1633,7 +1633,7 @@ mod tests {
 
         // Parse each and check the first is review-start.
         let start: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
-        assert_eq!(start["action"], "sprint review begin");
+        assert_eq!(start["action"], "phase review begin");
         assert_eq!(start["category"], "review");
         assert_eq!(start["tier"], "frontier");
 
@@ -1656,7 +1656,7 @@ mod tests {
             .output()
             .ok();
 
-        crate::sprint_cli::sprint_review_at(repo.path(), None, false, Some("66")).unwrap();
+        crate::phase_cli::phase_review_at(repo.path(), None, false, Some("66")).unwrap();
 
         let records = collect_records(guard.path());
         // Find verdict record (action starts with "verdict:").
@@ -1679,19 +1679,19 @@ mod tests {
     #[test]
     fn dispatch_failed_record_has_error_level_and_machinery_category() {
         // Test the dispatch-failed record SHAPE directly via build_review_record.
-        // Triggering a real dispatch failure inside sprint_review_at requires a
+        // Triggering a real dispatch failure inside phase_review_at requires a
         // repo with a non-empty diff against `main` AND a guaranteed dispatch
         // path — neither is reliable across CI envs (the temp repo has no
         // `main` branch in CI's git defaults). Testing the helper directly
         // captures the contract without env-coupling.
-        let record = crate::sprint_cli::build_review_record(
+        let record = crate::phase_cli::build_review_record(
             crate::flow::Level::Error,
             crate::flow::Category::Machinery,
             crate::flow::Tier::Local,
             crate::flow::Stage::Review,
             "dispatch failed".to_string(),
             "openclaw exit 1".to_string(),
-            "sprint-review-12345",
+            "phase-review-12345",
             Some("66"),
         );
 
@@ -1701,9 +1701,9 @@ mod tests {
         assert_eq!(json["tier"], "local");
         assert_eq!(json["stage"], "review");
         assert_eq!(json["action"], "dispatch failed");
-        assert_eq!(json["source"], "sprint_review");
-        assert_eq!(json["sprint_id"], "66");
-        assert_eq!(json["session_id"], "sprint-review-12345");
+        assert_eq!(json["source"], "phase_review");
+        assert_eq!(json["phase_id"], "66");
+        assert_eq!(json["session_id"], "phase-review-12345");
     }
 
     #[serial_test::serial]
@@ -1735,7 +1735,7 @@ mod tests {
             std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
         }
 
-        let result = crate::sprint_cli::sprint_review_at(repo.path(), None, false, Some("66"));
+        let result = crate::phase_cli::phase_review_at(repo.path(), None, false, Some("66"));
 
         unsafe {
             match prev {

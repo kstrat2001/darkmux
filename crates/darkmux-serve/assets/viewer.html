@@ -458,7 +458,7 @@
   .sps{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;padding:3px 8px;border-radius:10px;min-width:74px;text-align:center}
   .sps.complete{background:#1c1c22;color:var(--muted)}.sps.active{background:#16261d;color:var(--good)}.sps.backlog{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
   .sps.errored{background:#2a1416;color:var(--bad)}
-  /* (#827 Slice B) durable sprint statuses + cycle pipeline */
+  /* (#827 Slice B) durable phase statuses + cycle pipeline */
   .sps.running{background:#16261d;color:var(--good)}.sps.planned{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
   .sps.abandoned{background:#241a1a;color:var(--muted)}
   .cycstrip{display:inline-flex;align-items:center;gap:3px;flex:0 0 auto}
@@ -641,7 +641,7 @@
     /* mission index rows: reflow, meta drops to its own line */
     .mirow { flex-wrap: wrap; }
     .mimeta { flex: 1 1 100%; }
-    /* sprint rows: reflow; the 190px-min run-target column would overflow */
+    /* phase rows: reflow; the 190px-min run-target column would overflow */
     .sprow { flex-wrap: wrap; }
     .spa { min-width: 0; text-align: left; }
     .sprun { flex: 1 1 100%; text-align: left; }
@@ -741,13 +741,13 @@
 // docs/demo/demo-flow.jsonl — so the demo is identical to a local `/play`.
 // There is no demo fork; edit this viewer, then regenerate.
 let DATA = [];
-// (#827 Slice A) Durable mission/sprint structure from /missions + /sprints —
+// (#827 Slice A) Durable mission/phase structure from /missions + /phases —
 // the WORK plan, distinct from the flow-record run history. Fetched at boot
 // (best-effort; empty under the static demo / no daemon, where the missions
 // index falls back to mission_ids found in the flow). Joined in the missions
-// lens so a planned-but-not-yet-run sprint still shows.
+// lens so a planned-but-not-yet-run phase still shows.
 let MISSIONS = [];
-let SPRINTS = [];
+let PHASES = [];
 let DATA_SOURCE = "no records yet";
 // (#1132) Last mode/date seen by setBadges — the about modal reads these for
 // its mode row (they're otherwise function-locals in boot/setBadges).
@@ -1059,7 +1059,7 @@ function liveSubject(){
   const pick=uniq.find(r=>r.mission_id)||uniq[0]; // prefer a mission-scoped subject
   const count=uniq.length-1;                      // other live sessions
   if(pick.mission_id){
-    const sp=pick.sprint_id?` · sprint ${esc(pick.sprint_id)}`:'';
+    const sp=pick.phase_id?` · phase ${esc(pick.phase_id)}`:'';
     return {mission:true, label:`${esc(pick.mission_id)}${sp} on ${escN(uidOf(pick))}`, count};
   }
   const role=(pick.handle||'').replace(/^darkmux\//,'')||'dispatch';
@@ -1545,7 +1545,7 @@ function recentRow(n,ord,freshCls){
   const timing=n.startTs!=null?`${clk(n.startTs)}${n.closeTs!=null?' → '+clk(n.closeTs)+(dur?' ('+dur+')':''):''}`:'';
   const detail=[
     kv('session',`${esc(n.sid)} &nbsp;<a data-act="session" data-arg="${esc(n.sid)}">open →</a>`),
-    n.mission?kv('mission',esc(n.mission)+(n.sprint?` · sprint ${esc(n.sprint)}`:'')):'',
+    n.mission?kv('mission',esc(n.mission)+(n.phase?` · phase ${esc(n.phase)}`:'')):'',
     kv('about',about),
     kv('workspace',esc(sp.workspace)),
     kv('result',`<span class="${(n.errored||n.killed)?'wallerr':''}">${result}</span>`),
@@ -1643,7 +1643,7 @@ function renderMachine(){
     const errored=!!(c&&dispatchErrored(c)), killed=!!(c&&dispatchKilled(c));
     if(s){
       return {cls, lbl, pill:cls, closeTs, startTs, sid, handle:s.handle, model:s.model||'?',
-        mission:s.mission_id||null, sprint:s.sprint_id||null,
+        mission:s.mission_id||null, phase:s.phase_id||null,
         startPayload:s.payload||null, donePayload, errored, killed, hasStart:true,
         html:`<div class="node" data-act="session" data-arg="${esc(sid)}"><div class="h"><span class="nico">${ICON.worker}</span>${esc(s.handle)}</div>
         <div class="s">specialist role · ${esc(s.model||'?')}</div>
@@ -1660,7 +1660,7 @@ function renderMachine(){
     const fbTs=closeTs??(first.ts?T(first.ts):null);
     const fbLine=fbTs!=null?`<div class="s tsline">${stamp(closeTs!=null?'completed':'seen',fbTs)}</div>`:'';
     return {cls:'ended', lbl:'no start', pill:'warn', closeTs, startTs:first.ts?T(first.ts):null,
-      sid, handle, model, mission:first.mission_id||null, sprint:null,
+      sid, handle, model, mission:first.mission_id||null, phase:null,
       startPayload:null, donePayload, errored, killed, hasStart:false,
       html:`<div class="node" data-act="session" data-arg="${esc(sid)}"><div class="h"><span class="nico">${ICON.worker}</span>${esc(handle)}</div>
       <div class="s">role · ${esc(model)}</div>
@@ -1772,8 +1772,8 @@ function drillLoose(m){
 // header/brief — the prompt's scroll + open state survives the ~1/sec cadence.
 function runRegions(){
   const sid=state.session, m=state.machine; $("logscope").textContent=sid;
-  // (#1013) A sprint re-run REUSES the deterministic session id
-  // (mission-run-<mission>-<sprint>), so DATA for `sid` can hold MULTIPLE
+  // (#1013) A phase re-run REUSES the deterministic session id
+  // (mission-run-<mission>-<phase>), so DATA for `sid` can hold MULTIPLE
   // dispatch attempts. Scope this drill-down to the attempt active at the
   // scrubber — records from the most-recent dispatch.start AT/BEFORE state.t
   // onward — so wall clock, detections, and metrics describe ONE dispatch, not a
@@ -1864,7 +1864,7 @@ function runRegions(){
     kv('image', sp.image?esc(sp.image):''),
     kv('model', model?esc(model):''),
     kv('workspace', sp.workspace?esc(sp.workspace):''),
-    (d&&d.mission_id)?kv('mission', esc(d.mission_id)+(d.sprint_id?' · sprint '+esc(d.sprint_id):'')):'',
+    (d&&d.mission_id)?kv('mission', esc(d.mission_id)+(d.phase_id?' · phase '+esc(d.phase_id):'')):'',
     kv('timing', briefTiming),
   ].filter(Boolean).join('');
   // (#1127) The prompt is rendered as a collapsed <details> (it can be KB-long)
@@ -2166,8 +2166,8 @@ function renderLog(){
 }
 function renderCrumb(){
   // Mission crumb only when the loaded data actually has a mission. Lab/dispatch
-  // playback (no mission_id) starts at fleet. (Live mission/sprint detail is a
-  // follow-up seam — /missions + /sprints; MISSION stays the sample fixture.)
+  // playback (no mission_id) starts at fleet. (Live mission/phase detail is a
+  // follow-up seam — /missions + /phases; MISSION stays the sample fixture.)
   // (#691) Gate on the live-SCOPED mission, not the global count — in live mode
   // with nothing running, primaryMission() is null and the crumb drops the
   // mission link (no stale "◆ m6"). Playback: primaryMission()=missions[0].
@@ -2263,27 +2263,27 @@ window.goMission=()=>{ if(!missions.length)return goFleet(); state.level="missio
 // (#827 Slice A) The missions lens: index (all missions) + drill to one mission.
 window.goMissions=()=>{ state.level="missions";state.machine=null;state.session=null;state.missionId=null;state.follow=true;render();};
 window.drillMission=id=>{ state.level="mission";state.machine=null;state.session=null;state.missionId=id;state.follow=true;render();};
-// (#827 Slice A) Fetch the durable mission + sprint structure. Best-effort:
+// (#827 Slice A) Fetch the durable mission + phase structure. Best-effort:
 // any failure leaves the caches empty and the index falls back to flow-derived
 // mission_ids. Async, awaited once at boot (Slice A doesn't live-poll it).
-async function loadMissionsSprints(mUrl, sUrl){
+async function loadMissionsPhases(mUrl, pUrl){
   // Daemon path defaults to the live endpoints; the static demo passes the
   // committed fixture files (no daemon) — same join, different source, exactly
   // like flow-src vs the /flow endpoint (#827 Slice C).
-  mUrl=mUrl||"/missions"; sUrl=sUrl||"/sprints";
+  mUrl=mUrl||"/missions"; pUrl=pUrl||"/phases";
   try{
     const [m,s]=await Promise.all([
       fetch(mUrl,{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
-      fetch(sUrl,{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch(pUrl,{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
     ]);
     MISSIONS=(m&&Array.isArray(m.missions))?m.missions:[];
-    SPRINTS=(s&&Array.isArray(s.sprints))?s.sprints:[];
-  }catch(_){ MISSIONS=[]; SPRINTS=[]; }
+    PHASES=(s&&Array.isArray(s.phases))?s.phases:[];
+  }catch(_){ MISSIONS=[]; PHASES=[]; }
 }
 // (#827 Slice A) The missions index — every mission, durable plan joined with
 // flow-record history. Rows union /missions structs with mission_ids seen in
 // the flow (so it works under the demo without a /missions endpoint). Each row:
-// status, sprint progress (from the durable plan), machines touched + token
+// status, phase progress (from the durable plan), machines touched + token
 // rollup (from the flow), last activity. Click → that mission's detail.
 function renderMissionsIndex(){
   $("logscope").textContent="missions"; state.stageScope=()=>true;
@@ -2293,9 +2293,9 @@ function renderMissionsIndex(){
   const byId={}; MISSIONS.forEach(m=>{ if(m&&m.id)byId[m.id]=m; });
   // (#827 QA) One pass to bucket records by mission_id — avoids re-filtering
   // the whole visible window per row (O(n×m) → O(n+m)) on every live render.
-  const recsBy={}, sprBy={};
+  const recsBy={}, phBy={};
   visible().forEach(r=>{ if(r.mission_id){(recsBy[r.mission_id]||(recsBy[r.mission_id]=[])).push(r);} });
-  SPRINTS.forEach(s=>{ if(s&&s.mission_id){(sprBy[s.mission_id]||(sprBy[s.mission_id]=[])).push(s);} });
+  PHASES.forEach(s=>{ if(s&&s.mission_id){(phBy[s.mission_id]||(phBy[s.mission_id]=[])).push(s);} });
   const rows=[...ids].map(id=>{
     const m=byId[id]||null;
     // (#827 Slice B) status is the durable MISSION status; a mission with no
@@ -2303,11 +2303,11 @@ function renderMissionsIndex(){
     // a separate provenance tag, NOT jammed into the status slot.
     const status=m?(m.status||"active"):"untracked";
     const known=!!m;
-    // Sprint progress from the durable plan when present.
-    const sids=(m&&Array.isArray(m.sprint_ids))?m.sprint_ids:[];
-    const sprintObjs=sprBy[id]||[];
-    const total=sids.length||sprintObjs.length;
-    const done=sprintObjs.filter(s=>s.status==="complete").length;
+    // Phase progress from the durable plan when present.
+    const sids=(m&&Array.isArray(m.phase_ids))?m.phase_ids:[];
+    const phaseObjs=phBy[id]||[];
+    const total=sids.length||phaseObjs.length;
+    const done=phaseObjs.filter(s=>s.status==="complete").length;
     const pct=total?Math.round(done/total*100):0;
     // Cross-machine + token rollup from the flow.
     const recs=recsBy[id]||[];
@@ -2319,7 +2319,7 @@ function renderMissionsIndex(){
   }).sort((a,b)=> (a.status==="closed")-(b.status==="closed") || b.last-a.last );
   const body=rows.length?rows.map(r=>{
     const prog=r.total?`<span class="miprog"><span class="mibar"><span style="width:${r.pct}%"></span></span> ${r.done}/${r.total}</span>`
-                      :`<span class="midim">no sprints yet</span>`;
+                      :`<span class="midim">no phases yet</span>`;
     const tok=r.toks?` · ${fmtC(r.toks)} tok`:'';
     const mach=r.machs.length?` · ${esc(r.machs.length===1?r.machs[0]:r.machs.length+' machines')}`:'';
     // closed → done check; untracked (flow-only) → a quiet provenance tag, not
@@ -2336,10 +2336,10 @@ function renderMissionsIndex(){
   $("stage").innerHTML=savingsHero()+`<div><div class="stagehdr">missions · ${rows.length} total</div>
     <div class="milist">${body}</div></div>`;
 }
-// (#827 Slice B) The furthest cycle stage a sprint reached, from its
+// (#827 Slice B) The furthest cycle stage a phase reached, from its
 // mission-run session's `mission.run.*` records (≤ playhead). The loop is
 // run → qa → gate → ship; QA sits between run and gate, so reaching the gate
-// implies QA ran. `aborted` is the alternate terminal. Empty when the sprint
+// implies QA ran. `aborted` is the alternate terminal. Empty when the phase
 // has no mission.run records in the window (historical / never-run).
 // The session id `mission run` stamps (server: format!("mission-run-{m}-{s}")).
 // Built by concatenation, NOT template interpolation, so the XSS source-guard's
@@ -2354,8 +2354,8 @@ const clsSafe=s=>String(s).replace(/[^a-z]/gi,'');
 // /missions struct) — same provenance distinction the index makes.
 const missionBadge=ms=>ms?`<span class="mstat ${clsSafe(ms)}">${esc(ms)}</span>`
                          :`<span class="mitag">untracked</span>`;
-function cycleStage(mid, sprintId){
-  const sid=runSid(mid, sprintId);
+function cycleStage(mid, phaseId){
+  const sid=runSid(mid, phaseId);
   const recs=DATA.filter(r=>r.session_id===sid&&typeof r.action==="string"
     &&r.action.indexOf("mission.run")===0&&T(r.ts)<=state.t);
   if(!recs.length)return null;
@@ -2369,26 +2369,26 @@ function cycleStage(mid, sprintId){
     blocked:has("blocked"),
   };
 }
-// (#827 Slice B) Mission detail — the durable SPRINT plan (window-independent)
-// joined with flow-record run history. Rendering from /sprints (not just the
+// (#827 Slice B) Mission detail — the durable PHASE plan (window-independent)
+// joined with flow-record run history. Rendering from /phases (not just the
 // flow) means a planned or historical mission shows its real structure +
-// per-sprint status + cycle, instead of "0 dispatches" when its runs are
+// per-phase status + cycle, instead of "0 dispatches" when its runs are
 // outside the loaded window. Falls back to the old flow-dispatch grouping for
-// missions with no durable sprints (demo / ad-hoc dispatches).
+// missions with no durable phases (demo / ad-hoc dispatches).
 function renderMission(){
   const mid=state.missionId||primaryMission()||"—";
   state.stageScope=r=>r.mission_id===mid; $("logscope").textContent="mission";
   const mObj=MISSIONS.find(m=>m&&m.id===mid)||null;
   const mstat=mObj?(mObj.status||"active"):null;
-  const sprints=SPRINTS.filter(s=>s&&s.mission_id===mid)
+  const phases=PHASES.filter(s=>s&&s.mission_id===mid)
     .sort((a,b)=>(a.created_ts||0)-(b.created_ts||0)||String(a.id).localeCompare(b.id));
 
-  if(!sprints.length) return renderMissionFromFlow(mid, mstat);
+  if(!phases.length) return renderMissionFromFlow(mid, mstat);
 
-  const done=sprints.filter(s=>s.status==="complete").length;
-  const total=sprints.length, pct=total?Math.round(done/total*100):0;
+  const done=phases.filter(s=>s.status==="complete").length;
+  const total=phases.length, pct=total?Math.round(done/total*100):0;
   const pill=(on,label)=>`<span class="cyc ${on?'on':''}">${label}</span>`;
-  const rows=sprints.map(s=>{
+  const rows=phases.map(s=>{
     const cyc=cycleStage(mid, s.id);
     const sid=runSid(mid, s.id);
     const hasRun=DATA.some(r=>r.session_id===sid&&T(r.ts)<=state.t);
@@ -2405,11 +2405,11 @@ function renderMission(){
       runInfo=`<span class="spe">${cyc?'':'runs in history — open that day in playback'}</span>`;
     }
     // Cycle strip: lit by mission.run.* when present, else implied by the
-    // durable sprint status (complete ⇒ the whole cycle ran).
+    // durable phase status (complete ⇒ the whole cycle ran).
     const impliedComplete=s.status==="complete";
     const c=cyc||{};
-    // "blocked" is a CURRENT-state signal — suppress it once the sprint
-    // shipped/completed, so a once-blocked-then-done sprint doesn't show all
+    // "blocked" is a CURRENT-state signal — suppress it once the phase
+    // shipped/completed, so a once-blocked-then-done phase doesn't show all
     // stages lit AND a red blocked tag (QA: contradictory dual signal).
     const showBlocked=c.blocked&&!c.ship&&!c.merged&&!impliedComplete;
     const strip=c.aborted
@@ -2423,14 +2423,14 @@ function renderMission(){
       +`<span class="sprun">${runInfo}</span></div>`;
   }).join("");
 
-  const closedWarn = mstat==="closed" && sprints.some(s=>s.status!=="complete"&&s.status!=="abandoned")
-    ? `<div class="burnlbl"><span class="wallerr">⚠ mission Closed but a sprint isn't terminal — see <code>darkmux mission status</code></span></div>` : '';
+  const closedWarn = mstat==="closed" && phases.some(s=>s.status!=="complete"&&s.status!=="abandoned")
+    ? `<div class="burnlbl"><span class="wallerr">⚠ mission Closed but a phase isn't terminal — see <code>darkmux mission status</code></span></div>` : '';
   $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)} ${missionBadge(mstat)}</h2>
-    <div class="mgoal">${total} sprint${total===1?'':'s'} · ${done} complete</div>
-    <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} sprints complete · ${pct}%</div>${closedWarn}</div>
-    <div class="track"><div class="lbl">sprints · run › qa › gate › ship</div>${rows}</div></div>`;
+    <div class="mgoal">${total} phase${total===1?'':'s'} · ${done} complete</div>
+    <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} phases complete · ${pct}%</div>${closedWarn}</div>
+    <div class="track"><div class="lbl">phases · run › qa › gate › ship</div>${rows}</div></div>`;
 }
-// Legacy flow-derived view — kept for missions with no durable sprint plan
+// Legacy flow-derived view — kept for missions with no durable phase plan
 // (the static demo's flow-only "demo" mission, ad-hoc dispatches).
 function renderMissionFromFlow(mid, mstat){
   const starts={};
@@ -3303,14 +3303,14 @@ async function boot(){
   // when a daemon is behind us. (set once at boot; setBadges only updates its
   // text, so the data-act/class/title persist.)
   if(!flowSrc && mode!=="no-daemon"){ const sb=$("srcbadge"); if(sb){ sb.dataset.act="catalog"; sb.classList.add("srcbtn"); sb.title="browse history"; sb.setAttribute("role","button"); } }
-  // (#827 Slice A/C) Pull the durable mission/sprint plan. Live: the daemon's
-  // /missions + /sprints endpoints. Static demo: the committed fixture files
+  // (#827 Slice A/C) Pull the durable mission/phase plan. Live: the daemon's
+  // /missions + /phases endpoints. Static demo: the committed fixture files
   // injected as metas (no daemon). Best-effort either way — absent → the
   // missions lens derives rows from mission_ids in the flow instead.
   const missionsSrc=injectedMeta("darkmux-missions-src");
-  const sprintsSrc=injectedMeta("darkmux-sprints-src");
-  if(!flowSrc && mode!=="no-daemon"){ await loadMissionsSprints(); }
-  else if(missionsSrc||sprintsSrc){ await loadMissionsSprints(missionsSrc, sprintsSrc); }
+  const phasesSrc=injectedMeta("darkmux-phases-src");
+  if(!flowSrc && mode!=="no-daemon"){ await loadMissionsPhases(); }
+  else if(missionsSrc||phasesSrc){ await loadMissionsPhases(missionsSrc, phasesSrc); }
   setBadges(mode,date);
   recompute();
   state.t=tMax;
@@ -3362,7 +3362,7 @@ const LAB_POLL_BACKFILL_MS = 150; // rapid re-poll while draining a backlog (a b
 
 async function loadLabRuns(){
   // Static-playback override (the darkmux.com/demo + e2e-harness pattern
-  // already used by `loadMissionsSprints`): a committed fixture stands in
+  // already used by `loadMissionsPhases`): a committed fixture stands in
   // for the daemon's `/lab/runs` when no daemon is behind the page.
   const src = injectedMeta("darkmux-lab-runs-src") || "/lab/runs";
   try{

@@ -23,7 +23,7 @@ pub struct RunOpts {
     /// runtime; `Runtime::Openclaw` shells out to the openclaw CLI
     /// (legacy path).
     pub runtime: darkmux_crew::dispatch::Runtime,
-    /// Executable path for the openclaw shell-out (Sprint-E
+    /// Executable path for the openclaw shell-out (Phase-E
     /// replacement for the removed `DARKMUX_RUNTIME_CMD` env var).
     /// Defaults to `"openclaw"`; override via `--runtime-cmd <path>`
     /// to point at Aider / Cline / any tool exposing the

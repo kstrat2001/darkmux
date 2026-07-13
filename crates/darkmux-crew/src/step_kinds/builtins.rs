@@ -16,9 +16,9 @@ use std::collections::BTreeMap;
 /// Compose a step kind's base prompt/message with the gathered output of
 /// its already-`Complete` dependencies. Shared by `dispatch.internal` and
 /// `dispatch.single_shot` so the "prior step outputs" framing is
-/// identical across both — mirrors the one-hop "Prior sprint outputs"
-/// context block `dispatch::DispatchOpts::sprint_id` already builds for
-/// Sprint-level `depends_on`, generalized to Step-level `depends_on`.
+/// identical across both — mirrors the one-hop "Prior phase outputs"
+/// context block `dispatch::DispatchOpts::phase_id` already builds for
+/// Phase-level `depends_on`, generalized to Step-level `depends_on`.
 /// `input` iterates in `BTreeMap` key order (dependency step id), so the
 /// composed text is deterministic regardless of completion order.
 fn compose_message(base: &str, input: &BTreeMap<String, String>) -> String {
@@ -132,7 +132,7 @@ impl StepKind for DispatchInternalStepKind {
             json: true,
             watch_paths: Vec::new(),
             workdir: None,
-            sprint_id: None,
+            phase_id: None,
             runtime: Runtime::Internal,
             runtime_cmd: "openclaw".to_string(),
             machine: None,

@@ -97,10 +97,10 @@ mod tests {
     #[test]
     fn completion_passes_session_id_through() {
         let mut c = completion("ok", None);
-        c.session_id = "mission-foo-sprint-bar-12345-0".to_string();
+        c.session_id = "mission-foo-phase-bar-12345-0".to_string();
         let r = completion_to_dispatch_result(c);
-        assert_eq!(r.session_id, "mission-foo-sprint-bar-12345-0");
-        assert!(r.stdout.contains("mission-foo-sprint-bar-12345-0"));
+        assert_eq!(r.session_id, "mission-foo-phase-bar-12345-0");
+        assert!(r.stdout.contains("mission-foo-phase-bar-12345-0"));
     }
 
     #[test]
@@ -368,7 +368,7 @@ mod tests {
             "s-1".to_string(),
             None, // deliver None
             None, // workdir None
-            None, // sprint_id None
+            None, // phase_id None
             darkmux_crew::dispatch::Runtime::Openclaw,
             None, // image (#703 Slice 4)
             300,
@@ -389,8 +389,8 @@ mod tests {
             "None workdir must be omitted: {json}"
         );
         assert!(
-            !json.contains("sprint_id"),
-            "None sprint_id must be omitted: {json}"
+            !json.contains("phase_id"),
+            "None phase_id must be omitted: {json}"
         );
         assert!(
             !json.contains("published_by_machine"),

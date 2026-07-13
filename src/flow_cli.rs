@@ -13,9 +13,9 @@ pub enum FlowCmd {
     Note {
         #[arg(long)]
         text: String,
-        /// Optional sprint identifier.
-        #[arg(long = "sprint-id")]
-        sprint_id: Option<String>,
+        /// Optional phase identifier.
+        #[arg(long = "phase-id")]
+        phase_id: Option<String>,
         /// Optional session identifier.
         #[arg(long = "session-id")]
         session_id: Option<String>,
@@ -27,9 +27,9 @@ pub enum FlowCmd {
     Catch {
         #[arg(long)]
         text: String,
-        /// Optional sprint identifier.
-        #[arg(long = "sprint-id")]
-        sprint_id: Option<String>,
+        /// Optional phase identifier.
+        #[arg(long = "phase-id")]
+        phase_id: Option<String>,
         /// Optional session identifier.
         #[arg(long = "session-id")]
         session_id: Option<String>,
@@ -51,9 +51,9 @@ pub enum FlowCmd {
         action: String,
         #[arg(long)]
         handle: String,
-        /// Optional sprint identifier.
-        #[arg(long = "sprint-id")]
-        sprint_id: Option<String>,
+        /// Optional phase identifier.
+        #[arg(long = "phase-id")]
+        phase_id: Option<String>,
         /// Optional session identifier.
         #[arg(long = "session-id")]
         session_id: Option<String>,
@@ -94,9 +94,9 @@ pub enum FlowCmd {
         /// `trip-researcher`. Captured in the `handle` field.
         #[arg(long = "role-chosen")]
         role_chosen: Option<String>,
-        /// Optional sprint identifier this decision is scoped to.
-        #[arg(long = "sprint-id")]
-        sprint_id: Option<String>,
+        /// Optional phase identifier this decision is scoped to.
+        #[arg(long = "phase-id")]
+        phase_id: Option<String>,
         /// Optional mission identifier this decision is scoped to.
         #[arg(long = "mission-id")]
         mission_id: Option<String>,
@@ -336,7 +336,7 @@ pub fn run_tail(session: Option<&str>, json: bool) -> anyhow::Result<()> {
 pub fn build_record(cmd: FlowCmd) -> FlowRecord {
     let ts = flow::ts_utc_now();
     match cmd {
-        FlowCmd::Note { text, sprint_id, session_id, source } => FlowRecord {
+        FlowCmd::Note { text, phase_id, session_id, source } => FlowRecord {
             ts,
             level: Level::Info,
             category: Category::Work,
@@ -344,7 +344,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             stage: Stage::Scope,
             action: "note".to_string(),
             handle: text,
-            sprint_id,
+            phase_id,
             session_id,
             source,
             model: None,
@@ -359,7 +359,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             work_id: None,
             attempt: None,
         },
-        FlowCmd::Catch { text, sprint_id, session_id, source } => FlowRecord {
+        FlowCmd::Catch { text, phase_id, session_id, source } => FlowRecord {
             ts,
             level: Level::Warn,
             category: Category::Audit,
@@ -367,7 +367,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             stage: Stage::Review,
             action: "catch".to_string(),
             handle: text,
-            sprint_id,
+            phase_id,
             session_id,
             source,
             model: None,
@@ -389,7 +389,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             stage,
             action,
             handle,
-            sprint_id,
+            phase_id,
             session_id,
             source,
             reasoning,
@@ -402,7 +402,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             stage,
             action,
             handle,
-            sprint_id,
+            phase_id,
             session_id,
             source,
             model: None,
@@ -421,7 +421,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             decision,
             reasoning,
             role_chosen,
-            sprint_id,
+            phase_id,
             mission_id,
             session_id,
             source,
@@ -440,7 +440,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             // (decision=direct), handle is the decision itself.
             action: "tier-decision".to_string(),
             handle: role_chosen.clone().unwrap_or_else(|| decision.clone()),
-            sprint_id,
+            phase_id,
             session_id,
             source,
             model: None,
@@ -630,7 +630,7 @@ mod tests {
         let guard = FlowsDirGuard::new();
         run(FlowCmd::Note {
             text: "hello".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
         })
@@ -650,7 +650,7 @@ mod tests {
         let guard = FlowsDirGuard::new();
         run(FlowCmd::Catch {
             text: "oops".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
         })
@@ -672,7 +672,7 @@ mod tests {
             stage: Stage::Dispatch,
             action: "x".to_string(),
             handle: "y".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             reasoning: None,
@@ -700,7 +700,7 @@ mod tests {
             stage: Stage::Scope,
             action: "test-optional".to_string(),
             handle: "opt-handle".to_string(),
-            sprint_id: Some("66".to_string()),
+            phase_id: Some("66".to_string()),
             session_id: Some("abc".to_string()),
             source: Some("manual".to_string()),
             reasoning: None,
@@ -709,7 +709,7 @@ mod tests {
         .unwrap();
 
         let rec = single_record(&guard);
-        assert_eq!(rec["sprint_id"], "66");
+        assert_eq!(rec["phase_id"], "66");
         assert_eq!(rec["session_id"], "abc");
         assert_eq!(rec["source"], "manual");
     }
@@ -719,9 +719,9 @@ mod tests {
     fn multiple_calls_append_to_same_day_file() {
         let guard = FlowsDirGuard::new();
 
-        run(FlowCmd::Note { text: "a".into(), sprint_id: None, session_id: None, source: None }).unwrap();
-        run(FlowCmd::Note { text: "b".into(), sprint_id: None, session_id: None, source: None }).unwrap();
-        run(FlowCmd::Note { text: "c".into(), sprint_id: None, session_id: None, source: None }).unwrap();
+        run(FlowCmd::Note { text: "a".into(), phase_id: None, session_id: None, source: None }).unwrap();
+        run(FlowCmd::Note { text: "b".into(), phase_id: None, session_id: None, source: None }).unwrap();
+        run(FlowCmd::Note { text: "c".into(), phase_id: None, session_id: None, source: None }).unwrap();
 
         // Sum non-schema lines across however many day files the calls
         // produced (one in steady state; two if straddling UTC midnight).
@@ -748,7 +748,7 @@ mod tests {
             decision: "dispatch".into(),
             reasoning: "Bounded mechanical translation; testable via cargo test".into(),
             role_chosen: Some("coder".into()),
-            sprint_id: Some("113-s1".into()),
+            phase_id: Some("113-s1".into()),
             mission_id: Some("113-mission-propose-pipeline".into()),
             session_id: None,
             source: Some("frontier".into()),
@@ -762,7 +762,7 @@ mod tests {
         assert_eq!(rec["action"], "tier-decision");
         // handle carries role-chosen when dispatch + role known.
         assert_eq!(rec["handle"], "coder");
-        assert_eq!(rec["sprint_id"], "113-s1");
+        assert_eq!(rec["phase_id"], "113-s1");
         assert_eq!(rec["mission_id"], "113-mission-propose-pipeline");
         assert_eq!(rec["source"], "frontier");
         // reasoning carries the decision prefix + the operator's prose.
@@ -780,7 +780,7 @@ mod tests {
             decision: "direct".into(),
             reasoning: "Multi-variable holding, tone-critical; no testable threshold".into(),
             role_chosen: None,
-            sprint_id: Some("japan-day-3".into()),
+            phase_id: Some("japan-day-3".into()),
             mission_id: Some("japan-trip-2026-may".into()),
             session_id: None,
             source: None,

@@ -1134,7 +1134,7 @@ pub fn run(
                             )?;
                             // Persist the JSON for downstream
                             // consumers (replay, methodology
-                            // research, cross-sprint memory). Best-
+                            // research, cross-phase memory). Best-
                             // effort: a write failure logs but does
                             // NOT fail the dispatch — observability,
                             // not correctness.
@@ -1699,7 +1699,7 @@ fn measure_request_context(messages: &[Message]) -> (usize, usize) {
 /// output to `<runtime_dir>/compaction-<generation>.json`. Creates
 /// the parent directory if needed. Write failures log to stderr but
 /// do NOT propagate — persistence is observability (replay,
-/// methodology research, cross-sprint memory) not correctness, per
+/// methodology research, cross-phase memory) not correctness, per
 /// #352 "persistence falls out for free" framing.
 fn persist_structured_compaction_output(
     runtime_dir: &std::path::Path,
@@ -1809,7 +1809,7 @@ mod tests {
             errors_to_preserve: None,
             next_concrete_actions: None,
             verify_criteria: None,
-            sprint_id: None,
+            phase_id: None,
         }
     }
 

@@ -153,9 +153,9 @@ fn lab_with_no_subcommand_reports() {
 /// the source tree at runtime.
 ///
 /// Test passes `--runtime openclaw` because the default-internal runtime
-/// (post-Sprint-D) requires Docker + LMStudio, which CI doesn't have. The
+/// (post-Phase-D) requires Docker + LMStudio, which CI doesn't have. The
 /// openclaw shell-out path is mockable: we point `--runtime-cmd` at
-/// `/usr/bin/true` (Sprint-E replacement for the removed
+/// `/usr/bin/true` (Phase-E replacement for the removed
 /// `DARKMUX_RUNTIME_CMD` env var) so the dispatch always "succeeds"
 /// without actually hitting any backend. The test verifies that the
 /// surrounding plumbing (workload load → provider dispatch → manifest
@@ -270,8 +270,8 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     );
 }
 
-/// Sprint-E: `--runtime-cmd <path>` overrides the openclaw binary used
-/// by the shell-out path, replacing the pre-Sprint-E `DARKMUX_RUNTIME_CMD`
+/// Phase-E: `--runtime-cmd <path>` overrides the openclaw binary used
+/// by the shell-out path, replacing the pre-Phase-E `DARKMUX_RUNTIME_CMD`
 /// env var.
 ///
 /// The test points `--runtime-cmd` at a binary that DOES NOT EXIST and
@@ -302,7 +302,7 @@ fn lab_run_runtime_cmd_flag_overrides_openclaw_binary() {
     .unwrap();
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
-    let bogus_path = "/this/binary/definitely/does/not/exist/darkmux-sprint-e";
+    let bogus_path = "/this/binary/definitely/does/not/exist/darkmux-phase-e";
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.env(
         "DARKMUX_TEMPLATES_DIR",
@@ -345,7 +345,7 @@ fn lab_run_runtime_cmd_flag_overrides_openclaw_binary() {
     );
 }
 
-/// Sprint-E QA: passing `--runtime-cmd` without `--runtime openclaw` is
+/// Phase-E QA: passing `--runtime-cmd` without `--runtime openclaw` is
 /// an operator-intent conflict (the flag is only consulted under
 /// openclaw shell-out). The CLI must bail loudly rather than silently
 /// ignoring the flag — Beat 36 doctrine: "no implicit state, operator-
@@ -552,7 +552,7 @@ fn write_flat_mission_file(root: &std::path::Path, id: &str) {
     let body = serde_json::json!({
         "id": id,
         "description": "test",
-        "sprint_ids": [],
+        "phase_ids": [],
         "created_ts": 1,
     });
     fs::write(
@@ -562,8 +562,8 @@ fn write_flat_mission_file(root: &std::path::Path, id: &str) {
     .unwrap();
 }
 
-fn write_flat_sprint_file(root: &std::path::Path, id: &str, mission_id: &str) {
-    let dir = root.join("sprints");
+fn write_flat_phase_file(root: &std::path::Path, id: &str, mission_id: &str) {
+    let dir = root.join("phases");
     fs::create_dir_all(&dir).unwrap();
     let body = serde_json::json!({
         "id": id,
@@ -584,7 +584,7 @@ fn write_flat_sprint_file(root: &std::path::Path, id: &str, mission_id: &str) {
 fn mission_migrate_dry_run_shows_moves_without_moving() {
     let tmp = TempDir::new().unwrap();
     write_flat_mission_file(tmp.path(), "alpha");
-    write_flat_sprint_file(tmp.path(), "s1", "alpha");
+    write_flat_phase_file(tmp.path(), "s1", "alpha");
 
     Command::cargo_bin("darkmux")
         .unwrap()
@@ -602,8 +602,8 @@ fn mission_migrate_dry_run_shows_moves_without_moving() {
         "dry-run must not move the flat mission file"
     );
     assert!(
-        tmp.path().join("sprints/s1.json").is_file(),
-        "dry-run must not move the flat sprint file"
+        tmp.path().join("phases/s1.json").is_file(),
+        "dry-run must not move the flat phase file"
     );
 }
 
@@ -612,7 +612,7 @@ fn mission_migrate_dry_run_shows_moves_without_moving() {
 fn mission_migrate_apply_moves_files() {
     let tmp = TempDir::new().unwrap();
     write_flat_mission_file(tmp.path(), "alpha");
-    write_flat_sprint_file(tmp.path(), "s1", "alpha");
+    write_flat_phase_file(tmp.path(), "s1", "alpha");
 
     Command::cargo_bin("darkmux")
         .unwrap()
@@ -628,8 +628,8 @@ fn mission_migrate_apply_moves_files() {
         "mission.json should be at nested path after --apply"
     );
     assert!(
-        tmp.path().join("missions/alpha/sprints/s1.json").is_file(),
-        "sprint json should be at nested path after --apply"
+        tmp.path().join("missions/alpha/phases/s1.json").is_file(),
+        "phase json should be at nested path after --apply"
     );
     // Old flat paths must be gone.
     assert!(
@@ -637,8 +637,8 @@ fn mission_migrate_apply_moves_files() {
         "flat mission file should be gone after --apply"
     );
     assert!(
-        !tmp.path().join("sprints/s1.json").exists(),
-        "flat sprint file should be gone after --apply"
+        !tmp.path().join("phases/s1.json").exists(),
+        "flat phase file should be gone after --apply"
     );
 }
 
@@ -647,7 +647,7 @@ fn mission_migrate_apply_moves_files() {
 fn mission_migrate_apply_is_idempotent() {
     let tmp = TempDir::new().unwrap();
     write_flat_mission_file(tmp.path(), "alpha");
-    write_flat_sprint_file(tmp.path(), "s1", "alpha");
+    write_flat_phase_file(tmp.path(), "s1", "alpha");
 
     // First apply.
     Command::cargo_bin("darkmux")
@@ -667,7 +667,7 @@ fn mission_migrate_apply_is_idempotent() {
         .stdout(predicate::str::contains("nothing to do"));
 }
 
-/// Sprint-F: `darkmux recommendations show <tier>` prints the registry
+/// Phase-F: `darkmux recommendations show <tier>` prints the registry
 /// entry for a known tier. This verb is referenced by the bootstrap
 /// skill to read the live primary + compactor model ids; if the verb
 /// regresses the skill breaks for every new operator.
@@ -685,7 +685,7 @@ fn recommendations_show_known_tier_prints_validated_entry() {
         .stdout(predicate::str::contains("Rationale:"));
 }
 
-/// Sprint-F: `recommendations show <unknown-tier>` errors clearly.
+/// Phase-F: `recommendations show <unknown-tier>` errors clearly.
 /// The bootstrap skill's tier-resolution path depends on the verb
 /// bailing loud rather than silently returning an empty placeholder.
 #[test]
@@ -698,7 +698,7 @@ fn recommendations_show_unknown_tier_errors() {
 }
 
 
-/// Sprint-H: `notebook draft --role <id>` is the new flag (renamed
+/// Phase-H: `notebook draft --role <id>` is the new flag (renamed
 /// from `--agent` per Beat 36). The old `--agent` flag must NOT be
 /// accepted — clap should reject it as an unknown argument so
 /// operators with stale scripts get a loud failure instead of a
@@ -734,7 +734,7 @@ fn notebook_draft_rejects_old_agent_flag() {
     );
 }
 
-/// Sprint-H: `notebook draft --role <id>` accepts the new flag and
+/// Phase-H: `notebook draft --role <id>` accepts the new flag and
 /// proceeds. Uses --dry-run + an absolute manifest path so we don't
 /// need a real dispatch.
 #[test]
@@ -760,14 +760,14 @@ fn notebook_draft_accepts_role_flag_under_dry_run() {
         "scribe",
         "--dry-run",
         "--slug",
-        "sprint-h-test",
+        "phase-h-test",
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains("sprint-h-test"));
+    .stdout(predicate::str::contains("phase-h-test"));
 }
 
-/// Sprint-H + Sprint-E loud-bail gate: notebook draft also enforces
+/// Phase-H + Phase-E loud-bail gate: notebook draft also enforces
 /// "--runtime-cmd is only valid under --runtime openclaw."
 #[test]
 fn notebook_draft_runtime_cmd_without_openclaw_bails_loud() {

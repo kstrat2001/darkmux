@@ -15,7 +15,7 @@
 //! `agents.list[]` reflect the manifests on disk — writes/updates the
 //! `darkmux/<role>` entries to match what the manifests + `.md` prompts say.
 
-use crate::loader::{load_role_prompt, load_roles, load_sprints};
+use crate::loader::{load_role_prompt, load_roles, load_phases};
 use crate::types::Role;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
@@ -262,34 +262,34 @@ pub struct DispatchOpts {
     /// in #143, darkmux doesn't auto-create or auto-remove scope
     /// links; --workdir is the explicit operator opt-in.
     pub workdir: Option<PathBuf>,
-    /// Optional sprint id binding this dispatch to a sprint in a
+    /// Optional phase id binding this dispatch to a phase in a
     /// mission (#146 Stage 1). When set:
     ///
-    ///   1. The dispatcher loads the sprint manifest and resolves
+    ///   1. The dispatcher loads the phase manifest and resolves
     ///      `depends_on` parents. For each parent that has a recorded
-    ///      output file (`<sprint-id>-output.txt`), the parent's
+    ///      output file (`<phase-id>-output.txt`), the parent's
     ///      output text is prepended to the dispatch message as a
-    ///      "Prior sprint outputs" context block. One-hop only —
+    ///      "Prior phase outputs" context block. One-hop only —
     ///      transitive ancestors are NOT walked (Stage 1 scope).
     ///   2. After the dispatch returns, the agent's reply text is
-    ///      persisted to `<sprint-id>-output.txt` alongside the sprint
-    ///      manifest, so downstream sprints with this sprint in their
+    ///      persisted to `<phase-id>-output.txt` alongside the phase
+    ///      manifest, so downstream phases with this phase in their
     ///      `depends_on` can read it on their own dispatch.
     ///
-    /// When `None`, the dispatcher behaves as before — no sprint
+    /// When `None`, the dispatcher behaves as before — no phase
     /// awareness, no output persistence. Backwards-compatible default.
-    pub sprint_id: Option<String>,
+    pub phase_id: Option<String>,
     /// Which agent runtime to dispatch through. See [`Runtime`].
     /// Default: `Runtime::Internal` (the in-house container-bounded path).
     pub runtime: Runtime,
-    /// Executable path for the openclaw shell-out (Sprint-E). Defaults
+    /// Executable path for the openclaw shell-out (Phase-E). Defaults
     /// to `"openclaw"`; operators override via `--runtime-cmd <path>`
     /// to point at Aider / Cline / any tool exposing the
     /// `<cmd> agent --agent <id> --json ...` calling convention.
     /// **Ignored when `runtime == Runtime::Internal`** — internal-runtime
     /// dispatches use the in-house Rust loop and don't shell out.
     ///
-    /// Replaces the pre-Sprint-E global env var `DARKMUX_RUNTIME_CMD`.
+    /// Replaces the pre-Phase-E global env var `DARKMUX_RUNTIME_CMD`.
     /// Per-dispatch override (operator sovereignty); no implicit global
     /// state to surprise the operator across sessions.
     pub runtime_cmd: String,
@@ -503,7 +503,7 @@ impl CompactionDispatchArgs {
     /// Lookup chain: role override > profile default > None
     /// (runtime default ⇒ unbounded). Call after `from_profile` from
     /// any dispatcher that knows which role is about to run; sites
-    /// that don't have a role (sprint_cli adhoc) can skip the call
+    /// that don't have a role (phase_cli adhoc) can skip the call
     /// and the profile-level fallback applies.
     ///
     /// The role's `escalation_posture` field is parsed here too but
@@ -752,40 +752,40 @@ pub(crate) fn augment_prompt_with_identity(role_prompt: &str) -> String {
     }
 }
 
-/// Sprint-output file path for a given sprint id. Lives alongside the
-/// sprint manifest at `<crew_root>/sprints/<id>-output.txt`. Used by
-/// #146 Stage 1 (cross-sprint context) to:
+/// Phase-output file path for a given phase id. Lives alongside the
+/// phase manifest at `<crew_root>/phases/<id>-output.txt`. Used by
+/// #146 Stage 1 (cross-phase context) to:
 ///
-///   - Read parent sprint outputs when dispatching a sprint with
+///   - Read parent phase outputs when dispatching a phase with
 ///     `depends_on` (one-hop only)
-///   - Persist this sprint's agent reply so downstream sprints can
+///   - Persist this phase's agent reply so downstream phases can
 ///     read it on their own dispatch
 ///
 /// Plain text, not JSON — the agent's reply IS prose. Storing it raw
 /// keeps the inject-back-into-message format friction-free.
 ///
-/// Output file path for a sprint's recorded agent reply.
+/// Output file path for a phase's recorded agent reply.
 ///
-/// New layout (#148): `<crew_root>/missions/<mission_id>/sprints/<sprint_id>-output.txt`
-/// co-located with the sprint manifest under the per-mission directory.
-fn sprint_output_path(mission_id: &str, sprint_id: &str) -> PathBuf {
-    crate::lifecycle::sprints_dir(mission_id).join(format!("{sprint_id}-output.txt"))
+/// New layout (#148): `<crew_root>/missions/<mission_id>/phases/<phase_id>-output.txt`
+/// co-located with the phase manifest under the per-mission directory.
+fn phase_output_path(mission_id: &str, phase_id: &str) -> PathBuf {
+    crate::lifecycle::phases_dir(mission_id).join(format!("{phase_id}-output.txt"))
 }
 
-/// (#146 residual) Default per-parent cap, in chars, on injected prior-sprint
+/// (#146 residual) Default per-parent cap, in chars, on injected prior-phase
 /// output. A parent's recorded reply can be long; without a bound, a dependent
 /// dispatch's brief grows with every upstream hop and can crowd a small model's
-/// window. ~8000 chars ≈ 2000 tokens — generous for a sprint summary. Operator-
-/// tunable per dispatch via `DARKMUX_SPRINT_CONTEXT_MAX_CHARS`.
-const DEFAULT_SPRINT_CONTEXT_MAX_CHARS: usize = 8000;
+/// window. ~8000 chars ≈ 2000 tokens — generous for a phase summary. Operator-
+/// tunable per dispatch via `DARKMUX_PHASE_CONTEXT_MAX_CHARS`.
+const DEFAULT_PHASE_CONTEXT_MAX_CHARS: usize = 8000;
 
-/// The per-parent prior-sprint-output cap: `env(DARKMUX_SPRINT_CONTEXT_MAX_CHARS)`
+/// The per-parent prior-phase-output cap: `env(DARKMUX_PHASE_CONTEXT_MAX_CHARS)`
 /// when set + parseable, else the default. `0` disables the cap (inject in full).
-fn sprint_context_max_chars() -> usize {
-    std::env::var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS")
+fn phase_context_max_chars() -> usize {
+    std::env::var("DARKMUX_PHASE_CONTEXT_MAX_CHARS")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SPRINT_CONTEXT_MAX_CHARS)
+        .unwrap_or(DEFAULT_PHASE_CONTEXT_MAX_CHARS)
 }
 
 /// Truncate a parent's output to `max` chars (char-safe, never mid-UTF-8),
@@ -796,7 +796,7 @@ fn cap_parent_output(content: &str, max: usize) -> String {
         return content.to_string();
     }
     let head: String = content.chars().take(max).collect();
-    format!("{head}\n\n[… output truncated at {max} chars; full text in the sprint's output file]")
+    format!("{head}\n\n[… output truncated at {max} chars; full text in the phase's output file]")
 }
 
 /// Max chars of stderr carried in the dispatch-error flow record (#1042).
@@ -818,12 +818,12 @@ pub(crate) fn tail_excerpt(content: &str, max: usize) -> String {
     format!("[… stderr truncated, showing last {max} of {n} chars]\n{tail}")
 }
 
-/// Resolve the dispatch message: when `sprint_id` is `Some(id)`, look
-/// up the sprint's `depends_on` parents and prepend each parent's
-/// recorded output (capped per [`sprint_context_max_chars`]) as a "Prior
-/// sprint outputs" context block. Returns the augmented message (or the
+/// Resolve the dispatch message: when `phase_id` is `Some(id)`, look
+/// up the phase's `depends_on` parents and prepend each parent's
+/// recorded output (capped per [`phase_context_max_chars`]) as a "Prior
+/// phase outputs" context block. Returns the augmented message (or the
 /// original message unchanged if there are no parents, no recorded outputs,
-/// or no sprint_id at all).
+/// or no phase_id at all).
 ///
 /// One-hop only — transitive ancestors are NOT walked. Stage 1 scope
 /// per #146. The two-hop / DAG / context-budget refinements are Stage 2.
@@ -832,39 +832,39 @@ pub(crate) fn tail_excerpt(content: &str, max: usize) -> String {
 /// proceeds with whatever outputs are available. The dispatcher logs
 /// to stderr which parents were found vs. missing so the operator can
 /// see what context the agent received.
-fn augment_message_with_sprint_context(
-    sprint_id: Option<&str>,
+fn augment_message_with_phase_context(
+    phase_id: Option<&str>,
     original_message: &str,
 ) -> Result<String> {
-    let Some(sprint_id) = sprint_id else {
+    let Some(phase_id) = phase_id else {
         return Ok(original_message.to_string());
     };
 
-    // Load all sprints (cheap — small number of JSONs on disk). Find
-    // the named sprint; if not found, log + dispatch as-is.
-    let sprints = match load_sprints() {
+    // Load all phases (cheap — small number of JSONs on disk). Find
+    // the named phase; if not found, log + dispatch as-is.
+    let phases = match load_phases() {
         Ok(s) => s,
         Err(_) => {
             // Loader failure shouldn't block dispatch — just log.
             eprintln!(
-                "darkmux crew dispatch: sprint loader unavailable; \
-                 dispatching `{sprint_id}` without cross-sprint context."
+                "darkmux crew dispatch: phase loader unavailable; \
+                 dispatching `{phase_id}` without cross-phase context."
             );
             return Ok(original_message.to_string());
         }
     };
-    let sprint = match sprints.into_iter().find(|s| s.id == sprint_id) {
+    let phase = match phases.into_iter().find(|s| s.id == phase_id) {
         Some(s) => s,
         None => {
             eprintln!(
-                "darkmux crew dispatch: sprint `{sprint_id}` not found in \
-                 crew root; dispatching without cross-sprint context."
+                "darkmux crew dispatch: phase `{phase_id}` not found in \
+                 crew root; dispatching without cross-phase context."
             );
             return Ok(original_message.to_string());
         }
     };
 
-    if sprint.depends_on.is_empty() {
+    if phase.depends_on.is_empty() {
         // No dependencies declared; nothing to inject.
         return Ok(original_message.to_string());
     }
@@ -873,14 +873,14 @@ fn augment_message_with_sprint_context(
     // are accumulated in `missing_parents` so the operator sees which
     // parents the agent didn't get context for.
     //
-    // Per-mission layout (#148): parent sprints are assumed to live in the
-    // same mission as the child sprint. Output files are co-located with
-    // sprint manifests under `missions/<mission_id>/sprints/`.
-    let max_chars = sprint_context_max_chars();
+    // Per-mission layout (#148): parent phases are assumed to live in the
+    // same mission as the child phase. Output files are co-located with
+    // phase manifests under `missions/<mission_id>/phases/`.
+    let max_chars = phase_context_max_chars();
     let mut parent_blocks: Vec<String> = Vec::new();
     let mut missing_parents: Vec<String> = Vec::new();
-    for parent_id in &sprint.depends_on {
-        let path = sprint_output_path(&sprint.mission_id, parent_id);
+    for parent_id in &phase.depends_on {
+        let path = phase_output_path(&phase.mission_id, parent_id);
         match fs::read_to_string(&path) {
             Ok(content) if !content.trim().is_empty() => {
                 // (#146 residual) Bound each parent's output so a long upstream
@@ -897,10 +897,10 @@ fn augment_message_with_sprint_context(
     if parent_blocks.is_empty() {
         if !missing_parents.is_empty() {
             eprintln!(
-                "darkmux crew dispatch: sprint `{}` depends on {} \
+                "darkmux crew dispatch: phase `{}` depends on {} \
                  (no recorded output for any parent yet — dispatching with \
                  bare message).",
-                sprint_id,
+                phase_id,
                 missing_parents.join(", ")
             );
         }
@@ -909,22 +909,22 @@ fn augment_message_with_sprint_context(
 
     if !missing_parents.is_empty() {
         eprintln!(
-            "darkmux crew dispatch: sprint `{sprint_id}` got context from {} \
+            "darkmux crew dispatch: phase `{phase_id}` got context from {} \
              parent(s); missing recorded output for: {}",
             parent_blocks.len(),
             missing_parents.join(", ")
         );
     } else {
         eprintln!(
-            "darkmux crew dispatch: sprint `{sprint_id}` got context from {} \
+            "darkmux crew dispatch: phase `{phase_id}` got context from {} \
              parent(s).",
             parent_blocks.len()
         );
     }
 
     let context_block = format!(
-        "## Prior sprint outputs\n\n\
-         The following sprints in this mission have completed and produced \
+        "## Prior phase outputs\n\n\
+         The following phases in this mission have completed and produced \
          output you can reference. Use them as context for your task below.\n\n\
          {}\n\
          ---\n\n\
@@ -935,33 +935,33 @@ fn augment_message_with_sprint_context(
     Ok(context_block)
 }
 
-/// Persist the agent's reply text to the sprint's output file after a
+/// Persist the agent's reply text to the phase's output file after a
 /// dispatch completes (#146 Stage 1 / #148 layout). Operator-visible
-/// side effect: `<crew_root>/missions/<mission_id>/sprints/<sprint_id>-output.txt`
+/// side effect: `<crew_root>/missions/<mission_id>/phases/<phase_id>-output.txt`
 /// is created or overwritten with the agent's text reply.
 ///
-/// No-op when `sprint_id` is `None` (dispatcher was called without
-/// sprint context — typical for ad-hoc role dispatches).
+/// No-op when `phase_id` is `None` (dispatcher was called without
+/// phase context — typical for ad-hoc role dispatches).
 ///
-/// The `mission_id` is resolved via `lifecycle::load_sprint_by_id` at
-/// persist time. If the sprint is not found (e.g. the loader is
+/// The `mission_id` is resolved via `lifecycle::load_phase_by_id` at
+/// persist time. If the phase is not found (e.g. the loader is
 /// unavailable or the id is stale), persistence is skipped silently —
 /// the output is already on stdout.
 ///
 /// Returns the path written when persistence happened, `None`
 /// otherwise. Errors are logged but don't fail the dispatch itself —
-/// best-effort for downstream sprints.
-/// (#714) Resolve a sprint's mission so every dispatch flow record can be
+/// best-effort for downstream phases.
+/// (#714) Resolve a phase's mission so every dispatch flow record can be
 /// stamped with `mission_id` and group under its mission in the observability
-/// view. `None` when there's no `--sprint-id` or the sprint manifest can't be
+/// view. `None` when there's no `--phase-id` or the phase manifest can't be
 /// loaded — best-effort metadata, never a reason to fail the dispatch.
-pub(crate) fn resolve_mission_for_sprint(sprint_id: Option<&str>) -> Option<String> {
-    let sprint_id = sprint_id?;
-    match crate::lifecycle::load_sprint_by_id(sprint_id) {
+pub(crate) fn resolve_mission_for_phase(phase_id: Option<&str>) -> Option<String> {
+    let phase_id = phase_id?;
+    match crate::lifecycle::load_phase_by_id(phase_id) {
         Ok(s) => Some(s.mission_id),
         Err(_) => {
             eprintln!(
-                "darkmux crew dispatch: sprint `{sprint_id}` not found; \
+                "darkmux crew dispatch: phase `{phase_id}` not found; \
                  flow records won't carry a mission_id."
             );
             None
@@ -969,24 +969,24 @@ pub(crate) fn resolve_mission_for_sprint(sprint_id: Option<&str>) -> Option<Stri
     }
 }
 
-fn persist_sprint_output(sprint_id: Option<&str>, reply_text: &str) -> Option<PathBuf> {
-    let sprint_id = sprint_id?;
+fn persist_phase_output(phase_id: Option<&str>, reply_text: &str) -> Option<PathBuf> {
+    let phase_id = phase_id?;
     if reply_text.trim().is_empty() {
         return None;
     }
     // Resolve mission_id via lifecycle so the output file lands in the
-    // per-mission directory next to the sprint manifest (#148).
-    let mission_id = match crate::lifecycle::load_sprint_by_id(sprint_id) {
+    // per-mission directory next to the phase manifest (#148).
+    let mission_id = match crate::lifecycle::load_phase_by_id(phase_id) {
         Ok(s) => s.mission_id,
         Err(_) => {
             eprintln!(
-                "darkmux crew dispatch: sprint `{sprint_id}` not found; \
+                "darkmux crew dispatch: phase `{phase_id}` not found; \
                  skipping output persistence."
             );
             return None;
         }
     };
-    let path = sprint_output_path(&mission_id, sprint_id);
+    let path = phase_output_path(&mission_id, phase_id);
     if let Some(parent) = path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
             eprintln!(
@@ -1000,7 +1000,7 @@ fn persist_sprint_output(sprint_id: Option<&str>, reply_text: &str) -> Option<Pa
         Ok(()) => Some(path),
         Err(e) => {
             eprintln!(
-                "darkmux crew dispatch: failed to persist sprint output to {}: {e}",
+                "darkmux crew dispatch: failed to persist phase output to {}: {e}",
                 path.display()
             );
             None
@@ -1210,14 +1210,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         }
     }
 
-    // 2.75. Cross-sprint context injection (#146 Stage 1). When a
-    //       --sprint-id was passed, look up the sprint's depends_on
+    // 2.75. Cross-phase context injection (#146 Stage 1). When a
+    //       --phase-id was passed, look up the phase's depends_on
     //       parents and prepend each recorded output as a "Prior
-    //       sprint outputs" context block. One-hop only — transitive
+    //       phase outputs" context block. One-hop only — transitive
     //       ancestors are NOT walked. Missing parent outputs are
     //       logged and the dispatch proceeds with whatever's available.
     let augmented_message =
-        augment_message_with_sprint_context(opts.sprint_id.as_deref(), &opts.message)?;
+        augment_message_with_phase_context(opts.phase_id.as_deref(), &opts.message)?;
 
     // 3. Resolve session id. Always pass `--session-id` to openclaw — when
     //    the caller didn't supply one, generate a fresh `crew-dispatch-
@@ -1237,11 +1237,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // config is edited mid-dispatch. Non-fatal: None on failure.
     let resolved_model = resolve_dispatch_model(&agent_id);
 
-    // (#714) Resolve the sprint → mission once so every flow record this
-    // dispatch emits carries `mission_id`/`sprint_id` and groups under its
-    // mission in the observability view. Best-effort: None when not sprint-bound.
-    let dispatch_mission_id = resolve_mission_for_sprint(opts.sprint_id.as_deref());
-    let dispatch_sprint_id = opts.sprint_id.as_deref();
+    // (#714) Resolve the phase → mission once so every flow record this
+    // dispatch emits carries `mission_id`/`phase_id` and groups under its
+    // mission in the observability view. Best-effort: None when not phase-bound.
+    let dispatch_mission_id = resolve_mission_for_phase(opts.phase_id.as_deref());
+    let dispatch_phase_id = opts.phase_id.as_deref();
 
     // Flow emission: dispatch_start lands on disk before openclaw is
     // even invoked, so the viewer sees the local-tier event the instant
@@ -1268,7 +1268,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &resolved_session_id,
         resolved_model.as_deref(),
         dispatch_mission_id.as_deref(),
-        dispatch_sprint_id,
+        dispatch_phase_id,
         Some(dispatch_start_payload),
     ));
 
@@ -1342,7 +1342,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &resolved_session_id,
         resolved_model.as_deref(),
         dispatch_mission_id.as_deref(),
-        dispatch_sprint_id,
+        dispatch_phase_id,
         Some(dispatch_complete_payload),
     ));
 
@@ -1352,7 +1352,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    watch path. Surfaces ground-truth file presence + sizes so SIGNOFF
     //    claims are verifiable (#89). Empty watch_paths => empty snapshot
     //    vector; the CLI handler decides whether to default to the role's
-    //    workspace dir, so library callers (e.g. sprint_cli's internal
+    //    workspace dir, so library callers (e.g. phase_cli's internal
     //    dispatch) can opt out of the echo without ceremony.
     let watched_state: Vec<WatchedPathState> = opts
         .watch_paths
@@ -1363,7 +1363,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let stdout_text = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // 6. Persist sprint output for downstream context injection (#146
+    // 6. Persist phase output for downstream context injection (#146
     //    Stage 1). Best-effort — failures logged to stderr but don't
     //    fail the dispatch. The reply text comes from openclaw's JSON
     //    envelope on stdout; we extract `payloads[0].text` if present
@@ -1372,24 +1372,24 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    **Gated on dispatch success** (QA review on #157): a failed
     //    dispatch (timeout, agent error, partial truncation) must NOT
     //    clobber a previously-clean output. Operators re-running a
-    //    sprint that already had a recorded parent output should not
-    //    have downstream sprints silently start reading garbage.
+    //    phase that already had a recorded parent output should not
+    //    have downstream phases silently start reading garbage.
     //    Stderr already tells them what failed; they can decide whether
     //    to hand-edit the output file or accept the prior recording.
     if output.status.success() {
-        if let Some(sprint_id) = opts.sprint_id.as_deref() {
+        if let Some(phase_id) = opts.phase_id.as_deref() {
             let reply_text =
                 extract_payload_text(&stdout_text).unwrap_or_else(|| stdout_text.clone());
-            if let Some(path) = persist_sprint_output(Some(sprint_id), &reply_text) {
+            if let Some(path) = persist_phase_output(Some(phase_id), &reply_text) {
                 eprintln!(
-                    "darkmux crew dispatch: sprint `{sprint_id}` output persisted to {}",
+                    "darkmux crew dispatch: phase `{phase_id}` output persisted to {}",
                     path.display()
                 );
             }
         }
-    } else if opts.sprint_id.is_some() {
+    } else if opts.phase_id.is_some() {
         eprintln!(
-            "darkmux crew dispatch: dispatch failed (exit {}); NOT persisting sprint output. \
+            "darkmux crew dispatch: dispatch failed (exit {}); NOT persisting phase output. \
              Any prior recorded output remains intact.",
             output.status.code().unwrap_or(-1)
         );
@@ -1408,7 +1408,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
 /// Extract the `payloads[0].text` field from openclaw's JSON envelope.
 /// Returns `None` if the stdout isn't JSON or the field is missing.
-/// Used for sprint-output persistence (#146 Stage 1) so the recorded
+/// Used for phase-output persistence (#146 Stage 1) so the recorded
 /// file contains the agent's prose, not openclaw's outer envelope.
 ///
 /// Trims leading/trailing whitespace before parsing — openclaw sometimes
@@ -1463,7 +1463,7 @@ pub fn emit_route_record_and_resolve_session(
         .clone()
         .unwrap_or_else(|| fresh_session_id(&opts.role_id));
     let payload = build_route_payload(target_machine);
-    let mission_id = resolve_mission_for_sprint(opts.sprint_id.as_deref());
+    let mission_id = resolve_mission_for_phase(opts.phase_id.as_deref());
     let _ = darkmux_flow::record(build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
         "dispatch route",
@@ -1471,7 +1471,7 @@ pub fn emit_route_record_and_resolve_session(
         &session_id,
         None,
         mission_id.as_deref(),
-        opts.sprint_id.as_deref(),
+        opts.phase_id.as_deref(),
         Some(payload),
     ));
     session_id
@@ -1576,7 +1576,7 @@ pub fn build_dispatch_record_with_payload(
     session_id: &str,
     model: Option<&str>,
     mission_id: Option<&str>,
-    sprint_id: Option<&str>,
+    phase_id: Option<&str>,
     payload: Option<serde_json::Value>,
 ) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
@@ -1587,7 +1587,7 @@ pub fn build_dispatch_record_with_payload(
         stage: darkmux_flow::Stage::Dispatch,
         action: action.to_string(),
         handle: role_id.to_string(),
-        sprint_id: sprint_id.map(String::from),
+        phase_id: phase_id.map(String::from),
         session_id: Some(session_id.to_string()),
         source: Some("crew_dispatch".to_string()),
         model: model.map(String::from),
@@ -1619,7 +1619,7 @@ pub fn build_telemetry_record(
     session_id: &str,
     model: Option<&str>,
     mission_id: Option<&str>,
-    sprint_id: Option<&str>,
+    phase_id: Option<&str>,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
@@ -1630,7 +1630,7 @@ pub fn build_telemetry_record(
         stage: darkmux_flow::Stage::Dispatch,
         action: action.to_string(),
         handle: role_id.to_string(),
-        sprint_id: sprint_id.map(String::from),
+        phase_id: phase_id.map(String::from),
         session_id: Some(session_id.to_string()),
         source: Some(source.to_string()),
         model: model.map(String::from),
@@ -2416,28 +2416,28 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn augment_message_passes_through_when_no_sprint_id() {
-        let result = augment_message_with_sprint_context(None, "do the thing").unwrap();
+    fn augment_message_passes_through_when_no_phase_id() {
+        let result = augment_message_with_phase_context(None, "do the thing").unwrap();
         assert_eq!(result, "do the thing");
     }
 
     #[test]
     #[serial_test::serial]
-    fn augment_message_passes_through_when_sprint_has_no_deps() {
+    fn augment_message_passes_through_when_phase_has_no_deps() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
-        // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
-        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
-        fs::create_dir_all(&sprints_dir).unwrap();
+        // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
+        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        fs::create_dir_all(&phases_dir).unwrap();
         fs::write(
-            sprints_dir.join("solo-sprint.json"),
-            r#"{"id":"solo-sprint","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+            phases_dir.join("solo-phase.json"),
+            r#"{"id":"solo-phase","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
         ).unwrap();
 
-        let result = augment_message_with_sprint_context(Some("solo-sprint"), "task body").unwrap();
+        let result = augment_message_with_phase_context(Some("solo-phase"), "task body").unwrap();
         assert_eq!(result, "task body");
 
         unsafe {
@@ -2450,27 +2450,27 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn resolve_mission_for_sprint_returns_mission_for_known_sprint() {
-        // (#714) The resolution heart of the fix: a known sprint id maps to
+    fn resolve_mission_for_phase_returns_mission_for_known_phase() {
+        // (#714) The resolution heart of the fix: a known phase id maps to
         // its mission so dispatch records can group under it.
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
-        let sprints_dir = tmp.path().join("missions").join("sweep").join("sprints");
-        fs::create_dir_all(&sprints_dir).unwrap();
+        let phases_dir = tmp.path().join("missions").join("sweep").join("phases");
+        fs::create_dir_all(&phases_dir).unwrap();
         fs::write(
-            sprints_dir.join("s694.json"),
+            phases_dir.join("s694.json"),
             r#"{"id":"s694","mission_id":"sweep","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
         ).unwrap();
 
         assert_eq!(
-            resolve_mission_for_sprint(Some("s694")).as_deref(),
+            resolve_mission_for_phase(Some("s694")).as_deref(),
             Some("sweep")
         );
-        // No sprint id → no mission (one-off dispatch).
-        assert!(resolve_mission_for_sprint(None).is_none());
+        // No phase id → no mission (one-off dispatch).
+        assert!(resolve_mission_for_phase(None).is_none());
 
         unsafe {
             match prev {
@@ -2482,8 +2482,8 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn resolve_mission_for_sprint_returns_none_for_unknown_sprint() {
-        // An unresolvable sprint warns (stderr) and degrades to None rather
+    fn resolve_mission_for_phase_returns_none_for_unknown_phase() {
+        // An unresolvable phase warns (stderr) and degrades to None rather
         // than failing the dispatch — flow records just go ungrouped.
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
@@ -2491,7 +2491,7 @@ mod tests {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
         // No manifests written under the crew dir.
-        assert!(resolve_mission_for_sprint(Some("does-not-exist")).is_none());
+        assert!(resolve_mission_for_phase(Some("does-not-exist")).is_none());
 
         unsafe {
             match prev {
@@ -2509,23 +2509,23 @@ mod tests {
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
-        // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
-        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
-        fs::create_dir_all(&sprints_dir).unwrap();
-        // Parent + child sprint manifests.
+        // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
+        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        fs::create_dir_all(&phases_dir).unwrap();
+        // Parent + child phase manifests.
         fs::write(
-            sprints_dir.join("parent.json"),
+            phases_dir.join("parent.json"),
             r#"{"id":"parent","mission_id":"m","description":"d","status":"done","depends_on":[],"created_ts":0}"#,
         ).unwrap();
         fs::write(
-            sprints_dir.join("child.json"),
+            phases_dir.join("child.json"),
             r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent"],"created_ts":0}"#,
         ).unwrap();
         // Parent's recorded output co-located with manifests.
-        fs::write(sprints_dir.join("parent-output.txt"), "parent did X and Y").unwrap();
+        fs::write(phases_dir.join("parent-output.txt"), "parent did X and Y").unwrap();
 
-        let result = augment_message_with_sprint_context(Some("child"), "task body").unwrap();
-        assert!(result.contains("## Prior sprint outputs"), "got: {result}");
+        let result = augment_message_with_phase_context(Some("child"), "task body").unwrap();
+        assert!(result.contains("## Prior phase outputs"), "got: {result}");
         assert!(result.contains("### parent"), "got: {result}");
         assert!(result.contains("parent did X and Y"), "got: {result}");
         assert!(result.contains("## Your task"), "got: {result}");
@@ -2550,29 +2550,29 @@ mod tests {
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
-        // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
-        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
-        fs::create_dir_all(&sprints_dir).unwrap();
+        // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
+        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        fs::create_dir_all(&phases_dir).unwrap();
         fs::write(
-            sprints_dir.join("parent-a.json"),
+            phases_dir.join("parent-a.json"),
             r#"{"id":"parent-a","mission_id":"m","description":"d","status":"done","depends_on":[],"created_ts":0}"#,
         ).unwrap();
         fs::write(
-            sprints_dir.join("parent-b.json"),
+            phases_dir.join("parent-b.json"),
             r#"{"id":"parent-b","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
         ).unwrap();
         fs::write(
-            sprints_dir.join("child.json"),
+            phases_dir.join("child.json"),
             r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent-a","parent-b"],"created_ts":0}"#,
         ).unwrap();
         // Only parent-a has a recorded output; co-located with manifests.
         fs::write(
-            sprints_dir.join("parent-a-output.txt"),
+            phases_dir.join("parent-a-output.txt"),
             "parent-a finished X",
         )
         .unwrap();
 
-        let result = augment_message_with_sprint_context(Some("child"), "child task").unwrap();
+        let result = augment_message_with_phase_context(Some("child"), "child task").unwrap();
         assert!(result.contains("### parent-a"), "got: {result}");
         assert!(result.contains("parent-a finished X"), "got: {result}");
         // parent-b shouldn't show up in the context block — it has no
@@ -2597,20 +2597,20 @@ mod tests {
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
-        // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
-        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
-        fs::create_dir_all(&sprints_dir).unwrap();
+        // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
+        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        fs::create_dir_all(&phases_dir).unwrap();
         fs::write(
-            sprints_dir.join("parent.json"),
+            phases_dir.join("parent.json"),
             r#"{"id":"parent","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
         ).unwrap();
         fs::write(
-            sprints_dir.join("child.json"),
+            phases_dir.join("child.json"),
             r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent"],"created_ts":0}"#,
         ).unwrap();
         // No parent-output.txt — dispatch proceeds with bare message.
 
-        let result = augment_message_with_sprint_context(Some("child"), "task body").unwrap();
+        let result = augment_message_with_phase_context(Some("child"), "task body").unwrap();
         assert_eq!(result, "task body");
 
         unsafe {
@@ -2621,24 +2621,24 @@ mod tests {
         }
     }
 
-    /// (#146 residual) `sprint_context_max_chars` precedence: env (parseable) >
+    /// (#146 residual) `phase_context_max_chars` precedence: env (parseable) >
     /// default; unparseable/absent → default; `0` honored (disables the cap).
     #[test]
     #[serial_test::serial]
-    fn sprint_context_max_chars_env_precedence() {
-        let prev = std::env::var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS").ok();
-        unsafe { std::env::remove_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS") };
-        assert_eq!(sprint_context_max_chars(), DEFAULT_SPRINT_CONTEXT_MAX_CHARS, "absent → default");
-        unsafe { std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", " 1234 ") };
-        assert_eq!(sprint_context_max_chars(), 1234, "env (trimmed) wins");
-        unsafe { std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", "0") };
-        assert_eq!(sprint_context_max_chars(), 0, "0 honored (disables cap)");
-        unsafe { std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", "not-a-number") };
-        assert_eq!(sprint_context_max_chars(), DEFAULT_SPRINT_CONTEXT_MAX_CHARS, "unparseable → default");
+    fn phase_context_max_chars_env_precedence() {
+        let prev = std::env::var("DARKMUX_PHASE_CONTEXT_MAX_CHARS").ok();
+        unsafe { std::env::remove_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS") };
+        assert_eq!(phase_context_max_chars(), DEFAULT_PHASE_CONTEXT_MAX_CHARS, "absent → default");
+        unsafe { std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", " 1234 ") };
+        assert_eq!(phase_context_max_chars(), 1234, "env (trimmed) wins");
+        unsafe { std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", "0") };
+        assert_eq!(phase_context_max_chars(), 0, "0 honored (disables cap)");
+        unsafe { std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", "not-a-number") };
+        assert_eq!(phase_context_max_chars(), DEFAULT_PHASE_CONTEXT_MAX_CHARS, "unparseable → default");
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", v),
-                None => std::env::remove_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS"),
+                Some(v) => std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", v),
+                None => std::env::remove_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS"),
             }
         }
     }
@@ -2661,36 +2661,36 @@ mod tests {
     }
 
     /// (#146 residual) End-to-end: a long parent output is truncated in the
-    /// augmented brief, honoring `DARKMUX_SPRINT_CONTEXT_MAX_CHARS`. `#[serial]`
+    /// augmented brief, honoring `DARKMUX_PHASE_CONTEXT_MAX_CHARS`. `#[serial]`
     /// — mutates DARKMUX_CREW_DIR + the cap env.
     #[test]
     #[serial_test::serial]
     fn augment_message_caps_long_parent_output() {
         let tmp = TempDir::new().unwrap();
         let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
-        let prev_cap = std::env::var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS").ok();
+        let prev_cap = std::env::var("DARKMUX_PHASE_CONTEXT_MAX_CHARS").ok();
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-            std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", "50");
+            std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", "50");
         }
-        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
-        fs::create_dir_all(&sprints_dir).unwrap();
+        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        fs::create_dir_all(&phases_dir).unwrap();
         fs::write(
-            sprints_dir.join("parent.json"),
+            phases_dir.join("parent.json"),
             r#"{"id":"parent","mission_id":"m","description":"d","status":"done","depends_on":[],"created_ts":0}"#,
         ).unwrap();
         fs::write(
-            sprints_dir.join("child.json"),
+            phases_dir.join("child.json"),
             r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent"],"created_ts":0}"#,
         ).unwrap();
         let unique_tail = "TAIL_MARKER_THAT_MUST_NOT_SURVIVE";
         fs::write(
-            sprints_dir.join("parent-output.txt"),
+            phases_dir.join("parent-output.txt"),
             format!("{}{unique_tail}", "h".repeat(200)),
         )
         .unwrap();
 
-        let result = augment_message_with_sprint_context(Some("child"), "task body").unwrap();
+        let result = augment_message_with_phase_context(Some("child"), "task body").unwrap();
         assert!(result.contains("truncated at 50 chars"), "cap marker present: {result}");
         assert!(!result.contains(unique_tail), "the over-cap tail must be dropped: {result}");
         assert!(result.contains("task body"), "the task still rides along");
@@ -2701,43 +2701,43 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_CREW_DIR"),
             }
             match prev_cap {
-                Some(v) => std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", v),
-                None => std::env::remove_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS"),
+                Some(v) => std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", v),
+                None => std::env::remove_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS"),
             }
         }
     }
 
     #[test]
     #[serial_test::serial]
-    fn persist_sprint_output_writes_text_to_canonical_path() {
+    fn persist_phase_output_writes_text_to_canonical_path() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
 
-        // Seed sprint manifest so load_sprint_by_id can resolve mission_id (#148).
-        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
-        fs::create_dir_all(&sprints_dir).unwrap();
+        // Seed phase manifest so load_phase_by_id can resolve mission_id (#148).
+        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        fs::create_dir_all(&phases_dir).unwrap();
         fs::write(
-            sprints_dir.join("my-sprint.json"),
-            r#"{"id":"my-sprint","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+            phases_dir.join("my-phase.json"),
+            r#"{"id":"my-phase","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
         ).unwrap();
 
-        let path = persist_sprint_output(Some("my-sprint"), "agent reply text").unwrap();
+        let path = persist_phase_output(Some("my-phase"), "agent reply text").unwrap();
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "agent reply text");
-        // New layout: missions/<mission_id>/sprints/<sprint_id>-output.txt
+        // New layout: missions/<mission_id>/phases/<phase_id>-output.txt
         assert!(
-            path.ends_with("missions/m/sprints/my-sprint-output.txt"),
+            path.ends_with("missions/m/phases/my-phase-output.txt"),
             "got: {}",
             path.display()
         );
 
-        // No-op for None sprint_id.
-        assert!(persist_sprint_output(None, "ignored").is_none());
+        // No-op for None phase_id.
+        assert!(persist_phase_output(None, "ignored").is_none());
         // No-op for empty reply.
-        assert!(persist_sprint_output(Some("my-sprint"), "").is_none());
+        assert!(persist_phase_output(Some("my-phase"), "").is_none());
 
         unsafe {
             match prev {
@@ -3245,7 +3245,7 @@ mod tests {
         assert!(!id.contains("crew-dispatch--"));
     }
 
-    // ─── build_dispatch_record (Sprint 2 of #104) ──────────────────────────
+    // ─── build_dispatch_record (Phase 2 of #104) ──────────────────────────
 
     #[test]
     fn dispatch_record_carries_role_id_session_and_local_tier() {
@@ -3267,11 +3267,11 @@ mod tests {
         assert!(matches!(rec.tier, darkmux_flow::Tier::Local));
         assert!(matches!(rec.stage, darkmux_flow::Stage::Dispatch));
         assert!(matches!(rec.category, darkmux_flow::Category::Work));
-        // The bare `build_dispatch_record` wrapper carries no mission/sprint
-        // (it's the legacy/test call shape). A real sprint-bound dispatch goes
-        // through `_with_payload` with the resolved mission/sprint (#714); the
+        // The bare `build_dispatch_record` wrapper carries no mission/phase
+        // (it's the legacy/test call shape). A real phase-bound dispatch goes
+        // through `_with_payload` with the resolved mission/phase (#714); the
         // viewer joins via session_id either way.
-        assert!(rec.sprint_id.is_none());
+        assert!(rec.phase_id.is_none());
         // ts is set to a non-empty UTC datetime string.
         assert!(!rec.ts.is_empty());
         assert!(rec.ts.ends_with('Z'), "ts should be UTC: {}", rec.ts);
@@ -3299,8 +3299,8 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_record_with_payload_stamps_mission_and_sprint() {
-        // (#714) A sprint-bound dispatch threads its mission/sprint onto
+    fn dispatch_record_with_payload_stamps_mission_and_phase() {
+        // (#714) A phase-bound dispatch threads its mission/phase onto
         // every flow record so the observability view groups the dispatch
         // under its mission. The viewer keys the mission crumb/panel on
         // `mission_id`; without this the records were ungrouped.
@@ -3315,12 +3315,12 @@ mod tests {
             None,
         );
         assert_eq!(rec.mission_id.as_deref(), Some("pre-1.0-compat-sweep"));
-        assert_eq!(rec.sprint_id.as_deref(), Some("s694-profiles-schema"));
+        assert_eq!(rec.phase_id.as_deref(), Some("s694-profiles-schema"));
     }
 
     #[test]
-    fn dispatch_record_with_payload_omits_mission_when_not_sprint_bound() {
-        // A one-off dispatch (no --sprint-id) carries neither field — they
+    fn dispatch_record_with_payload_omits_mission_when_not_phase_bound() {
+        // A one-off dispatch (no --phase-id) carries neither field — they
         // serialize away (skip_serializing_if), so old viewers and the
         // ungrouped-session rendering are untouched.
         let rec = build_dispatch_record_with_payload(
@@ -3334,16 +3334,16 @@ mod tests {
             None,
         );
         assert!(rec.mission_id.is_none());
-        assert!(rec.sprint_id.is_none());
+        assert!(rec.phase_id.is_none());
         let json = serde_json::to_string(&rec).unwrap();
         assert!(
-            !json.contains("mission_id") && !json.contains("sprint_id"),
-            "absent mission/sprint should serialize away: {json}"
+            !json.contains("mission_id") && !json.contains("phase_id"),
+            "absent mission/phase should serialize away: {json}"
         );
     }
 
     #[test]
-    fn telemetry_record_with_payload_stamps_mission_and_sprint() {
+    fn telemetry_record_with_payload_stamps_mission_and_phase() {
         // Telemetry siblings (runtime turns, CPU samples, detector events)
         // group under the mission too — same wire as the work records.
         let rec = build_telemetry_record(
@@ -3358,7 +3358,7 @@ mod tests {
             serde_json::json!({ "turns": 9 }),
         );
         assert_eq!(rec.mission_id.as_deref(), Some("pre-1.0-compat-sweep"));
-        assert_eq!(rec.sprint_id.as_deref(), Some("s694-profiles-schema"));
+        assert_eq!(rec.phase_id.as_deref(), Some("s694-profiles-schema"));
     }
 
     #[test]

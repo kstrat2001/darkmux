@@ -1,4 +1,4 @@
-//! Crew architecture — Role, Crew, Mission, Sprint schema + loaders.
+//! Crew architecture — Role, Crew, Mission, Phase schema + loaders.
 //!
 //! The doctrine in `CLAUDE.md` names "Role + Crew (not Team)" — composition
 //! is operator-defined per mission, no fixed membership. This module groups
@@ -8,7 +8,7 @@
 //!
 //! Module layout:
 //!
-//!   crew::types  — schema (Role, Crew, Mission, Sprint, Skill, …)
+//!   crew::types  — schema (Role, Crew, Mission, Phase, Skill, …)
 //!   crew::loader — read JSON manifests from `~/.darkmux/crew/<entity>/`
 //!                  with binary-embedded built-ins as fallback
 
@@ -25,7 +25,7 @@ pub mod lifecycle;
 pub mod loader;
 pub mod pins;
 pub mod select;
-// (#1230 Packet 2) Generic dependency-graph scheduler over `Step`/`Sprint`
+// (#1230 Packet 2) Generic dependency-graph scheduler over `Step`/`Phase`
 // — see the module doc for the DependencyNode/is_ready/reachable/
 // run_step_graph shape.
 pub mod scheduler;

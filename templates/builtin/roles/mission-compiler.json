@@ -1,6 +1,6 @@
 {
   "id": "mission-compiler",
-  "description": "Utility-family role that takes unstructured intent and emits a structured Mission+Sprint proposal JSON. Pinned to specialist-tier MODEL (35B per #203) because mission planning is judgment-bearing strategy work \u2014 but the BEHAVIOR shape is bounded-I/O (read inputs, emit one structured output, no multi-turn agent loop with side-effecting tools). `role_family` controls whether the agent-loop preamble applies; mission-compiler is `role_family: utility` \u2014 the model is big, the work shape is bounded.",
+  "description": "Utility-family role that takes unstructured intent and emits a structured Mission+Phase proposal JSON. Pinned to specialist-tier MODEL (35B per #203) because mission planning is judgment-bearing strategy work \u2014 but the BEHAVIOR shape is bounded-I/O (read inputs, emit one structured output, no multi-turn agent loop with side-effecting tools). `role_family` controls whether the agent-loop preamble applies; mission-compiler is `role_family: utility` \u2014 the model is big, the work shape is bounded.",
   "skills": [
     "mission-compiling"
   ],

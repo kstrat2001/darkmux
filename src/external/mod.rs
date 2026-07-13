@@ -1,6 +1,6 @@
 //! External-source plugins for `darkmux external pull`. Each plugin
 //! emits text/markdown to stdout. Procedural-only (no AI); the AI
-//! structuring lives in `darkmux mission propose` (#113 Sprint 3).
+//! structuring lives in `darkmux mission propose` (#113 Phase 3).
 //!
 //! Plugin contract: take the source identifier, produce text/markdown
 //! on stdout. Errors bubble up via `anyhow::Result<()>`.
@@ -75,7 +75,7 @@ fn pull_gh(target: &str) -> Result<()> {
 
 /// Wrap `curl -s -L --max-time 30 <url>`. Passes through whatever the
 /// URL responds with — HTML, JSON, markdown all valid. Downstream
-/// AI-structuring (Sprint 3 `mission propose`) handles the lowering.
+/// AI-structuring (Phase 3 `mission propose`) handles the lowering.
 fn pull_url(target: &str) -> Result<()> {
     // (#1112) Argument-injection guard (shared with the gh path). The http(s)
     // scheme check below already excludes a leading `-`; the explicit guard

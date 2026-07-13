@@ -1,7 +1,7 @@
 //! `darkmux mission propose` — AI-built-in verb that takes unstructured
-//! operator intent and emits a structured Mission + Sprint proposal
+//! operator intent and emits a structured Mission + Phase proposal
 //! JSON via internal dispatch to the `mission-compiler` utility role
-//! (#113 Sprint 1). Operator approval gate is mandatory; the proposal
+//! (#113 Phase 1). Operator approval gate is mandatory; the proposal
 //! is only persisted to disk after the operator accepts (operator-
 //! sovereignty per #44).
 //!
@@ -20,8 +20,8 @@
 //!   3. Parse the proposal JSON from the response (fenced ```json block)
 //!   4. Render a human-readable summary
 //!   5. Prompt operator: approve / edit / reject / regenerate
-//!   6. On approve: write Mission + Sprint JSONs to
-//!      `~/.darkmux/crew/missions/` and `~/.darkmux/crew/sprints/`
+//!   6. On approve: write Mission + Phase JSONs to
+//!      `~/.darkmux/crew/missions/` and `~/.darkmux/crew/phases/`
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ use std::io::{BufRead, Read, Write};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Proposal {
     mission: ProposedMission,
-    sprints: Vec<ProposedSprint>,
+    phases: Vec<ProposedPhase>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +42,7 @@ struct ProposedMission {
     description: String,
     #[serde(default = "default_active")]
     status: String,
-    sprint_ids: Vec<String>,
+    phase_ids: Vec<String>,
     #[serde(default)]
     created_ts: u64,
     /// (#815) The operator's verbatim propose input, stamped at persist
@@ -57,7 +57,7 @@ struct ProposedMission {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProposedSprint {
+struct ProposedPhase {
     id: String,
     mission_id: String,
     description: String,
@@ -107,7 +107,7 @@ pub fn propose(
         };
 
         // 3b. Validate cross-references inside the proposal. A
-        // hallucinated mission_id, missing sprint_id, or dangling
+        // hallucinated mission_id, missing phase_id, or dangling
         // depends_on slips through serde happily but lands a broken
         // mission on disk. Surface it now so the operator can hit `e`
         // and regenerate with a hint instead of debugging the viewer.
@@ -207,9 +207,9 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         watch_paths: Vec::new(),
         // mission-compiler reads stdin-piped intent; no scope override.
         workdir: None,
-        // mission-compiler runs BEFORE any mission/sprints exist on disk —
+        // mission-compiler runs BEFORE any mission/phases exist on disk —
         // there's nothing to bind to and no parent context to inject.
-        sprint_id: None,
+        phase_id: None,
         // Mission propose is a system-level utility dispatch; runs
         // through the internal Docker-bounded runtime — same default
         // as `darkmux crew dispatch` (#309). Beat 36 directional
@@ -308,20 +308,20 @@ fn parse_proposal(response: &str) -> Result<Proposal> {
 
 /// Validate cross-references inside a Proposal so a hallucinated /
 /// drifted utility-agent output can't land on disk as a broken
-/// mission+sprints set. `add_sprint_to_mission` already enforces these
-/// invariants for the mid-flight add-sprint path; `propose` should hold
+/// mission+phases set. `add_phase_to_mission` already enforces these
+/// invariants for the mid-flight add-phase path; `propose` should hold
 /// the same bar at first-write time. Three checks:
 ///
-///   - Every `sprints[].mission_id` matches `mission.id`
-///   - Every entry in `mission.sprint_ids` exists as a `sprints[].id`
-///   - Every `sprints[].depends_on` value references an in-proposal id
+///   - Every `phases[].mission_id` matches `mission.id`
+///   - Every entry in `mission.phase_ids` exists as a `phases[].id`
+///   - Every `phases[].depends_on` value references an in-proposal id
 ///
 /// Returns a readable error so the operator can hit `e` to regenerate
 /// with a hint instead of having to discover the problem post-persist
-/// in the viewer's sprint-progress widget.
-/// (#867 security) Reject any MODEL-supplied mission/sprint id that isn't a
+/// in the viewer's phase-progress widget.
+/// (#867 security) Reject any MODEL-supplied mission/phase id that isn't a
 /// safe single path component, BEFORE it reaches `lifecycle::mission_path` /
-/// `sprint_path` (which build paths by raw `join`). A `../`- or `/`-bearing id
+/// `phase_path` (which build paths by raw `join`). A `../`- or `/`-bearing id
 /// would otherwise escape the crew dir — a controlled `.json`/`mission.json`
 /// write-primitive from untrusted local-model output. `validate_identifier`
 /// rejects anything outside `[a-z0-9_-]`, so `.`/`/` (hence `..`) can't pass;
@@ -330,8 +330,8 @@ fn parse_proposal(response: &str) -> Result<Proposal> {
 /// UX rejection) and `persist` (the write boundary) so the two never drift.
 fn validate_proposal_ids(p: &Proposal) -> Result<()> {
     crate::fleet::validate_identifier("mission_id", &p.mission.id)?;
-    for s in &p.sprints {
-        crate::fleet::validate_identifier("sprint_id", &s.id)?;
+    for s in &p.phases {
+        crate::fleet::validate_identifier("phase_id", &s.id)?;
     }
     Ok(())
 }
@@ -340,22 +340,22 @@ fn validate_proposal_invariants(p: &Proposal) -> Result<()> {
     // Charset-validate the path-bearing ids before any cross-ref logic (#867).
     validate_proposal_ids(p)?;
 
-    let sprint_ids: std::collections::HashSet<&str> =
-        p.sprints.iter().map(|s| s.id.as_str()).collect();
+    let phase_ids: std::collections::HashSet<&str> =
+        p.phases.iter().map(|s| s.id.as_str()).collect();
 
-    for s in &p.sprints {
+    for s in &p.phases {
         if s.mission_id != p.mission.id {
             return Err(anyhow!(
-                "proposal invariant: sprint `{}` has mission_id `{}` but mission is `{}`",
+                "proposal invariant: phase `{}` has mission_id `{}` but mission is `{}`",
                 s.id,
                 s.mission_id,
                 p.mission.id
             ));
         }
         for dep in &s.depends_on {
-            if !sprint_ids.contains(dep.as_str()) {
+            if !phase_ids.contains(dep.as_str()) {
                 return Err(anyhow!(
-                    "proposal invariant: sprint `{}` depends_on `{}` which is not in the proposal",
+                    "proposal invariant: phase `{}` depends_on `{}` which is not in the proposal",
                     s.id,
                     dep
                 ));
@@ -363,10 +363,10 @@ fn validate_proposal_invariants(p: &Proposal) -> Result<()> {
         }
     }
 
-    for sid in &p.mission.sprint_ids {
-        if !sprint_ids.contains(sid.as_str()) {
+    for sid in &p.mission.phase_ids {
+        if !phase_ids.contains(sid.as_str()) {
             return Err(anyhow!(
-                "proposal invariant: mission.sprint_ids references `{}` which is not in sprints[]",
+                "proposal invariant: mission.phase_ids references `{}` which is not in phases[]",
                 sid
             ));
         }
@@ -466,16 +466,16 @@ fn render_proposal(p: &Proposal) {
         eprintln!("    {line}");
     }
     eprintln!();
-    eprintln!("  Sprints ({}):", p.sprints.len());
-    for (i, s) in p.sprints.iter().enumerate() {
+    eprintln!("  Phases ({}):", p.phases.len());
+    for (i, s) in p.phases.iter().enumerate() {
         let deps = if s.depends_on.is_empty() {
             "—".to_string()
         } else {
             s.depends_on.join(", ")
         };
         eprintln!("    {}. {} (depends_on: {deps})", i + 1, s.id);
-        // Show only the first line of each sprint description in the
-        // summary — keeps the table-style render readable when sprint
+        // Show only the first line of each phase description in the
+        // summary — keeps the table-style render readable when phase
         // descriptions are multi-line.
         if let Some(first) = s.description.lines().next() {
             eprintln!("       {first}");
@@ -531,7 +531,7 @@ fn persist(p: &Proposal, source_input: &str, ticket: Option<&str>) -> Result<i32
     use crate::crew::lifecycle;
 
     // (#867 security boundary) Re-assert id safety at the path-construction
-    // site — persist builds `lifecycle::{mission,sprint}_path` via raw join, so
+    // site — persist builds `lifecycle::{mission,phase}_path` via raw join, so
     // a model-supplied `../`/`/`-id must never reach here even if a future
     // caller skips `validate_proposal_invariants`. This function, not its
     // callers, owns the path-write boundary.
@@ -560,12 +560,12 @@ fn persist(p: &Proposal, source_input: &str, ticket: Option<&str>) -> Result<i32
         mission.ticket = Some(t.to_string());
     }
 
-    // Ensure the per-mission dir + its sprints/ subdir exist before any
+    // Ensure the per-mission dir + its phases/ subdir exist before any
     // existence checks or writes. create_dir_all is idempotent and also
     // creates the parent mission dir, so one call covers both.
-    let sprints_dir = lifecycle::sprints_dir(&mission.id);
-    std::fs::create_dir_all(&sprints_dir)
-        .with_context(|| format!("creating {}", sprints_dir.display()))?;
+    let phases_dir = lifecycle::phases_dir(&mission.id);
+    std::fs::create_dir_all(&phases_dir)
+        .with_context(|| format!("creating {}", phases_dir.display()))?;
 
     // Refuse to overwrite existing mission file.
     let mission_path = lifecycle::mission_path(&mission.id);
@@ -577,12 +577,12 @@ fn persist(p: &Proposal, source_input: &str, ticket: Option<&str>) -> Result<i32
         ));
     }
 
-    // Same for each sprint — scoped to the mission's sprints/ subdir.
-    for s in &p.sprints {
-        let sp = lifecycle::sprint_path(&mission.id, &s.id);
+    // Same for each phase — scoped to the mission's phases/ subdir.
+    for s in &p.phases {
+        let sp = lifecycle::phase_path(&mission.id, &s.id);
         if sp.exists() {
             return Err(anyhow!(
-                "mission propose: sprint `{}` already exists at {} — aborting (no overwrite)",
+                "mission propose: phase `{}` already exists at {} — aborting (no overwrite)",
                 s.id,
                 sp.display()
             ));
@@ -608,9 +608,9 @@ fn persist(p: &Proposal, source_input: &str, ticket: Option<&str>) -> Result<i32
     }
 
     eprintln!(
-        "mission propose: persisted {} mission + {} sprints",
+        "mission propose: persisted {} mission + {} phases",
         1,
-        p.sprints.len()
+        p.phases.len()
     );
     Ok(0)
 }
@@ -634,17 +634,17 @@ fn write_all(
     written.push(mission_path.to_path_buf());
     println!("wrote mission: {}", mission_path.display());
 
-    for s in &p.sprints {
-        let mut sprint = s.clone();
-        if sprint.created_ts == 0 {
-            sprint.created_ts = now;
+    for s in &p.phases {
+        let mut phase = s.clone();
+        if phase.created_ts == 0 {
+            phase.created_ts = now;
         }
-        let sp = lifecycle::sprint_path(&mission.id, &sprint.id);
-        let sprint_json = serde_json::to_string_pretty(&sprint).context("serializing sprint")?;
-        std::fs::write(&sp, format!("{sprint_json}\n"))
+        let sp = lifecycle::phase_path(&mission.id, &phase.id);
+        let phase_json = serde_json::to_string_pretty(&phase).context("serializing phase")?;
+        std::fs::write(&sp, format!("{phase_json}\n"))
             .with_context(|| format!("writing {}", sp.display()))?;
         written.push(sp.clone());
-        println!("wrote sprint:  {}", sp.display());
+        println!("wrote phase:  {}", sp.display());
     }
 
     Ok(())
@@ -725,23 +725,23 @@ mod tests {
     }
 
     /// Minimal valid Proposal for tests. Adjust fields per-test as needed.
-    fn sample_proposal(mission_id: &str, sprint_ids: &[&str]) -> Proposal {
+    fn sample_proposal(mission_id: &str, phase_ids: &[&str]) -> Proposal {
         Proposal {
             mission: ProposedMission {
                 id: mission_id.to_string(),
                 description: "test mission".to_string(),
                 status: "active".to_string(),
-                sprint_ids: sprint_ids.iter().map(|s| s.to_string()).collect(),
+                phase_ids: phase_ids.iter().map(|s| s.to_string()).collect(),
                 created_ts: 0,
                 source_input: None,
                 ticket: None,
             },
-            sprints: sprint_ids
+            phases: phase_ids
                 .iter()
-                .map(|sid| ProposedSprint {
+                .map(|sid| ProposedPhase {
                     id: sid.to_string(),
                     mission_id: mission_id.to_string(),
-                    description: format!("sprint {sid}"),
+                    description: format!("phase {sid}"),
                     status: "planned".to_string(),
                     depends_on: Vec::new(),
                     created_ts: 0,
@@ -752,10 +752,10 @@ mod tests {
 
     #[test]
     fn extract_json_block_finds_fenced_block() {
-        let resp = "preamble text\n```json\n{\"mission\": {}, \"sprints\": []}\n```\nepilogue";
+        let resp = "preamble text\n```json\n{\"mission\": {}, \"phases\": []}\n```\nepilogue";
         let block = extract_json_block(resp).expect("should extract");
         assert!(block.contains("\"mission\""));
-        assert!(block.contains("\"sprints\""));
+        assert!(block.contains("\"phases\""));
     }
 
     #[test]
@@ -770,7 +770,7 @@ mod tests {
         // (#896) A bare fence wrapping some OTHER block precedes the real
         // ```json block. The old scanner opened on the bare fence and
         // captured the wrong region; we must prefer the tagged opener.
-        let resp = "```\nnot json — some shell snippet\n```\n```json\n{\"mission\": {}, \"sprints\": []}\n```";
+        let resp = "```\nnot json — some shell snippet\n```\n```json\n{\"mission\": {}, \"phases\": []}\n```";
         let block = extract_json_block(resp).expect("should extract the tagged block");
         assert!(block.contains("\"mission\""));
         assert!(!block.contains("shell snippet"));
@@ -781,7 +781,7 @@ mod tests {
         // (#896) A ```json opener with no closing fence (token-truncated
         // local model). Must be a DISTINCT "unterminated" error, not the
         // misleading "no fenced block" — there was a block, it didn't finish.
-        let resp = "preamble\n```json\n{\"mission\": {}, \"sprints\": [";
+        let resp = "preamble\n```json\n{\"mission\": {}, \"phases\": [";
         let err = extract_json_block(resp).expect_err("should error on truncation");
         let msg = err.to_string();
         assert!(msg.contains("unterminated"), "got: {msg}");
@@ -791,7 +791,7 @@ mod tests {
     #[test]
     fn extract_json_block_falls_back_to_bare_fence() {
         // No language tag anywhere → fall back to the first bare fence.
-        let resp = "```\n{\"mission\": {}, \"sprints\": []}\n```";
+        let resp = "```\n{\"mission\": {}, \"phases\": []}\n```";
         let block = extract_json_block(resp).expect("should extract the bare-fenced block");
         assert!(block.contains("\"mission\""));
     }
@@ -815,14 +815,14 @@ mod tests {
     "id": "test-mission",
     "description": "a test mission",
     "status": "active",
-    "sprint_ids": ["test-s1"],
+    "phase_ids": ["test-s1"],
     "created_ts": 0
   },
-  "sprints": [
+  "phases": [
     {
       "id": "test-s1",
       "mission_id": "test-mission",
-      "description": "first sprint",
+      "description": "first phase",
       "status": "planned",
       "depends_on": [],
       "created_ts": 0
@@ -833,15 +833,15 @@ mod tests {
 some epilogue"#;
         let p = parse_proposal(resp).expect("should parse");
         assert_eq!(p.mission.id, "test-mission");
-        assert_eq!(p.sprints.len(), 1);
-        assert_eq!(p.sprints[0].id, "test-s1");
+        assert_eq!(p.phases.len(), 1);
+        assert_eq!(p.phases[0].id, "test-s1");
     }
 
     #[test]
     fn build_compiler_message_includes_hint_when_present() {
-        let msg = build_compiler_message("intent", Some("merge sprints 3 and 4"));
+        let msg = build_compiler_message("intent", Some("merge phases 3 and 4"));
         assert!(msg.contains("intent"));
-        assert!(msg.contains("merge sprints 3 and 4"));
+        assert!(msg.contains("merge phases 3 and 4"));
         assert!(msg.contains("regeneration hint"));
     }
 
@@ -881,7 +881,7 @@ some epilogue"#;
         // Seed the new nested layout: missions/<id>/mission.json
         let existing_path = crate::crew::lifecycle::mission_path("test-existing-mission");
         std::fs::create_dir_all(existing_path.parent().unwrap()).unwrap();
-        std::fs::write(&existing_path, r#"{"id":"test-existing-mission","description":"existing","status":"active","sprint_ids":[],"created_ts":0}"#)
+        std::fs::write(&existing_path, r#"{"id":"test-existing-mission","description":"existing","status":"active","phase_ids":[],"created_ts":0}"#)
             .expect("writing existing mission");
 
         let proposal = sample_proposal("test-existing-mission", &[]);
@@ -892,30 +892,30 @@ some epilogue"#;
     #[cfg(unix)]
     #[serial_test::serial]
     #[test]
-    fn persist_rolls_back_mission_when_sprint_write_fails() {
-        // Atomicity regression: if a sprint write fails mid-loop, the
-        // mission file + any EARLIER successfully-written sprint files must be
+    fn persist_rolls_back_mission_when_phase_write_fails() {
+        // Atomicity regression: if a phase write fails mid-loop, the
+        // mission file + any EARLIER successfully-written phase files must be
         // cleaned up so the operator's retry sees a clean slate.
         //
         // Triggering a WRITE-time (not exists-pre-flight) failure on the
-        // SECOND sprint with VALID ids — `/`-bearing ids are now rejected up
+        // SECOND phase with VALID ids — `/`-bearing ids are now rejected up
         // front by validate_identifier (#867) — needs a path that PASSES the
         // `.exists()` pre-flight yet FAILS the write. A symlink whose target's
         // parent is missing does exactly that: `Path::exists()` follows it and
         // sees the absent target (pre-flight passes), while `std::fs::write`
         // follows it and ENOENTs on the missing parent (rollback fires). So
-        // mission + sprint-1 land, sprint-2 fails, and both are rolled back.
+        // mission + phase-1 land, phase-2 fails, and both are rolled back.
         // (Previously this used a `deep/test-s2` slashed id, which #867 now
         // correctly refuses.)
         use std::os::unix::fs::symlink;
         let _guard = CrewDirGuard::new(TempDir::new().unwrap());
 
         let proposal = sample_proposal("test-rollback", &["test-s1", "test-s2"]);
-        let sprints_dir = crate::crew::lifecycle::sprints_dir("test-rollback");
-        std::fs::create_dir_all(&sprints_dir).unwrap();
-        let s2_path = crate::crew::lifecycle::sprint_path("test-rollback", "test-s2");
+        let phases_dir = crate::crew::lifecycle::phases_dir("test-rollback");
+        std::fs::create_dir_all(&phases_dir).unwrap();
+        let s2_path = crate::crew::lifecycle::phase_path("test-rollback", "test-s2");
         // Symlink s2's .json at a target whose parent dir doesn't exist.
-        symlink(sprints_dir.join("missing-parent").join("target.json"), &s2_path)
+        symlink(phases_dir.join("missing-parent").join("target.json"), &s2_path)
             .expect("pre-create the failing symlink at the s2 json path");
 
         let err = persist(&proposal, "test input", None).expect_err("persist should fail mid-loop");
@@ -924,18 +924,18 @@ some epilogue"#;
             "expected a write error, got: {err}"
         );
 
-        // Mission file and the first sprint file must both be cleaned up.
+        // Mission file and the first phase file must both be cleaned up.
         let mission_path = crate::crew::lifecycle::mission_path("test-rollback");
-        let sprint1_path = crate::crew::lifecycle::sprint_path("test-rollback", "test-s1");
+        let phase1_path = crate::crew::lifecycle::phase_path("test-rollback", "test-s1");
         assert!(
             !mission_path.exists(),
             "mission file should have been rolled back; found {}",
             mission_path.display()
         );
         assert!(
-            !sprint1_path.exists(),
-            "sprint 1 file should have been rolled back; found {}",
-            sprint1_path.display()
+            !phase1_path.exists(),
+            "phase 1 file should have been rolled back; found {}",
+            phase1_path.display()
         );
     }
 
@@ -946,19 +946,19 @@ some epilogue"#;
     }
 
     #[test]
-    fn validate_proposal_rejects_dangling_sprint_id_in_mission() {
+    fn validate_proposal_rejects_dangling_phase_id_in_mission() {
         let mut p = sample_proposal("m1", &["s1"]);
-        // Add a sprint_id to the mission that doesn't exist in sprints[].
-        p.mission.sprint_ids.push("ghost".to_string());
-        let err = validate_proposal_invariants(&p).expect_err("should reject dangling sprint_id");
+        // Add a phase_id to the mission that doesn't exist in phases[].
+        p.mission.phase_ids.push("ghost".to_string());
+        let err = validate_proposal_invariants(&p).expect_err("should reject dangling phase_id");
         assert!(err.to_string().contains("ghost"));
     }
 
     #[test]
     fn validate_proposal_rejects_dangling_depends_on() {
         let mut p = sample_proposal("m1", &["s1"]);
-        // Reference a non-existent sprint id in depends_on.
-        p.sprints[0].depends_on = vec!["missing".to_string()];
+        // Reference a non-existent phase id in depends_on.
+        p.phases[0].depends_on = vec!["missing".to_string()];
         let err = validate_proposal_invariants(&p).expect_err("should reject dangling depends_on");
         assert!(err.to_string().contains("missing"));
     }
@@ -977,11 +977,11 @@ some epilogue"#;
     }
 
     #[test]
-    fn validate_proposal_rejects_path_traversal_sprint_id() {
-        // (#867 security) Same guard for sprint ids → sprint_path raw join.
+    fn validate_proposal_rejects_path_traversal_phase_id() {
+        // (#867 security) Same guard for phase ids → phase_path raw join.
         let p = sample_proposal("m1", &["../../etc/passwd"]);
         let err = validate_proposal_invariants(&p)
-            .expect_err("a traversal sprint id must be rejected");
+            .expect_err("a traversal phase id must be rejected");
         assert!(
             err.to_string().contains("invalid char"),
             "expected an identifier-charset rejection, got: {err}"
@@ -1059,7 +1059,7 @@ some epilogue"#;
         let envelope = r#"{
           "payloads": [
             {
-              "text": "```json\n{\n  \"mission\": {\n    \"id\": \"env-test\",\n    \"description\": \"envelope-wrapped\",\n    \"status\": \"active\",\n    \"sprint_ids\": [\"env-s1\"],\n    \"created_ts\": 0\n  },\n  \"sprints\": [\n    {\n      \"id\": \"env-s1\",\n      \"mission_id\": \"env-test\",\n      \"description\": \"first sprint\",\n      \"status\": \"planned\",\n      \"depends_on\": [],\n      \"created_ts\": 0\n    }\n  ]\n}\n```",
+              "text": "```json\n{\n  \"mission\": {\n    \"id\": \"env-test\",\n    \"description\": \"envelope-wrapped\",\n    \"status\": \"active\",\n    \"phase_ids\": [\"env-s1\"],\n    \"created_ts\": 0\n  },\n  \"phases\": [\n    {\n      \"id\": \"env-s1\",\n      \"mission_id\": \"env-test\",\n      \"description\": \"first phase\",\n      \"status\": \"planned\",\n      \"depends_on\": [],\n      \"created_ts\": 0\n    }\n  ]\n}\n```",
               "mediaUrl": null
             }
           ],
@@ -1067,15 +1067,15 @@ some epilogue"#;
         }"#;
         let p = parse_proposal(envelope).expect("envelope-wrapped proposal should parse");
         assert_eq!(p.mission.id, "env-test");
-        assert_eq!(p.sprints.len(), 1);
-        assert_eq!(p.sprints[0].id, "env-s1");
+        assert_eq!(p.phases.len(), 1);
+        assert_eq!(p.phases[0].id, "env-s1");
     }
 
     #[test]
     fn validate_proposal_rejects_mismatched_mission_id() {
         let mut p = sample_proposal("m1", &["s1"]);
-        // Make a sprint claim a different mission_id than the mission's id.
-        p.sprints[0].mission_id = "other-mission".to_string();
+        // Make a phase claim a different mission_id than the mission's id.
+        p.phases[0].mission_id = "other-mission".to_string();
         let err =
             validate_proposal_invariants(&p).expect_err("should reject mismatched mission_id");
         assert!(err.to_string().contains("other-mission"));

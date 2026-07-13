@@ -1,7 +1,7 @@
 //! (#816) Repo-level shipping conventions — `<repo>/.darkmux/conventions.json`.
 //!
 //! `mission run`/`ship` default to darkmux-native output (branch
-//! `darkmux/<sprint>`, sprint-description commit subject, generated PR
+//! `darkmux/<phase>`, phase-description commit subject, generated PR
 //! body, no labels). Repos with their own conventions — ticket-prefixed
 //! branches and commits, a PR template, required labels — declare them in
 //! an operator-owned file at the repo root, and the loop speaks them.
@@ -13,7 +13,7 @@
 //! behavior, no `--engagement` flag).
 //!
 //! Template variables: `{ticket}` (from the mission's `ticket` field, set
-//! via `mission propose --ticket`), `{sprint}`, `{mission}`, `{subject}`
+//! via `mission propose --ticket`), `{phase}`, `{mission}`, `{subject}`
 //! (the default-computed commit subject). A template that references
 //! `{ticket}` on a ticketless mission falls back to the built-in default
 //! for that item with a soft warning — loud beats quiet, but conventions
@@ -28,8 +28,8 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Conventions {
-    /// Branch name template, e.g. `"{ticket}/{sprint}"`. Default when
-    /// absent: `darkmux/{sprint}`.
+    /// Branch name template, e.g. `"{ticket}/{phase}"`. Default when
+    /// absent: `darkmux/{phase}`.
     #[serde(default)]
     pub branch_template: Option<String>,
     /// Commit subject template, e.g. `"{ticket}: {subject}"`.
@@ -119,7 +119,7 @@ pub fn load(repo_root: &Path) -> Option<Conventions> {
 /// the caller to fall back (see `expand`).
 pub struct Vars<'a> {
     pub ticket: Option<&'a str>,
-    pub sprint: &'a str,
+    pub phase: &'a str,
     pub mission: &'a str,
     pub subject: &'a str,
 }
@@ -135,7 +135,7 @@ pub fn expand(template: &str, vars: &Vars) -> Option<String> {
     Some(
         template
             .replace("{ticket}", vars.ticket.unwrap_or(""))
-            .replace("{sprint}", vars.sprint)
+            .replace("{phase}", vars.phase)
             .replace("{mission}", vars.mission)
             .replace("{subject}", vars.subject),
     )
@@ -171,12 +171,12 @@ mod tests {
     use super::*;
 
     fn vars<'a>(ticket: Option<&'a str>) -> Vars<'a> {
-        Vars { ticket, sprint: "s1-fix", mission: "m1", subject: "fix the page copy" }
+        Vars { ticket, phase: "s1-fix", mission: "m1", subject: "fix the page copy" }
     }
 
     #[test]
     fn expand_fills_all_vars() {
-        let out = expand("{ticket}/{sprint}", &vars(Some("SYS-2598"))).unwrap();
+        let out = expand("{ticket}/{phase}", &vars(Some("SYS-2598"))).unwrap();
         assert_eq!(out, "SYS-2598/s1-fix");
         let out = expand("{ticket}: {subject}", &vars(Some("SYS-2598"))).unwrap();
         assert_eq!(out, "SYS-2598: fix the page copy");
@@ -184,14 +184,14 @@ mod tests {
 
     #[test]
     fn expand_signals_fallback_on_missing_ticket() {
-        assert!(expand("{ticket}/{sprint}", &vars(None)).is_none());
+        assert!(expand("{ticket}/{phase}", &vars(None)).is_none());
         // Templates NOT referencing {ticket} still expand fine ticketless.
-        assert_eq!(expand("wip/{sprint}", &vars(None)).unwrap(), "wip/s1-fix");
+        assert_eq!(expand("wip/{phase}", &vars(None)).unwrap(), "wip/s1-fix");
     }
 
     #[test]
     fn unknown_placeholders_pass_through_visibly() {
-        assert_eq!(expand("{tikcet}/{sprint}", &vars(Some("S-1"))).unwrap(), "{tikcet}/s1-fix");
+        assert_eq!(expand("{tikcet}/{phase}", &vars(Some("S-1"))).unwrap(), "{tikcet}/s1-fix");
     }
 
     #[test]
@@ -226,11 +226,11 @@ mod tests {
         assert!(load(tmp.path()).is_none(), "malformed → None (warn)");
         std::fs::write(
             tmp.path().join(".darkmux/conventions.json"),
-            r#"{"branch_template":"{ticket}/{sprint}","pr_labels":["agent-work"],"unknown_key":1}"#,
+            r#"{"branch_template":"{ticket}/{phase}","pr_labels":["agent-work"],"unknown_key":1}"#,
         )
         .unwrap();
         let c = load(tmp.path()).expect("valid file loads");
-        assert_eq!(c.branch_template.as_deref(), Some("{ticket}/{sprint}"));
+        assert_eq!(c.branch_template.as_deref(), Some("{ticket}/{phase}"));
         assert_eq!(c.pr_labels, vec!["agent-work"]);
     }
 
