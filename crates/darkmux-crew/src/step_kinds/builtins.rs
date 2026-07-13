@@ -143,6 +143,7 @@ impl StepKind for DispatchInternalStepKind {
             force_container: false,
             max_completion_tokens: None,
             image,
+            model_base_url_override: None,
         };
         let result =
             dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;
