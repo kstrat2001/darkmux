@@ -3834,7 +3834,7 @@ pub struct ReviewStepContext {
 /// parameter — only the NEW graph glue trades that seam for parity with the
 /// rest of the Task/Step step-kind family.
 fn dispatch_chat(ctx: &ReviewStepContext, call: &ChatCall) -> Result<SingleShotReply> {
-    match call.endpoint {
+    let reply = match call.endpoint {
         Some(endpoint) => single_shot_chat_hosted(&HostedSingleShotRequest {
             endpoint,
             model: call.model,
@@ -3852,7 +3852,65 @@ fn dispatch_chat(ctx: &ReviewStepContext, call: &ChatCall) -> Result<SingleShotR
             max_tokens: call.max_tokens,
             timeout_seconds: ctx.timeout_seconds,
         }),
-    }
+    }?;
+    emit_review_token_telemetry(&ctx.case_id, call.model, &reply);
+    Ok(reply)
+}
+
+/// (#1361) Emit a `telemetry.tokens` record for one review dispatch call —
+/// the shape `dispatch_internal.rs`'s per-turn tailer emits for the
+/// internal-runtime container path. The review pipeline's
+/// `single_shot_chat`/`_hosted` calls never go through that tailer at all
+/// (it's not an agentic loop), so without this the fleet dashboard's
+/// `tokensOffMeter()` — which sums ONLY `category:telemetry, source:tokens`
+/// records — is structurally blind to every review/funnel dispatch's real
+/// token usage. No `turn_seq`: each review call is an independent
+/// single-shot request, not a growing agentic-loop context, so the
+/// viewer's fresh/re-read decomposition correctly buckets these as
+/// unclassified rather than fabricating a sequential-turn overlap.
+/// Silently skipped when the response carried no `usage.total_tokens` at
+/// all (nothing to report — matches `turn_tokens_payload`'s same skip).
+fn emit_review_token_telemetry(case_id: &str, model: &str, reply: &SingleShotReply) {
+    let Some(payload) = review_token_telemetry_payload(reply) else {
+        return;
+    };
+    let _ = darkmux_flow::record(darkmux_crew::dispatch::build_telemetry_record(
+        darkmux_flow::Level::Info,
+        "telemetry.tokens",
+        "tokens",
+        "review",
+        case_id,
+        Some(model),
+        None,
+        None,
+        payload,
+    ));
+}
+
+/// Pure: map a review dispatch's [`SingleShotReply`] to the
+/// `{prompt_tokens, completion_tokens, total_tokens}` `telemetry.tokens`
+/// payload — the sibling of `dispatch_internal.rs`'s `turn_tokens_payload`
+/// for the review pipeline's single-shot calls. No I/O, so unit-testable
+/// in isolation from `emit_review_token_telemetry`'s flow-record emission
+/// (same split as `turn_tokens_payload` / `handle_event`).
+///
+/// `None` when the reply carried no `total_tokens` at all (the OpenAI-compat
+/// response omitted `usage` entirely) — nothing to report, mirrors
+/// `turn_tokens_payload` skipping turns with no `usage`. A `total_tokens`
+/// with no `prompt_tokens` breakdown defaults prompt to 0 and completion to
+/// the full total (defensive; real LMStudio/hosted responses always send
+/// both alongside `total_tokens`).
+fn review_token_telemetry_payload(reply: &SingleShotReply) -> Option<serde_json::Value> {
+    let total_tokens = reply.total_tokens?;
+    let prompt_tokens = reply.prompt_tokens.unwrap_or(0);
+    let completion_tokens = reply
+        .completion_tokens
+        .unwrap_or_else(|| total_tokens.saturating_sub(prompt_tokens));
+    Some(serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }))
 }
 
 /// A "step result" companion flow record — the review's own equivalent of
@@ -5229,8 +5287,57 @@ mod tests {
         SingleShotReply {
             content: content.to_string(),
             total_tokens: Some(10),
+            prompt_tokens: None,
+            completion_tokens: None,
             model: None,
         }
+    }
+
+    // ── review_token_telemetry_payload (#1361) ───────────────────────
+
+    #[test]
+    fn review_token_telemetry_payload_uses_prompt_and_completion_when_present() {
+        let r = SingleShotReply {
+            content: String::new(),
+            total_tokens: Some(42),
+            prompt_tokens: Some(30),
+            completion_tokens: Some(12),
+            model: None,
+        };
+        let payload = review_token_telemetry_payload(&r).expect("total_tokens present");
+        assert_eq!(payload["prompt_tokens"], 30);
+        assert_eq!(payload["completion_tokens"], 12);
+        assert_eq!(payload["total_tokens"], 42);
+    }
+
+    #[test]
+    fn review_token_telemetry_payload_defaults_missing_split_from_total() {
+        // Real LMStudio/hosted responses always send prompt_tokens +
+        // completion_tokens alongside total_tokens, but the fallback must
+        // still produce an honest payload if a backend ever omits the split.
+        let r = SingleShotReply {
+            content: String::new(),
+            total_tokens: Some(50),
+            prompt_tokens: None,
+            completion_tokens: None,
+            model: None,
+        };
+        let payload = review_token_telemetry_payload(&r).expect("total_tokens present");
+        assert_eq!(payload["prompt_tokens"], 0);
+        assert_eq!(payload["completion_tokens"], 50);
+        assert_eq!(payload["total_tokens"], 50);
+    }
+
+    #[test]
+    fn review_token_telemetry_payload_none_when_no_total_tokens() {
+        let r = SingleShotReply {
+            content: String::new(),
+            total_tokens: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            model: None,
+        };
+        assert!(review_token_telemetry_payload(&r).is_none());
     }
 
     // ── judge ruling parser ──────────────────────────────────────────
@@ -8268,6 +8375,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             Ok(SingleShotReply {
                 content,
                 total_tokens: Some(10),
+                prompt_tokens: None,
+                completion_tokens: None,
                 model: Some("gpt-4o-2026-08-01".to_string()),
             })
         };
@@ -8325,6 +8434,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             Ok(SingleShotReply {
                 content,
                 total_tokens: Some(10),
+                prompt_tokens: None,
+                completion_tokens: None,
                 model: Some(call.model.to_string()),
             })
         };
@@ -8359,6 +8470,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(SingleShotReply {
                     content: "a real defect `const end = start.plus(30)`".to_string(),
                     total_tokens: Some(600),
+                    prompt_tokens: None,
+                    completion_tokens: None,
                     model: None,
                 })
             }
@@ -8422,6 +8535,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(SingleShotReply {
                     content: CONFIRM_JSON.to_string(),
                     total_tokens: Some(600),
+                    prompt_tokens: None,
+                    completion_tokens: None,
                     model: None,
                 })
             } else {
@@ -8686,6 +8801,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(SingleShotReply {
                     content: VERIFIED_JSON.to_string(),
                     total_tokens: Some(600),
+                    prompt_tokens: None,
+                    completion_tokens: None,
                     model: None,
                 })
             } else if call.model == "darkmux:judge-model" {
@@ -8798,7 +8915,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // retries once, so two 600-token attempts.
         let mut chat = |call: &ChatCall| {
             if call.endpoint.is_some() {
-                Ok(SingleShotReply { content: String::new(), total_tokens: Some(600), model: None })
+                Ok(SingleShotReply { content: String::new(), total_tokens: Some(600), prompt_tokens: None, completion_tokens: None, model: None })
             } else {
                 Ok(reply(CONFIRM_JSON))
             }
@@ -8954,7 +9071,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let mut chat = |call: &ChatCall| {
             assert_ne!(call.model, "darkmux:verify-model", "a judge-doomed run must not spend on verify");
             if call.endpoint.is_some() {
-                Ok(SingleShotReply { content: CONFIRM_JSON.to_string(), total_tokens: Some(600), model: None })
+                Ok(SingleShotReply { content: CONFIRM_JSON.to_string(), total_tokens: Some(600), prompt_tokens: None, completion_tokens: None, model: None })
             } else {
                 Ok(reply("a real defect"))
             }
@@ -9117,7 +9234,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let mut cyc2 = RecordingCycler::new();
         let mut chat2 = |call: &ChatCall| {
             if call.endpoint.is_some() {
-                Ok(SingleShotReply { content: CONFIRM_JSON.to_string(), total_tokens: Some(42), model: None })
+                Ok(SingleShotReply { content: CONFIRM_JSON.to_string(), total_tokens: Some(42), prompt_tokens: None, completion_tokens: None, model: None })
             } else {
                 Ok(reply("a real defect"))
             }
