@@ -102,6 +102,33 @@ fn disappeared_machines<'a>(
         .collect()
 }
 
+/// Pure: the beats present in `now` whose uid is absent from `last_uids` —
+/// i.e. the machines that reappeared since the previous reconcile tick
+/// (#1362). Symmetric with [`disappeared_machines`], extracted the same way
+/// for the same reason (unit-testable without Redis).
+///
+/// This closes a real gap: [`emit_machine_online_edge`] only self-emits
+/// `machine.online` once, at daemon startup — so a machine whose presence
+/// beat drops out TRANSIENTLY (a TTL expiry without the daemon process
+/// itself restarting — e.g. the presence-heartbeat thread briefly starved
+/// by concurrent local inference load) gets a reconciler-emitted
+/// `machine.offline` from [`disappeared_machines`] but NOTHING ever
+/// records it coming back, since the only online-edge emitter fires once
+/// per process lifetime. Without this, that machine reads as offline
+/// forever in the flow stream — both live (until a client's presence poll
+/// happens to win the race against the stale edge fallback) and,
+/// durably, in any later PLAYBACK of that stretch, which has no live poll
+/// to fall back on at all.
+fn reappeared_machines<'a>(
+    last_uids: &HashSet<String>,
+    now: &'a HashMap<String, PresenceBeat>,
+) -> Vec<&'a PresenceBeat> {
+    now.iter()
+        .filter(|(uid, _)| !last_uids.contains(*uid))
+        .map(|(_, beat)| beat)
+        .collect()
+}
+
 /// Build a machine lifecycle edge record (`machine.online` / `machine.offline`)
 /// for the given uid + display label. `machine_uid` and `machine_id` are set
 /// EXPLICITLY to the *subject* machine — for an offline edge that's the
@@ -306,6 +333,32 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                                     }
                                 }
                             }
+                            // (#1362) Machine online (reappeared) edges — the
+                            // symmetric close of the gap `disappeared_machines`
+                            // alone leaves open: a machine whose beat comes
+                            // back without its daemon actually restarting has
+                            // no self-emitter to record it, so the reconciler
+                            // is the only observer that can. Same dedup claim
+                            // scheme (a distinct "machine-online" namespace, so
+                            // it can never collide with an offline claim for
+                            // the same uid); a harmless duplicate is possible
+                            // if the daemon's own restart-time self-emit races
+                            // this tick, but `machPresent()`'s "last edge wins"
+                            // read makes that a no-op, never a wrong reading.
+                            let last_uids: HashSet<String> =
+                                last_machines.keys().cloned().collect();
+                            for back in reappeared_machines(&last_uids, &now_machines) {
+                                if claim_edge(&client, "machine-online", &back.machine_uid)
+                                    && crate::record(build_machine_edge_record(
+                                        "machine.online",
+                                        &back.machine_uid,
+                                        &back.display_name,
+                                    ))
+                                    .is_err()
+                                {
+                                    release_edge_claim(&client, "machine-online", &back.machine_uid);
+                                }
+                            }
                             // Session end edges (only when the session read
                             // succeeded — a blip must not read as a disappearance).
                             if let Ok(ref sbeats) = session_read {
@@ -439,6 +492,33 @@ mod tests {
         let last = HashMap::new();
         let now: HashSet<String> = ["NEW".to_string()].into_iter().collect();
         assert!(disappeared_machines(&last, &now).is_empty());
+    }
+
+    #[test]
+    fn reappeared_is_now_minus_last() {
+        // (#1362) A wasn't present on the previous tick (`last_uids`) but is
+        // present now — a machine coming back (transient presence gap, not
+        // a daemon restart, so nothing else would ever record its fresh
+        // `machine.online`). B was present on the previous tick too — still
+        // there now is continuity, not a reappearance.
+        let last_uids: HashSet<String> = ["B".to_string()].into_iter().collect();
+        let mut now = HashMap::new();
+        now.insert("A".to_string(), beat("A", "studio"));
+        now.insert("B".to_string(), beat("B", "laptop"));
+        let mut back: Vec<String> = reappeared_machines(&last_uids, &now)
+            .iter()
+            .map(|b| b.machine_uid.clone())
+            .collect();
+        back.sort();
+        assert_eq!(back, vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn reappeared_is_empty_when_nothing_new() {
+        let last_uids: HashSet<String> = ["A".to_string()].into_iter().collect();
+        let mut now = HashMap::new();
+        now.insert("A".to_string(), beat("A", "studio"));
+        assert!(reappeared_machines(&last_uids, &now).is_empty());
     }
 
     fn sbeat(sid: &str, role: &str) -> SessionBeat {
