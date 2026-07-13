@@ -10,7 +10,7 @@
 //! here from `serve` so `crew` doesn't depend on `serve`).
 
 /// Default address the local `darkmux serve` daemon binds to. Used by
-/// the pre-dispatch reachability nudge (#104 Sprint 3) so an operator
+/// the pre-dispatch reachability nudge (#104 Phase 3) so an operator
 /// running a dispatch with the daemon down sees a single-line heads-up
 /// rather than discovering the silence only when they open the viewer.
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8765";
@@ -58,7 +58,7 @@ fn is_addr_reachable(addr: std::net::SocketAddr, timeout: std::time::Duration) -
 /// before realizing it.
 ///
 /// `verb_hint` is the verb the operator just ran (e.g. "crew dispatch"
-/// or "sprint review"); used in the nudge to make the message
+/// or "phase review"); used in the nudge to make the message
 /// context-specific.
 pub fn nudge_if_daemon_unreachable(verb_hint: &str) {
     if is_daemon_reachable() {

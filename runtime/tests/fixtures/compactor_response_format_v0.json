@@ -51,7 +51,7 @@
         "objective": {
           "type": "string"
         },
-        "sprint_id": {
+        "phase_id": {
           "type": "string"
         },
         "verify_criteria": {

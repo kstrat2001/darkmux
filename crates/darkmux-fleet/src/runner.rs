@@ -316,7 +316,7 @@ impl WorkJob {
             json: false,
             watch_paths: vec![],
             workdir: self.workdir.map(PathBuf::from),
-            sprint_id: self.sprint_id,
+            phase_id: self.phase_id,
             runtime: self.runtime,
             // Runner-side runtime_cmd hardcoded to "openclaw" —
             // intentionally NOT threaded from the publisher's WorkJob.

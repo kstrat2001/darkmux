@@ -14,7 +14,7 @@
 //! - No `--workdir` symlink injection (workspace is a fresh tempdir
 //!   per dispatch; the gallery-incident class of bug is structurally
 //!   impossible because there's nowhere persistent to leak into)
-//! - No sprint-output persistence (later iteration)
+//! - No phase-output persistence (later iteration)
 //! - No watched-path post-dispatch echo (same)
 //! - No model pin enforcement (probes whatever LMStudio currently has loaded)
 //!
@@ -700,7 +700,7 @@ impl<'a> DispatchBookendGuard<'a> {
         session_id: String,
         model: String,
         mission_id: Option<String>,
-        sprint_id: Option<String>,
+        phase_id: Option<String>,
     ) -> Self {
         let on_abort = move |_id: &str, _kind: &str| {
             // Best-effort, same as every other emit on this path: a
@@ -713,7 +713,7 @@ impl<'a> DispatchBookendGuard<'a> {
                 &session_id,
                 Some(&model),
                 mission_id.as_deref(),
-                sprint_id.as_deref(),
+                phase_id.as_deref(),
                 Some(serde_json::json!({
                     "runtime": "internal",
                     "result_class": "error",
@@ -1426,7 +1426,7 @@ fn build_remote_record(
     role_id: &str,
     session_id: &str,
     model: &str,
-    sprint_id: Option<&str>,
+    phase_id: Option<&str>,
     action: &str,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
@@ -1436,8 +1436,8 @@ fn build_remote_record(
         role_id,
         session_id,
         Some(model),
-        None, // (#1177) mission_id — resolved from sprint in a follow-up
-        sprint_id,
+        None, // (#1177) mission_id — resolved from phase in a follow-up
+        phase_id,
         Some(payload),
     )
 }
@@ -1472,7 +1472,7 @@ fn dispatch_remote(
     // in-flight session in the viewer.
     let url = remote_chat_url(ep);
     let auth = remote_auth_header(ep)?;
-    let sprint = opts.sprint_id.as_deref();
+    let phase = opts.phase_id.as_deref();
 
     // (#1230 Packet 0) `dispatch_remote` previously had NO bookend guard at
     // all — a panic mid-hosted-call (or any future early return added
@@ -1485,7 +1485,7 @@ fn dispatch_remote(
     let role_id_for_abort = opts.role_id.clone();
     let session_id_for_abort = session_id.clone();
     let model_for_abort = pm.id.clone();
-    let sprint_for_abort = sprint.map(str::to_string);
+    let phase_for_abort = phase.map(str::to_string);
     let label_for_abort = label.clone();
     let on_abort = move |_id: &str, _kind: &str| {
         crate::dispatch::build_dispatch_record_with_payload(
@@ -1495,7 +1495,7 @@ fn dispatch_remote(
             &session_id_for_abort,
             Some(&model_for_abort),
             None,
-            sprint_for_abort.as_deref(),
+            phase_for_abort.as_deref(),
             Some(serde_json::json!({
                 "runtime": "direct",
                 "endpoint": label_for_abort,
@@ -1515,7 +1515,7 @@ fn dispatch_remote(
             &opts.role_id,
             &session_id,
             &pm.id,
-            sprint,
+            phase,
             "dispatch start",
             serde_json::json!({
                 "runtime": "direct",
@@ -1549,7 +1549,7 @@ fn dispatch_remote(
                     &opts.role_id,
                     &session_id,
                     &pm.id,
-                    sprint,
+                    phase,
                     "dispatch error",
                     serde_json::json!({ "runtime": "direct", "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
                 ),
@@ -1583,7 +1583,7 @@ fn dispatch_remote(
             &opts.role_id,
             &session_id,
             &pm.id,
-            sprint,
+            phase,
             "dispatch complete",
             serde_json::json!({
                 "result_class": "ok",
@@ -1826,14 +1826,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         )
     });
 
-    // (#714) Resolve the sprint → mission once so every flow record this
+    // (#714) Resolve the phase → mission once so every flow record this
     // dispatch emits (start / turn / tool / compaction / complete / telemetry)
-    // carries `mission_id`/`sprint_id` and groups under its mission in the
-    // observability view. Best-effort: None when this isn't a sprint-bound
-    // dispatch. The router (dispatch.rs) returns here before its own sprint
+    // carries `mission_id`/`phase_id` and groups under its mission in the
+    // observability view. Best-effort: None when this isn't a phase-bound
+    // dispatch. The router (dispatch.rs) returns here before its own phase
     // wiring, so the internal path resolves it directly from `opts`.
-    let mission_id = crate::dispatch::resolve_mission_for_sprint(opts.sprint_id.as_deref());
-    let sprint_id = opts.sprint_id.clone();
+    let mission_id = crate::dispatch::resolve_mission_for_phase(opts.phase_id.as_deref());
+    let phase_id = opts.phase_id.clone();
 
     // 4. Workspace resolution. Two paths (#206):
     //
@@ -1979,7 +1979,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         session_id.clone(),
         model.clone(),
         mission_id.clone(),
-        sprint_id.clone(),
+        phase_id.clone(),
     );
     bookend.open(crate::dispatch::build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
@@ -1988,7 +1988,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &session_id,
         Some(&model),
         mission_id.as_deref(),
-        sprint_id.as_deref(),
+        phase_id.as_deref(),
         Some(dispatch_start_payload),
     ));
     let dispatch_start_instant = std::time::Instant::now();
@@ -2116,7 +2116,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // TODO (#839): Network hardening — the runtime must reach host LMStudio
     // via `host.docker.internal`. Constraining networking (e.g. `--network none`
     // with a proxy, or `--network host` explicitly) is a separate, riskier
-    // change. This sprint scopes to caps/limits/user only.
+    // change. This phase scopes to caps/limits/user only.
 
     // (#457 Changes 2+3) Operator-opt-in per-dispatch caps on turn
     // count + cumulative completion tokens. Read from env vars on
@@ -2210,7 +2210,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let role_id = opts.role_id.clone();
         let model = model.clone();
         let mission_id = mission_id.clone();
-        let sprint_id = sprint_id.clone();
+        let phase_id = phase_id.clone();
         let inactivity_deadline = Arc::clone(&inactivity_deadline);
         thread::spawn(move || {
             run_tailer(
@@ -2219,7 +2219,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 role_id,
                 model,
                 mission_id,
-                sprint_id,
+                phase_id,
                 stop,
                 inactivity_deadline,
                 inactivity_secs,
@@ -2306,7 +2306,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let session_id = session_id.clone();
         let model = model.clone();
         let mission_id = mission_id.clone();
-        let sprint_id = sprint_id.clone();
+        let phase_id = phase_id.clone();
         thread::spawn(move || {
             run_telemetry_sampler(
                 sampler_stop,
@@ -2314,7 +2314,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 session_id,
                 model,
                 mission_id,
-                sprint_id,
+                phase_id,
             )
         })
     };
@@ -2454,7 +2454,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &session_id,
         Some(&model),
         mission_id.as_deref(),
-        sprint_id.as_deref(),
+        phase_id.as_deref(),
         Some(dispatch_complete_payload),
     ));
     // (#888) The container ran to its terminal record — retain the auto
@@ -2475,7 +2475,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &session_id,
         Some(&model),
         mission_id.as_deref(),
-        sprint_id.as_deref(),
+        phase_id.as_deref(),
         serde_json::json!({ "turns": trajectory_summary.turns }),
     ));
 
@@ -2636,7 +2636,7 @@ fn run_tailer(
     role_id: String,
     model: String,
     mission_id: Option<String>,
-    sprint_id: Option<String>,
+    phase_id: Option<String>,
     stop_flag: Arc<AtomicBool>,
     inactivity_deadline: Arc<Mutex<Instant>>,
     inactivity_secs: u64,
@@ -2653,7 +2653,7 @@ fn run_tailer(
         inactivity_deadline,
         inactivity_secs,
     )
-    .with_mission(mission_id, sprint_id)
+    .with_mission(mission_id, phase_id)
     .with_compaction_threshold(compaction_threshold);
 
     loop {
@@ -2713,7 +2713,7 @@ fn run_telemetry_sampler(
     session_id: String,
     model: String,
     mission_id: Option<String>,
-    sprint_id: Option<String>,
+    phase_id: Option<String>,
 ) {
     let emit = |source: &str, action: &str, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
@@ -2724,7 +2724,7 @@ fn run_telemetry_sampler(
             &session_id,
             Some(&model),
             mission_id.as_deref(),
-            sprint_id.as_deref(),
+            phase_id.as_deref(),
             payload,
         ));
     };
@@ -2851,11 +2851,11 @@ struct TailerState {
     session_id: String,
     role_id: String,
     model: String,
-    /// (#714) Mission/sprint this dispatch belongs to (when sprint-bound),
+    /// (#714) Mission/phase this dispatch belongs to (when phase-bound),
     /// stamped onto every per-event flow record so they group under the
     /// mission in the observability view. `None` for a one-off dispatch.
     mission_id: Option<String>,
-    sprint_id: Option<String>,
+    phase_id: Option<String>,
     last_heartbeat_at: Option<Instant>,
     summary: TrajectorySummary,
     /// (#457) Shared with the watchdog thread. Tailer writes a new
@@ -2889,7 +2889,7 @@ impl TailerState {
             role_id,
             model,
             mission_id: None,
-            sprint_id: None,
+            phase_id: None,
             last_heartbeat_at: None,
             summary: TrajectorySummary::default(),
             inactivity_deadline: Some(inactivity_deadline),
@@ -2898,13 +2898,13 @@ impl TailerState {
         }
     }
 
-    /// (#714) Stamp the sprint → mission this dispatch belongs to so the
+    /// (#714) Stamp the phase → mission this dispatch belongs to so the
     /// per-event flow records group under the mission. Builder-style so the
     /// `new`/`new_for_test` call sites (incl. unit tests) stay unchanged;
     /// only the production `run_tailer` opts in.
-    fn with_mission(mut self, mission_id: Option<String>, sprint_id: Option<String>) -> Self {
+    fn with_mission(mut self, mission_id: Option<String>, phase_id: Option<String>) -> Self {
         self.mission_id = mission_id;
-        self.sprint_id = sprint_id;
+        self.phase_id = phase_id;
         self
     }
 
@@ -2935,7 +2935,7 @@ impl TailerState {
             role_id,
             model,
             mission_id: None,
-            sprint_id: None,
+            phase_id: None,
             last_heartbeat_at: None,
             summary: TrajectorySummary::default(),
             inactivity_deadline: None,
@@ -3227,7 +3227,7 @@ impl TailerState {
             &self.session_id,
             Some(&self.model),
             self.mission_id.as_deref(),
-            self.sprint_id.as_deref(),
+            self.phase_id.as_deref(),
             Some(payload),
         ));
     }
@@ -3245,7 +3245,7 @@ impl TailerState {
             &self.session_id,
             Some(&self.model),
             self.mission_id.as_deref(),
-            self.sprint_id.as_deref(),
+            self.phase_id.as_deref(),
             payload,
         ));
     }
@@ -4051,7 +4051,7 @@ fn probe_loaded_model_list() -> Result<Vec<String>> {
 fn probe_loaded_model() -> Result<String> {
     // env(DARKMUX_LMSTUDIO_URL) > config.lmstudio_url > http://localhost:1234,
     // + the /v1/models path (#661 Slice 4 — the probe is now config-aware and
-    // shares the base URL with the sprint chat narrator).
+    // shares the base URL with the phase chat narrator).
     let url = format!("{}/v1/models", darkmux_types::config_access::lmstudio_url());
     let output = Command::new("curl")
         .args(["-sf", "-m", "5", &url])
@@ -6925,7 +6925,7 @@ mod tests {
             .expect("armed guard should emit a dispatch.error terminal on drop");
         assert_eq!(rec["session_id"], "sess-orphan");
         assert_eq!(rec["mission_id"], "pre-1.0-compat-sweep");
-        assert_eq!(rec["sprint_id"], "s694");
+        assert_eq!(rec["phase_id"], "s694");
         assert_eq!(rec["payload"]["result_class"], "error");
     }
 
@@ -7822,19 +7822,19 @@ mod tests {
     #[test]
     fn tailer_state_with_mission_stamps_fields() {
         // (#714) The production tailer chains `.with_mission(...)` so every
-        // per-event flow record it emits carries the dispatch's mission/sprint
+        // per-event flow record it emits carries the dispatch's mission/phase
         // and groups under the mission in the observability view. Default
         // (test/one-off) is None.
         let tmp = TempDir::new().unwrap();
         let bare = fixture_state(tmp.path().join("t.jsonl"));
-        assert!(bare.mission_id.is_none() && bare.sprint_id.is_none());
+        assert!(bare.mission_id.is_none() && bare.phase_id.is_none());
 
         let stamped = fixture_state(tmp.path().join("t.jsonl")).with_mission(
             Some("pre-1.0-compat-sweep".into()),
             Some("s694-profiles-schema".into()),
         );
         assert_eq!(stamped.mission_id.as_deref(), Some("pre-1.0-compat-sweep"));
-        assert_eq!(stamped.sprint_id.as_deref(), Some("s694-profiles-schema"));
+        assert_eq!(stamped.phase_id.as_deref(), Some("s694-profiles-schema"));
     }
 
     #[test]

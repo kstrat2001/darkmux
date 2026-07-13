@@ -5,7 +5,7 @@
 //!
 //! darkmux's real dispatch machinery (`crates/darkmux-crew`'s
 //! `dispatch_internal::dispatch`, used by `darkmux crew dispatch` /
-//! `darkmux mission run` / `darkmux sprint review`, and eventually the
+//! `darkmux mission run` / `darkmux phase review`, and eventually the
 //! review funnel) talks to "the model" over one narrow seam: an
 //! OpenAI/LMStudio-compatible `POST /v1/chat/completions` call from inside
 //! a real Docker container (see `runtime/src/lmstudio.rs`). This binary

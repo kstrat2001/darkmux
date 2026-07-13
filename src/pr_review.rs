@@ -963,7 +963,7 @@ fn path_from_bundle_id(bundle_id: &str) -> &str {
 
 /// (#1247 Part 1) Production wiring of `funnel::FunnelEmitter` — writes
 /// through the real darkmux-flow machinery (`darkmux_flow::record`), the
-/// same engagement-scoped stream `crew dispatch`/`sprint review` write
+/// same engagement-scoped stream `crew dispatch`/`phase review` write
 /// through (env/config-resolved sink, `machine_id`/`orchestrator`
 /// auto-stamped at write time). This is the FLEET sink: `darkmux pr-review
 /// run` drives ONE case per invocation (a real PR review), so its run/step/
@@ -3211,7 +3211,7 @@ mod tests {
             stage: darkmux_flow::Stage::Dispatch,
             action: action.to_string(),
             handle: "test-crew".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: Some("case-1".to_string()),
             source: Some("funnel".to_string()),
             model: None,

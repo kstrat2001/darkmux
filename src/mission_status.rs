@@ -1,6 +1,6 @@
 //! `darkmux mission status` — the global mission-control read (#829).
 //!
-//! Every other `mission`/`sprint` verb is a mutation or a single-shot op;
+//! Every other `mission`/`phase` verb is a mutation or a single-shot op;
 //! none answers "show me the whole board, what's drifted, what needs closing
 //! out." This is that read — the CLI twin of the viewer's missions lens,
 //! headless and scriptable. It completes the `<noun> status` family that
@@ -12,7 +12,7 @@
 //! prints copy-pasteable reconcile commands, but never mutates state. The
 //! operator (or the frontier reading `--json`) runs the suggested commands.
 //!
-//! The board is computed purely from the durable mission + sprint JSON (the
+//! The board is computed purely from the durable mission + phase JSON (the
 //! loader), so it works offline with no Redis/flow dependency — exactly what
 //! a session-start housekeeping cue needs.
 
@@ -20,8 +20,8 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 
 use crate::crew;
-use crate::crew::scheduler::{reachable, DependencyNode, SprintNode};
-use crate::crew::types::{Mission, MissionStatus, Sprint, SprintStatus};
+use crate::crew::scheduler::{reachable, DependencyNode, PhaseNode};
+use crate::crew::types::{Mission, MissionStatus, Phase, PhaseStatus};
 use darkmux_types::{config_access, style};
 
 /// A flagged inconsistency on one mission, with concrete reconcile commands.
@@ -44,51 +44,51 @@ struct MissionView<'a> {
     drifts: Vec<Drift>,
 }
 
-fn is_terminal(s: SprintStatus) -> bool {
-    matches!(s, SprintStatus::Complete | SprintStatus::Abandoned)
+fn is_terminal(s: PhaseStatus) -> bool {
+    matches!(s, PhaseStatus::Complete | PhaseStatus::Abandoned)
 }
 
-/// State-accurate reconcile commands for a non-terminal sprint. `complete`
-/// only transitions Running→Complete, so a PLANNED (never-started) sprint
-/// needs `sprint start` first — emitting a bare `sprint complete` for it
+/// State-accurate reconcile commands for a non-terminal phase. `complete`
+/// only transitions Running→Complete, so a PLANNED (never-started) phase
+/// needs `phase start` first — emitting a bare `phase complete` for it
 /// (the original bug) prints a command that errors. `abandon` works from
 /// either state. Surfaced by the cold-session reconcile of the
-/// cli-styling-foundation sprints, which were planned, not running (#829).
-fn reconcile_cmds(s: &Sprint) -> Vec<String> {
+/// cli-styling-foundation phases, which were planned, not running (#829).
+fn reconcile_cmds(s: &Phase) -> Vec<String> {
     let shipped = match s.status {
-        SprintStatus::Planned => format!(
-            "darkmux sprint start {id} && darkmux sprint complete {id}   # if its work shipped",
+        PhaseStatus::Planned => format!(
+            "darkmux phase start {id} && darkmux phase complete {id}   # if its work shipped",
             id = s.id
         ),
         // Running (or any other non-terminal): complete goes straight through.
-        _ => format!("darkmux sprint complete {}   # if its work shipped", s.id),
+        _ => format!("darkmux phase complete {}   # if its work shipped", s.id),
     };
     vec![
         shipped,
-        format!("darkmux sprint abandon {}   # if it was dropped", s.id),
+        format!("darkmux phase abandon {}   # if it was dropped", s.id),
     ]
 }
 
-/// Pure drift detection for one mission given its sprints. `now` and
+/// Pure drift detection for one mission given its phases. `now` and
 /// `stale_days` are passed in (rather than read internally) so the function
 /// stays IO-free and unit-testable with fixed timestamps — see the module
 /// doc. Four load-bearing inconsistencies:
-///   - a CLOSED mission with a non-terminal (planned/running) sprint — the
+///   - a CLOSED mission with a non-terminal (planned/running) phase — the
 ///     work likely shipped outside `mission ship --merge`, or `mission close`
 ///     didn't reconcile; the board reads "closed · 0/1".
-///   - an ACTIVE/PAUSED mission whose sprints are ALL terminal with at least
+///   - an ACTIVE/PAUSED mission whose phases are ALL terminal with at least
 ///     one complete — done, just never closed out.
-///   - (#1230 Packet 5) an ACTIVE mission with ZERO complete sprints whose
+///   - (#1230 Packet 5) an ACTIVE mission with ZERO complete phases whose
 ///     `started_ts` is older than `stale_days` — the `doom-loop-m4` case
-///     (0/4 sprints for ~20 days, no drift surfaced by either check above).
-///   - (#1230 Packet 5) a PLANNED sprint whose dependency chain includes an
-///     Abandoned/Error sprint, via Packet 2's `reachable()` — permanently
-///     stuck even though the sprint itself is still Planned.
-fn detect_drift(m: &Mission, sprints: &[&Sprint], now: u64, stale_days: u64) -> Vec<Drift> {
+///     (0/4 phases for ~20 days, no drift surfaced by either check above).
+///   - (#1230 Packet 5) a PLANNED phase whose dependency chain includes an
+///     Abandoned/Error phase, via Packet 2's `reachable()` — permanently
+///     stuck even though the phase itself is still Planned.
+fn detect_drift(m: &Mission, phases: &[&Phase], now: u64, stale_days: u64) -> Vec<Drift> {
     let mut out = Vec::new();
-    let open: Vec<&&Sprint> = sprints.iter().filter(|s| !is_terminal(s.status)).collect();
-    let complete = sprints.iter().filter(|s| s.status == SprintStatus::Complete).count();
-    let all_terminal = !sprints.is_empty() && open.is_empty();
+    let open: Vec<&&Phase> = phases.iter().filter(|s| !is_terminal(s.status)).collect();
+    let complete = phases.iter().filter(|s| s.status == PhaseStatus::Complete).count();
+    let all_terminal = !phases.is_empty() && open.is_empty();
 
     if m.status == MissionStatus::Closed && !open.is_empty() {
         let mut suggest = Vec::new();
@@ -96,9 +96,9 @@ fn detect_drift(m: &Mission, sprints: &[&Sprint], now: u64, stale_days: u64) -> 
             suggest.extend(reconcile_cmds(s));
         }
         out.push(Drift {
-            kind: "closed-with-open-sprint",
+            kind: "closed-with-open-phase",
             detail: format!(
-                "mission is Closed but {} sprint(s) are not terminal (planned/running)",
+                "mission is Closed but {} phase(s) are not terminal (planned/running)",
                 open.len()
             ),
             suggest,
@@ -111,7 +111,7 @@ fn detect_drift(m: &Mission, sprints: &[&Sprint], now: u64, stale_days: u64) -> 
     {
         out.push(Drift {
             kind: "done-not-closed",
-            detail: "all sprints are terminal — the mission looks done but is still open"
+            detail: "all phases are terminal — the mission looks done but is still open"
                 .to_string(),
             suggest: vec![format!("darkmux mission close {}", m.id)],
         });
@@ -121,12 +121,12 @@ fn detect_drift(m: &Mission, sprints: &[&Sprint], now: u64, stale_days: u64) -> 
         out.push(d);
     }
 
-    out.extend(unreachable_sprint_drifts(sprints));
+    out.extend(unreachable_phase_drifts(phases));
 
     out
 }
 
-/// An Active mission with zero Complete sprints, stalled for `stale_days`
+/// An Active mission with zero Complete phases, stalled for `stale_days`
 /// or longer since `started_ts`. A mission that hasn't started yet
 /// (`started_ts: None`) can't be judged stale — fails closed, same
 /// discipline `reachable` uses for a dangling dependency reference.
@@ -142,42 +142,42 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
     Some(Drift {
         kind: "stale-active",
         detail: format!(
-            "mission has been Active for {age_days} day(s) with zero sprints complete \
+            "mission has been Active for {age_days} day(s) with zero phases complete \
              (staleness threshold: {stale_days} day(s))"
         ),
         suggest: vec![format!(
-            "darkmux mission status --json   # inspect sprint details — consider \
-             `darkmux sprint abandon <id>` for stalled work or `darkmux mission close {}` \
+            "darkmux mission status --json   # inspect phase details — consider \
+             `darkmux phase abandon <id>` for stalled work or `darkmux mission close {}` \
              if the mission is done",
             m.id
         )],
     })
 }
 
-/// A Planned sprint whose dependency chain includes an Abandoned/Error
-/// sprint — via Packet 2's `reachable()` through the existing
-/// `Sprint -> DependencyNode` adapter (`SprintNode`), no new graph-walking
+/// A Planned phase whose dependency chain includes an Abandoned/Error
+/// phase — via Packet 2's `reachable()` through the existing
+/// `Phase -> DependencyNode` adapter (`PhaseNode`), no new graph-walking
 /// logic. This is the `doom-loop-m4` signal: `validate-cure` is still
 /// Planned but can never legally run because `file-match` (a dependency)
 /// was abandoned.
-fn unreachable_sprint_drifts(sprints: &[&Sprint]) -> Vec<Drift> {
-    let nodes: Vec<SprintNode> = sprints.iter().map(|s| SprintNode(s)).collect();
-    let by_id: BTreeMap<String, &SprintNode> =
+fn unreachable_phase_drifts(phases: &[&Phase]) -> Vec<Drift> {
+    let nodes: Vec<PhaseNode> = phases.iter().map(|s| PhaseNode(s)).collect();
+    let by_id: BTreeMap<String, &PhaseNode> =
         nodes.iter().map(|n| (n.node_id().to_string(), n)).collect();
 
-    sprints
+    phases
         .iter()
-        .filter(|s| s.status == SprintStatus::Planned)
+        .filter(|s| s.status == PhaseStatus::Planned)
         .filter(|s| !reachable(&s.id, &by_id))
         .map(|s| Drift {
-            kind: "unreachable-sprint",
+            kind: "unreachable-phase",
             detail: format!(
-                "sprint '{}' can never run — its dependency chain includes an \
-                 abandoned or errored sprint",
+                "phase '{}' can never run — its dependency chain includes an \
+                 abandoned or errored phase",
                 s.id
             ),
             suggest: vec![format!(
-                "darkmux sprint abandon {}   # dependency chain is permanently dead",
+                "darkmux phase abandon {}   # dependency chain is permanently dead",
                 s.id
             )],
         })
@@ -189,26 +189,26 @@ fn unreachable_sprint_drifts(sprints: &[&Sprint]) -> Vec<Drift> {
 /// aggregated suggested-next-steps.
 pub fn run(json: bool) -> Result<i32> {
     let missions = crew::loader::load_missions()?;
-    let sprints = crew::loader::load_sprints()?;
+    let phases = crew::loader::load_phases()?;
     let now = now_unix();
     let stale_days = config_access::mission_stale_active_days();
 
-    // Bucket sprints by mission_id once.
-    let mut by_mission: BTreeMap<&str, Vec<&Sprint>> = BTreeMap::new();
-    for s in &sprints {
+    // Bucket phases by mission_id once.
+    let mut by_mission: BTreeMap<&str, Vec<&Phase>> = BTreeMap::new();
+    for s in &phases {
         by_mission.entry(s.mission_id.as_str()).or_default().push(s);
     }
 
     let mut views: Vec<MissionView> = missions
         .iter()
         .map(|m| {
-            let ss: Vec<&Sprint> = by_mission.get(m.id.as_str()).cloned().unwrap_or_default();
+            let ss: Vec<&Phase> = by_mission.get(m.id.as_str()).cloned().unwrap_or_default();
             MissionView {
                 total: ss.len(),
-                complete: ss.iter().filter(|s| s.status == SprintStatus::Complete).count(),
-                running: ss.iter().filter(|s| s.status == SprintStatus::Running).count(),
-                planned: ss.iter().filter(|s| s.status == SprintStatus::Planned).count(),
-                abandoned: ss.iter().filter(|s| s.status == SprintStatus::Abandoned).count(),
+                complete: ss.iter().filter(|s| s.status == PhaseStatus::Complete).count(),
+                running: ss.iter().filter(|s| s.status == PhaseStatus::Running).count(),
+                planned: ss.iter().filter(|s| s.status == PhaseStatus::Planned).count(),
+                abandoned: ss.iter().filter(|s| s.status == PhaseStatus::Abandoned).count(),
                 drifts: detect_drift(m, &ss, now, stale_days),
                 m,
             }
@@ -248,7 +248,7 @@ pub fn run(json: bool) -> Result<i32> {
         for v in g {
             let prog = format!("{}/{}", v.complete, v.total);
             let bar = progress_bar(v.complete, v.total);
-            let mix = sprint_mix(v);
+            let mix = phase_mix(v);
             println!("  ◆ {:30}  {:>5}  {}  {}", v.m.id, prog, bar, style::dim(&mix));
             for d in &v.drifts {
                 println!("      {} {}", style::warn("⚠"), style::warn(&d.detail));
@@ -261,7 +261,7 @@ pub fn run(json: bool) -> Result<i32> {
 
     println!();
     if attention == 0 {
-        println!("{}", style::success("✓ board is clean — every mission's sprints are reconciled"));
+        println!("{}", style::success("✓ board is clean — every mission's phases are reconciled"));
     } else {
         println!(
             "{}",
@@ -283,7 +283,7 @@ fn run_json(views: &[MissionView]) -> Result<i32> {
                 "id": v.m.id,
                 "status": status_word(v.m.status),
                 "ticket": v.m.ticket,
-                "sprints": {
+                "phases": {
                     "total": v.total, "complete": v.complete, "running": v.running,
                     "planned": v.planned, "abandoned": v.abandoned,
                 },
@@ -312,9 +312,9 @@ fn status_word(s: MissionStatus) -> &'static str {
     }
 }
 
-fn sprint_mix(v: &MissionView) -> String {
+fn phase_mix(v: &MissionView) -> String {
     if v.total == 0 {
-        return "no sprints".to_string();
+        return "no phases".to_string();
     }
     let mut parts = Vec::new();
     if v.complete > 0 { parts.push(format!("{} complete", v.complete)); }
@@ -353,7 +353,7 @@ mod tests {
             id: id.into(),
             description: "d".into(),
             status,
-            sprint_ids: vec![],
+            phase_ids: vec![],
             created_ts: 0,
             started_ts: None,
             closed_ts: None,
@@ -362,8 +362,8 @@ mod tests {
             ticket: None,
         }
     }
-    fn sprint(id: &str, mid: &str, status: SprintStatus) -> Sprint {
-        Sprint {
+    fn phase(id: &str, mid: &str, status: PhaseStatus) -> Phase {
+        Phase {
             id: id.into(),
             mission_id: mid.into(),
             description: "d".into(),
@@ -378,44 +378,44 @@ mod tests {
     }
 
     #[test]
-    fn closed_mission_with_running_sprint_drifts() {
+    fn closed_mission_with_running_phase_drifts() {
         let m = mission("m1", MissionStatus::Closed);
-        let s = sprint("s1", "m1", SprintStatus::Running);
+        let s = phase("s1", "m1", PhaseStatus::Running);
         let d = detect_drift(&m, &[&s], 0, 14);
         assert_eq!(d.len(), 1);
-        assert_eq!(d[0].kind, "closed-with-open-sprint");
+        assert_eq!(d[0].kind, "closed-with-open-phase");
         // RUNNING → complete transitions straight through (no `start`).
-        assert!(d[0].suggest.iter().any(|c| c.contains("sprint complete s1")
-            && !c.contains("sprint start")));
-        assert!(d[0].suggest.iter().any(|c| c.contains("sprint abandon s1")));
+        assert!(d[0].suggest.iter().any(|c| c.contains("phase complete s1")
+            && !c.contains("phase start")));
+        assert!(d[0].suggest.iter().any(|c| c.contains("phase abandon s1")));
     }
 
     #[test]
-    fn closed_mission_with_planned_sprint_suggests_start_then_complete() {
-        // (#829 follow-up) A PLANNED sprint can't go straight to complete —
-        // the cue must include `sprint start` first, or it prints a command
+    fn closed_mission_with_planned_phase_suggests_start_then_complete() {
+        // (#829 follow-up) A PLANNED phase can't go straight to complete —
+        // the cue must include `phase start` first, or it prints a command
         // that errors. Caught by the cold-session reconcile.
         let m = mission("m1", MissionStatus::Closed);
-        let s = sprint("s1", "m1", SprintStatus::Planned);
+        let s = phase("s1", "m1", PhaseStatus::Planned);
         let d = detect_drift(&m, &[&s], 0, 14);
         assert_eq!(d.len(), 1);
         let shipped = d[0].suggest.iter().find(|c| c.contains("if its work shipped")).unwrap();
-        assert!(shipped.contains("sprint start s1") && shipped.contains("sprint complete s1"),
-            "planned-sprint cue must start then complete; got: {shipped}");
-        assert!(d[0].suggest.iter().any(|c| c.contains("sprint abandon s1")));
+        assert!(shipped.contains("phase start s1") && shipped.contains("phase complete s1"),
+            "planned-phase cue must start then complete; got: {shipped}");
+        assert!(d[0].suggest.iter().any(|c| c.contains("phase abandon s1")));
     }
 
     #[test]
     fn closed_mission_all_terminal_is_clean() {
         let m = mission("m1", MissionStatus::Closed);
-        let s = sprint("s1", "m1", SprintStatus::Complete);
+        let s = phase("s1", "m1", PhaseStatus::Complete);
         assert!(detect_drift(&m, &[&s], 0, 14).is_empty());
     }
 
     #[test]
     fn active_mission_all_terminal_suggests_close() {
         let m = mission("m1", MissionStatus::Active);
-        let s = sprint("s1", "m1", SprintStatus::Complete);
+        let s = phase("s1", "m1", PhaseStatus::Complete);
         let d = detect_drift(&m, &[&s], 0, 14);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].kind, "done-not-closed");
@@ -423,10 +423,10 @@ mod tests {
     }
 
     #[test]
-    fn active_mission_with_running_sprint_is_clean() {
+    fn active_mission_with_running_phase_is_clean() {
         // Work in flight is normal, not drift.
         let m = mission("m1", MissionStatus::Active);
-        let s = sprint("s1", "m1", SprintStatus::Running);
+        let s = phase("s1", "m1", PhaseStatus::Running);
         assert!(detect_drift(&m, &[&s], 0, 14).is_empty());
     }
 
@@ -434,12 +434,12 @@ mod tests {
     fn active_mission_only_abandoned_is_not_done() {
         // All terminal but nothing COMPLETE → not "done", don't nag to close.
         let m = mission("m1", MissionStatus::Active);
-        let s = sprint("s1", "m1", SprintStatus::Abandoned);
+        let s = phase("s1", "m1", PhaseStatus::Abandoned);
         assert!(detect_drift(&m, &[&s], 0, 14).is_empty());
     }
 
     #[test]
-    fn mission_with_no_sprints_is_clean() {
+    fn mission_with_no_phases_is_clean() {
         let m = mission("m1", MissionStatus::Active);
         assert!(detect_drift(&m, &[], 0, 14).is_empty());
     }
@@ -450,7 +450,7 @@ mod tests {
     fn stale_active_mission_past_threshold_drifts() {
         let mut m = mission("m1", MissionStatus::Active);
         m.started_ts = Some(0);
-        // No sprints at all — zero complete either way.
+        // No phases at all — zero complete either way.
         let now = 15 * 86_400; // 15 days later
         let d = detect_drift(&m, &[], now, 14);
         assert_eq!(d.len(), 1);
@@ -476,68 +476,68 @@ mod tests {
     }
 
     #[test]
-    fn active_mission_with_a_complete_sprint_is_not_flagged_stale() {
-        // Old started_ts, but at least one sprint completed — progress is
+    fn active_mission_with_a_complete_phase_is_not_flagged_stale() {
+        // Old started_ts, but at least one phase completed — progress is
         // happening, this is `done-not-closed`/normal territory, not stale.
         let mut m = mission("m1", MissionStatus::Active);
         m.started_ts = Some(0);
-        let s = sprint("s1", "m1", SprintStatus::Complete);
+        let s = phase("s1", "m1", PhaseStatus::Complete);
         let d = detect_drift(&m, &[&s], 30 * 86_400, 14);
         // `done-not-closed` fires (all terminal + complete>0), but NOT
         // `stale-active`.
         assert!(!d.iter().any(|dr| dr.kind == "stale-active"));
     }
 
-    // ─── unreachable-sprint (#1230 Packet 5) ────────────────────────────
+    // ─── unreachable-phase (#1230 Packet 5) ────────────────────────────
 
     #[test]
-    fn planned_sprint_depending_on_abandoned_sprint_drifts() {
-        let mut dead = sprint("dead", "m1", SprintStatus::Abandoned);
+    fn planned_phase_depending_on_abandoned_phase_drifts() {
+        let mut dead = phase("dead", "m1", PhaseStatus::Abandoned);
         dead.abandoned_ts = Some(1);
-        let mut blocked = sprint("blocked", "m1", SprintStatus::Planned);
+        let mut blocked = phase("blocked", "m1", PhaseStatus::Planned);
         blocked.depends_on = vec!["dead".to_string()];
         let m = mission("m1", MissionStatus::Active);
 
         let d = detect_drift(&m, &[&dead, &blocked], 0, 14);
-        assert!(d.iter().any(|dr| dr.kind == "unreachable-sprint"
+        assert!(d.iter().any(|dr| dr.kind == "unreachable-phase"
             && dr.detail.contains("blocked")
-            && dr.suggest.iter().any(|c| c.contains("sprint abandon blocked"))));
+            && dr.suggest.iter().any(|c| c.contains("phase abandon blocked"))));
     }
 
     #[test]
-    fn planned_sprint_with_healthy_dependency_is_not_flagged_unreachable() {
-        let done = sprint("done", "m1", SprintStatus::Complete);
-        let mut next = sprint("next", "m1", SprintStatus::Planned);
+    fn planned_phase_with_healthy_dependency_is_not_flagged_unreachable() {
+        let done = phase("done", "m1", PhaseStatus::Complete);
+        let mut next = phase("next", "m1", PhaseStatus::Planned);
         next.depends_on = vec!["done".to_string()];
         let m = mission("m1", MissionStatus::Active);
 
         let d = detect_drift(&m, &[&done, &next], 0, 14);
-        assert!(!d.iter().any(|dr| dr.kind == "unreachable-sprint"));
+        assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
     }
 
     #[test]
-    fn non_planned_sprint_with_abandoned_dependency_is_not_flagged() {
-        // Only PLANNED sprints get flagged — a sprint that already
+    fn non_planned_phase_with_abandoned_dependency_is_not_flagged() {
+        // Only PLANNED phases get flagged — a phase that already
         // completed/abandoned/started isn't "stuck", it already resolved.
-        let dead = sprint("dead", "m1", SprintStatus::Abandoned);
-        let mut done = sprint("done", "m1", SprintStatus::Complete);
+        let dead = phase("dead", "m1", PhaseStatus::Abandoned);
+        let mut done = phase("done", "m1", PhaseStatus::Complete);
         done.depends_on = vec!["dead".to_string()];
         let m = mission("m1", MissionStatus::Active);
 
         let d = detect_drift(&m, &[&dead, &done], 0, 14);
-        assert!(!d.iter().any(|dr| dr.kind == "unreachable-sprint"));
+        assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
     }
 
     /// (#1230 Packet 5 acceptance) Reproduces the REAL `doom-loop-m4`
     /// mission read from `~/.darkmux/missions/doom-loop-m4/` on disk:
     /// `mission.json` (Active, `started_ts: 1782141824`) + its four
-    /// sprints — `runtime-capture`/`sovereignty-verbs` (Planned),
+    /// phases — `runtime-capture`/`sovereignty-verbs` (Planned),
     /// `file-match` (Abandoned), `validate-cure` (Planned, depends on all
     /// three, including the abandoned `file-match`). Same real shape
     /// `scheduler::tests::doom_loop_m4_fixture_validate_cure_is_unreachable`
     /// (#1230 Packet 2) already used for the scheduler-level check — this
     /// is the `mission status` surfacing of the same real data. The mission
-    /// has sat at 0/4 sprints since `started_ts`, which is `> stale_days`
+    /// has sat at 0/4 phases since `started_ts`, which is `> stale_days`
     /// ago as of any `now` after that timestamp — real elapsed wall-clock,
     /// not a synthetic offset, since the operator's live board (read-only,
     /// never mutated by this test) is the acceptance target.
@@ -547,7 +547,7 @@ mod tests {
             id: "doom-loop-m4".to_string(),
             description: "M4 doom-loop arc".to_string(),
             status: MissionStatus::Active,
-            sprint_ids: vec![
+            phase_ids: vec![
                 "runtime-capture".to_string(),
                 "file-match".to_string(),
                 "sovereignty-verbs".to_string(),
@@ -560,32 +560,32 @@ mod tests {
             source_input: None,
             ticket: None,
         };
-        let runtime_capture = sprint("runtime-capture", "doom-loop-m4", SprintStatus::Planned);
-        let mut file_match = sprint("file-match", "doom-loop-m4", SprintStatus::Abandoned);
+        let runtime_capture = phase("runtime-capture", "doom-loop-m4", PhaseStatus::Planned);
+        let mut file_match = phase("file-match", "doom-loop-m4", PhaseStatus::Abandoned);
         file_match.started_ts = Some(1_782_141_937);
         file_match.abandoned_ts = Some(1_782_147_136);
         let sovereignty_verbs =
-            sprint("sovereignty-verbs", "doom-loop-m4", SprintStatus::Planned);
-        let mut validate_cure = sprint("validate-cure", "doom-loop-m4", SprintStatus::Planned);
+            phase("sovereignty-verbs", "doom-loop-m4", PhaseStatus::Planned);
+        let mut validate_cure = phase("validate-cure", "doom-loop-m4", PhaseStatus::Planned);
         validate_cure.depends_on = vec![
             "runtime-capture".to_string(),
             "file-match".to_string(),
             "sovereignty-verbs".to_string(),
         ];
-        let sprints: Vec<&Sprint> =
+        let phases: Vec<&Phase> =
             vec![&runtime_capture, &file_match, &sovereignty_verbs, &validate_cure];
 
         let now = now_unix(); // real elapsed time since the real started_ts
-        let d = detect_drift(&m, &sprints, now, 14);
+        let d = detect_drift(&m, &phases, now, 14);
 
         assert!(
             d.iter().any(|dr| dr.kind == "stale-active"),
-            "doom-loop-m4 has sat at 0/4 sprints for weeks — must flag stale-active: {d:?}"
+            "doom-loop-m4 has sat at 0/4 phases for weeks — must flag stale-active: {d:?}"
         );
         assert!(
-            d.iter().any(|dr| dr.kind == "unreachable-sprint"
+            d.iter().any(|dr| dr.kind == "unreachable-phase"
                 && dr.detail.contains("validate-cure")),
-            "validate-cure depends on abandoned file-match — must flag unreachable-sprint: {d:?}"
+            "validate-cure depends on abandoned file-match — must flag unreachable-phase: {d:?}"
         );
         // Exactly these two — no accidental extra/missing drift on this
         // mission's real shape.

@@ -836,7 +836,7 @@ fn dispatch_via_internal(
         json: true,
         watch_paths: Vec::new(),
         workdir,
-        sprint_id: None,
+        phase_id: None,
         runtime: Runtime::Internal,
         runtime_cmd: "openclaw".to_string(),
         machine: None,
@@ -872,7 +872,7 @@ fn dispatch_via_internal(
 
 /// Dispatch via the legacy openclaw shell-out path. Shells out with the
 /// `<cmd> agent --agent <role> --json ...` calling convention.
-/// `runtime_cmd` is the operator-supplied binary path (Sprint-E:
+/// `runtime_cmd` is the operator-supplied binary path (Phase-E:
 /// `--runtime-cmd <path>` flag; defaults to `"openclaw"`).
 fn dispatch_via_openclaw(
     runtime_cmd: &str,

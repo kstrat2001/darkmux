@@ -206,8 +206,13 @@ pub struct FlowRecord {
     pub stage: Stage,
     pub action: String,
     pub handle: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sprint_id: Option<String>,
+    /// Sprint→Phase rename read-compat: historical flow records on disk
+    /// (append-only JSONL, never rewritten) carry this under the pre-
+    /// rename wire key `sprint_id`. `alias` lets readers accept either
+    /// key so historical records don't silently lose the field; every
+    /// newly-written record emits the canonical `phase_id` key.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "sprint_id")]
+    pub phase_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -218,7 +223,7 @@ pub struct FlowRecord {
     /// the model-status pill's timestamp. Resolved from openclaw config
     /// at dispatch entry: first checks `agents.list[<agent-id>].model`,
     /// then falls back to `agents.defaults.model.primary` when absent.
-    /// None for non-dispatch records (lifecycle transitions, sprint
+    /// None for non-dispatch records (lifecycle transitions, phase
     /// review verdicts) and for dispatches where the openclaw config
     /// can't be resolved. Schema 1.2 addition (#106).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,7 +336,7 @@ pub fn day_utc_now() -> String {
 
 /// ISO 8601 UTC datetime string from current time — `YYYY-MM-DDTHH:MM:SSZ`.
 /// Used for `FlowRecord.ts`. Seconds precision is sufficient for the
-/// dispatch / sprint timing surfaces; finer precision is a future bump.
+/// dispatch / phase timing surfaces; finer precision is a future bump.
 pub fn ts_utc_now() -> String {
     let secs = current_epoch_secs();
     let (y, mo, d) = epoch_to_yyyymmdd(secs);

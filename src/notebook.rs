@@ -4,7 +4,7 @@
 //! runtime to draft a lab-notebook entry, dispatches it (typically against the
 //! `scribe` role), and writes the draft to .darkmux/notebook/<date>-<slug>.md.
 //!
-//! Sprint-H (Beat 36 finish): routes through the internal Docker-bounded
+//! Phase-H (Beat 36 finish): routes through the internal Docker-bounded
 //! runtime by default — same default as `crew dispatch` / `lab run`. The
 //! openclaw shell-out path remains available via `--runtime openclaw`.
 
@@ -21,7 +21,7 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 pub struct DraftOptions {
     pub run_id: String,
-    /// DM role id to dispatch the drafting prompt through (Sprint-H:
+    /// DM role id to dispatch the drafting prompt through (Phase-H:
     /// renamed from `agent` per Beat 36 directional principle — DM
     /// concepts are primary on DM-side CLI surfaces). The role
     /// resolves through `templates/builtin/roles/<role>.{json,md}`
@@ -33,9 +33,9 @@ pub struct DraftOptions {
     /// Override the machine id (overrides DARKMUX_MACHINE_ID env var).
     pub machine_override: Option<String>,
     /// Which agent runtime to dispatch the drafting prompt through.
-    /// Default: `Runtime::Internal` (Sprint-H — Beat 36 finish).
+    /// Default: `Runtime::Internal` (Phase-H — Beat 36 finish).
     pub runtime: Runtime,
-    /// Executable path for the openclaw shell-out (Sprint-E pattern).
+    /// Executable path for the openclaw shell-out (Phase-E pattern).
     /// Defaults to `"openclaw"`; ignored when `runtime == Internal`.
     pub runtime_cmd: String,
 }
@@ -100,10 +100,10 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
     let run_data = build_run_data_summary(&run_dir, &manifest)?;
     let prompt = NOTEBOOK_PROMPT_TEMPLATE.replace("{run_data}", &run_data);
 
-    // Sprint-H (Beat 36 finish): dispatch through the operator-selected
+    // Phase-H (Beat 36 finish): dispatch through the operator-selected
     // runtime. `Internal` is the default — uses darkmux's in-house
     // Docker-bounded runtime via `crew::dispatch::dispatch()`, mirroring
-    // the Sprint-D/E pattern used by `lab run` + `crew dispatch`.
+    // the Phase-D/E pattern used by `lab run` + `crew dispatch`.
     // `Openclaw` is the opt-in shell-out path, preserved for operators
     // who already use openclaw.
     let session_id = format!(
@@ -175,7 +175,7 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
 }
 
 /// Dispatch the drafting prompt through darkmux's internal Docker-bounded
-/// runtime via `crew::dispatch::dispatch()`. Sprint-H (Beat 36 finish):
+/// runtime via `crew::dispatch::dispatch()`. Phase-H (Beat 36 finish):
 /// notebook draft no longer requires openclaw — the internal runtime
 /// reads the role manifest from `templates/builtin/roles/<role>.{json,md}`
 /// (or the operator's override under `~/.darkmux/roles/`).
@@ -188,15 +188,15 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
         timeout_seconds: 1800,
         skip_preflight: false,
         // notebook draft parses reply text from the JSON envelope's
-        // `.final_assistant` field (same shape Sprint-B established
+        // `.final_assistant` field (same shape Phase-B established
         // for qa-review).
         json: true,
         watch_paths: Vec::new(),
         workdir: None,
-        sprint_id: None,
+        phase_id: None,
         runtime: Runtime::Internal,
         // Ignored when runtime == Internal; see DispatchOpts::runtime_cmd
-        // doc (Sprint-E). Hardcoded "openclaw" preserves codebase parity.
+        // doc (Phase-E). Hardcoded "openclaw" preserves codebase parity.
         runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
@@ -227,7 +227,7 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
 }
 
 /// Dispatch the drafting prompt via the legacy openclaw shell-out path.
-/// `runtime_cmd` is the operator-supplied binary path (Sprint-E flag).
+/// `runtime_cmd` is the operator-supplied binary path (Phase-E flag).
 fn dispatch_draft_via_openclaw(
     runtime_cmd: &str,
     role: &str,
@@ -368,8 +368,8 @@ fn extract_reply_text(stdout: &str) -> String {
     let Ok(parsed) = serde_json::from_str::<Value>(stdout) else {
         return stdout.to_string();
     };
-    // Sprint-H: try the DM internal-runtime JSON envelope first
-    // (Sprint-A shape: `{result, final_assistant, metrics,
+    // Phase-H: try the DM internal-runtime JSON envelope first
+    // (Phase-A shape: `{result, final_assistant, metrics,
     // trajectory_path}`). Falls through to openclaw's `payloads[]`
     // / `reply` shapes for the `--runtime openclaw` path.
     if let Some(final_assistant) = parsed.get("final_assistant").and_then(|v| v.as_str()) {
@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(extract_reply_text(""), "");
     }
 
-    /// Sprint-H: extract_reply_text understands DM's internal-runtime
+    /// Phase-H: extract_reply_text understands DM's internal-runtime
     /// JSON envelope (`final_assistant`). Without this, notebook draft
     /// against `--runtime internal` would return empty for the reply.
     #[test]
@@ -679,7 +679,7 @@ mod tests {
         );
     }
 
-    /// Sprint-H: when both shapes are present (shouldn't happen in
+    /// Phase-H: when both shapes are present (shouldn't happen in
     /// practice, but be deterministic), `final_assistant` wins — that's
     /// the DM-side envelope, and notebook draft now defaults internal.
     #[test]

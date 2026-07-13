@@ -267,7 +267,7 @@ fn check_legacy_compaction_extras() -> Check {
 }
 
 /// Detect operators still on the pre-Beat-33 `<root>/crew/{roles,
-/// missions,sprints,crews,skills,role-model-pins.json}` layout
+/// missions,phases,crews,skills,role-model-pins.json}` layout
 /// and emit an mv-script they can copy-paste to flatten. The loader's
 /// dual-read keeps the legacy layout working, so this is a Warn (not
 /// Fail) — operator-sovereignty: doctor proposes, operator runs.
@@ -292,7 +292,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
     // specific. We only care about the post-Beat-33 promoted subdirs +
     // the pinned file; anything else under crew/ is operator-authored
     // territory we won't recommend moving.
-    let promoted_subdirs = ["roles", "missions", "sprints", "crews", "skills"];
+    let promoted_subdirs = ["roles", "missions", "phases", "crews", "skills"];
     let promoted_file = "role-model-pins.json";
     let mut present_subdirs: Vec<&str> = promoted_subdirs
         .iter()
@@ -2097,7 +2097,7 @@ fn check_profile_loaded_match() -> Check {
     }
 }
 
-/// Sprint-G: openclaw-as-active gate.
+/// Phase-G: openclaw-as-active gate.
 ///
 /// Returns true when openclaw is configured on this machine — defined
 /// as: `~/.openclaw/openclaw.json` (or the path the dispatch resolver
@@ -2184,7 +2184,7 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
 }
 
 fn check_runtime_command() -> Check {
-    // Sprint-G: skip when no openclaw config on disk. The internal
+    // Phase-G: skip when no openclaw config on disk. The internal
     // runtime is the default and needs no external binary; checking
     // for `openclaw` on PATH only matters when the operator has
     // declared OC is part of their setup (config file present).
@@ -2243,7 +2243,7 @@ fn parse_openclaw_version(raw: &str) -> Option<(u32, u32, u32)> {
 }
 
 fn check_runtime_version() -> Check {
-    // Sprint-G: skip when openclaw not configured on this machine (no
+    // Phase-G: skip when openclaw not configured on this machine (no
     // config file on disk). Same gate as check_runtime_command — when
     // OC isn't active, version-checking it is noise.
     if !openclaw_active() {
@@ -2741,7 +2741,7 @@ fn check_agent_role_definitions() -> Check {
     // #332 — use the canonical openclaw-config resolver so the
     // `DARKMUX_OPENCLAW_CONFIG` env var is honored consistently
     // with every other OC-touching surface (dispatcher, swap's
-    // apply_runtime, Sprint-G's openclaw-active gate). Pre-fix this
+    // apply_runtime, Phase-G's openclaw-active gate). Pre-fix this
     // check hardcoded `~/.openclaw/openclaw.json` and silently
     // probed the wrong file when the operator pointed the env var
     // somewhere else.
@@ -2908,14 +2908,14 @@ fn check_power_state() -> Check {
     }
 }
 
-/// Warn when legacy flat mission/sprint files exist in the pre-#148 layout.
-/// Pass when neither legacy_missions_dir nor legacy_sprints_dir contain any
+/// Warn when legacy flat mission/phase files exist in the pre-#148 layout.
+/// Pass when neither legacy_missions_dir nor legacy_phases_dir contain any
 /// top-level .json files. Fail never — legacy files don't break the system,
 /// but they're a signal that `darkmux mission migrate --apply` should be run
 /// to consolidate into the per-mission layout. (#148)
 fn check_legacy_mission_layout() -> Check {
     let missions_dir = darkmux_crew::lifecycle::legacy_missions_dir();
-    let sprints_dir = darkmux_crew::lifecycle::legacy_sprints_dir();
+    let phases_dir = darkmux_crew::lifecycle::legacy_phases_dir();
 
     let mut legacy_count = 0u32;
 
@@ -2934,8 +2934,8 @@ fn check_legacy_mission_layout() -> Check {
         }
     }
 
-    // Count legacy flat .json files in sprints dir
-    if let Ok(entries) = std::fs::read_dir(&sprints_dir) {
+    // Count legacy flat .json files in phases dir
+    if let Ok(entries) = std::fs::read_dir(&phases_dir) {
         for entry in entries.flatten() {
             if let Ok(metadata) = entry.metadata() {
                 if metadata.is_file() {
@@ -2954,14 +2954,14 @@ fn check_legacy_mission_layout() -> Check {
         // through dual-read so the path shown is the one the operator
         // can cd into, regardless of canonical vs Beat-33-legacy layout).
         let missions = darkmux_crew::loader::missions_dir();
-        let sprints = darkmux_crew::loader::sprints_dir();
+        let phases = darkmux_crew::loader::phases_dir();
         Check {
             name: "legacy mission layout".into(),
             status: Status::Warn,
             message: format!(
                 "{legacy_count} legacy flat file(s) at {}/<id>.json or {}/<id>.json",
                 missions.display(),
-                sprints.display()
+                phases.display()
             ),
             hint: Some(
                 "Run `darkmux mission migrate --apply` to move them to the per-mission layout (#148)."
@@ -4029,12 +4029,12 @@ mod tests {
         );
     }
 
-    // ─── Sprint-G: OC-active gate on doctor runtime checks ──
+    // ─── Phase-G: OC-active gate on doctor runtime checks ──
 
     /// Helper that points `DARKMUX_OPENCLAW_CONFIG` at a non-existent
     /// path for the test's duration so `default_openclaw_config()`
     /// resolves to a missing file (the "openclaw not configured"
-    /// signal Sprint-G keys on).
+    /// signal Phase-G keys on).
     struct OpenclawConfigGuard {
         prev: Option<String>,
         _tmp: tempfile::TempDir,

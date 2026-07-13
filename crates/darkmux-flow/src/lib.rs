@@ -1390,7 +1390,7 @@ mod tests {
             stage: Stage::Dispatch,
             action: "test".to_string(),
             handle: "t".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -1496,7 +1496,7 @@ mod tests {
             stage: Stage::Dispatch,
             action: "ran".to_string(),
             handle: "test-1".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -1539,7 +1539,7 @@ mod tests {
             stage: Stage::Dispatch,
             action: action.to_string(),
             handle: "test".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -1643,7 +1643,7 @@ mod tests {
             stage: Stage::Estimate,
             action: "budget_check".to_string(),
             handle: "handle-42".to_string(),
-            sprint_id: Some("sp-100".to_string()),
+            phase_id: Some("sp-100".to_string()),
             session_id: Some("sess-abc".to_string()),
             source: Some("estimator".to_string()),
             model: None,
@@ -1678,8 +1678,8 @@ mod tests {
         assert_eq!(parsed["handle"], "handle-42");
 
         // Optional fields should be present (not omitted) when set.
-        let sprint_id = parsed.get("sprint_id").expect("expected sprint_id");
-        assert_eq!(sprint_id, "sp-100");
+        let phase_id = parsed.get("phase_id").expect("expected phase_id");
+        assert_eq!(phase_id, "sp-100");
 
         let session_id = parsed.get("session_id").expect("expected session_id");
         assert_eq!(session_id, "sess-abc");
@@ -1711,7 +1711,7 @@ mod tests {
                 stage: Stage::Scope,
                 action: "scope_review".to_string(),
                 handle: "ex-path-1".to_string(),
-                sprint_id: None,
+                phase_id: None,
                 session_id: None,
                 source: Some("reviewer".to_string()),
                 model: None,
@@ -1758,7 +1758,7 @@ mod tests {
             stage: Stage::Ship,
             action: "deploy".to_string(),
             handle: "ship-1".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -1784,7 +1784,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(rec_line).unwrap();
 
         // Verify keys don't exist (not null, absent entirely).
-        assert!(parsed.get("sprint_id").is_none());
+        assert!(parsed.get("phase_id").is_none());
         assert!(parsed.get("session_id").is_none());
         assert!(parsed.get("source").is_none());
 
@@ -1814,7 +1814,7 @@ mod tests {
             stage: Stage::Review,
             action: "env_test".to_string(),
             handle: "ev-1".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -1962,7 +1962,7 @@ mod tests {
             stage: Stage::Scope,
             action: "test".to_string(),
             handle: "h".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2139,7 +2139,7 @@ mod tests {
             stage: Stage::Scope,
             action: "explicit-sink".to_string(),
             handle: "h".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2181,7 +2181,7 @@ mod tests {
             stage: Stage::Scope,
             action: "tee-test".to_string(),
             handle: "h".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2237,7 +2237,7 @@ mod tests {
             stage: Stage::Scope,
             action: "tee-fail".to_string(),
             handle: "h".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2281,7 +2281,7 @@ mod tests {
             stage: Stage::Scope,
             action: "default-path".to_string(),
             handle: "h".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2320,7 +2320,7 @@ mod tests {
         // bump if the change is breaking).
         //
         // Version history:
-        //   1.2.0 — added optional `model` field (#106, Sprint 4 of #104)
+        //   1.2.0 — added optional `model` field (#106, Phase 4 of #104)
         //   1.3.0 — added optional `reasoning` and `mission_id` fields and a
         //           new `Stage::TierDecision` variant (#136). Minor bump.
         //   1.4.0 — added optional `machine_id` and `orchestrator` fields
@@ -2432,7 +2432,7 @@ mod tests {
             stage: Stage::Scope,
             action: "test".to_string(),
             handle: "h".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2468,7 +2468,7 @@ mod tests {
                 stage: Stage::Dispatch,
                 action: "init".to_string(),
                 handle: "schema-check".to_string(),
-                sprint_id: None,
+                phase_id: None,
                 session_id: None,
                 source: None,
                 model: None,
@@ -2650,7 +2650,7 @@ mod tests {
             stage: Stage::Scope,
             action: "x".to_string(),
             handle: "y".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2680,7 +2680,7 @@ mod tests {
             stage: Stage::Scope,
             action: "x".to_string(),
             handle: "y".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2727,7 +2727,7 @@ mod tests {
             stage: Stage::Scope,
             action: "auto-pop".to_string(),
             handle: "h".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2784,7 +2784,7 @@ mod tests {
             stage: Stage::Scope,
             action: "x".to_string(),
             handle: "y".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2818,7 +2818,7 @@ mod tests {
             stage: Stage::Scope,
             action: "x".to_string(),
             handle: "y".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -2892,7 +2892,7 @@ mod tests {
                 stage: Stage::Scope,
                 action: "pre-1.8-record".to_string(),
                 handle: format!("h-{i}"),
-                sprint_id: None,
+                phase_id: None,
                 session_id: None,
                 source: None,
                 model: None,
@@ -2958,7 +2958,7 @@ mod tests {
                 stage: Stage::Scope,
                 action: format!("audit-{i}"),
                 handle: format!("rec-{i}"),
-                sprint_id: None,
+                phase_id: None,
                 session_id: None,
                 source: None,
                 model: None,
@@ -3008,7 +3008,7 @@ mod tests {
                 stage: Stage::Scope,
                 action: format!("audit-{i}"),
                 handle: format!("rec-{i}"),
-                sprint_id: None,
+                phase_id: None,
                 session_id: None,
                 source: None,
                 model: None,
@@ -3073,7 +3073,7 @@ mod tests {
             stage: Stage::Scope,
             action: "post-recovery".to_string(),
             handle: "h".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -3139,7 +3139,7 @@ mod tests {
             stage: Stage::Scope,
             action: "x".to_string(),
             handle: handle.to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,
@@ -3462,7 +3462,7 @@ mod tests {
             stage: Stage::Dispatch,
             action: "test-unresponsive-redis".to_string(),
             handle: "test".to_string(),
-            sprint_id: None,
+            phase_id: None,
             session_id: None,
             source: None,
             model: None,

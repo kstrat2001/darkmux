@@ -238,13 +238,13 @@ pub(crate) trait WorkloadProvider: Send + Sync {
     ///
     /// `runtime_cmd` is the executable path for the openclaw shell-out
     /// (default `"openclaw"`, override via `--runtime-cmd <path>`).
-    /// Ignored when `runtime == Runtime::Internal`. Sprint-E replacement
+    /// Ignored when `runtime == Runtime::Internal`. Phase-E replacement
     /// for the removed `DARKMUX_RUNTIME_CMD` env var.
     ///
     /// Argument count exceeds clippy's default threshold (8 vs 7); the
     /// trait shape mirrors the dispatch contract closely (profile,
     /// runtime, runtime_cmd are inherent to a dispatch). A `RunContext`
-    /// struct is a candidate cleanup but out of Sprint-E's scope.
+    /// struct is a candidate cleanup but out of Phase-E's scope.
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,

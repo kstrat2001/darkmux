@@ -1,12 +1,12 @@
 //! `darkmux mission run` — the local dispatch-to-PR loop, up to the gate.
 //!
 //! `mission dispatch` (see `cmd_mission_dispatch`) fans a mission's ready
-//! sprints onto the global Redis work queue for the fleet to claim. `mission
-//! run` is its **local, synchronous, single-sprint sibling**: it owns the
-//! mechanical per-sprint loop on THIS machine —
+//! phases onto the global Redis work queue for the fleet to claim. `mission
+//! run` is its **local, synchronous, single-phase sibling**: it owns the
+//! mechanical per-phase loop on THIS machine —
 //!
-//!   1. create an isolated git worktree for the sprint,
-//!   2. dispatch the coder role into it (sprint-bound, internal runtime),
+//!   1. create an isolated git worktree for the phase,
+//!   2. dispatch the coder role into it (phase-bound, internal runtime),
 //!   3. run the local `code-reviewer` QA against the worktree diff,
 //!   4. surface the coder result + tokens-off-meter + QA findings,
 //!   5. **stop at the gate** — worktree left in place, nothing committed.
@@ -15,7 +15,7 @@
 //! judgment/gate steps that belong to the frontier orchestrator + operator,
 //! never to a CLI verb (operator sovereignty, #44; never-auto-merge). `mission
 //! run` tees everything up so sign-off is one follow-on step — `darkmux mission
-//! ship <id> --sprint <sprint-id>` (PR2) does the commit → PR → CI → merge →
+//! ship <id> --phase <phase-id>` (PR2) does the commit → PR → CI → merge →
 //! teardown after the operator/frontier signs off. This verb kills the
 //! worktree-dance + manual-token-tally frictions (#782) without taking the
 //! merge decision out of the operator's hands.
@@ -40,7 +40,7 @@ fn emit_run_record(
     level: flow::Level,
     action: &str,
     mission_id: &str,
-    sprint_id: &str,
+    phase_id: &str,
     session_id: &str,
     payload: serde_json::Value,
 ) {
@@ -51,12 +51,12 @@ fn emit_run_record(
         session_id,
         None,
         Some(mission_id),
-        Some(sprint_id),
+        Some(phase_id),
         Some(payload),
     ));
 }
 
-/// Resolve the base directory holding per-sprint worktrees:
+/// Resolve the base directory holding per-phase worktrees:
 /// `~/.darkmux/worktrees` (HOME-less fallback `/tmp/darkmux/worktrees`).
 /// Outside the main working tree by design — git refuses a worktree nested
 /// inside another, and a stable, discoverable location lets `mission ship`
@@ -70,11 +70,11 @@ fn worktrees_base() -> PathBuf {
 /// The MAIN working tree of the current repository, resolved identically
 /// whether invoked from the main checkout or from inside a linked worktree.
 ///
-/// `mission run` creates the sprint worktree off this repo and `mission ship`
-/// recomputes that worktree's path from `(repo-name, sprint)` — both must
+/// `mission run` creates the phase worktree off this repo and `mission ship`
+/// recomputes that worktree's path from `(repo-name, phase)` — both must
 /// agree on the repo name. `git rev-parse --show-toplevel` returns the
 /// *current* working tree, which inside a mission's linked worktree is the
-/// sprint dir (basename = sprint id, NOT the repo name); using it made
+/// phase dir (basename = phase id, NOT the repo name); using it made
 /// `mission ship` from inside a worktree recompute a different (wrong) path
 /// than `mission run` created (#846). The first `worktree` entry of
 /// `git worktree list --porcelain` is always the main working tree, so it
@@ -208,22 +208,22 @@ fn pr_merge_state(dir: &Path, pr_url: &str) -> MergeState {
     }
 }
 
-/// Deterministic worktree path for a sprint: `<base>/<repo-name>/<sprint-id>`.
-/// Recomputable by `mission ship` from the same (repo, sprint) inputs.
-fn worktree_path(repo_root: &Path, sprint_id: &str) -> PathBuf {
+/// Deterministic worktree path for a phase: `<base>/<repo-name>/<phase-id>`.
+/// Recomputable by `mission ship` from the same (repo, phase) inputs.
+fn worktree_path(repo_root: &Path, phase_id: &str) -> PathBuf {
     let repo_name = repo_root
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
-    worktrees_base().join(repo_name).join(sprint_id)
+    worktrees_base().join(repo_name).join(phase_id)
 }
 
-/// Branch name for a sprint's worktree. The sprint id is already charset-
+/// Branch name for a phase's worktree. The phase id is already charset-
 /// validated (`fleet::validate_identifier`) before this is called, so it's a
 /// safe git ref component; we prefix `darkmux/` to namespace the branch and
 /// keep it recognizable as a darkmux-managed worktree branch.
-fn branch_name(sprint_id: &str) -> String {
-    format!("darkmux/{sprint_id}")
+fn branch_name(phase_id: &str) -> String {
+    format!("darkmux/{phase_id}")
 }
 
 /// (#816) Conventions-aware branch name: the repo's `branch_template`
@@ -233,17 +233,17 @@ fn branch_name(sprint_id: &str) -> String {
 /// template that can't expand (ticketless mission) or expands to an
 /// invalid ref falls back loudly-but-softly to the default.
 fn conventions_branch(
-    sprint: &crew::types::Sprint,
+    phase: &crew::types::Phase,
     mission: &crew::types::Mission,
     conv: Option<&crate::conventions::Conventions>,
 ) -> String {
-    let default = branch_name(&sprint.id);
+    let default = branch_name(&phase.id);
     let Some(template) = conv.and_then(|c| c.branch_template.as_deref()) else {
         return default;
     };
     let vars = crate::conventions::Vars {
         ticket: mission.ticket.as_deref(),
-        sprint: &sprint.id,
+        phase: &phase.id,
         mission: &mission.id,
         subject: "",
     };
@@ -265,66 +265,66 @@ fn conventions_branch(
     }
 }
 
-/// Choose which sprint to run. Explicit `--sprint` wins (validated to belong
+/// Choose which phase to run. Explicit `--phase` wins (validated to belong
 /// to the mission and not be terminal). Otherwise auto-select the single
-/// ready sprint — `Planned` AND every `depends_on` entry resolves to a
-/// `Complete` sprint (`crew::scheduler::is_ready` via the `SprintNode`
+/// ready phase — `Planned` AND every `depends_on` entry resolves to a
+/// `Complete` phase (`crew::scheduler::is_ready` via the `PhaseNode`
 /// adapter, #1230 Packet 2 — replaces the historical flat
 /// `depends_on.is_empty()` "is this a root" filter, which only ever
-/// auto-selected sprints with NO dependencies at all and never actually
-/// checked whether a sprint's dependencies had been satisfied). 0 or >1
+/// auto-selected phases with NO dependencies at all and never actually
+/// checked whether a phase's dependencies had been satisfied). 0 or >1
 /// ready is ambiguous and bails with guidance rather than guessing — the
 /// operator stays in the loop.
-fn select_sprint(
-    sprints: &[crew::types::Sprint],
+fn select_phase(
+    phases: &[crew::types::Phase],
     mission_id: &str,
     explicit: Option<&str>,
-) -> Result<crew::types::Sprint> {
-    use crew::scheduler::{is_ready, SprintNode};
-    use crew::types::SprintStatus;
+) -> Result<crew::types::Phase> {
+    use crew::scheduler::{is_ready, PhaseNode};
+    use crew::types::PhaseStatus;
 
     if let Some(id) = explicit {
-        let s = sprints
+        let s = phases
             .iter()
             .find(|s| s.id == id)
-            .ok_or_else(|| anyhow::anyhow!("sprint `{id}` not found"))?;
+            .ok_or_else(|| anyhow::anyhow!("phase `{id}` not found"))?;
         if s.mission_id != mission_id {
             bail!(
-                "sprint `{id}` belongs to mission `{}`, not `{mission_id}`",
+                "phase `{id}` belongs to mission `{}`, not `{mission_id}`",
                 s.mission_id
             );
         }
-        if matches!(s.status, SprintStatus::Complete) {
-            bail!("sprint `{id}` is already Complete (terminal) — nothing to run");
+        if matches!(s.status, PhaseStatus::Complete) {
+            bail!("phase `{id}` is already Complete (terminal) — nothing to run");
         }
         return Ok(s.clone());
     }
 
-    // `by_id` covers every loaded sprint (not just this mission's) since
+    // `by_id` covers every loaded phase (not just this mission's) since
     // `depends_on` cross-mission references are unusual but not invalid
-    // (see `lifecycle::add_sprint_to_mission`'s own doc comment).
-    let nodes: Vec<SprintNode> = sprints.iter().map(SprintNode).collect();
-    let by_id: std::collections::BTreeMap<String, &SprintNode> =
+    // (see `lifecycle::add_phase_to_mission`'s own doc comment).
+    let nodes: Vec<PhaseNode> = phases.iter().map(PhaseNode).collect();
+    let by_id: std::collections::BTreeMap<String, &PhaseNode> =
         nodes.iter().map(|n| (n.0.id.clone(), n)).collect();
 
-    let ready: Vec<&crew::types::Sprint> = sprints
+    let ready: Vec<&crew::types::Phase> = phases
         .iter()
         .filter(|s| s.mission_id == mission_id)
-        .filter(|s| is_ready(&SprintNode(s), &by_id))
+        .filter(|s| is_ready(&PhaseNode(s), &by_id))
         .collect();
 
     match ready.as_slice() {
         [] => bail!(
-            "mission `{mission_id}` has no ready sprint to run (need a Planned sprint with \
-             no unmet dependencies). Pass `--sprint <id>` to target one explicitly, or check \
+            "mission `{mission_id}` has no ready phase to run (need a Planned phase with \
+             no unmet dependencies). Pass `--phase <id>` to target one explicitly, or check \
              `darkmux mission show {mission_id}`."
         ),
         [one] => Ok((*one).clone()),
         many => {
             let ids: Vec<&str> = many.iter().map(|s| s.id.as_str()).collect();
             bail!(
-                "mission `{mission_id}` has {} ready sprints ({}). `mission run` does one sprint \
-                 at a time — pass `--sprint <id>` to choose.",
+                "mission `{mission_id}` has {} ready phases ({}). `mission run` does one phase \
+                 at a time — pass `--phase <id>` to choose.",
                 many.len(),
                 ids.join(", ")
             )
@@ -332,14 +332,14 @@ fn select_sprint(
     }
 }
 
-/// Create the git worktree for this sprint, branching off `base`. If the
-/// worktree path already exists (a prior `mission run` for the same sprint
+/// Create the git worktree for this phase, branching off `base`. If the
+/// worktree path already exists (a prior `mission run` for the same phase
 /// that wasn't shipped/torn down), bail with a pointer rather than clobbering
 /// — the operator decides whether to resume, ship, or `git worktree remove`.
 fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> Result<()> {
     if wt_path.exists() {
         bail!(
-            "worktree already exists at {} — a previous `mission run` for this sprint hasn't \
+            "worktree already exists at {} — a previous `mission run` for this phase hasn't \
              been shipped or torn down. Inspect it, run `darkmux mission ship` to finish, or \
              `git worktree remove {}` to discard.",
             wt_path.display(),
@@ -377,7 +377,7 @@ fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> R
 // data (a 3-Task/3-Step graph) and executed through Packet 2's
 // `scheduler::run_step_graph` instead of a hand-written function body. The
 // GATE (blocker check, sign-off printing) and `ship()` (commit → PR →
-// merge) stay outside the graph — genuinely Sprint-level land/gate steps
+// merge) stay outside the graph — genuinely Phase-level land/gate steps
 // in #1240's vocabulary, not Steps.
 //
 // Each step kind below does its OWN printing + `emit_run_record` calls
@@ -389,7 +389,7 @@ fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> R
 // inside `run` reproduces `run()`'s old inline ordering exactly.
 //
 // Rich per-step results (the full `DispatchResult`, the full
-// `SprintReviewOutput`) don't fit the generic `StepOutcome.output: String`
+// `PhaseReviewOutput`) don't fit the generic `StepOutcome.output: String`
 // contract, so each kind stashes its structured result into a side-channel
 // `Arc<Mutex<Option<T>>>` slot the caller reads after `run_step_graph`
 // returns — `Step.output` still carries a plain-text summary for
@@ -409,30 +409,30 @@ use std::sync::{Arc, Mutex};
 /// ids the caller's `StepKindRegistry` resolves at scheduling time; this
 /// function only builds the graph SHAPE, not the registry (production vs.
 /// test registries wire different implementations behind the same ids).
-fn default_sprint_graph(sprint_id: &str, role: &str) -> (Vec<Task>, std::collections::BTreeMap<String, crew::types::Step>) {
-    let worktree_task_id = format!("{sprint_id}-worktree");
-    let coder_task_id = format!("{sprint_id}-coder");
-    let verify_task_id = format!("{sprint_id}-verify");
-    let worktree_step_id = format!("{sprint_id}-worktree-step");
-    let coder_step_id = format!("{sprint_id}-coder-step");
-    let verify_step_id = format!("{sprint_id}-verify-step");
+fn default_phase_graph(phase_id: &str, role: &str) -> (Vec<Task>, std::collections::BTreeMap<String, crew::types::Step>) {
+    let worktree_task_id = format!("{phase_id}-worktree");
+    let coder_task_id = format!("{phase_id}-coder");
+    let verify_task_id = format!("{phase_id}-verify");
+    let worktree_step_id = format!("{phase_id}-worktree-step");
+    let coder_step_id = format!("{phase_id}-coder-step");
+    let verify_step_id = format!("{phase_id}-verify-step");
 
     let tasks = vec![
         Task {
             id: worktree_task_id.clone(),
-            sprint_id: sprint_id.to_string(),
-            description: "prepare the sprint worktree".to_string(),
+            phase_id: phase_id.to_string(),
+            description: "prepare the phase worktree".to_string(),
             step_ids: vec![worktree_step_id.clone()],
         },
         Task {
             id: coder_task_id.clone(),
-            sprint_id: sprint_id.to_string(),
+            phase_id: phase_id.to_string(),
             description: format!("dispatch `{role}` into the worktree"),
             step_ids: vec![coder_step_id.clone()],
         },
         Task {
             id: verify_task_id.clone(),
-            sprint_id: sprint_id.to_string(),
+            phase_id: phase_id.to_string(),
             description: "local QA — mechanical verify (code-reviewer)".to_string(),
             step_ids: vec![verify_step_id.clone()],
         },
@@ -496,7 +496,7 @@ struct MissionWorktreeStepKind {
     branch: String,
     base: String,
     mission_id: String,
-    sprint_id: String,
+    phase_id: String,
     session_id: String,
     role: String,
 }
@@ -521,7 +521,7 @@ impl StepKind for MissionWorktreeStepKind {
             flow::Level::Info,
             "mission.run.start",
             &self.mission_id,
-            &self.sprint_id,
+            &self.phase_id,
             &self.session_id,
             serde_json::json!({
                 "role": self.role,
@@ -571,7 +571,7 @@ struct MissionCoderStepKind {
     opts: Mutex<Option<crew::dispatch::DispatchOpts>>,
     wt_path: PathBuf,
     mission_id: String,
-    sprint_id: String,
+    phase_id: String,
     session_id: String,
     role_id: String,
     result_slot: Arc<Mutex<Option<CoderStepResult>>>,
@@ -610,13 +610,13 @@ impl StepKind for MissionCoderStepKind {
             eprintln!(
                 "{}",
                 style::error(&format!(
-                    "✗ coder dispatch exited {exit_code} — see stderr above. The sprint stays \
+                    "✗ coder dispatch exited {exit_code} — see stderr above. The phase stays \
                      Running and the worktree is left at {} for inspection. Re-running `darkmux \
                      mission run` will refuse until you tear it down: `darkmux mission abort {} \
-                     --sprint {}`.",
+                     --phase {}`.",
                     self.wt_path.display(),
                     self.mission_id,
-                    self.sprint_id,
+                    self.phase_id,
                 ))
             );
             print_token_line(&tokens);
@@ -624,7 +624,7 @@ impl StepKind for MissionCoderStepKind {
                 flow::Level::Error,
                 "mission.run.error",
                 &self.mission_id,
-                &self.sprint_id,
+                &self.phase_id,
                 &self.session_id,
                 serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total() }),
             );
@@ -647,7 +647,7 @@ impl StepKind for MissionCoderStepKind {
             },
             "mission.run.verification",
             &self.mission_id,
-            &self.sprint_id,
+            &self.phase_id,
             &self.session_id,
             serde_json::json!({ "failed": failed_verifiers, "count": failed_verifiers.len() }),
         );
@@ -666,20 +666,20 @@ impl StepKind for MissionCoderStepKind {
     }
 
     fn residency(&self, _step: &crew::types::Step) -> Option<crew::step_kinds::Placement> {
-        resolve_local_placement(&self.role_id, None, None, &format!("mission-coder:{}", self.sprint_id))
+        resolve_local_placement(&self.role_id, None, None, &format!("mission-coder:{}", self.phase_id))
     }
 }
 
 /// Wraps the mechanical-verify half of the old hand-written sequence
-/// (`sprint_cli::sprint_review_output_at` against the worktree diff). Its
+/// (`phase_cli::phase_review_output_at` against the worktree diff). Its
 /// `run()` role is ALWAYS `"code-reviewer"` — that's hardcoded inside
-/// `sprint_review_output_at` itself (mirrors the standalone `darkmux
-/// sprint review` verb), not something `mission run` overrides.
+/// `phase_review_output_at` itself (mirrors the standalone `darkmux
+/// phase review` verb), not something `mission run` overrides.
 struct MissionVerifyStepKind {
     wt_path: PathBuf,
     base: String,
-    sprint_id: String,
-    result_slot: Arc<Mutex<Option<std::result::Result<crate::sprint_cli::SprintReviewOutput, String>>>>,
+    phase_id: String,
+    result_slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>,
 }
 
 impl StepKind for MissionVerifyStepKind {
@@ -697,7 +697,7 @@ impl StepKind for MissionVerifyStepKind {
             style::header("▶ local QA — dispatching `code-reviewer` against the worktree diff…")
         );
 
-        match crate::sprint_cli::sprint_review_output_at(&self.wt_path, Some(&self.base), Some(&self.sprint_id)) {
+        match crate::phase_cli::phase_review_output_at(&self.wt_path, Some(&self.base), Some(&self.phase_id)) {
             Ok(review) => {
                 print_review_summary(&review);
                 let verdict = review.verdict.clone();
@@ -723,7 +723,7 @@ impl StepKind for MissionVerifyStepKind {
     }
 
     fn residency(&self, _step: &crew::types::Step) -> Option<crew::step_kinds::Placement> {
-        resolve_local_placement("code-reviewer", None, None, &format!("mission-verify:{}", self.sprint_id))
+        resolve_local_placement("code-reviewer", None, None, &format!("mission-verify:{}", self.phase_id))
     }
 }
 
@@ -734,20 +734,20 @@ impl StepKind for MissionVerifyStepKind {
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     mission_id: &str,
-    sprint_id: Option<&str>,
+    phase_id: Option<&str>,
     role: &str,
     image: Option<&str>,
     base: &str,
     timeout_seconds: u32,
 ) -> Result<i32> {
-    use crew::loader::{load_missions, load_roles, load_sprints};
+    use crew::loader::{load_missions, load_roles, load_phases};
 
     // CLI-boundary charset validation — these flow into branch names,
     // worktree paths, session ids, and flow records.
     fleet::validate_identifier("mission_id", mission_id)?;
     fleet::validate_identifier("role_id", role)?;
-    if let Some(s) = sprint_id {
-        fleet::validate_identifier("--sprint", s)?;
+    if let Some(s) = phase_id {
+        fleet::validate_identifier("--phase", s)?;
     }
 
     // 1. Validate the mission + role exist.
@@ -776,29 +776,29 @@ pub fn run(
         bail!("role `{role}` not found (check `darkmux crew roles`)");
     }
 
-    // 2. Select the sprint to run.
-    let sprints = load_sprints()?;
-    let sprint = select_sprint(&sprints, mission_id, sprint_id)?;
+    // 2. Select the phase to run.
+    let phases = load_phases()?;
+    let phase = select_phase(&phases, mission_id, phase_id)?;
 
     // Shared session id for every record this run emits — the frontier
     // tails the stream on this id to track the run end to end.
-    let session_id = format!("mission-run-{}-{}", mission_id, sprint.id);
+    let session_id = format!("mission-run-{}-{}", mission_id, phase.id);
 
     // 3. Set up the isolated worktree.
     let root = repo_root()?;
-    let wt_path = worktree_path(&root, &sprint.id);
+    let wt_path = worktree_path(&root, &phase.id);
     let conv = crate::conventions::load(&root);
-    let branch = conventions_branch(&sprint, mission, conv.as_ref());
+    let branch = conventions_branch(&phase, mission, conv.as_ref());
 
     println!(
         "{}",
         style::header(&format!(
-            "▶ mission run — {} · sprint {}",
-            mission_id, sprint.id
+            "▶ mission run — {} · phase {}",
+            mission_id, phase.id
         ))
     );
     println!("  {}  {}", style::dim("mission:"), mission.description);
-    println!("  {}   {}", style::dim("sprint:"), sprint.description);
+    println!("  {}   {}", style::dim("phase:"), phase.description);
     println!(
         "  {} {} {} {}",
         style::dim("worktree:"),
@@ -815,24 +815,24 @@ pub fn run(
     // sequence (right after the header prints above), just moved behind
     // the step-kind boundary.
 
-    // 4. Flip the sprint Planned → Running (consistent with `mission
+    // 4. Flip the phase Planned → Running (consistent with `mission
     //    dispatch`). It IS being worked on now; `mission ship` flips it to
     //    Complete on merge. If it was already Running (a resumed run), the
     //    lifecycle call is a no-op-ish; surface any error softly.
-    if matches!(sprint.status, crew::types::SprintStatus::Planned) {
-        if let Err(e) = crew::lifecycle::sprint_start(&sprint.id) {
+    if matches!(phase.status, crew::types::PhaseStatus::Planned) {
+        if let Err(e) = crew::lifecycle::phase_start(&phase.id) {
             eprintln!(
                 "{}",
                 style::warn(&format!(
-                    "darkmux mission run: sprint_start({}) failed: {e:#} — continuing; \
-                     state can be reconciled with `darkmux sprint` verbs.",
-                    sprint.id
+                    "darkmux mission run: phase_start({}) failed: {e:#} — continuing; \
+                     state can be reconciled with `darkmux phase` verbs.",
+                    phase.id
                 ))
             );
         }
     }
 
-    // 5. Dispatch the coder into the worktree, sprint-bound, internal
+    // 5. Dispatch the coder into the worktree, phase-bound, internal
     //    runtime, --json so the token totals (#782a) land in metrics.json.
     println!(
         "\n{}",
@@ -840,20 +840,20 @@ pub fn run(
     );
     // (#849 half 1) Carry forward corrections the reviewer recorded on earlier
     // dispatches in this mission (the doom-loop fix). Scope to the mission's
-    // EXACT dispatch session ids (built from its sprints) — a `mission-run-<id>-`
+    // EXACT dispatch session ids (built from its phases) — a `mission-run-<id>-`
     // prefix match would bleed a sibling mission whose id is a hyphen-extension.
     // Surface the texts so the operator sees what's injected — provenance, not
     // a silent rule (#44).
-    let mission_session_ids: std::collections::HashSet<String> = sprints
+    let mission_session_ids: std::collections::HashSet<String> = phases
         .iter()
         .filter(|s| s.mission_id.as_str() == mission_id)
         .map(|s| format!("mission-run-{}-{}", mission_id, s.id))
         .collect();
-    // (#1002) Files this dispatch is about to work on (from the sprint
+    // (#1002) Files this dispatch is about to work on (from the phase
     // description) — used to rank file-in-play cautions + lessons above
     // engagement-level ones, and to staleness-check cautions against the
     // worktree's current content.
-    let intent = intent_files(&sprint.description);
+    let intent = intent_files(&phase.description);
 
     // (#994 retrieve+inject) The three injected-context sources, each fully
     // ranked but UNCAPPED here — the proportional budget (#1011) decides how
@@ -924,7 +924,7 @@ pub fn run(
     // here.
     let opts = crew::dispatch::DispatchOpts {
         role_id: role.to_string(),
-        message: coder_brief(&sprint, mission, &lessons, &prior_corrections, &detected_cautions),
+        message: coder_brief(&phase, mission, &lessons, &prior_corrections, &detected_cautions),
         deliver: None,
         session_id: Some(session_id.clone()),
         timeout_seconds,
@@ -934,7 +934,7 @@ pub fn run(
         // default openclaw workspace dir (library-caller convention).
         watch_paths: Vec::new(),
         workdir: Some(wt_path.clone()),
-        sprint_id: Some(sprint.id.clone()),
+        phase_id: Some(phase.id.clone()),
         runtime: crew::dispatch::Runtime::Internal,
         runtime_cmd: "openclaw".to_string(),
         // `--machine` is not a `mission run` flag — always local. See
@@ -961,7 +961,7 @@ pub fn run(
     // observability (the graph lens, #1230 Packet 6) — best-effort, not
     // load-bearing for this run's own control flow, which reads the
     // in-memory `steps` map below.
-    let (tasks, mut steps) = default_sprint_graph(&sprint.id, role);
+    let (tasks, mut steps) = default_phase_graph(&phase.id, role);
     for task in &tasks {
         if let Err(e) = crew::lifecycle::save_task(mission_id, task) {
             eprintln!(
@@ -973,7 +973,7 @@ pub fn run(
 
     let coder_result_slot: Arc<Mutex<Option<CoderStepResult>>> = Arc::new(Mutex::new(None));
     let verify_result_slot: Arc<
-        Mutex<Option<std::result::Result<crate::sprint_cli::SprintReviewOutput, String>>>,
+        Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>,
     > = Arc::new(Mutex::new(None));
 
     let registry = StepKindRegistry::new();
@@ -984,7 +984,7 @@ pub fn run(
             branch: branch.clone(),
             base: base.to_string(),
             mission_id: mission_id.to_string(),
-            sprint_id: sprint.id.clone(),
+            phase_id: phase.id.clone(),
             session_id: session_id.clone(),
             role: role.to_string(),
         }))
@@ -994,7 +994,7 @@ pub fn run(
             opts: Mutex::new(Some(opts)),
             wt_path: wt_path.clone(),
             mission_id: mission_id.to_string(),
-            sprint_id: sprint.id.clone(),
+            phase_id: phase.id.clone(),
             session_id: session_id.clone(),
             role_id: role.to_string(),
             result_slot: coder_result_slot.clone(),
@@ -1004,7 +1004,7 @@ pub fn run(
         .register(Arc::new(MissionVerifyStepKind {
             wt_path: wt_path.clone(),
             base: base.to_string(),
-            sprint_id: sprint.id.clone(),
+            phase_id: phase.id.clone(),
             result_slot: verify_result_slot.clone(),
         }))
         .expect("mission.verify registered once");
@@ -1024,7 +1024,7 @@ pub fn run(
     })?;
 
     for step in steps.values() {
-        if let Err(e) = crew::lifecycle::save_step(mission_id, &sprint.id, step) {
+        if let Err(e) = crew::lifecycle::save_step(mission_id, &phase.id, step) {
             eprintln!(
                 "{}",
                 style::dim(&format!("darkmux mission run: step persist warning: {e:#}"))
@@ -1032,9 +1032,9 @@ pub fn run(
         }
     }
 
-    let worktree_step_id = format!("{}-worktree-step", sprint.id);
-    let coder_step_id = format!("{}-coder-step", sprint.id);
-    let verify_step_id = format!("{}-verify-step", sprint.id);
+    let worktree_step_id = format!("{}-worktree-step", phase.id);
+    let coder_step_id = format!("{}-coder-step", phase.id);
+    let verify_step_id = format!("{}-verify-step", phase.id);
 
     // Worktree creation failing is a hard stop — same as the pre-migration
     // `add_worktree(...)?` propagating straight out of `run()` (an
@@ -1085,7 +1085,7 @@ pub fn run(
             flow::Level::Warn,
             "mission.run.qa-unavailable",
             mission_id,
-            &sprint.id,
+            &phase.id,
             &session_id,
             serde_json::json!({ "error": err_text, "total_tokens": tokens_total }),
         );
@@ -1096,9 +1096,9 @@ pub fn run(
         println!(
             "\n{}",
             style::warn(&format!(
-                "review the diff manually, then:  darkmux mission ship {mission_id} --sprint {} \
-                 (or abort: darkmux mission abort {mission_id} --sprint {})",
-                sprint.id, sprint.id
+                "review the diff manually, then:  darkmux mission ship {mission_id} --phase {} \
+                 (or abort: darkmux mission abort {mission_id} --phase {})",
+                phase.id, phase.id
             ))
         );
         return Ok(3);
@@ -1144,20 +1144,20 @@ pub fn run(
         );
         println!(
             "  {}",
-            style::dim("re-run QA after fixing: darkmux sprint review (in the worktree)")
+            style::dim("re-run QA after fixing: darkmux phase review (in the worktree)")
         );
         println!(
             "  {}",
             style::dim(&format!(
-                "or abandon this run: darkmux mission abort {mission_id} --sprint {}",
-                sprint.id
+                "or abandon this run: darkmux mission abort {mission_id} --phase {}",
+                phase.id
             ))
         );
         emit_run_record(
             flow::Level::Warn,
             "mission.run.blocked",
             mission_id,
-            &sprint.id,
+            &phase.id,
             &session_id,
             serde_json::json!({
                 "verdict": review.verdict,
@@ -1172,8 +1172,8 @@ pub fn run(
     println!(
         "\n{}",
         style::success(&format!(
-            "✓ ready for sign-off. After review:  darkmux mission ship {mission_id} --sprint {}",
-            sprint.id
+            "✓ ready for sign-off. After review:  darkmux mission ship {mission_id} --phase {}",
+            phase.id
         ))
     );
     // (#807/#817) Cue the frontier orchestrator at the decision moment —
@@ -1196,7 +1196,7 @@ pub fn run(
         flow::Level::Info,
         "mission.run.gate",
         mission_id,
-        &sprint.id,
+        &phase.id,
         &session_id,
         serde_json::json!({
             "verdict": review.verdict,
@@ -1209,17 +1209,17 @@ pub fn run(
 }
 
 /// `darkmux mission abort` — the explicit teardown half of the hybrid
-/// contract. Removes the sprint's worktree + its branch and flips the sprint
+/// contract. Removes the phase's worktree + its branch and flips the phase
 /// `Running → Abandoned`, so a frontier/operator who decides mid-loop that the
 /// run is going nowhere can cleanly back it out (vs. leaving an orphan
 /// worktree). Idempotent-ish: a missing worktree/branch is reported, not
 /// fatal. Returns `0` on a clean teardown.
-pub fn abort(mission_id: &str, sprint_id: Option<&str>) -> Result<i32> {
-    use crew::loader::{load_missions, load_sprints};
+pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
+    use crew::loader::{load_missions, load_phases};
 
     fleet::validate_identifier("mission_id", mission_id)?;
-    if let Some(s) = sprint_id {
-        fleet::validate_identifier("--sprint", s)?;
+    if let Some(s) = phase_id {
+        fleet::validate_identifier("--phase", s)?;
     }
 
     let missions = load_missions()?;
@@ -1227,22 +1227,22 @@ pub fn abort(mission_id: &str, sprint_id: Option<&str>) -> Result<i32> {
         .iter()
         .find(|m| m.id == mission_id)
         .ok_or_else(|| anyhow::anyhow!("mission `{mission_id}` not found"))?;
-    let sprints = load_sprints()?;
-    // Explicit `--sprint` resolves by id (any status — a Running sprint, the
+    let phases = load_phases()?;
+    // Explicit `--phase` resolves by id (any status — a Running phase, the
     // common abort case after a `run`, resolves); auto-path requires a ready
-    // Planned sprint. So to abort a Running sprint, pass `--sprint`.
-    let sprint = resolve_sprint(&sprints, mission_id, sprint_id)?;
+    // Planned phase. So to abort a Running phase, pass `--phase`.
+    let phase = resolve_phase(&phases, mission_id, phase_id)?;
 
     let root = repo_root()?;
-    let wt_path = worktree_path(&root, &sprint.id);
+    let wt_path = worktree_path(&root, &phase.id);
     let conv = crate::conventions::load(&root);
-    let branch = conventions_branch(&sprint, mission, conv.as_ref());
+    let branch = conventions_branch(&phase, mission, conv.as_ref());
 
     println!(
         "{}",
         style::header(&format!(
-            "▶ mission abort — {} · sprint {}",
-            mission_id, sprint.id
+            "▶ mission abort — {} · phase {}",
+            mission_id, phase.id
         ))
     );
 
@@ -1287,46 +1287,46 @@ pub fn abort(mission_id: &str, sprint_id: Option<&str>) -> Result<i32> {
         );
     }
 
-    // Flip the sprint Running/Planned → Abandoned (legal restart later).
-    match crew::lifecycle::sprint_abandon(&sprint.id) {
-        Ok(_) => println!("{}", style::success(&format!("✓ sprint {} → Abandoned", sprint.id))),
+    // Flip the phase Running/Planned → Abandoned (legal restart later).
+    match crew::lifecycle::phase_abandon(&phase.id) {
+        Ok(_) => println!("{}", style::success(&format!("✓ phase {} → Abandoned", phase.id))),
         Err(e) => eprintln!(
             "{}",
             style::warn(&format!(
-                "sprint_abandon({}) failed: {e:#} — reconcile with `darkmux sprint` verbs.",
-                sprint.id
+                "phase_abandon({}) failed: {e:#} — reconcile with `darkmux phase` verbs.",
+                phase.id
             ))
         ),
     }
 
-    let session_id = format!("mission-run-{}-{}", mission_id, sprint.id);
+    let session_id = format!("mission-run-{}-{}", mission_id, phase.id);
     emit_run_record(
         flow::Level::Info,
         "mission.run.abort",
         mission_id,
-        &sprint.id,
+        &phase.id,
         &session_id,
         serde_json::json!({ "branch": branch, "worktree": wt_path.display().to_string() }),
     );
     Ok(0)
 }
 
-/// Resolve the sprint a post-run verb (`ship` / `abort`) targets. An explicit
-/// `--sprint` is looked up by id directly (no status filter — so a Running
-/// sprint, the common post-`run` case, resolves); otherwise fall back to
-/// `select_sprint`'s ready-Planned auto-pick.
-fn resolve_sprint(
-    sprints: &[crew::types::Sprint],
+/// Resolve the phase a post-run verb (`ship` / `abort`) targets. An explicit
+/// `--phase` is looked up by id directly (no status filter — so a Running
+/// phase, the common post-`run` case, resolves); otherwise fall back to
+/// `select_phase`'s ready-Planned auto-pick.
+fn resolve_phase(
+    phases: &[crew::types::Phase],
     mission_id: &str,
     explicit: Option<&str>,
-) -> Result<crew::types::Sprint> {
+) -> Result<crew::types::Phase> {
     match explicit {
-        Some(id) => sprints
+        Some(id) => phases
             .iter()
             .find(|s| s.id == id && s.mission_id == mission_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("sprint `{id}` not found in mission `{mission_id}`")),
-        None => select_sprint(sprints, mission_id, None),
+            .ok_or_else(|| anyhow::anyhow!("phase `{id}` not found in mission `{mission_id}`")),
+        None => select_phase(phases, mission_id, None),
     }
 }
 
@@ -1387,9 +1387,9 @@ fn resolved_git_identity(dir: &Path) -> String {
     format!("{} <{}>", g("user.name"), g("user.email"))
 }
 
-/// Commit subject for a shipped sprint: the sprint description's first line,
+/// Commit subject for a shipped phase: the phase description's first line,
 /// trimmed to a conventional ~72-char subject.
-/// (#815) The coder's dispatch brief: the sprint's compiled description
+/// (#815) The coder's dispatch brief: the phase's compiled description
 /// (the STRUCTURE) plus, when the mission carries it, the operator's
 /// verbatim `mission propose` input (the WORDS) under a provenance-tagged
 /// block. The 2026-06-12 dogfood showed the compiler compressing exact
@@ -1398,7 +1398,7 @@ fn resolved_git_identity(dir: &Path) -> String {
 /// follows the model-facing prompt doctrine: AI-convention framing, with
 /// the tag itself carrying the provenance a clean-context model needs.
 fn coder_brief(
-    sprint: &crew::types::Sprint,
+    phase: &crew::types::Phase,
     mission: &crew::types::Mission,
     lessons: &[String],
     prior_corrections: &[String],
@@ -1407,12 +1407,12 @@ fn coder_brief(
     let base = match mission.source_input.as_deref().map(str::trim) {
         Some(src) if !src.is_empty() => format!(
             "{desc}\n\n<operator-source-input>\nThe user's original, unabridged request that \
-             produced this sprint. The summary above is derived from it; where this text \
+             produced this phase. The summary above is derived from it; where this text \
              adds constraints, exact strings, or scope limits beyond the summary, THIS \
              text is authoritative.\n\n{src}\n</operator-source-input>",
-            desc = sprint.description,
+            desc = phase.description,
         ),
-        _ => sprint.description.clone(),
+        _ => phase.description.clone(),
     };
     append_injected_blocks(base, lessons, prior_corrections, cautions)
 }
@@ -1544,13 +1544,13 @@ pub(crate) fn injected_context_for_lab(
     profile: Option<&str>,
     profiles_file: Option<&str>,
 ) -> String {
-    use crew::loader::load_sprints;
-    // No sprint at lab time → no files-in-play; lessons/cautions still inject at
+    use crew::loader::load_phases;
+    // No phase at lab time → no files-in-play; lessons/cautions still inject at
     // engagement scope.
     let intent = std::collections::HashSet::new();
     let (corrections, cautions) = match mission_id {
         Some(mid) => {
-            let ids: std::collections::HashSet<String> = load_sprints()
+            let ids: std::collections::HashSet<String> = load_phases()
                 .unwrap_or_default()
                 .iter()
                 .filter(|s| s.mission_id.as_str() == mid)
@@ -1587,11 +1587,11 @@ pub(crate) fn injected_context_for_lab(
 /// dispatches, for injection into the next coder brief. Scans the flow trail
 /// for `action=note` + `source=adjudication` whose `session_id` is one of the
 /// mission's EXACT dispatch session ids (`mission_session_ids`, built from the
-/// mission's sprints as `mission-run-<mission>-<sprint>`). Exact-set match, NOT
+/// mission's phases as `mission-run-<mission>-<phase>`). Exact-set match, NOT
 /// a `mission-run-<mission>-` prefix — a prefix bleeds a sibling mission whose
 /// id is a hyphen-extension (`auth` would swallow `auth-v2`'s notes, since
 /// `mission-run-auth-v2-s1` starts with `mission-run-auth-`). Mission-scoped,
-/// not sprint-scoped, by design — a correction like "don't rename that field"
+/// not phase-scoped, by design — a correction like "don't rename that field"
 /// applies mission-wide. Best-effort: any IO/parse problem reads as "no
 /// corrections" (the loop just doesn't get the carry-forward, never errors).
 /// Bounded: the most-recent `ADJUDICATION_LOOKBACK_DAYS` day-files. Returned
@@ -1682,7 +1682,7 @@ fn normalize_path_lexical(p: &str) -> String {
     out.to_string_lossy().into_owned()
 }
 
-/// (#1002) The files a dispatch is about to work on, derived from the sprint
+/// (#1002) The files a dispatch is about to work on, derived from the phase
 /// description — the source knowable at brief-assembly time (a git diff is empty
 /// here; precise files-in-play is the deferred #219-fed Half B). Conservative
 /// tokenizer (no `regex` dep): a token is a candidate path when, after stripping
@@ -2015,8 +2015,8 @@ fn engagement_lessons(intent: &std::collections::HashSet<String>) -> Vec<String>
         .collect()
 }
 
-fn sprint_status_label(s: crew::types::SprintStatus) -> &'static str {
-    use crew::types::SprintStatus::*;
+fn phase_status_label(s: crew::types::PhaseStatus) -> &'static str {
+    use crew::types::PhaseStatus::*;
     match s {
         Planned => "planned",
         Running => "running",
@@ -2056,14 +2056,14 @@ fn print_bullets_or_none(items: &[String]) {
 }
 
 /// (#1000) The debrief ceremony's gathered raw material for one mission. Owned
-/// (not borrowed from the loaded mission/sprint Vecs) so the gather + render are
+/// (not borrowed from the loaded mission/phase Vecs) so the gather + render are
 /// cleanly separable and the gather is unit-testable without stdout capture.
 struct DebriefReport {
     mission_id: String,
     mission_description: String,
     mission_status: &'static str,
-    /// (sprint_id, first-line description, status label) per sprint.
-    sprints: Vec<(String, String, &'static str)>,
+    /// (phase_id, first-line description, status label) per phase.
+    phases: Vec<(String, String, &'static str)>,
     /// Already bullet-formatted by [`mission_cautions`].
     cautions: Vec<String>,
     /// The reviewer's adjudication notes (#849), as recorded.
@@ -2072,18 +2072,18 @@ struct DebriefReport {
 
 /// (#1000) Gather the debrief raw material for `mission_id`: the loop
 /// pathologies darkmux's detectors flagged across the mission's runs (cautions),
-/// the corrections the reviewer recorded (#849), and the mission's sprints + how
+/// the corrections the reviewer recorded (#849), and the mission's phases + how
 /// each ended. READ-ONLY.
 ///
 /// The flow stream IS the mission's durable history (the #557 single-stream
 /// doctrine); this reads it scoped to the mission's EXACT dispatch session ids
-/// (same `mission-run-<id>-<sprint>` construction as the run path, so a sibling
+/// (same `mission-run-<id>-<phase>` construction as the run path, so a sibling
 /// mission whose id is a hyphen-extension never bleeds in). It does NOT assume a
 /// coding mission — no git diffs are reconstructed here: for a coding mission
 /// the `darkmux-mission-debrief` skill pulls the actual patch with `git show`,
 /// and a non-coding mission simply has no coding activity.
 fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
-    use crew::loader::{load_missions, load_sprints};
+    use crew::loader::{load_missions, load_phases};
     // (#1011) How many cautions/corrections the retrospective summary shows
     // (the collectors are uncapped now; the dispatch path budgets, the debrief
     // just truncates for readability).
@@ -2098,15 +2098,15 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
             anyhow::anyhow!("mission `{mission_id}` not found (check `darkmux mission status`)")
         })?;
 
-    let sprints = load_sprints()?;
-    let mission_sprints: Vec<&crew::types::Sprint> = sprints
+    let phases = load_phases()?;
+    let mission_phases: Vec<&crew::types::Phase> = phases
         .iter()
         .filter(|s| s.mission_id.as_str() == mission_id)
         .collect();
 
     // The mission's exact dispatch session ids — same construction as `run`,
     // so the collectors scope to THIS mission's sessions (no sibling bleed).
-    let mission_session_ids: std::collections::HashSet<String> = mission_sprints
+    let mission_session_ids: std::collections::HashSet<String> = mission_phases
         .iter()
         .map(|s| format!("mission-run-{}-{}", mission_id, s.id))
         .collect();
@@ -2115,13 +2115,13 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
         mission_id: mission.id.clone(),
         mission_description: mission.description.clone(),
         mission_status: mission_status_label(mission.status),
-        sprints: mission_sprints
+        phases: mission_phases
             .iter()
             .map(|s| {
                 (
                     s.id.clone(),
                     s.description.lines().next().unwrap_or("").trim().to_string(),
-                    sprint_status_label(s.status),
+                    phase_status_label(s.status),
                 )
             })
             .collect(),
@@ -2148,7 +2148,7 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
 }
 
 /// (#1000) `darkmux mission debrief <id>` — surface a completed mission's
-/// debrief material (cautions + corrections + sprints) for the post-mission
+/// debrief material (cautions + corrections + phases) for the post-mission
 /// review ceremony. `--json` feeds the `darkmux-mission-debrief` skill, which
 /// distills durable `lessons` (with the why) for the next crew. The ceremony
 /// that turns transient signal into durable lessons — NASA Lessons Learned,
@@ -2157,8 +2157,8 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
     let report = gather_debrief(mission_id)?;
 
     if json {
-        let sprints_json: Vec<serde_json::Value> = report
-            .sprints
+        let phases_json: Vec<serde_json::Value> = report
+            .phases
             .iter()
             .map(|(id, desc, status)| {
                 serde_json::json!({ "id": id, "description": desc, "status": status })
@@ -2170,7 +2170,7 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
                 "description": report.mission_description,
                 "status": report.mission_status,
             },
-            "sprints": sprints_json,
+            "phases": phases_json,
             "cautions": report.cautions,
             "corrections": report.corrections,
         });
@@ -2188,11 +2188,11 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
     }
     println!();
 
-    println!("{}", style::header("sprints"));
-    if report.sprints.is_empty() {
+    println!("{}", style::header("phases"));
+    if report.phases.is_empty() {
         println!("  {}", style::dim("(none)"));
     } else {
-        for (id, desc, status) in &report.sprints {
+        for (id, desc, status) in &report.phases {
             println!(
                 "  {} [{}] {}",
                 style::accent(id),
@@ -2233,7 +2233,7 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
 /// durable `lessons` for the next crew. Emits a `Stage::Debrief` flow record
 /// marking the prompt in the mission's history. Prints, never blocks (a nudge,
 /// not a gate — operator sovereignty #44). The within-mission learning already
-/// happened live (corrections + cautions carried sprint→sprint at run time);
+/// happened live (corrections + cautions carried phase→phase at run time);
 /// this is the cross-MISSION lesson-banking step.
 pub fn nudge_mission_debrief(mission_id: &str) {
     let _ = flow::record(flow::FlowRecord {
@@ -2244,7 +2244,7 @@ pub fn nudge_mission_debrief(mission_id: &str) {
         stage: flow::Stage::Debrief,
         action: "mission.debrief.prompt".to_string(),
         handle: mission_id.to_string(),
-        sprint_id: None,
+        phase_id: None,
         session_id: Some(format!("mission:{mission_id}")),
         source: Some("mission_debrief".to_string()),
         model: None,
@@ -2301,7 +2301,7 @@ fn session_has_orchestrator_note(session_id: &str) -> bool {
     false
 }
 
-/// (#817) Soft nudge printed at ship time when a gated sprint is shipping
+/// (#817) Soft nudge printed at ship time when a gated phase is shipping
 /// with zero adjudication notes in its trail — the gate is where judgment
 /// calls happen, and without a note darkmux's own record of the mission has
 /// a hole where the reasoning should be. Prints, never blocks (nudges, not
@@ -2400,7 +2400,7 @@ fn print_unverified_banner(failed: &[FailedVerifier]) {
 
 /// (#799) The verifier commands the LATEST run's coder FAILED TO RUN, read back
 /// from the flow trail by the run's deterministic session id
-/// (`mission-run-<mission>-<sprint>`). `mission run` emits a
+/// (`mission-run-<mission>-<phase>`). `mission run` emits a
 /// `mission.run.verification` record (payload `{ failed: [{command, reason}] }`)
 /// on EVERY run — empty `failed` on an honest run — so `ship` reads the latest
 /// run's status and HOLDs an auto-merge only when that run had failures. The
@@ -2408,7 +2408,7 @@ fn print_unverified_banner(failed: &[FailedVerifier]) {
 /// runtime's out-dir is an ephemeral per-dispatch tempdir ship can't
 /// reconstruct). Scans the last 2 days oldest→newest and OVERWRITES `latest` on
 /// each match, so a clean re-run's empty record correctly clears a prior dirty
-/// run's (latest-wins on a resumed sprint). Best effort: any IO/parse problem,
+/// run's (latest-wins on a resumed phase). Best effort: any IO/parse problem,
 /// or no record in the recent window, reads as "none" — this soft backstop
 /// fails OPEN (the run-time banner is the primary surface). Mirrors
 /// `session_has_orchestrator_note`.
@@ -2454,10 +2454,10 @@ fn session_failed_verifiers(session_id: &str) -> Vec<FailedVerifier> {
     latest
 }
 
-fn commit_subject(sprint: &crew::types::Sprint) -> String {
-    let first = sprint.description.lines().next().unwrap_or("").trim();
+fn commit_subject(phase: &crew::types::Phase) -> String {
+    let first = phase.description.lines().next().unwrap_or("").trim();
     let s = if first.is_empty() {
-        format!("darkmux sprint {}", sprint.id)
+        format!("darkmux phase {}", phase.id)
     } else {
         first.to_string()
     };
@@ -2469,22 +2469,22 @@ fn commit_subject(sprint: &crew::types::Sprint) -> String {
     }
 }
 
-/// PR body — sprint + mission provenance. Authored by the LOCAL coder via
+/// PR body — phase + mission provenance. Authored by the LOCAL coder via
 /// `mission run`; the body says so (no frontier/Claude co-author claim — this
 /// is local-AI work shipped through darkmux's loop).
-fn pr_body(mission: &crew::types::Mission, sprint: &crew::types::Sprint) -> String {
+fn pr_body(mission: &crew::types::Mission, phase: &crew::types::Phase) -> String {
     format!(
-        "## {sprint_desc}\n\n\
+        "## {phase_desc}\n\n\
          Shipped via `darkmux mission ship` — the local dispatch-to-PR loop.\n\n\
          - **Mission:** `{mission_id}` — {mission_desc}\n\
-         - **Sprint:** `{sprint_id}`\n\n\
+         - **Phase:** `{phase_id}`\n\n\
          The implementation was produced by the local-AI coder under \
          `darkmux mission run` and reviewed by the local `code-reviewer` before \
          sign-off. The frontier/operator adjudicated the QA findings at the gate.",
-        sprint_desc = sprint.description.lines().next().unwrap_or("").trim(),
+        phase_desc = phase.description.lines().next().unwrap_or("").trim(),
         mission_id = mission.id,
         mission_desc = mission.description.lines().next().unwrap_or("").trim(),
-        sprint_id = sprint.id,
+        phase_id = phase.id,
     )
 }
 
@@ -2510,15 +2510,15 @@ fn worktree_branch(wt_path: &Path) -> Option<String> {
 /// the mission doesn't have, or it expands empty.
 fn conventioned(
     template: Option<&str>,
-    sprint: &crew::types::Sprint,
+    phase: &crew::types::Phase,
     mission: &crew::types::Mission,
     what: &str,
 ) -> String {
-    let default = commit_subject(sprint);
+    let default = commit_subject(phase);
     let Some(t) = template else { return default };
     let vars = crate::conventions::Vars {
         ticket: mission.ticket.as_deref(),
-        sprint: &sprint.id,
+        phase: &phase.id,
         mission: &mission.id,
         subject: &default,
     };
@@ -2540,11 +2540,11 @@ fn conventioned(
 /// absent. Missing/unreadable template file warns + falls back.
 fn conventioned_pr_body(
     mission: &crew::types::Mission,
-    sprint: &crew::types::Sprint,
+    phase: &crew::types::Phase,
     conv: Option<&crate::conventions::Conventions>,
     repo_root: &Path,
 ) -> String {
-    let summary = pr_body(mission, sprint);
+    let summary = pr_body(mission, phase);
     let Some(rel) = conv.and_then(|c| c.pr_body_template.as_deref()) else {
         return summary;
     };
@@ -2566,7 +2566,7 @@ fn conventioned_pr_body(
 ///
 /// `gh pr view <branch>` falls back to the most-recent CLOSED/MERGED PR when no
 /// OPEN one exists. On a deterministic, reusable branch name
-/// (`darkmux/<sprint-id>`) that could hand back a STALE merged PR; the ship
+/// (`darkmux/<phase-id>`) that could hand back a STALE merged PR; the ship
 /// path would then skip `gh pr create` and later verify merge-state against
 /// that stale URL (#844), wrongly OK-ing a teardown of un-merged work. The
 /// `select(.state=="OPEN")` jq filter closes that seam: a recycled branch whose
@@ -2637,25 +2637,25 @@ fn ci_is_green(dir: &Path, branch: &str) -> Result<bool> {
 /// `darkmux mission ship` — the post-sign-off completion of the dispatch-to-PR
 /// loop. Commits the worktree's work, pushes the branch, opens (or reuses) the
 /// PR, and STOPS at the PR by default. `--wait-ci` blocks on CI; `--merge`
-/// (opt-in, green-gated) squash-merges, flips the sprint to Complete, and
+/// (opt-in, green-gated) squash-merges, flips the phase to Complete, and
 /// tears the worktree down. **Never auto-merges** — `--merge` is the operator/
 /// frontier's explicit sign-off act. Returns `0` on success, `1` on a refused
-/// merge (CI not green), `2` when the PR merged but the sprint couldn't be
+/// merge (CI not green), `2` when the PR merged but the phase couldn't be
 /// marked Complete (inconsistent state — needs manual reconcile), `3` when
 /// `--merge` is HELD because the run had verifier commands that failed to run
 /// (#799 — review the SIGNOFF, then merge manually or re-run after fixing).
 pub fn ship(
     mission_id: &str,
-    sprint_id: Option<&str>,
+    phase_id: Option<&str>,
     base: &str,
     wait_ci: bool,
     merge: bool,
 ) -> Result<i32> {
-    use crew::loader::{load_missions, load_sprints};
+    use crew::loader::{load_missions, load_phases};
 
     fleet::validate_identifier("mission_id", mission_id)?;
-    if let Some(s) = sprint_id {
-        fleet::validate_identifier("--sprint", s)?;
+    if let Some(s) = phase_id {
+        fleet::validate_identifier("--phase", s)?;
     }
 
     let missions = load_missions()?;
@@ -2664,21 +2664,21 @@ pub fn ship(
         .find(|m| m.id == mission_id)
         .ok_or_else(|| anyhow::anyhow!("mission `{mission_id}` not found"))?
         .clone();
-    let sprints = load_sprints()?;
-    let sprint = resolve_sprint(&sprints, mission_id, sprint_id)?;
+    let phases = load_phases()?;
+    let phase = resolve_phase(&phases, mission_id, phase_id)?;
 
-    // A Complete sprint is terminal — a prior `--merge` already shipped it
+    // A Complete phase is terminal — a prior `--merge` already shipped it
     // (and tore down its worktree). Re-shipping would duplicate-PR or churn;
     // refuse rather than confuse.
-    if matches!(sprint.status, crew::types::SprintStatus::Complete) {
+    if matches!(phase.status, crew::types::PhaseStatus::Complete) {
         bail!(
-            "sprint `{}` is already Complete (terminal) — nothing to ship.",
-            sprint.id
+            "phase `{}` is already Complete (terminal) — nothing to ship.",
+            phase.id
         );
     }
 
     let root = repo_root()?;
-    let wt_path = worktree_path(&root, &sprint.id);
+    let wt_path = worktree_path(&root, &phase.id);
     let conv = crate::conventions::load(&root);
     // (#816) Ship pushes the branch the worktree is ACTUALLY on — created at
     // `mission run` time — not a recomputation. If conventions.json changed
@@ -2686,20 +2686,20 @@ pub fn ship(
     // exist (QA drift finding). The computed name is only the fallback for
     // a worktree whose HEAD can't be read.
     let branch = worktree_branch(&wt_path)
-        .unwrap_or_else(|| conventions_branch(&sprint, &mission, conv.as_ref()));
-    let session_id = format!("mission-run-{}-{}", mission_id, sprint.id);
+        .unwrap_or_else(|| conventions_branch(&phase, &mission, conv.as_ref()));
+    let session_id = format!("mission-run-{}-{}", mission_id, phase.id);
 
     if !wt_path.exists() {
         bail!(
-            "no worktree at {} — run `darkmux mission run {mission_id} --sprint {}` first.",
+            "no worktree at {} — run `darkmux mission run {mission_id} --phase {}` first.",
             wt_path.display(),
-            sprint.id
+            phase.id
         );
     }
 
     println!(
         "{}",
-        style::header(&format!("▶ mission ship — {} · sprint {}", mission_id, sprint.id))
+        style::header(&format!("▶ mission ship — {} · phase {}", mission_id, phase.id))
     );
 
     // 1. Commit the worktree's work (the coder's changes + any operator edits
@@ -2724,11 +2724,11 @@ pub fn ship(
     if !nothing_staged {
         let subject = conventioned(
         conv.as_ref().and_then(|c| c.commit_subject_template.as_deref()),
-        &sprint, &mission, "commit subject",
+        &phase, &mission, "commit subject",
     );
         let msg = format!(
-            "{subject}\n\nAuthored via `darkmux mission run` (local-AI coder, sprint {}).",
-            sprint.id
+            "{subject}\n\nAuthored via `darkmux mission run` (local-AI coder, phase {}).",
+            phase.id
         );
         // (#834) Commit under the declared bot identity when the repo's
         // conventions name one (sets author AND committer). Without it, a repo
@@ -2787,9 +2787,9 @@ pub fn ship(
         None => {
             let title = conventioned(
                 conv.as_ref().and_then(|c| c.pr_title_template.as_deref()),
-                &sprint, &mission, "PR title",
+                &phase, &mission, "PR title",
             );
-            let body = conventioned_pr_body(&mission, &sprint, conv.as_ref(), &root);
+            let body = conventioned_pr_body(&mission, &phase, conv.as_ref(), &root);
             let mut args: Vec<&str> = vec![
                 "pr", "create", "--base", base, "--head", &branch, "--title", &title,
                 "--body", &body,
@@ -2837,7 +2837,7 @@ pub fn ship(
         flow::Level::Info,
         "mission.run.ship",
         mission_id,
-        &sprint.id,
+        &phase.id,
         &session_id,
         serde_json::json!({ "branch": branch, "pr_url": pr_url, "base": base }),
     );
@@ -2878,15 +2878,15 @@ pub fn ship(
                     "  the PR is open ({pr_url}) and the worktree is intact — nothing was \
                      discarded. Review the diff + SIGNOFF; if verification really is sound, merge \
                      manually (`gh pr merge {branch} --squash`). If the toolchain was broken, fix \
-                     it and re-run `darkmux mission run {mission_id} --sprint {}`.",
-                    sprint.id
+                     it and re-run `darkmux mission run {mission_id} --phase {}`.",
+                    phase.id
                 ))
             );
             emit_run_record(
                 flow::Level::Warn,
                 "mission.run.ship.held",
                 mission_id,
-                &sprint.id,
+                &phase.id,
                 &session_id,
                 serde_json::json!({
                     "reason": "verification-unproven",
@@ -2923,8 +2923,8 @@ pub fn ship(
                 style::error(&format!(
                     "✗ refusing to merge {branch} — CI is not green (a check failed, or no \
                      checks ran; `--merge` requires configured + passing CI). Resolve, re-push, \
-                     then re-run `darkmux mission ship {mission_id} --sprint {} --merge`.",
-                    sprint.id
+                     then re-run `darkmux mission ship {mission_id} --phase {} --merge`.",
+                    phase.id
                 ))
             );
             return Ok(1);
@@ -2941,7 +2941,7 @@ pub fn ship(
             // checked out in the primary worktree, so gh's local `git checkout
             // main` fatals — and gh exits non-zero even though the REMOTE merge
             // already landed (#844). Treating that as a total failure used to
-            // skip sprint-complete + teardown → silent drift (merged PR, sprint
+            // skip phase-complete + teardown → silent drift (merged PR, phase
             // stuck Running, orphaned worktree). So verify the PR's ACTUAL
             // state: only bail if it truly didn't merge.
             match pr_merge_state(&root, &pr_url) {
@@ -2970,9 +2970,9 @@ pub fn ship(
                     bail!(
                         "`gh pr merge` exited non-zero and the PR's merge state could not be \
                          confirmed — check {pr_url}. If it DID merge, reconcile with \
-                         `darkmux sprint complete {}` and `git worktree remove --force {}`. \
+                         `darkmux phase complete {}` and `git worktree remove --force {}`. \
                          gh stderr: {}",
-                        sprint.id,
+                        phase.id,
                         wt_path.display(),
                         String::from_utf8_lossy(&out.stderr).trim()
                     );
@@ -2981,20 +2981,20 @@ pub fn ship(
         }
         println!("{}", style::success(&format!("✓ merged {branch} (squash)")));
 
-        // Flip the sprint Complete + tear down the worktree. The merge is
-        // already irreversible, so a sprint_complete failure can't roll it
-        // back — but it leaves merged-PR-but-Running-sprint, so we must NOT
+        // Flip the phase Complete + tear down the worktree. The merge is
+        // already irreversible, so a phase_complete failure can't roll it
+        // back — but it leaves merged-PR-but-Running-phase, so we must NOT
         // claim a clean "loop closed". Track the outcome and exit non-zero
         // with a reconcile pointer if completion didn't take.
-        let complete_ok = match crew::lifecycle::sprint_complete(&sprint.id) {
+        let complete_ok = match crew::lifecycle::phase_complete(&phase.id) {
             Ok(_) => {
-                println!("{}", style::success(&format!("✓ sprint {} → Complete", sprint.id)));
+                println!("{}", style::success(&format!("✓ phase {} → Complete", phase.id)));
                 true
             }
             Err(e) => {
                 eprintln!(
                     "{}",
-                    style::error(&format!("✗ sprint_complete({}) failed: {e:#}", sprint.id))
+                    style::error(&format!("✗ phase_complete({}) failed: {e:#}", phase.id))
                 );
                 false
             }
@@ -3022,8 +3022,8 @@ pub fn ship(
         // gh's `--delete-branch` removed the REMOTE branch via API, but its
         // local-branch deletion rode the same post-merge sync that fails under
         // the worktree layout (#844). With the worktree (which pinned the
-        // branch) now gone, reap the local branch ourselves so shipped sprints
-        // don't accrete dead `darkmux/<sprint>` refs. Safe unconditionally:
+        // branch) now gone, reap the local branch ourselves so shipped phases
+        // don't accrete dead `darkmux/<phase>` refs. Safe unconditionally:
         // if gh already deleted it, `-D` exits 1 (swallowed); if the worktree
         // removal above FAILED, the branch is still pinned and git `-D` refuses
         // outright — so this never orphan-kills a branch holding live work.
@@ -3033,22 +3033,22 @@ pub fn ship(
             flow::Level::Info,
             "mission.run.ship.merged",
             mission_id,
-            &sprint.id,
+            &phase.id,
             &session_id,
-            serde_json::json!({ "pr_url": pr_url, "sprint_completed": complete_ok }),
+            serde_json::json!({ "pr_url": pr_url, "phase_completed": complete_ok }),
         );
         if !complete_ok {
             eprintln!(
                 "{}",
                 style::error(&format!(
-                    "PR was MERGED but sprint `{}` could not be marked Complete — state is \
-                     inconsistent. Reconcile with `darkmux sprint complete {}`.",
-                    sprint.id, sprint.id
+                    "PR was MERGED but phase `{}` could not be marked Complete — state is \
+                     inconsistent. Reconcile with `darkmux phase complete {}`.",
+                    phase.id, phase.id
                 ))
             );
             return Ok(2);
         }
-        println!("\n{}", style::success("✓ sprint shipped + merged. Loop closed."));
+        println!("\n{}", style::success("✓ phase shipped + merged. Loop closed."));
         // (#807/#817) The arc just concluded — soft-nudge if the run's trail
         // has no adjudication note (session-id pre-filled scaffold), then cue
         // the DASHBOARD note: the operator-facing card line. The placeholder
@@ -3076,8 +3076,8 @@ pub fn ship(
         "  {}",
         style::dim(&format!(
             "review CI, then merge. To finish via darkmux after green: \
-             darkmux mission ship {mission_id} --sprint {} --merge",
-            sprint.id
+             darkmux mission ship {mission_id} --phase {} --merge",
+            phase.id
         ))
     );
     // (#817) Stop-at-PR exit gets the same soft nudge as the merge exit —
@@ -3098,7 +3098,7 @@ fn print_token_line(t: &crew::dispatch_internal::TokenTotals) {
 }
 
 /// Render the QA verdict + findings with severity coloring.
-fn print_review_summary(review: &crate::sprint_cli::SprintReviewOutput) {
+fn print_review_summary(review: &crate::phase_cli::PhaseReviewOutput) {
     let verdict_styled = match review.verdict.as_str() {
         "clean" => style::success("clean"),
         "flags-only" => style::warn("flags-only"),
@@ -3128,17 +3128,17 @@ fn print_review_summary(review: &crate::sprint_cli::SprintReviewOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crew::types::{Sprint, SprintStatus};
+    use crew::types::{Phase, PhaseStatus};
 
     /// (#816) conventions_branch: template + ticket → conventioned ref;
     /// ticketless mission or invalid expansion → darkmux default (soft
     /// fallback, never an error).
     #[test]
     fn conventions_branch_expands_and_falls_back() {
-        let s = sprint("s1-fix", "m1", &[], SprintStatus::Planned);
+        let s = phase("s1-fix", "m1", &[], PhaseStatus::Planned);
         let mut m = mission("m1", "desc");
         let conv: crate::conventions::Conventions =
-            serde_json::from_str(r#"{"branch_template":"{ticket}/{sprint}"}"#).unwrap();
+            serde_json::from_str(r#"{"branch_template":"{ticket}/{phase}"}"#).unwrap();
         // ticketless → default
         assert_eq!(conventions_branch(&s, &m, Some(&conv)), "darkmux/s1-fix");
         // ticketed → conventioned
@@ -3148,7 +3148,7 @@ mod tests {
         assert_eq!(conventions_branch(&s, &m, None), "darkmux/s1-fix");
         // template expanding to an invalid ref → default
         let bad: crate::conventions::Conventions =
-            serde_json::from_str(r#"{"branch_template":"-{sprint}"}"#).unwrap();
+            serde_json::from_str(r#"{"branch_template":"-{phase}"}"#).unwrap();
         assert_eq!(conventions_branch(&s, &m, Some(&bad)), "darkmux/s1-fix");
     }
 
@@ -3158,7 +3158,7 @@ mod tests {
     /// missions) the brief is the bare description, unchanged.
     #[test]
     fn coder_brief_appends_verbatim_source_when_present() {
-        let s = sprint("s1", "m1", &[], SprintStatus::Planned);
+        let s = phase("s1", "m1", &[], PhaseStatus::Planned);
         let mut m = mission("m1", "compiled summary");
         m.source_input = Some("EXACT placeholder: 'APIM Key Name'. Do NOT rename fields.".into());
         let brief = coder_brief(&s, &m, &[], &[], &[]);
@@ -3173,12 +3173,12 @@ mod tests {
             !brief.contains("  "),
             "brief preamble contains a literal space-run: {brief:?}"
         );
-        assert!(brief.contains("unabridged request that produced this sprint"));
+        assert!(brief.contains("unabridged request that produced this phase"));
     }
 
     #[test]
     fn coder_brief_is_bare_description_without_source() {
-        let s = sprint("s1", "m1", &[], SprintStatus::Planned);
+        let s = phase("s1", "m1", &[], PhaseStatus::Planned);
         let m = mission("m1", "compiled summary");
         assert_eq!(coder_brief(&s, &m, &[], &[], &[]), "desc s1");
         // Whitespace-only source_input behaves as absent.
@@ -3189,7 +3189,7 @@ mod tests {
 
     #[test]
     fn coder_brief_injects_prior_corrections() {
-        let s = sprint("s1", "m1", &[], SprintStatus::Planned);
+        let s = phase("s1", "m1", &[], PhaseStatus::Planned);
         let m = mission("m1", "compiled summary");
         let corrections = vec![
             "Do NOT rename the APIM key field.".to_string(),
@@ -3229,7 +3229,7 @@ mod tests {
     /// orders authored corrections before auto-detected cautions.
     #[test]
     fn coder_brief_injects_detected_cautions() {
-        let s = sprint("s1", "m1", &[], SprintStatus::Planned);
+        let s = phase("s1", "m1", &[], PhaseStatus::Planned);
         let m = mission("m1", "compiled summary");
         let cautions = vec![
             "- [cycle] `edit` called 3× in the last 10 tool calls (in `src/x.rs`)".to_string(),
@@ -3269,7 +3269,7 @@ mod tests {
     /// base → lessons → corrections → cautions.
     #[test]
     fn coder_brief_injects_lessons_authoritative_and_first() {
-        let s = sprint("s1", "m1", &[], SprintStatus::Planned);
+        let s = phase("s1", "m1", &[], PhaseStatus::Planned);
         let m = mission("m1", "compiled summary");
         let lessons =
             vec!["- American English: house style across all work, no British spellings.".to_string()];
@@ -3679,9 +3679,9 @@ mod tests {
         std::fs::write(
             tmp.path().join("2026-06-21.jsonl"),
             concat!(
-                // mission `auth`, sprint s1 — an adjudication correction
+                // mission `auth`, phase s1 — an adjudication correction
                 r#"{"ts":"2026-06-21T10:00:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
-                // `auth`, a LATER sprint — same family, must be carried forward
+                // `auth`, a LATER phase — same family, must be carried forward
                 r#"{"ts":"2026-06-21T11:00:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s2","handle":"Use cargo test -p foo."}"#, "\n",
                 // exact duplicate of the first — must not repeat
                 r#"{"ts":"2026-06-21T11:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
@@ -3699,7 +3699,7 @@ mod tests {
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
 
         // `auth`'s EXACT dispatch session ids — as run() builds them from the
-        // mission's sprints. Note `auth-v2`'s session id is deliberately absent.
+        // mission's phases. Note `auth-v2`'s session id is deliberately absent.
         let auth_ids: std::collections::HashSet<String> =
             ["mission-run-auth-s1", "mission-run-auth-s2"]
                 .iter()
@@ -3726,10 +3726,10 @@ mod tests {
     }
 
     /// (#1000) The debrief gather assembles a mission's review material from
-    /// on-disk mission/sprint state + the flow stream: the mission identity, its
-    /// sprints + how each ended, the detector cautions, and the reviewer's
+    /// on-disk mission/phase state + the flow stream: the mission identity, its
+    /// phases + how each ended, the detector cautions, and the reviewer's
     /// corrections — all scoped to THIS mission's exact dispatch sessions.
-    /// `#[serial]` — mutates DARKMUX_HOME (mission/sprint loaders) + the
+    /// `#[serial]` — mutates DARKMUX_HOME (mission/phase loaders) + the
     /// DARKMUX_FLOWS_DIR (the collectors read it live per-access).
     #[test]
     #[serial_test::serial]
@@ -3737,24 +3737,24 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let flows = tempfile::TempDir::new().unwrap();
         let mid = "m-debrief";
-        let sprints_dir = home.path().join("missions").join(mid).join("sprints");
-        std::fs::create_dir_all(&sprints_dir).unwrap();
+        let phases_dir = home.path().join("missions").join(mid).join("phases");
+        std::fs::create_dir_all(&phases_dir).unwrap();
         std::fs::write(
             home.path().join("missions").join(mid).join("mission.json"),
             format!(
-                r#"{{"id":"{mid}","description":"close the doom loop","status":"closed","sprint_ids":["s1","s2"],"created_ts":1700000000}}"#
+                r#"{{"id":"{mid}","description":"close the doom loop","status":"closed","phase_ids":["s1","s2"],"created_ts":1700000000}}"#
             ),
         )
         .unwrap();
         std::fs::write(
-            sprints_dir.join("s1.json"),
+            phases_dir.join("s1.json"),
             format!(
                 r#"{{"id":"s1","mission_id":"{mid}","description":"capture slice","status":"complete","depends_on":[],"created_ts":1700000200}}"#
             ),
         )
         .unwrap();
         std::fs::write(
-            sprints_dir.join("s2.json"),
+            phases_dir.join("s2.json"),
             format!(
                 r#"{{"id":"s2","mission_id":"{mid}","description":"index slice","status":"abandoned","depends_on":[],"created_ts":1700000300}}"#
             ),
@@ -3797,16 +3797,16 @@ mod tests {
         let report = report.expect("mission found");
         assert_eq!(report.mission_id, mid);
         assert_eq!(report.mission_status, "closed");
-        assert_eq!(report.sprints.len(), 2, "both sprints surfaced: {:?}", report.sprints);
+        assert_eq!(report.phases.len(), 2, "both phases surfaced: {:?}", report.phases);
         assert!(
-            report.sprints.iter().any(|(id, _, st)| id == "s1" && *st == "complete"),
+            report.phases.iter().any(|(id, _, st)| id == "s1" && *st == "complete"),
             "{:?}",
-            report.sprints
+            report.phases
         );
         assert!(
-            report.sprints.iter().any(|(id, _, st)| id == "s2" && *st == "abandoned"),
+            report.phases.iter().any(|(id, _, st)| id == "s2" && *st == "abandoned"),
             "{:?}",
-            report.sprints
+            report.phases
         );
         assert_eq!(report.cautions.len(), 1, "one in-mission caution (sibling excluded): {:?}", report.cautions);
         assert!(report.cautions[0].contains("src/index.rs"), "{:?}", report.cautions);
@@ -3891,8 +3891,8 @@ mod tests {
         assert!(adjudication_tag, "the adjudication audit-trail tag must satisfy the scan");
     }
 
-    fn sprint(id: &str, mission: &str, deps: &[&str], status: SprintStatus) -> Sprint {
-        Sprint {
+    fn phase(id: &str, mission: &str, deps: &[&str], status: PhaseStatus) -> Phase {
+        Phase {
             id: id.to_string(),
             mission_id: mission.to_string(),
             description: format!("desc {id}"),
@@ -3907,76 +3907,76 @@ mod tests {
     }
 
     #[test]
-    fn select_sprint_explicit_must_belong_to_mission() {
-        let sprints = vec![sprint("s1", "m1", &[], SprintStatus::Planned)];
-        let err = select_sprint(&sprints, "m2", Some("s1")).unwrap_err();
+    fn select_phase_explicit_must_belong_to_mission() {
+        let phases = vec![phase("s1", "m1", &[], PhaseStatus::Planned)];
+        let err = select_phase(&phases, "m2", Some("s1")).unwrap_err();
         assert!(err.to_string().contains("belongs to mission"), "{err}");
     }
 
     #[test]
-    fn select_sprint_explicit_rejects_complete() {
-        let sprints = vec![sprint("s1", "m1", &[], SprintStatus::Complete)];
-        let err = select_sprint(&sprints, "m1", Some("s1")).unwrap_err();
+    fn select_phase_explicit_rejects_complete() {
+        let phases = vec![phase("s1", "m1", &[], PhaseStatus::Complete)];
+        let err = select_phase(&phases, "m1", Some("s1")).unwrap_err();
         assert!(err.to_string().contains("already Complete"), "{err}");
     }
 
     #[test]
-    fn select_sprint_auto_picks_single_ready() {
-        let sprints = vec![
-            sprint("s1", "m1", &[], SprintStatus::Planned),
-            sprint("s2", "m1", &["s1"], SprintStatus::Planned), // has unmet dep
-            sprint("s3", "m2", &[], SprintStatus::Planned),     // other mission
+    fn select_phase_auto_picks_single_ready() {
+        let phases = vec![
+            phase("s1", "m1", &[], PhaseStatus::Planned),
+            phase("s2", "m1", &["s1"], PhaseStatus::Planned), // has unmet dep
+            phase("s3", "m2", &[], PhaseStatus::Planned),     // other mission
         ];
-        let chosen = select_sprint(&sprints, "m1", None).unwrap();
+        let chosen = select_phase(&phases, "m1", None).unwrap();
         assert_eq!(chosen.id, "s1");
     }
 
     #[test]
-    fn select_sprint_auto_bails_on_zero_ready() {
-        let sprints = vec![sprint("s1", "m1", &[], SprintStatus::Running)];
-        let err = select_sprint(&sprints, "m1", None).unwrap_err();
-        assert!(err.to_string().contains("no ready sprint"), "{err}");
+    fn select_phase_auto_bails_on_zero_ready() {
+        let phases = vec![phase("s1", "m1", &[], PhaseStatus::Running)];
+        let err = select_phase(&phases, "m1", None).unwrap_err();
+        assert!(err.to_string().contains("no ready phase"), "{err}");
     }
 
     #[test]
-    fn select_sprint_auto_bails_ambiguous() {
-        let sprints = vec![
-            sprint("s1", "m1", &[], SprintStatus::Planned),
-            sprint("s2", "m1", &[], SprintStatus::Planned),
+    fn select_phase_auto_bails_ambiguous() {
+        let phases = vec![
+            phase("s1", "m1", &[], PhaseStatus::Planned),
+            phase("s2", "m1", &[], PhaseStatus::Planned),
         ];
-        let err = select_sprint(&sprints, "m1", None).unwrap_err();
+        let err = select_phase(&phases, "m1", None).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("2 ready sprints"), "{msg}");
-        assert!(msg.contains("--sprint"), "{msg}");
+        assert!(msg.contains("2 ready phases"), "{msg}");
+        assert!(msg.contains("--phase"), "{msg}");
     }
 
     /// (#1230 Packet 2) The actual fix this packet ships for
-    /// `select_sprint`: a sprint whose sole dependency has already
+    /// `select_phase`: a phase whose sole dependency has already
     /// completed is now auto-selected. Under the OLD flat
-    /// `depends_on.is_empty()` filter this sprint would NEVER have been
-    /// selectable except via explicit `--sprint` — it has a non-empty
+    /// `depends_on.is_empty()` filter this phase would NEVER have been
+    /// selectable except via explicit `--phase` — it has a non-empty
     /// `depends_on`, so the old filter excluded it unconditionally
     /// regardless of whether that dependency was satisfied.
     #[test]
-    fn select_sprint_auto_picks_sprint_whose_dependency_is_complete() {
-        let sprints = vec![
-            sprint("s1", "m1", &[], SprintStatus::Complete),
-            sprint("s2", "m1", &["s1"], SprintStatus::Planned),
+    fn select_phase_auto_picks_phase_whose_dependency_is_complete() {
+        let phases = vec![
+            phase("s1", "m1", &[], PhaseStatus::Complete),
+            phase("s2", "m1", &["s1"], PhaseStatus::Planned),
         ];
-        let chosen = select_sprint(&sprints, "m1", None).unwrap();
+        let chosen = select_phase(&phases, "m1", None).unwrap();
         assert_eq!(chosen.id, "s2", "s2's only dependency (s1) is Complete — it's ready");
     }
 
     /// Companion negative case: same shape, but the dependency is only
     /// `Running` (not yet `Complete`) — s2 must NOT be selected.
     #[test]
-    fn select_sprint_auto_excludes_sprint_whose_dependency_is_still_running() {
-        let sprints = vec![
-            sprint("s1", "m1", &[], SprintStatus::Running),
-            sprint("s2", "m1", &["s1"], SprintStatus::Planned),
+    fn select_phase_auto_excludes_phase_whose_dependency_is_still_running() {
+        let phases = vec![
+            phase("s1", "m1", &[], PhaseStatus::Running),
+            phase("s2", "m1", &["s1"], PhaseStatus::Planned),
         ];
-        let err = select_sprint(&sprints, "m1", None).unwrap_err();
-        assert!(err.to_string().contains("no ready sprint"), "{err}");
+        let err = select_phase(&phases, "m1", None).unwrap_err();
+        assert!(err.to_string().contains("no ready phase"), "{err}");
     }
 
     #[test]
@@ -4056,12 +4056,12 @@ mod tests {
         // Locks the load-bearing #846 contract against REAL git: invoked from
         // INSIDE a linked worktree, `git worktree list --porcelain` still lists
         // the MAIN working tree first — so repo_root() (= this command +
-        // parse_main_worktree) resolves the repo, not the sprint dir. A future
+        // parse_main_worktree) resolves the repo, not the phase dir. A future
         // git change or an output-ordering refactor that broke this is caught
         // here. No process-cwd mutation: git is invoked with `current_dir`.
         let tmp = tempfile::TempDir::new().unwrap();
         let main_repo = tmp.path().join("mainrepo");
-        let linked = tmp.path().join("linked-sprint");
+        let linked = tmp.path().join("linked-phase");
         std::fs::create_dir_all(&main_repo).unwrap();
 
         let git = |dir: &Path, args: &[&str]| {
@@ -4076,7 +4076,7 @@ mod tests {
         git(&main_repo, &["config", "user.email", "t@example.com"]);
         git(&main_repo, &["config", "user.name", "t"]);
         git(&main_repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
-        git(&main_repo, &["worktree", "add", "-q", linked.to_str().unwrap(), "-b", "sprint-x"]);
+        git(&main_repo, &["worktree", "add", "-q", linked.to_str().unwrap(), "-b", "phase-x"]);
 
         // Invoked FROM the linked worktree — the exact #846 scenario.
         let out = Command::new("git")
@@ -4100,7 +4100,7 @@ mod tests {
             id: id.to_string(),
             description: desc.to_string(),
             status: crew::types::MissionStatus::Active,
-            sprint_ids: vec![],
+            phase_ids: vec![],
             created_ts: 0,
             started_ts: None,
             closed_ts: None,
@@ -4112,14 +4112,14 @@ mod tests {
 
     #[test]
     fn commit_subject_takes_first_line() {
-        let s = sprint("s1", "m1", &[], SprintStatus::Running);
-        // sprint() sets description = "desc s1"
+        let s = phase("s1", "m1", &[], PhaseStatus::Running);
+        // phase() sets description = "desc s1"
         assert_eq!(commit_subject(&s), "desc s1");
     }
 
     #[test]
     fn commit_subject_truncates_long_and_takes_only_first_line() {
-        let mut s = sprint("s1", "m1", &[], SprintStatus::Running);
+        let mut s = phase("s1", "m1", &[], PhaseStatus::Running);
         s.description = format!("{}\nsecond line ignored", "x".repeat(100));
         let subj = commit_subject(&s);
         assert!(subj.chars().count() <= 72, "len {}", subj.chars().count());
@@ -4129,15 +4129,15 @@ mod tests {
 
     #[test]
     fn commit_subject_falls_back_on_empty_description() {
-        let mut s = sprint("s1", "m1", &[], SprintStatus::Running);
+        let mut s = phase("s1", "m1", &[], PhaseStatus::Running);
         s.description = String::new();
-        assert_eq!(commit_subject(&s), "darkmux sprint s1");
+        assert_eq!(commit_subject(&s), "darkmux phase s1");
     }
 
     #[test]
-    fn pr_body_names_mission_and_sprint_no_currency() {
+    fn pr_body_names_mission_and_phase_no_currency() {
         let m = mission("m1", "ship the thing");
-        let s = sprint("s1", "m1", &[], SprintStatus::Running);
+        let s = phase("s1", "m1", &[], PhaseStatus::Running);
         let body = pr_body(&m, &s);
         assert!(body.contains("`m1`"), "{body}");
         assert!(body.contains("`s1`"), "{body}");
@@ -4201,7 +4201,7 @@ mod tests {
     }
 
     /// (#799 part 2) The ship-side reader round-trip — the run→ship handoff. The
-    /// load-bearing case is RESUMED-SPRINT latest-wins: a clean re-run's empty
+    /// load-bearing case is RESUMED-PHASE latest-wins: a clean re-run's empty
     /// `mission.run.verification` record must OVERWRITE a prior dirty run's for
     /// the same session, so the documented fix-and-retry actually clears the
     /// hold. Also: a dirty-only session stays held, and other sessions don't
@@ -4248,12 +4248,12 @@ mod tests {
     // ─── (#1230 Packet 3) Task/Step graph migration ─────────────────────
 
     #[test]
-    fn default_sprint_graph_has_the_expected_shape() {
-        let (tasks, steps) = default_sprint_graph("s1", "coder");
+    fn default_phase_graph_has_the_expected_shape() {
+        let (tasks, steps) = default_phase_graph("s1", "coder");
 
         assert_eq!(tasks.len(), 3, "worktree, coder, verify — one Task each");
         for t in &tasks {
-            assert_eq!(t.sprint_id, "s1");
+            assert_eq!(t.phase_id, "s1");
             assert_eq!(t.step_ids.len(), 1, "each Task holds exactly one Step");
         }
 
@@ -4279,7 +4279,7 @@ mod tests {
     /// Docker — pure git plumbing) — proves the migrated worktree step
     /// reproduces `add_worktree`'s two real-world outcomes: a clean
     /// creation, and the "already exists" bail on a second run for the
-    /// same sprint (the exact scenario a resumed/un-shipped `mission run`
+    /// same phase (the exact scenario a resumed/un-shipped `mission run`
     /// hits).
     #[test]
     fn mission_worktree_step_kind_creates_then_rejects_duplicate() {
@@ -4302,7 +4302,7 @@ mod tests {
             branch: "darkmux/s1".to_string(),
             base: "HEAD".to_string(),
             mission_id: "m1".to_string(),
-            sprint_id: "s1".to_string(),
+            phase_id: "s1".to_string(),
             session_id: "mission-run-m1-s1".to_string(),
             role: "coder".to_string(),
         };
@@ -4322,7 +4322,7 @@ mod tests {
         assert!(wt_path.is_dir(), "worktree dir must exist after a clean run");
         assert_eq!(outcome.output, wt_path.display().to_string());
 
-        // A second run against the SAME sprint (the resumed-run case) must
+        // A second run against the SAME phase (the resumed-run case) must
         // fail loud, not silently clobber — same contract `add_worktree`
         // always had.
         let err = kind.run(&step, &std::collections::BTreeMap::new()).unwrap_err();
@@ -4330,13 +4330,13 @@ mod tests {
     }
 
     /// `MissionVerifyStepKind` against a REAL git repo with an EMPTY diff
-    /// (no coder changes made yet). `sprint_review_output_at` short-
-    /// circuits an empty diff to a canned "clean" `SprintReviewOutput`
+    /// (no coder changes made yet). `phase_review_output_at` short-
+    /// circuits an empty diff to a canned "clean" `PhaseReviewOutput`
     /// with ZERO reviewer dispatch — so this exercises the real verify
     /// step end to end with no LMStudio/Docker involved, matching the
     /// operator's no-live-dispatch constraint. `#[serial]` — mutates the
     /// shared `DARKMUX_FLOWS_DIR` (the empty-diff path still emits a
-    /// "sprint review begin"/"verdict: clean" flow record pair).
+    /// "phase review begin"/"verdict: clean" flow record pair).
     #[test]
     #[serial_test::serial]
     fn mission_verify_step_kind_clean_diff_needs_no_dispatch() {
@@ -4358,12 +4358,12 @@ mod tests {
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows.path()) };
 
-        let slot: Arc<Mutex<Option<std::result::Result<crate::sprint_cli::SprintReviewOutput, String>>>> =
+        let slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>> =
             Arc::new(Mutex::new(None));
         let kind = MissionVerifyStepKind {
             wt_path: repo.clone(),
             base: "main".to_string(),
-            sprint_id: "s1".to_string(),
+            phase_id: "s1".to_string(),
             result_slot: slot.clone(),
         };
         let step = crew::types::Step {

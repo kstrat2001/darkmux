@@ -1,6 +1,6 @@
 //! E2E TDD scenario for Wave-E.8 (#255): pre-validation is all-or-
-//! nothing. If any sprint trips `WorkJob::validate()` (e.g. oversize
-//! description), `mission dispatch` MUST NOT publish any sprints —
+//! nothing. If any phase trips `WorkJob::validate()` (e.g. oversize
+//! description), `mission dispatch` MUST NOT publish any phases —
 //! not even the ones whose own jobs would have passed validation.
 //!
 //! This is regression coverage for the fix already in main (PR-D.1
@@ -27,14 +27,14 @@ fn redis_available() -> bool {
         .unwrap_or(false)
 }
 
-fn write_mission_with_oversize_sprint(
+fn write_mission_with_oversize_phase(
     crew_root: &std::path::Path,
     mission_id: &str,
-    oversize_sprint_id: &str,
-    normal_sprint_id: &str,
+    oversize_phase_id: &str,
+    normal_phase_id: &str,
 ) {
     let mission_dir = crew_root.join("missions").join(mission_id);
-    std::fs::create_dir_all(mission_dir.join("sprints")).unwrap();
+    std::fs::create_dir_all(mission_dir.join("phases")).unwrap();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -44,7 +44,7 @@ fn write_mission_with_oversize_sprint(
         "id": mission_id,
         "description": "all-or-nothing pre-publish validation test",
         "status": "active",
-        "sprint_ids": [oversize_sprint_id, normal_sprint_id],
+        "phase_ids": [oversize_phase_id, normal_phase_id],
         "created_ts": now_ms,
         "started_ts": now_ms,
     });
@@ -54,11 +54,11 @@ fn write_mission_with_oversize_sprint(
     )
     .unwrap();
 
-    // Sprint with a 300 KiB description — over `MAX_WORK_MESSAGE_BYTES`
+    // Phase with a 300 KiB description — over `MAX_WORK_MESSAGE_BYTES`
     // (256 KiB). Will trip `WorkJob::validate()` at pre-build time.
     let oversize = "x".repeat(300 * 1024);
-    let sprint_oversize = serde_json::json!({
-        "id": oversize_sprint_id,
+    let phase_oversize = serde_json::json!({
+        "id": oversize_phase_id,
         "mission_id": mission_id,
         "description": oversize,
         "status": "planned",
@@ -66,25 +66,25 @@ fn write_mission_with_oversize_sprint(
         "created_ts": now_ms,
     });
     std::fs::write(
-        mission_dir.join("sprints").join(format!("{oversize_sprint_id}.json")),
-        serde_json::to_string_pretty(&sprint_oversize).unwrap(),
+        mission_dir.join("phases").join(format!("{oversize_phase_id}.json")),
+        serde_json::to_string_pretty(&phase_oversize).unwrap(),
     )
     .unwrap();
 
-    // The other sprint is well within limits. Pre-fix (publish-each-
-    // and-validate-each), this sprint would land on Redis as an orphan
-    // before sprint_oversize tripped validation.
-    let sprint_normal = serde_json::json!({
-        "id": normal_sprint_id,
+    // The other phase is well within limits. Pre-fix (publish-each-
+    // and-validate-each), this phase would land on Redis as an orphan
+    // before phase_oversize tripped validation.
+    let phase_normal = serde_json::json!({
+        "id": normal_phase_id,
         "mission_id": mission_id,
-        "description": "small sprint",
+        "description": "small phase",
         "status": "planned",
         "depends_on": [],
         "created_ts": now_ms,
     });
     std::fs::write(
-        mission_dir.join("sprints").join(format!("{normal_sprint_id}.json")),
-        serde_json::to_string_pretty(&sprint_normal).unwrap(),
+        mission_dir.join("phases").join(format!("{normal_phase_id}.json")),
+        serde_json::to_string_pretty(&phase_normal).unwrap(),
     )
     .unwrap();
 }
@@ -98,7 +98,7 @@ fn xlen(redis_url: &str, stream: &str) -> u64 {
 }
 
 #[test]
-fn oversize_sprint_aborts_publish_with_no_orphans() {
+fn oversize_phase_aborts_publish_with_no_orphans() {
     if !redis_available() {
         eprintln!("skipping: redis-server not on PATH");
         return;
@@ -108,7 +108,7 @@ fn oversize_sprint_aborts_publish_with_no_orphans() {
         .expect("FleetHarness::boot");
     let node = harness.node("node-a").unwrap();
 
-    // Set up a tdd-coder role + the mission + sprints.
+    // Set up a tdd-coder role + the mission + phases.
     let role_json = serde_json::json!({
         "id": "tdd-coder",
         "description": "test role",
@@ -126,11 +126,11 @@ fn oversize_sprint_aborts_publish_with_no_orphans() {
     .unwrap();
     std::fs::write(role_dir.join("tdd-coder.md"), "test prompt").unwrap();
 
-    write_mission_with_oversize_sprint(
+    write_mission_with_oversize_phase(
         &node.crew_root,
         "m-oversize-test",
-        "sprint-oversize",
-        "sprint-normal",
+        "phase-oversize",
+        "phase-normal",
     );
 
     // Sanity: stream is empty before dispatch.
@@ -158,8 +158,8 @@ fn oversize_sprint_aborts_publish_with_no_orphans() {
         "expected validation error message; stderr={stderr}"
     );
 
-    // Critical assertion: NO sprints published. The all-or-nothing
-    // invariant means even the well-formed `sprint-normal` did not
+    // Critical assertion: NO phases published. The all-or-nothing
+    // invariant means even the well-formed `phase-normal` did not
     // land on Redis. Net XADD count for our stream after the failed
     // dispatch must equal the pre-dispatch count (typically 0).
     let post_xlen = xlen(harness.redis_url(), "darkmux:work");
@@ -167,7 +167,7 @@ fn oversize_sprint_aborts_publish_with_no_orphans() {
         post_xlen, pre_xlen,
         "all-or-nothing pre-publish invariant violated: \
          XLEN(darkmux:work) went from {pre_xlen} to {post_xlen}. \
-         A future refactor must NOT publish ANY sprint when ANY sprint trips validation."
+         A future refactor must NOT publish ANY phase when ANY phase trips validation."
     );
 
     // Bonus: ORPHAN-list message must NOT appear (we never had orphans

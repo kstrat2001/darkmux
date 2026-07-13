@@ -1,10 +1,10 @@
-//! Sprint + Mission lifecycle transitions (#95).
+//! Phase + Mission lifecycle transitions (#95).
 //!
-//! Sprint/Mission state lives in JSON files under `<crew_root>/sprints/<id>.json`
+//! Phase/Mission state lives in JSON files under `<crew_root>/phases/<id>.json`
 //! and `<crew_root>/missions/<id>.json` respectively. This module provides the
 //! operator-facing verbs that transition status + timestamp those entities:
 //!
-//! - `sprint start <id>` / `sprint complete <id>` / `sprint abandon <id>`
+//! - `phase start <id>` / `phase complete <id>` / `phase abandon <id>`
 //! - `mission start <id>` / `mission close <id>` / `mission pause <id>` /
 //!   `mission resume <id>`
 //!
@@ -21,15 +21,15 @@
 //! a record never blocks the state transition. The JSON source-of-truth is
 //! the authority; the activity stream is observability.
 //!
-//! Operator-sovereignty: nothing auto-transitions. A sprint stays `Running`
+//! Operator-sovereignty: nothing auto-transitions. A phase stays `Running`
 //! forever until the operator runs `complete` or `abandon`. The wall-clock
 //! UI (consuming this data via Track B's API exposure) renders an unbounded
-//! sweep on stale `Running` sprints — clearly-wrong-looking signals that
+//! sweep on stale `Running` phases — clearly-wrong-looking signals that
 //! the operator forgot to close one. By design.
 //!
 //! State machines:
 //!
-//! Sprint:
+//! Phase:
 //!   | from        | start                | complete                | abandon              |
 //!   |-------------|----------------------|-------------------------|----------------------|
 //!   | `Planned`   | → Running ✓          | error: must start first | → Abandoned ✓        |
@@ -62,8 +62,8 @@
 //! transition, not "this mission exists." That's why creation alone
 //! leaves `started_ts: None`.
 
-use crate::loader::load_sprints;
-use crate::types::{Mission, MissionStatus, Sprint, SprintStatus};
+use crate::loader::load_phases;
+use crate::types::{Mission, MissionStatus, Phase, PhaseStatus};
 use darkmux_flow as flow;
 use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
 use anyhow::{bail, Context, Result};
@@ -78,13 +78,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 //     missions/
 //       <mission-id>/
 //         mission.json
-//         sprints/
-//           <sprint-id>.json
+//         phases/
+//           <phase-id>.json
 //
 // Legacy flat layout (pre-#148):
 //   <crew_root>/
 //     missions/<mission-id>.json
-//     sprints/<sprint-id>.json
+//     phases/<phase-id>.json
 //
 // Loaders + writers go through the new helpers below. The `legacy_*`
 // helpers exist for the `darkmux mission migrate` verb (Task 8) and the
@@ -96,7 +96,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // "DARKMUX_CREW_DIR", tmp.path())` and mark themselves
 // `#[serial_test::serial]` since env var mutation isn't thread-safe.
 
-/// Directory holding the mission's JSON and its sprints/ subdir.
+/// Directory holding the mission's JSON and its phases/ subdir.
 pub(crate) fn mission_dir(mission_id: &str) -> PathBuf {
     crate::loader::missions_dir().join(mission_id)
 }
@@ -106,33 +106,51 @@ pub fn mission_path(mission_id: &str) -> PathBuf {
     mission_dir(mission_id).join("mission.json")
 }
 
-/// Directory holding the mission's sprint JSONs.
-pub fn sprints_dir(mission_id: &str) -> PathBuf {
-    mission_dir(mission_id).join("sprints")
+/// Directory holding the mission's phase JSONs.
+///
+/// **Sprint→Phase rename read-fallback:** pre-rename mission data nests its
+/// phase JSONs under `sprints/` (the old directory name), not `phases/`. If
+/// the canonical `phases/` subdir doesn't exist yet for this mission but the
+/// legacy `sprints/` one does, reads (and any subsequent writes, via
+/// `save_json`'s create-on-write) route there instead — same "writes follow
+/// reads" convention `loader::resolve_user_subdir` uses for the Beat-33
+/// flatten, so the rename never orphans an operator's real existing mission
+/// data. A mission with neither subdir yet (brand new) gets the canonical
+/// path so a fresh write creates the new-name layout.
+pub fn phases_dir(mission_id: &str) -> PathBuf {
+    let canonical = mission_dir(mission_id).join("phases");
+    if canonical.is_dir() {
+        return canonical;
+    }
+    let legacy = mission_dir(mission_id).join("sprints");
+    if legacy.is_dir() {
+        return legacy;
+    }
+    canonical
 }
 
-/// Path to a single sprint JSON within a mission.
-pub fn sprint_path(mission_id: &str, sprint_id: &str) -> PathBuf {
-    sprints_dir(mission_id).join(format!("{sprint_id}.json"))
+/// Path to a single phase JSON within a mission.
+pub fn phase_path(mission_id: &str, phase_id: &str) -> PathBuf {
+    phases_dir(mission_id).join(format!("{phase_id}.json"))
 }
 
 // ─── Task / Step storage (#1230 Packet 2) ──────────────────────────────
 //
-// Mirrors the sprint layout above, nested one level deeper under the
-// owning sprint so a Task/Step id only has to be unique WITHIN its
-// sprint (matching `Task.sprint_id` / `Step.task_id`'s own scoping):
+// Mirrors the phase layout above, nested one level deeper under the
+// owning phase so a Task/Step id only has to be unique WITHIN its
+// phase (matching `Task.phase_id` / `Step.task_id`'s own scoping):
 //
 //   <crew_root>/
 //     missions/
 //       <mission-id>/
 //         mission.json
-//         sprints/
-//           <sprint-id>.json
+//         phases/
+//           <phase-id>.json
 //         tasks/
-//           <sprint-id>/
+//           <phase-id>/
 //             <task-id>.json
 //         steps/
-//           <sprint-id>/
+//           <phase-id>/
 //             <step-id>.json
 //
 // One file per Task and one file per Step — never a combined DAG blob —
@@ -141,79 +159,79 @@ pub fn sprint_path(mission_id: &str, sprint_id: &str) -> PathBuf {
 // whole graph. Uses the same atomic-rename `save_json` every other
 // entity in this module uses.
 
-/// Directory holding a sprint's Task JSONs.
-pub fn tasks_dir(mission_id: &str, sprint_id: &str) -> PathBuf {
-    mission_dir(mission_id).join("tasks").join(sprint_id)
+/// Directory holding a phase's Task JSONs.
+pub fn tasks_dir(mission_id: &str, phase_id: &str) -> PathBuf {
+    mission_dir(mission_id).join("tasks").join(phase_id)
 }
 
-/// Path to a single Task JSON within a sprint.
-pub fn task_path(mission_id: &str, sprint_id: &str, task_id: &str) -> PathBuf {
-    tasks_dir(mission_id, sprint_id).join(format!("{task_id}.json"))
+/// Path to a single Task JSON within a phase.
+pub fn task_path(mission_id: &str, phase_id: &str, task_id: &str) -> PathBuf {
+    tasks_dir(mission_id, phase_id).join(format!("{task_id}.json"))
 }
 
-/// Directory holding a sprint's Step JSONs.
-pub fn steps_dir(mission_id: &str, sprint_id: &str) -> PathBuf {
-    mission_dir(mission_id).join("steps").join(sprint_id)
+/// Directory holding a phase's Step JSONs.
+pub fn steps_dir(mission_id: &str, phase_id: &str) -> PathBuf {
+    mission_dir(mission_id).join("steps").join(phase_id)
 }
 
-/// Path to a single Step JSON within a sprint.
-pub fn step_path(mission_id: &str, sprint_id: &str, step_id: &str) -> PathBuf {
-    steps_dir(mission_id, sprint_id).join(format!("{step_id}.json"))
+/// Path to a single Step JSON within a phase.
+pub fn step_path(mission_id: &str, phase_id: &str, step_id: &str) -> PathBuf {
+    steps_dir(mission_id, phase_id).join(format!("{step_id}.json"))
 }
 
 /// Persist a Task via the same atomic-rename `save_json` every other
 /// entity uses.
 pub fn save_task(mission_id: &str, task: &crate::types::Task) -> Result<()> {
-    save_json(&task_path(mission_id, &task.sprint_id, &task.id), task)
+    save_json(&task_path(mission_id, &task.phase_id, &task.id), task)
 }
 
-/// Load a single Task by its fully-qualified (mission, sprint, task)
+/// Load a single Task by its fully-qualified (mission, phase, task)
 /// coordinates.
-pub fn load_task(mission_id: &str, sprint_id: &str, task_id: &str) -> Result<crate::types::Task> {
-    let path = task_path(mission_id, sprint_id, task_id);
+pub fn load_task(mission_id: &str, phase_id: &str, task_id: &str) -> Result<crate::types::Task> {
+    let path = task_path(mission_id, phase_id, task_id);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Load every Task under a sprint. Missing `tasks/<sprint-id>/` dir
-/// (a sprint with no Task/Step graph yet) is NOT an error — returns
+/// Load every Task under a phase. Missing `tasks/<phase-id>/` dir
+/// (a phase with no Task/Step graph yet) is NOT an error — returns
 /// an empty `Vec`, matching the additive/backward-compatible nature of
-/// the Task/Step schema (a pre-#1230 sprint has none).
-pub fn load_tasks_for_sprint(mission_id: &str, sprint_id: &str) -> Result<Vec<crate::types::Task>> {
-    load_json_dir(&tasks_dir(mission_id, sprint_id))
+/// the Task/Step schema (a pre-#1230 phase has none).
+pub fn load_tasks_for_phase(mission_id: &str, phase_id: &str) -> Result<Vec<crate::types::Task>> {
+    load_json_dir(&tasks_dir(mission_id, phase_id))
 }
 
 /// Persist a Step via the same atomic-rename `save_json` every other
-/// entity uses. The caller resolves `sprint_id` (a `Step` doesn't carry
-/// its own sprint id directly — only `task_id`; callers hold the sprint
+/// entity uses. The caller resolves `phase_id` (a `Step` doesn't carry
+/// its own phase id directly — only `task_id`; callers hold the phase
 /// id from context, e.g. the scheduler loop or the Task the step
-/// belongs to) since `step_path` is scoped by sprint, mirroring
+/// belongs to) since `step_path` is scoped by phase, mirroring
 /// `task_path`.
-pub fn save_step(mission_id: &str, sprint_id: &str, step: &crate::types::Step) -> Result<()> {
-    save_json(&step_path(mission_id, sprint_id, &step.id), step)
+pub fn save_step(mission_id: &str, phase_id: &str, step: &crate::types::Step) -> Result<()> {
+    save_json(&step_path(mission_id, phase_id, &step.id), step)
 }
 
-/// Load a single Step by its fully-qualified (mission, sprint, step)
+/// Load a single Step by its fully-qualified (mission, phase, step)
 /// coordinates.
-pub fn load_step(mission_id: &str, sprint_id: &str, step_id: &str) -> Result<crate::types::Step> {
-    let path = step_path(mission_id, sprint_id, step_id);
+pub fn load_step(mission_id: &str, phase_id: &str, step_id: &str) -> Result<crate::types::Step> {
+    let path = step_path(mission_id, phase_id, step_id);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Load every Step under a sprint (across all of that sprint's Tasks —
-/// `steps_dir` is scoped by sprint, not by task). Missing dir → empty
-/// `Vec`, same convention as `load_tasks_for_sprint`.
-pub fn load_steps_for_sprint(mission_id: &str, sprint_id: &str) -> Result<Vec<crate::types::Step>> {
-    load_json_dir(&steps_dir(mission_id, sprint_id))
+/// Load every Step under a phase (across all of that phase's Tasks —
+/// `steps_dir` is scoped by phase, not by task). Missing dir → empty
+/// `Vec`, same convention as `load_tasks_for_phase`.
+pub fn load_steps_for_phase(mission_id: &str, phase_id: &str) -> Result<Vec<crate::types::Step>> {
+    load_json_dir(&steps_dir(mission_id, phase_id))
 }
 
 /// Shared "read every `*.json` file directly in `dir`, deserialize as
-/// `T`" helper backing `load_tasks_for_sprint`/`load_steps_for_sprint`.
+/// `T`" helper backing `load_tasks_for_phase`/`load_steps_for_phase`.
 /// A missing directory is NOT an error (empty `Vec`) — the normal state
-/// for any sprint that predates the Task/Step schema or simply has no
+/// for any phase that predates the Task/Step schema or simply has no
 /// graph yet.
 fn load_json_dir<T: serde::de::DeserializeOwned>(dir: &std::path::Path) -> Result<Vec<T>> {
     if !dir.is_dir() {
@@ -251,12 +269,12 @@ pub(crate) fn legacy_mission_path(mission_id: &str) -> PathBuf {
     crate::loader::missions_dir().join(format!("{mission_id}.json"))
 }
 
-/// Pre-#148 flat sprint path: `<sprints_dir>/<id>.json`. Held as
+/// Pre-#148 flat phase path: `<phases_dir>/<id>.json`. Held as
 /// public API for symmetry with the dir helpers; see
 /// `legacy_mission_path` for why.
 #[allow(dead_code)]
-pub(crate) fn legacy_sprint_path(sprint_id: &str) -> PathBuf {
-    crate::loader::sprints_dir().join(format!("{sprint_id}.json"))
+pub(crate) fn legacy_phase_path(phase_id: &str) -> PathBuf {
+    crate::loader::phases_dir().join(format!("{phase_id}.json"))
 }
 
 /// Pre-#148 flat missions dir: `<missions_dir>/` (containing flat
@@ -265,9 +283,9 @@ pub fn legacy_missions_dir() -> PathBuf {
     crate::loader::missions_dir()
 }
 
-/// Pre-#148 flat sprints dir: `<sprints_dir>/`.
-pub fn legacy_sprints_dir() -> PathBuf {
-    crate::loader::sprints_dir()
+/// Pre-#148 flat phases dir: `<phases_dir>/`.
+pub fn legacy_phases_dir() -> PathBuf {
+    crate::loader::phases_dir()
 }
 
 // ─── Time ───────────────────────────────────────────────────────────────
@@ -361,41 +379,41 @@ fn fsync_dir(dir: &std::path::Path) -> Result<()> {
 
 // ─── Load-by-id ────────────────────────────────────────────────────────
 
-/// Load a sprint by its fully-qualified (mission, sprint) coordinates. O(1).
-/// Currently every internal caller routes through `load_sprint_by_id` (since
-/// the CLI verbs accept a bare sprint id and discover the mission from the
+/// Load a phase by its fully-qualified (mission, phase) coordinates. O(1).
+/// Currently every internal caller routes through `load_phase_by_id` (since
+/// the CLI verbs accept a bare phase id and discover the mission from the
 /// JSON itself). Kept as the primary public surface for code that *does*
 /// have both ids in scope (e.g., crew dispatch when `--mission` lands).
 #[allow(dead_code)]
-pub(crate) fn load_sprint(mission_id: &str, sprint_id: &str) -> Result<Sprint> {
-    let path = sprint_path(mission_id, sprint_id);
+pub(crate) fn load_phase(mission_id: &str, phase_id: &str) -> Result<Phase> {
+    let path = phase_path(mission_id, phase_id);
     if !path.is_file() {
         anyhow::bail!(
-            "no sprint with id `{sprint_id}` found at {} (mission `{mission_id}`)",
+            "no phase with id `{phase_id}` found at {} (mission `{mission_id}`)",
             path.display()
         );
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
-    let sprint: Sprint = serde_json::from_str(&text)
+    let phase: Phase = serde_json::from_str(&text)
         .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(sprint)
+    Ok(phase)
 }
 
-/// Load a sprint by sprint-id alone — scans every mission's sprints dir
+/// Load a phase by phase-id alone — scans every mission's phases dir
 /// and returns the first match. Used by the operator CLI which accepts
-/// `darkmux sprint start <id>` without a mission qualifier.
+/// `darkmux phase start <id>` without a mission qualifier.
 ///
-/// If two missions both contain a sprint with this id (possible only
+/// If two missions both contain a phase with this id (possible only
 /// during a partial #148 migration since post-migration the uniqueness
-/// is per-mission), the first match in `(mission_id, sprint_id)` sort
+/// is per-mission), the first match in `(mission_id, phase_id)` sort
 /// order wins and a flow record is emitted.
-pub(crate) fn load_sprint_by_id(sprint_id: &str) -> Result<Sprint> {
-    let all = load_sprints()?;
-    let mut matches: Vec<&Sprint> = all.iter().filter(|s| s.id == sprint_id).collect();
+pub(crate) fn load_phase_by_id(phase_id: &str) -> Result<Phase> {
+    let all = load_phases()?;
+    let mut matches: Vec<&Phase> = all.iter().filter(|s| s.id == phase_id).collect();
     match matches.as_slice() {
         [] => anyhow::bail!(
-            "no sprint with id `{sprint_id}` found in any mission under {}",
+            "no phase with id `{phase_id}` found in any mission under {}",
             crate::loader::missions_dir().display()
         ),
         [_one] => Ok(matches.remove(0).clone()),
@@ -411,14 +429,14 @@ pub(crate) fn load_sprint_by_id(sprint_id: &str) -> Result<Sprint> {
                 category: Category::Machinery,
                 tier: Tier::Operator,
                 stage: Stage::Scope,
-                action: "ambiguous-sprint-id".into(),
+                action: "ambiguous-phase-id".into(),
                 handle: format!(
-                    "sprint id `{sprint_id}` found in {count} missions; using `{}`",
+                    "phase id `{phase_id}` found in {count} missions; using `{}`",
                     chosen.mission_id
                 ),
-                sprint_id: Some(sprint_id.to_string()),
+                phase_id: Some(phase_id.to_string()),
                 session_id: None,
-                source: Some("sprint_lifecycle".to_string()),
+                source: Some("phase_lifecycle".to_string()),
                 model: None,
                 reasoning: None,
                 mission_id: Some(chosen.mission_id.clone()),
@@ -450,7 +468,7 @@ fn load_mission(id: &str) -> Result<Mission> {
 
 // ─── Flow record emission ──────────────────────────────────────────────
 
-fn emit_sprint_transition_record(sprint_id: &str, mission_id: &str, action: &str) {
+fn emit_phase_transition_record(phase_id: &str, mission_id: &str, action: &str) {
     let _ = flow::record(FlowRecord {
         ts: flow::ts_utc_now(),
         level: Level::Info,
@@ -458,10 +476,10 @@ fn emit_sprint_transition_record(sprint_id: &str, mission_id: &str, action: &str
         tier: Tier::Operator,
         stage: Stage::Scope,
         action: action.to_string(),
-        handle: sprint_id.to_string(),
-        sprint_id: Some(sprint_id.to_string()),
+        handle: phase_id.to_string(),
+        phase_id: Some(phase_id.to_string()),
         session_id: Some(format!("mission:{mission_id}")),
-        source: Some("sprint_lifecycle".to_string()),
+        source: Some("phase_lifecycle".to_string()),
         model: None,
         reasoning: None,
         // #136 schema 1.3: first-class mission_id. The session_id
@@ -505,7 +523,7 @@ fn emit_mission_transition_record_with_reasoning(
         stage: Stage::Scope,
         action: action.to_string(),
         handle: mission_id.to_string(),
-        sprint_id: None,
+        phase_id: None,
         session_id: Some(format!("mission:{mission_id}")),
         source: Some("mission_lifecycle".to_string()),
         model: None,
@@ -522,21 +540,21 @@ fn emit_mission_transition_record_with_reasoning(
     });
 }
 
-/// Distinct from `emit_sprint_transition_record` (which uses
-/// `source: sprint_lifecycle` for status flips on an already-tracked
-/// sprint). This one fires when the *mission's shape* changes — a
-/// new sprint joining the plan — so the `source` field reflects that
+/// Distinct from `emit_phase_transition_record` (which uses
+/// `source: phase_lifecycle` for status flips on an already-tracked
+/// phase). This one fires when the *mission's shape* changes — a
+/// new phase joining the plan — so the `source` field reflects that
 /// the change came from the mission_lifecycle surface even though the
-/// `handle` is the new sprint id.
+/// `handle` is the new phase id.
 #[allow(dead_code)]
 // Kept for back-compat + test ergonomics; CLI path uses
-// `emit_sprint_added_record_with_reasoning` directly.
-fn emit_sprint_added_record(sprint_id: &str, mission_id: &str) {
-    emit_sprint_added_record_with_reasoning(sprint_id, mission_id, None);
+// `emit_phase_added_record_with_reasoning` directly.
+fn emit_phase_added_record(phase_id: &str, mission_id: &str) {
+    emit_phase_added_record_with_reasoning(phase_id, mission_id, None);
 }
 
-fn emit_sprint_added_record_with_reasoning(
-    sprint_id: &str,
+fn emit_phase_added_record_with_reasoning(
+    phase_id: &str,
     mission_id: &str,
     reasoning: Option<&str>,
 ) {
@@ -546,9 +564,9 @@ fn emit_sprint_added_record_with_reasoning(
         category: Category::Work,
         tier: Tier::Operator,
         stage: Stage::Scope,
-        action: "sprint added".to_string(),
-        handle: sprint_id.to_string(),
-        sprint_id: Some(sprint_id.to_string()),
+        action: "phase added".to_string(),
+        handle: phase_id.to_string(),
+        phase_id: Some(phase_id.to_string()),
         session_id: Some(format!("mission:{mission_id}")),
         source: Some("mission_lifecycle".to_string()),
         model: None,
@@ -565,55 +583,55 @@ fn emit_sprint_added_record_with_reasoning(
     });
 }
 
-// ─── Sprint transitions ─────────────────────────────────────────────────
+// ─── Phase transitions ─────────────────────────────────────────────────
 
-/// `sprint start <id>` — Planned/Abandoned → Running.
+/// `phase start <id>` — Planned/Abandoned → Running.
 /// Sets `started_ts = now()`; clears `abandoned_ts` if it was set.
-pub fn sprint_start(id: &str) -> Result<Sprint> {
-    let mut sprint = load_sprint_by_id(id)?;
-    match sprint.status {
-        SprintStatus::Planned | SprintStatus::Abandoned => {}
-        SprintStatus::Running => bail!("sprint `{id}` is already Running"),
-        SprintStatus::Complete => bail!("sprint `{id}` is Complete (terminal) — create a new sprint instead"),
+pub fn phase_start(id: &str) -> Result<Phase> {
+    let mut phase = load_phase_by_id(id)?;
+    match phase.status {
+        PhaseStatus::Planned | PhaseStatus::Abandoned => {}
+        PhaseStatus::Running => bail!("phase `{id}` is already Running"),
+        PhaseStatus::Complete => bail!("phase `{id}` is Complete (terminal) — create a new phase instead"),
     }
-    sprint.status = SprintStatus::Running;
-    sprint.started_ts = Some(now_unix());
-    sprint.abandoned_ts = None; // restart clears the prior abandonment
-    save_json(&sprint_path(&sprint.mission_id, id), &sprint)?;
-    emit_sprint_transition_record(id, &sprint.mission_id, "sprint start");
-    Ok(sprint)
+    phase.status = PhaseStatus::Running;
+    phase.started_ts = Some(now_unix());
+    phase.abandoned_ts = None; // restart clears the prior abandonment
+    save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    emit_phase_transition_record(id, &phase.mission_id, "phase start");
+    Ok(phase)
 }
 
-/// `sprint complete <id>` — Running → Complete (terminal).
-pub fn sprint_complete(id: &str) -> Result<Sprint> {
-    let mut sprint = load_sprint_by_id(id)?;
-    match sprint.status {
-        SprintStatus::Running => {}
-        SprintStatus::Planned => bail!("sprint `{id}` is Planned — must `sprint start` first"),
-        SprintStatus::Abandoned => bail!("sprint `{id}` is Abandoned — `sprint start` to restart, then complete"),
-        SprintStatus::Complete => bail!("sprint `{id}` is already Complete"),
+/// `phase complete <id>` — Running → Complete (terminal).
+pub fn phase_complete(id: &str) -> Result<Phase> {
+    let mut phase = load_phase_by_id(id)?;
+    match phase.status {
+        PhaseStatus::Running => {}
+        PhaseStatus::Planned => bail!("phase `{id}` is Planned — must `phase start` first"),
+        PhaseStatus::Abandoned => bail!("phase `{id}` is Abandoned — `phase start` to restart, then complete"),
+        PhaseStatus::Complete => bail!("phase `{id}` is already Complete"),
     }
-    sprint.status = SprintStatus::Complete;
-    sprint.completed_ts = Some(now_unix());
-    save_json(&sprint_path(&sprint.mission_id, id), &sprint)?;
-    emit_sprint_transition_record(id, &sprint.mission_id, "sprint complete");
-    Ok(sprint)
+    phase.status = PhaseStatus::Complete;
+    phase.completed_ts = Some(now_unix());
+    save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    emit_phase_transition_record(id, &phase.mission_id, "phase complete");
+    Ok(phase)
 }
 
-/// `sprint abandon <id>` — Planned/Running → Abandoned.
-/// Cannot abandon a `Complete` sprint (terminal in the other direction).
-pub fn sprint_abandon(id: &str) -> Result<Sprint> {
-    let mut sprint = load_sprint_by_id(id)?;
-    match sprint.status {
-        SprintStatus::Planned | SprintStatus::Running => {}
-        SprintStatus::Abandoned => bail!("sprint `{id}` is already Abandoned"),
-        SprintStatus::Complete => bail!("sprint `{id}` is Complete — can't abandon a finished sprint"),
+/// `phase abandon <id>` — Planned/Running → Abandoned.
+/// Cannot abandon a `Complete` phase (terminal in the other direction).
+pub fn phase_abandon(id: &str) -> Result<Phase> {
+    let mut phase = load_phase_by_id(id)?;
+    match phase.status {
+        PhaseStatus::Planned | PhaseStatus::Running => {}
+        PhaseStatus::Abandoned => bail!("phase `{id}` is already Abandoned"),
+        PhaseStatus::Complete => bail!("phase `{id}` is Complete — can't abandon a finished phase"),
     }
-    sprint.status = SprintStatus::Abandoned;
-    sprint.abandoned_ts = Some(now_unix());
-    save_json(&sprint_path(&sprint.mission_id, id), &sprint)?;
-    emit_sprint_transition_record(id, &sprint.mission_id, "sprint abandon");
-    Ok(sprint)
+    phase.status = PhaseStatus::Abandoned;
+    phase.abandoned_ts = Some(now_unix());
+    save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    emit_phase_transition_record(id, &phase.mission_id, "phase abandon");
+    Ok(phase)
 }
 
 // ─── Mission transitions ───────────────────────────────────────────────
@@ -712,50 +730,50 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
 
 // ─── Mission scope growth ──────────────────────────────────────────────
 
-/// `mission add-sprint` — operator-sovereign scope growth (#107).
+/// `mission add-phase` — operator-sovereign scope growth (#107).
 ///
-/// Adds a new Sprint to an existing Mission mid-flight. The alternative
-/// today is one of: (a) hand-edit the Mission JSON to append a sprint id
-/// and hand-author a new Sprint JSON, (b) create a separate Mission that
+/// Adds a new Phase to an existing Mission mid-flight. The alternative
+/// today is one of: (a) hand-edit the Mission JSON to append a phase id
+/// and hand-author a new Phase JSON, (b) create a separate Mission that
 /// loses the *"this composes with what we're already doing"* signal, or
-/// (c) leave the discovery as a GH issue with no Mission/Sprint
+/// (c) leave the discovery as a GH issue with no Mission/Phase
 /// representation. None reflect how engineering work actually evolves
-/// during a sprint.
+/// during a phase.
 ///
 /// Behavior:
-///   - Writes a new Sprint JSON at `<crew_root>/sprints/<sprint-id>.json`
+///   - Writes a new Phase JSON at `<crew_root>/phases/<phase-id>.json`
 ///     with `status: Planned`, `mission_id`, `description`, `depends_on`,
 ///     `created_ts: now()`.
-///   - Appends the sprint id to the Mission's `sprint_ids` array (atomic
+///   - Appends the phase id to the Mission's `phase_ids` array (atomic
 ///     write per the existing `save_json` semantics).
-///   - Emits a `sprint added` flow record (tier=operator, source=
+///   - Emits a `phase added` flow record (tier=operator, source=
 ///     mission_lifecycle) so the addition is observable in the viewer.
 ///
-/// Idempotent on EXACT match: re-adding a sprint with the same id +
-/// mission + description is a no-op (no error). The sprint_ids array
-/// gets the sprint appended if it had drifted off (defensive). Non-
+/// Idempotent on EXACT match: re-adding a phase with the same id +
+/// mission + description is a no-op (no error). The phase_ids array
+/// gets the phase appended if it had drifted off (defensive). Non-
 /// matching descriptions error — we don't silently overwrite operator
 /// content.
 ///
 /// Errors loudly when:
 ///   - Mission doesn't exist.
-///   - Sprint id is already in use under a *different* mission (would
-///     break the unique-id-per-sprint invariant the loader relies on).
-///   - Sprint id is in use under SAME mission but with different
+///   - Phase id is already in use under a *different* mission (would
+///     break the unique-id-per-phase invariant the loader relies on).
+///   - Phase id is in use under SAME mission but with different
 ///     description (operator probably meant a different id or wants to
 ///     explicitly edit; either way, don't paper over the conflict).
-///   - Any `depends_on` id doesn't resolve to an existing sprint.
+///   - Any `depends_on` id doesn't resolve to an existing phase.
 #[allow(dead_code)]
-pub(crate) fn add_sprint_to_mission(
+pub(crate) fn add_phase_to_mission(
     mission_id: &str,
-    sprint_id: &str,
+    phase_id: &str,
     description: &str,
     depends_on: Vec<String>,
     after: Option<&str>,
-) -> Result<Sprint> {
-    add_sprint_to_mission_with_reasoning(
+) -> Result<Phase> {
+    add_phase_to_mission_with_reasoning(
         mission_id,
-        sprint_id,
+        phase_id,
         description,
         depends_on,
         after,
@@ -763,71 +781,71 @@ pub(crate) fn add_sprint_to_mission(
     )
 }
 
-/// `add_sprint_to_mission` with operator-supplied reasoning for the
+/// `add_phase_to_mission` with operator-supplied reasoning for the
 /// scope growth. Reasoning lands on the emitted flow record so the
 /// audit substrate captures *why* the mission grew here.
-pub fn add_sprint_to_mission_with_reasoning(
+pub fn add_phase_to_mission_with_reasoning(
     mission_id: &str,
-    sprint_id: &str,
+    phase_id: &str,
     description: &str,
     depends_on: Vec<String>,
     after: Option<&str>,
     reasoning: Option<&str>,
-) -> Result<Sprint> {
+) -> Result<Phase> {
     let mut mission = load_mission(mission_id)?;
 
-    let all_sprints = load_sprints()?;
+    let all_phases = load_phases()?;
 
     // Idempotency / collision check.
-    if let Some(existing) = all_sprints.iter().find(|s| s.id == sprint_id) {
+    if let Some(existing) = all_phases.iter().find(|s| s.id == phase_id) {
         if existing.mission_id != mission_id {
             bail!(
-                "sprint id `{sprint_id}` already in use under mission `{}`; pick a fresh id",
+                "phase id `{phase_id}` already in use under mission `{}`; pick a fresh id",
                 existing.mission_id
             );
         }
         if existing.description != description {
             bail!(
-                "sprint id `{sprint_id}` already exists under this mission with a different description; \
+                "phase id `{phase_id}` already exists under this mission with a different description; \
                  edit the existing JSON or pick a fresh id"
             );
         }
         // Exact match — idempotent path. Defensive: ensure the mission's
-        // sprint_ids still includes this id (operator may have hand-
+        // phase_ids still includes this id (operator may have hand-
         // edited the JSON and removed it). Idempotent re-adds do NOT
         // reposition; the operator has to remove the existing entry
         // first if they want a different position. That keeps re-runs
         // safe even when `--after` is non-default.
-        let already_listed = mission.sprint_ids.iter().any(|s| s == sprint_id);
+        let already_listed = mission.phase_ids.iter().any(|s| s == phase_id);
         if !already_listed {
-            let pos = resolve_insert_position(&mission.sprint_ids, after)?;
-            mission.sprint_ids.insert(pos, sprint_id.to_string());
+            let pos = resolve_insert_position(&mission.phase_ids, after)?;
+            mission.phase_ids.insert(pos, phase_id.to_string());
             save_json(&mission_path(mission_id), &mission)?;
         }
         return Ok(existing.clone());
     }
 
-    // depends_on dangling check — every referenced sprint must exist.
+    // depends_on dangling check — every referenced phase must exist.
     for dep in &depends_on {
-        if !all_sprints.iter().any(|s| s.id.as_str() == dep.as_str()) {
+        if !all_phases.iter().any(|s| s.id.as_str() == dep.as_str()) {
             bail!(
-                "depends_on references unknown sprint `{}`; add it first or correct the id",
+                "depends_on references unknown phase `{}`; add it first or correct the id",
                 dep
             );
         }
     }
 
     // Pre-validate the `--after` target BEFORE writing any state, so a
-    // typo'd `--after` doesn't leave a sprint JSON on disk that's not
+    // typo'd `--after` doesn't leave a phase JSON on disk that's not
     // referenced from any mission. Resolve to the insertion index now,
-    // then use it after the sprint JSON is written.
-    let insert_pos = resolve_insert_position(&mission.sprint_ids, after)?;
+    // then use it after the phase JSON is written.
+    let insert_pos = resolve_insert_position(&mission.phase_ids, after)?;
 
-    let sprint = Sprint {
-        id: sprint_id.to_string(),
+    let phase = Phase {
+        id: phase_id.to_string(),
         mission_id: mission_id.to_string(),
         description: description.to_string(),
-        status: SprintStatus::Planned,
+        status: PhaseStatus::Planned,
         depends_on,
         created_ts: now_unix(),
         started_ts: None,
@@ -835,44 +853,44 @@ pub fn add_sprint_to_mission_with_reasoning(
         abandoned_ts: None,
         task_ids: Vec::new(),
     };
-    save_json(&sprint_path(mission_id, sprint_id), &sprint)?;
+    save_json(&phase_path(mission_id, phase_id), &phase)?;
 
-    // Position into the mission's sprint_ids. Belt-and-suspenders: the
+    // Position into the mission's phase_ids. Belt-and-suspenders: the
     // collision check above means we shouldn't see a duplicate here,
     // but the idempotent guard makes the operation safe to retry on
     // partial-failure paths.
-    if !mission.sprint_ids.iter().any(|s| s == sprint_id) {
-        mission.sprint_ids.insert(insert_pos, sprint_id.to_string());
+    if !mission.phase_ids.iter().any(|s| s == phase_id) {
+        mission.phase_ids.insert(insert_pos, phase_id.to_string());
         save_json(&mission_path(mission_id), &mission)?;
     }
 
-    emit_sprint_added_record_with_reasoning(sprint_id, mission_id, reasoning);
+    emit_phase_added_record_with_reasoning(phase_id, mission_id, reasoning);
 
-    Ok(sprint)
+    Ok(phase)
 }
 
-/// Compute the index at which a new sprint should be inserted into
-/// the mission's `sprint_ids` array. Pure — does NOT mutate the
+/// Compute the index at which a new phase should be inserted into
+/// the mission's `phase_ids` array. Pure — does NOT mutate the
 /// vector. Pre-validates `--after` so callers can write the new
-/// sprint JSON without risking an orphan record when the reference
+/// phase JSON without risking an orphan record when the reference
 /// is stale.
 ///
-/// When `after` is `None`, returns `sprint_ids.len()` (append). When
-/// `after` names a present sprint, returns the index immediately
-/// after it. Errors when `after` names an absent sprint — silently
+/// When `after` is `None`, returns `phase_ids.len()` (append). When
+/// `after` names a present phase, returns the index immediately
+/// after it. Errors when `after` names an absent phase — silently
 /// appending would obscure a typo or stale reference, which violates
 /// operator sovereignty (don't substitute system judgment for
 /// operator intent).
-fn resolve_insert_position(sprint_ids: &[String], after: Option<&str>) -> Result<usize> {
+fn resolve_insert_position(phase_ids: &[String], after: Option<&str>) -> Result<usize> {
     match after {
-        None => Ok(sprint_ids.len()),
+        None => Ok(phase_ids.len()),
         Some(target) => {
-            let pos = sprint_ids
+            let pos = phase_ids
                 .iter()
                 .position(|s| s == target)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "--after references sprint `{target}` which isn't in this mission's sprint_ids; \
+                        "--after references phase `{target}` which isn't in this mission's phase_ids; \
                          pick an id that's already in the plan (or omit --after to append)"
                     )
                 })?;
@@ -886,7 +904,7 @@ fn resolve_insert_position(sprint_ids: &[String], after: Option<&str>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Mission, MissionStatus, Sprint, SprintStatus};
+    use crate::types::{Mission, MissionStatus, Phase, PhaseStatus};
     use std::env;
     use tempfile::TempDir;
 
@@ -936,11 +954,11 @@ mod tests {
         }
     }
 
-    fn seed_sprint(id: &str, status: SprintStatus) -> Sprint {
-        let s = Sprint {
+    fn seed_phase(id: &str, status: PhaseStatus) -> Phase {
+        let s = Phase {
             id: id.to_string(),
             mission_id: "test-mission".to_string(),
-            description: "test sprint".to_string(),
+            description: "test phase".to_string(),
             status,
             depends_on: Vec::new(),
             created_ts: 1_700_000_000,
@@ -949,7 +967,7 @@ mod tests {
             abandoned_ts: None,
             task_ids: Vec::new(),
         };
-        save_json(&sprint_path("test-mission", id), &s).unwrap();
+        save_json(&phase_path("test-mission", id), &s).unwrap();
         s
     }
 
@@ -958,7 +976,7 @@ mod tests {
             id: id.to_string(),
             description: "test mission".to_string(),
             status,
-            sprint_ids: Vec::new(),
+            phase_ids: Vec::new(),
             created_ts: 1_700_000_000,
             started_ts: None,
             closed_ts: None,
@@ -970,17 +988,17 @@ mod tests {
         m
     }
 
-    // ─── Sprint state machine ─────────────────────────────────────────
+    // ─── Phase state machine ─────────────────────────────────────────
 
     #[serial_test::serial]
     #[test]
-    fn sprint_start_from_planned_sets_running_and_started_ts() {
+    fn phase_start_from_planned_sets_running_and_started_ts() {
         let _g = CrewGuard::new();
-        seed_sprint("s1", SprintStatus::Planned);
+        seed_phase("s1", PhaseStatus::Planned);
 
-        let updated = sprint_start("s1").unwrap();
+        let updated = phase_start("s1").unwrap();
 
-        assert_eq!(updated.status, SprintStatus::Running);
+        assert_eq!(updated.status, PhaseStatus::Running);
         assert!(updated.started_ts.is_some());
         assert!(updated.completed_ts.is_none());
         assert!(updated.abandoned_ts.is_none());
@@ -988,87 +1006,87 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn sprint_start_from_running_errors() {
+    fn phase_start_from_running_errors() {
         let _g = CrewGuard::new();
-        seed_sprint("s2", SprintStatus::Running);
-        let err = sprint_start("s2").unwrap_err();
+        seed_phase("s2", PhaseStatus::Running);
+        let err = phase_start("s2").unwrap_err();
         assert!(err.to_string().contains("already Running"));
     }
 
     #[serial_test::serial]
     #[test]
-    fn sprint_start_from_complete_errors() {
+    fn phase_start_from_complete_errors() {
         let _g = CrewGuard::new();
-        seed_sprint("s3", SprintStatus::Complete);
-        let err = sprint_start("s3").unwrap_err();
+        seed_phase("s3", PhaseStatus::Complete);
+        let err = phase_start("s3").unwrap_err();
         assert!(err.to_string().contains("Complete"));
     }
 
     #[serial_test::serial]
     #[test]
-    fn sprint_start_from_abandoned_clears_abandoned_ts() {
+    fn phase_start_from_abandoned_clears_abandoned_ts() {
         let _g = CrewGuard::new();
-        let mut s = seed_sprint("s4", SprintStatus::Abandoned);
+        let mut s = seed_phase("s4", PhaseStatus::Abandoned);
         s.abandoned_ts = Some(1_700_000_500);
-        save_json(&sprint_path("test-mission", "s4"), &s).unwrap();
+        save_json(&phase_path("test-mission", "s4"), &s).unwrap();
 
-        let updated = sprint_start("s4").unwrap();
-        assert_eq!(updated.status, SprintStatus::Running);
+        let updated = phase_start("s4").unwrap();
+        assert_eq!(updated.status, PhaseStatus::Running);
         assert!(updated.started_ts.is_some());
         assert!(updated.abandoned_ts.is_none(), "restart clears abandoned_ts");
     }
 
     #[serial_test::serial]
     #[test]
-    fn sprint_complete_from_running_sets_complete_and_completed_ts() {
+    fn phase_complete_from_running_sets_complete_and_completed_ts() {
         let _g = CrewGuard::new();
-        let mut s = seed_sprint("s5", SprintStatus::Running);
+        let mut s = seed_phase("s5", PhaseStatus::Running);
         s.started_ts = Some(1_700_000_100);
-        save_json(&sprint_path("test-mission", "s5"), &s).unwrap();
+        save_json(&phase_path("test-mission", "s5"), &s).unwrap();
 
-        let updated = sprint_complete("s5").unwrap();
-        assert_eq!(updated.status, SprintStatus::Complete);
+        let updated = phase_complete("s5").unwrap();
+        assert_eq!(updated.status, PhaseStatus::Complete);
         assert!(updated.completed_ts.is_some());
         assert!(updated.completed_ts.unwrap() >= updated.started_ts.unwrap());
     }
 
     #[serial_test::serial]
     #[test]
-    fn sprint_complete_from_planned_errors() {
+    fn phase_complete_from_planned_errors() {
         let _g = CrewGuard::new();
-        seed_sprint("s6", SprintStatus::Planned);
-        let err = sprint_complete("s6").unwrap_err();
+        seed_phase("s6", PhaseStatus::Planned);
+        let err = phase_complete("s6").unwrap_err();
         assert!(err.to_string().contains("Planned"));
     }
 
     #[serial_test::serial]
     #[test]
-    fn sprint_abandon_from_running_sets_abandoned_and_abandoned_ts() {
+    fn phase_abandon_from_running_sets_abandoned_and_abandoned_ts() {
         let _g = CrewGuard::new();
-        seed_sprint("s7", SprintStatus::Running);
-        let updated = sprint_abandon("s7").unwrap();
-        assert_eq!(updated.status, SprintStatus::Abandoned);
+        seed_phase("s7", PhaseStatus::Running);
+        let updated = phase_abandon("s7").unwrap();
+        assert_eq!(updated.status, PhaseStatus::Abandoned);
         assert!(updated.abandoned_ts.is_some());
     }
 
     #[serial_test::serial]
     #[test]
-    fn sprint_abandon_from_complete_errors() {
+    fn phase_abandon_from_complete_errors() {
         let _g = CrewGuard::new();
-        seed_sprint("s8", SprintStatus::Complete);
-        let err = sprint_abandon("s8").unwrap_err();
+        seed_phase("s8", PhaseStatus::Complete);
+        let err = phase_abandon("s8").unwrap_err();
         assert!(err.to_string().contains("Complete"));
     }
 
     #[serial_test::serial]
     #[test]
-    fn sprint_round_trip_records_durations() {
+    fn phase_round_trip_records_durations() {
         let _g = CrewGuard::new();
-        seed_sprint("s9", SprintStatus::Planned);
+        seed_phase("s9", PhaseStatus::Planned);
 
-        let s1 = sprint_start("s9").unwrap();
+        let s1 = phase_start("s9").unwrap();
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let s2 = sprint_complete("s9").unwrap();
+        let s2 = phase_complete("s9").unwrap();
 
         let started = s1.started_ts.expect("started_ts after start");
         let completed = s2.completed_ts.expect("completed_ts after complete");
@@ -1162,10 +1180,10 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn sprint_start_on_missing_id_errors() {
+    fn phase_start_on_missing_id_errors() {
         let _g = CrewGuard::new();
-        let err = sprint_start("does-not-exist").unwrap_err();
-        assert!(err.to_string().contains("no sprint with id"));
+        let err = phase_start("does-not-exist").unwrap_err();
+        assert!(err.to_string().contains("no phase with id"));
     }
 
     #[serial_test::serial]
@@ -1181,89 +1199,146 @@ mod tests {
     fn save_json_atomic_via_tmp_rename() {
         // After a save, the .tmp file should not be left behind.
         let _g = CrewGuard::new();
-        seed_sprint("s-atomic", SprintStatus::Planned);
-        let _ = sprint_start("s-atomic").unwrap();
-        let tmp_path = sprint_path("test-mission", "s-atomic").with_extension("json.tmp");
+        seed_phase("s-atomic", PhaseStatus::Planned);
+        let _ = phase_start("s-atomic").unwrap();
+        let tmp_path = phase_path("test-mission", "s-atomic").with_extension("json.tmp");
         assert!(!tmp_path.exists(), "atomic save should rename, leaving no .tmp");
     }
 
-    // ─── add_sprint_to_mission (#107) ───────────────────────────────────
+    // ─── Sprint→Phase rename: existing real-data compat ────────────────
+
+    /// End-to-end: a phase written under the legacy `sprints/` dir name
+    /// (simulating an operator's real pre-rename mission on disk) is fully
+    /// operable through the lifecycle verbs — `load_phase_by_id` finds it
+    /// and `phase_start` writes the transition back to the SAME legacy
+    /// dir (writes follow reads; no silent state split, no orphaned data).
+    #[serial_test::serial]
+    #[test]
+    fn phase_lifecycle_operates_on_legacy_sprints_dir_data() {
+        let _g = CrewGuard::new();
+        let legacy_dir = crate::loader::missions_dir().join("legacy-mission").join("sprints");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let s = Phase {
+            id: "legacy-phase".to_string(),
+            mission_id: "legacy-mission".to_string(),
+            description: "pre-rename phase".to_string(),
+            status: PhaseStatus::Planned,
+            depends_on: Vec::new(),
+            created_ts: 1_700_000_000,
+            started_ts: None,
+            completed_ts: None,
+            abandoned_ts: None,
+            task_ids: Vec::new(),
+        };
+        save_json(&legacy_dir.join("legacy-phase.json"), &s).unwrap();
+
+        let loaded = load_phase_by_id("legacy-phase").expect("legacy phase should be discoverable");
+        assert_eq!(loaded.mission_id, "legacy-mission");
+
+        let updated = phase_start("legacy-phase").expect("phase_start should operate on legacy data");
+        assert_eq!(updated.status, PhaseStatus::Running);
+        // The transition must have been written back into the SAME legacy
+        // dir, not a freshly-created `phases/` dir — no silent state split.
+        assert!(legacy_dir.join("legacy-phase.json").exists());
+        assert!(!crate::loader::missions_dir().join("legacy-mission").join("phases").exists());
+    }
+
+    /// A mission.json written with the pre-rename `sprint_ids` wire key
+    /// (instead of the canonical `phase_ids`) deserializes correctly via
+    /// `#[serde(alias = "sprint_ids")]` — an operator's real existing
+    /// mission JSON isn't silently emptied of its phase list.
+    #[serial_test::serial]
+    #[test]
+    fn mission_json_with_legacy_sprint_ids_key_deserializes() {
+        let _g = CrewGuard::new();
+        let legacy_json = r#"{
+            "id": "legacy-mission-2",
+            "description": "pre-rename mission",
+            "status": "active",
+            "sprint_ids": ["s1", "s2"],
+            "created_ts": 1700000000
+        }"#;
+        let m: Mission = serde_json::from_str(legacy_json).expect("legacy sprint_ids key must parse");
+        assert_eq!(m.phase_ids, vec!["s1".to_string(), "s2".to_string()]);
+    }
+
+    // ─── add_phase_to_mission (#107) ───────────────────────────────────
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_creates_planned_sprint_and_extends_mission() {
+    fn add_phase_creates_planned_phase_and_extends_mission() {
         let _g = CrewGuard::new();
         let mission = seed_mission("test-mission", MissionStatus::Active);
-        assert!(mission.sprint_ids.is_empty(), "starting state: empty sprint list");
+        assert!(mission.phase_ids.is_empty(), "starting state: empty phase list");
 
-        let s = add_sprint_to_mission(
+        let s = add_phase_to_mission(
             "test-mission",
-            "new-sprint",
+            "new-phase",
             "discovered mid-flight",
             Vec::new(),
             None,
         )
         .unwrap();
 
-        assert_eq!(s.status, SprintStatus::Planned);
+        assert_eq!(s.status, PhaseStatus::Planned);
         assert_eq!(s.mission_id, "test-mission");
         assert_eq!(s.description, "discovered mid-flight");
         assert!(s.started_ts.is_none());
-        // Sprint JSON exists on disk.
-        assert!(sprint_path("test-mission", "new-sprint").exists());
-        // Mission JSON's sprint_ids was updated.
+        // Phase JSON exists on disk.
+        assert!(phase_path("test-mission", "new-phase").exists());
+        // Mission JSON's phase_ids was updated.
         let reloaded = load_mission("test-mission").unwrap();
-        assert_eq!(reloaded.sprint_ids, vec!["new-sprint".to_string()]);
+        assert_eq!(reloaded.phase_ids, vec!["new-phase".to_string()]);
     }
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_is_idempotent_on_exact_match() {
+    fn add_phase_is_idempotent_on_exact_match() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
 
-        let first = add_sprint_to_mission("m1", "s-once", "same desc", Vec::new(), None).unwrap();
-        let second = add_sprint_to_mission("m1", "s-once", "same desc", Vec::new(), None).unwrap();
+        let first = add_phase_to_mission("m1", "s-once", "same desc", Vec::new(), None).unwrap();
+        let second = add_phase_to_mission("m1", "s-once", "same desc", Vec::new(), None).unwrap();
 
-        // Same created_ts on the second call — we returned the existing sprint, not a fresh one.
+        // Same created_ts on the second call — we returned the existing phase, not a fresh one.
         assert_eq!(first.created_ts, second.created_ts);
-        // Mission's sprint_ids contains the id once, not twice.
+        // Mission's phase_ids contains the id once, not twice.
         let m = load_mission("m1").unwrap();
-        assert_eq!(m.sprint_ids.iter().filter(|s| *s == "s-once").count(), 1);
+        assert_eq!(m.phase_ids.iter().filter(|s| *s == "s-once").count(), 1);
     }
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_errors_when_id_collides_across_missions() {
+    fn add_phase_errors_when_id_collides_across_missions() {
         let _g = CrewGuard::new();
         seed_mission("m-a", MissionStatus::Active);
         seed_mission("m-b", MissionStatus::Active);
-        add_sprint_to_mission("m-a", "shared", "first", Vec::new(), None).unwrap();
+        add_phase_to_mission("m-a", "shared", "first", Vec::new(), None).unwrap();
 
-        let err = add_sprint_to_mission("m-b", "shared", "second", Vec::new(), None).unwrap_err();
+        let err = add_phase_to_mission("m-b", "shared", "second", Vec::new(), None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("already in use under mission `m-a`"), "got: {msg}");
     }
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_errors_when_same_id_has_different_description() {
+    fn add_phase_errors_when_same_id_has_different_description() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        add_sprint_to_mission("m1", "s1", "original", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "s1", "original", Vec::new(), None).unwrap();
 
-        let err = add_sprint_to_mission("m1", "s1", "different", Vec::new(), None).unwrap_err();
+        let err = add_phase_to_mission("m1", "s1", "different", Vec::new(), None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("different description"), "got: {msg}");
     }
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_errors_when_mission_missing() {
+    fn add_phase_errors_when_mission_missing() {
         let _g = CrewGuard::new();
-        let err = add_sprint_to_mission(
+        let err = add_phase_to_mission(
             "ghost-mission",
-            "new-sprint",
+            "new-phase",
             "desc",
             Vec::new(),
             None,
@@ -1278,12 +1353,12 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_errors_when_depends_on_dangles() {
+    fn add_phase_errors_when_depends_on_dangles() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        let err = add_sprint_to_mission(
+        let err = add_phase_to_mission(
             "m1",
-            "new-sprint",
+            "new-phase",
             "desc",
             vec!["nonexistent".to_string()],
             None,
@@ -1291,49 +1366,49 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("depends_on references unknown sprint `nonexistent`"),
+            msg.contains("depends_on references unknown phase `nonexistent`"),
             "got: {msg}",
         );
     }
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_resolves_depends_on_against_existing_sprints() {
+    fn add_phase_resolves_depends_on_against_existing_phases() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        seed_sprint("dep-sprint", SprintStatus::Planned);
+        seed_phase("dep-phase", PhaseStatus::Planned);
 
-        // Note: seed_sprint hard-codes mission_id="test-mission"; the dep
+        // Note: seed_phase hard-codes mission_id="test-mission"; the dep
         // doesn't have to live in the same mission for the resolution
         // check (cross-mission deps are unusual but not invalid).
-        let s = add_sprint_to_mission(
+        let s = add_phase_to_mission(
             "m1",
-            "new-sprint",
+            "new-phase",
             "desc",
-            vec!["dep-sprint".to_string()],
+            vec!["dep-phase".to_string()],
             None,
         )
         .unwrap();
-        assert_eq!(s.depends_on, vec!["dep-sprint".to_string()]);
+        assert_eq!(s.depends_on, vec!["dep-phase".to_string()]);
     }
 
     // ─── --after positioning (insert-in-middle) ─────────────────────────
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_with_after_inserts_in_middle_not_at_end() {
+    fn add_phase_with_after_inserts_in_middle_not_at_end() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        add_sprint_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
-        add_sprint_to_mission("m1", "beta", "second", Vec::new(), None).unwrap();
-        add_sprint_to_mission("m1", "gamma", "third", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "beta", "second", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "gamma", "third", Vec::new(), None).unwrap();
 
         // Insert `delta` between `alpha` and `beta`.
-        add_sprint_to_mission("m1", "delta", "inserted", Vec::new(), Some("alpha")).unwrap();
+        add_phase_to_mission("m1", "delta", "inserted", Vec::new(), Some("alpha")).unwrap();
 
         let m = load_mission("m1").unwrap();
         assert_eq!(
-            m.sprint_ids,
+            m.phase_ids,
             vec![
                 "alpha".to_string(),
                 "delta".to_string(),
@@ -1346,27 +1421,27 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_with_after_at_tail_inserts_after_last() {
-        // Edge case: --after the last sprint should append (not error).
+    fn add_phase_with_after_at_tail_inserts_after_last() {
+        // Edge case: --after the last phase should append (not error).
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        add_sprint_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
-        add_sprint_to_mission("m1", "beta", "second", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "beta", "second", Vec::new(), None).unwrap();
 
-        add_sprint_to_mission("m1", "gamma", "third", Vec::new(), Some("beta")).unwrap();
+        add_phase_to_mission("m1", "gamma", "third", Vec::new(), Some("beta")).unwrap();
 
         let m = load_mission("m1").unwrap();
-        assert_eq!(m.sprint_ids, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(m.phase_ids, vec!["alpha", "beta", "gamma"]);
     }
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_with_after_unknown_id_errors_loudly() {
+    fn add_phase_with_after_unknown_id_errors_loudly() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        add_sprint_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
 
-        let err = add_sprint_to_mission(
+        let err = add_phase_to_mission(
             "m1",
             "beta",
             "second",
@@ -1376,22 +1451,22 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("--after references sprint `nonexistent-id`"),
+            msg.contains("--after references phase `nonexistent-id`"),
             "got: {msg}"
         );
-        // Mission was not mutated on error — alpha is still the only sprint.
+        // Mission was not mutated on error — alpha is still the only phase.
         let m = load_mission("m1").unwrap();
-        assert_eq!(m.sprint_ids, vec!["alpha".to_string()]);
-        // The sprint JSON should NOT have been left behind either.
-        assert!(!sprint_path("m1", "beta").exists(), "errored insert must not leave orphan sprint");
+        assert_eq!(m.phase_ids, vec!["alpha".to_string()]);
+        // The phase JSON should NOT have been left behind either.
+        assert!(!phase_path("m1", "beta").exists(), "errored insert must not leave orphan phase");
     }
 
     #[serial_test::serial]
     #[test]
-    fn add_sprint_emits_sprint_added_flow_record() {
+    fn add_phase_emits_phase_added_flow_record() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        add_sprint_to_mission("m1", "new-sprint", "desc", Vec::new(), None).unwrap();
+        add_phase_to_mission("m1", "new-phase", "desc", Vec::new(), None).unwrap();
 
         // Read the day's flow file from the temp DARKMUX_FLOWS_DIR.
         let flows_dir = env::var("DARKMUX_FLOWS_DIR").unwrap();
@@ -1399,11 +1474,11 @@ mod tests {
         let path = std::path::PathBuf::from(flows_dir).join(format!("{day}.jsonl"));
         let raw = std::fs::read_to_string(&path).expect("flow file should have been created");
         let found = raw.lines().any(|line| {
-            line.contains("\"action\":\"sprint added\"")
-                && line.contains("\"handle\":\"new-sprint\"")
+            line.contains("\"action\":\"phase added\"")
+                && line.contains("\"handle\":\"new-phase\"")
                 && line.contains("\"source\":\"mission_lifecycle\"")
         });
-        assert!(found, "expected a `sprint added` flow record, got:\n{raw}");
+        assert!(found, "expected a `phase added` flow record, got:\n{raw}");
     }
 }
 
@@ -1429,8 +1504,8 @@ mod path_helper_tests {
         with_test_root(|root| {
             assert_eq!(mission_dir("m"), root.join("missions/m"));
             assert_eq!(mission_path("m"), root.join("missions/m/mission.json"));
-            assert_eq!(sprints_dir("m"), root.join("missions/m/sprints"));
-            assert_eq!(sprint_path("m", "s"), root.join("missions/m/sprints/s.json"));
+            assert_eq!(phases_dir("m"), root.join("missions/m/phases"));
+            assert_eq!(phase_path("m", "s"), root.join("missions/m/phases/s.json"));
         });
     }
 
@@ -1439,9 +1514,48 @@ mod path_helper_tests {
     fn legacy_resolvers() {
         with_test_root(|root| {
             assert_eq!(legacy_mission_path("m"), root.join("missions/m.json"));
-            assert_eq!(legacy_sprint_path("s"), root.join("sprints/s.json"));
+            assert_eq!(legacy_phase_path("s"), root.join("phases/s.json"));
             assert_eq!(legacy_missions_dir(), root.join("missions"));
-            assert_eq!(legacy_sprints_dir(), root.join("sprints"));
+            assert_eq!(legacy_phases_dir(), root.join("phases"));
+        });
+    }
+
+    /// Sprint→Phase rename read-fallback (real-data compat): a mission dir
+    /// with ONLY a legacy `sprints/` subdir (pre-rename on-disk layout) must
+    /// still resolve `phases_dir` to it, so an operator's existing mission
+    /// data survives the rename without a manual migration step.
+    #[test]
+    #[serial]
+    fn phases_dir_falls_back_to_legacy_sprints_subdir_name() {
+        with_test_root(|root| {
+            let legacy_dir = root.join("missions/m/sprints");
+            std::fs::create_dir_all(&legacy_dir).unwrap();
+            assert_eq!(phases_dir("m"), legacy_dir);
+            assert_eq!(phase_path("m", "s"), legacy_dir.join("s.json"));
+        });
+    }
+
+    /// Once the canonical `phases/` subdir exists (even alongside a
+    /// still-present `sprints/` one — e.g. mid-migration), canonical wins.
+    #[test]
+    #[serial]
+    fn phases_dir_prefers_canonical_when_both_exist() {
+        with_test_root(|root| {
+            let legacy_dir = root.join("missions/m/sprints");
+            let canonical_dir = root.join("missions/m/phases");
+            std::fs::create_dir_all(&legacy_dir).unwrap();
+            std::fs::create_dir_all(&canonical_dir).unwrap();
+            assert_eq!(phases_dir("m"), canonical_dir);
+        });
+    }
+
+    /// Brand-new mission (neither subdir exists yet) resolves to the
+    /// canonical name so a fresh write creates the new-name layout.
+    #[test]
+    #[serial]
+    fn phases_dir_defaults_to_canonical_when_neither_exists() {
+        with_test_root(|root| {
+            assert_eq!(phases_dir("m"), root.join("missions/m/phases"));
         });
     }
 
@@ -1461,7 +1575,7 @@ mod path_helper_tests {
 mod task_step_storage_tests {
     //! (#1230 Packet 2) Round-trip storage tests for the Task/Step
     //! per-mission-nested JSON layout — one file per Step, atomic-rename
-    //! `save_json`, same conventions as Sprint/Mission storage above.
+    //! `save_json`, same conventions as Phase/Mission storage above.
     use super::*;
     use crate::types::{NodeStatus, Step, Task};
     use serial_test::serial;
@@ -1490,10 +1604,10 @@ mod task_step_storage_tests {
         }
     }
 
-    fn task(id: &str, sprint_id: &str) -> Task {
+    fn task(id: &str, phase_id: &str) -> Task {
         Task {
             id: id.to_string(),
-            sprint_id: sprint_id.to_string(),
+            phase_id: phase_id.to_string(),
             description: format!("task {id}"),
             step_ids: Vec::new(),
         }
@@ -1521,28 +1635,28 @@ mod task_step_storage_tests {
         save_task("m1", &t).unwrap();
         let loaded = load_task("m1", "s1", "t1").unwrap();
         assert_eq!(loaded.id, "t1");
-        assert_eq!(loaded.sprint_id, "s1");
+        assert_eq!(loaded.phase_id, "s1");
         assert_eq!(loaded.description, "task t1");
     }
 
     #[test]
     #[serial]
-    fn load_tasks_for_sprint_missing_dir_is_empty_not_error() {
+    fn load_tasks_for_phase_missing_dir_is_empty_not_error() {
         let _g = CrewGuard::new();
-        let tasks = load_tasks_for_sprint("ghost-mission", "ghost-sprint").unwrap();
+        let tasks = load_tasks_for_phase("ghost-mission", "ghost-phase").unwrap();
         assert!(tasks.is_empty());
     }
 
     #[test]
     #[serial]
-    fn load_tasks_for_sprint_returns_every_task_in_deterministic_order() {
+    fn load_tasks_for_phase_returns_every_task_in_deterministic_order() {
         let _g = CrewGuard::new();
         save_task("m1", &task("t-b", "s1")).unwrap();
         save_task("m1", &task("t-a", "s1")).unwrap();
-        // A different sprint's task must NOT show up in s1's listing.
+        // A different phase's task must NOT show up in s1's listing.
         save_task("m1", &task("t-other", "s2")).unwrap();
 
-        let tasks = load_tasks_for_sprint("m1", "s1").unwrap();
+        let tasks = load_tasks_for_phase("m1", "s1").unwrap();
         let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["t-a", "t-b"], "sorted by filename, s2's task excluded");
     }
@@ -1564,21 +1678,21 @@ mod task_step_storage_tests {
 
     #[test]
     #[serial]
-    fn load_steps_for_sprint_missing_dir_is_empty_not_error() {
+    fn load_steps_for_phase_missing_dir_is_empty_not_error() {
         let _g = CrewGuard::new();
-        let steps = load_steps_for_sprint("ghost-mission", "ghost-sprint").unwrap();
+        let steps = load_steps_for_phase("ghost-mission", "ghost-phase").unwrap();
         assert!(steps.is_empty());
     }
 
     #[test]
     #[serial]
-    fn load_steps_for_sprint_returns_every_step_across_tasks() {
+    fn load_steps_for_phase_returns_every_step_across_tasks() {
         let _g = CrewGuard::new();
         save_step("m1", "s1", &step("st-b", "t1")).unwrap();
         save_step("m1", "s1", &step("st-a", "t2")).unwrap();
         save_step("m1", "s2", &step("st-other", "t3")).unwrap();
 
-        let steps = load_steps_for_sprint("m1", "s1").unwrap();
+        let steps = load_steps_for_phase("m1", "s1").unwrap();
         let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["st-a", "st-b"], "sorted by filename, s2's step excluded");
     }

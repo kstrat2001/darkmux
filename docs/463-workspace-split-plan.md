@@ -25,7 +25,7 @@ darkmux-types  (foundation: types.rs whole + lab/paths.rs lifted in)
 
 darkmux-flow   (true leaf — zero darkmux deps)
    ▲
-   └── darkmux-crew, darkmux-serve, binary (flow_cli, sprint_cli)
+   └── darkmux-crew, darkmux-serve, binary (flow_cli, phase_cli)
 
 binary (darkmux) ── everything above + the ~18 unassigned modules
 runtime/         ── separate crate, EXCLUDED from workspace (own Cargo.lock; "stays as-is")
@@ -101,7 +101,7 @@ flips in `flow.rs` actually change.
 - `darkmux-serve`: `serve.rs`. Dep: `darkmux-flow` (+ `darkmux-types` for `LoadedModel`).
 - Thin the binary: `main.rs` becomes the clap orchestrator wiring the crates; the
   ~18 unassigned modules (`agent_roles`, `eureka`, `external`, `fleet`, `hardware`,
-  `heuristics`, `init`, `recommendations`, `skills`, `flow_cli`, `sprint_cli`,
+  `heuristics`, `init`, `recommendations`, `skills`, `flow_cli`, `phase_cli`,
   `mission_propose`, `notebook`, `role_cli`, `migrate`, `optimize`, `workdir`) stay
   in the binary, importing from the new crates.
 - **Open sub-decision — `darkmux-doctor`:** the issue lists it as its own crate, but
@@ -138,7 +138,7 @@ flips in `flow.rs` actually change.
   `crate::{lms,swap,runtime}` unchanged. No `pub(crate)` flips needed.
 
 Known pre-existing failure (NOT introduced here, also fails on `main`):
-`sprint_cli::tests::flow_record_failure_does_not_crash_review` — sets a dir
+`phase_cli::tests::flow_record_failure_does_not_crash_review` — sets a dir
 read-only to force a write failure, but CI/dev runs as root and root bypasses
 the permission, so a record gets written. Orthogonal to #463; track separately.
 
@@ -153,7 +153,7 @@ not contain dependency cycles, and the real call graph has two:
   (10+ sites). Tightly coupled both ways.
 - **crew ↔ serve**: `crew/dispatch.rs` calls
   `serve::nudge_if_daemon_unreachable` (1 site); `serve.rs` calls
-  `crew::loader::{load_missions, load_sprints, missions_dir, sprints_dir}`.
+  `crew::loader::{load_missions, load_phases, missions_dir, phases_dir}`.
 
 (`crew → lab::paths` is trivially fixable — paths is now in `darkmux-types`;
 rewrite the 3 sites in `crew/{loader,index}.rs` to `darkmux_types::paths`.

@@ -194,7 +194,7 @@ fn dispatch_via_internal(
         json: true,
         watch_paths: Vec::new(),
         workdir: None,
-        sprint_id: None,
+        phase_id: None,
         runtime: Runtime::Internal,
         runtime_cmd: "openclaw".to_string(),
         machine: None,
@@ -225,7 +225,7 @@ fn dispatch_via_internal(
 
 /// Dispatch via the legacy openclaw shell-out path. Shells out with the
 /// `<cmd> agent --agent <role> --json ...` calling convention.
-/// `runtime_cmd` is the operator-supplied binary path (Sprint-E:
+/// `runtime_cmd` is the operator-supplied binary path (Phase-E:
 /// `--runtime-cmd <path>` flag; defaults to `"openclaw"`). Kept for
 /// operators who explicitly opt in via `--runtime openclaw`.
 fn dispatch_via_openclaw(
@@ -292,7 +292,7 @@ pub(crate) fn extract_reply_text(stdout: &str) -> String {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stdout) else {
         return stdout.to_string();
     };
-    // darkmux internal-runtime --json envelope (Beat 36 / Sprint-A):
+    // darkmux internal-runtime --json envelope (Beat 36 / Phase-A):
     // `{"final_assistant": "...", "result": "stop", ...}`.
     if let Some(final_assistant) = parsed.get("final_assistant").and_then(|v| v.as_str()) {
         return final_assistant.to_string();
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn extract_reply_handles_internal_runtime_envelope() {
-        // Sprint-A's darkmux-runtime --json envelope. Beat 36: this
+        // Phase-A's darkmux-runtime --json envelope. Beat 36: this
         // branch should be checked FIRST in extract_reply_text so the
         // DM-first parsing wins over the openclaw fallback chain.
         let json = r#"{"result":"stop","final_assistant":"hello from internal runtime","metrics":{"wall_ms":2135}}"#;

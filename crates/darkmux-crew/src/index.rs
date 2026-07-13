@@ -4,8 +4,8 @@
 //!
 //! The non-obvious choices and why:
 //!
-//! - **Composite PK `(id, mission_id)` on sprints** — sprint IDs are scoped
-//!   per mission, not globally unique. The Rust `Sprint` struct's
+//! - **Composite PK `(id, mission_id)` on phases** — phase IDs are scoped
+//!   per mission, not globally unique. The Rust `Phase` struct's
 //!   `mission_id: String` field aligns with this; the issue spec's "nested
 //!   under missions or sibling — implementer choice" is resolved by
 //!   composite.
@@ -15,7 +15,7 @@
 //! - **`PRAGMA foreign_keys = ON`** as a connection-default — FKs are off
 //!   by default in SQLite; explicit opt-in is required.
 //! - **`source_files.kind` covers ALL entity types** —
-//!   `kind IN ('role', 'skill', 'crew', 'mission', 'sprint')`.
+//!   `kind IN ('role', 'skill', 'crew', 'mission', 'phase')`.
 //! - **`PRAGMA user_version` for schema versioning** — SQLite-native; no
 //!   external migration tooling needed.
 //! - **`role_escalation_targets` table** — the
@@ -30,11 +30,11 @@
 //! - **FTS5 sync triggers** — `skill_keywords_ai` / `_ad` / `_au`
 //!   propagate INSERT / DELETE / UPDATE on `skill_keywords` to the
 //!   `skill_keywords_fts` mirror automatically.
-//! - **`Mission.sprint_ids` is JSON-only**, NOT a denormalized DB column —
-//!   sprint membership is derived from `sprints WHERE mission_id = ?`.
+//! - **`Mission.phase_ids` is JSON-only**, NOT a denormalized DB column —
+//!   phase membership is derived from `phases WHERE mission_id = ?`.
 //!   The JSON-side field stays in the manifest for operator hand-editing.
-//! - **`outcomes.sprint_id` + `outcomes.mission_id`** — both columns
-//!   present. A composite FK to `sprints(id, mission_id)` isn't
+//! - **`outcomes.phase_id` + `outcomes.mission_id`** — both columns
+//!   present. A composite FK to `phases(id, mission_id)` isn't
 //!   expressible in SQLite without extra triggers; the redundancy is a
 //!   deliberate denormalization for query ergonomics + application-side
 //!   validation.
@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Bumped to 2 in refactor 0 (`capability` → `skill` rename, #448); to 3
-/// for the #95 mission/sprint transition-timestamp columns (#914); to 4 for
+/// for the #95 mission/phase transition-timestamp columns (#914); to 4 for
 /// the #994 engagement-context `cautions` table (derived from the flow stream);
 /// to 5 (#999) when the scaffolded `knowledge` table was dropped — authored
 /// lessons live in their own durable `lessons.db` store now (`darkmux lessons`),
@@ -83,12 +83,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Allocator tables + `meta_kv` are NOT derived and are preserved across
 /// rebuilds. No data is lost — every dropped table is rebuilt from the on-disk
 /// manifests + the flow stream.
-const SCHEMA_VERSION: i32 = 5;
+///
+/// Bumped 5 -> 6 for the Sprint -> Phase rename: the `cautions` table's
+/// `sprint_id` column is now `phase_id`. A stale on-disk index still
+/// carrying the old column name is harmless — it's just detected as
+/// stale by this bump and rebuilt from the JSON source-of-truth (which
+/// itself is read-compat via serde aliases, see `Mission::phase_ids`).
+const SCHEMA_VERSION: i32 = 6;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS source_files (
     path          TEXT PRIMARY KEY,
-    kind          TEXT NOT NULL CHECK (kind IN ('role','skill','crew','mission','sprint')),
+    kind          TEXT NOT NULL CHECK (kind IN ('role','skill','crew','mission','phase')),
     mtime         INTEGER NOT NULL,
     content_hash  TEXT NOT NULL
 );
@@ -178,7 +184,7 @@ CREATE TABLE IF NOT EXISTS missions (
     paused_ts   INTEGER   -- most-recent Paused transition; #95
 );
 
-CREATE TABLE IF NOT EXISTS sprints (
+CREATE TABLE IF NOT EXISTS phases (
     id              TEXT NOT NULL,
     mission_id      TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
     description     TEXT NOT NULL,
@@ -195,7 +201,7 @@ CREATE TABLE IF NOT EXISTS sprints (
 CREATE TABLE IF NOT EXISTS allocations (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     mission_id            TEXT,
-    sprint_id             TEXT,
+    phase_id             TEXT,
     ticket_text           TEXT,
     ticket_hash           TEXT,
     suggested_crew_json   TEXT,
@@ -207,7 +213,7 @@ CREATE TABLE IF NOT EXISTS allocations (
 
 CREATE TABLE IF NOT EXISTS outcomes (
     allocation_id     INTEGER PRIMARY KEY REFERENCES allocations(id) ON DELETE CASCADE,
-    sprint_id         TEXT,
+    phase_id         TEXT,
     mission_id        TEXT,
     wall_seconds      INTEGER,
     success           INTEGER NOT NULL CHECK (success IN (0,1)),
@@ -242,7 +248,7 @@ CREATE TABLE IF NOT EXISTS cautions (
     detail      TEXT NOT NULL,
     code_hash   TEXT,
     mission_id  TEXT,
-    sprint_id   TEXT,
+    phase_id   TEXT,
     session_id  TEXT,
     role        TEXT,
     model       TEXT,
@@ -269,7 +275,7 @@ const REBUILD_TABLES: &[&str] = &[
     "role_skills",
     "skill_keywords",
     "crew_members",
-    "sprints",
+    "phases",
     "missions",
     "crews",
     "roles",
@@ -282,7 +288,7 @@ const REBUILD_TABLES: &[&str] = &[
 /// existing index. Tests use the `_at(&path)` variants (`rebuild_at`,
 /// `role_list_at`, `crew_list_at`, etc.) rather than overriding this path.
 /// (#1012) ForceUser, NOT Auto: the index is DERIVED from the user-scope crew /
-/// missions / sprints (now resolved via `user_state_root` = ForceUser), so it
+/// missions / phases (now resolved via `user_state_root` = ForceUser), so it
 /// must be user-scoped to match its content — a project-scoped index of
 /// user-scoped data is incoherent, and a bare `<cwd>/.darkmux/` must not relocate
 /// it. In the common no-project-`.darkmux` case `Auto` already resolved to user,
@@ -351,12 +357,12 @@ fn mission_status_str(s: MissionStatus) -> &'static str {
     }
 }
 
-fn sprint_status_str(s: SprintStatus) -> &'static str {
+fn phase_status_str(s: PhaseStatus) -> &'static str {
     match s {
-        SprintStatus::Planned => "planned",
-        SprintStatus::Running => "running",
-        SprintStatus::Complete => "complete",
-        SprintStatus::Abandoned => "abandoned",
+        PhaseStatus::Planned => "planned",
+        PhaseStatus::Running => "running",
+        PhaseStatus::Complete => "complete",
+        PhaseStatus::Abandoned => "abandoned",
     }
 }
 
@@ -407,7 +413,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
     // Self-heal derived-table schema drift (#914): drop + recreate every
     // derived table on each rebuild so a column added to the DDL (e.g. the
-    // #95 mission/sprint timestamp columns) lands even on a pre-existing DB —
+    // #95 mission/phase timestamp columns) lands even on a pre-existing DB —
     // the `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL below cannot add columns
     // to a table that already exists. Dropping `skill_keywords` also drops
     // its three FTS-sync triggers, which SCHEMA_SQL then recreates; the FTS
@@ -481,7 +487,7 @@ fn kind_to_dir(kind: &str) -> PathBuf {
         "skill" => loader::skills_dir(),
         "crew" => loader::crews_dir(),
         "mission" => loader::missions_dir(),
-        "sprint" => loader::sprints_dir(),
+        "phase" => loader::phases_dir(),
         _ => unreachable!("unknown index kind: {kind}"),
     }
 }
@@ -493,7 +499,7 @@ fn populate(conn: &mut Connection) -> Result<()> {
     let skills = loader::load_skills()?;
     let crews = loader::load_crews()?;
     let missions = loader::load_missions()?;
-    let sprints = loader::load_sprints()?;
+    let phases = loader::load_phases()?;
 
     let tx = conn.transaction()?;
     tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
@@ -600,22 +606,22 @@ fn populate(conn: &mut Connection) -> Result<()> {
         )?;
     }
 
-    // Sprints.
-    for sprint in &sprints {
-        let depends_on_json = serde_json::to_string(&sprint.depends_on)?;
+    // Phases.
+    for phase in &phases {
+        let depends_on_json = serde_json::to_string(&phase.depends_on)?;
         tx.execute(
-            "INSERT INTO sprints (id, mission_id, description, status, depends_on_json, created_ts, started_ts, completed_ts, abandoned_ts)
+            "INSERT INTO phases (id, mission_id, description, status, depends_on_json, created_ts, started_ts, completed_ts, abandoned_ts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                sprint.id,
-                sprint.mission_id,
-                sprint.description,
-                sprint_status_str(sprint.status),
+                phase.id,
+                phase.mission_id,
+                phase.description,
+                phase_status_str(phase.status),
                 depends_on_json,
-                sprint.created_ts as i64,
-                sprint.started_ts.map(|t| t as i64),
-                sprint.completed_ts.map(|t| t as i64),
-                sprint.abandoned_ts.map(|t| t as i64),
+                phase.created_ts as i64,
+                phase.started_ts.map(|t| t as i64),
+                phase.completed_ts.map(|t| t as i64),
+                phase.abandoned_ts.map(|t| t as i64),
             ],
         )?;
     }
@@ -624,7 +630,7 @@ fn populate(conn: &mut Connection) -> Result<()> {
     // the stored darkmux_version in meta_kv, not by per-file mtime). Each
     // kind's directory is resolved through the loader's dual-read helpers
     // so the legacy <root>/crew/<subdir>/ layout still indexes correctly.
-    let kinds: &[&str] = &["role", "skill", "crew", "mission", "sprint"];
+    let kinds: &[&str] = &["role", "skill", "crew", "mission", "phase"];
     for kind in kinds {
         let dir = kind_to_dir(kind);
         for (path, _id, bytes) in enumerate_user_files(&dir)? {
@@ -737,7 +743,7 @@ fn derive_cautions(tx: &Connection) -> Result<()> {
     }
     let mut insert = tx.prepare(
         "INSERT INTO cautions
-            (file, kind, severity, detail, code_hash, mission_id, sprint_id, session_id, role, model, ts)
+            (file, kind, severity, detail, code_hash, mission_id, phase_id, session_id, role, model, ts)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     for entry in
@@ -770,7 +776,7 @@ fn derive_cautions(tx: &Connection) -> Result<()> {
                 detail,
                 code_hash,
                 rec.mission_id,
-                rec.sprint_id,
+                rec.phase_id,
                 rec.session_id,
                 rec.handle,
                 rec.model,
@@ -889,7 +895,7 @@ fn status_at(path: &Path) -> Result<StatusReport> {
     // Drift detection: compare on-disk state to source_files. Each kind's
     // directory is resolved through the loader's dual-read helpers so
     // a legacy <root>/crew/<subdir>/ layout still drift-detects correctly.
-    let kinds: &[&str] = &["role", "skill", "crew", "mission", "sprint"];
+    let kinds: &[&str] = &["role", "skill", "crew", "mission", "phase"];
 
     // Build set of all paths currently recorded.
     let mut recorded_paths: std::collections::BTreeMap<String, (String, i64, String)> =
@@ -1316,16 +1322,16 @@ mod tests {
               "id": "{id}",
               "description": "{description}",
               "status": "active",
-              "sprint_ids": [],
+              "phase_ids": [],
               "created_ts": 1700000000
             }}"#
         );
         fs::write(dir.join("mission.json"), json).unwrap();
     }
 
-    fn write_sprint(crew_root: &Path, id: &str, mission_id: &str, description: &str) {
-        // Per-mission layout (#148): <crew_root>/missions/<mission_id>/sprints/<id>.json
-        let dir = crew_root.join("missions").join(mission_id).join("sprints");
+    fn write_phase(crew_root: &Path, id: &str, mission_id: &str, description: &str) {
+        // Per-mission layout (#148): <crew_root>/missions/<mission_id>/phases/<id>.json
+        let dir = crew_root.join("missions").join(mission_id).join("phases");
         fs::create_dir_all(&dir).unwrap();
         let json = format!(
             r#"{{
@@ -1460,21 +1466,21 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn composite_sprint_pk_allows_same_id_across_missions() {
+    fn composite_phase_pk_allows_same_id_across_missions() {
         let guard = CrewDirGuard::new();
         write_mission(guard.path(), "alpha", "First mission");
         write_mission(guard.path(), "beta", "Second mission");
-        write_sprint(guard.path(), "kickoff", "alpha", "Kickoff for alpha");
-        write_sprint(guard.path(), "kickoff", "beta", "Kickoff for beta");
+        write_phase(guard.path(), "kickoff", "alpha", "Kickoff for alpha");
+        write_phase(guard.path(), "kickoff", "beta", "Kickoff for beta");
 
         let idx = index_path(guard.path());
         rebuild_at(&idx).unwrap();
 
         let conn = open_index(&idx).unwrap();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sprints WHERE id = 'kickoff'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM phases WHERE id = 'kickoff'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 2, "same sprint id should coexist under different missions");
+        assert_eq!(n, 2, "same phase id should coexist under different missions");
     }
 
     #[serial_test::serial]
@@ -1859,7 +1865,7 @@ mod tests {
         let mission = serde_json::json!({
             "id": id,
             "description": "mission carrying a started_ts",
-            "sprint_ids": [],
+            "phase_ids": [],
             "created_ts": 1_700_000_000u64,
             "started_ts": 1_700_000_100u64,
         });
@@ -1928,7 +1934,7 @@ mod tests {
                 ],
             ),
             (
-                "sprints",
+                "phases",
                 &[
                     "abandoned_ts",
                     "completed_ts",
@@ -1951,10 +1957,10 @@ mod tests {
                     "kind",
                     "mission_id",
                     "model",
+                    "phase_id",
                     "role",
                     "session_id",
                     "severity",
-                    "sprint_id",
                     "ts",
                 ],
             ),

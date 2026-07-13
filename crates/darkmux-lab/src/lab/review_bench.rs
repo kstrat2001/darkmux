@@ -670,7 +670,7 @@ fn dispatch_case(
         // Agentic mode mounts the case's repo tree at /workspace; diff-only
         // modes dispatch with no workdir (a fresh tempdir).
         workdir,
-        sprint_id: None,
+        phase_id: None,
         runtime: Runtime::Internal,
         runtime_cmd: "openclaw".to_string(),
         machine: None,
@@ -2690,7 +2690,7 @@ mod tests {
                 stage: darkmux_flow::Stage::Dispatch,
                 action: action.to_string(),
                 handle: "test-crew".to_string(),
-                sprint_id: None,
+                phase_id: None,
                 session_id: Some("c1".to_string()),
                 source: Some("funnel".to_string()),
                 model: None,

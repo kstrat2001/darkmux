@@ -67,9 +67,9 @@ pub struct WorkJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
 
-    /// Optional sprint-id binding — same semantics as DispatchOpts.sprint_id.
+    /// Optional phase-id binding — same semantics as DispatchOpts.phase_id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sprint_id: Option<String>,
+    pub phase_id: Option<String>,
 
     /// Which runtime the runner should use — `Openclaw` (default) or
     /// `Internal`. Wave-E.14 lifted this from `String` to the
@@ -93,7 +93,7 @@ pub struct WorkJob {
 
     /// Unix-millis when the job was published. Used for queue-age
     /// diagnostics + the eureka rule that fires when total wall-clock
-    /// < sum-of-sprint-wall-clocks (parallel-dispatch proof point).
+    /// < sum-of-phase-wall-clocks (parallel-dispatch proof point).
     pub published_at_unix_ms: u64,
 
     /// Machine that published the job (the dispatching orchestrator's
@@ -607,7 +607,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             deliver: None,
             workdir: None,
-            sprint_id: None,
+            phase_id: None,
             runtime: darkmux_crew::dispatch::Runtime::Internal,
             image: None,
             timeout_seconds: 60,

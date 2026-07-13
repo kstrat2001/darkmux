@@ -149,7 +149,7 @@ pub fn lms_bin() -> String {
 /// The LMStudio **base** URL (`scheme://host:port`), resolving
 /// `env(DARKMUX_LMSTUDIO_URL) > config.lmstudio_url > http://localhost:1234`.
 /// Callers append their endpoint path: `/v1/chat/completions`
-/// (`sprint_cli::lmstudio_chat_url`) and `/v1/models` (the `dispatch_internal`
+/// (`phase_cli::lmstudio_chat_url`) and `/v1/models` (the `dispatch_internal`
 /// model probe).
 ///
 /// (#661 Slice 4) `DARKMUX_LMSTUDIO_URL` is the **base** URL — a clean pre-1.0
@@ -354,7 +354,7 @@ pub fn check_updates() -> bool {
 }
 
 // ── Mission board (#1230 Packet 5) ──
-/// How many days an Active mission may sit with zero `Complete` sprints
+/// How many days an Active mission may sit with zero `Complete` phases
 /// before `darkmux mission status`'s drift detector flags it as stale.
 /// Resolves `env(DARKMUX_MISSION_STALE_ACTIVE_DAYS) >
 /// config.mission.stale_active_days > 14` — mirrors

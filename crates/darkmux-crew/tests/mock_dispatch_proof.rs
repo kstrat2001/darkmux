@@ -2,7 +2,7 @@
 //!
 //! Runs `darkmux_crew::dispatch::dispatch(DispatchOpts { runtime:
 //! Runtime::Internal, .. })` — the SAME function `darkmux crew dispatch` /
-//! `darkmux mission run` / `darkmux sprint review` call — for real:
+//! `darkmux mission run` / `darkmux phase review` call — for real:
 //!
 //!   - a REAL, genuinely separate OS process (`tools/darkmux-mock-model`)
 //!     is spawned and reached over a real TCP socket, standing in for
@@ -198,7 +198,7 @@ fn run_mock_dispatch(
         json: true,
         watch_paths: vec![],
         workdir: None,
-        sprint_id: None,
+        phase_id: None,
         runtime: Runtime::Internal,
         runtime_cmd: "openclaw".to_string(), // ignored on the internal runtime
         machine: None,

@@ -36,7 +36,7 @@ use std::path::Path;
 // seats). Minor bump, same lenient-read reasoning.
 // 1.3 (#1230 Packet 5): additive `mission{}` block (mission.stale_active_days
 // — the staleness threshold `darkmux mission status`'s drift detector uses
-// to flag an Active mission with zero Complete sprints). Minor bump, same
+// to flag an Active mission with zero Complete phases). Minor bump, same
 // lenient-read reasoning.
 pub const CONFIG_SCHEMA_VERSION: &str = "1.3";
 
@@ -247,9 +247,9 @@ pub struct RemoteConfig {
 /// `darkmux mission status`'s `detect_drift`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MissionConfig {
-    /// How many days an Active mission may sit with zero `Complete` sprints
+    /// How many days an Active mission may sit with zero `Complete` phases
     /// before `mission status` flags it as stale (default 14). The concrete
-    /// motivating case: `doom-loop-m4` sat at 0/4 sprints for ~20 days with
+    /// motivating case: `doom-loop-m4` sat at 0/4 phases for ~20 days with
     /// no drift surfaced at all, because the pre-#1230-Packet-5 detector
     /// only checked Closed+non-terminal and Active+all-terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub stale_active_days: Option<u64>,
@@ -384,7 +384,7 @@ impl DarkmuxConfig {
     /// (#1323) `ForceUser`, NOT `Auto`: config.json carries user/machine-level
     /// state (redis/audit/lms/machine_id) — there is no legitimate per-project
     /// config. Under `Auto`, the mere existence of a `<cwd>/.darkmux/` created
-    /// for an unrelated purpose (project-tier missions/sprints/lessons) silently
+    /// for an unrelated purpose (project-tier missions/phases/lessons) silently
     /// resolved the "home" to the project dir, defaulting redis+audit OFF — a
     /// real audit-trail hole on a self-hosted-runner checkout. Same shadowing
     /// class as #1012/#1016; this is the config/flow-sink resolution path.
@@ -408,7 +408,7 @@ mod tests {
     use super::*;
 
     /// (#1323) The config seam's self-defending conformance test: a project-local
-    /// `.darkmux/config.json` (created for missions/sprints/lessons) must NEVER
+    /// `.darkmux/config.json` (created for missions/phases/lessons) must NEVER
     /// shadow the user-scope config. `DARKMUX_HOME` is UNSET on purpose — with it
     /// set, `paths::resolve` short-circuits to the same root for every scope, so
     /// Auto and ForceUser wouldn't diverge and this guard would be hollow. If

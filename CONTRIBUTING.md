@@ -74,11 +74,11 @@ When filing a bug, please include:
 
 ## Project structure
 
-darkmux is a Cargo **workspace** — most code lives in focused crates under `crates/` (`darkmux-types`, `darkmux-profiles`, `darkmux-crew`, `darkmux-flow`, `darkmux-lab`, `darkmux-serve`, `darkmux-eureka`, `darkmux-doctor`, `darkmux-fleet`, …), with the agent runtime as its own excluded crate at `runtime/`. The thin binary entrypoint and the CLI verb modules (`flow_cli.rs`, `mission_propose.rs`, `role_cli.rs`, `sprint_cli.rs`, …) live in `src/`. Embedded assets (workload / role / skill manifests + prompts) live under `templates/builtin/`; integration tests are several `*.rs` files under `tests/` that spawn the compiled binary via `assert_cmd`.
+darkmux is a Cargo **workspace** — most code lives in focused crates under `crates/` (`darkmux-types`, `darkmux-profiles`, `darkmux-crew`, `darkmux-flow`, `darkmux-lab`, `darkmux-serve`, `darkmux-eureka`, `darkmux-doctor`, `darkmux-fleet`, …), with the agent runtime as its own excluded crate at `runtime/`. The thin binary entrypoint and the CLI verb modules (`flow_cli.rs`, `mission_propose.rs`, `role_cli.rs`, `phase_cli.rs`, …) live in `src/`. Embedded assets (workload / role / skill manifests + prompts) live under `templates/builtin/`; integration tests are several `*.rs` files under `tests/` that spawn the compiled binary via `assert_cmd`.
 
 The **authoritative, kept-current** map of where each module lives is the **"Where things live"** section of [`CLAUDE.md`](CLAUDE.md) — refer to it rather than a parallel list here. A duplicated map is exactly what drifts: this section previously described a pre-workspace `src/` monolith that no longer exists.
 
-For the **conceptual model** the code implements — role families, the mission/sprint lifecycle, the internal runtime + compaction, telemetry, and the flow record, each with a `path:line` citation and a shipped-vs-planned line — see [`docs/architecture/CONCEPTS.md`](docs/architecture/CONCEPTS.md). It's the source of truth a new contributor (or agent) should read before changing any of those surfaces.
+For the **conceptual model** the code implements — role families, the mission/phase lifecycle, the internal runtime + compaction, telemetry, and the flow record, each with a `path:line` citation and a shipped-vs-planned line — see [`docs/architecture/CONCEPTS.md`](docs/architecture/CONCEPTS.md). It's the source of truth a new contributor (or agent) should read before changing any of those surfaces.
 
 ## Releases
 

@@ -60,7 +60,7 @@ This is what the [M4 roadmap charter](docs/roadmap/M4.md) hardens, and it's grou
 - **Self-review is mostly confirmatory.** At one gate a coder's full test suite + linter were *all green on its own broken work*; only a *fresh-context* review caught the regressions. The Self-Verification Dilemma ([arXiv 2602.03485](https://arxiv.org/abs/2602.03485)) measures exactly this: re-checking in your own context entrenches the original answer, while cross-context *re-thinking* corrects it. So the reviewer runs in a fresh context, and escalation is becoming codified loop policy ([#849](https://github.com/kstrat2001/darkmux/issues/849)).
 - **A wrong, confident diagnosis is worse than none.** A lab run caught a reviewer verdict that *sounded* authoritative but was wrong; it sent the next coder in circles for 600 seconds, zero net progress, then a watchdog timeout. The fix: detect the no-progress signature and escalate instead of looping ([#453](https://github.com/kstrat2001/darkmux/issues/453)).
 
-darkmux drives this loop on **real production work** (FinSys, FinHub, and FinXtract, the finance products at [finhub.finhero.asia](https://finhub.finhero.asia)) and on darkmux itself. The recursive case is the strongest evidence: darkmux's own observability features were built *through* `mission run`, so the data those features visualize is the data the loop produced while building them. One self-building sprint ran 106 turns and ~5.2M prompt tokens with **zero compactions** (context peaked near 70K of a 262K window), which retired a standing question by turning it into a measurement: on a window that large the compaction threshold is a *cost* knob, not a correctness one.
+darkmux drives this loop on **real production work** (FinSys, FinHub, and FinXtract, the finance products at [finhub.finhero.asia](https://finhub.finhero.asia)) and on darkmux itself. The recursive case is the strongest evidence: darkmux's own observability features were built *through* `mission run`, so the data those features visualize is the data the loop produced while building them. One self-building phase ran 106 turns and ~5.2M prompt tokens with **zero compactions** (context peaked near 70K of a 262K window), which retired a standing question by turning it into a measurement: on a window that large the compaction threshold is a *cost* knob, not a correctness one.
 
 ### Observability — from a telemetry sketch to a unified stream
 
@@ -93,7 +93,7 @@ Single-operator multi-machine is the design target. The operator owns a couple o
 **Out of scope (today; may revisit)**:
 
 - Multi-tenant authn/authz (see [What darkmux is NOT](#what-darkmux-is-not)).
-- Cross-machine mission/sprint state replication (per-machine FS today; tracked as a future architectural pivot, [#280](https://github.com/kstrat2001/darkmux/issues/280)).
+- Cross-machine mission/phase state replication (per-machine FS today; tracked as a future architectural pivot, [#280](https://github.com/kstrat2001/darkmux/issues/280)).
 - Mission priority + cross-fleet pause/resume ([#282](https://github.com/kstrat2001/darkmux/issues/282)).
 - Elastic-hub failover (any peer promotable to hub), which would close the SPOF of a fixed-hub deployment.
 
@@ -120,10 +120,10 @@ The two runtimes overlap on the basic shape (model + system prompt + tools + cha
 |---|---|---|
 | Install footprint | Docker image (~150 MB) | openclaw binary + `~/.openclaw/openclaw.json` |
 | Workspace isolation | per-dispatch container (kernel-enforced) | host process + symlink fences |
-| Session model | per-dispatch tempdir; cross-dispatch state is file-mediated (sprint-as-contract) | persistent sessions at `~/.openclaw/agents/<id>/sessions/` |
+| Session model | per-dispatch tempdir; cross-dispatch state is file-mediated (phase-as-contract) | persistent sessions at `~/.openclaw/agents/<id>/sessions/` |
 | Agent registry | role manifests under `templates/builtin/roles/` (re-read every dispatch) | `agents.list[]` in `openclaw.json` (synced via `darkmux crew sync`) |
 | Tool surface | `read`, `edit`, `write`, `search`, `bash` | broader (adds `update_plan`, `process`, background lifecycle) |
-| Reach for it when | new install; out-of-box dispatching; sprint-as-contract workflows | already openclaw-wired; want session persistence; need `update_plan` / `process` |
+| Reach for it when | new install; out-of-box dispatching; phase-as-contract workflows | already openclaw-wired; want session persistence; need `update_plan` / `process` |
 
 The internal runtime has stricter isolation and a tighter feature surface scoped to darkmux's specific workflow needs. Openclaw has the broader feature surface and the mature ecosystem an existing operator may already depend on.
 
@@ -131,7 +131,7 @@ The internal runtime has stricter isolation and a tighter feature surface scoped
 
 When deciding what to add to the internal runtime, the filter is **workflow-fit**, not feature-parity with openclaw. darkmux is shaped by three load-bearing decisions:
 
-- **Mission-as-contract.** A sprint is a bounded unit of work with explicit inputs (prior sprint outputs, scope file), explicit outputs (typed text file persisted to disk), and explicit verify criteria. Cross-sprint memory is file-mediated by design, so the frontier orchestrator sees what state moves between sprints. Hidden session-state that survives across dispatches breaks this contract.
+- **Mission-as-contract.** A phase is a bounded unit of work with explicit inputs (prior phase outputs, scope file), explicit outputs (typed text file persisted to disk), and explicit verify criteria. Cross-phase memory is file-mediated by design, so the frontier orchestrator sees what state moves between phases. Hidden session-state that survives across dispatches breaks this contract.
 - **Utility/specialist split.** Utility agents (4B-class: compactor, scribe, estimator, mission-compiler) handle bounded structured work at high throughput. Specialist agents (35B+: coder, code-reviewer, analyst) handle judgment-dependent work at lower throughput. Features that push specialists toward utility work (mid-dispatch planning, todo tracking, autonomous replanning) collapse the layering that makes the split valuable, turning judgment-bearing work into hidden utility work.
 - **Operator sovereignty + frontier-as-strategic-layer.** The frontier orchestrator (Claude Code) holds the strategic context; utility agents structure under that context; specialists execute within it. Features that move strategic choices *down* into utility or specialist dispatches (opaque session state, automated replanning, scoped planning verbs) quietly relocate decision authority into layers that lack the context to make them well.
 

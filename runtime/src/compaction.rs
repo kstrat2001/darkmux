@@ -767,7 +767,7 @@ fn structured_output_response_format_schema() -> serde_json::Value {
                     "errors_to_preserve": {"type": "string"},
                     "next_concrete_actions": {"type": "string"},
                     "verify_criteria": {"type": "string"},
-                    "sprint_id": {"type": "string"}
+                    "phase_id": {"type": "string"}
                 },
                 "required": ["objective", "current_truth", "compaction_metadata"],
                 "additionalProperties": true
@@ -799,7 +799,7 @@ fn structured_compactor_system_prompt() -> &'static str {
        \"errors_to_preserve\": <string, optional>,\n  \
        \"next_concrete_actions\": <string, optional>,\n  \
        \"verify_criteria\": <string, optional>,\n  \
-       \"sprint_id\": <string, optional>\n  \
+       \"phase_id\": <string, optional>\n  \
      }\n\
      \n\
      Output JSON ONLY. No prose. No markdown fences. The metadata fields \
@@ -1009,7 +1009,7 @@ pub fn default_slot_caps_v0_1() -> std::collections::BTreeMap<String, u32> {
         ("errors_to_preserve", 2048),
         ("next_concrete_actions", 1024),
         ("verify_criteria", 1024),
-        ("sprint_id", 256),
+        ("phase_id", 256),
     ];
     entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
 }
@@ -1073,8 +1073,8 @@ pub fn apply_slot_caps(
     if let Some(&n) = caps.get("verify_criteria") {
         cap_opt(&mut out.verify_criteria, n as usize);
     }
-    if let Some(&n) = caps.get("sprint_id") {
-        cap_opt(&mut out.sprint_id, n as usize);
+    if let Some(&n) = caps.get("phase_id") {
+        cap_opt(&mut out.phase_id, n as usize);
     }
 }
 
@@ -1163,8 +1163,8 @@ pub fn render_structured_output_as_markdown(
     if let Some(s) = &out.verify_criteria {
         md.push_str(&format!("**Verify criteria:** {s}\n\n"));
     }
-    if let Some(s) = &out.sprint_id {
-        md.push_str(&format!("**Sprint:** {s}\n\n"));
+    if let Some(s) = &out.phase_id {
+        md.push_str(&format!("**Phase:** {s}\n\n"));
     }
     md
 }
@@ -1232,7 +1232,7 @@ pub struct StructuredCompactionOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_criteria: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sprint_id: Option<String>,
+    pub phase_id: Option<String>,
 }
 
 /// Nested under `StructuredCompactionOutput.current_truth`. Sub-slots
@@ -1640,7 +1640,7 @@ mod tests {
             errors_to_preserve: None,
             next_concrete_actions: None,
             verify_criteria: None,
-            sprint_id: None,
+            phase_id: None,
         }
     }
 
@@ -1768,7 +1768,7 @@ mod tests {
             errors_to_preserve: None,
             next_concrete_actions: None,
             verify_criteria: None,
-            sprint_id: None,
+            phase_id: None,
         };
         let md = render_structured_output_as_markdown(&out, 5);
         assert!(
@@ -1817,7 +1817,7 @@ mod tests {
             errors_to_preserve: Some("don't retry Y".into()),
             next_concrete_actions: Some("do Z".into()),
             verify_criteria: Some("npm test exits 0".into()),
-            sprint_id: Some("sprint-1".into()),
+            phase_id: Some("phase-1".into()),
         };
         let md = render_structured_output_as_markdown(&out, 5);
         assert!(md.contains("**Completed decisions:**"));
@@ -1869,7 +1869,7 @@ mod tests {
             "errors_to_preserve": "mockImplementation persists across tests",
             "next_concrete_actions": "Switch to mockImplementationOnce",
             "verify_criteria": "npm test exits 0",
-            "sprint_id": "sprint-42"
+            "phase_id": "phase-42"
         }"#;
         let out: StructuredCompactionOutput = serde_json::from_str(json).unwrap();
         assert_eq!(out.objective, "Audit refresh-token rotation tests");
@@ -1881,7 +1881,7 @@ mod tests {
             out.completed_decisions.as_deref(),
             Some("Decided to fix mock isolation")
         );
-        assert_eq!(out.sprint_id.as_deref(), Some("sprint-42"));
+        assert_eq!(out.phase_id.as_deref(), Some("phase-42"));
     }
 
     #[test]
@@ -1957,7 +1957,7 @@ mod tests {
             errors_to_preserve: None,
             next_concrete_actions: None,
             verify_criteria: None,
-            sprint_id: None,
+            phase_id: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: StructuredCompactionOutput = serde_json::from_str(&json).unwrap();
@@ -2851,7 +2851,7 @@ mod tests {
             errors_to_preserve: None,
             next_concrete_actions: None,
             verify_criteria: None,
-            sprint_id: None,
+            phase_id: None,
         }
     }
 

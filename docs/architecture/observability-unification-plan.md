@@ -63,7 +63,7 @@ Fold per-run telemetry into the flow stream as `FlowRecord`s. The schema is alre
 
 ```
 FlowRecord { ts, level, category, tier, stage, action, handle,
-             sprint_id?, session_id?, source?, model?, mission_id?, machine_id?,
+             phase_id?, session_id?, source?, model?, mission_id?, machine_id?,
              orchestrator?, prev_hash?, hash?, payload?, work_id?, attempt? }
 ```
 

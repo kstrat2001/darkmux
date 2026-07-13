@@ -409,7 +409,7 @@ pub struct RuntimeCompactionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<String>,
     /// Openclaw-shape passthrough + forward-compat overflow. Read by
-    /// existing consumers (`sprint_cli` reads `maxHistoryShare`; openclaw
+    /// existing consumers (`phase_cli` reads `maxHistoryShare`; openclaw
     /// runtime config-patching reads `model` / `mode` /
     /// `customInstructions`). Future Step 7 of #352 will stamp the
     /// resolved config onto each dispatch's flow record; until then
@@ -440,7 +440,7 @@ impl RuntimeCompactionConfig {
             ("errors_to_preserve", 2048),
             ("next_concrete_actions", 1024),
             ("verify_criteria", 1024),
-            ("sprint_id", 256),
+            ("phase_id", 256),
         ];
         entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
@@ -1391,7 +1391,7 @@ mod tests {
         assert_eq!(caps.get("errors_to_preserve"), Some(&2048));
         assert_eq!(caps.get("next_concrete_actions"), Some(&1024));
         assert_eq!(caps.get("verify_criteria"), Some(&1024));
-        assert_eq!(caps.get("sprint_id"), Some(&256));
+        assert_eq!(caps.get("phase_id"), Some(&256));
     }
 
     /// Operator-extensibility: arbitrary slot names (including ones

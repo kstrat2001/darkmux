@@ -2,7 +2,7 @@
 //! created with mode `0o600` (owner read/write only) so a misconfigured
 //! umask, a shared-filesystem mount, or a future multi-user fleet
 //! deployment can't leak roster contents (machine addresses, tier
-//! assignments, future bearer-token fields) or mission/sprint state
+//! assignments, future bearer-token fields) or mission/phase state
 //! (operator intent, prompts, descriptions) to other users.
 //!
 //! Pre-fix: every state writer used `fs::write` which respects the
@@ -114,7 +114,7 @@ fn lifecycle_save_json_is_owner_only_mode() {
         let crew = home.join(".darkmux").join("crew");
         let mission_id = "test-mission-e11";
         let mission_dir = crew.join("missions").join(mission_id);
-        std::fs::create_dir_all(mission_dir.join("sprints")).unwrap();
+        std::fs::create_dir_all(mission_dir.join("phases")).unwrap();
         let mission_path = mission_dir.join("mission.json");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -127,7 +127,7 @@ fn lifecycle_save_json_is_owner_only_mode() {
             "id": mission_id,
             "description": "e11 mode test",
             "status": "active",
-            "sprint_ids": [],
+            "phase_ids": [],
             "created_ts": now,
         });
         std::fs::write(&mission_path, serde_json::to_string_pretty(&body).unwrap())

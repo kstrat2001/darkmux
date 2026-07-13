@@ -18,7 +18,7 @@ pub use darkmux_doctor as doctor;
 pub use darkmux_eureka as eureka;
 mod external;
 // #515 — fleet extracted (deps crew/flow/types all crates now). Re-export
-// keeps crate::fleet::* resolving for serve/sprint_cli/notebook/mission_propose.
+// keeps crate::fleet::* resolving for serve/phase_cli/notebook/mission_propose.
 pub use darkmux_fleet as fleet;
 // #463 workspace split — flow extracted to the darkmux-flow crate. The
 // re-export keeps all existing `crate::flow::*` paths resolving unchanged.
@@ -50,10 +50,10 @@ pub use darkmux_recommendations as recommendations;
 mod role_cli;
 // #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
 // flow/profiles all crates). Re-export keeps crate::serve::* resolving for
-// main + sprint_cli.
+// main + phase_cli.
 pub use darkmux_serve as serve;
 mod skills;
-mod sprint_cli;
+mod phase_cli;
 // #463 workspace split (PR2) — profiles/swap/lms/runtime extracted to the
 // darkmux-profiles crate. These re-exports keep every existing
 // crate::{profiles,swap,lms,runtime}::* path resolving unchanged.
@@ -257,13 +257,13 @@ enum Cmd {
         #[command(subcommand)]
         sub: RoleCmd,
     },
-    /// Sprint planning — pre-dispatch budget oracle.
-    /// `darkmux sprint estimate <spec.json>` computes token consumption +
+    /// Phase planning — pre-dispatch budget oracle.
+    /// `darkmux phase estimate <spec.json>` computes token consumption +
     /// recommends a profile. `--narrate` adds a one-sentence operator-facing
     /// wrap from the 4B compactor.
-    Sprint {
+    Phase {
         #[command(subcommand)]
-        sub: SprintCmd,
+        sub: PhaseCmd,
     },
     /// Mission lifecycle — transition missions through their state machine.
     /// Mission status flows: Active ↔ Paused → Closed. All transitions are
@@ -580,16 +580,16 @@ enum CrewCmd {
         /// operator has set up manually.
         #[arg(long = "workdir", value_name = "PATH")]
         workdir: Option<std::path::PathBuf>,
-        /// Sprint id binding this dispatch to a sprint in a mission
-        /// (#146 Stage 1). When set, the dispatcher reads the sprint's
+        /// Phase id binding this dispatch to a phase in a mission
+        /// (#146 Stage 1). When set, the dispatcher reads the phase's
         /// `depends_on` parents and prepends each recorded output as a
-        /// "Prior sprint outputs" context block on the message. After
+        /// "Prior phase outputs" context block on the message. After
         /// the dispatch returns, the agent's reply text is persisted to
-        /// `<crew_root>/sprints/<sprint-id>-output.txt` so downstream
-        /// sprints can read it on their own dispatch. One-hop only —
+        /// `<crew_root>/phases/<phase-id>-output.txt` so downstream
+        /// phases can read it on their own dispatch. One-hop only —
         /// transitive ancestors are not walked (Stage 1 scope).
-        #[arg(long = "sprint-id", value_name = "ID")]
-        sprint_id: Option<String>,
+        #[arg(long = "phase-id", value_name = "ID")]
+        phase_id: Option<String>,
         /// Skip the pre-flight checks. Use only for debugging.
         #[arg(long, hide = true)]
         skip_preflight: bool,
@@ -610,7 +610,7 @@ enum CrewCmd {
         /// `runtime/README.md` for the internal runtime's scope.
         #[arg(long, default_value = "internal")]
         runtime: String,
-        /// Executable to invoke for the openclaw shell-out (Sprint-E
+        /// Executable to invoke for the openclaw shell-out (Phase-E
         /// replacement for the removed `DARKMUX_RUNTIME_CMD` env var).
         /// Defaults to `openclaw`; override to point at Aider, Cline,
         /// or any tool exposing the `<cmd> agent --agent <id> --json
@@ -708,7 +708,7 @@ enum RoleCmd {
 }
 
 #[derive(Subcommand)]
-enum SprintCmd {
+enum PhaseCmd {
     /// Pre-dispatch budget oracle. Reads a workload-spec JSON, computes
     /// predicted token consumption across planned turns, picks the
     /// smallest adequate profile, emits structured JSON.
@@ -731,22 +731,22 @@ enum SprintCmd {
         /// Exit nonzero if any BLOCK-severity findings.
         #[arg(long)]
         require_clean: bool,
-        /// Optional sprint identifier passed through to flow records.
-        #[arg(long = "sprint-id")]
-        sprint_id: Option<String>,
+        /// Optional phase identifier passed through to flow records.
+        #[arg(long = "phase-id")]
+        phase_id: Option<String>,
     },
-    /// Transition a sprint to `Running`. From `Planned` (first start) or
+    /// Transition a phase to `Running`. From `Planned` (first start) or
     /// `Abandoned` (restart — clears abandoned_ts). Stamps `started_ts=now()`.
     Start {
-        /// Sprint id (filename stem under ~/.darkmux/sprints/).
+        /// Phase id (filename stem under ~/.darkmux/phases/).
         id: String,
     },
-    /// Transition a `Running` sprint to `Complete` (terminal). Stamps
+    /// Transition a `Running` phase to `Complete` (terminal). Stamps
     /// `completed_ts=now()`. Wall-clock duration = completed_ts - started_ts.
     Complete { id: String },
-    /// Transition a `Planned` or `Running` sprint to `Abandoned`. Operator-
-    /// sovereign: only the operator marks a sprint dead; nothing auto-
-    /// abandons on staleness. A subsequent `sprint start` clears the
+    /// Transition a `Planned` or `Running` phase to `Abandoned`. Operator-
+    /// sovereign: only the operator marks a phase dead; nothing auto-
+    /// abandons on staleness. A subsequent `phase start` clears the
     /// abandonment (operator changed their mind).
     Abandon { id: String },
 }
@@ -754,9 +754,9 @@ enum SprintCmd {
 #[derive(Subcommand)]
 enum MissionCmd {
     /// Global mission-control read (#829): the whole board — every mission
-    /// grouped by status with sprint progress, the inconsistencies that need
-    /// attention (a Closed mission with a non-terminal sprint; an open mission
-    /// whose sprints are all done), and copy-pasteable reconcile commands.
+    /// grouped by status with phase progress, the inconsistencies that need
+    /// attention (a Closed mission with a non-terminal phase; an open mission
+    /// whose phases are all done), and copy-pasteable reconcile commands.
     /// READ-ONLY — surfaces and suggests, never mutates. The CLI twin of the
     /// viewer's missions lens; run it as session-start housekeeping.
     Status {
@@ -768,7 +768,7 @@ enum MissionCmd {
     /// Debrief a mission (#1000) — the post-mission review ceremony's raw
     /// material in one place: the loop pathologies darkmux's detectors flagged
     /// across the mission's runs (cautions), the corrections the reviewer
-    /// recorded (#849), and the mission's sprints + how each ended. READ-ONLY.
+    /// recorded (#849), and the mission's phases + how each ended. READ-ONLY.
     /// Run it (or let the close nudge prompt it) at mission completion; the
     /// `darkmux-mission-debrief` skill consumes `--json` to distill durable
     /// `lessons` (with the why) for the next crew. NASA vocabulary:
@@ -819,7 +819,7 @@ enum MissionCmd {
         #[arg(long)]
         reasoning: Option<String>,
     },
-    /// Propose a Mission + Sprints from unstructured input (#113 Sprint 3).
+    /// Propose a Mission + Phases from unstructured input (#113 Phase 3).
     /// Dispatches the `mission-compiler` utility agent against the input,
     /// renders the proposal to the operator for approve/edit/reject/regen,
     /// and writes the JSONs only after approval. The operator approval
@@ -861,31 +861,31 @@ enum MissionCmd {
         #[arg(long, value_name = "ID")]
         ticket: Option<String>,
     },
-    /// Add a new Sprint to an existing Mission mid-flight (#107).
+    /// Add a new Phase to an existing Mission mid-flight (#107).
     /// Operator-sovereign scope growth — alternative to either hand-
     /// editing JSON or filing a separate Mission for work that
     /// composes with the in-flight arc. Idempotent on exact-match
     /// (same id + mission + description); errors on collision or
     /// dangling depends_on.
-    AddSprint {
+    AddPhase {
         /// Mission id to extend (must exist).
         mission_id: String,
-        /// Id for the new Sprint (must not collide with any existing
-        /// sprint under a different mission; idempotent if same).
-        #[arg(long = "sprint-id")]
-        sprint_id: String,
-        /// Description of the new Sprint's scope.
+        /// Id for the new Phase (must not collide with any existing
+        /// phase under a different mission; idempotent if same).
+        #[arg(long = "phase-id")]
+        phase_id: String,
+        /// Description of the new Phase's scope.
         #[arg(long)]
         description: String,
-        /// Optional dependencies — other sprint ids that should
-        /// complete first. Each must reference an existing sprint.
+        /// Optional dependencies — other phase ids that should
+        /// complete first. Each must reference an existing phase.
         #[arg(long = "depends-on")]
         depends_on: Vec<String>,
-        /// Insert the new sprint immediately after this existing
-        /// sprint id (insert-in-middle). When omitted, the new
-        /// sprint is appended to the end of the mission's sprint
+        /// Insert the new phase immediately after this existing
+        /// phase id (insert-in-middle). When omitted, the new
+        /// phase is appended to the end of the mission's phase
         /// list (queue-on-end). The named id must already be in
-        /// the mission's sprint_ids — errors otherwise to surface
+        /// the mission's phase_ids — errors otherwise to surface
         /// typos and stale references.
         #[arg(long)]
         after: Option<String>,
@@ -895,14 +895,14 @@ enum MissionCmd {
         #[arg(long)]
         reasoning: Option<String>,
     },
-    /// Migrate mission + sprint storage from the pre-#148 flat layout
-    /// (`<crew>/missions/<id>.json`, `<crew>/sprints/<id>.json`) into the
+    /// Migrate mission + phase storage from the pre-#148 flat layout
+    /// (`<crew>/missions/<id>.json`, `<crew>/phases/<id>.json`) into the
     /// per-mission nested layout (`<crew>/missions/<id>/mission.json`,
-    /// `<crew>/missions/<id>/sprints/<sprint-id>.json`).
+    /// `<crew>/missions/<id>/phases/<phase-id>.json`).
     ///
     /// Dry-run by default — prints the proposed moves without touching any
     /// files. Pass `--apply` to commit the migration. Idempotent: re-running
-    /// after a successful apply is a no-op. Orphan sprints (whose
+    /// after a successful apply is a no-op. Orphan phases (whose
     /// `mission_id` has no matching mission on disk) are reported but never
     /// auto-moved; operator resolves them manually.
     Migrate {
@@ -911,15 +911,15 @@ enum MissionCmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Fan-out dispatch all initial-depends sprints (depends_on=[]) of a
+    /// Fan-out dispatch all initial-depends phases (depends_on=[]) of a
     /// mission across the fleet in parallel (#247, PR-D.1). One role
-    /// applies to every dispatched sprint — operator-explicit per the
+    /// applies to every dispatched phase — operator-explicit per the
     /// CLAUDE.md doctrine that mission planning is judgment-bearing
     /// work the operator owns.
     ///
-    /// Each sprint becomes a WorkJob published to the single global
+    /// Each phase becomes a WorkJob published to the single global
     /// `darkmux:work` stream (#590); the first available runner claims
-    /// and runs each one. Default `--wait` blocks until all sprints emit
+    /// and runs each one. Default `--wait` blocks until all phases emit
     /// `dispatch.complete` (or timeout). `--no-wait` returns immediately
     /// with the session_ids for later polling.
     ///
@@ -928,43 +928,43 @@ enum MissionCmd {
     Dispatch {
         /// Mission id to dispatch.
         mission_id: String,
-        /// Role to dispatch each sprint under (e.g. `coder`,
-        /// `code-reviewer`). One role applies to every dispatched sprint.
+        /// Role to dispatch each phase under (e.g. `coder`,
+        /// `code-reviewer`). One role applies to every dispatched phase.
         #[arg(long)]
         role: String,
-        /// Optional advisory target machine for every sprint. When
+        /// Optional advisory target machine for every phase. When
         /// omitted, jobs publish with no `target_machine` hint — the
         /// first available runner claims each (pull semantics). The hint
         /// is advisory (#590): any runner may claim regardless.
         #[arg(long, value_name = "ID")]
         machine: Option<String>,
-        /// Per-sprint dispatch timeout (seconds). Default 600.
+        /// Per-phase dispatch timeout (seconds). Default 600.
         #[arg(long, default_value = "600")]
         timeout: u32,
-        /// Return immediately after publishing all sprint jobs instead
+        /// Return immediately after publishing all phase jobs instead
         /// of blocking on each `dispatch.complete`. Default is `--wait`.
         #[arg(long)]
         no_wait: bool,
     },
-    /// Run one sprint's dispatch-to-PR loop LOCALLY, up to the sign-off
-    /// gate. Unlike `dispatch` (which fans sprints onto the fleet work
-    /// queue), `run` is synchronous and single-sprint on this machine:
+    /// Run one phase's dispatch-to-PR loop LOCALLY, up to the sign-off
+    /// gate. Unlike `dispatch` (which fans phases onto the fleet work
+    /// queue), `run` is synchronous and single-phase on this machine:
     /// it creates an isolated git worktree, dispatches the coder into it,
     /// runs the local `code-reviewer` QA against the diff, surfaces the
     /// result + tokens-off-meter + findings, then STOPS — nothing is
     /// committed, PR'd, or merged. Adjudicating findings and merging are
     /// gate steps for the operator/frontier (never auto-merge). After
-    /// sign-off, `darkmux mission ship <id> --sprint <sprint-id>` finishes
+    /// sign-off, `darkmux mission ship <id> --phase <phase-id>` finishes
     /// the loop. (#782)
     Run {
-        /// Mission id to run a sprint from.
+        /// Mission id to run a phase from.
         mission_id: String,
-        /// Sprint to run. Optional — when omitted, the single ready sprint
+        /// Phase to run. Optional — when omitted, the single ready phase
         /// (Planned, no unmet dependencies) is auto-selected; 0 or >1 ready
-        /// sprints is ambiguous and bails asking for an explicit `--sprint`.
+        /// phases is ambiguous and bails asking for an explicit `--phase`.
         #[arg(long, value_name = "ID")]
-        sprint: Option<String>,
-        /// Role to dispatch the sprint under. Default `coder`.
+        phase: Option<String>,
+        /// Role to dispatch the phase under. Default `coder`.
         #[arg(long, default_value = "coder")]
         role: String,
         /// Dispatch image. The default slim runtime image is used when
@@ -983,37 +983,37 @@ enum MissionCmd {
         #[arg(long, default_value = "600")]
         timeout: u32,
     },
-    /// Abort a `mission run` cleanly: remove the sprint's worktree + branch
-    /// and flip the sprint to Abandoned. The explicit teardown for a run
+    /// Abort a `mission run` cleanly: remove the phase's worktree + branch
+    /// and flip the phase to Abandoned. The explicit teardown for a run
     /// the operator/frontier decides to back out of (vs. leaving an orphan
     /// worktree). (#782)
     Abort {
         /// Mission id.
         mission_id: String,
-        /// Sprint to abort. Optional — when omitted, the single ready sprint
-        /// is selected (pass `--sprint` explicitly to abort a Running one).
+        /// Phase to abort. Optional — when omitted, the single ready phase
+        /// is selected (pass `--phase` explicitly to abort a Running one).
         #[arg(long, value_name = "ID")]
-        sprint: Option<String>,
+        phase: Option<String>,
     },
     /// Ship a `mission run`'s work: commit the worktree, push the branch,
     /// and open (or reuse) the PR. By DEFAULT stops at the PR — merging is
     /// the operator/frontier's explicit act (never auto-merge). `--wait-ci`
     /// blocks on CI; `--merge` (opt-in, green-gated) squash-merges, flips the
-    /// sprint to Complete, and tears down the worktree. (#782)
+    /// phase to Complete, and tears down the worktree. (#782)
     Ship {
         /// Mission id.
         mission_id: String,
-        /// Sprint to ship. Optional — when omitted the single ready sprint
-        /// is selected (pass `--sprint` explicitly for a Running sprint).
+        /// Phase to ship. Optional — when omitted the single ready phase
+        /// is selected (pass `--phase` explicitly for a Running phase).
         #[arg(long, value_name = "ID")]
-        sprint: Option<String>,
+        phase: Option<String>,
         /// Base branch the PR targets. Default `main`.
         #[arg(long, default_value = "main")]
         base: String,
         /// Block on CI checks until they finish, then report green/red.
         #[arg(long)]
         wait_ci: bool,
-        /// After CI is green, squash-merge the PR, mark the sprint Complete,
+        /// After CI is green, squash-merge the PR, mark the phase Complete,
         /// and remove the worktree. Opt-in — refuses to merge if CI isn't
         /// green. Without this flag, ship stops at the PR.
         #[arg(long)]
@@ -1147,7 +1147,7 @@ enum NotebookCmd {
     /// Draft a notebook entry from a recorded run via the active role.
     Draft {
         run_id: String,
-        /// DM role id to dispatch the drafting prompt through (Sprint-H
+        /// DM role id to dispatch the drafting prompt through (Phase-H
         /// rename from `--agent`; Beat 36 — DM concepts primary on
         /// DM-side surfaces). Resolves through
         /// `templates/builtin/roles/<role>.{json,md}` under the
@@ -1165,12 +1165,12 @@ enum NotebookCmd {
         #[arg(long)]
         machine: Option<String>,
         /// Which agent runtime to dispatch through. Default `internal`
-        /// is darkmux's in-house container-bounded runtime (Sprint-H
+        /// is darkmux's in-house container-bounded runtime (Phase-H
         /// — Beat 36 finish); `openclaw` opts into the legacy
         /// shell-out path.
         #[arg(long, default_value = "internal")]
         runtime: String,
-        /// Executable to invoke for the openclaw shell-out (Sprint-E
+        /// Executable to invoke for the openclaw shell-out (Phase-E
         /// pattern). Only consulted when `--runtime openclaw`.
         #[arg(long = "runtime-cmd", value_name = "PATH", default_value = "openclaw")]
         runtime_cmd: String,
@@ -1327,7 +1327,7 @@ enum LabCmd {
         /// target the operator opts into per dispatch.
         #[arg(long, default_value = "internal")]
         runtime: String,
-        /// Executable to invoke for the openclaw shell-out (Sprint-E
+        /// Executable to invoke for the openclaw shell-out (Phase-E
         /// replacement for the removed `DARKMUX_RUNTIME_CMD` env var).
         /// Defaults to `openclaw`; override to point at Aider, Cline,
         /// or any tool exposing the `<cmd> agent --message` calling
@@ -1485,7 +1485,7 @@ enum LabCmd {
         #[arg(long)]
         ab: bool,
         /// Scope the injected cautions + corrections to this mission's
-        /// dispatches (its `mission-run-<id>-<sprint>` sessions). Without it,
+        /// dispatches (its `mission-run-<id>-<phase>` sessions). Without it,
         /// only the repo's authored lessons inject. Requires `--ab` (clap
         /// errors otherwise, so the flag is never a silent no-op).
         #[arg(long = "inject-from-mission", requires = "ab")]
@@ -1625,7 +1625,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::PrReview { sub } => cmd_pr_review(sub),
         Cmd::Lessons { sub } => cmd_lessons(sub),
         Cmd::Role { sub } => cmd_role(sub),
-        Cmd::Sprint { sub } => cmd_sprint(sub),
+        Cmd::Phase { sub } => cmd_phase(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
         Cmd::Recommendations { sub } => cmd_recommendations(sub),
         Cmd::Flow { sub } => {
@@ -1898,9 +1898,9 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
             runtime_cmd,
         } => {
             let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
-            // Sprint-E loud-bail gate: --runtime-cmd is only valid under
+            // Phase-E loud-bail gate: --runtime-cmd is only valid under
             // --runtime openclaw. Silent ignore would re-introduce the
-            // implicit-state pattern Sprint-E removed.
+            // implicit-state pattern Phase-E removed.
             if runtime_flag != crew::dispatch::Runtime::Openclaw && runtime_cmd != "openclaw" {
                 anyhow::bail!(
                     "--runtime-cmd `{runtime_cmd}` is only valid with --runtime openclaw \
@@ -2209,41 +2209,41 @@ fn cmd_role(sub: RoleCmd) -> Result<i32> {
     }
 }
 
-fn cmd_sprint(sub: SprintCmd) -> Result<i32> {
+fn cmd_phase(sub: PhaseCmd) -> Result<i32> {
     match sub {
-        SprintCmd::Estimate { spec, narrate } => sprint_cli::estimate(&spec, narrate),
-        SprintCmd::Review {
+        PhaseCmd::Estimate { spec, narrate } => phase_cli::estimate(&spec, narrate),
+        PhaseCmd::Review {
             base,
             require_clean,
-            sprint_id,
+            phase_id,
         } => {
-            let sid = sprint_id.as_deref();
-            sprint_cli::sprint_review(base.as_deref(), require_clean, sid)
+            let sid = phase_id.as_deref();
+            phase_cli::phase_review(base.as_deref(), require_clean, sid)
         }
-        SprintCmd::Start { id } => {
-            let s = crew::lifecycle::sprint_start(&id)?;
+        PhaseCmd::Start { id } => {
+            let s = crew::lifecycle::phase_start(&id)?;
             println!(
-                "sprint `{}` → Running  started_ts={}",
+                "phase `{}` → Running  started_ts={}",
                 s.id,
                 s.started_ts.unwrap_or(0)
             );
             Ok(0)
         }
-        SprintCmd::Complete { id } => {
-            let s = crew::lifecycle::sprint_complete(&id)?;
+        PhaseCmd::Complete { id } => {
+            let s = crew::lifecycle::phase_complete(&id)?;
             let started = s.started_ts.unwrap_or(0);
             let completed = s.completed_ts.unwrap_or(0);
             let dur = completed.saturating_sub(started);
             println!(
-                "sprint `{}` → Complete  duration={}s  completed_ts={}",
+                "phase `{}` → Complete  duration={}s  completed_ts={}",
                 s.id, dur, completed
             );
             Ok(0)
         }
-        SprintCmd::Abandon { id } => {
-            let s = crew::lifecycle::sprint_abandon(&id)?;
+        PhaseCmd::Abandon { id } => {
+            let s = crew::lifecycle::phase_abandon(&id)?;
             println!(
-                "sprint `{}` → Abandoned  abandoned_ts={}",
+                "phase `{}` → Abandoned  abandoned_ts={}",
                 s.id,
                 s.abandoned_ts.unwrap_or(0)
             );
@@ -2305,17 +2305,17 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             start,
             ticket,
         } => mission_propose::propose(from_stdin, from_file.as_deref(), yes, start, ticket.as_deref()),
-        MissionCmd::AddSprint {
+        MissionCmd::AddPhase {
             mission_id,
-            sprint_id,
+            phase_id,
             description,
             depends_on,
             after,
             reasoning,
         } => {
-            let s = crew::lifecycle::add_sprint_to_mission_with_reasoning(
+            let s = crew::lifecycle::add_phase_to_mission_with_reasoning(
                 &mission_id,
-                &sprint_id,
+                &phase_id,
                 &description,
                 depends_on,
                 after.as_deref(),
@@ -2326,7 +2326,7 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
                 None => String::new(),
             };
             println!(
-                "mission `{}` ← added sprint `{}`{}",
+                "mission `{}` ← added phase `{}`{}",
                 mission_id, s.id, position
             );
             Ok(0)
@@ -2344,7 +2344,7 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             if !plan.is_empty() {
                 println!(
                     "\nmigrate: applied {} move(s).",
-                    plan.mission_moves.len() + plan.sprint_moves.len()
+                    plan.mission_moves.len() + plan.phase_moves.len()
                 );
             }
             Ok(0)
@@ -2358,14 +2358,14 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
         } => cmd_mission_dispatch(&mission_id, &role, machine.as_deref(), timeout, !no_wait),
         MissionCmd::Run {
             mission_id,
-            sprint,
+            phase,
             role,
             image,
             base,
             timeout,
         } => mission_run::run(
             &mission_id,
-            sprint.as_deref(),
+            phase.as_deref(),
             &role,
             image.as_deref(),
             &base,
@@ -2373,15 +2373,15 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
         ),
         MissionCmd::Abort {
             mission_id,
-            sprint,
-        } => mission_run::abort(&mission_id, sprint.as_deref()),
+            phase,
+        } => mission_run::abort(&mission_id, phase.as_deref()),
         MissionCmd::Ship {
             mission_id,
-            sprint,
+            phase,
             base,
             wait_ci,
             merge,
-        } => mission_run::ship(&mission_id, sprint.as_deref(), &base, wait_ci, merge),
+        } => mission_run::ship(&mission_id, phase.as_deref(), &base, wait_ci, merge),
     }
 }
 
@@ -2392,7 +2392,7 @@ fn cmd_mission_dispatch(
     timeout_seconds: u32,
     wait: bool,
 ) -> Result<i32> {
-    use crew::loader::{load_missions, load_roles, load_sprints};
+    use crew::loader::{load_missions, load_roles, load_phases};
 
     // 0. CLI-boundary charset validation (Wave-E.5 #255 — security-
     //    auditor MEDIUM from PR-D.1 review). `mission_id` flows into
@@ -2424,8 +2424,8 @@ fn cmd_mission_dispatch(
         );
     }
 
-    // 2. Confirm the role exists before fanning out sprints. After #590
-    //    there is no tier requirement — sprints fan onto the single
+    // 2. Confirm the role exists before fanning out phases. After #590
+    //    there is no tier requirement — phases fan onto the single
     //    global `darkmux:work` stream and the first available runner
     //    claims each one.
     let roles = load_roles()?;
@@ -2433,59 +2433,59 @@ fn cmd_mission_dispatch(
         anyhow::bail!("role `{role_id}` not found");
     }
 
-    // 3. Filter sprints: this mission + ready + status=Planned. Ready
+    // 3. Filter phases: this mission + ready + status=Planned. Ready
     //    (#1230 Packet 2) means `crew::scheduler::is_ready` via the
-    //    `SprintNode` adapter — Planned AND every `depends_on` entry
-    //    resolves to a Complete sprint — replacing the historical flat
+    //    `PhaseNode` adapter — Planned AND every `depends_on` entry
+    //    resolves to a Complete phase — replacing the historical flat
     //    `depends_on.is_empty()` filter, which only ever fanned out
-    //    sprints with NO dependencies at all and never actually checked
-    //    whether a sprint's dependencies had been satisfied.
+    //    phases with NO dependencies at all and never actually checked
+    //    whether a phase's dependencies had been satisfied.
     //    `Running` is NOT included — PR-D.1 filter-level guard (subsumed
     //    by `is_ready` requiring `Planned`). Wave-E.3 adds the
-    //    state-machine gate: each filtered sprint goes through
-    //    `lifecycle::sprint_start` BEFORE publish, flipping Planned →
+    //    state-machine gate: each filtered phase goes through
+    //    `lifecycle::phase_start` BEFORE publish, flipping Planned →
     //    Running. A second `mission dispatch` invocation finds 0
-    //    dispatchable sprints (all Running now) and bails with exit 2.
-    let sprints = load_sprints()?;
-    let sprint_nodes: Vec<crew::scheduler::SprintNode> =
-        sprints.iter().map(crew::scheduler::SprintNode).collect();
-    let sprint_by_id: std::collections::BTreeMap<String, &crew::scheduler::SprintNode> =
-        sprint_nodes.iter().map(|n| (n.0.id.clone(), n)).collect();
-    let initial: Vec<_> = sprints
+    //    dispatchable phases (all Running now) and bails with exit 2.
+    let phases = load_phases()?;
+    let phase_nodes: Vec<crew::scheduler::PhaseNode> =
+        phases.iter().map(crew::scheduler::PhaseNode).collect();
+    let phase_by_id: std::collections::BTreeMap<String, &crew::scheduler::PhaseNode> =
+        phase_nodes.iter().map(|n| (n.0.id.clone(), n)).collect();
+    let initial: Vec<_> = phases
         .iter()
         .filter(|s| s.mission_id == mission_id)
-        .filter(|s| crew::scheduler::is_ready(&crew::scheduler::SprintNode(s), &sprint_by_id))
+        .filter(|s| crew::scheduler::is_ready(&crew::scheduler::PhaseNode(s), &phase_by_id))
         .collect();
 
     if initial.is_empty() {
         eprintln!(
-            "darkmux mission dispatch: no sprints with depends_on=[] in mission `{mission_id}` \
-             in Planned status. Nothing to fan out. (Running sprints from a previous \
-             dispatch must be `darkmux sprint complete` or `sprint abandon` before \
+            "darkmux mission dispatch: no phases with depends_on=[] in mission `{mission_id}` \
+             in Planned status. Nothing to fan out. (Running phases from a previous \
+             dispatch must be `darkmux phase complete` or `phase abandon` before \
              they're eligible again.)"
         );
         return Ok(2);
     }
 
-    // 3b. Flip each filtered sprint Planned → Running BEFORE publishing.
-    //     If a sprint flipped between the filter and this call (unlikely
+    // 3b. Flip each filtered phase Planned → Running BEFORE publishing.
+    //     If a phase flipped between the filter and this call (unlikely
     //     in single-operator scenarios but possible under racing CLIs),
-    //     `sprint_start` bails on already-Running; skip and warn.
-    let mut started: Vec<&crew::types::Sprint> = Vec::with_capacity(initial.len());
-    for sprint in &initial {
-        match crew::lifecycle::sprint_start(&sprint.id) {
-            Ok(_) => started.push(*sprint),
+    //     `phase_start` bails on already-Running; skip and warn.
+    let mut started: Vec<&crew::types::Phase> = Vec::with_capacity(initial.len());
+    for phase in &initial {
+        match crew::lifecycle::phase_start(&phase.id) {
+            Ok(_) => started.push(*phase),
             Err(e) => {
                 eprintln!(
-                    "darkmux mission dispatch: skipping sprint `{}` — sprint_start failed: {e:#}",
-                    sprint.id
+                    "darkmux mission dispatch: skipping phase `{}` — phase_start failed: {e:#}",
+                    phase.id
                 );
             }
         }
     }
     if started.is_empty() {
         eprintln!(
-            "darkmux mission dispatch: no sprints survived sprint_start (all were \
+            "darkmux mission dispatch: no phases survived phase_start (all were \
              already Running/Complete). Nothing to fan out."
         );
         return Ok(2);
@@ -2500,7 +2500,7 @@ fn cmd_mission_dispatch(
         .with_context(|| format!("opening Redis client {raw_url} for mission dispatch"))?;
 
     // 5. Build + pre-validate all WorkJobs BEFORE publishing any
-    //    (HIGH-2 from review). All-or-nothing semantics: if any sprint
+    //    (HIGH-2 from review). All-or-nothing semantics: if any phase
     //    would trip validate() (oversize description, etc.), the
     //    operator finds out before ANY orphan job lands on Redis.
     //    Loop-index suffix on session_id defeats microsecond collisions
@@ -2511,20 +2511,20 @@ fn cmd_mission_dispatch(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros())
         .unwrap_or(0);
-    let mut jobs: Vec<(String, String, fleet::WorkJob)> = Vec::new(); // (sprint_id, session_id, job)
-    for (idx, sprint) in started.iter().enumerate() {
+    let mut jobs: Vec<(String, String, fleet::WorkJob)> = Vec::new(); // (phase_id, session_id, job)
+    for (idx, phase) in started.iter().enumerate() {
         let session_id = format!(
-            "mission-{}-sprint-{}-{}-{}",
-            mission_id, sprint.id, dispatch_micros, idx
+            "mission-{}-phase-{}-{}-{}",
+            mission_id, phase.id, dispatch_micros, idx
         );
         let job = fleet::build_work_job(
             machine.map(String::from),
             role_id.to_string(),
-            sprint.description.clone(),
+            phase.description.clone(),
             session_id.clone(),
             None,
             None,
-            Some(sprint.id.clone()),
+            Some(phase.id.clone()),
             // Mission dispatch publishes work jobs to peers; the runner
             // on the receiving machine runs the role through the
             // internal Docker-bounded runtime (same default as local
@@ -2539,35 +2539,35 @@ fn cmd_mission_dispatch(
         // Pre-validate. Surfaces oversize/charset failures BEFORE any
         // partial publish lands on the queue.
         job.validate()
-            .with_context(|| format!("pre-publish validation failed for sprint `{}`", sprint.id))?;
-        jobs.push((sprint.id.clone(), session_id, job));
+            .with_context(|| format!("pre-publish validation failed for phase `{}`", phase.id))?;
+        jobs.push((phase.id.clone(), session_id, job));
     }
 
     // 6. Publish. Capture sessions for wait-aggregation. If a mid-loop
     //    publish fails (Redis network blip), the operator gets the
-    //    list of already-published (sprint_id, session_id, work_id)
+    //    list of already-published (phase_id, session_id, work_id)
     //    triples on stderr so they can dedup / clean up via flow tail.
     eprintln!(
         "darkmux mission dispatch: mission={mission_id} role={role_id} \
-         sprints={} target_machine={}",
+         phases={} target_machine={}",
         jobs.len(),
         machine.unwrap_or("<any>")
     );
-    let mut sessions: Vec<(String, String, String)> = Vec::new(); // (sprint_id, session_id, work_id)
-    for (sprint_id, session_id, job) in &jobs {
+    let mut sessions: Vec<(String, String, String)> = Vec::new(); // (phase_id, session_id, work_id)
+    for (phase_id, session_id, job) in &jobs {
         match fleet::publish_job(&client, job) {
             Ok(work_id) => {
-                eprintln!("  sprint={sprint_id} work_id={work_id} session={session_id}");
-                sessions.push((sprint_id.clone(), session_id.clone(), work_id));
+                eprintln!("  phase={phase_id} work_id={work_id} session={session_id}");
+                sessions.push((phase_id.clone(), session_id.clone(), work_id));
             }
             Err(e) => {
                 eprintln!(
-                    "\ndarkmux mission dispatch: ERROR — publish failed for sprint `{sprint_id}` \
+                    "\ndarkmux mission dispatch: ERROR — publish failed for phase `{phase_id}` \
                      after {} successful publishes. Already-published jobs are in flight on runners:",
                     sessions.len()
                 );
                 for (sid, sess, wid) in &sessions {
-                    eprintln!("  ORPHAN sprint={sid} session={sess} work_id={wid}");
+                    eprintln!("  ORPHAN phase={sid} session={sess} work_id={wid}");
                 }
                 eprintln!(
                     "Tail each via `darkmux flow tail --session <id>` OR \
@@ -2576,18 +2576,18 @@ fn cmd_mission_dispatch(
                      double-fire the orphans."
                 );
                 return Err(e)
-                    .with_context(|| format!("publishing sprint `{sprint_id}` as WorkJob"));
+                    .with_context(|| format!("publishing phase `{phase_id}` as WorkJob"));
             }
         }
     }
 
     if !wait {
         println!(
-            "Published {} sprint job(s); operator polls for completion via flow stream.",
+            "Published {} phase job(s); operator polls for completion via flow stream.",
             sessions.len()
         );
-        for (sprint_id, session_id, work_id) in &sessions {
-            println!("  sprint={sprint_id} session_id={session_id} work_id={work_id}");
+        for (phase_id, session_id, work_id) in &sessions {
+            println!("  phase={phase_id} session_id={session_id} work_id={work_id}");
         }
         return Ok(0);
     }
@@ -2595,7 +2595,7 @@ fn cmd_mission_dispatch(
     // 6. Wait for each completion. Sequential polling is correct (XRANGE
     //    full-scan returns ALL records; finding session A doesn't preclude
     //    finding session B in the same pass). Net wall-clock is bounded by
-    //    the slowest sprint's completion.
+    //    the slowest phase's completion.
     let wait_timeout = std::time::Duration::from_secs((timeout_seconds as u64).saturating_add(60));
     eprintln!(
         "\n{}",
@@ -2604,8 +2604,8 @@ fn cmd_mission_dispatch(
     let mut completed: usize = 0;
     let mut failures: usize = 0;
     let mission_start = std::time::Instant::now();
-    let mut sum_sprint_wall_ms: u64 = 0;
-    for (sprint_id, session_id, _work_id) in &sessions {
+    let mut sum_phase_wall_ms: u64 = 0;
+    for (phase_id, session_id, _work_id) in &sessions {
         match fleet::wait_for_completion(&raw_url, session_id, wait_timeout) {
             Ok(c) => {
                 completed += 1;
@@ -2613,36 +2613,36 @@ fn cmd_mission_dispatch(
                     failures += 1;
                 }
                 if let Some(ms) = c.wall_ms {
-                    sum_sprint_wall_ms += ms;
+                    sum_phase_wall_ms += ms;
                 }
                 eprintln!(
-                    "  ✓ sprint={sprint_id} result={} wall_ms={:?}",
+                    "  ✓ phase={phase_id} result={} wall_ms={:?}",
                     c.result_class, c.wall_ms
                 );
             }
             Err(e) => {
                 failures += 1;
-                eprintln!("  ✗ sprint={sprint_id} wait error: {e:#}");
+                eprintln!("  ✗ phase={phase_id} wait error: {e:#}");
             }
         }
     }
     let mission_wall_ms = mission_start.elapsed().as_millis() as u64;
 
     // Empirical parallelism check (#246 Q3 risk #3): if total wall-clock
-    // is meaningfully less than sum of sprint wall-clocks, dispatches
+    // is meaningfully less than sum of phase wall-clocks, dispatches
     // ran in parallel. Otherwise they were serial under the hood.
     println!(
         "\nmission dispatch: completed={completed}/{} failures={failures} \
-         wall_ms={mission_wall_ms} sum_sprint_wall_ms={sum_sprint_wall_ms}",
+         wall_ms={mission_wall_ms} sum_phase_wall_ms={sum_phase_wall_ms}",
         sessions.len()
     );
-    match speedup_verdict(sum_sprint_wall_ms, mission_wall_ms, sessions.len()) {
+    match speedup_verdict(sum_phase_wall_ms, mission_wall_ms, sessions.len()) {
         SpeedupVerdict::ParallelConfirmed { speedup } => println!(
             "  → wall-clock indicates parallel execution: {speedup:.2}× speedup vs the \
-             sum of per-sprint wall_ms (runner self-reported; not authenticated)."
+             sum of per-phase wall_ms (runner self-reported; not authenticated)."
         ),
         SpeedupVerdict::SeriallySuspect { speedup } => println!(
-            "  ⚠ wall_ms ≈ sum of sprint wall_ms ({speedup:.2}×) — sprints may have run \
+            "  ⚠ wall_ms ≈ sum of phase wall_ms ({speedup:.2}×) — phases may have run \
              serially. Check fleet roster + runner reachability."
         ),
         SpeedupVerdict::Inconclusive => {}
@@ -2657,31 +2657,31 @@ fn cmd_mission_dispatch(
 
 /// Render the operator-facing "waiting for N completion(s)" banner with
 /// the worst-case wall-clock bound named up front (Wave-E.9 #255). The
-/// wait loop is sequential-per-sprint, so worst case is
-/// `N × (per_sprint_timeout + slack)`. Surfacing this lets the operator
-/// decide whether to SIGINT before the second per-sprint timeout if the
-/// first sprint hangs — closes the PR-D.1 review MEDIUM where the
+/// wait loop is sequential-per-phase, so worst case is
+/// `N × (per_phase_timeout + slack)`. Surfacing this lets the operator
+/// decide whether to SIGINT before the second per-phase timeout if the
+/// first phase hangs — closes the PR-D.1 review MEDIUM where the
 /// unbounded total wait could quietly run hours.
 pub fn worst_case_wait_banner(
     n_sessions: usize,
-    per_sprint_timeout_seconds: u32,
+    per_phase_timeout_seconds: u32,
     wait_timeout_seconds: u64,
 ) -> String {
     let worst_case_secs = (n_sessions as u64).saturating_mul(wait_timeout_seconds);
     format!(
         "darkmux mission dispatch: waiting for {n_sessions} completion(s) \
-         (per-sprint timeout {per_sprint_timeout_seconds}s + 60s slack; \
+         (per-phase timeout {per_phase_timeout_seconds}s + 60s slack; \
          worst-case total wall ≈ {worst_case_secs}s = {worst_case_min}min). \
          SIGINT cleanly aborts.",
         worst_case_min = worst_case_secs / 60,
     )
 }
 
-/// Minimum speedup ratio (sum_sprint_wall_ms / mission_wall_ms) at which
+/// Minimum speedup ratio (sum_phase_wall_ms / mission_wall_ms) at which
 /// the mission-dispatch summary asserts "parallel execution." Below this,
 /// the metric is reported with a serially-suspect warning OR nothing
 /// (n=1 case). 1.5 is a conservative threshold for 2-machine fleets —
-/// noise and per-sprint setup overhead can push a truly-parallel run
+/// noise and per-phase setup overhead can push a truly-parallel run
 /// below 2.0× speedup. Adjust upward if false-positives appear.
 const PARALLELISM_CONFIRMED_THRESHOLD: f64 = 1.5;
 
@@ -2692,46 +2692,46 @@ const PARALLELISM_CONFIRMED_THRESHOLD: f64 = 1.5;
 #[derive(Debug, PartialEq)]
 pub enum SpeedupVerdict {
     /// Wall-clock indicates parallel execution: speedup ≥
-    /// `PARALLELISM_CONFIRMED_THRESHOLD` AND more than one sprint
+    /// `PARALLELISM_CONFIRMED_THRESHOLD` AND more than one phase
     /// completed. Caller renders an operator-facing
     /// "parallel execution: Nx speedup" line.
     ParallelConfirmed { speedup: f64 },
-    /// Wall-clock ≈ sum-of-sprints (`speedup < threshold`) with multiple
-    /// sprints — sprints may have run serially under the hood. Caller
+    /// Wall-clock ≈ sum-of-phases (`speedup < threshold`) with multiple
+    /// phases — phases may have run serially under the hood. Caller
     /// renders the operator-warning line pointing at fleet roster +
     /// runner reachability.
     SeriallySuspect { speedup: f64 },
     /// Insufficient data to assert parallel vs serial: either zero
-    /// sprints completed (`sum_sprint_wall_ms == 0`) OR exactly one
-    /// sprint (parallelism is undefined for n=1). Caller stays silent.
+    /// phases completed (`sum_phase_wall_ms == 0`) OR exactly one
+    /// phase (parallelism is undefined for n=1). Caller stays silent.
     Inconclusive,
 }
 
 /// Pure-function speedup verdict computation. Inputs are the metric
 /// summaries collected during `mission dispatch --wait`:
 ///
-/// - `sum_sprint_wall_ms` — sum of `wall_ms` from each
+/// - `sum_phase_wall_ms` — sum of `wall_ms` from each
 ///   `dispatch.complete` flow record. Runner self-reported.
 /// - `mission_wall_ms` — wall time from `mission dispatch` invocation
 ///   to the last completion seen, measured by the publisher.
-/// - `n_sprints` — number of sprints dispatched (sessions.len()).
+/// - `n_phases` — number of phases dispatched (sessions.len()).
 pub fn speedup_verdict(
-    sum_sprint_wall_ms: u64,
+    sum_phase_wall_ms: u64,
     mission_wall_ms: u64,
-    n_sprints: usize,
+    n_phases: usize,
 ) -> SpeedupVerdict {
-    if sum_sprint_wall_ms == 0 || n_sprints == 0 {
+    if sum_phase_wall_ms == 0 || n_phases == 0 {
         return SpeedupVerdict::Inconclusive;
     }
     // Avoid divide-by-zero on instantaneous missions; the `.max(1.0)`
     // floor doesn't materially change any non-degenerate case.
-    let speedup = (sum_sprint_wall_ms as f64) / (mission_wall_ms as f64).max(1.0);
-    if n_sprints > 1 && speedup >= PARALLELISM_CONFIRMED_THRESHOLD {
+    let speedup = (sum_phase_wall_ms as f64) / (mission_wall_ms as f64).max(1.0);
+    if n_phases > 1 && speedup >= PARALLELISM_CONFIRMED_THRESHOLD {
         SpeedupVerdict::ParallelConfirmed { speedup }
-    } else if n_sprints > 1 {
+    } else if n_phases > 1 {
         SpeedupVerdict::SeriallySuspect { speedup }
     } else {
-        // n == 1: parallelism is undefined for a single sprint. Stay
+        // n == 1: parallelism is undefined for a single phase. Stay
         // silent even if the math says speedup >= threshold (which can
         // only happen via clock skew or wall_ms misreporting).
         SpeedupVerdict::Inconclusive
@@ -3156,7 +3156,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             timeout,
             watch,
             workdir,
-            sprint_id,
+            phase_id,
             skip_preflight,
             json,
             runtime,
@@ -3182,7 +3182,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             };
             // CLI default: if the operator didn't supply --watch, watch the
             // role's openclaw workspace dir. Library callers (e.g.
-            // sprint_cli) pass an empty Vec directly to opt out.
+            // phase_cli) pass an empty Vec directly to opt out.
             let watch_paths = if watch.is_empty() {
                 vec![crew::dispatch::default_workspace_for_role(&role)]
             } else {
@@ -3193,11 +3193,11 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             // runtime (see `runtime/`); `openclaw` is the opt-in
             // shell-out path.
             let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
-            // Sprint-E QA: bail loud when --runtime-cmd is set without
+            // Phase-E QA: bail loud when --runtime-cmd is set without
             // --runtime openclaw. The flag is only consulted by the
             // openclaw shell-out; silently ignoring it under Internal
             // would re-introduce the "implicit state surprising the
-            // operator" pattern Sprint-E removed.
+            // operator" pattern Phase-E removed.
             if runtime_flag != crew::dispatch::Runtime::Openclaw && runtime_cmd != "openclaw" {
                 anyhow::bail!(
                     "--runtime-cmd `{runtime_cmd}` is only valid with --runtime openclaw \
@@ -3214,7 +3214,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 json,
                 watch_paths,
                 workdir,
-                sprint_id,
+                phase_id,
                 runtime: runtime_flag,
                 runtime_cmd,
                 machine,
@@ -3223,7 +3223,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 // config here; the internal dispatch fills the runtime-
                 // required context window from the resolved `default_profile`
                 // (#632 — the runtime has no built-in context-window default),
-                // so a `default()` is safe. Lab + sprint paths derive the
+                // so a `default()` is safe. Lab + phase paths derive the
                 // full compaction config from the profile up front.
                 compaction: crew::dispatch::CompactionDispatchArgs::default(),
                 // (#1054) `--profile <name>` selects a named profile from the
@@ -3995,7 +3995,7 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             runtime_cmd,
         } => {
             let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
-            // Sprint-E QA: bail loud when --runtime-cmd is set without
+            // Phase-E QA: bail loud when --runtime-cmd is set without
             // --runtime openclaw — see CrewCmd::Dispatch for the same
             // gate; doctrine is "no implicit state, operator-explicit
             // intent only" (Beat 36).
@@ -4595,7 +4595,7 @@ mod tests {
     }
 
     #[test]
-    fn worst_case_wait_banner_handles_single_sprint() {
+    fn worst_case_wait_banner_handles_single_phase() {
         let s = worst_case_wait_banner(1, 60, 120);
         assert!(s.contains("1 completion(s)"));
         assert!(s.contains("worst-case total wall ≈ 120s"));
@@ -4622,7 +4622,7 @@ mod tests {
 
     #[test]
     fn speedup_verdict_confirms_parallel_when_speedup_above_threshold() {
-        // 2 sprints, each 5000ms, mission wall 5000ms → speedup = 2.0
+        // 2 phases, each 5000ms, mission wall 5000ms → speedup = 2.0
         let v = speedup_verdict(10_000, 5_000, 2);
         match v {
             SpeedupVerdict::ParallelConfirmed { speedup } => {
@@ -4634,7 +4634,7 @@ mod tests {
 
     #[test]
     fn speedup_verdict_warns_serial_when_speedup_below_threshold() {
-        // 2 sprints, sum 10000ms, mission wall 8500ms → speedup ≈ 1.18 (< 1.5)
+        // 2 phases, sum 10000ms, mission wall 8500ms → speedup ≈ 1.18 (< 1.5)
         let v = speedup_verdict(10_000, 8_500, 2);
         match v {
             SpeedupVerdict::SeriallySuspect { speedup } => {
@@ -4648,7 +4648,7 @@ mod tests {
     }
 
     #[test]
-    fn speedup_verdict_inconclusive_when_no_sprints_completed() {
+    fn speedup_verdict_inconclusive_when_no_phases_completed() {
         assert_eq!(
             speedup_verdict(0, 100, 2),
             SpeedupVerdict::Inconclusive,
@@ -4657,8 +4657,8 @@ mod tests {
     }
 
     #[test]
-    fn speedup_verdict_inconclusive_when_single_sprint() {
-        // Parallelism is undefined for a single sprint — stay silent
+    fn speedup_verdict_inconclusive_when_single_phase() {
+        // Parallelism is undefined for a single phase — stay silent
         // even if the math would otherwise say "confirmed".
         let v = speedup_verdict(10_000, 5_000, 1);
         assert_eq!(v, SpeedupVerdict::Inconclusive);

@@ -1,6 +1,6 @@
 ---
 name: darkmux-mission-debrief
-description: Run a mission's debrief — the post-mission review ceremony that turns one mission's transient signal into durable engagement lessons. Reads `darkmux mission debrief <id> --json` (the loop pathologies darkmux's detectors flagged across the mission's runs, the corrections the reviewer recorded, and the mission's sprints + how each ended), reviews the engagement's own docs, and — for a coding mission — `git show`s the shipped work, then proposes durable lessons WITH the why and records each via `darkmux lessons add`. Lessons then brief every future crew in this engagement as a `<lessons>` block (#994/#1000). Read + propose + approve — the skill proposes; the operator approves before any write. Run it at mission completion (the close nudge prompts it). NASA vocabulary: Mission · Crew · Debrief · Lessons.
+description: Run a mission's debrief — the post-mission review ceremony that turns one mission's transient signal into durable engagement lessons. Reads `darkmux mission debrief <id> --json` (the loop pathologies darkmux's detectors flagged across the mission's runs, the corrections the reviewer recorded, and the mission's phases + how each ended), reviews the engagement's own docs, and — for a coding mission — `git show`s the shipped work, then proposes durable lessons WITH the why and records each via `darkmux lessons add`. Lessons then brief every future crew in this engagement as a `<lessons>` block (#994/#1000). Read + propose + approve — the skill proposes; the operator approves before any write. Run it at mission completion (the close nudge prompts it). NASA vocabulary: Mission · Crew · Debrief · Lessons.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*),Bash(git:*),Read,Glob,Grep"
 ---
@@ -9,7 +9,7 @@ allowed-tools: "Bash(darkmux:*),Bash(git:*),Read,Glob,Grep"
 
 This skill runs the **debrief** ceremony for one completed mission: it sifts the mission's transient signal — the detector **cautions** and the reviewer's **corrections**, both perishable — and decides which is a durable **lesson** worth keeping for *every future mission* in this engagement. Each lesson is recorded **with the reasoning behind it** ("include the why"), so a fresh-context local model can apply it with judgment rather than re-deriving or re-repeating.
 
-It closes the loop the operator named: **detect → distill → inject → don't-repeat.** Detect and inject are automatic (cautions are captured to the flow stream; corrections + cautions are carried sprint→sprint live). The debrief is the **distill** step — and it is a *cross-mission* act: the within-mission learning already happened live; the debrief banks what this mission taught for the *next* one. This is NASA's Lessons Learned practice, applied locally.
+It closes the loop the operator named: **detect → distill → inject → don't-repeat.** Detect and inject are automatic (cautions are captured to the flow stream; corrections + cautions are carried phase→phase live). The debrief is the **distill** step — and it is a *cross-mission* act: the within-mission learning already happened live; the debrief banks what this mission taught for the *next* one. This is NASA's Lessons Learned practice, applied locally.
 
 **Operator-sovereignty (#44):** the skill *proposes* lessons; nothing is written until the operator approves. The "why" cannot be auto-generated meaningfully — that judgment is the operator's, and the skill draws it out rather than inventing it.
 
@@ -36,7 +36,7 @@ This is the mission's history, scoped to its dispatch sessions, in one place:
 
 - **`cautions`** — the loop pathologies darkmux's detectors flagged across the mission's runs (repeated-tool cycles, looping reasoning, tool-failure cascades), each naming the file it happened in when known. **Recurring** patterns are lessons; a one-off is noise.
 - **`corrections`** — the adjudication notes the reviewer recorded on the mission's dispatches (#849): what was overridden and why. These are first-class lesson candidates — a correction made once should not have to be made again.
-- **`sprints`** — the mission's sprints and how each ended (`complete` / `abandoned` / …). The shape of what the mission actually did.
+- **`phases`** — the mission's phases and how each ended (`complete` / `abandoned` / …). The shape of what the mission actually did.
 
 For each recurring caution or repeated correction, the lesson is **not** "the detector fired" or "the reviewer corrected X once" — it is the *durable rule*: what the runs kept getting wrong, what to do instead, and **why**. The detection points at *where* to look; the operator supplies *what the lesson is*. (e.g. detector saw repeated edits to `loop_runner.rs` → the lesson might be "the retry loop is bounded at N on purpose — don't add another retry path; the loop entrenches its first answer.")
 
@@ -52,7 +52,7 @@ Read whichever exist — pull out conventions, constraints, and decisions alread
 
 ```bash
 git log --oneline -15           # find the mission's shipped commits
-git show <sha>                  # inspect a shipped sprint's actual change
+git show <sha>                  # inspect a shipped phase's actual change
 ```
 
 A non-coding mission has no diff — Steps 1 + 2's docs carry it.
@@ -62,7 +62,7 @@ A non-coding mission has no diff — Steps 1 + 2's docs carry it.
 A short, targeted interview — not a form. Ask only what the material didn't already answer:
 
 - For each recurring caution: "is this a real lesson, or just how that run went? If real, what should a future dispatch do instead, and why?"
-- For each correction: "should this become a standing rule for this engagement, or was it one-off to that sprint?"
+- For each correction: "should this become a standing rule for this engagement, or was it one-off to that phase?"
 - Open: "what did this mission teach about this codebase that isn't written down anywhere — that the next crew (or a local model) would get wrong?"
 
 Keep it to a handful of questions. Stop when the operator's out of additions.
@@ -116,5 +116,5 @@ The banked lessons surface to the next coder dispatch in this repo as a `<lesson
 
 - **The why is the point.** A lesson that only states a rule ("don't rename the field") is weak; one that carries the reasoning ("don't rename `apim_key` — three downstream configs match on the literal string") lets a model apply judgment. If a proposed body has no why, push for one in the interview before recording it.
 - **Curated, not automatic.** The skill never promotes a caution or correction to a lesson on its own — the operator decides what's a durable lesson vs a one-off. A detector firing is evidence, not a verdict.
-- **Cross-mission, not within-mission.** Within a mission, corrections + cautions already carry sprint→sprint live. The debrief banks lessons for the *next* mission; run it at completion, not mid-arc (though `darkmux mission debrief` is read-only and safe to run any time you're curious).
+- **Cross-mission, not within-mission.** Within a mission, corrections + cautions already carry phase→phase live. The debrief banks lessons for the *next* mission; run it at completion, not mid-arc (though `darkmux mission debrief` is read-only and safe to run any time you're curious).
 - **Engagement-scoped by construction.** Per-repo is the default; reserve `--global` for conventions true everywhere. Don't let one engagement's specifics leak into the global tier.

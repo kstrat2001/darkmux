@@ -95,7 +95,7 @@ pub struct Role {
     pub prompt_path: Option<PathBuf>,
     /// (#377) Per-role escalation bound — overrides
     /// `profile.runtime.compaction.reserve.bail_after_compactions`
-    /// when set. Sprint-shaped roles (coder, reviewer) typically pin
+    /// when set. Phase-shaped roles (coder, reviewer) typically pin
     /// a low value (2-3) for tight bound; long-arc roles (researcher,
     /// mission-compiler) may pin higher (5-7) for more local-tier
     /// runway. Absent ⇒ profile default ⇒ runtime default (unbounded).
@@ -114,7 +114,7 @@ pub struct Role {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation_posture: Option<String>,
     /// (#425) Role family — a **scope** distinction (#590): `"specialist"`
-    /// roles work the mission/sprints (the deliverable); `"utility"` roles
+    /// roles work the mission/phases (the deliverable); `"utility"` roles
     /// support the runtime outside mission scope (mission-compiler, scribe,
     /// and — once #590 lands it — the compactor). The split also drives
     /// dispatch shape: specialists run the multi-turn agent loop and get the
@@ -254,15 +254,20 @@ pub enum MissionStatus {
     Paused,
 }
 
-/// A mission — a named objective tying sprints together.
+/// A mission — a named objective tying phases together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mission {
     pub id: String,
     pub description: String,
     #[serde(default)]
     pub status: MissionStatus,
-    #[serde(default)]
-    pub sprint_ids: Vec<String>,
+    /// Sprint→Phase rename read-compat: pre-rename mission JSON on disk
+    /// carries this list under the old key `sprint_ids`. `alias` lets
+    /// serde accept either wire name on read; every subsequent
+    /// `save_json` write emits the canonical `phase_ids` key, so a
+    /// mission self-migrates its field name the next time it's touched.
+    #[serde(default, alias = "sprint_ids")]
+    pub phase_ids: Vec<String>,
     pub created_ts: u64,
     /// When the mission first transitioned to `Active`. None until
     /// `darkmux mission start` runs. Used by the wall-clock UI.
@@ -279,8 +284,8 @@ pub struct Mission {
     pub paused_ts: Option<u64>,
     /// (#815) The operator's VERBATIM `mission propose` input — the
     /// unabridged prose the mission-compiler summarized into the
-    /// description + sprint descriptions. `mission run` dispatches this
-    /// alongside each sprint's compiled description so exact strings and
+    /// description + phase descriptions. `mission run` dispatches this
+    /// alongside each phase's compiled description so exact strings and
     /// constraints survive the compiler's compression (the lost-in-
     /// translation seam from the 2026-06-12 dogfood). None on
     /// hand-authored or pre-#815 missions.
@@ -296,10 +301,10 @@ pub struct Mission {
     pub ticket: Option<String>,
 }
 
-/// Status of a sprint.
+/// Status of a phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum SprintStatus {
+pub enum PhaseStatus {
     #[default]
     Planned,
     Running,
@@ -307,39 +312,39 @@ pub enum SprintStatus {
     Abandoned,
 }
 
-/// A sprint — a time-boxed work unit within a mission.
+/// A phase — a time-boxed work unit within a mission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Sprint {
+pub struct Phase {
     pub id: String,
     pub mission_id: String,
     pub description: String,
     #[serde(default)]
-    pub status: SprintStatus,
-    /// IDs of other sprints this depends on (must complete before running).
+    pub status: PhaseStatus,
+    /// IDs of other phases this depends on (must complete before running).
     #[serde(default)]
     pub depends_on: Vec<String>,
     pub created_ts: u64,
-    /// When the sprint first transitioned to `Running` (or last transitioned
+    /// When the phase first transitioned to `Running` (or last transitioned
     /// to `Running` after being `Abandoned` and restarted). None until
-    /// `darkmux sprint start` runs. Wall-clock UI shows live elapsed when
+    /// `darkmux phase start` runs. Wall-clock UI shows live elapsed when
     /// `status == Running` (now - started_ts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_ts: Option<u64>,
-    /// When the sprint transitioned to `Complete`. Complete is terminal —
-    /// once set, lifecycle verbs can't move the sprint elsewhere. Wall-clock
+    /// When the phase transitioned to `Complete`. Complete is terminal —
+    /// once set, lifecycle verbs can't move the phase elsewhere. Wall-clock
     /// duration = completed_ts - started_ts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_ts: Option<u64>,
-    /// When the sprint transitioned to `Abandoned`. Cleared when the
-    /// operator changes their mind and runs `sprint start` again — the
+    /// When the phase transitioned to `Abandoned`. Cleared when the
+    /// operator changes their mind and runs `phase start` again — the
     /// state machine treats `Abandoned → Running` as a legal restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abandoned_ts: Option<u64>,
     /// (#1230 Packet 2) IDs of the DAG-native `Task`s that make up this
-    /// sprint's actual execution graph. Additive-only field — everything
-    /// else about `Sprint`'s own lifecycle (`status`, `depends_on`,
-    /// `*_ts`) is unchanged; a Sprint stays the real operator-gated unit
-    /// it always was. `#[serde(default)]` so every pre-#1230 sprint JSON
+    /// phase's actual execution graph. Additive-only field — everything
+    /// else about `Phase`'s own lifecycle (`status`, `depends_on`,
+    /// `*_ts`) is unchanged; a Phase stays the real operator-gated unit
+    /// it always was. `#[serde(default)]` so every pre-#1230 phase JSON
     /// on disk continues to parse with an empty `task_ids` (no Task/Step
     /// graph underneath it yet).
     #[serde(default)]
@@ -347,12 +352,12 @@ pub struct Sprint {
 }
 
 /// (#1230 Packet 2) Status of a DAG node (`Step`, and — via the
-/// `DependencyNode` adapter in `scheduler.rs` — `Sprint` too). Distinct
-/// from `SprintStatus`: a Sprint is an operator-gated planning unit
+/// `DependencyNode` adapter in `scheduler.rs` — `Phase` too). Distinct
+/// from `PhaseStatus`: a Phase is an operator-gated planning unit
 /// (`start`/`complete`/`abandon` are explicit operator verbs); a `Step` is
 /// scheduler-driven (`Planned` → `Running` → `Complete`/`Error` happens
 /// automatically as `run_step_graph` walks the graph). `Error` has no
-/// `SprintStatus` analog — a Sprint either completes or is abandoned by
+/// `PhaseStatus` analog — a Phase either completes or is abandoned by
 /// the operator; a Step can fail its own execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -397,7 +402,7 @@ pub struct Step {
     pub completed_ts: Option<u64>,
     /// The step kind's own output text on success (or an error summary on
     /// `NodeStatus::Error`). Generalizes the one-hop
-    /// `<sprint-id>-output.txt` context file `dispatch.rs`'s `sprint_id`
+    /// `<phase-id>-output.txt` context file `dispatch.rs`'s `phase_id`
     /// plumbing already writes — downstream Steps read a completed
     /// dependency's `output` as their own input (see
     /// `scheduler::gather_inputs`).
@@ -406,13 +411,19 @@ pub struct Step {
 }
 
 /// (#1230 Packet 2) A real (not synthesized) grouping of Steps within a
-/// Sprint — operators reference a Task directly (e.g. "the coder task"),
+/// Phase — operators reference a Task directly (e.g. "the coder task"),
 /// so it's a first-class schema level, not just a derived view over Step
 /// edges.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
-    pub sprint_id: String,
+    /// Sprint→Phase rename read-compat: accepts the pre-rename wire key
+    /// `sprint_id` as well as the canonical `phase_id` (see `Mission::phase_ids`'s
+    /// alias for the same rationale). Task/Step storage postdates the rename
+    /// by only a few days (#1230 Packet 2), so this is defensive more than
+    /// load-bearing, but costs nothing to keep consistent.
+    #[serde(alias = "sprint_id")]
+    pub phase_id: String,
     pub description: String,
     #[serde(default)]
     pub step_ids: Vec<String>,
