@@ -533,10 +533,28 @@ impl HostTelemetrySampler {
         interval: Duration,
         poll: Duration,
         sample_fn: fn() -> HostSample,
+        lms_fn: fn() -> anyhow::Result<Vec<darkmux_types::LoadedModel>>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let stop_thread = Arc::clone(&stop);
+        // (#1247 follow-up) lms load/unload deltas — the diff-state twin of
+        // dispatch_internal.rs's `run_telemetry_sampler`. `sample_host` was
+        // already shared (the doctrine surface this module's own doc names),
+        // but `lms_diff` wasn't wired up here at all, so a review run's
+        // "model (lms)" viewer track always read "no telemetry yet" — the
+        // run-detail view has host cpu/mem/gpu (from the sampling below) but
+        // never which models were actually resident. `seeded` mirrors
+        // dispatch_internal's baseline-emission: the FIRST successful sample
+        // diffs against empty so the models already resident when the run
+        // started show up immediately, not only on a later load/unload edge.
+        // `lms_fn` is injected (same discipline as `sample_fn`, same reason)
+        // — the real `darkmux_profiles::lms::list_loaded` shells out to the
+        // `lms` CLI, and an un-injected real subprocess call in this loop
+        // raced and broke the fast-cadence telemetry test's tight timing
+        // margin (this file has 20+ sub-millisecond mocked review runs).
+        let mut prev_loaded: Vec<darkmux_types::LoadedModel> = Vec::new();
+        let mut seeded = false;
         let handle = thread::Builder::new()
             .name("review-telemetry".to_string())
             .spawn(move || loop {
@@ -563,6 +581,34 @@ impl HostTelemetrySampler {
                     let nap = poll.min(interval - slept);
                     thread::sleep(nap);
                     slept += nap;
+                }
+                // lms load/unload deltas. Only diff against a SUCCESSFUL
+                // probe — a failed `list_loaded` is skipped (leaves
+                // `prev_loaded` intact) so a transient lms hiccup doesn't
+                // emit a flurry of spurious unloads (same guard as
+                // dispatch_internal.rs's sampler).
+                if let Ok(cur) = lms_fn() {
+                    let diffs = if seeded {
+                        darkmux_crew::telemetry_sampler::lms_diff(&prev_loaded, &cur)
+                    } else {
+                        seeded = true;
+                        darkmux_crew::telemetry_sampler::lms_diff(&[], &cur)
+                    };
+                    for payload in diffs {
+                        let record = darkmux_crew::dispatch::build_telemetry_record(
+                            darkmux_flow::Level::Info,
+                            "telemetry.lms",
+                            "lms",
+                            &crew,
+                            &case_id,
+                            None,
+                            None,
+                            None,
+                            payload,
+                        );
+                        let _ = tx.send(record);
+                    }
+                    prev_loaded = cur;
                 }
                 let sample = sample_fn();
                 if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
@@ -686,16 +732,18 @@ impl<'a> ReviewRunGuard<'a> {
             REVIEW_TELEMETRY_INTERVAL,
             REVIEW_TELEMETRY_POLL,
             sample_host,
+            darkmux_profiles::lms::list_loaded,
         )
     }
 
     /// Same as [`Self::new`] but with a caller-chosen telemetry cadence
-    /// AND sampling function — the test-only seam a scripted run uses to
+    /// AND sampling functions — the test-only seam a scripted run uses to
     /// observe deterministic samples without a multi-second sleep and
     /// without shelling to the real (macOS-only, ~600-900ms-per-call)
-    /// `top`/`vm_stat`/`ioreg` commands. Production always goes through
-    /// `new`, which fixes the cadence at [`REVIEW_TELEMETRY_INTERVAL`]
-    /// and the sampler at the real `sample_host`.
+    /// `top`/`vm_stat`/`ioreg` commands, or to the real `lms` CLI.
+    /// Production always goes through `new`, which fixes the cadence at
+    /// [`REVIEW_TELEMETRY_INTERVAL`] and the samplers at the real
+    /// `sample_host` / `darkmux_profiles::lms::list_loaded`.
     fn new_with_telemetry(
         sink: &'a mut EmitterSink<'a>,
         case_id: &str,
@@ -703,6 +751,7 @@ impl<'a> ReviewRunGuard<'a> {
         telemetry_interval: Duration,
         telemetry_poll: Duration,
         sample_fn: fn() -> HostSample,
+        lms_fn: fn() -> anyhow::Result<Vec<darkmux_types::LoadedModel>>,
     ) -> Self {
         let case_id_owned = case_id.to_string();
         let crew_owned = crew.to_string();
@@ -737,6 +786,7 @@ impl<'a> ReviewRunGuard<'a> {
                 telemetry_interval,
                 telemetry_poll,
                 sample_fn,
+                lms_fn,
             ),
             case_id: case_id.to_string(),
             crew: crew.to_string(),
@@ -3514,17 +3564,24 @@ pub fn run_review(
         REVIEW_TELEMETRY_INTERVAL,
         REVIEW_TELEMETRY_POLL,
         sample_host,
+        darkmux_profiles::lms::list_loaded,
     )
 }
 
 /// Test-only seam: identical pipeline to [`run_review`], but with a
-/// caller-chosen telemetry cadence AND sampling function, so a scripted
+/// caller-chosen telemetry cadence AND sampling functions, so a scripted
 /// test can observe deterministic host-telemetry samples without a
 /// multi-second sleep and without shelling to the real macOS-only host
-/// commands (hermetic — no subprocess timing to race on a CI runner).
-/// No production caller uses this — `run_review` always fixes the cadence
-/// at [`REVIEW_TELEMETRY_INTERVAL`] and the sampler at the real
-/// `sample_host`.
+/// commands or the real `lms` CLI (hermetic — no subprocess timing to race
+/// on a CI runner). No production caller uses this — `run_review` always
+/// fixes the cadence at [`REVIEW_TELEMETRY_INTERVAL`] and the samplers at
+/// the real `sample_host` / `darkmux_profiles::lms::list_loaded`.
+// Test-only seam threading two independently-injected sample functions
+// through to `ReviewRunGuard::new_with_telemetry` — the 8th param crossed
+// clippy's default threshold, but splitting these into a config struct
+// would touch every production AND test call site for a #[cfg(test)]-only
+// function; not worth the diff.
+#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn run_review_with_telemetry(
     inputs: &ReviewInputs,
@@ -3534,10 +3591,14 @@ fn run_review_with_telemetry(
     telemetry_interval: Duration,
     telemetry_poll: Duration,
     sample_fn: fn() -> HostSample,
+    lms_fn: fn() -> anyhow::Result<Vec<darkmux_types::LoadedModel>>,
 ) -> Result<ReviewEnvelope> {
-    run_review_impl(inputs, chat, cycler, emitter, telemetry_interval, telemetry_poll, sample_fn)
+    run_review_impl(inputs, chat, cycler, emitter, telemetry_interval, telemetry_poll, sample_fn, lms_fn)
 }
 
+// Same test-seam threading as `run_review_with_telemetry` above (this is
+// its shared implementation, also called by production's `run_review`).
+#[allow(clippy::too_many_arguments)]
 fn run_review_impl(
     inputs: &ReviewInputs,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
@@ -3546,6 +3607,7 @@ fn run_review_impl(
     telemetry_interval: Duration,
     telemetry_poll: Duration,
     sample_fn: fn() -> HostSample,
+    lms_fn: fn() -> anyhow::Result<Vec<darkmux_types::LoadedModel>>,
 ) -> Result<ReviewEnvelope> {
     let ReviewSeats { probes, judge, verify } = validate_review_crew(inputs.crew)?;
     let mode = resolve_mode(inputs.mode, probes, judge);
@@ -3583,6 +3645,7 @@ fn run_review_impl(
         telemetry_interval,
         telemetry_poll,
         sample_fn,
+        lms_fn,
     );
     guard.task_started(json!({
         "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
@@ -5040,6 +5103,7 @@ pub fn run_review_graph(
         REVIEW_TELEMETRY_INTERVAL,
         REVIEW_TELEMETRY_POLL,
         sample_host,
+        darkmux_profiles::lms::list_loaded,
     );
 
     let facts = {
@@ -6487,6 +6551,17 @@ mod tests {
         HostSample { cpu: Some(42), mem: Some(50), gpu: Some(7) }
     }
 
+    /// (#1361 follow-up) Deterministic fake `lms_fn` for the telemetry
+    /// tests below — the `lms_fn` twin of [`fake_sample`], same reason: an
+    /// un-injected real `list_loaded` shells out to the `lms` CLI and
+    /// raced/broke the fast-cadence tests' tight timing margin. Empty
+    /// list — no diff, no `telemetry.lms` records — is a valid, honest
+    /// "nothing resident" reading and keeps these tests focused on the
+    /// `telemetry.process` family they actually assert on.
+    fn fake_lms() -> anyhow::Result<Vec<darkmux_types::LoadedModel>> {
+        Ok(Vec::new())
+    }
+
     /// `HostTelemetrySampler` on its own, outside any guard: `drop` alone
     /// must stop and join the background thread. The join itself runs on
     /// a SPAWNED thread (not the test thread) and the test asserts via
@@ -6501,6 +6576,7 @@ mod tests {
             Duration::from_millis(5),
             Duration::from_millis(2),
             fake_sample,
+            fake_lms,
         );
         // Let at least one interval tick elapse so the thread is inside
         // its live sample-or-sleep loop, not still spinning up.
@@ -6534,6 +6610,7 @@ mod tests {
                 Duration::from_millis(5),
                 Duration::from_millis(2),
                 fake_sample,
+                fake_lms,
             );
             guard.task_started(json!({"status": "started"}));
             let env = ReviewEnvelope {
@@ -6569,6 +6646,7 @@ mod tests {
                     Duration::from_millis(5),
                     Duration::from_millis(2),
                     fake_sample,
+                    fake_lms,
                 );
                 guard.task_started(json!({"status": "started"}));
                 // No `task_finished` call — the guard drops here still
@@ -6636,6 +6714,7 @@ mod tests {
             Duration::from_millis(5),
             Duration::from_millis(2),
             fake_sample,
+            fake_lms,
         )
         .expect("review runs");
         assert!(env.degenerate.is_none());
@@ -6666,6 +6745,83 @@ mod tests {
             assert_eq!(payload["mem"], json!(50));
             assert_eq!(payload["gpu"], json!(7));
         }
+    }
+
+    /// (#1361 follow-up) Same end-to-end shape as the `telemetry.process`
+    /// test above, but for `telemetry.lms` — the fleet dashboard's
+    /// "model (lms)" run-detail track was structurally blind for every
+    /// review dispatch (only `dispatch_internal.rs`'s internal-runtime
+    /// sampler ever wired up `lms_diff`). An injected `lms_fn` reporting one
+    /// resident model must produce a baseline `telemetry.lms` "load" record
+    /// on the FIRST successful sample (diffed against empty, same seeding
+    /// dispatch_internal's own sampler does) — proving the review pipeline's
+    /// `HostTelemetrySampler` now emits the family the viewer's model track
+    /// reads, not just host cpu/mem/gpu.
+    #[test]
+    fn flow_emission_includes_lms_telemetry_when_sampler_cadence_is_fast() {
+        fn fake_lms_one_model() -> anyhow::Result<Vec<darkmux_types::LoadedModel>> {
+            Ok(vec![darkmux_types::LoadedModel {
+                identifier: "darkmux:qwen3.6-35b-a3b".to_string(),
+                model: "darkmux:qwen3.6-35b-a3b".to_string(),
+                status: "IDLE".to_string(),
+                size: "21.00 GB".to_string(),
+                context: 65536,
+            }])
+        }
+        let crew = valid_crew();
+        let inputs = ReviewInputs {
+            case_id: "c-lms-telemetry".to_string(),
+            crew: &crew,
+            intent_title: "add a feature",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 500_000,
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut emitter = RecordingEmitter::new();
+        let mut call_n = 0u32;
+        let mut chat = |_call: &ChatCall| {
+            thread::sleep(Duration::from_millis(25));
+            call_n += 1;
+            if call_n <= 2 {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                Ok(reply(CONFIRM_JSON))
+            }
+        };
+        let env = run_review_with_telemetry(
+            &inputs,
+            &mut chat,
+            &mut cycler,
+            &mut emitter,
+            Duration::from_millis(5),
+            Duration::from_millis(2),
+            fake_sample,
+            fake_lms_one_model,
+        )
+        .expect("review runs");
+        assert!(env.degenerate.is_none());
+
+        let lms_records: Vec<&darkmux_flow::FlowRecord> =
+            emitter.records.iter().filter(|r| r.action == "telemetry.lms").collect();
+        assert!(
+            !lms_records.is_empty(),
+            "expected at least one telemetry.lms record with a fast sampler cadence"
+        );
+        let baseline = lms_records[0];
+        assert!(matches!(baseline.category, darkmux_flow::Category::Telemetry));
+        assert_eq!(baseline.source.as_deref(), Some("lms"));
+        assert_eq!(baseline.session_id.as_deref(), Some("c-lms-telemetry"));
+        assert_eq!(baseline.handle, crew.name);
+        let payload = baseline.payload.as_ref().expect("telemetry.lms record carries a payload");
+        assert_eq!(payload["event"], json!("load"));
+        assert_eq!(payload["model"], json!("darkmux:qwen3.6-35b-a3b"));
+        assert_eq!(payload["gb"], json!(21));
     }
 
     // ── staffing snapshot (#1247 lab-view addition) ────────────────────
