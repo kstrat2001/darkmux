@@ -38,7 +38,12 @@ use std::path::Path;
 // — the staleness threshold `darkmux mission status`'s drift detector uses
 // to flag an Active mission with zero Complete phases). Minor bump, same
 // lenient-read reasoning.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.3";
+// 1.4 (#1349): additive `review{}` block (review.judge_concurrency — the
+// PR-review pipeline judge step's bounded-concurrency cap, moved off a bare
+// `DARKMUX_FUNNEL_JUDGE_CONCURRENCY` env read onto the standard precedence
+// chain as part of the funnel->review rename). Minor bump, same
+// lenient-read reasoning.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.4";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -75,6 +80,8 @@ pub struct DarkmuxConfig {
     pub remote: Option<RemoteConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission: Option<MissionConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewConfig>,
 
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer config read by an older binary).
@@ -202,7 +209,7 @@ pub struct FleetConfig {
 }
 
 /// (#1260/#1177) Remote (hosted-endpoint) dispatch knobs — the config home
-/// for the per-execution token bucket the review funnel enforces on
+/// for the per-execution token bucket the review pipeline enforces on
 /// endpoint-staffed seats. Unlike `redis{}`/`audit{}` there is NO `enabled`
 /// gate: remote staffing is enabled by the profile itself (endpoint present
 /// on the staffing's model — contract 1, profile uniformity), so the block
@@ -210,13 +217,13 @@ pub struct FleetConfig {
 /// the default populated, per the visible-defaults doctrine.
 ///
 /// **What an "execution" is (operator decision, 2026-07-10 design chat):**
-/// one pipeline stage — the funnel's probe pass, each judge pass, the
+/// one pipeline stage — the review pipeline's probe pass, each judge pass, the
 /// verify pass; a bare `crew dispatch` is one execution. Each stage's
 /// REMOTE calls draw from their own allowance, so a runaway stage is caught
 /// at the cap without starving later stages. Tokens only — never currency.
 ///
 /// **Which paths this meters (1.18.0 scope — be precise):** the review
-/// funnel's remote seats (probe / judge-pass1 / judge-pass2 / verify) AND the
+/// pipeline's remote seats (probe / judge-pass1 / judge-pass2 / verify) AND the
 /// tool-less single-shot remote `crew dispatch` path (`dispatch_remote`). The
 /// AGENTIC-remote container path (#1187 — a tool-granting role on an endpoint
 /// profile, driven by the multi-call container loop) is NOT metered by this
@@ -253,6 +260,24 @@ pub struct MissionConfig {
     /// no drift surfaced at all, because the pre-#1230-Packet-5 detector
     /// only checked Closed+non-terminal and Active+all-terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub stale_active_days: Option<u64>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#1349) The PR-review pipeline's own tuning knobs — separate from
+/// `RuntimeBehaviorConfig`/`RemoteConfig` because they're specific to
+/// `darkmux pr-review run`'s driver (`darkmux_lab::lab::review`), not
+/// general dispatch behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// The judge step's internal bounded-concurrency for-each cap —
+    /// dispatch pass-1 (then pass-2 if confirmed) for up to this many
+    /// deduped flags AT ONCE (default 1, fully sequential). Was a bare
+    /// `std::env::var("DARKMUX_FUNNEL_JUDGE_CONCURRENCY")` read prior to
+    /// #1349 (deliberately, per its own doc — a placeholder pending real
+    /// concurrency-ceiling data); wired through the standard precedence
+    /// chain now that it's being renamed anyway, per `config_access`'s
+    /// "every setting resolves in ONE place" contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub judge_concurrency: Option<u32>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -369,6 +394,10 @@ impl DarkmuxConfig {
             }),
             mission: Some(MissionConfig {
                 stale_active_days: Some(14),
+                extras: Default::default(),
+            }),
+            review: Some(ReviewConfig {
+                judge_concurrency: Some(1),
                 extras: Default::default(),
             }),
             extras: Default::default(),

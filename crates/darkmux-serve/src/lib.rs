@@ -1404,7 +1404,7 @@ struct LabRunSummary {
     /// actually used — `None` only for a brand-new live run whose first case
     /// hasn't completed yet (no `funnels.json` snapshot exists).
     #[serde(skip_serializing_if = "Option::is_none")]
-    staffing: Option<darkmux_lab::lab::funnel::CrewStaffingSnapshot>,
+    staffing: Option<darkmux_lab::lab::review::CrewStaffingSnapshot>,
     bundles: usize,
     raw_flags: usize,
     deduped_flags: usize,
@@ -1529,7 +1529,7 @@ fn build_lab_run_summary(
 
     if has_funnels {
         if let Ok(text) = std::fs::read_to_string(dir.join("funnels.json")) {
-            if let Ok(envs) = serde_json::from_str::<Vec<darkmux_lab::lab::funnel::FunnelEnvelope>>(&text) {
+            if let Ok(envs) = serde_json::from_str::<Vec<darkmux_lab::lab::review::ReviewEnvelope>>(&text) {
                 for e in &envs {
                     if !case_ids.contains(&e.case_id) {
                         case_ids.push(e.case_id.clone());
@@ -1649,7 +1649,7 @@ fn scan_events_prefix_for_task_meta(
         let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if rec.get("action").and_then(|a| a.as_str()) != Some("funnel.task") {
+        if rec.get("action").and_then(|a| a.as_str()) != Some("review.task") {
             continue;
         }
         let Some(payload) = rec.get("payload") else {
@@ -1680,7 +1680,7 @@ struct LabDirQuery {
 #[derive(serde::Serialize, Default)]
 struct LabRunDetailResponse {
     dir: String,
-    funnels: Vec<darkmux_lab::lab::funnel::FunnelEnvelope>,
+    funnels: Vec<darkmux_lab::lab::review::ReviewEnvelope>,
     scores: Option<darkmux_lab::lab::scores::ScoresDoc>,
 }
 
@@ -1710,7 +1710,7 @@ async fn lab_run_detail_handler(
     };
     let dir_label = q.dir.clone();
     let (funnels, scores) = tokio::task::spawn_blocking(move || {
-        let funnels: Vec<darkmux_lab::lab::funnel::FunnelEnvelope> =
+        let funnels: Vec<darkmux_lab::lab::review::ReviewEnvelope> =
             std::fs::read_to_string(run_dir.join("funnels.json"))
                 .ok()
                 .and_then(|t| serde_json::from_str(&t).ok())
@@ -6138,7 +6138,7 @@ mod tests {
     // ─── #1247 Part 3: lab observer lens ───────────────────────────────────
     //
     // Every fixture below is SYNTHETIC — fabricated field-for-field to match
-    // the real `FunnelEnvelope` / `FlowRecord` / `ScoresDoc` shapes (verified
+    // the real `ReviewEnvelope` / `FlowRecord` / `ScoresDoc` shapes (verified
     // against the actual types via `darkmux_lab::lab::{funnel,scores}`), but
     // with invented model names / case ids / crew names. No content from any
     // private corpus.
@@ -6182,14 +6182,14 @@ mod tests {
             "{}\n{}\n",
             serde_json::json!({
                 "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "funnel.task",
-                "handle": crew, "session_id": case_id, "source": "funnel",
+                "tier": "local", "stage": "dispatch", "action": "review.task",
+                "handle": crew, "session_id": case_id, "source": "review",
                 "payload": {"case_id": case_id, "crew": crew, "exec_mode": "sequential", "status": "started", "bundles": 5}
             }),
             serde_json::json!({
                 "ts": "2026-01-01T00:05:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "funnel.task",
-                "handle": crew, "session_id": case_id, "source": "funnel",
+                "tier": "local", "stage": "dispatch", "action": "review.task",
+                "handle": crew, "session_id": case_id, "source": "review",
                 "payload": {"status": "finished", "confirmed": 2, "needs_check": 1, "archived": 3}
             }),
         );
@@ -6220,8 +6220,8 @@ mod tests {
         fs::create_dir_all(dir).unwrap();
         let record = serde_json::json!({
             "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
-            "tier": "local", "stage": "dispatch", "action": "funnel.task",
-            "handle": crew, "session_id": case_id, "source": "funnel",
+            "tier": "local", "stage": "dispatch", "action": "review.task",
+            "handle": crew, "session_id": case_id, "source": "review",
             "payload": {"case_id": case_id, "crew": crew, "exec_mode": "parallel", "status": "started", "bundles": 12}
         });
         fs::write(dir.join("funnel-events.jsonl"), format!("{record}\n")).unwrap();
@@ -6642,8 +6642,8 @@ mod tests {
             "{}",
             serde_json::json!({
                 "ts": "2026-01-01T00:01:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "funnel.step",
-                "handle": "demo-gate-crew", "session_id": "demo-case-b", "source": "funnel",
+                "tier": "local", "stage": "dispatch", "action": "review.step",
+                "handle": "demo-gate-crew", "session_id": "demo-case-b", "source": "review",
                 "payload": {"step_id": "bundle", "kind": "procedural", "status": "finished", "items_in": 1, "items_out": 12, "wall_ms": 0}
             })
         )
@@ -6664,7 +6664,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let lines = json["lines"].as_array().unwrap();
         assert_eq!(lines.len(), 1, "only the newly-appended record: {lines:?}");
-        assert_eq!(lines[0]["action"], "funnel.step");
+        assert_eq!(lines[0]["action"], "review.step");
     }
 
     #[tokio::test]

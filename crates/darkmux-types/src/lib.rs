@@ -125,7 +125,7 @@ impl ProfileModel {
     ///
     /// `n_ctx` is optional at the schema layer (endpoint-bearing models have
     /// no local context to declare), so every path that LOADS the model
-    /// locally — dispatch preload, swap, the funnel cycler — resolves the
+    /// locally — dispatch preload, swap, the review cycler — resolves the
     /// window through this helper and gets ONE uniform, named error when a
     /// local model omits it. Endpoint paths must not call this (they don't
     /// read `n_ctx` at all).
@@ -560,7 +560,7 @@ impl Profile {
 pub const PROFILES_SCHEMA_VERSION: &str = "1.5";
 
 /// A **saved crew assignment**: which models staff which crew-role seats,
-/// for multi-seat pipelines (e.g. a review funnel's probe + judge seats).
+/// for multi-seat pipelines (e.g. a review pipeline's probe + judge seats).
 /// Machine-side because staffing is a hardware-fit decision, not an
 /// engagement-shaping one. **Selection is still per-dispatch** (operator
 /// sovereignty, #44) — a `Crew` is a reusable lineup an operator can point a
@@ -590,7 +590,7 @@ pub struct Crew {
     /// consumer-side concern.
     pub seats: BTreeMap<String, Vec<SeatStaffing>>,
     /// (#1302) Opt in to a **blocking** review for confirmed findings. When
-    /// `true`, a review-funnel run staffed by this crew renders its confirmed
+    /// `true`, a review-pipeline run staffed by this crew renders its confirmed
     /// tier as a formal `REQUEST_CHANGES` review — a real GitHub merge gate
     /// (`reviewDecision: CHANGES_REQUESTED`). Default `false` renders the
     /// confirmed tier as a NON-blocking `COMMENT`-event review that still

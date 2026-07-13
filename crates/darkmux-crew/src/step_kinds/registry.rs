@@ -60,6 +60,24 @@ impl StepKindRegistry {
         Ok(())
     }
 
+    /// (#1349) Register `kind` under an EXPLICIT `id`, bypassing
+    /// `kind.id()` — for a legacy/retired id that must keep resolving to
+    /// the SAME `StepKind` impl after a rename (a persisted `Step.kind`
+    /// string from before the rename shipped, if anything ever re-reads
+    /// it back through a registry, must not become "unknown step kind").
+    /// Same duplicate-id guard as [`Self::register`]. `Arc::clone` is
+    /// cheap — the caller registers the real instance once under its
+    /// current `kind.id()`, then calls this once per legacy alias with a
+    /// clone of the SAME `Arc`.
+    pub fn register_alias(&self, id: &str, kind: Arc<dyn StepKind>) -> Result<()> {
+        let mut map = self.kinds.lock().expect("step-kind registry poisoned");
+        if map.contains_key(id) {
+            return Err(anyhow!("step kind already registered: {id}"));
+        }
+        map.insert(id.to_string(), kind);
+        Ok(())
+    }
+
     /// Look up a step kind by id, returning an owned `Arc` clone —
     /// `'static` and `Send`, so the caller can move it into a
     /// `run_bounded` worker closure without holding the registry's
@@ -124,6 +142,28 @@ mod tests {
         let registry = StepKindRegistry::new();
         registry.register(Arc::new(StubKind("dup"))).unwrap();
         let err = registry.register(Arc::new(StubKind("dup"))).unwrap_err();
+        assert!(err.to_string().contains("already registered"));
+    }
+
+    #[test]
+    fn register_alias_resolves_a_legacy_id_to_the_same_kind() {
+        let registry = StepKindRegistry::new();
+        let kind = Arc::new(StubKind("review.probe:fast"));
+        registry.register(kind.clone()).unwrap();
+        registry.register_alias("funnel.probe:fast", kind).unwrap();
+        assert_eq!(registry.get("review.probe:fast").unwrap().id(), "review.probe:fast");
+        // The legacy id resolves to the SAME impl — its `.id()` still
+        // reports the CURRENT id (kind.id() is a property of the impl,
+        // not of which key found it), proving both keys point at one
+        // instance rather than two independently-registered stubs.
+        assert_eq!(registry.get("funnel.probe:fast").unwrap().id(), "review.probe:fast");
+    }
+
+    #[test]
+    fn register_alias_errors_on_a_duplicate_id() {
+        let registry = StepKindRegistry::new();
+        registry.register(Arc::new(StubKind("taken"))).unwrap();
+        let err = registry.register_alias("taken", Arc::new(StubKind("other"))).unwrap_err();
         assert!(err.to_string().contains("already registered"));
     }
 

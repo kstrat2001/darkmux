@@ -66,7 +66,7 @@ fn emit_run_record(
 /// logic used to emit directly — ONE generic action name now, with `kind`
 /// (`"mission.worktree"` | `"mission.coder"` | `"mission.verify"`) plus a
 /// free-form `payload` object distinguishing WHICH step and WHAT happened,
-/// mirroring the funnel module's own `funnel.step`/`funnel.ruling`
+/// mirroring the review module's own `review.step`/`review.ruling`
 /// generic-action-plus-payload convention. Consumers: the viewer's
 /// `cycleStage()`, `darkmux-serve`'s `resolve_session` (the `/diff`
 /// endpoint), and `session_failed_verifiers` below all filter on `kind`

@@ -1,7 +1,7 @@
 {
   "id": "review-probe",
   "role_family": "specialist",
-  "description": "Probe seat of the review funnel (#1222 Phase B): given one bundle (a code slice plus its fact sheet) already established to contain a defect, finds and describes the most serious one. Dispatched k times per bundle at temp 0.2 via the container-free single-shot chat primitive (no agent loop, no tools) — the funnel de-duplicates and hands every surviving flag to the judge for confirmation. Deliberately tool-less (the bundle is the whole record; nothing to explore) and deliberately no output_schema (free prose, not a grammar-locked flag object).",
+  "description": "Probe seat of the review pipeline (#1222 Phase B): given one bundle (a code slice plus its fact sheet) already established to contain a defect, finds and describes the most serious one. Dispatched k times per bundle at temp 0.2 via the container-free single-shot chat primitive (no agent loop, no tools) — the pipeline de-duplicates and hands every surviving flag to the judge for confirmation. Deliberately tool-less (the bundle is the whole record; nothing to explore) and deliberately no output_schema (free prose, not a grammar-locked flag object).",
   "skills": [
     "code-reviewing"
   ],

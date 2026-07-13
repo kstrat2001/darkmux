@@ -19,13 +19,13 @@
 //! envelope, empty reply, vacuous pass) — the workflow posts the comment AND
 //! marks its check failed/neutral, never green.
 //!
-//! `darkmux pr-review run` (#1222 Phase B packet 5) is the review-FUNNEL
-//! verb: it drives `darkmux_lab::lab::funnel::{run_funnel, run_judge_only}`
+//! `darkmux pr-review run` (#1222 Phase B packet 5) is the PR-REVIEW
+//! verb: it drives `darkmux_lab::lab::review::{run_review, run_judge_only}`
 //! (packet 4 — bundle → probe(k draws) → dedup → double-confirm judge) using
 //! the REAL bundler (`darkmux_lab::lab::bundle::{build_bundles,
 //! external_bundles, slice_code}`, packet 3) and emits the same
 //! `{mode, review, comment}` payload [`render_with_attribution`] does, via
-//! [`synthesize_funnel`]'s three-tier synthesis: a `Tier::Confirmed` flag
+//! [`synthesize_review`]'s three-tier synthesis: a `Tier::Confirmed` flag
 //! becomes an inline, merge-blocking comment (or a general body item when
 //! its anchor can't be resolved to a diff line); a `Tier::NeedsCheck` flag
 //! (including a pass-2 demotion) becomes a non-blocking "worth a double
@@ -41,9 +41,9 @@ use darkmux_crew::single_shot::{
 use darkmux_lab::lab::bundle::{
     build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, FileSource,
 };
-use darkmux_lab::lab::funnel::{
-    build_funnel_graph, run_funnel_graph, run_judge_only, validate_funnel_crew, BundleInput,
-    ChatCall, ExecMode, FunnelEmitter, FunnelEnvelope, FunnelInputs, FunnelStepContext,
+use darkmux_lab::lab::review::{
+    build_review_graph, run_review_graph, run_judge_only, validate_review_crew, BundleInput,
+    ChatCall, ExecMode, ReviewEmitter, ReviewEnvelope, ReviewInputs, ReviewStepContext,
     JudgeRecord, LmsCycler, ProbeFlag, Tier, VerifyRecord, VerifyRuling,
 };
 use darkmux_profiles::crews::{resolve_crew, ResolvedCrew};
@@ -61,20 +61,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// (#1298) The single-reviewer (`pr-review render`) default footer. The funnel
+// (#1298) The single-reviewer (`pr-review render`) default footer. The review
 // path never uses this — it derives its footer from the envelope's member
-// provenance (see `funnel_footer`). The stale "`pr-reviewer` role" wording is
+// provenance (see `review_footer`). The stale "`pr-reviewer` role" wording is
 // gone from both paths; the "no cloud API" claim survives ONLY here because
 // this path has no envelope to derive from and the workflow that knows where
-// the model ran passes the truthful `--attribution` (the funnel does derive).
+// the model ran passes the truthful `--attribution` (the review does derive).
 const FOOTER: &str = "\n\n---\n<sub>Automated review by darkmux, running on a \
 local model (no cloud API) via a self-hosted runner. Advisory, not a merge gate.</sub>";
 
-/// (#1298/#1186) Default tagline for the funnel's posted footer — the
+/// (#1298/#1186) Default tagline for the review's posted footer — the
 /// operator-owned "why this comment exists" half. The operator overrides it
 /// via `--attribution`; the model / local-vs-cloud half is DERIVED from the
 /// run, never carried here (see [`dispatch_provenance`]).
-const FUNNEL_TAGLINE: &str = "Advisory, not a merge gate.";
+const REVIEW_TAGLINE: &str = "Advisory, not a merge gate.";
 
 /// Severity → label. Unknown severity renders as a plain note.
 fn sev_label(severity: Option<&str>) -> &'static str {
@@ -212,7 +212,7 @@ pub fn new_side_index(diff: &str) -> HashMap<String, HashMap<String, Vec<u32>>> 
 /// a markdown bullet, a diff snippet in docs — is stored with that char intact),
 /// then with one leading `+`/`-`/space stripped (a model that left the diff
 /// marker on). First non-empty line of a multi-line quote; trimmed match. If the
-/// exact whole-line match fails, falls back to a substring match (the funnel
+/// exact whole-line match fails, falls back to a substring match (the review
 /// stores a sub-expression span, not the whole line) — but only when exactly one
 /// new-side line contains it, so it still never guesses between candidates.
 pub fn resolve_anchor(
@@ -242,7 +242,7 @@ pub fn resolve_anchor(
         }
     }
     // (#1299) Fragment fallback (the mis-anchor half; dedup half shipped 1.18.1).
-    // The review funnel stores a backtick SPAN as the anchor
+    // The review review stores a backtick SPAN as the anchor
     // (`extract_new_side_anchor` in the lab crate) — frequently a sub-expression
     // of a changed line, not the whole line — so it matched the diff by SUBSTRING
     // at extraction time but the whole-line lookup above misses it, and the
@@ -532,7 +532,7 @@ fn degraded_fallback(note: &str, attribution: Option<&str>) -> Rendered {
     degraded_with_footer(note, &footer_for(attribution))
 }
 
-/// The degraded rendering with an explicit footer — so the funnel path can
+/// The degraded rendering with an explicit footer — so the review path can
 /// pass its envelope-derived footer (#1298) while the single-reviewer path
 /// keeps the static-default footer. Body text is identical either way.
 fn degraded_with_footer(note: &str, footer: &str) -> Rendered {
@@ -665,27 +665,27 @@ fn footer_for(attribution: Option<&str>) -> String {
     }
 }
 
-/// (#1298) The funnel's posted footer, with its dispatch-provenance clause
+/// (#1298) The review's posted footer, with its dispatch-provenance clause
 /// DERIVED from the envelope's member records — never a hardcoded claim that
 /// can contradict the run. The prior static footer asserted "`pr-reviewer`
 /// role, running on a local model (no cloud API)" unconditionally; on the
-/// first all-remote (Azure) funnel review that was three lies in the most
+/// first all-remote (Azure) review review that was three lies in the most
 /// visible place — a public comment saying "no cloud API" about a cloud
 /// review (#1186 "never off the meter"). The operator's `--attribution`
 /// supplies only the tagline; WHERE the models ran is computed from what
 /// actually ran.
-fn funnel_footer(env: &FunnelEnvelope, attribution: Option<&str>) -> String {
+fn review_footer(env: &ReviewEnvelope, attribution: Option<&str>) -> String {
     let tagline = attribution
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(FUNNEL_TAGLINE);
+        .unwrap_or(REVIEW_TAGLINE);
     format!(
-        "\n\n---\n<sub>Automated review by darkmux's review funnel, {} — {tagline}</sub>",
+        "\n\n---\n<sub>Automated review by darkmux's review review, {} — {tagline}</sub>",
         dispatch_provenance(env)
     )
 }
 
-/// (#1298) The dispatch-provenance clause: WHERE the funnel's seats actually
+/// (#1298) The dispatch-provenance clause: WHERE the review's seats actually
 /// ran, read from the envelope's member records. An audit-integrity surface —
 /// a posted review must never claim "no cloud API" about a review that
 /// dispatched to a hosted endpoint.
@@ -695,7 +695,7 @@ fn funnel_footer(env: &FunnelEnvelope, attribution: Option<&str>) -> String {
 /// - Any seat remote → names the hosted model(s); never "no cloud API".
 /// - Mixed crew → names both the local and the hosted seat models.
 /// - No member records → asserts neither local nor cloud (stays honest).
-fn dispatch_provenance(env: &FunnelEnvelope) -> String {
+fn dispatch_provenance(env: &ReviewEnvelope) -> String {
     let local = unique_seat_models(env, false);
     let remote = unique_seat_models(env, true);
     match (local.is_empty(), remote.is_empty()) {
@@ -716,7 +716,7 @@ fn dispatch_provenance(env: &FunnelEnvelope) -> String {
 /// "requested X, served Y" — never silently hiding the alias behind the
 /// deployment name. Agreeing or absent, `model` alone is shown (the common,
 /// unremarkable case).
-fn unique_seat_models(env: &FunnelEnvelope, remote: bool) -> Vec<String> {
+fn unique_seat_models(env: &ReviewEnvelope, remote: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for m in env.members.iter().filter(|m| m.remote == remote) {
         if m.model.is_empty() {
@@ -761,7 +761,7 @@ pub fn cmd_render(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// `darkmux pr-review run` — the review funnel verb (#1222 Phase B packet 5)
+// `darkmux pr-review run` — the review review verb (#1222 Phase B packet 5)
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Parsed `darkmux pr-review run` CLI surface. Mirrors the clap variant's
@@ -780,11 +780,11 @@ pub struct RunOpts {
     pub diff: PathBuf,
     /// The author's stated intent for the change, fed into the JUDGE prompt
     /// ONLY — Phase A never showed the probe seat the intent, so
-    /// `funnel::probe_user_message` never reads it either (#1256). This CLI
+    /// `review::probe_user_message` never reads it either (#1256). This CLI
     /// carries one blob (no separate title field), passed through as
-    /// `FunnelInputs::intent_body` with `intent_title` empty; an absent or
+    /// `ReviewInputs::intent_body` with `intent_title` empty; an absent or
     /// empty file -> "(no description provided)" (matches
-    /// `funnel::judge_prompt`'s own per-field fallback).
+    /// `review::judge_prompt`'s own per-field fallback).
     pub intent_file: Option<PathBuf>,
     /// Crew name from `profiles.json`'s `"crews"` map, staffing the
     /// `review-probe`/`review-judge` seats. Required unless `from_envelope`
@@ -794,7 +794,7 @@ pub struct RunOpts {
     pub mode: String,
     /// Overrides every `review-probe` staffing's draw count (`k`).
     pub k: Option<u32>,
-    /// Write the full funnel envelope (pretty JSON) here.
+    /// Write the full review envelope (pretty JSON) here.
     pub envelope_out: Option<PathBuf>,
     /// Write the rendered `{mode, review, comment}` payload here. `None`,
     /// or the literal path `-`, writes to stdout (mirrors `cmd_render`'s
@@ -817,7 +817,7 @@ pub struct RunOpts {
     pub from_envelope: Option<PathBuf>,
 }
 
-/// `darkmux pr-review run` handler: drive the review funnel end-to-end (or
+/// `darkmux pr-review run` handler: drive the review review end-to-end (or
 /// synthesis-only, via `--from-envelope`) and emit the same
 /// `{mode, review, comment}` payload `render`/`cmd_render` do.
 pub fn cmd_run(opts: RunOpts) -> Result<i32> {
@@ -830,7 +830,7 @@ pub fn cmd_run(opts: RunOpts) -> Result<i32> {
     let diff_text = std::fs::read_to_string(&opts.diff)
         .with_context(|| format!("reading --diff {}", opts.diff.display()))?;
 
-    let env: FunnelEnvelope = if let Some(path) = &opts.from_envelope {
+    let env: ReviewEnvelope = if let Some(path) = &opts.from_envelope {
         // Synthesis-only: dispatch-shaping flags have nothing to shape.
         // Warn (don't error) so a copy-pasted full command still runs —
         // operator sovereignty: surface, never silently ignore.
@@ -859,13 +859,13 @@ pub fn cmd_run(opts: RunOpts) -> Result<i32> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading --from-envelope {}", path.display()))?;
         serde_json::from_str(&raw)
-            .with_context(|| format!("parsing --from-envelope {} as a funnel envelope", path.display()))?
+            .with_context(|| format!("parsing --from-envelope {} as a review envelope", path.display()))?
     } else {
         run_dispatch(&opts, &diff_text)?
     };
 
     if let Some(path) = &opts.envelope_out {
-        let pretty = serde_json::to_string_pretty(&env).context("serializing the funnel envelope")?;
+        let pretty = serde_json::to_string_pretty(&env).context("serializing the review envelope")?;
         std::fs::write(path, pretty)
             .with_context(|| format!("writing --envelope-out {}", path.display()))?;
     }
@@ -874,7 +874,7 @@ pub fn cmd_run(opts: RunOpts) -> Result<i32> {
     // slow, hang-prone half — is behind us. `synthesis` then `done` bracket the
     // pure-CPU render so a wedge in the (local) synthesis code is still visible.
     liveness("synthesis");
-    let rendered = synthesize_funnel(&env, &diff_text, opts.attribution.as_deref());
+    let rendered = synthesize_review(&env, &diff_text, opts.attribution.as_deref());
     let code = emit_rendered(&rendered, opts.emit.as_deref())?;
     liveness("done");
     Ok(code)
@@ -927,8 +927,8 @@ fn parse_exec_mode(mode: &str) -> Result<ExecMode> {
 }
 
 /// `Bundle` (packet 3's `darkmux_lab::lab::bundle`) -> `BundleInput`
-/// (packet 4's `darkmux_lab::lab::funnel` shape) — the reconciliation the
-/// funnel module's own doc names as this packet's job. Each bundle's
+/// (packet 4's `darkmux_lab::lab::review` shape) — the reconciliation the
+/// review module's own doc names as this packet's job. Each bundle's
 /// line-span pointers are rendered PER SEAT (#1256): `slice_code` (the
 /// judge's `// path` raw format) into `code`, `slice_code_probe` (the
 /// probe's Phase A ``### `path`` + ```` ```typescript ```` fenced format)
@@ -954,7 +954,7 @@ fn bundle_inputs_from_set(set: &BundleSet, source: &FileSource) -> Result<Vec<Bu
 }
 
 /// Real `Bundle.id`s are `"<fn>@<path>"` (packet 3's `build_bundles`); the
-/// provisional funnel-internal bundler used `id == path` with no `@`.
+/// provisional review-internal bundler used `id == path` with no `@`.
 /// `split_once('@')` — the FIRST `@` — handles both: function names never
 /// contain `@`, but paths can (an npm `@scope/pkg` vendored path), so
 /// splitting on the LAST `@` would mangle them. Falls back to the whole id
@@ -963,7 +963,7 @@ fn path_from_bundle_id(bundle_id: &str) -> &str {
     bundle_id.split_once('@').map(|(_, p)| p).unwrap_or(bundle_id)
 }
 
-/// (#1247 Part 1) Production wiring of `funnel::FunnelEmitter` — writes
+/// (#1247 Part 1) Production wiring of `review::ReviewEmitter` — writes
 /// through the real darkmux-flow machinery (`darkmux_flow::record`), the
 /// same engagement-scoped stream `crew dispatch`/`phase review` write
 /// through (env/config-resolved sink, `machine_id`/`orchestrator`
@@ -978,7 +978,7 @@ fn path_from_bundle_id(bundle_id: &str) -> &str {
 /// in the codebase; a flow-record write failure must never abort a review.
 struct FleetFlowEmitter;
 
-impl FunnelEmitter for FleetFlowEmitter {
+impl ReviewEmitter for FleetFlowEmitter {
     fn emit(&mut self, record: darkmux_flow::FlowRecord) {
         let _ = darkmux_flow::record(record);
     }
@@ -986,8 +986,8 @@ impl FunnelEmitter for FleetFlowEmitter {
 
 /// (#1272) Every distinct model this crew's resolved seats will dispatch,
 /// darkmux-namespaced (`swap::namespaced_identifier` — the same form
-/// `FunnelEnvelope::staffing` records) and deduped/sorted for a stable
-/// display string. A funnel run is inherently multi-model (>=1 probe seat
+/// `ReviewEnvelope::staffing` records) and deduped/sorted for a stable
+/// display string. A review run is inherently multi-model (>=1 probe seat
 /// plus the judge seat) — unlike a single-model `crew dispatch`, there's no
 /// one "the model" for the dispatch bookend's `model` field, so this is the
 /// closest honest equivalent: every model actually in play, comma-joined,
@@ -1019,16 +1019,16 @@ fn crew_model_summary(crew: &ResolvedCrew) -> Option<String> {
     }
 }
 
-/// (#1272) One funnel-run dispatch bookend record. Same builder + field
+/// (#1272) One review-run dispatch bookend record. Same builder + field
 /// shape `crew dispatch` uses (`build_dispatch_record_with_payload`), with
 /// ONE deliberate difference: `source` is overridden from the builder's
-/// hardcoded `"crew_dispatch"` to `"funnel"` — the SAME provenance tag
-/// every sibling `funnel.task/step/ruling` record in this session carries
-/// (`funnel_flow_record` in `darkmux_lab::lab::funnel`). One session, one
+/// hardcoded `"crew_dispatch"` to `"review"` — the SAME provenance tag
+/// every sibling `review.task/step/ruling` record in this session carries
+/// (`review_flow_record` in `darkmux_lab::lab::review`). One session, one
 /// source: without the override, the viewer's Source facet would split a
 /// single production review's records across two contradictory provenance
 /// tags, and the mislabel would persist durably in the flow/audit files.
-fn funnel_bookend_record(
+fn review_bookend_record(
     level: darkmux_flow::Level,
     action: &str,
     crew_name: &str,
@@ -1046,24 +1046,39 @@ fn funnel_bookend_record(
         None,
         Some(payload),
     );
-    record.source = Some("funnel".to_string());
+    record.source = Some("review".to_string());
     record
 }
 
+/// (#1349) Merge `extra`'s top-level keys into `base` (both expected to be
+/// JSON objects) and return the result — the same flat-bag technique
+/// `mission_run.rs`'s `emit_step_result` uses to layer caller-specific
+/// fields onto a shared payload shape. `extra`'s keys win on collision (the
+/// caller is adding detail, not overriding the bookend's own `runtime`
+/// tag, so callers should avoid colliding key names in practice).
+fn merge_json_object(mut base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    if let (serde_json::Value::Object(extra), serde_json::Value::Object(base)) =
+        (extra, &mut base)
+    {
+        base.extend(extra);
+    }
+    base
+}
+
 /// (#1272, unified onto `darkmux_flow::BookendGuard` in #1230 Packet 0)
-/// Adapts a [`FunnelEmitter`] to `darkmux_flow`'s generic
-/// `BookendSink` — same bridging pattern `darkmux-lab`'s `FunnelBookendGuard`
-/// uses (`darkmux_lab::lab::funnel::EmitterSink`, not reused directly since
-/// it's private to that crate). ALSO implements `FunnelEmitter` itself
+/// Adapts a [`ReviewEmitter`] to `darkmux_flow`'s generic
+/// `BookendSink` — same bridging pattern `darkmux-lab`'s `ReviewRunGuard`
+/// uses (`darkmux_lab::lab::review::EmitterSink`, not reused directly since
+/// it's private to that crate). ALSO implements `ReviewEmitter` itself
 /// (trivial forward) so `with_dispatch_bookends` can re-borrow the guard's
-/// sink as a `&mut dyn FunnelEmitter` via `BookendGuard::sink_mut()` and
-/// hand that to `f` (`run_funnel`/`run_judge_only`) — those need the raw
-/// `FunnelEmitter` view, not the `BookendSink` one, so this concrete
+/// sink as a `&mut dyn ReviewEmitter` via `BookendGuard::sink_mut()` and
+/// hand that to `f` (`run_review`/`run_judge_only`) — those need the raw
+/// `ReviewEmitter` view, not the `BookendSink` one, so this concrete
 /// adapter type (not a type-erased `dyn BookendSink`) is what makes that
 /// re-lending possible without an unsafe downcast; see
 /// `darkmux_flow::bookend`'s module doc for why the guard can't do that
 /// lending itself.
-struct EmitterSink<'a>(&'a mut dyn FunnelEmitter);
+struct EmitterSink<'a>(&'a mut dyn ReviewEmitter);
 
 impl darkmux_flow::BookendSink for EmitterSink<'_> {
     fn emit(&mut self, record: darkmux_flow::FlowRecord) {
@@ -1071,7 +1086,7 @@ impl darkmux_flow::BookendSink for EmitterSink<'_> {
     }
 }
 
-impl FunnelEmitter for EmitterSink<'_> {
+impl ReviewEmitter for EmitterSink<'_> {
     fn emit(&mut self, record: darkmux_flow::FlowRecord) {
         self.0.emit(record);
     }
@@ -1080,62 +1095,74 @@ impl FunnelEmitter for EmitterSink<'_> {
 /// (#1272) Emit `dispatch start`, run `f`, then emit the matching terminal
 /// record — `dispatch complete` on `Ok`, `dispatch error` (carrying the
 /// real error text) on `Err`. Same shape `crew dispatch` emits around every
-/// dispatch ([`funnel_bookend_record`] — the `crew dispatch` builder with
-/// only `source` re-tagged `"funnel"`; action = `"dispatch start"`/
+/// dispatch ([`review_bookend_record`] — the `crew dispatch` builder with
+/// only `source` re-tagged `"review"`; action = `"dispatch start"`/
 /// `"dispatch complete"`/`"dispatch error"`, no new action vocabulary), so
 /// a production `pr-review run` opens/closes the SAME liveness edge the
 /// viewer's fleet/machine surfaces already key on (#857 — a session's open
 /// edge is its `dispatch.start` record, per `darkmux-flow`'s
-/// `presence_reconciler`) that `crew dispatch` opens today. Before this fix, the funnel's OWN `funnel.task/step/ruling`
+/// `presence_reconciler`) that `crew dispatch` opens today. Before this fix, the review's OWN `review.task/step/ruling`
 /// vocabulary (#1247/#1248) was the only thing a production `pr-review
 /// run` ever emitted, so a real production review never showed up as a
 /// running dispatch anywhere in the viewer (#1272).
 ///
-/// `f` (the funnel dispatch itself — `run_funnel` or `run_judge_only`) is
+/// `f` (the review dispatch itself — `run_review` or `run_judge_only`) is
 /// injected so a test can drive a scripted stand-in instead of a real crew
 /// and LMStudio round trip, and receives the SAME sink the bookend records
 /// go through (production: [`FleetFlowEmitter`]) — one sink for the whole
 /// `pr-review run` invocation, so `dispatch start` always precedes every
-/// `funnel.*` record and the terminal record always follows them, in the
+/// `review.*` record and the terminal record always follows them, in the
 /// SAME emitter's observed sequence.
 ///
 /// Terminal-on-all-paths via `darkmux_flow::BookendGuard`'s RAII Drop
 /// backstop (#1230 Packet 0, same shared mechanism `DispatchBookendGuard`
-/// and `FunnelBookendGuard` use) — the `?`-return case is simply `f`
+/// and `ReviewRunGuard` use) — the `?`-return case is simply `f`
 /// returning `Err`, handled by the `Err` arm below like any other early
 /// exit; a panic mid-`f` fires the guard's Drop path instead.
 ///
 /// **The actual bug fix (#1230 Packet 0):** on `Ok(env)`, a remote-seat
 /// member previously stamped `payload.remote_tokens` alone — never
 /// `payload.endpoint`, the ONLY field the viewer's `tokensOffMeter()`
-/// reads to classify a session as cloud vs. local, so a funnel run with a
+/// reads to classify a session as cloud vs. local, so a review run with a
 /// remote-endpoint seat silently reported 100% of its tokens as local
 /// savings. Now stamps both via `darkmux_flow::stamp_remote_classification`,
 /// built from `darkmux_flow::remote_route_label` against the first remote
 /// member's endpoint host + declared model id — the same canonical shape
 /// `dispatch_internal::remote_endpoint_label` produces.
+///
+/// `start_extra` (#1349) merges flat into the `dispatch start` payload
+/// alongside `{"runtime": "review"}` — the caller-supplied exec-mode/
+/// bundle-count fields the now-retired `review.task started` record used to
+/// carry (`darkmux_lab::lab::review::run_review_graph`'s doc explains why
+/// that inner bookend was retired rather than fixed: this OUTER wrap
+/// already covers the same liveness edge). Empty (`json!({})`) for a
+/// caller with nothing to add. The `Ok(env)` arm below does the same for
+/// the `dispatch complete` payload — `confirmed`/`needs_check`/`archived`/
+/// `degenerate` ride there now, unconditionally, since every `ReviewEnvelope`
+/// carries them regardless of which review entry point produced it.
 fn with_dispatch_bookends(
-    emitter: &mut dyn FunnelEmitter,
+    emitter: &mut dyn ReviewEmitter,
     case_id: &str,
     crew_name: &str,
     model: Option<&str>,
-    f: impl FnOnce(&mut dyn FunnelEmitter) -> Result<FunnelEnvelope>,
-) -> Result<FunnelEnvelope> {
+    start_extra: serde_json::Value,
+    f: impl FnOnce(&mut dyn ReviewEmitter) -> Result<ReviewEnvelope>,
+) -> Result<ReviewEnvelope> {
     let mut sink = EmitterSink(emitter);
     let case_id_owned = case_id.to_string();
     let crew_owned = crew_name.to_string();
     let model_owned = model.map(str::to_string);
     let on_abort = move |_id: &str, _kind: &str| {
-        funnel_bookend_record(
+        review_bookend_record(
             darkmux_flow::Level::Error,
             "dispatch error",
             &crew_owned,
             &case_id_owned,
             model_owned.as_deref(),
             json!({
-                "runtime": "funnel",
+                "runtime": "review",
                 "result_class": "error",
-                "error": "funnel dispatch terminated before completion (early return or panic)",
+                "error": "review dispatch terminated before completion (early return or panic)",
             }),
         )
     };
@@ -1143,19 +1170,19 @@ fn with_dispatch_bookends(
     guard.open(
         "dispatch",
         "dispatch",
-        funnel_bookend_record(
+        review_bookend_record(
             darkmux_flow::Level::Info,
             "dispatch start",
             crew_name,
             case_id,
             model,
-            json!({ "runtime": "funnel" }),
+            merge_json_object(json!({ "runtime": "review" }), start_extra),
         ),
     );
 
-    // Re-borrow the guard's sink as a `&mut dyn FunnelEmitter` for `f` — the
+    // Re-borrow the guard's sink as a `&mut dyn ReviewEmitter` for `f` — the
     // SAME underlying sink the bookend records go through, so `dispatch
-    // start` always precedes every `funnel.*` record `f` emits. This
+    // start` always precedes every `review.*` record `f` emits. This
     // reborrow ends when `f` returns (ordinary NLL scoping), so `guard`
     // itself is free to be used again right after; a panic mid-`f` still
     // fires the guard's own Drop, since `guard` is a local in THIS frame
@@ -1165,7 +1192,19 @@ fn with_dispatch_bookends(
 
     match result {
         Ok(env) => {
-            let mut payload = json!({ "runtime": "funnel", "result_class": "ok" });
+            let mut payload = json!({
+                "runtime": "review",
+                "result_class": "ok",
+                // (#1349) Carried over from the now-retired `review.task
+                // finished` record — every `ReviewEnvelope`, from either
+                // review entry point, has these fields.
+                "confirmed": env.confirmed,
+                "needs_check": env.needs_check,
+                "archived": env.archived,
+            });
+            if let Some(reason) = &env.degenerate {
+                payload["degenerate"] = json!(reason);
+            }
             // (#1260/#1186/#1230) Remote-seat tokens ride the dispatch
             // bookend too, so downstream token-accounting surfaces can
             // EXCLUDE cloud tokens from local-savings math without opening
@@ -1185,7 +1224,7 @@ fn with_dispatch_bookends(
             }
             guard.close(
                 "dispatch",
-                funnel_bookend_record(
+                review_bookend_record(
                     darkmux_flow::Level::Info,
                     "dispatch complete",
                     crew_name,
@@ -1199,14 +1238,14 @@ fn with_dispatch_bookends(
         Err(e) => {
             guard.close(
                 "dispatch",
-                funnel_bookend_record(
+                review_bookend_record(
                     darkmux_flow::Level::Error,
                     "dispatch error",
                     crew_name,
                     case_id,
                     model,
                     json!({
-                        "runtime": "funnel",
+                        "runtime": "review",
                         "result_class": "error",
                         "error": e.to_string(),
                     }),
@@ -1218,7 +1257,7 @@ fn with_dispatch_bookends(
 }
 
 /// The dispatch case handle: `owner/repo@sha` for a GitHub-API source, else the
-/// worktree path, else `local`. Used both as the funnel's `case_id` and as the
+/// worktree path, else `local`. Used both as the review's `case_id` and as the
 /// #1311 liveness case field, so the floor trail and the flow records line up.
 fn case_label(opts: &RunOpts) -> String {
     match (&opts.github, &opts.head_sha) {
@@ -1277,30 +1316,26 @@ fn crew_detail(crew: &ResolvedCrew) -> String {
 /// LMStudio's real per-model concurrent-prediction ceiling is genuinely
 /// unresolved (operator observation: ~4 in practice, sometimes 1), and
 /// judge is typically ONE model processing N flags, so graph-level fan-out
-/// here would buy little while adding real risk. A lightweight env-var
-/// knob (not yet threaded through the full `config.json` /
-/// `darkmux_types::config_access` precedence chain other `DARKMUX_*`
-/// settings use — a deliberate, smaller-scoped follow-up once real
-/// concurrency-ceiling data exists to justify a durable operator-facing
-/// setting) rather than a hardcoded literal, per the "config is the
-/// extension mechanism" principle.
-fn funnel_judge_concurrency() -> u32 {
-    std::env::var("DARKMUX_FUNNEL_JUDGE_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(1)
+/// here would buy little while adding real risk. (#1349) Was a bare
+/// `std::env::var("DARKMUX_FUNNEL_JUDGE_CONCURRENCY")` read, deliberately
+/// NOT yet threaded through the `config.json`/`darkmux_types::config_access`
+/// precedence chain other `DARKMUX_*` settings use — now wired through it
+/// (`config_access::review_judge_concurrency`, `config.review.
+/// judge_concurrency`) as part of the same rename that retired the
+/// `FUNNEL_JUDGE_CONCURRENCY` name.
+fn review_judge_concurrency() -> u32 {
+    darkmux_types::config_access::review_judge_concurrency()
 }
 
 /// The real, persisted Mission + three Phases (investigate / adjudicate /
-/// report — see `darkmux_lab::lab::funnel`'s module doc) a `pr-review run`
-/// dispatch creates before running the funnel graph. Phase boundaries here
+/// report — see `darkmux_lab::lab::review`'s module doc) a `pr-review run`
+/// dispatch creates before running the review graph. Phase boundaries here
 /// mark genuinely inspectable, self-contained artifacts an operator would
 /// want to see independently (deduped flags = "what's the review forming
 /// to be," judged flags = "what got confirmed") — a labeling/observability
-/// layer over the flat Task/Step graph `build_funnel_graph` builds, not a
+/// layer over the flat Task/Step graph `build_review_graph` builds, not a
 /// second scheduler.
-struct FunnelMissionPhases {
+struct ReviewMissionPhases {
     mission_id: String,
     investigate_phase_id: String,
     adjudicate_phase_id: String,
@@ -1340,10 +1375,10 @@ fn now_unix() -> u64 {
 /// erroring or duplicating — `darkmux pr-review run` has no "first run
 /// only" contract the way `mission propose`'s no-overwrite gate does.
 /// Best-effort (a persistence hiccup here must never block the review
-/// itself — the funnel graph still runs and produces a real envelope even
+/// itself — the review graph still runs and produces a real envelope even
 /// if Mission/Phase persistence failed; only the mission-status/graph-lens
 /// VIEW of the run would be degraded, not the run itself).
-fn build_mission_for_funnel(case_id: &str, crew_name: &str) -> Result<FunnelMissionPhases> {
+fn build_mission_for_review(case_id: &str, crew_name: &str) -> Result<ReviewMissionPhases> {
     let mission_id = format!("pr-review-{}", sanitize_mission_id(case_id));
     let investigate_phase_id = format!("{mission_id}-investigate");
     let adjudicate_phase_id = format!("{mission_id}-adjudicate");
@@ -1408,18 +1443,18 @@ fn build_mission_for_funnel(case_id: &str, crew_name: &str) -> Result<FunnelMiss
         }
     }
 
-    Ok(FunnelMissionPhases { mission_id, investigate_phase_id, adjudicate_phase_id, report_phase_id })
+    Ok(ReviewMissionPhases { mission_id, investigate_phase_id, adjudicate_phase_id, report_phase_id })
 }
 
 /// Everything but `--from-envelope`: resolve the source + crew, build real
-/// bundles, and dispatch either `run_funnel` (the full pipeline) or
+/// bundles, and dispatch either `run_review` (the full pipeline) or
 /// `run_judge_only` (`--charges-file` — re-judge a saved flag list without
 /// re-running the probe; the bundler still runs since the judge needs the
 /// code each flag's `bundle_id` refers to).
-fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
+fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<ReviewEnvelope> {
     // (#1311) The liveness case handle, computed from the opts up front so
     // every floor marker below carries the same handle the dispatch bookends /
-    // funnel records use (`repo@sha`, the worktree path, or `local`). Derived
+    // review records use (`repo@sha`, the worktree path, or `local`). Derived
     // purely from already-parsed args — nothing here can hang.
     let case = case_label(opts);
     let crew_name = match opts.crew.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -1472,6 +1507,11 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     };
     let bundles = bundle_inputs_from_set(&bundle_set, &source)?;
     liveness_detail("bundling-done", &case, &format!("bundles={}", bundles.len()));
+    // (#1349) Captured before `bundles` moves into either branch below —
+    // feeds the `dispatch start` bookend's `start_extra` payload, the same
+    // "exec_mode"/"bundles" fields the now-retired `review.task started`
+    // record used to carry.
+    let bundle_count = bundles.len();
 
     let intent = match &opts.intent_file {
         Some(p) => std::fs::read_to_string(p)
@@ -1480,6 +1520,13 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     };
 
     let mode = parse_exec_mode(&opts.mode)?;
+    // (#1349) `with_dispatch_bookends`'s `start_extra` — the exec-mode/
+    // bundle-count fields the retired `review.task started` record used to
+    // carry, now riding the outer `dispatch start` bookend instead. Built
+    // from `opts.mode` (the operator's raw CLI string) rather than the
+    // private `review::mode_label` — same information, no need to widen
+    // that function's visibility for one caller.
+    let dispatch_start_extra = json!({ "exec_mode": opts.mode, "bundles": bundle_count });
     let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
         anyhow!(
             "darkmux: role \"review-probe\" has no system prompt — reinstall darkmux or check \
@@ -1502,11 +1549,11 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     })?;
 
     // (#1311) Same handle the floor markers used above — one derivation, so the
-    // dispatch bookend / funnel records and the liveness trail always agree.
+    // dispatch bookend / review records and the liveness trail always agree.
     let case_id = case.clone();
 
     // (#1272) Bookend identity — captured up front from data that outlives
-    // both branches below, so the dispatch bookend / funnel records and the
+    // both branches below, so the dispatch bookend / review records and the
     // liveness trail always agree regardless of which path runs.
     let case_id_for_bookends = case_id.clone();
     let crew_name_for_bookends = crew.name.clone();
@@ -1534,7 +1581,7 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     );
 
     if let Some(charges_path) = &opts.charges_file {
-        let inputs = FunnelInputs {
+        let inputs = ReviewInputs {
             case_id,
             crew: &crew,
             intent_title: "",
@@ -1579,22 +1626,23 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
             &case_id_for_bookends,
             &crew_name_for_bookends,
             model_for_bookends.as_deref(),
+            dispatch_start_extra,
             move |emitter| run_judge_only(flags, &inputs, &mut chat, &mut cycler, emitter),
         )
     } else {
-        // (#1230/#1341 DRY pass) The main funnel path now runs as a real,
+        // (#1230/#1341 DRY pass) The main review path now runs as a real,
         // upfront-declared Task/Step graph — one Mission with three Phases
-        // (investigate/adjudicate/report) — instead of `run_funnel`'s
-        // sequential six-call driver. See `build_mission_for_funnel` +
-        // `darkmux_lab::lab::funnel::{build_funnel_graph, run_funnel_graph}`.
-        let seats = validate_funnel_crew(&crew)?;
+        // (investigate/adjudicate/report) — instead of `run_review`'s
+        // sequential six-call driver. See `build_mission_for_review` +
+        // `darkmux_lab::lab::review::{build_review_graph, run_review_graph}`.
+        let seats = validate_review_crew(&crew)?;
         let probes: Vec<_> = seats.probes.clone();
         let judge = seats.judge.clone();
         let verify = seats.verify.cloned();
-        let judge_identifier = darkmux_lab::lab::funnel::seat_identifier(&judge.pm);
+        let judge_identifier = darkmux_lab::lab::review::seat_identifier(&judge.pm);
         let request_changes = crew.request_changes;
 
-        let ctx = Arc::new(FunnelStepContext {
+        let ctx = Arc::new(ReviewStepContext {
             case_id: case_id_for_bookends.clone(),
             crew: crew.clone(),
             intent_title: String::new(),
@@ -1608,8 +1656,8 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
             timeout_seconds: opts.timeout,
         });
 
-        let mission = build_mission_for_funnel(&case_id_for_bookends, &crew_name_for_bookends)?;
-        let graph = build_funnel_graph(
+        let mission = build_mission_for_review(&case_id_for_bookends, &crew_name_for_bookends)?;
+        let graph = build_review_graph(
             ctx.clone(),
             judge.clone(),
             verify.clone(),
@@ -1617,15 +1665,15 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
             &mission.investigate_phase_id,
             &mission.adjudicate_phase_id,
             &mission.report_phase_id,
-            funnel_judge_concurrency(),
+            review_judge_concurrency(),
         );
         for task in &graph.tasks {
             let _ = darkmux_crew::lifecycle::save_task(&mission.mission_id, task);
         }
 
-        let fingerprint_val = darkmux_lab::lab::funnel::fingerprint(&judge_identifier, &ctx.judge_system);
+        let fingerprint_val = darkmux_lab::lab::review::fingerprint(&judge_identifier, &ctx.judge_system);
         let staffing_snapshot =
-            darkmux_lab::lab::funnel::staffing_snapshot(&probes, &judge, verify.as_ref(), request_changes);
+            darkmux_lab::lab::review::staffing_snapshot(&probes, &judge, verify.as_ref(), request_changes);
         let mission_id = mission.mission_id.clone();
         let phase_id_of_step = graph.phase_id_of_step.clone();
         // Cloned for the `move` closure's own use — `with_dispatch_bookends`
@@ -1639,8 +1687,9 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
             &case_id_for_bookends,
             &crew_name_for_bookends,
             model_for_bookends.as_deref(),
+            dispatch_start_extra,
             move |emitter| {
-                run_funnel_graph(&ctx, &crew_name_for_closure, mode, fingerprint_val, staffing_snapshot, graph, emitter)
+                run_review_graph(&ctx, &crew_name_for_closure, mode, fingerprint_val, staffing_snapshot, graph, emitter)
                     .map(|(env, steps)| {
                         for (step_id, step) in &steps {
                             let phase_id = phase_id_of_step
@@ -1665,7 +1714,7 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
 const CONFIRMED_MARKER: &str =
     "⚠ needs frontier verification — confirmed by a local judge, not yet frontier-verified";
 
-/// Three-tier synthesis of a [`FunnelEnvelope`] into the [`Rendered`]
+/// Three-tier synthesis of a [`ReviewEnvelope`] into the [`Rendered`]
 /// `{mode, review, comment}` contract:
 ///
 /// - [`Tier::Confirmed`] -> an inline review comment (anchor resolved via
@@ -1694,18 +1743,18 @@ const CONFIRMED_MARKER: &str =
 ///   vanish a second defect's description.
 /// - [`Tier::Archived`] -> never rendered; stays in the envelope only.
 /// - Zero confirmed AND zero needs-check on a healthy (non-degenerate)
-///   funnel -> an honest `"comment"` summary naming how much was
+///   review -> an honest `"comment"` summary naming how much was
 ///   investigated plus which models ran it — never a silent green pass.
 /// - A degenerate envelope (`env.degenerate.is_some()`) -> `"degraded"`,
 ///   the same contract [`degraded_fallback`] (#1113) uses elsewhere in
 ///   this module — no review signal was produced.
-pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&str>) -> Rendered {
+pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&str>) -> Rendered {
     if let Some(note) = &env.degenerate {
         // (#1298) Even a degenerate run posts the envelope-derived footer, so a
         // remote crew that produced no signal never claims "no cloud API".
         return degraded_with_footer(
-            &format!("The review funnel produced no signal: {note}."),
-            &funnel_footer(env, attribution),
+            &format!("The review review produced no signal: {note}."),
+            &review_footer(env, attribution),
         );
     }
 
@@ -1765,14 +1814,14 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         let mut lines = vec!["### 🤖 darkmux PR review".to_string(), String::new()];
         if needs_check_count == 0 {
             lines.push(format!(
-                "review funnel ran: {} flags investigated across {} bundles, none confirmed. _{}_",
+                "review review ran: {} flags investigated across {} bundles, none confirmed. _{}_",
                 env.deduped_flags,
                 env.bundles,
                 member_summary(env)
             ));
         } else {
             lines.push(format!(
-                "review funnel ran: {} flags investigated across {} bundles, none confirmed — \
+                "review review ran: {} flags investigated across {} bundles, none confirmed — \
                  {} worth a double check (not merge-blocking). _{}_",
                 env.deduped_flags,
                 env.bundles,
@@ -1787,7 +1836,7 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         return Rendered {
             mode: "comment",
             review: None,
-            comment: Some(format!("{}{}", lines.join("\n"), funnel_footer(env, attribution))),
+            comment: Some(format!("{}{}", lines.join("\n"), review_footer(env, attribution))),
         };
     }
 
@@ -1830,7 +1879,7 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         mode: "review",
         review: Some(json!({
             "event": event,
-            "body": format!("{}{}", body.join("\n"), funnel_footer(env, attribution)),
+            "body": format!("{}{}", body.join("\n"), review_footer(env, attribution)),
             "comments": inline,
         })),
         comment: None,
@@ -1843,7 +1892,7 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
 /// keep the manual-verification marker), or a remote probe seat failing
 /// (reduced coverage). Empty (and byte-identical to pre-#1260 output) when
 /// the run produced no warnings — a crew without remote seats never does.
-fn run_warnings_block(env: &FunnelEnvelope) -> Vec<String> {
+fn run_warnings_block(env: &ReviewEnvelope) -> Vec<String> {
     if env.warnings.is_empty() {
         return Vec::new();
     }
@@ -1939,9 +1988,9 @@ fn needs_check_bullet(path: &str, anchor: Option<&str>, record: &JudgeRecord) ->
 /// "probed by <models>; judged by <model>" — the "member/model attribution"
 /// half of the zero-confirms-healthy comment, distinct from the operator-
 /// supplied `attribution` CLI flag (which governs the posted footer via
-/// [`footer_for`]). Names WHICH local models ran the funnel, not WHERE it
+/// [`footer_for`]). Names WHICH local models ran the review, not WHERE it
 /// ran.
-fn member_summary(env: &FunnelEnvelope) -> String {
+fn member_summary(env: &ReviewEnvelope) -> String {
     let probes: Vec<&str> = env
         .members
         .iter()
@@ -1963,11 +2012,11 @@ fn member_summary(env: &FunnelEnvelope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Test-only: these funnel types aren't referenced by this module's
+    // Test-only: these review types aren't referenced by this module's
     // production code (only inferred through `env.judged`/`env.members`
     // iteration), so importing them at file scope would warn "unused" on a
     // plain (non-test) `cargo build`.
-    use darkmux_lab::lab::funnel::{FunnelRuling, JudgedFlag, MemberRecord, NeedsCheckCluster};
+    use darkmux_lab::lab::review::{JudgeRuling, JudgedFlag, MemberRecord, NeedsCheckCluster};
 
     const DIFF: &str = "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,3 +1,4 @@\n const a = 1;\n+const b = 2;\n const c = 3;\n-const d = 4;\n+const d = 5;\n";
 
@@ -2146,7 +2195,7 @@ mod tests {
         assert_eq!(resolve_anchor(Some("src/x.ts"), Some("\n  \nconst b = 2;"), &idx()), Some(2));
     }
 
-    // ── #1300 fragment fallback: the funnel stores a sub-expression SPAN,
+    // ── #1300 fragment fallback: the review stores a sub-expression SPAN,
     //    not the whole line, so the exact lookup misses. Recover via a
     //    substring match, but only when exactly one new-side line contains it.
 
@@ -2518,9 +2567,9 @@ mod tests {
             .contains("no cloud API"));
     }
 
-    // ─── synthesize_funnel: three-tier synthesis (#1222 Phase B packet 5) ──
+    // ─── synthesize_review: three-tier synthesis (#1222 Phase B packet 5) ──
 
-    fn judge_record(ruling: FunnelRuling, evidence: &str, note: &str) -> JudgeRecord {
+    fn judge_record(ruling: JudgeRuling, evidence: &str, note: &str) -> JudgeRecord {
         JudgeRecord {
             ruling,
             decisive_evidence: evidence.to_string(),
@@ -2543,9 +2592,9 @@ mod tests {
     }
 
     /// A double-confirmed flag: pass-1 AND pass-2 both `confirmed` — the
-    /// only way `judge_one_flag` (funnel.rs) ever produces `Tier::Confirmed`.
+    /// only way `judge_one_flag` (review.rs) ever produces `Tier::Confirmed`.
     fn confirmed_flag(bundle_id: &str, anchor: Option<&str>, note: &str, evidence: &str) -> JudgedFlag {
-        let record = judge_record(FunnelRuling::Confirmed, evidence, note);
+        let record = judge_record(JudgeRuling::Confirmed, evidence, note);
         JudgedFlag {
             flag: probe_flag(bundle_id, anchor),
             pass1: record.clone(),
@@ -2560,14 +2609,14 @@ mod tests {
     /// `demoted = true` mirrors a pass-1 `confirmed` that pass-2 disagreed
     /// with (`demoted_by_pass2 = true`, per `judge_one_flag`'s state
     /// machine); `demoted = false` is a plain pass-1 `needs_check` with no
-    /// pass-2 at all. Either way `tier` is `NeedsCheck` — `synthesize_funnel`
+    /// pass-2 at all. Either way `tier` is `NeedsCheck` — `synthesize_review`
     /// doesn't special-case `demoted_by_pass2` itself, it just reads `tier`.
     fn needs_check_flag(bundle_id: &str, anchor: Option<&str>, note: &str, demoted: bool) -> JudgedFlag {
         if demoted {
             JudgedFlag {
                 flag: probe_flag(bundle_id, anchor),
-                pass1: judge_record(FunnelRuling::Confirmed, "pass-1 evidence", "pass-1 note"),
-                pass2: Some(judge_record(FunnelRuling::FalsePositive, "pass-2 evidence", note)),
+                pass1: judge_record(JudgeRuling::Confirmed, "pass-1 evidence", "pass-1 note"),
+                pass2: Some(judge_record(JudgeRuling::FalsePositive, "pass-2 evidence", note)),
                 tier: Tier::NeedsCheck,
                 demoted_by_pass2: true,
                     verify: None,
@@ -2576,7 +2625,7 @@ mod tests {
         } else {
             JudgedFlag {
                 flag: probe_flag(bundle_id, anchor),
-                pass1: judge_record(FunnelRuling::NeedsCheck, "pass-1 evidence", note),
+                pass1: judge_record(JudgeRuling::NeedsCheck, "pass-1 evidence", note),
                 pass2: None,
                 tier: Tier::NeedsCheck,
                 demoted_by_pass2: false,
@@ -2589,7 +2638,7 @@ mod tests {
     fn archived_flag(bundle_id: &str) -> JudgedFlag {
         JudgedFlag {
             flag: probe_flag(bundle_id, None),
-            pass1: judge_record(FunnelRuling::FalsePositive, "not a real issue", "no action needed"),
+            pass1: judge_record(JudgeRuling::FalsePositive, "not a real issue", "no action needed"),
             pass2: None,
             tier: Tier::Archived,
             demoted_by_pass2: false,
@@ -2598,10 +2647,10 @@ mod tests {
         }
     }
 
-    fn healthy_envelope(judged: Vec<JudgedFlag>) -> FunnelEnvelope {
+    fn healthy_envelope(judged: Vec<JudgedFlag>) -> ReviewEnvelope {
         let distinct_bundles: std::collections::HashSet<&str> =
             judged.iter().map(|j| j.flag.bundle_id.as_str()).collect();
-        FunnelEnvelope {
+        ReviewEnvelope {
             deduped_flags: judged.len(),
             bundles: distinct_bundles.len().max(1),
             judged,
@@ -2617,9 +2666,9 @@ mod tests {
     /// blocking review event (`request_changes: true`) — the mirror of the
     /// default (`healthy_envelope`, which leaves `staffing: None` and so
     /// renders the non-blocking `COMMENT`).
-    fn blocking_envelope(judged: Vec<JudgedFlag>) -> FunnelEnvelope {
-        FunnelEnvelope {
-            staffing: Some(darkmux_lab::lab::funnel::CrewStaffingSnapshot {
+    fn blocking_envelope(judged: Vec<JudgedFlag>) -> ReviewEnvelope {
+        ReviewEnvelope {
+            staffing: Some(darkmux_lab::lab::review::CrewStaffingSnapshot {
                 request_changes: true,
                 ..Default::default()
             }),
@@ -2636,7 +2685,7 @@ mod tests {
             "the clamp is bypassed",
         );
         let env = healthy_envelope(vec![j]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "review");
         let review = r.review.unwrap();
         // (#1302) Default: a formal review with the NON-blocking `COMMENT`
@@ -2670,7 +2719,7 @@ mod tests {
             "the clamp is bypassed",
         );
         let env = blocking_envelope(vec![j]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "review");
         let review = r.review.unwrap();
         assert_eq!(review["event"], "REQUEST_CHANGES", "request_changes:true opts back into blocking");
@@ -2694,7 +2743,7 @@ mod tests {
             "some evidence",
         );
         let env = healthy_envelope(vec![j]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let review = r.review.unwrap();
         assert_eq!(review["event"], "COMMENT", "general confirmed findings are advisory by default too");
         assert_eq!(review["comments"].as_array().unwrap().len(), 0, "unresolvable anchor never guesses a line");
@@ -2710,7 +2759,7 @@ mod tests {
             "some evidence",
         );
         let env = healthy_envelope(vec![j]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "review");
         let review = r.review.unwrap();
         assert_eq!(
@@ -2730,7 +2779,7 @@ mod tests {
         // `resolve_anchor` returns `None` for a `None` anchor.
         let j = confirmed_flag("computeEnd@src/x.ts", None, "file-level concern", "evidence");
         let env = healthy_envelope(vec![j]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let review = r.review.unwrap();
         assert_eq!(review["comments"].as_array().unwrap().len(), 0);
         assert!(review["body"].as_str().unwrap().contains("file-level concern"));
@@ -2747,7 +2796,7 @@ mod tests {
             true,
         );
         let env = healthy_envelope(vec![confirmed, demoted]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "review");
         let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
         assert!(body.contains("1 confirmed (1 inline, 0 general)"), "{body}");
@@ -2766,7 +2815,7 @@ mod tests {
         let confirmed =
             confirmed_flag("otherFn@src/y.ts", Some("const b = 2;"), "real bug", "evidence");
         let env = healthy_envelope(vec![confirmed, nc]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
         assert!(body.contains("worth a second look"), "{body}");
         assert!(body.contains("const c = 3;"), "anchor is named in the bullet: {body}");
@@ -2783,7 +2832,7 @@ mod tests {
             false,
         );
         let env = healthy_envelope(vec![nc]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "comment", "zero confirms never opens a review");
         let c = r.comment.unwrap();
         assert!(c.contains("worth a double check"), "{c}");
@@ -2792,7 +2841,7 @@ mod tests {
 
     #[test]
     fn synthesize_zero_confirms_zero_needs_check_healthy_is_honest_comment() {
-        let env = FunnelEnvelope {
+        let env = ReviewEnvelope {
             deduped_flags: 3,
             bundles: 2,
             judged: vec![archived_flag("computeEnd@src/x.ts"), archived_flag("otherFn@src/y.ts")],
@@ -2802,11 +2851,11 @@ mod tests {
             ],
             ..Default::default()
         };
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "comment");
         let c = r.comment.unwrap();
         assert!(
-            c.contains("review funnel ran: 3 flags investigated across 2 bundles, none confirmed"),
+            c.contains("review review ran: 3 flags investigated across 2 bundles, none confirmed"),
             "{c}"
         );
         assert!(c.contains("darkmux:probe-a"), "member attribution: {c}");
@@ -2823,7 +2872,7 @@ mod tests {
         );
         let archived = archived_flag("suspicious-archived-bundle-id@src/y.ts");
         let env = healthy_envelope(vec![confirmed, archived]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let review = r.review.unwrap();
         let body = review["body"].as_str().unwrap().to_string();
         assert!(
@@ -2839,11 +2888,11 @@ mod tests {
 
     #[test]
     fn synthesize_degenerate_envelope_is_degraded() {
-        let env = FunnelEnvelope {
+        let env = ReviewEnvelope {
             degenerate: Some("zero flags from all probe draws — never a silent pass".to_string()),
             ..Default::default()
         };
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "degraded");
         let c = r.comment.unwrap();
         assert!(c.contains("no signal"), "{c}");
@@ -2864,14 +2913,14 @@ mod tests {
     #[test]
     fn synthesize_judge_dead_envelope_is_degraded_not_honest_comment() {
         // The judge-dead honesty gate's synthesis half (#1222 packet 5
-        // review): the envelope finish_funnel now produces when every judge
+        // review): the envelope finish_review now produces when every judge
         // ruling was Unparsed/Error — judged flags all Archived, zero
         // confirms/needs-check, degenerate SET — must route to "degraded",
         // never to the honest "N flags investigated, none confirmed"
         // comment.
         let mut env = healthy_envelope(vec![JudgedFlag {
             flag: probe_flag("computeEnd@src/x.ts", None),
-            pass1: judge_record(FunnelRuling::Unparsed, "", ""),
+            pass1: judge_record(JudgeRuling::Unparsed, "", ""),
             pass2: None,
             tier: Tier::Archived,
             demoted_by_pass2: false,
@@ -2880,7 +2929,7 @@ mod tests {
         }]);
         env.degenerate =
             Some("judge produced no usable ruling on any of 1 flags (all errored/unparsed)".to_string());
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "degraded", "a dead judge must never render green");
         let c = r.comment.unwrap();
         assert!(c.contains("no usable ruling"), "{c}");
@@ -2891,9 +2940,9 @@ mod tests {
     fn synthesize_attribution_flows_into_footer() {
         let confirmed =
             confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "n", "e");
-        let att = "Reviewed by the review funnel on the repo's self-hosted runner.";
+        let att = "Reviewed by the review review on the repo's self-hosted runner.";
         let env = healthy_envelope(vec![confirmed]);
-        let r = synthesize_funnel(&env, DIFF, Some(att));
+        let r = synthesize_review(&env, DIFF, Some(att));
         let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
         assert!(body.contains(att), "{body}");
     }
@@ -2911,8 +2960,8 @@ mod tests {
     /// staffed by exactly `members`, then its rendered review body.
     fn footer_body_for(members: Vec<MemberRecord>) -> String {
         let confirmed = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "n", "e");
-        let env = FunnelEnvelope { members, ..healthy_envelope(vec![confirmed]) };
-        synthesize_funnel(&env, DIFF, None).review.unwrap()["body"]
+        let env = ReviewEnvelope { members, ..healthy_envelope(vec![confirmed]) };
+        synthesize_review(&env, DIFF, None).review.unwrap()["body"]
             .as_str()
             .unwrap()
             .to_string()
@@ -2954,7 +3003,7 @@ mod tests {
             judge_member("darkmux:qwen-judge", false),
         ]);
         assert!(!body.contains("pr-reviewer"), "the stale role name must be gone: {body}");
-        assert!(body.contains("review funnel"), "names the crew/funnel instead: {body}");
+        assert!(body.contains("review review"), "names the crew/review instead: {body}");
     }
 
     // ─── #1300: served model surfaces an aliased deployment, never hides it ─
@@ -2989,12 +3038,12 @@ mod tests {
         assert!(body.contains("gpt-4o"), "{body}");
     }
 
-    // ─── synthesize_funnel: coverage sweep (#1222 Phase B packet 5 QA) ────
+    // ─── synthesize_review: coverage sweep (#1222 Phase B packet 5 QA) ────
 
     #[test]
     fn synthesize_confirmed_ambiguous_anchor_falls_to_general() {
         // The `hits.len() == 1` discipline (`resolve_anchor`) must hold at
-        // the synthesize_funnel level too: a confirmed flag whose anchor
+        // the synthesize_review level too: a confirmed flag whose anchor
         // matches TWO diff lines must never guess — it lands in the general
         // body list, same as an unresolvable anchor. Mirrors
         // `resolve_ambiguous_duplicate_is_general` (render()-level) one
@@ -3002,7 +3051,7 @@ mod tests {
         let dup_diff = "diff --git a/y.ts b/y.ts\n+++ b/y.ts\n@@ -1,0 +1,2 @@\n+  return;\n+  return;\n";
         let j = confirmed_flag("fn@y.ts", Some("return;"), "ambiguous note", "ambiguous evidence");
         let env = healthy_envelope(vec![j]);
-        let r = synthesize_funnel(&env, dup_diff, None);
+        let r = synthesize_review(&env, dup_diff, None);
         assert_eq!(r.mode, "review");
         let review = r.review.unwrap();
         assert_eq!(
@@ -3017,7 +3066,7 @@ mod tests {
 
     #[test]
     fn confirmed_comment_body_empty_note_and_evidence_uses_fallback_text() {
-        let record = judge_record(FunnelRuling::Confirmed, "", "");
+        let record = judge_record(JudgeRuling::Confirmed, "", "");
         let body = confirmed_comment_body(&record, None, &[]);
         assert!(body.contains("(no note from the judge)"), "{body}");
         assert!(!body.contains("Evidence:"), "empty evidence must not render a line: {body}");
@@ -3045,7 +3094,7 @@ mod tests {
         let mut j = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "note", "evidence");
         j.verify = Some(verify_record(VerifyRuling::Verified));
         let env = healthy_envelope(vec![j]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "review", "a verified finding is still merge-blocking");
         let review = r.review.unwrap();
         let body = review["comments"][0]["body"].as_str().unwrap();
@@ -3056,7 +3105,7 @@ mod tests {
         let mut g = confirmed_flag("ghost@src/nowhere.ts", Some("no such line"), "note", "evidence");
         g.verify = Some(verify_record(VerifyRuling::Verified));
         let env = healthy_envelope(vec![g]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
         assert!(body.contains("verified by gpt-5.1 adjudication"), "{body}");
         assert!(!body.contains(CONFIRMED_MARKER), "{body}");
@@ -3069,11 +3118,11 @@ mod tests {
         let mut j = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "note", "evidence");
         j.verify = Some(verify_record(VerifyRuling::Uncertain));
         let env = healthy_envelope(vec![j]);
-        let with_uncertain = synthesize_funnel(&env, DIFF, None);
+        let with_uncertain = synthesize_review(&env, DIFF, None);
 
         let no_seat = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "note", "evidence");
         let env2 = healthy_envelope(vec![no_seat]);
-        let without_seat = synthesize_funnel(&env2, DIFF, None);
+        let without_seat = synthesize_review(&env2, DIFF, None);
 
         let a = with_uncertain.review.unwrap();
         let b = without_seat.review.unwrap();
@@ -3110,7 +3159,7 @@ mod tests {
                 .to_string(),
         ];
 
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "review", "confirmed findings still merge-block; never degraded");
         let review = r.review.unwrap();
         let comments = serde_json::to_string(&review["comments"]).unwrap();
@@ -3131,7 +3180,7 @@ mod tests {
         refuted.verify = Some(verify_record(VerifyRuling::Refuted));
         let kept = confirmed_flag("other@src/x.ts", Some("const d = 5;"), "kept note", "e");
         let env = healthy_envelope(vec![refuted, kept]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let review = r.review.unwrap();
         let body = review["body"].as_str().unwrap();
         let comments = serde_json::to_string(&review["comments"]).unwrap();
@@ -3141,7 +3190,7 @@ mod tests {
 
     #[test]
     fn confirmed_general_bullet_empty_note_and_evidence_uses_fallback_text() {
-        let record = judge_record(FunnelRuling::Confirmed, "", "");
+        let record = judge_record(JudgeRuling::Confirmed, "", "");
         let line = confirmed_general_bullet("src/x.ts", &record, None, &[]);
         assert!(line.contains("(no note from the judge)"), "{line}");
         assert!(!line.contains("_Evidence:"), "empty evidence must not render a line: {line}");
@@ -3150,7 +3199,7 @@ mod tests {
 
     #[test]
     fn needs_check_bullet_empty_note_uses_fallback_text() {
-        let record = judge_record(FunnelRuling::NeedsCheck, "some evidence", "");
+        let record = judge_record(JudgeRuling::NeedsCheck, "some evidence", "");
         let line = needs_check_bullet("src/x.ts", Some("const b = 2;"), &record);
         assert!(line.contains("(no note from the judge)"), "{line}");
         assert!(line.contains("const b = 2;"), "the anchor is still named: {line}");
@@ -3163,7 +3212,7 @@ mod tests {
         // still render, with the fallback text, not blank lines.
         let j = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "", "");
         let env = healthy_envelope(vec![j]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let review = r.review.unwrap();
         let comments = review["comments"].as_array().unwrap();
         assert_eq!(comments.len(), 1);
@@ -3176,7 +3225,7 @@ mod tests {
     #[test]
     fn synthesize_npm_scoped_path_end_to_end_resolves_inline() {
         // (#1222 packet 5 review) the bundle_id `<fn>@<path>` split-on-
-        // first-`@` fix must hold end-to-end through synthesize_funnel — a
+        // first-`@` fix must hold end-to-end through synthesize_review — a
         // path that itself contains `@` (an npm `@scope/pkg` vendored
         // path) must resolve to an inline comment on the RIGHT path, not
         // just at `path_from_bundle_id`'s own unit level.
@@ -3188,7 +3237,7 @@ mod tests {
             "scoped-path evidence",
         );
         let env = healthy_envelope(vec![j]);
-        let r = synthesize_funnel(&env, scoped_diff, None);
+        let r = synthesize_review(&env, scoped_diff, None);
         assert_eq!(r.mode, "review");
         let review = r.review.unwrap();
         let comments = review["comments"].as_array().unwrap();
@@ -3211,7 +3260,7 @@ mod tests {
             false,
         );
         let env = healthy_envelope(vec![nc]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert!(r.review.is_none(), "needs-check-only must never populate `review`");
         assert!(r.comment.is_some());
     }
@@ -3229,7 +3278,7 @@ mod tests {
             false,
         );
         let env = healthy_envelope(vec![nc]); // darkmux:probe-model / darkmux:judge-model
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let c = r.comment.unwrap();
         assert!(c.contains("darkmux:probe-model"), "{c}");
         assert!(c.contains("darkmux:judge-model"), "{c}");
@@ -3237,7 +3286,7 @@ mod tests {
 
     #[test]
     fn synthesize_honest_zero_comment_names_multiple_probe_models() {
-        let env = FunnelEnvelope {
+        let env = ReviewEnvelope {
             deduped_flags: 4,
             bundles: 2,
             judged: vec![archived_flag("a@f1.ts"), archived_flag("b@f2.ts")],
@@ -3248,7 +3297,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let c = r.comment.unwrap();
         assert!(c.contains("probed by darkmux:probe-a, darkmux:probe-b"), "{c}");
         assert!(c.contains("judged by darkmux:judge-c"), "{c}");
@@ -3256,14 +3305,14 @@ mod tests {
 
     #[test]
     fn synthesize_honest_zero_comment_falls_back_to_unknown_with_no_members() {
-        let env = FunnelEnvelope {
+        let env = ReviewEnvelope {
             deduped_flags: 1,
             bundles: 1,
             judged: vec![archived_flag("a@f1.ts")],
             members: vec![],
             ..Default::default()
         };
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let c = r.comment.unwrap();
         assert!(c.contains("probed by unknown"), "{c}");
         assert!(c.contains("judged by unknown"), "{c}");
@@ -3283,7 +3332,7 @@ mod tests {
         for _ in 0..4 {
             judged.push(needs_check_flag("svcB@src/b.ts", None, "a provenance concern", false));
         }
-        let env = FunnelEnvelope {
+        let env = ReviewEnvelope {
             deduped_flags: judged.len(),
             bundles: 2,
             judged,
@@ -3301,7 +3350,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         assert_eq!(r.mode, "comment", "zero confirmed → comment mode");
         let c = r.comment.unwrap();
         // The raw total is conserved in the summary (10, not the 2 clusters).
@@ -3326,7 +3375,7 @@ mod tests {
         ];
         // needs_check_clusters left empty (Default) — clustering did NOT fire.
         let env = healthy_envelope(judged);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let c = r.comment.unwrap();
         assert!(c.contains("2 worth a double check"), "{c}");
         assert!(c.contains("double check one"), "raw bullet retained:\n{c}");
@@ -3348,7 +3397,7 @@ mod tests {
         j.flag.also_flagged =
             vec!["a second framing of the same defect".into(), "a third framing".into()];
         let env = healthy_envelope(vec![j]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let body = r.review.unwrap()["comments"][0]["body"].as_str().unwrap().to_string();
         assert!(body.contains("Also flagged (same location):"), "{body}");
         assert!(body.contains("a second framing of the same defect"), "{body}");
@@ -3367,16 +3416,16 @@ mod tests {
         );
         j.flag.also_flagged = vec!["absorbed alternate framing".into()];
         let env = healthy_envelope(vec![j]);
-        let r = synthesize_funnel(&env, DIFF, None);
+        let r = synthesize_review(&env, DIFF, None);
         let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
         assert!(body.contains("Also flagged (same location): absorbed alternate framing"), "{body}");
     }
 
-    // ── #1272: dispatch.start/terminal bookends around a production funnel run ──
+    // ── #1272: dispatch.start/terminal bookends around a production review run ──
 
-    /// Recording [`FunnelEmitter`] mock — pushes every emitted record into a
+    /// Recording [`ReviewEmitter`] mock — pushes every emitted record into a
     /// `Vec` so a test can assert the exact action sequence, same discipline
-    /// as `darkmux-lab`'s own `funnel.rs` test-module `RecordingEmitter`
+    /// as `darkmux-lab`'s own `review.rs` test-module `RecordingEmitter`
     /// (that one is private to its crate's test module, so this is the
     /// pr_review-layer equivalent — the "smallest injectable seam" the
     /// live-dispatch path needed).
@@ -3384,17 +3433,17 @@ mod tests {
     struct RecordingEmitter {
         records: Vec<darkmux_flow::FlowRecord>,
     }
-    impl FunnelEmitter for RecordingEmitter {
+    impl ReviewEmitter for RecordingEmitter {
         fn emit(&mut self, record: darkmux_flow::FlowRecord) {
             self.records.push(record);
         }
     }
 
-    /// A minimal, valid `FlowRecord` standing in for whatever `run_funnel`/
-    /// `run_judge_only` would really emit through the injected `FunnelEmitter`
+    /// A minimal, valid `FlowRecord` standing in for whatever `run_review`/
+    /// `run_judge_only` would really emit through the injected `ReviewEmitter`
     /// mid-dispatch — the bookend wrapper doesn't inspect these records, only
     /// brackets them, so a bare action string is enough to prove ordering.
-    fn fake_funnel_record(action: &str) -> darkmux_flow::FlowRecord {
+    fn fake_review_record(action: &str) -> darkmux_flow::FlowRecord {
         darkmux_flow::FlowRecord {
             ts: darkmux_flow::ts_utc_now(),
             level: darkmux_flow::Level::Info,
@@ -3405,7 +3454,7 @@ mod tests {
             handle: "test-crew".to_string(),
             phase_id: None,
             session_id: Some("case-1".to_string()),
-            source: Some("funnel".to_string()),
+            source: Some("review".to_string()),
             model: None,
             reasoning: None,
             mission_id: None,
@@ -3421,23 +3470,23 @@ mod tests {
     }
 
     #[test]
-    fn with_dispatch_bookends_start_precedes_funnel_records_with_exactly_one_terminal_on_success() {
+    fn with_dispatch_bookends_start_precedes_review_records_with_exactly_one_terminal_on_success() {
         let mut emitter = RecordingEmitter::default();
-        let result = with_dispatch_bookends(&mut emitter, "case-1", "test-crew", Some("darkmux:judge-model"), |em| {
-            em.emit(fake_funnel_record("funnel.task"));
-            em.emit(fake_funnel_record("funnel.step"));
-            em.emit(fake_funnel_record("funnel.ruling"));
-            Ok(FunnelEnvelope::default())
+        let result = with_dispatch_bookends(&mut emitter, "case-1", "test-crew", Some("darkmux:judge-model"), json!({}), |em| {
+            em.emit(fake_review_record("review.task"));
+            em.emit(fake_review_record("review.step"));
+            em.emit(fake_review_record("review.ruling"));
+            Ok(ReviewEnvelope::default())
         });
         assert!(result.is_ok());
 
         let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
-        assert_eq!(actions, vec!["dispatch start", "funnel.task", "funnel.step", "funnel.ruling", "dispatch complete"]);
+        assert_eq!(actions, vec!["dispatch start", "review.task", "review.step", "review.ruling", "dispatch complete"]);
 
         let start_idx = actions.iter().position(|a| *a == "dispatch start").expect("dispatch start emitted");
         assert!(
-            actions.iter().enumerate().filter(|(_, a)| a.starts_with("funnel.")).all(|(i, _)| i > start_idx),
-            "dispatch start must precede every funnel.* record: {actions:?}"
+            actions.iter().enumerate().filter(|(_, a)| a.starts_with("review.")).all(|(i, _)| i > start_idx),
+            "dispatch start must precede every review.* record: {actions:?}"
         );
 
         let terminals = actions.iter().filter(|a| **a == "dispatch complete" || **a == "dispatch error").count();
@@ -3449,29 +3498,29 @@ mod tests {
         assert_eq!(start.model.as_deref(), Some("darkmux:judge-model"));
         assert!(matches!(start.level, darkmux_flow::Level::Info));
         // Provenance: the bookends must carry the SAME source tag as the
-        // funnel.* records they bracket — never the builder's hardcoded
+        // review.* records they bracket — never the builder's hardcoded
         // "crew_dispatch" (which would split one session across two
         // contradictory Source facets in the viewer).
-        assert_eq!(start.source.as_deref(), Some("funnel"));
+        assert_eq!(start.source.as_deref(), Some("review"));
 
         let terminal = emitter.records.last().unwrap();
         assert_eq!(terminal.action, "dispatch complete");
         assert!(matches!(terminal.level, darkmux_flow::Level::Info));
-        assert_eq!(terminal.source.as_deref(), Some("funnel"));
+        assert_eq!(terminal.source.as_deref(), Some("review"));
         assert_eq!(terminal.payload.as_ref().unwrap()["result_class"], "ok");
     }
 
     #[test]
     fn with_dispatch_bookends_error_path_emits_dispatch_error_terminal_with_the_real_message() {
         let mut emitter = RecordingEmitter::default();
-        let result = with_dispatch_bookends(&mut emitter, "case-2", "test-crew", None, |em| {
-            em.emit(fake_funnel_record("funnel.task"));
+        let result = with_dispatch_bookends(&mut emitter, "case-2", "test-crew", None, json!({}), |em| {
+            em.emit(fake_review_record("review.task"));
             Err(anyhow!("probe dispatch failed: connection refused"))
         });
         assert!(result.is_err());
 
         let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
-        assert_eq!(actions, vec!["dispatch start", "funnel.task", "dispatch error"]);
+        assert_eq!(actions, vec!["dispatch start", "review.task", "dispatch error"]);
 
         let terminals = actions.iter().filter(|a| **a == "dispatch complete" || **a == "dispatch error").count();
         assert_eq!(terminals, 1, "exactly one terminal dispatch record: {actions:?}");
@@ -3479,7 +3528,7 @@ mod tests {
         let terminal = emitter.records.last().unwrap();
         assert_eq!(terminal.action, "dispatch error");
         assert!(matches!(terminal.level, darkmux_flow::Level::Error));
-        assert_eq!(terminal.source.as_deref(), Some("funnel"), "error terminal carries funnel provenance");
+        assert_eq!(terminal.source.as_deref(), Some("review"), "error terminal carries review provenance");
         let payload = terminal.payload.as_ref().unwrap();
         assert_eq!(payload["result_class"], "error");
         assert!(
@@ -3498,7 +3547,7 @@ mod tests {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {})); // silence the expected panic backtrace
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_dispatch_bookends(&mut emitter, "case-3", "test-crew", None, |_em| {
+            with_dispatch_bookends(&mut emitter, "case-3", "test-crew", None, json!({}), |_em| {
                 panic!("simulated crash mid-dispatch");
             })
         }));
@@ -3509,14 +3558,14 @@ mod tests {
         assert_eq!(actions, vec!["dispatch start", "dispatch error"]);
         let terminal = emitter.records.last().unwrap();
         assert!(matches!(terminal.level, darkmux_flow::Level::Error));
-        assert_eq!(terminal.source.as_deref(), Some("funnel"), "guard's Drop terminal carries funnel provenance");
+        assert_eq!(terminal.source.as_deref(), Some("review"), "guard's Drop terminal carries review provenance");
         assert!(terminal.payload.as_ref().unwrap()["error"]
             .as_str()
             .unwrap()
             .contains("early return or panic"));
     }
 
-    /// (#1230 Packet 0 — the actual bug fix) A funnel run with a
+    /// (#1230 Packet 0 — the actual bug fix) A review run with a
     /// remote-endpoint member must stamp BOTH `payload.remote_tokens` AND
     /// `payload.endpoint` on the `dispatch complete` terminal record —
     /// before this fix, only `remote_tokens` landed, so the viewer's
@@ -3532,9 +3581,9 @@ mod tests {
     #[test]
     fn with_dispatch_bookends_stamps_endpoint_and_remote_tokens_for_a_remote_member() {
         let mut emitter = RecordingEmitter::default();
-        let result = with_dispatch_bookends(&mut emitter, "case-4", "test-crew", Some("darkmux:judge-model"), |em| {
-            em.emit(fake_funnel_record("funnel.task"));
-            Ok(FunnelEnvelope {
+        let result = with_dispatch_bookends(&mut emitter, "case-4", "test-crew", Some("darkmux:judge-model"), json!({}), |em| {
+            em.emit(fake_review_record("review.task"));
+            Ok(ReviewEnvelope {
                 members: vec![
                     MemberRecord {
                         model: "darkmux:probe-model".into(),
@@ -3586,8 +3635,8 @@ mod tests {
     #[test]
     fn with_dispatch_bookends_omits_endpoint_and_remote_tokens_when_fully_local() {
         let mut emitter = RecordingEmitter::default();
-        let result = with_dispatch_bookends(&mut emitter, "case-5", "test-crew", None, |_em| {
-            Ok(FunnelEnvelope {
+        let result = with_dispatch_bookends(&mut emitter, "case-5", "test-crew", None, json!({}), |_em| {
+            Ok(ReviewEnvelope {
                 members: vec![MemberRecord {
                     model: "darkmux:probe-model".into(),
                     seat: "review-probe".into(),
@@ -3607,6 +3656,120 @@ mod tests {
         let payload = terminal.payload.as_ref().unwrap();
         assert!(payload.get("endpoint").is_none(), "local-only omits endpoint: {payload}");
         assert!(payload.get("remote_tokens").is_none(), "local-only omits remote_tokens: {payload}");
+    }
+
+    /// (#1349) The actual regression test for the bug fix: wraps a REAL
+    /// `run_review_graph` call (zero bundles, offline — no LMStudio/network,
+    /// same fixture shape `darkmux_lab::lab::review`'s own
+    /// `run_review_graph_with_empty_bundles_completes_with_zero_dispatches`
+    /// uses) in `with_dispatch_bookends`, exactly like `run_dispatch`'s
+    /// production call site does. Confirms three things at once: (1) the
+    /// dispatch-liveness edge #1272 needed is present — exactly one
+    /// `dispatch start` and one terminal record bracket the WHOLE graph run;
+    /// (2) `run_review_graph` itself no longer opens a second, competing
+    /// `review.task` bookend inside that wrap (the actual #1349 bug); (3) no
+    /// data was lost in retiring that inner bookend — `exec_mode`/`bundles`
+    /// ride the `dispatch start` payload and `confirmed`/`needs_check`/
+    /// `archived`/`degenerate` ride the terminal payload, via
+    /// `with_dispatch_bookends`'s `start_extra` + its `Ok(env)` enrichment.
+    #[test]
+    fn with_dispatch_bookends_wraps_run_review_graph_with_no_inner_task_bookend_and_carries_tier_counts() {
+        use darkmux_profiles::crews::ResolvedSeatStaffing;
+        use darkmux_types::ProfileModel;
+        use std::collections::BTreeMap;
+
+        fn staffing(model_id: &str) -> ResolvedSeatStaffing {
+            ResolvedSeatStaffing {
+                name: "fast".into(),
+                pm: ProfileModel { id: model_id.into(), ..Default::default() },
+                k: 1,
+                passes: 2,
+                max_tokens: None,
+                selector: None,
+            }
+        }
+        let mut seats = BTreeMap::new();
+        seats.insert("review-probe".to_string(), vec![staffing("probe-model")]);
+        seats.insert("review-judge".to_string(), vec![staffing("judge-model")]);
+        let crew = ResolvedCrew { name: "test-crew".into(), seats, request_changes: false };
+
+        let seats_resolved = validate_review_crew(&crew).expect("valid crew");
+        let judge = seats_resolved.judge.clone();
+        let verify = seats_resolved.verify.cloned();
+        let probes: Vec<_> = seats_resolved.probes.clone();
+
+        let ctx = Arc::new(ReviewStepContext {
+            case_id: "case-graph".to_string(),
+            crew: crew.clone(),
+            intent_title: String::new(),
+            intent_body: String::new(),
+            diff: String::new(),
+            probe_system: "probe sys".to_string(),
+            judge_system: "judge sys".to_string(),
+            verify_system: "verify sys".to_string(),
+            bundles: Vec::new(),
+            remote_max_tokens_per_execution: 500_000,
+            timeout_seconds: 30,
+        });
+
+        let graph =
+            build_review_graph(ctx.clone(), judge.clone(), verify.clone(), &probes, "investigate", "adjudicate", "report", 1);
+        let fingerprint_val = darkmux_lab::lab::review::fingerprint(
+            &darkmux_lab::lab::review::seat_identifier(&judge.pm),
+            &ctx.judge_system,
+        );
+        let staffing_snap = darkmux_lab::lab::review::staffing_snapshot(&probes, &judge, verify.as_ref(), false);
+
+        let mut emitter = RecordingEmitter::default();
+        let ctx_for_closure = ctx.clone();
+        let result = with_dispatch_bookends(
+            &mut emitter,
+            "case-graph",
+            "test-crew",
+            None,
+            json!({ "exec_mode": "sequential", "bundles": 0 }),
+            move |em| {
+                run_review_graph(&ctx_for_closure, "test-crew", ExecMode::Sequential, fingerprint_val, staffing_snap, graph, em)
+                    .map(|(env, _steps)| env)
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+
+        let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
+        assert_eq!(actions.first(), Some(&"dispatch start"), "{actions:?}");
+        assert_eq!(actions.last(), Some(&"dispatch complete"), "{actions:?}");
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| **a == "dispatch start" || **a == "dispatch complete" || **a == "dispatch error")
+                .count(),
+            2,
+            "exactly one dispatch start + one terminal — no inner review-scoped bookend duplicating it: {actions:?}"
+        );
+        assert!(
+            actions.iter().all(|a| *a != "review.task"),
+            "the retired bespoke review.task bookend must not resurface: {actions:?}"
+        );
+
+        let start = &emitter.records[0];
+        let start_payload = start.payload.as_ref().unwrap();
+        assert_eq!(start_payload["exec_mode"], "sequential");
+        assert_eq!(start_payload["bundles"], 0);
+
+        let terminal = emitter.records.last().unwrap();
+        let payload = terminal.payload.as_ref().unwrap();
+        assert_eq!(payload["confirmed"], 0);
+        assert_eq!(payload["needs_check"], 0);
+        assert_eq!(payload["archived"], 0);
+        // (Not a #1349 assertion — a pre-existing, separate behavior of the
+        // graph-based driver: zero bundles never reaches the judge-dead
+        // honesty gate (`env.judged` stays empty, so that gate's own
+        // `!env.judged.is_empty()` guard never fires), so `env.degenerate`
+        // stays `None` here — unlike the old sequential driver, which
+        // explicitly marks a zero-bundle run degenerate. Out of scope for
+        // this fix; asserting the ACTUAL behavior so this test doesn't
+        // silently mask that gap if it's ever revisited.)
+        assert!(payload.get("degenerate").is_none(), "{payload}");
     }
 
     #[test]

@@ -27,7 +27,7 @@
 //! dispatch preflight's own resolution); `mission_run`'s own
 //! `MissionCoderStepKind`/`MissionVerifyStepKind` do the same for the
 //! `mission.coder`/`mission.verify` kinds. `dispatch.single_shot`'s
-//! residency (the funnel's probe/judge seats) is left at the default
+//! residency (the review's probe/judge seats) is left at the default
 //! (`None` → `Remote`) — Packet 4's job, once real concurrent local
 //! seats exist to benefit from it; today's linear graphs (mission_run's
 //! 3-step chain) never have more than one step ready per wave, so the

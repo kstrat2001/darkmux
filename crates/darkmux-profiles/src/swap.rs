@@ -28,7 +28,7 @@ pub const DARKMUX_LMS_NAMESPACE: &str = darkmux_gestalt::DARKMUX_NAMESPACE;
 /// `darkmux_gestalt::namespaced_identifier` — the `&ProfileModel` form this
 /// crate's callers use, feeding gestalt's two-explicit-parameter form (a
 /// bare `pub use` can't bridge the signature). ONE definition now backs
-/// both swap.rs and the funnel's `LmsCycler`; `tests/gestalt_parity.rs`,
+/// both swap.rs and the review's `LmsCycler`; `tests/gestalt_parity.rs`,
 /// which existed only to guard the pre-cutover duplication window, is
 /// retired now that there is nothing left to fork.
 ///
@@ -93,7 +93,7 @@ fn should_patch_openclaw(opts: &SwapOpts) -> bool {
 /// it (operator sovereignty over loaded state). Only an *insufficient* load
 /// (smaller than the minimum) triggers a reload.
 ///
-/// `pub` since #1271: the review funnel's `LmsCycler` residency
+/// `pub` since #1271: the review's `LmsCycler` residency
 /// reconciliation makes the same keep-or-reload call and shares this ONE
 /// definition of "sufficient" rather than re-deriving the `>=` inline.
 ///

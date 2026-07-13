@@ -15,7 +15,7 @@
 //! Named divergences from the two production paths this crate absorbs; each
 //! cuts over to the unified semantic when packet 3 re-points them here:
 //!
-//! - **Review funnel** (darkmux-lab funnel.rs): a foreign resident sharing
+//! - **Review** (darkmux-lab review.rs): a foreign resident sharing
 //!   the desired weights no longer hard-Blocks the placement. The planner
 //!   loads darkmux's own namespaced copy ALONGSIDE when the #1243 budget and
 //!   pool headroom fit (surfaced via [`Warning::ForeignDuplicateResident`]),
@@ -530,7 +530,7 @@ pub fn plan_acquire(
 /// Alias-release asymmetry (recorded deliberately): a placement under an
 /// explicit un-namespaced alias is treated as OURS by acquisition
 /// (reuse/reconcile eligible) but is SKIPPED here — release-parity with the
-/// funnel cycler's namespace guard, which no-ops on aliases. The fix
+/// review cycler's namespace guard, which no-ops on aliases. The fix
 /// (release-by-OwnedTarget would permit alias unload, since the alias is
 /// claimable as this call's own identifier) is deferred as an operator call;
 /// until then an aliased resident is only ever reclaimed manually or by the
@@ -930,7 +930,7 @@ mod tests {
     fn foreign_duplicate_loads_alongside() {
         // Named divergence, absolute-ownership decision, operator-approved
         // 2026-07-10, #1274: a foreign resident sharing the modelKey no
-        // longer Blocks (the pre-cutover funnel semantic) — its load config
+        // longer Blocks (the pre-cutover review semantic) — its load config
         // is the #1135 ghost, so it is never reused (its 16k ctx would have
         // satisfied the 8k request); darkmux loads its own namespaced copy
         // alongside, and the duplicate + its pool cost are surfaced.
@@ -1602,7 +1602,7 @@ mod tests {
     #[test]
     fn release_respects_alias_namespace_guard() {
         // The recorded alias-release asymmetry: an explicit un-namespaced
-        // alias is ours to acquisition but skipped by release (funnel
+        // alias is ours to acquisition but skipped by release (review
         // cycler no-op parity) — see plan_release docs for the deferred fix.
         let f = facts(vec![resident("custom", "m", 8_000, None)]);
         let plan = plan_release(&[aliased("m", 8_000, "custom")], &[], &f);

@@ -1,7 +1,7 @@
 {
   "id": "review-judge",
   "role_family": "specialist",
-  "description": "Judge seat of the review funnel (#1222 Phase B): investigates one probe-raised flag against the code it was raised on and rules confirmed, needs_check, or false_positive. Every confirmed flag is re-judged a second time (fresh call, same prompt) before it reaches the author — disagreement between the two passes demotes the flag to needs_check rather than shipping a coin-flip as a defect report. Deliberately tool-less (the record handed in the prompt is everything the judge weighs) and deliberately no output_schema (the contract is reason-freely-then-one-fenced-JSON-block, so reasoning-capable models keep their reasoning room).",
+  "description": "Judge seat of the review pipeline (#1222 Phase B): investigates one probe-raised flag against the code it was raised on and rules confirmed, needs_check, or false_positive. Every confirmed flag is re-judged a second time (fresh call, same prompt) before it reaches the author — disagreement between the two passes demotes the flag to needs_check rather than shipping a coin-flip as a defect report. Deliberately tool-less (the record handed in the prompt is everything the judge weighs) and deliberately no output_schema (the contract is reason-freely-then-one-fenced-JSON-block, so reasoning-capable models keep their reasoning room).",
   "skills": [
     "code-reviewing"
   ],

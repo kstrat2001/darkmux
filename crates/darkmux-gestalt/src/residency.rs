@@ -1,16 +1,16 @@
 //! The four-way residency split — the validated miniature the gestalt core
 //! generalizes (#1274).
 //!
-//! Absorbed from the review funnel's `decide_residency` (darkmux-lab
-//! funnel.rs, PR #1275). The Reuse / Reconcile / LoadFresh arms are
-//! byte-semantic ports; the funnel's Blocked-on-foreign arm is DELIBERATELY
+//! Absorbed from the review's `decide_residency` (darkmux-lab
+//! review.rs, PR #1275). The Reuse / Reconcile / LoadFresh arms are
+//! byte-semantic ports; the review's Blocked-on-foreign arm is DELIBERATELY
 //! DIVERGED under the absolute-ownership decision (operator-approved
 //! 2026-07-10, #1274): a foreign resident sharing the weights is now a
 //! [`ResidencyDecision::ForeignDuplicate`] fact — respected as pool
 //! consumption, never a reuse candidate — and the planner decides
 //! load-alongside vs Block-on-capacity. The root-crate
 //! `tests/gestalt_parity.rs` proves arm-for-arm agreement against the
-//! funnel's own test fixtures for the arms that still match, and annotates
+//! review's own test fixtures for the arms that still match, and annotates
 //! the diverged vectors as named behavior changes.
 
 use crate::desired::Placement;
@@ -61,7 +61,7 @@ pub enum ResidencyDecision {
 /// #1274): the first darkmux-owned/alias resident sharing the modelKey (in
 /// host-reported order) decides Reuse vs Reconcile; foreign residents are
 /// never candidates, only facts. A foreign copy listed AHEAD of a darkmux
-/// copy therefore no longer shadows it (the funnel's first-match-across-
+/// copy therefore no longer shadows it (the review's first-match-across-
 /// ownership rule Blocked there — a named cutover behavior change; see the
 /// crate docs). Only when no owned resident shares the modelKey does a
 /// foreign one surface, as [`ResidencyDecision::ForeignDuplicate`].
@@ -93,7 +93,7 @@ pub fn decide_residency(residents: &[ResidentFact], p: &Placement) -> ResidencyD
 
 #[cfg(test)]
 mod tests {
-    //! Golden arm-for-arm fixtures lifted from the funnel's own residency
+    //! Golden arm-for-arm fixtures lifted from the review's own residency
     //! tests (the #1271 `LmsCycler` suite) — same residents, same wanted
     //! ctx, same expected arm. The cross-crate copy of these vectors lives
     //! in the root crate's tests/gestalt_parity.rs.
@@ -120,14 +120,14 @@ mod tests {
 
     #[test]
     fn load_fresh_when_no_resident_shares_model_key() {
-        // Funnel fixture (d): empty residents → plain load.
+        // Review fixture (d): empty residents → plain load.
         let p = placement("devstral", 32_768, None);
         assert_eq!(decide_residency(&[], &p), ResidencyDecision::LoadFresh);
     }
 
     #[test]
     fn reuse_when_darkmux_owned_sufficient() {
-        // Funnel fixture (b): darkmux:devstral @ 40960 satisfies 32768.
+        // Review fixture (b): darkmux:devstral @ 40960 satisfies 32768.
         let residents = vec![resident("darkmux:devstral", "devstral", 40_960)];
         let p = placement("devstral", 32_768, None);
         assert_eq!(
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn reconcile_when_darkmux_owned_insufficient() {
-        // Funnel fixture (a): darkmux:devstral @ 20000 is undersized for
+        // Review fixture (a): darkmux:devstral @ 20000 is undersized for
         // 32768 — the exact #1271 repro shape.
         let residents = vec![resident("darkmux:devstral", "devstral", 20_000)];
         let p = placement("devstral", 32_768, None);
@@ -153,12 +153,12 @@ mod tests {
 
     #[test]
     fn foreign_duplicate_when_foreign_shares_model_key() {
-        // Funnel fixture (c), UPDATED: named divergence, absolute-ownership
+        // Review fixture (c), UPDATED: named divergence, absolute-ownership
         // decision, operator-approved 2026-07-10, #1274. devstral-manual is
         // operator state — never touched, never reused (even at sufficient
         // ctx: its load config is the #1135 ghost); surfaced as a
         // ForeignDuplicate fact for the planner's load-alongside-or-Block
-        // call. The funnel Blocked outright here.
+        // call. The review Blocked outright here.
         let residents = vec![resident("devstral-manual", "devstral", 40_960)];
         let p = placement("devstral", 32_768, None);
         assert_eq!(
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn explicit_alias_sufficient_reuses_not_blocked() {
-        // The funnel's explicit-alias fixture: a resident under the
+        // The review's explicit-alias fixture: a resident under the
         // placement's own alias is OURS (the namespace opt-out), never
         // foreign.
         let residents = vec![resident("custom", "devstral", 32_768)];
@@ -192,12 +192,12 @@ mod tests {
 
     #[test]
     fn foreign_first_no_longer_shadows_darkmux_copy() {
-        // Funnel multi-resident fixture, UPDATED: named divergence,
+        // Review multi-resident fixture, UPDATED: named divergence,
         // absolute-ownership decision, operator-approved 2026-07-10, #1274.
         // Ownership partitions before matching: a user-owned copy listed
         // ahead of a darkmux-stale instance no longer shadows it — OUR copy
         // reconciles (ours to fix), the user copy stays untouched pool
-        // consumption. The funnel Blocked on the first-match foreign here.
+        // consumption. The review Blocked on the first-match foreign here.
         let residents = vec![
             resident("devstral-manual", "devstral", 40_960),
             resident("darkmux:devstral", "devstral", 20_000),

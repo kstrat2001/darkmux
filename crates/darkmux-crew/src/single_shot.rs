@@ -4,7 +4,7 @@
 //! the hardened curl machinery in `dispatch_internal` (0600 secret-bearing
 //! curl config, 429 backoff) but skips the container path entirely — this
 //! is for callers that just need ONE chat completion, not an agentic
-//! dispatch (a review-funnel probe/judge invocation is the first consumer).
+//! dispatch (a review probe/judge invocation is the first consumer).
 //!
 //! **Dialect note:** the LOCAL LMStudio dialect is `"max_tokens"` +
 //! `"temperature"` + `"stream": false`. The HOSTED (Azure/OpenAI) dialect
@@ -12,7 +12,7 @@
 //! exists in two single-shot shapes: `dispatch_internal::single_shot_body`
 //! for `dispatch_remote` (a full role dispatch), and this module's
 //! [`hosted_chat_body`] + [`single_shot_chat_hosted`] (#1260) for
-//! endpoint-staffed crew seats (the review funnel's remote probe/judge/
+//! endpoint-staffed crew seats (the review's remote probe/judge/
 //! verify seats). Local vs hosted are separate request shapes for separate
 //! targets — do not merge them; local vs hosted here differ ONLY in the
 //! transport dialect, never in message assembly (contract 6 — frozen
@@ -299,7 +299,7 @@ mod tests {
 
     // ─── Phase A request-BODY parity (#1256 scope extension) ────────────
     //
-    // Prompt-string parity (`darkmux-lab`'s funnel golden tests) proves the
+    // Prompt-string parity (`darkmux-lab`'s review golden tests) proves the
     // TEXT matches; these prove the FULL serialized request shape matches
     // too — field set, message-array structure, and every non-content
     // value — so a stray field (a `tools` array, a `top_p`, an accidental
@@ -309,7 +309,7 @@ mod tests {
     // `call_judge` build (both read 2026-07 for #1256) — `json.dumps({...})`
     // over those literal dicts round-trips to exactly the `serde_json::json!`
     // literals asserted against here (verified by hand during development;
-    // see funnel.rs's golden-harness comment for the sibling prompt-text
+    // see review.rs's golden-harness comment for the sibling prompt-text
     // provenance note).
 
     /// `body`'s `"temperature"` compared within tolerance (the f32->f64

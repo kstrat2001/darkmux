@@ -59,7 +59,7 @@
 //!
 //! No `Task`/`Step` schema and no dependency-graph scheduler — that is
 //! Packet 2's `run_step_graph`, which this executor is the primitive
-//! underneath. No CLI verb. Nothing here is wired into the review funnel
+//! underneath. No CLI verb. Nothing here is wired into the review
 //! yet (Packet 4) or `mission run` (Packet 3); this module has zero
 //! production callers in this packet, matching how `darkmux-gestalt`
 //! itself shipped as a fully-tested, uncalled crate ahead of its own

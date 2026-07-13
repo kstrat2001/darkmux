@@ -142,6 +142,26 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.17.0";
 //           existing action; older readers ignore it, and a fully-local
 //           dispatch's payload is byte-identical to before (both fields
 //           stay absent).
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #1349: the review
+//           pipeline's module (`darkmux_lab::lab::funnel` -> `::lab::review`)
+//           and its `funnel.task`/`funnel.step`/`funnel.ruling` action
+//           vocabulary from 1.17.0 above are renamed to `review.task`/
+//           `review.step`/`review.ruling` — "funnel" described a separate,
+//           bespoke execution mechanism that #1348 retired (the pipeline is
+//           just a mission now, like any other); the name outlived the
+//           thing it named. Same payload shapes, same semantics, action
+//           STRING only. #1349 also retired the redundant task-level
+//           bookend `run_review_graph` (nee `run_funnel_graph`) used to open
+//           from INSIDE the pipeline's own top-level call — every
+//           production caller already wraps that call in
+//           `src/pr_review.rs`'s `with_dispatch_bookends`, which opens the
+//           canonical `dispatch start`/`dispatch complete`/`dispatch error`
+//           bookend around it (#1230 Packet 0); the inner `review.task`
+//           bookend now fires ONLY from the older, still-used sequential
+//           driver (`run_review`/`run_judge_only`), never from the Task/Step
+//           graph driver. Older readers that don't recognize the renamed
+//           actions degrade the same way 1.17.0 documented: additive,
+//           unknown-action-tolerant.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

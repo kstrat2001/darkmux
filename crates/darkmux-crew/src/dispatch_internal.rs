@@ -677,13 +677,16 @@ fn inactivity_timeout_seconds() -> u64 {
 /// A thin wrapper: this is a flat, depth-≤1 case of the generic
 /// `darkmux_flow::BookendGuard` stack (one dispatch, one open unit) — the
 /// `open`/`close` bookkeeping and the Drop-time abort emission both live in
-/// `darkmux-flow` now, shared with `FunnelBookendGuard`
-/// (`darkmux-lab::lab::funnel`) and `pr_review.rs`'s funnel→dispatch bridge.
-/// Emits through the process-wide default sink (`darkmux_flow::record`) —
-/// same as every other record on this dispatch path — so, unlike the
-/// funnel guards, there's no injected `FunnelEmitter` to bridge and no
-/// re-lending concern (see `darkmux_flow::bookend`'s module doc for why
-/// that matters elsewhere).
+/// `darkmux-flow` now, shared with `ReviewRunGuard`
+/// (`darkmux-lab::lab::review`, renamed from `FunnelBookendGuard`/
+/// `darkmux-lab::lab::funnel` in #1349) and `pr_review.rs`'s
+/// review→dispatch bridge (`with_dispatch_bookends`, #1349's `run_review_graph`
+/// top-level wrap since retired its OWN task-level bookend — see that
+/// function's doc). Emits through the process-wide default sink
+/// (`darkmux_flow::record`) — same as every other record on this dispatch
+/// path — so, unlike the review guards, there's no injected `ReviewEmitter`
+/// to bridge and no re-lending concern (see `darkmux_flow::bookend`'s
+/// module doc for why that matters elsewhere).
 struct DispatchBookendGuard<'a> {
     inner: darkmux_flow::DynBookendGuard<'a>,
 }
@@ -940,7 +943,7 @@ fn single_shot_body(
 /// admits the one call (the spend is then accounted in the `dispatch.complete`
 /// record's `total_tokens`, spend-after). The AGENTIC-remote container path
 /// (#1187 — a tool-granting role on an endpoint profile, multi-call loop) is
-/// NOT metered in 1.18.0; only this single-shot path and the review funnel's
+/// NOT metered in 1.18.0; only this single-shot path and the review pipeline's
 /// seats are — see the module scope note / issue #1260 follow-up.
 fn admit_remote_execution(budget: u64) -> Result<()> {
     if budget == 0 {
@@ -1014,7 +1017,7 @@ pub(crate) fn remote_chat_url(ep: &darkmux_types::ModelEndpoint) -> String {
 /// LEAF w.r.t. this crate — shouldn't know about that type); the actual
 /// string formatting delegates to `darkmux_flow::remote_route_label`
 /// (#1230 Packet 0) so this shape has one source of truth shared with the
-/// funnel→dispatch bookend bridge in `src/pr_review.rs`.
+/// review→dispatch bookend bridge in `src/pr_review.rs`.
 fn remote_endpoint_label(ep: &darkmux_types::ModelEndpoint, model_id: &str) -> String {
     let url = ep.base_url();
     let host = url
@@ -2769,7 +2772,7 @@ fn run_telemetry_sampler(
         // best-effort and unprivileged; a tick emits whichever of the three
         // succeed (a failed field is simply omitted from the payload).
         // `sample_host` is the shared mechanism (#1247 doctrine surface) —
-        // `darkmux-lab`'s funnel driver samples through the same function.
+        // `darkmux-lab`'s review driver samples through the same function.
         let sample = crate::telemetry_sampler::sample_host();
         if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
             let mut payload = serde_json::Map::new();
