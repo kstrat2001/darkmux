@@ -15,7 +15,7 @@
 //! `agents.list[]` reflect the manifests on disk — writes/updates the
 //! `darkmux/<role>` entries to match what the manifests + `.md` prompts say.
 
-use crate::loader::{load_role_prompt, load_roles, load_phases};
+use crate::loader::{load_missions, load_role_prompt, load_roles, load_phases};
 use crate::types::Role;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
@@ -818,20 +818,24 @@ pub(crate) fn tail_excerpt(content: &str, max: usize) -> String {
     format!("[… stderr truncated, showing last {max} of {n} chars]\n{tail}")
 }
 
-/// Resolve the dispatch message: when `phase_id` is `Some(id)`, look
-/// up the phase's `depends_on` parents and prepend each parent's
-/// recorded output (capped per [`phase_context_max_chars`]) as a "Prior
-/// phase outputs" context block. Returns the augmented message (or the
-/// original message unchanged if there are no parents, no recorded outputs,
-/// or no phase_id at all).
+/// Resolve the dispatch message: when `phase_id` is `Some(id)`, look up
+/// the phase's PREDECESSOR — the phase immediately before it in its
+/// mission's `Mission.phase_ids` order (#1341: Phases are strictly linear,
+/// ordered purely by list position — "Phase.depends_on" no longer exists;
+/// see `types::Phase`'s doc) — and prepend its recorded output (capped per
+/// [`phase_context_max_chars`]) as a "Prior phase outputs" context block.
+/// Returns the augmented message (or the original message unchanged if
+/// this is the mission's first phase, there's no recorded output, or no
+/// phase_id at all).
 ///
-/// One-hop only — transitive ancestors are NOT walked. Stage 1 scope
-/// per #146. The two-hop / DAG / context-budget refinements are Stage 2.
+/// One predecessor only — transitive ancestors are NOT walked (unchanged
+/// from the pre-#1341 "Stage 1, one-hop only" scope per #146; a phase now
+/// structurally has at most one immediate predecessor anyway).
 ///
-/// Missing parents / missing output files are NOT fatal — the dispatch
-/// proceeds with whatever outputs are available. The dispatcher logs
-/// to stderr which parents were found vs. missing so the operator can
-/// see what context the agent received.
+/// A missing predecessor / missing output file is NOT fatal — the
+/// dispatch proceeds without it. The dispatcher logs to stderr when the
+/// predecessor's output wasn't found so the operator can see what context
+/// the agent received.
 fn augment_message_with_phase_context(
     phase_id: Option<&str>,
     original_message: &str,
@@ -864,33 +868,54 @@ fn augment_message_with_phase_context(
         }
     };
 
-    if phase.depends_on.is_empty() {
-        // No dependencies declared; nothing to inject.
+    let missions = match load_missions() {
+        Ok(m) => m,
+        Err(_) => {
+            eprintln!(
+                "darkmux crew dispatch: mission loader unavailable; \
+                 dispatching `{phase_id}` without cross-phase context."
+            );
+            return Ok(original_message.to_string());
+        }
+    };
+    let Some(mission) = missions.into_iter().find(|m| m.id == phase.mission_id) else {
+        eprintln!(
+            "darkmux crew dispatch: mission `{}` not found for phase `{phase_id}`; \
+             dispatching without cross-phase context.",
+            phase.mission_id
+        );
         return Ok(original_message.to_string());
-    }
+    };
+    let position = mission.phase_ids.iter().position(|id| id == phase_id);
+    let predecessor_id = match position {
+        Some(0) | None => None, // first phase (or not listed — defensive): no predecessor
+        Some(i) => Some(mission.phase_ids[i - 1].clone()),
+    };
+    let Some(predecessor_id) = predecessor_id else {
+        // First phase in the mission; nothing to inject.
+        return Ok(original_message.to_string());
+    };
 
-    // For each parent, look up its recorded output. Missing outputs
-    // are accumulated in `missing_parents` so the operator sees which
-    // parents the agent didn't get context for.
+    // Look up the predecessor's recorded output. Missing output is
+    // accumulated in `missing_parents` so the operator sees the phase
+    // didn't get cross-phase context.
     //
-    // Per-mission layout (#148): parent phases are assumed to live in the
-    // same mission as the child phase. Output files are co-located with
-    // phase manifests under `missions/<mission_id>/phases/`.
+    // Per-mission layout (#148): the predecessor phase lives in the same
+    // mission as this one. Output files are co-located with phase
+    // manifests under `missions/<mission_id>/phases/`.
     let max_chars = phase_context_max_chars();
     let mut parent_blocks: Vec<String> = Vec::new();
     let mut missing_parents: Vec<String> = Vec::new();
-    for parent_id in &phase.depends_on {
-        let path = phase_output_path(&phase.mission_id, parent_id);
-        match fs::read_to_string(&path) {
-            Ok(content) if !content.trim().is_empty() => {
-                // (#146 residual) Bound each parent's output so a long upstream
-                // reply can't blow the dependent dispatch's brief.
-                let capped = cap_parent_output(content.trim_end(), max_chars);
-                parent_blocks.push(format!("### {parent_id}\n\n{capped}\n"));
-            }
-            _ => {
-                missing_parents.push(parent_id.clone());
-            }
+    let path = phase_output_path(&phase.mission_id, &predecessor_id);
+    match fs::read_to_string(&path) {
+        Ok(content) if !content.trim().is_empty() => {
+            // (#146 residual) Bound the predecessor's output so a long
+            // upstream reply can't blow the dependent dispatch's brief.
+            let capped = cap_parent_output(content.trim_end(), max_chars);
+            parent_blocks.push(format!("### {predecessor_id}\n\n{capped}\n"));
+        }
+        _ => {
+            missing_parents.push(predecessor_id.clone());
         }
     }
 
@@ -2423,18 +2448,26 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn augment_message_passes_through_when_phase_has_no_deps() {
+    fn augment_message_passes_through_when_phase_is_first_in_mission() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
         // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
-        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        let mission_dir = tmp.path().join("missions").join("m");
+        let phases_dir = mission_dir.join("phases");
         fs::create_dir_all(&phases_dir).unwrap();
+        // (#1341) Phases are strictly linear — ordered purely by
+        // `Mission.phase_ids` position. `solo-phase` is first (index 0),
+        // so it has no predecessor.
+        fs::write(
+            mission_dir.join("mission.json"),
+            r#"{"id":"m","description":"d","phase_ids":["solo-phase"],"created_ts":0}"#,
+        ).unwrap();
         fs::write(
             phases_dir.join("solo-phase.json"),
-            r#"{"id":"solo-phase","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+            r#"{"id":"solo-phase","mission_id":"m","description":"d","status":"planned","created_ts":0}"#,
         ).unwrap();
 
         let result = augment_message_with_phase_context(Some("solo-phase"), "task body").unwrap();
@@ -2503,23 +2536,29 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn augment_message_injects_parent_output_when_recorded() {
+    fn augment_message_injects_predecessor_output_when_recorded() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
         // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
-        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        let mission_dir = tmp.path().join("missions").join("m");
+        let phases_dir = mission_dir.join("phases");
         fs::create_dir_all(&phases_dir).unwrap();
-        // Parent + child phase manifests.
+        // (#1341) `child`'s predecessor is derived from `Mission.phase_ids`
+        // order (`["parent", "child"]`), not a `depends_on` field.
+        fs::write(
+            mission_dir.join("mission.json"),
+            r#"{"id":"m","description":"d","phase_ids":["parent","child"],"created_ts":0}"#,
+        ).unwrap();
         fs::write(
             phases_dir.join("parent.json"),
-            r#"{"id":"parent","mission_id":"m","description":"d","status":"done","depends_on":[],"created_ts":0}"#,
+            r#"{"id":"parent","mission_id":"m","description":"d","status":"complete","created_ts":0}"#,
         ).unwrap();
         fs::write(
             phases_dir.join("child.json"),
-            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent"],"created_ts":0}"#,
+            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","created_ts":0}"#,
         ).unwrap();
         // Parent's recorded output co-located with manifests.
         fs::write(phases_dir.join("parent-output.txt"), "parent did X and Y").unwrap();
@@ -2541,43 +2580,36 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn augment_message_handles_mixed_recorded_and_missing_parents() {
-        // Realistic case: child depends on two parents; one has recorded
-        // output, the other doesn't. Child should get context for the
-        // recorded one and the stderr should flag the missing one.
+    fn augment_message_one_hop_only_skips_the_phase_before_the_predecessor() {
+        // (#1341) Phases are strictly linear now — `["grandparent", "parent",
+        // "child"]` — and the injection is still ONE-HOP: `child` gets
+        // `parent`'s output, never `grandparent`'s, even though
+        // `grandparent` also has recorded output.
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
-        // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
-        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        let mission_dir = tmp.path().join("missions").join("m");
+        let phases_dir = mission_dir.join("phases");
         fs::create_dir_all(&phases_dir).unwrap();
         fs::write(
-            phases_dir.join("parent-a.json"),
-            r#"{"id":"parent-a","mission_id":"m","description":"d","status":"done","depends_on":[],"created_ts":0}"#,
+            mission_dir.join("mission.json"),
+            r#"{"id":"m","description":"d","phase_ids":["grandparent","parent","child"],"created_ts":0}"#,
         ).unwrap();
-        fs::write(
-            phases_dir.join("parent-b.json"),
-            r#"{"id":"parent-b","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
-        ).unwrap();
-        fs::write(
-            phases_dir.join("child.json"),
-            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent-a","parent-b"],"created_ts":0}"#,
-        ).unwrap();
-        // Only parent-a has a recorded output; co-located with manifests.
-        fs::write(
-            phases_dir.join("parent-a-output.txt"),
-            "parent-a finished X",
-        )
-        .unwrap();
+        for id in ["grandparent", "parent", "child"] {
+            fs::write(
+                phases_dir.join(format!("{id}.json")),
+                format!(r#"{{"id":"{id}","mission_id":"m","description":"d","status":"complete","created_ts":0}}"#),
+            ).unwrap();
+        }
+        fs::write(phases_dir.join("grandparent-output.txt"), "grandparent did A").unwrap();
+        fs::write(phases_dir.join("parent-output.txt"), "parent did B").unwrap();
 
         let result = augment_message_with_phase_context(Some("child"), "child task").unwrap();
-        assert!(result.contains("### parent-a"), "got: {result}");
-        assert!(result.contains("parent-a finished X"), "got: {result}");
-        // parent-b shouldn't show up in the context block — it has no
-        // recorded output. The stderr line (not asserted here) flags it.
-        assert!(!result.contains("### parent-b"), "got: {result}");
+        assert!(result.contains("### parent"), "got: {result}");
+        assert!(result.contains("parent did B"), "got: {result}");
+        assert!(!result.contains("grandparent did A"), "one-hop only: {result}");
         assert!(result.contains("## Your task"), "got: {result}");
         assert!(result.contains("child task"), "got: {result}");
 
@@ -2591,22 +2623,27 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn augment_message_falls_back_to_bare_when_no_parent_outputs_recorded() {
+    fn augment_message_falls_back_to_bare_when_no_predecessor_output_recorded() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
         }
         // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
-        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        let mission_dir = tmp.path().join("missions").join("m");
+        let phases_dir = mission_dir.join("phases");
         fs::create_dir_all(&phases_dir).unwrap();
         fs::write(
+            mission_dir.join("mission.json"),
+            r#"{"id":"m","description":"d","phase_ids":["parent","child"],"created_ts":0}"#,
+        ).unwrap();
+        fs::write(
             phases_dir.join("parent.json"),
-            r#"{"id":"parent","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+            r#"{"id":"parent","mission_id":"m","description":"d","status":"planned","created_ts":0}"#,
         ).unwrap();
         fs::write(
             phases_dir.join("child.json"),
-            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent"],"created_ts":0}"#,
+            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","created_ts":0}"#,
         ).unwrap();
         // No parent-output.txt — dispatch proceeds with bare message.
 
@@ -2673,15 +2710,20 @@ mod tests {
             std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
             std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", "50");
         }
-        let phases_dir = tmp.path().join("missions").join("m").join("phases");
+        let mission_dir = tmp.path().join("missions").join("m");
+        let phases_dir = mission_dir.join("phases");
         fs::create_dir_all(&phases_dir).unwrap();
         fs::write(
+            mission_dir.join("mission.json"),
+            r#"{"id":"m","description":"d","phase_ids":["parent","child"],"created_ts":0}"#,
+        ).unwrap();
+        fs::write(
             phases_dir.join("parent.json"),
-            r#"{"id":"parent","mission_id":"m","description":"d","status":"done","depends_on":[],"created_ts":0}"#,
+            r#"{"id":"parent","mission_id":"m","description":"d","status":"complete","created_ts":0}"#,
         ).unwrap();
         fs::write(
             phases_dir.join("child.json"),
-            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent"],"created_ts":0}"#,
+            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","created_ts":0}"#,
         ).unwrap();
         let unique_tail = "TAIL_MARKER_THAT_MUST_NOT_SURVIVE";
         fs::write(

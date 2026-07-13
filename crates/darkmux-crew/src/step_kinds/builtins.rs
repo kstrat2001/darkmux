@@ -9,7 +9,7 @@
 //! an operator/caller typo.
 
 use super::types::{StepKind, StepOutcome};
-use crate::types::Step;
+use crate::types::{Step, Task};
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 
@@ -93,24 +93,103 @@ pub fn resolve_local_placement(
     })
 }
 
+/// (#1230 Packet 4 DRY pass) One `failed_tool_invocations` entry from the
+/// internal runtime's `--json` envelope — a verifier command the dispatched
+/// role's tool loop attempted to run but never actually executed (missing
+/// binary, toolchain not present, etc). Moved here from `src/mission_run.rs`
+/// (was mission-run-private) so ANY `dispatch.internal`-shaped step can
+/// surface it, not just `mission.coder` — see `parse_failed_verifiers` and
+/// `DispatchInternalStepKind`'s `parse_verifiers` config opt-in below.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FailedVerifier {
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Best-effort parse of `failed_tool_invocations` from the internal
+/// runtime's `--json` envelope (a dispatch's stdout). In `--json` mode the
+/// runtime prints a single-line JSON envelope to stdout (status goes to
+/// stderr), so the whole buffer is the envelope; the last-non-empty-line
+/// fallback is pure defense against an unexpected leading line. Returns
+/// EMPTY on any parse miss or absent field — a soft signal must never fire
+/// a FALSE alarm, so "couldn't tell" reads as "nothing failed."
+pub fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedVerifier> {
+    let as_json = |s: &str| serde_json::from_str::<serde_json::Value>(s.trim()).ok();
+    let Some(v) = as_json(envelope_stdout).or_else(|| {
+        envelope_stdout
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .and_then(as_json)
+    }) else {
+        return Vec::new();
+    };
+    v.get("failed_tool_invocations")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| serde_json::from_value::<FailedVerifier>(e.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Wraps `dispatch::dispatch(DispatchOpts)` — a full agentic dispatch
-/// through darkmux's internal Docker-bounded runtime. Required
-/// `Step.config` keys: `role_id` (string), `message` (string, the base
-/// prompt — prior-dependency output is prepended per `compose_message`).
-/// Optional: `timeout_seconds` (u32, default 3600), `profile_name`
-/// (string), `image` (string), `config_path` (string, `--profiles-file`
-/// passthrough).
+/// through darkmux's internal Docker-bounded runtime.
+///
+/// **Assignment sourcing (#1230/#1341): the owning Task is the assignable
+/// unit.** `role_id`/`profile_name`/`workdir`/`image` come from the Task
+/// FIRST (`task.role_id` etc — see `types::Task`'s doc: like a Jira ticket
+/// assigned to one crew member, these are properties of the whole job,
+/// fixed for its duration) and fall back to the matching `Step.config` key
+/// only when the Task leaves that field unset — so a Task built without
+/// resource fields (an older caller, or a test) still works exactly as
+/// before. `role_id` is REQUIRED from one source or the other. Remaining
+/// `Step.config` keys (unaffected by this Task-sourcing — these are
+/// per-dispatch mechanics, not job-level assignment): `message` (string,
+/// the base prompt — prior-dependency output is prepended per
+/// `compose_message`), `timeout_seconds` (u32, default 3600),
+/// `config_path` (string, `--profiles-file` passthrough), `phase_id`
+/// (string, threads a Phase-scoped context file into the dispatch — see
+/// `DispatchOpts::phase_id`), `session_id` (string, overrides the default
+/// `step:<id>` session id so a caller's own flow records line up with this
+/// dispatch's), `parse_verifiers` (bool, default false — when true,
+/// attaches a `failed_verifiers`/`count` field pair, parsed via
+/// `parse_failed_verifiers`, onto the returned `StepOutcome`'s companion
+/// flow record under `action: "step result"`, `payload.kind:
+/// "dispatch.internal"`).
+///
+/// **A non-zero dispatch exit code is a step-level `Err`, not a silent
+/// `Complete`.** The dispatched role's OWN container ran (the darkmux-level
+/// dispatch itself always returns `Ok(DispatchResult)`); a non-zero exit
+/// means the role's run didn't finish cleanly. Treating that as `Complete`
+/// would let downstream `depends_on` steps (e.g. a verify step) run against
+/// an incomplete/broken result — this is the same "coder failed, skip
+/// downstream steps entirely" contract `mission.coder` always enforced; it
+/// is now this kind's DEFAULT for every caller, not a mission-specific
+/// carve-out.
 pub struct DispatchInternalStepKind;
+
+/// `task.<field>.clone()`, falling back to `Step.config.<key>` (as a
+/// string) when the Task leaves it unset — the shared sourcing rule every
+/// dispatch-shaped built-in's assignment fields use (#1230/#1341).
+fn task_or_config_str(task_field: Option<&String>, step: &Step, key: &str) -> Option<String> {
+    task_field.cloned().or_else(|| config_str(step, key).map(str::to_string))
+}
 
 impl StepKind for DispatchInternalStepKind {
     fn id(&self) -> &'static str {
         "dispatch.internal"
     }
 
-    fn run(&self, step: &Step, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         use crate::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts, Runtime};
 
-        let role_id = require_config_str(step, self.id(), "role_id")?.to_string();
+        let role_id = task_or_config_str(task.role_id.as_ref(), step, "role_id").ok_or_else(|| {
+            anyhow!("step `{}`: `{}` requires task.role_id or config.role_id", step.id, self.id())
+        })?;
         let base_message = config_str(step, "message").unwrap_or_default();
         let message = compose_message(base_message, input);
         let timeout_seconds = step
@@ -118,21 +197,34 @@ impl StepKind for DispatchInternalStepKind {
             .get("timeout_seconds")
             .and_then(|v| v.as_u64())
             .unwrap_or(3600) as u32;
-        let profile_name = config_str(step, "profile_name").map(str::to_string);
-        let image = config_str(step, "image").map(str::to_string);
+        let profile_name = task_or_config_str(task.profile_name.as_ref(), step, "profile_name");
+        let image = task_or_config_str(task.image.as_ref(), step, "image");
         let config_path = config_str(step, "config_path").map(str::to_string);
+        let workdir = task
+            .workdir
+            .clone()
+            .or_else(|| config_str(step, "workdir").map(std::path::PathBuf::from));
+        let phase_id = config_str(step, "phase_id").map(str::to_string);
+        let session_id = config_str(step, "session_id")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("step:{}", step.id));
+        let parse_verifiers = step
+            .config
+            .get("parse_verifiers")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let opts = DispatchOpts {
             role_id,
             message,
             deliver: None,
-            session_id: Some(format!("step:{}", step.id)),
+            session_id: Some(session_id),
             timeout_seconds,
             skip_preflight: false,
             json: true,
             watch_paths: Vec::new(),
-            workdir: None,
-            phase_id: None,
+            workdir,
+            phase_id,
             runtime: Runtime::Internal,
             runtime_cmd: "openclaw".to_string(),
             machine: None,
@@ -147,17 +239,62 @@ impl StepKind for DispatchInternalStepKind {
         };
         let result =
             dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;
+
+        if result.exit_code != 0 {
+            anyhow::bail!(
+                "step `{}` dispatch.internal: dispatch exited {} — {}",
+                step.id,
+                result.exit_code,
+                result.stdout.trim()
+            );
+        }
+
+        let mut flow_records = Vec::new();
+        if parse_verifiers {
+            let failed = parse_failed_verifiers(&result.stdout);
+            if !failed.is_empty() {
+                flow_records.push(darkmux_flow::FlowRecord {
+                    ts: darkmux_flow::ts_utc_now(),
+                    level: darkmux_flow::Level::Warn,
+                    category: darkmux_flow::Category::Work,
+                    tier: darkmux_flow::Tier::Local,
+                    stage: darkmux_flow::Stage::Dispatch,
+                    action: "step result".to_string(),
+                    handle: step.id.clone(),
+                    phase_id: None,
+                    session_id: Some(format!("task:{}", step.task_id)),
+                    source: Some("scheduler".to_string()),
+                    model: None,
+                    reasoning: None,
+                    mission_id: None,
+                    machine_id: None,
+                    machine_uid: None,
+                    orchestrator: None,
+                    prev_hash: None,
+                    hash: None,
+                    payload: Some(serde_json::json!({
+                        "step_id": step.id,
+                        "kind": "dispatch.internal",
+                        "failed_verifiers": failed,
+                        "count": failed.len(),
+                    })),
+                    work_id: None,
+                    attempt: None,
+                });
+            }
+        }
+
         Ok(StepOutcome {
             output: result.stdout,
-            flow_records: Vec::new(),
+            flow_records,
         })
     }
 
-    fn residency(&self, step: &Step) -> Option<darkmux_gestalt::Placement> {
-        let role_id = config_str(step, "role_id")?;
-        let profile_name = config_str(step, "profile_name");
-        let config_path = config_str(step, "config_path");
-        resolve_local_placement(role_id, profile_name, config_path, &format!("step:{}", step.id))
+    fn residency(&self, step: &Step, task: &Task) -> Option<darkmux_gestalt::Placement> {
+        let role_id = task_or_config_str(task.role_id.as_ref(), step, "role_id")?;
+        let profile_name = task_or_config_str(task.profile_name.as_ref(), step, "profile_name");
+        let config_path = config_str(step, "config_path").map(str::to_string);
+        resolve_local_placement(&role_id, profile_name.as_deref(), config_path.as_deref(), &format!("step:{}", step.id))
     }
 }
 
@@ -178,7 +315,7 @@ impl StepKind for DispatchSingleShotStepKind {
         "dispatch.single_shot"
     }
 
-    fn run(&self, step: &Step, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         use crate::single_shot::{
             single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest,
             SingleShotRequest,
@@ -253,7 +390,7 @@ impl StepKind for ProceduralShellStepKind {
         "procedural.shell"
     }
 
-    fn run(&self, step: &Step, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let command = require_config_str(step, self.id(), "command")?;
         let cwd = config_str(step, "cwd");
 
@@ -305,7 +442,7 @@ impl StepKind for ProceduralNoopStepKind {
         "procedural.noop"
     }
 
-    fn run(&self, step: &Step, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let output = config_str(step, "output").unwrap_or(&step.id).to_string();
         Ok(StepOutcome {
             output,
@@ -324,12 +461,30 @@ mod tests {
             id: id.to_string(),
             task_id: "t1".to_string(),
             kind: kind.to_string(),
-            depends_on: Vec::new(),
             status: crate::types::NodeStatus::Planned,
             config,
             started_ts: None,
             completed_ts: None,
             output: None,
+        }
+    }
+
+    /// A Task with no resource assignment (#1230/#1341) — the default
+    /// fixture for tests that don't exercise Task-sourced
+    /// `role_id`/`profile_name`/`workdir`/`image` (see
+    /// `dispatch_internal_sources_role_id_from_task` for a test that
+    /// does).
+    fn empty_task() -> Task {
+        Task {
+            id: "t1".to_string(),
+            phase_id: "p1".to_string(),
+            description: "test task".to_string(),
+            step_ids: vec!["s1".to_string()],
+            depends_on: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
         }
     }
 
@@ -353,37 +508,65 @@ mod tests {
     }
 
     #[test]
+    fn parse_failed_verifiers_extracts_from_envelope() {
+        let stdout = r#"{"failed_tool_invocations":[{"command":"cargo test","reason":"not found"}]}"#;
+        let out = parse_failed_verifiers(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].command, "cargo test");
+        assert_eq!(out[0].reason, "not found");
+    }
+
+    #[test]
+    fn parse_failed_verifiers_empty_on_no_field() {
+        let stdout = r#"{"status":"ok"}"#;
+        assert!(parse_failed_verifiers(stdout).is_empty());
+    }
+
+    #[test]
+    fn parse_failed_verifiers_empty_on_garbage() {
+        assert!(parse_failed_verifiers("not json at all").is_empty());
+    }
+
+    #[test]
+    fn parse_failed_verifiers_falls_back_to_last_line() {
+        let stdout = "some leading log noise\n{\"failed_tool_invocations\":[{\"command\":\"pytest\",\"reason\":\"toolchain missing\"}]}";
+        let out = parse_failed_verifiers(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].command, "pytest");
+    }
+
+    #[test]
     fn dispatch_internal_requires_role_id() {
         let s = step("s1", "dispatch.internal", json!({"message": "hi"}));
-        let err = DispatchInternalStepKind.run(&s, &BTreeMap::new()).unwrap_err();
+        let err = DispatchInternalStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains("config.role_id"), "{err}");
     }
 
     #[test]
     fn dispatch_single_shot_requires_model() {
         let s = step("s1", "dispatch.single_shot", json!({"user": "hi"}));
-        let err = DispatchSingleShotStepKind.run(&s, &BTreeMap::new()).unwrap_err();
+        let err = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains("config.model"), "{err}");
     }
 
     #[test]
     fn procedural_shell_requires_command() {
         let s = step("s1", "procedural.shell", json!({}));
-        let err = ProceduralShellStepKind.run(&s, &BTreeMap::new()).unwrap_err();
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains("config.command"), "{err}");
     }
 
     #[test]
     fn procedural_shell_runs_and_captures_stdout() {
         let s = step("s1", "procedural.shell", json!({"command": "echo hello-shell"}));
-        let out = ProceduralShellStepKind.run(&s, &BTreeMap::new()).unwrap();
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
         assert!(out.output.contains("hello-shell"));
     }
 
     #[test]
     fn procedural_shell_nonzero_exit_is_an_error() {
         let s = step("s1", "procedural.shell", json!({"command": "exit 3"}));
-        let err = ProceduralShellStepKind.run(&s, &BTreeMap::new()).unwrap_err();
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains("exited with"), "{err}");
     }
 
@@ -396,21 +579,21 @@ mod tests {
             "procedural.shell",
             json!({"command": "echo $DARKMUX_STEP_INPUT_UPSTREAM_STEP"}),
         );
-        let out = ProceduralShellStepKind.run(&s, &input).unwrap();
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &input).unwrap();
         assert!(out.output.contains("value-from-upstream"), "got: {}", out.output);
     }
 
     #[test]
     fn procedural_noop_defaults_output_to_step_id() {
         let s = step("marker-step", "procedural.noop", json!(null));
-        let out = ProceduralNoopStepKind.run(&s, &BTreeMap::new()).unwrap();
+        let out = ProceduralNoopStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
         assert_eq!(out.output, "marker-step");
     }
 
     #[test]
     fn procedural_noop_honors_config_output_override() {
         let s = step("s1", "procedural.noop", json!({"output": "custom"}));
-        let out = ProceduralNoopStepKind.run(&s, &BTreeMap::new()).unwrap();
+        let out = ProceduralNoopStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
         assert_eq!(out.output, "custom");
     }
 }

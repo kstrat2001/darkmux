@@ -1,19 +1,15 @@
-//! Dependency-graph scheduler (#1230 Packet 2).
+//! Dependency-graph scheduler (#1230 Packet 2, revised #1341).
 //!
-//! Generic over a `DependencyNode` trait so ONE readiness function
-//! (`is_ready`) and one reachability function (`reachable`) serve both
-//! Steps within a Task/Phase AND Phases within a Mission — the latter
-//! via the `PhaseNode` adapter at the bottom of this file, which is what
-//! finally makes `Phase.depends_on` dependency-aware instead of the
-//! historical flat `depends_on.is_empty()` "is this a root" filter (see
-//! `src/mission_run.rs::select_phase` and `src/main.rs`'s `mission
-//! dispatch` fan-out, both migrated to `is_ready` via this adapter).
-//!
-//! `run_step_graph` is the actual DAG executor: compute every currently-
-//! ready Step, fan them out through Packet 1's `run_bounded` (one
-//! `run_bounded` call = one "wave" of concurrently-runnable work), flush
-//! results, recompute readiness, repeat until nothing is ready and
-//! nothing is left `Planned`.
+//! **All real dependency/concurrency/data-flow lives at the Task level**
+//! (`Task::depends_on`) — see `types::Task`'s doc. Phase is strictly
+//! linear (ordered by `Mission::phase_ids` position, no dependency
+//! semantics of its own); Step is strictly linear within its Task
+//! (ordered by `Task::step_ids` position, no dependency semantics of its
+//! own either). `run_step_graph` is the actual DAG executor: compute every
+//! currently-ready Step (Task-aware — see `step_is_ready`), fan them out
+//! through Packet 1's `run_bounded` (one `run_bounded` call = one "wave"
+//! of concurrently-runnable work), flush results, recompute readiness,
+//! repeat until nothing is ready and nothing is left `Planned`.
 //!
 //! # Residency (resolved for real in Packet 3)
 //!
@@ -38,127 +34,34 @@
 //! classification is correctness/observability, not a measured speedup.
 
 use crate::step_kinds::StepKindRegistry;
-use crate::types::{NodeStatus, Phase, PhaseStatus, Step};
+use crate::types::{NodeStatus, Step, Task};
 use anyhow::{anyhow, Result};
 use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
 use darkmux_gestalt::{Facts, FootprintEstimator};
 use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// ─── DependencyNode + readiness/reachability ───────────────────────────
+// ─── Task dependency cycle detection (graph-load-time) (#1341) ────────
+//
+// (#1341 — reaches back into Packet 2) The generic `DependencyNode`/
+// `is_ready`/`reachable`/`PhaseNode` machinery this module used to define
+// is GONE: Phase is now strictly linear (ordered purely by
+// `Mission::phase_ids` position, no `depends_on` of its own — see
+// `types::Phase`'s doc) and Step has no `depends_on` either (ordered by
+// `Task::step_ids` position). The only real graph left is Task-level
+// (`Task::depends_on`), handled by the direct functions below — Phase's
+// "is this the next runnable one"/"is this unreachable" questions
+// (`mission_run::select_phase`, `mission_status::unreachable_phase_drifts`)
+// are now simple linear scans over `Mission::phase_ids`, needing no
+// graph-walking trait at all.
 
-/// A node in a dependency graph — implemented by `Step` directly and, via
-/// `PhaseNode`, by `Phase` too (see module doc).
-pub trait DependencyNode {
-    fn node_id(&self) -> &str;
-    fn node_depends_on(&self) -> &[String];
-    fn node_status(&self) -> NodeStatus;
-}
-
-impl DependencyNode for Step {
-    fn node_id(&self) -> &str {
-        &self.id
-    }
-    fn node_depends_on(&self) -> &[String] {
-        &self.depends_on
-    }
-    fn node_status(&self) -> NodeStatus {
-        self.status
-    }
-}
-
-/// `Phase → DependencyNode` adapter. Maps `PhaseStatus` onto
-/// `NodeStatus` (`Complete → Complete`, `Abandoned → Abandoned`,
-/// `Planned`/`Running` passthrough — `PhaseStatus` has no `Error`
-/// variant, so that arm is unreachable from this mapping direction).
-/// `Copy` (just wraps a `&Phase`) so building the `by_id` map the
-/// generic functions need is cheap.
-#[derive(Clone, Copy)]
-pub struct PhaseNode<'a>(pub &'a Phase);
-
-impl<'a> DependencyNode for PhaseNode<'a> {
-    fn node_id(&self) -> &str {
-        &self.0.id
-    }
-    fn node_depends_on(&self) -> &[String] {
-        &self.0.depends_on
-    }
-    fn node_status(&self) -> NodeStatus {
-        match self.0.status {
-            PhaseStatus::Planned => NodeStatus::Planned,
-            PhaseStatus::Running => NodeStatus::Running,
-            PhaseStatus::Complete => NodeStatus::Complete,
-            PhaseStatus::Abandoned => NodeStatus::Abandoned,
-        }
-    }
-}
-
-/// `true` iff `node` is itself `Planned` AND every dependency it names
-/// resolves (in `by_id`) to a node whose status is `Complete`. A
-/// dependency id that doesn't resolve in `by_id` (a dangling reference)
-/// is treated as unsatisfied — `is_ready` fails closed, never open, on
-/// a graph-integrity problem.
-pub fn is_ready<N: DependencyNode>(node: &N, by_id: &BTreeMap<String, &N>) -> bool {
-    if node.node_status() != NodeStatus::Planned {
-        return false;
-    }
-    node.node_depends_on().iter().all(|dep_id| {
-        by_id
-            .get(dep_id)
-            .map(|dep| dep.node_status() == NodeStatus::Complete)
-            .unwrap_or(false)
-    })
-}
-
-/// `true` iff `target_id` and every node in its FULL ancestor chain
-/// (transitive `depends_on`, not just one hop) is neither `Abandoned`
-/// nor `Error`. This is the doom-loop signal: `validate-cure` depending
-/// on `runtime-capture` (planned), `file-match` (abandoned), and
-/// `sovereignty-verbs` (planned) is permanently unreachable the moment
-/// `file-match` is abandoned, even though `validate-cure` itself is
-/// still `Planned` — see the `doom_loop_m4_fixture` regression test.
-///
-/// An unresolvable dependency id (dangling reference) does NOT itself
-/// make the target unreachable — a missing node can't be judged
-/// abandoned/errored, only a *known* bad node can. A cycle in the graph
-/// (which `detect_cycles` should already have rejected before this runs
-/// in `run_step_graph`'s path) is defused defensively via a `seen` set
-/// so this function terminates rather than looping forever.
-pub fn reachable<N: DependencyNode>(target_id: &str, by_id: &BTreeMap<String, &N>) -> bool {
-    let mut seen: HashSet<String> = HashSet::new();
-    reachable_inner(target_id, by_id, &mut seen)
-}
-
-fn reachable_inner<N: DependencyNode>(
-    id: &str,
-    by_id: &BTreeMap<String, &N>,
-    seen: &mut HashSet<String>,
-) -> bool {
-    if !seen.insert(id.to_string()) {
-        // Already visited this id on the current walk without finding a
-        // bad ancestor — treat as fine rather than looping (cycles are
-        // supposed to be rejected upstream by `detect_cycles`).
-        return true;
-    }
-    let Some(node) = by_id.get(id) else {
-        // Dangling reference — can't judge; not this function's job to
-        // flag graph integrity (that's `detect_cycles`/loader validation).
-        return true;
-    };
-    if matches!(node.node_status(), NodeStatus::Abandoned | NodeStatus::Error) {
-        return false;
-    }
-    node.node_depends_on()
-        .iter()
-        .all(|dep| reachable_inner(dep, by_id, seen))
-}
-
-// ─── Cycle detection (graph-load-time, before scheduling starts) ──────
-
-/// Rejects a `Step` graph containing a dependency cycle with a clear
-/// error naming the cycle, rather than letting `run_step_graph` hang
-/// forever waiting for a ready node that can never become ready.
-pub fn detect_cycles(steps: &BTreeMap<String, Step>) -> Result<()> {
+/// Rejects a `Task` graph containing a `Task.depends_on` cycle with a
+/// clear error naming the cycle, rather than letting `run_step_graph` hang
+/// forever waiting for a Task that can never become ready. Task-level now
+/// (#1341 moved ALL cross-Step dependency declaration up to
+/// `Task.depends_on` — Steps within one Task are ordered purely by
+/// `step_ids` position, which is structurally acyclic by construction).
+pub fn detect_cycles(tasks: &BTreeMap<String, Task>) -> Result<()> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Color {
         White,
@@ -168,7 +71,7 @@ pub fn detect_cycles(steps: &BTreeMap<String, Step>) -> Result<()> {
 
     fn visit(
         id: &str,
-        steps: &BTreeMap<String, Step>,
+        tasks: &BTreeMap<String, Task>,
         colors: &mut BTreeMap<String, Color>,
         path: &mut Vec<String>,
     ) -> Result<()> {
@@ -178,15 +81,15 @@ pub fn detect_cycles(steps: &BTreeMap<String, Step>) -> Result<()> {
                 path.push(id.to_string());
                 let cycle_start = path.iter().position(|p| p == id).unwrap_or(0);
                 let cycle = path[cycle_start..].join(" -> ");
-                anyhow::bail!("cycle detected in step graph: {cycle}");
+                anyhow::bail!("cycle detected in task graph: {cycle}");
             }
             Some(Color::White) => {}
         }
         colors.insert(id.to_string(), Color::Gray);
         path.push(id.to_string());
-        if let Some(step) = steps.get(id) {
-            for dep in &step.depends_on {
-                visit(dep, steps, colors, path)?;
+        if let Some(task) = tasks.get(id) {
+            for dep in &task.depends_on {
+                visit(dep, tasks, colors, path)?;
             }
         }
         path.pop();
@@ -195,46 +98,188 @@ pub fn detect_cycles(steps: &BTreeMap<String, Step>) -> Result<()> {
     }
 
     let mut colors: BTreeMap<String, Color> =
-        steps.keys().map(|k| (k.clone(), Color::White)).collect();
-    for id in steps.keys() {
+        tasks.keys().map(|k| (k.clone(), Color::White)).collect();
+    for id in tasks.keys() {
         let mut path = Vec::new();
-        visit(id, steps, &mut colors, &mut path)?;
+        visit(id, tasks, &mut colors, &mut path)?;
     }
     Ok(())
 }
 
-// ─── Input gathering ────────────────────────────────────────────────────
+// ─── Shared-workdir concurrency warning (#1341) ────────────────────────
 
-/// The `output` text of every already-`Complete` dependency of `step`,
-/// keyed by dependency Step id. A dependency that's `Complete` but has
-/// no recorded `output` (a step kind that legitimately produces none) is
-/// omitted, not stubbed with an empty string.
-pub fn gather_inputs(step: &Step, steps: &BTreeMap<String, Step>) -> BTreeMap<String, String> {
-    step.depends_on
-        .iter()
-        .filter_map(|dep_id| {
-            let dep = steps.get(dep_id)?;
-            if dep.status != NodeStatus::Complete {
-                return None;
+/// Warn (never reject — "concurrency with responsibility": the system
+/// informs, it doesn't block) when two Tasks share a non-empty `workdir`
+/// and are NOT dependency-related to each other (directly or transitively,
+/// in EITHER direction) — meaning they could run CONCURRENTLY against the
+/// same workspace (e.g. two coder dispatches both pointed at the same git
+/// worktree). Loud, named, surfaced in `SchedulerReport.warnings`; never
+/// blocks the run.
+pub fn shared_workdir_warnings(tasks: &BTreeMap<String, Task>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let ids: Vec<&String> = tasks.keys().collect();
+    for i in 0..ids.len() {
+        for other in &ids[i + 1..] {
+            let a = &tasks[ids[i]];
+            let b = &tasks[*other];
+            let (Some(wa), Some(wb)) = (&a.workdir, &b.workdir) else { continue };
+            if wa != wb {
+                continue;
             }
-            dep.output.clone().map(|output| (dep_id.clone(), output))
-        })
-        .collect()
+            if task_depends_transitively(a, &b.id, tasks) || task_depends_transitively(b, &a.id, tasks) {
+                continue; // one depends on the other — ordered, never concurrent
+            }
+            warnings.push(format!(
+                "task `{}` and task `{}` share workdir `{}` and have no dependency relationship \
+                 between them — they could run concurrently against the same workspace",
+                a.id,
+                b.id,
+                wa.display()
+            ));
+        }
+    }
+    warnings
+}
+
+/// `true` iff `from` depends on `target`, directly or transitively, via
+/// `Task.depends_on` edges.
+fn task_depends_transitively(from: &Task, target: &str, tasks: &BTreeMap<String, Task>) -> bool {
+    let mut stack: Vec<&str> = from.depends_on.iter().map(String::as_str).collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if id == target {
+            return true;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(t) = tasks.get(id) {
+            stack.extend(t.depends_on.iter().map(String::as_str));
+        }
+    }
+    false
+}
+
+// ─── Task-derived status + Step readiness (#1341) ──────────────────────
+
+/// A Task's status is DERIVED from its steps, never a stored field:
+/// `Error` if any step errored, `Abandoned` if any step is abandoned (and
+/// none errored), `Complete` iff every step is `Complete` (and it has at
+/// least one), `Running` if any step is running, else `Planned`.
+/// Recomputed fresh every readiness pass — a Task never goes stale.
+fn task_status(task: &Task, steps: &BTreeMap<String, Step>) -> NodeStatus {
+    let statuses: Vec<NodeStatus> =
+        task.step_ids.iter().filter_map(|id| steps.get(id)).map(|s| s.status).collect();
+    if statuses.contains(&NodeStatus::Error) {
+        NodeStatus::Error
+    } else if statuses.contains(&NodeStatus::Abandoned) {
+        NodeStatus::Abandoned
+    } else if !statuses.is_empty() && statuses.iter().all(|s| *s == NodeStatus::Complete) {
+        NodeStatus::Complete
+    } else if statuses.contains(&NodeStatus::Running) {
+        NodeStatus::Running
+    } else {
+        NodeStatus::Planned
+    }
+}
+
+/// `true` iff `step` is ready to run: itself `Planned`, AND —
+/// - if it's the FIRST step of `task` (or `task.step_ids` doesn't list it
+///   at all — defensive): every Task named in `task.depends_on` has
+///   `task_status(..) == Complete`;
+/// - otherwise (a later step in a multi-step Task): the step immediately
+///   before it in `task.step_ids` is `Complete`.
+///
+/// A Task whose dependency chain includes a dead (`Error`/`Abandoned`)
+/// ancestor never satisfies the first branch — its steps simply never
+/// become ready, the same "stays `Planned` forever" terminal shape the
+/// pre-#1341 `reachable`-gated design had, now emerging naturally from
+/// this fixed-point check rather than a separate reachability pre-pass.
+fn step_is_ready(
+    step: &Step,
+    task: &Task,
+    tasks: &BTreeMap<String, Task>,
+    steps: &BTreeMap<String, Step>,
+) -> bool {
+    if step.status != NodeStatus::Planned {
+        return false;
+    }
+    match task.step_ids.iter().position(|id| id == &step.id) {
+        Some(i) if i > 0 => steps
+            .get(&task.step_ids[i - 1])
+            .map(|s| s.status == NodeStatus::Complete)
+            .unwrap_or(false),
+        _ => task
+            .depends_on
+            .iter()
+            .all(|dep_id| tasks.get(dep_id).map(|t| task_status(t, steps) == NodeStatus::Complete).unwrap_or(false)),
+    }
+}
+
+// ─── Input gathering (#1341 — Task-aware) ──────────────────────────────
+
+/// The `input` map `step`'s job should receive:
+/// - If `step` is the FIRST step of `task`: one entry per `task.depends_on`
+///   Task id whose LAST step is `Complete` and has recorded `output`,
+///   keyed by that dependency TASK's id (#1341 — Task is the
+///   dependency-declaring unit now; see `Task::depends_on`'s doc for the
+///   "only the first step receives upstream Task output" design choice).
+/// - Otherwise (a later step in a multi-step Task): exactly one entry —
+///   the immediately-previous SAME-TASK step's `output` (if `Complete`),
+///   keyed by that step's id.
+///
+/// A dependency that's `Complete` but has no recorded `output` (a step
+/// kind that legitimately produces none) is omitted, not stubbed with an
+/// empty string.
+pub fn gather_inputs(
+    step: &Step,
+    task: &Task,
+    tasks: &BTreeMap<String, Task>,
+    steps: &BTreeMap<String, Step>,
+) -> BTreeMap<String, String> {
+    match task.step_ids.iter().position(|id| id == &step.id) {
+        Some(i) if i > 0 => {
+            let prev_id = &task.step_ids[i - 1];
+            steps
+                .get(prev_id)
+                .filter(|s| s.status == NodeStatus::Complete)
+                .and_then(|s| s.output.clone())
+                .map(|output| [(prev_id.clone(), output)].into_iter().collect())
+                .unwrap_or_default()
+        }
+        _ => task
+            .depends_on
+            .iter()
+            .filter_map(|dep_task_id| {
+                let dep_task = tasks.get(dep_task_id)?;
+                let last_step_id = dep_task.step_ids.last()?;
+                let last_step = steps.get(last_step_id)?;
+                if last_step.status != NodeStatus::Complete {
+                    return None;
+                }
+                last_step.output.clone().map(|output| (dep_task_id.clone(), output))
+            })
+            .collect(),
+    }
 }
 
 // ─── The scheduler loop ─────────────────────────────────────────────────
 
 /// Summary of one `run_step_graph` call: which steps completed, which
 /// errored, and how many wave iterations it took. Steps left `Planned`
-/// at the end (possible only if their dependency chain includes an
-/// `Error`/`Abandoned` node — see `reachable`) are NOT listed in either
-/// `completed` or `errored`; the caller can find them by scanning
-/// `steps` for lingering `NodeStatus::Planned` after the call returns.
+/// at the end (possible only if their owning Task's dependency chain
+/// includes a dead — `Error`/`Abandoned` — Task) are NOT listed in either
+/// `completed` or `errored`; the caller can find them by scanning `steps`
+/// for lingering `NodeStatus::Planned` after the call returns. `warnings`
+/// carries non-fatal graph-shape findings computed up front (today: only
+/// `shared_workdir_warnings` — #1341) — "concurrency with responsibility":
+/// surfaced loud, never blocking.
 #[derive(Debug, Default, Clone)]
 pub struct SchedulerReport {
     pub completed: Vec<String>,
     pub errored: Vec<String>,
     pub iterations: usize,
+    pub warnings: Vec<String>,
 }
 
 /// Walk `steps` to completion: each iteration computes every currently-
@@ -244,36 +289,47 @@ pub struct SchedulerReport {
 /// job's `StepOutcome` onto its Step (status + `output` + timestamps),
 /// emits step-lifecycle bookend records through `emit`, and recomputes
 /// readiness. Stops when nothing is ready (either the graph finished, or
-/// every remaining `Planned` step's dependency chain includes an
-/// `Error`/`Abandoned` node — i.e. is `!reachable`).
+/// every remaining `Planned` step's owning Task depends, directly or
+/// transitively, on a dead Task — see `step_is_ready`).
 ///
-/// Rejects a cyclic graph up front via `detect_cycles` rather than
-/// looping forever on a Step that can never become ready.
+/// `tasks` is the FULL Task map (#1341 — dependency/concurrency/data-flow
+/// all live at Task level now; see `Task`'s doc): readiness, cycle
+/// detection, and `input` gathering all resolve through it. A Step whose
+/// `task_id` has no entry in `tasks` (a caller that never registered one —
+/// e.g. a scheduler-level test exercising pure Step scheduling with no
+/// Task-assignment concerns) falls back to a synthetic single-step Task
+/// with no dependencies (always immediately ready) rather than erroring —
+/// a SCHEDULING CONVENIENCE for Task-agnostic callers, not license to skip
+/// building real Tasks in production; every production caller in this
+/// codebase always builds a real, persisted Task per Step.
+///
+/// Rejects a cyclic Task graph up front via `detect_cycles` rather than
+/// looping forever on a Task that can never become ready.
 pub fn run_step_graph(
     steps: &mut BTreeMap<String, Step>,
+    tasks: &BTreeMap<String, Task>,
     kinds: &StepKindRegistry,
     facts: &Facts,
     est: &dyn FootprintEstimator,
     remote_cap: usize,
     emit: &mut dyn FnMut(FlowRecord),
 ) -> Result<SchedulerReport> {
-    detect_cycles(steps)?;
+    detect_cycles(tasks)?;
 
-    let mut report = SchedulerReport::default();
+    let mut report = SchedulerReport {
+        warnings: shared_workdir_warnings(tasks),
+        ..Default::default()
+    };
 
     loop {
-        // Scoped so `by_id`'s borrows into `steps` end before the
-        // mutable `steps.get_mut` calls below — `ready_ids` itself is
-        // fully owned (`Vec<String>`) and carries no borrow forward.
-        let ready_ids: Vec<String> = {
-            let by_id: BTreeMap<String, &Step> =
-                steps.iter().map(|(k, v)| (k.clone(), v)).collect();
-            steps
-                .values()
-                .filter(|s| is_ready(*s, &by_id))
-                .map(|s| s.id.clone())
-                .collect()
-        };
+        let ready_ids: Vec<String> = steps
+            .values()
+            .filter(|s| {
+                let task = tasks.get(&s.task_id).cloned().unwrap_or_else(|| synthetic_task(s));
+                step_is_ready(s, &task, tasks, steps)
+            })
+            .map(|s| s.id.clone())
+            .collect();
 
         if ready_ids.is_empty() {
             break;
@@ -288,12 +344,17 @@ pub fn run_step_graph(
             emit(step_lifecycle_record(step, "step start"));
         }
         // Re-borrow immutably now that every ready step's status flip is
-        // recorded — `gather_inputs` needs `&steps` (completed sibling
-        // outputs), and the job closures below need owned snapshots
-        // ('static, per `run_bounded`'s `Send + 'static` job contract).
+        // recorded — `gather_inputs` needs `&steps`/`&tasks` (completed
+        // sibling/upstream outputs), and the job closures below need owned
+        // snapshots ('static, per `run_bounded`'s `Send + 'static` job
+        // contract).
         for (idx, id) in ready_ids.iter().enumerate() {
             let step_snapshot = steps.get(id).expect("just set to Running above").clone();
-            let input = gather_inputs(&step_snapshot, steps);
+            let task_snapshot = tasks
+                .get(&step_snapshot.task_id)
+                .cloned()
+                .unwrap_or_else(|| synthetic_task(&step_snapshot));
+            let input = gather_inputs(&step_snapshot, &task_snapshot, tasks, steps);
             let kind = kinds
                 .get(&step_snapshot.kind)
                 .with_context_step(&step_snapshot)?;
@@ -301,13 +362,13 @@ pub fn run_step_graph(
             // trait doc on `StepKind::residency` and the module doc above.
             // Best-effort: `None` (every kind's behavior before this hook
             // existed, and every non-dispatch kind today) schedules Remote.
-            let residency = match kind.residency(&step_snapshot) {
+            let residency = match kind.residency(&step_snapshot, &task_snapshot) {
                 Some(placement) => crate::concurrent_dispatch::Residency::Local(placement),
                 None => crate::concurrent_dispatch::Residency::Remote,
             };
             let job: crate::concurrent_dispatch::DispatchJob<StepJobResult> =
                 Box::new(move || {
-                    let outcome = kind.run(&step_snapshot, &input)?;
+                    let outcome = kind.run(&step_snapshot, &task_snapshot, &input)?;
                     Ok((
                         StepJobResult {
                             output: outcome.output,
@@ -376,6 +437,24 @@ impl<T> WithContextStep<T> for Result<T> {
     }
 }
 
+/// The synthetic empty `Task` a Step resolves to when the caller's `tasks`
+/// map has no entry for `step.task_id` — see `run_step_graph`'s doc for why
+/// this falls back rather than erroring (a scheduling convenience for
+/// Task-assignment-agnostic callers, not a production shape).
+fn synthetic_task(step: &Step) -> Task {
+    Task {
+        id: step.task_id.clone(),
+        phase_id: String::new(),
+        description: String::new(),
+        step_ids: vec![step.id.clone()],
+        depends_on: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    }
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -422,389 +501,420 @@ mod tests {
     use darkmux_gestalt::FixedEstimator;
     use serde_json::json;
 
-    fn noop_step(id: &str, depends_on: &[&str]) -> Step {
-        Step {
+    // ─── fixtures (#1341 Task-level model) ─────────────────────────────
+
+    /// A single-step Task: Task id `<id>`, its one Step id `<id>-step`,
+    /// `Task.depends_on` set from `deps` (other TASK ids). The overwhelming
+    /// majority of this codebase's real Tasks are exactly this shape.
+    fn task_and_step(id: &str, deps: &[&str]) -> (Task, Step) {
+        let step_id = format!("{id}-step");
+        let task = Task {
             id: id.to_string(),
-            task_id: "t1".to_string(),
+            phase_id: "p1".to_string(),
+            description: format!("task {id}"),
+            step_ids: vec![step_id.clone()],
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let step = Step {
+            id: step_id,
+            task_id: id.to_string(),
             kind: "procedural.noop".to_string(),
-            depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             status: NodeStatus::Planned,
             config: json!(null),
             started_ts: None,
             completed_ts: None,
             output: None,
+        };
+        (task, step)
+    }
+
+    fn step_with_status(id: &str, deps: &[&str], status: NodeStatus) -> (Task, Step) {
+        let (task, mut step) = task_and_step(id, deps);
+        step.status = status;
+        (task, step)
+    }
+
+    fn graph(pairs: Vec<(Task, Step)>) -> (BTreeMap<String, Task>, BTreeMap<String, Step>) {
+        let mut tasks = BTreeMap::new();
+        let mut steps = BTreeMap::new();
+        for (t, s) in pairs {
+            steps.insert(s.id.clone(), s);
+            tasks.insert(t.id.clone(), t);
         }
+        (tasks, steps)
     }
 
-    fn step_with_status(id: &str, depends_on: &[&str], status: NodeStatus) -> Step {
-        let mut s = noop_step(id, depends_on);
-        s.status = status;
-        s
-    }
-
-    // ─── is_ready ────────────────────────────────────────────────────
+    // ─── task_status ────────────────────────────────────────────────
 
     #[test]
-    fn is_ready_true_for_planned_no_deps() {
-        let a = step_with_status("a", &[], NodeStatus::Planned);
-        let by_id: BTreeMap<String, &Step> = [("a".to_string(), &a)].into_iter().collect();
-        assert!(is_ready(&a, &by_id));
+    fn task_status_planned_with_no_steps_run() {
+        let (task, step) = task_and_step("a", &[]);
+        let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into_iter().collect();
+        assert_eq!(task_status(&task, &steps), NodeStatus::Planned);
     }
 
     #[test]
-    fn is_ready_false_when_not_planned() {
-        let a = step_with_status("a", &[], NodeStatus::Running);
-        let by_id: BTreeMap<String, &Step> = [("a".to_string(), &a)].into_iter().collect();
-        assert!(!is_ready(&a, &by_id));
+    fn task_status_complete_when_every_step_complete() {
+        let (task, mut step) = task_and_step("a", &[]);
+        step.status = NodeStatus::Complete;
+        let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into_iter().collect();
+        assert_eq!(task_status(&task, &steps), NodeStatus::Complete);
     }
 
     #[test]
-    fn is_ready_false_when_dependency_incomplete() {
-        let a = step_with_status("a", &[], NodeStatus::Planned);
-        let b = step_with_status("b", &["a"], NodeStatus::Planned);
-        let by_id: BTreeMap<String, &Step> =
-            [("a".to_string(), &a), ("b".to_string(), &b)].into_iter().collect();
-        assert!(!is_ready(&b, &by_id));
+    fn task_status_error_if_any_step_errored() {
+        let (task, mut step) = task_and_step("a", &[]);
+        step.status = NodeStatus::Error;
+        let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into_iter().collect();
+        assert_eq!(task_status(&task, &steps), NodeStatus::Error);
     }
 
     #[test]
-    fn is_ready_true_when_dependency_complete() {
-        let a = step_with_status("a", &[], NodeStatus::Complete);
-        let b = step_with_status("b", &["a"], NodeStatus::Planned);
-        let by_id: BTreeMap<String, &Step> =
-            [("a".to_string(), &a), ("b".to_string(), &b)].into_iter().collect();
-        assert!(is_ready(&b, &by_id));
+    fn task_status_running_if_any_step_running_and_none_dead() {
+        let (task, mut step) = task_and_step("a", &[]);
+        step.status = NodeStatus::Running;
+        let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into_iter().collect();
+        assert_eq!(task_status(&task, &steps), NodeStatus::Running);
+    }
+
+    // ─── step_is_ready ──────────────────────────────────────────────
+
+    #[test]
+    fn step_is_ready_true_for_first_step_with_no_task_deps() {
+        let (task, step) = task_and_step("a", &[]);
+        let tasks: BTreeMap<String, Task> = [(task.id.clone(), task.clone())].into_iter().collect();
+        let steps: BTreeMap<String, Step> = [(step.id.clone(), step.clone())].into_iter().collect();
+        assert!(step_is_ready(&step, &task, &tasks, &steps));
     }
 
     #[test]
-    fn is_ready_false_on_dangling_dependency() {
-        let b = step_with_status("b", &["ghost"], NodeStatus::Planned);
-        let by_id: BTreeMap<String, &Step> = [("b".to_string(), &b)].into_iter().collect();
-        assert!(!is_ready(&b, &by_id), "a dangling dep must fail closed");
-    }
-
-    // ─── reachable ───────────────────────────────────────────────────
-
-    #[test]
-    fn reachable_true_for_clean_chain() {
-        let a = step_with_status("a", &[], NodeStatus::Complete);
-        let b = step_with_status("b", &["a"], NodeStatus::Planned);
-        let by_id: BTreeMap<String, &Step> =
-            [("a".to_string(), &a), ("b".to_string(), &b)].into_iter().collect();
-        assert!(reachable("b", &by_id));
+    fn step_is_ready_false_when_not_planned() {
+        let (task, mut step) = task_and_step("a", &[]);
+        step.status = NodeStatus::Running;
+        let tasks: BTreeMap<String, Task> = [(task.id.clone(), task.clone())].into_iter().collect();
+        let steps: BTreeMap<String, Step> = [(step.id.clone(), step.clone())].into_iter().collect();
+        assert!(!step_is_ready(&step, &task, &tasks, &steps));
     }
 
     #[test]
-    fn reachable_false_when_direct_ancestor_abandoned() {
-        let a = step_with_status("a", &[], NodeStatus::Abandoned);
-        let b = step_with_status("b", &["a"], NodeStatus::Planned);
-        let by_id: BTreeMap<String, &Step> =
-            [("a".to_string(), &a), ("b".to_string(), &b)].into_iter().collect();
-        assert!(!reachable("b", &by_id));
+    fn step_is_ready_false_when_task_dependency_incomplete() {
+        let (task_a, step_a) = task_and_step("a", &[]);
+        let (task_b, step_b) = task_and_step("b", &["a"]);
+        let (tasks, steps) = graph(vec![(task_a, step_a), (task_b.clone(), step_b.clone())]);
+        assert!(!step_is_ready(&step_b, &task_b, &tasks, &steps));
     }
 
     #[test]
-    fn reachable_false_when_transitive_ancestor_errored() {
-        let a = step_with_status("a", &[], NodeStatus::Error);
-        let b = step_with_status("b", &["a"], NodeStatus::Complete);
-        let c = step_with_status("c", &["b"], NodeStatus::Planned);
-        let by_id: BTreeMap<String, &Step> = [
-            ("a".to_string(), &a),
-            ("b".to_string(), &b),
-            ("c".to_string(), &c),
-        ]
-        .into_iter()
-        .collect();
-        assert!(
-            !reachable("c", &by_id),
-            "c depends transitively on errored `a` via `b` — must be unreachable"
-        );
+    fn step_is_ready_true_when_task_dependency_complete() {
+        let (task_a, step_a) = step_with_status("a", &[], NodeStatus::Complete);
+        let (task_b, step_b) = task_and_step("b", &["a"]);
+        let (tasks, steps) = graph(vec![(task_a, step_a), (task_b.clone(), step_b.clone())]);
+        assert!(step_is_ready(&step_b, &task_b, &tasks, &steps));
     }
 
     #[test]
-    fn reachable_true_when_target_itself_is_abandoned_sibling_branch_unaffected() {
-        // Sibling branches don't cross-contaminate reachability.
-        let a = step_with_status("a", &[], NodeStatus::Complete);
-        let b = step_with_status("b", &[], NodeStatus::Abandoned);
-        let d = step_with_status("d", &["a"], NodeStatus::Planned);
-        let by_id: BTreeMap<String, &Step> = [
-            ("a".to_string(), &a),
-            ("b".to_string(), &b),
-            ("d".to_string(), &d),
-        ]
-        .into_iter()
-        .collect();
-        assert!(reachable("d", &by_id), "d depends only on healthy `a`, not on abandoned `b`");
+    fn step_is_ready_false_on_dangling_task_dependency() {
+        let (task_b, step_b) = task_and_step("b", &["ghost"]);
+        let tasks: BTreeMap<String, Task> = [(task_b.id.clone(), task_b.clone())].into_iter().collect();
+        let steps: BTreeMap<String, Step> = [(step_b.id.clone(), step_b.clone())].into_iter().collect();
+        assert!(!step_is_ready(&step_b, &task_b, &tasks, &steps), "a dangling task dep must fail closed");
     }
 
-    /// (#1230 Packet 2 acceptance) Reproduces the REAL `doom-loop-m4`
-    /// mission's shape read from `~/.darkmux/missions/doom-loop-m4/`:
-    /// `validate-cure` depends on `runtime-capture` (planned),
-    /// `file-match` (abandoned), `sovereignty-verbs` (planned).
-    /// `file-match` being abandoned must make `validate-cure`
-    /// permanently unreachable even though `validate-cure` itself is
-    /// still `Planned`.
     #[test]
-    fn doom_loop_m4_fixture_validate_cure_is_unreachable() {
-        let runtime_capture = crate::types::Phase {
-            id: "runtime-capture".to_string(),
-            mission_id: "doom-loop-m4".to_string(),
-            description: "runtime-side firing-time capture".to_string(),
-            status: PhaseStatus::Planned,
-            depends_on: vec![],
-            created_ts: 1_782_141_824,
+    fn step_is_ready_later_step_needs_only_immediately_previous_same_task_step() {
+        // A two-step Task: step-0 -> step-1, positional order, no
+        // `Task.depends_on` involved at all for the intra-task edge.
+        let task = Task {
+            id: "multi".to_string(),
+            phase_id: "p1".to_string(),
+            description: "multi-step task".to_string(),
+            step_ids: vec!["multi-0".to_string(), "multi-1".to_string()],
+            depends_on: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let step0 = Step {
+            id: "multi-0".to_string(),
+            task_id: "multi".to_string(),
+            kind: "procedural.noop".to_string(),
+            status: NodeStatus::Complete,
+            config: json!(null),
             started_ts: None,
             completed_ts: None,
-            abandoned_ts: None,
-            task_ids: Vec::new(),
+            output: Some("step0 out".to_string()),
         };
-        let file_match = crate::types::Phase {
-            id: "file-match".to_string(),
-            mission_id: "doom-loop-m4".to_string(),
-            description: "file-match precision".to_string(),
-            status: PhaseStatus::Abandoned,
-            depends_on: vec![],
-            created_ts: 1_782_141_824,
-            started_ts: Some(1_782_141_937),
-            completed_ts: None,
-            abandoned_ts: Some(1_782_147_136),
-            task_ids: Vec::new(),
-        };
-        let sovereignty_verbs = crate::types::Phase {
-            id: "sovereignty-verbs".to_string(),
-            mission_id: "doom-loop-m4".to_string(),
-            description: "lessons sovereignty verbs".to_string(),
-            status: PhaseStatus::Planned,
-            depends_on: vec![],
-            created_ts: 1_782_141_824,
+        let step1 = Step {
+            id: "multi-1".to_string(),
+            task_id: "multi".to_string(),
+            kind: "procedural.noop".to_string(),
+            status: NodeStatus::Planned,
+            config: json!(null),
             started_ts: None,
             completed_ts: None,
-            abandoned_ts: None,
-            task_ids: Vec::new(),
+            output: None,
         };
-        let validate_cure = crate::types::Phase {
-            id: "validate-cure".to_string(),
-            mission_id: "doom-loop-m4".to_string(),
-            description: "validate the cure".to_string(),
-            status: PhaseStatus::Planned,
-            depends_on: vec![
-                "runtime-capture".to_string(),
-                "file-match".to_string(),
-                "sovereignty-verbs".to_string(),
-            ],
-            created_ts: 1_782_141_824,
-            started_ts: None,
-            completed_ts: None,
-            abandoned_ts: None,
-            task_ids: Vec::new(),
-        };
-
-        let nodes: Vec<PhaseNode> = vec![
-            PhaseNode(&runtime_capture),
-            PhaseNode(&file_match),
-            PhaseNode(&sovereignty_verbs),
-            PhaseNode(&validate_cure),
-        ];
-        let by_id: BTreeMap<String, &PhaseNode> = nodes
-            .iter()
-            .map(|n| (n.node_id().to_string(), n))
-            .collect();
-
-        assert!(
-            !reachable("validate-cure", &by_id),
-            "validate-cure must be unreachable — file-match (a dependency) is abandoned"
-        );
-        assert!(
-            !is_ready(&PhaseNode(&validate_cure), &by_id),
-            "validate-cure must not be ready either — file-match never completes"
-        );
-        // The healthy phases (no abandoned ancestors) remain reachable —
-        // this fixture isn't accidentally flagging the whole mission.
-        assert!(reachable("runtime-capture", &by_id));
-        assert!(reachable("sovereignty-verbs", &by_id));
-    }
-
-    // ─── detect_cycles ───────────────────────────────────────────────
-
-    #[test]
-    fn detect_cycles_ok_on_acyclic_graph() {
-        let a = noop_step("a", &[]);
-        let b = noop_step("b", &["a"]);
+        let tasks: BTreeMap<String, Task> = [("multi".to_string(), task.clone())].into_iter().collect();
         let steps: BTreeMap<String, Step> =
-            [("a".to_string(), a), ("b".to_string(), b)].into_iter().collect();
-        assert!(detect_cycles(&steps).is_ok());
+            [("multi-0".to_string(), step0), ("multi-1".to_string(), step1.clone())].into_iter().collect();
+        assert!(step_is_ready(&step1, &task, &tasks, &steps));
+    }
+
+    // ─── gather_inputs ──────────────────────────────────────────────
+
+    #[test]
+    fn gather_inputs_first_step_keys_by_dependency_task_id() {
+        let (task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.status = NodeStatus::Complete;
+        step_a.output = Some("a's output".to_string());
+        let (task_b, step_b) = task_and_step("b", &["a"]);
+        let (tasks, steps) = graph(vec![(task_a, step_a), (task_b.clone(), step_b.clone())]);
+        let input = gather_inputs(&step_b, &task_b, &tasks, &steps);
+        assert_eq!(input.get("a").map(String::as_str), Some("a's output"));
     }
 
     #[test]
-    fn detect_cycles_rejects_direct_cycle() {
-        let a = noop_step("a", &["b"]);
-        let b = noop_step("b", &["a"]);
+    fn gather_inputs_omits_incomplete_or_outputless_dependency() {
+        let (task_a, step_a) = task_and_step("a", &[]); // still Planned
+        let (task_b, step_b) = task_and_step("b", &["a"]);
+        let (tasks, steps) = graph(vec![(task_a, step_a), (task_b.clone(), step_b.clone())]);
+        let input = gather_inputs(&step_b, &task_b, &tasks, &steps);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn gather_inputs_later_step_keys_by_previous_same_task_step_id() {
+        let task = Task {
+            id: "multi".to_string(),
+            phase_id: "p1".to_string(),
+            description: "d".to_string(),
+            step_ids: vec!["multi-0".to_string(), "multi-1".to_string()],
+            depends_on: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let step0 = Step {
+            id: "multi-0".to_string(),
+            task_id: "multi".to_string(),
+            kind: "procedural.noop".to_string(),
+            status: NodeStatus::Complete,
+            config: json!(null),
+            started_ts: None,
+            completed_ts: None,
+            output: Some("step0 out".to_string()),
+        };
+        let step1 = Step {
+            id: "multi-1".to_string(),
+            task_id: "multi".to_string(),
+            kind: "procedural.noop".to_string(),
+            status: NodeStatus::Planned,
+            config: json!(null),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let tasks: BTreeMap<String, Task> = [("multi".to_string(), task.clone())].into_iter().collect();
         let steps: BTreeMap<String, Step> =
-            [("a".to_string(), a), ("b".to_string(), b)].into_iter().collect();
-        let err = detect_cycles(&steps).unwrap_err();
+            [("multi-0".to_string(), step0), ("multi-1".to_string(), step1.clone())].into_iter().collect();
+        let input = gather_inputs(&step1, &task, &tasks, &steps);
+        assert_eq!(input.get("multi-0").map(String::as_str), Some("step0 out"));
+    }
+
+    // ─── detect_cycles (Task-level, #1341) ──────────────────────────
+
+    #[test]
+    fn detect_cycles_ok_on_acyclic_task_graph() {
+        let (task_a, _) = task_and_step("a", &[]);
+        let (task_b, _) = task_and_step("b", &["a"]);
+        let tasks: BTreeMap<String, Task> =
+            [(task_a.id.clone(), task_a), (task_b.id.clone(), task_b)].into_iter().collect();
+        assert!(detect_cycles(&tasks).is_ok());
+    }
+
+    #[test]
+    fn detect_cycles_rejects_direct_task_cycle() {
+        let (task_a, _) = task_and_step("a", &["b"]);
+        let (task_b, _) = task_and_step("b", &["a"]);
+        let tasks: BTreeMap<String, Task> =
+            [(task_a.id.clone(), task_a), (task_b.id.clone(), task_b)].into_iter().collect();
+        let err = detect_cycles(&tasks).unwrap_err();
         assert!(err.to_string().contains("cycle detected"), "{err}");
     }
 
     #[test]
-    fn detect_cycles_rejects_transitive_cycle() {
-        let a = noop_step("a", &["c"]);
-        let b = noop_step("b", &["a"]);
-        let c = noop_step("c", &["b"]);
-        let steps: BTreeMap<String, Step> = [
-            ("a".to_string(), a),
-            ("b".to_string(), b),
-            ("c".to_string(), c),
+    fn detect_cycles_rejects_transitive_task_cycle() {
+        let (task_a, _) = task_and_step("a", &["c"]);
+        let (task_b, _) = task_and_step("b", &["a"]);
+        let (task_c, _) = task_and_step("c", &["b"]);
+        let tasks: BTreeMap<String, Task> = [
+            (task_a.id.clone(), task_a),
+            (task_b.id.clone(), task_b),
+            (task_c.id.clone(), task_c),
         ]
         .into_iter()
         .collect();
-        let err = detect_cycles(&steps).unwrap_err();
+        let err = detect_cycles(&tasks).unwrap_err();
         assert!(err.to_string().contains("cycle detected"), "{err}");
     }
 
     #[test]
     fn detect_cycles_self_dependency_is_a_cycle() {
-        let a = noop_step("a", &["a"]);
-        let steps: BTreeMap<String, Step> = [("a".to_string(), a)].into_iter().collect();
-        assert!(detect_cycles(&steps).is_err());
+        let (task_a, _) = task_and_step("a", &["a"]);
+        let tasks: BTreeMap<String, Task> = [(task_a.id.clone(), task_a)].into_iter().collect();
+        assert!(detect_cycles(&tasks).is_err());
+    }
+
+    // ─── shared_workdir_warnings (#1341) ────────────────────────────
+
+    #[test]
+    fn shared_workdir_warnings_flags_unrelated_tasks_sharing_a_workdir() {
+        let (mut task_a, step_a) = task_and_step("a", &[]);
+        let (mut task_b, step_b) = task_and_step("b", &[]); // no dependency edge
+        task_a.workdir = Some(std::path::PathBuf::from("/tmp/wt"));
+        task_b.workdir = Some(std::path::PathBuf::from("/tmp/wt"));
+        let (tasks, _steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
+        let warnings = shared_workdir_warnings(&tasks);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("task `a`") && warnings[0].contains("task `b`"), "{warnings:?}");
+    }
+
+    #[test]
+    fn shared_workdir_warnings_silent_when_tasks_are_dependency_related() {
+        let (mut task_a, step_a) = task_and_step("a", &[]);
+        let (mut task_b, step_b) = task_and_step("b", &["a"]); // b depends on a — ordered
+        task_a.workdir = Some(std::path::PathBuf::from("/tmp/wt"));
+        task_b.workdir = Some(std::path::PathBuf::from("/tmp/wt"));
+        let (tasks, _steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
+        assert!(shared_workdir_warnings(&tasks).is_empty());
+    }
+
+    #[test]
+    fn shared_workdir_warnings_silent_when_workdirs_differ() {
+        let (mut task_a, step_a) = task_and_step("a", &[]);
+        let (mut task_b, step_b) = task_and_step("b", &[]);
+        task_a.workdir = Some(std::path::PathBuf::from("/tmp/wt-a"));
+        task_b.workdir = Some(std::path::PathBuf::from("/tmp/wt-b"));
+        let (tasks, _steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
+        assert!(shared_workdir_warnings(&tasks).is_empty());
     }
 
     // ─── run_step_graph (integration, via procedural.noop) ────────────
 
-    fn run_test_graph(steps: &mut BTreeMap<String, Step>) -> SchedulerReport {
+    fn run_test_graph(
+        tasks: &BTreeMap<String, Task>,
+        steps: &mut BTreeMap<String, Step>,
+    ) -> SchedulerReport {
         let kinds = StepKindRegistry::with_builtins();
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let mut emitted = Vec::new();
-        run_step_graph(steps, &kinds, &facts, &est, 8, &mut |r| emitted.push(r)).unwrap()
+        run_step_graph(steps, tasks, &kinds, &facts, &est, 8, &mut |r| emitted.push(r)).unwrap()
     }
 
     #[test]
-    fn run_step_graph_respects_topological_ordering_linear_chain() {
-        let mut steps: BTreeMap<String, Step> = [
-            ("a".to_string(), noop_step("a", &[])),
-            ("b".to_string(), noop_step("b", &["a"])),
-            ("c".to_string(), noop_step("c", &["b"])),
-        ]
-        .into_iter()
-        .collect();
+    fn run_step_graph_respects_topological_ordering_linear_task_chain() {
+        let (task_a, step_a) = task_and_step("a", &[]);
+        let (task_b, step_b) = task_and_step("b", &["a"]);
+        let (task_c, step_c) = task_and_step("c", &["b"]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a), (task_b, step_b), (task_c, step_c)]);
 
-        let report = run_test_graph(&mut steps);
+        let report = run_test_graph(&tasks, &mut steps);
 
         assert_eq!(report.completed.len(), 3);
         assert_eq!(report.errored.len(), 0);
-        for id in ["a", "b", "c"] {
+        for id in ["a-step", "b-step", "c-step"] {
             assert_eq!(steps[id].status, NodeStatus::Complete, "{id} should be Complete");
         }
-        let a_done = steps["a"].completed_ts.unwrap();
-        let b_start = steps["b"].started_ts.unwrap();
-        let b_done = steps["b"].completed_ts.unwrap();
-        let c_start = steps["c"].started_ts.unwrap();
+        let a_done = steps["a-step"].completed_ts.unwrap();
+        let b_start = steps["b-step"].started_ts.unwrap();
+        let b_done = steps["b-step"].completed_ts.unwrap();
+        let c_start = steps["c-step"].started_ts.unwrap();
         assert!(a_done <= b_start, "b must not start before a completes");
         assert!(b_done <= c_start, "c must not start before b completes");
     }
 
-    /// (#1230 Packet 2 acceptance) Diamond shape: A→B, A→C, B and C both
-    /// →D. B and C must both complete before D becomes ready — and,
-    /// since they're scheduled in the SAME wave (both ready at once
-    /// after A completes), they run concurrently via Packet 1's
-    /// `run_bounded`.
+    /// (#1230 Packet 2 acceptance, revised #1341 for Task-level deps)
+    /// Diamond shape: A→B, A→C, B and C both →D — now expressed as
+    /// `Task.depends_on` edges. B and C must both complete before D
+    /// becomes ready — and, since they're scheduled in the SAME wave
+    /// (both ready at once after A completes), they run concurrently via
+    /// Packet 1's `run_bounded`.
     #[test]
     fn run_step_graph_diamond_runs_b_and_c_concurrently_then_d() {
-        let mut steps: BTreeMap<String, Step> = [
-            ("a".to_string(), noop_step("a", &[])),
-            ("b".to_string(), noop_step("b", &["a"])),
-            ("c".to_string(), noop_step("c", &["a"])),
-            ("d".to_string(), noop_step("d", &["b", "c"])),
-        ]
-        .into_iter()
-        .collect();
+        let (task_a, step_a) = task_and_step("a", &[]);
+        let (task_b, step_b) = task_and_step("b", &["a"]);
+        let (task_c, step_c) = task_and_step("c", &["a"]);
+        let (task_d, step_d) = task_and_step("d", &["b", "c"]);
+        let (tasks, mut steps) =
+            graph(vec![(task_a, step_a), (task_b, step_b), (task_c, step_c), (task_d, step_d)]);
 
-        let report = run_test_graph(&mut steps);
+        let report = run_test_graph(&tasks, &mut steps);
 
         assert_eq!(report.completed.len(), 4);
-        for id in ["a", "b", "c", "d"] {
+        for id in ["a-step", "b-step", "c-step", "d-step"] {
             assert_eq!(steps[id].status, NodeStatus::Complete, "{id} should be Complete");
         }
-        // D must start only after BOTH B and C have completed.
-        let b_done = steps["b"].completed_ts.unwrap();
-        let c_done = steps["c"].completed_ts.unwrap();
-        let d_start = steps["d"].started_ts.unwrap();
+        let b_done = steps["b-step"].completed_ts.unwrap();
+        let c_done = steps["c-step"].completed_ts.unwrap();
+        let d_start = steps["d-step"].started_ts.unwrap();
         assert!(b_done <= d_start && c_done <= d_start);
-        // B and C were scheduled in the same wave (both became ready in
-        // the same readiness computation, right after A completed) —
-        // the iteration count proves the wave shape: A alone (1), then
-        // B+C together (2), then D alone (3) = 3 iterations, not 4.
         assert_eq!(report.iterations, 3, "A, then B+C together, then D");
     }
 
     #[test]
-    fn run_step_graph_reports_errored_step_and_still_completes_independent_branch() {
-        let failing = {
-            let mut s = noop_step("fails", &[]);
-            s.kind = "procedural.shell".to_string();
-            s.config = json!({"command": "exit 1"});
-            s
-        };
-        let mut steps: BTreeMap<String, Step> = [
-            ("fails".to_string(), failing),
-            ("independent".to_string(), noop_step("independent", &[])),
-        ]
-        .into_iter()
-        .collect();
+    fn run_step_graph_reports_errored_step_and_still_completes_independent_task() {
+        let (task_fails, mut step_fails) = task_and_step("fails", &[]);
+        step_fails.kind = "procedural.shell".to_string();
+        step_fails.config = json!({"command": "exit 1"});
+        let (task_ind, step_ind) = task_and_step("independent", &[]);
+        let (tasks, mut steps) = graph(vec![(task_fails, step_fails), (task_ind, step_ind)]);
 
-        let report = run_test_graph(&mut steps);
+        let report = run_test_graph(&tasks, &mut steps);
 
-        assert_eq!(steps["fails"].status, NodeStatus::Error);
-        assert_eq!(steps["independent"].status, NodeStatus::Complete);
-        assert_eq!(report.errored, vec!["fails".to_string()]);
-        assert!(report.completed.contains(&"independent".to_string()));
+        assert_eq!(steps["fails-step"].status, NodeStatus::Error);
+        assert_eq!(steps["independent-step"].status, NodeStatus::Complete);
+        assert_eq!(report.errored, vec!["fails-step".to_string()]);
+        assert!(report.completed.contains(&"independent-step".to_string()));
     }
 
     #[test]
-    fn run_step_graph_downstream_of_errored_step_never_runs_and_stays_planned() {
-        let failing = {
-            let mut s = noop_step("fails", &[]);
-            s.kind = "procedural.shell".to_string();
-            s.config = json!({"command": "exit 1"});
-            s
-        };
-        let mut steps: BTreeMap<String, Step> = [
-            ("fails".to_string(), failing),
-            ("downstream".to_string(), noop_step("downstream", &["fails"])),
-        ]
-        .into_iter()
-        .collect();
+    fn run_step_graph_downstream_task_of_errored_task_never_runs_and_stays_planned() {
+        let (task_fails, mut step_fails) = task_and_step("fails", &[]);
+        step_fails.kind = "procedural.shell".to_string();
+        step_fails.config = json!({"command": "exit 1"});
+        let (task_down, step_down) = task_and_step("downstream", &["fails"]);
+        let (tasks, mut steps) = graph(vec![(task_fails, step_fails), (task_down, step_down)]);
 
-        let report = run_test_graph(&mut steps);
+        let report = run_test_graph(&tasks, &mut steps);
 
-        assert_eq!(steps["fails"].status, NodeStatus::Error);
+        assert_eq!(steps["fails-step"].status, NodeStatus::Error);
         assert_eq!(
-            steps["downstream"].status,
+            steps["downstream-step"].status,
             NodeStatus::Planned,
-            "downstream of an errored dependency never becomes ready"
+            "downstream of an errored task dependency never becomes ready"
         );
-        assert!(!report.completed.contains(&"downstream".to_string()));
-        assert!(!report.errored.contains(&"downstream".to_string()));
-
-        // Cross-check against `reachable`: the scheduler's own behavior
-        // (never running `downstream`) matches what `reachable` predicts.
-        let by_id: BTreeMap<String, &Step> =
-            steps.iter().map(|(k, v)| (k.clone(), v)).collect();
-        assert!(!reachable("downstream", &by_id));
+        assert!(!report.completed.contains(&"downstream-step".to_string()));
+        assert!(!report.errored.contains(&"downstream-step".to_string()));
     }
 
     #[test]
-    fn run_step_graph_rejects_cyclic_graph_before_running_anything() {
-        let a = noop_step("a", &["b"]);
-        let b = noop_step("b", &["a"]);
-        let mut steps: BTreeMap<String, Step> =
-            [("a".to_string(), a), ("b".to_string(), b)].into_iter().collect();
+    fn run_step_graph_rejects_cyclic_task_graph_before_running_anything() {
+        let (task_a, step_a) = task_and_step("a", &["b"]);
+        let (task_b, step_b) = task_and_step("b", &["a"]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
 
         let kinds = StepKindRegistry::with_builtins();
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let mut emitted = Vec::new();
-        let err = run_step_graph(&mut steps, &kinds, &facts, &est, 8, &mut |r| emitted.push(r))
+        let err = run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &mut |r| emitted.push(r))
             .unwrap_err();
         assert!(err.to_string().contains("cycle detected"));
         assert!(emitted.is_empty(), "no step-lifecycle records before the cycle check fires");
@@ -815,16 +925,30 @@ mod tests {
 
     #[test]
     fn run_step_graph_emits_step_start_and_step_complete_records() {
-        let mut steps: BTreeMap<String, Step> =
-            [("a".to_string(), noop_step("a", &[]))].into_iter().collect();
+        let (task_a, step_a) = task_and_step("a", &[]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
         let kinds = StepKindRegistry::with_builtins();
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let mut emitted: Vec<FlowRecord> = Vec::new();
-        run_step_graph(&mut steps, &kinds, &facts, &est, 8, &mut |r| emitted.push(r)).unwrap();
+        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &mut |r| emitted.push(r)).unwrap();
 
         let actions: Vec<&str> = emitted.iter().map(|r| r.action.as_str()).collect();
         assert!(actions.contains(&"step start"));
         assert!(actions.contains(&"step complete"));
+    }
+
+    #[test]
+    fn run_step_graph_surfaces_shared_workdir_warning_without_blocking() {
+        let (mut task_a, step_a) = task_and_step("a", &[]);
+        let (mut task_b, step_b) = task_and_step("b", &[]);
+        task_a.workdir = Some(std::path::PathBuf::from("/tmp/wt"));
+        task_b.workdir = Some(std::path::PathBuf::from("/tmp/wt"));
+        let (tasks, mut steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
+
+        let report = run_test_graph(&tasks, &mut steps);
+
+        assert_eq!(report.completed.len(), 2, "the warning never blocks the run");
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     }
 }

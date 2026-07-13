@@ -2342,10 +2342,20 @@ function renderMissionsIndex(){
     <div class="milist">${body}</div></div>`;
 }
 // (#827 Slice B) The furthest cycle stage a phase reached, from its
-// mission-run session's `mission.run.*` records (≤ playhead). The loop is
-// run → qa → gate → ship; QA sits between run and gate, so reaching the gate
-// implies QA ran. `aborted` is the alternate terminal. Empty when the phase
-// has no mission.run records in the window (historical / never-run).
+// mission-run session's records (≤ playhead). The loop is run → qa → gate →
+// ship; QA sits between run and gate, so reaching the gate implies QA ran.
+// `aborted` is the alternate terminal. Empty when the phase has no mission-run
+// records in the window (historical / never-run).
+//
+// (#1230 Packet 4) The worktree→coder→verify Task/Step graph retired its
+// bespoke `mission.run.start`/`mission.run.error`/`mission.run.verification`/
+// `mission.run.qa-unavailable`/`mission.run.blocked`/`mission.run.gate`
+// vocabulary in favor of a single generic `"step result"` action carrying
+// `payload.kind` (`"mission.worktree"` | `"mission.coder"` |
+// `"mission.verify"`) — see `src/mission_run.rs`'s `emit_step_result` doc.
+// `mission.run.abort`/`mission.run.ship`/`mission.run.ship.merged` are
+// UNCHANGED — they're mission/phase-level lifecycle events outside the
+// Task/Step graph (`mission abort`/`mission ship`), not steps.
 // The session id `mission run` stamps (server: format!("mission-run-{m}-{s}")).
 // Built by concatenation, NOT template interpolation, so the XSS source-guard's
 // raw-mission-id deny-rule doesn't false-positive on this non-HTML data key.
@@ -2361,17 +2371,25 @@ const missionBadge=ms=>ms?`<span class="mstat ${clsSafe(ms)}">${esc(ms)}</span>`
                          :`<span class="mitag">untracked</span>`;
 function cycleStage(mid, phaseId){
   const sid=runSid(mid, phaseId);
-  const recs=DATA.filter(r=>r.session_id===sid&&typeof r.action==="string"
-    &&r.action.indexOf("mission.run")===0&&T(r.ts)<=state.t);
-  if(!recs.length)return null;
+  const recs=DATA.filter(r=>r.session_id===sid&&typeof r.action==="string"&&T(r.ts)<=state.t);
   const has=a=>recs.some(r=>r.action==="mission.run."+a);
+  const stepResults=recs.filter(r=>r.action==="step result"&&r.payload);
+  if(!stepResults.length && !has("abort") && !has("ship") && !has("ship.merged")) return null;
+  // The most recent `mission.verify` step-result — DATA is chronological, so
+  // the last match is the latest (a re-run's fresh verdict supersedes an
+  // earlier one, mirroring the server-side `session_failed_verifiers`
+  // latest-wins convention).
+  const verifyResults=stepResults.filter(r=>r.payload.kind==="mission.verify");
+  const lastVerify=verifyResults.length?verifyResults[verifyResults.length-1]:null;
+  const verifyOk=lastVerify&&!lastVerify.payload.error;
+  const blockers=verifyOk&&typeof lastVerify.payload.blockers==="number"?lastVerify.payload.blockers:null;
   return {
-    run:true,
-    gate:has("gate")||has("ship")||has("ship.merged"),
+    run:stepResults.length>0,
+    gate:(verifyOk&&blockers===0)||has("ship")||has("ship.merged"),
     ship:has("ship")||has("ship.merged"),
     merged:has("ship.merged"),
     aborted:has("abort"),
-    blocked:has("blocked"),
+    blocked:!!(verifyOk&&blockers>0),
   };
 }
 // (#827 Slice B) Mission detail — the durable PHASE plan (window-independent)

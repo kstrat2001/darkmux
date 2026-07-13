@@ -42,8 +42,9 @@ use darkmux_lab::lab::bundle::{
     build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, FileSource,
 };
 use darkmux_lab::lab::funnel::{
-    run_funnel, run_judge_only, BundleInput, ChatCall, ExecMode, FunnelEmitter, FunnelEnvelope,
-    FunnelInputs, JudgeRecord, LmsCycler, ProbeFlag, Tier, VerifyRecord, VerifyRuling,
+    build_funnel_graph, run_funnel_graph, run_judge_only, validate_funnel_crew, BundleInput,
+    ChatCall, ExecMode, FunnelEmitter, FunnelEnvelope, FunnelInputs, FunnelStepContext,
+    JudgeRecord, LmsCycler, ProbeFlag, Tier, VerifyRecord, VerifyRuling,
 };
 use darkmux_profiles::crews::{resolve_crew, ResolvedCrew};
 use darkmux_profiles::profiles::load_registry;
@@ -58,6 +59,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // (#1298) The single-reviewer (`pr-review render`) default footer. The funnel
 // path never uses this — it derives its footer from the envelope's member
@@ -1268,6 +1270,147 @@ fn crew_detail(crew: &ResolvedCrew) -> String {
     format!("crew={} seats={seat_count} remote_hosts={hosts_str}", crew.name)
 }
 
+/// (#1230/#1341 DRY pass) The judge step's internal bounded-concurrency
+/// for-each cap — dispatch pass-1 (then pass-2 if confirmed) for up to this
+/// many deduped flags AT ONCE. `1` (fully sequential — byte-identical
+/// dispatch ORDER to the historical driver) is the conservative default:
+/// LMStudio's real per-model concurrent-prediction ceiling is genuinely
+/// unresolved (operator observation: ~4 in practice, sometimes 1), and
+/// judge is typically ONE model processing N flags, so graph-level fan-out
+/// here would buy little while adding real risk. A lightweight env-var
+/// knob (not yet threaded through the full `config.json` /
+/// `darkmux_types::config_access` precedence chain other `DARKMUX_*`
+/// settings use — a deliberate, smaller-scoped follow-up once real
+/// concurrency-ceiling data exists to justify a durable operator-facing
+/// setting) rather than a hardcoded literal, per the "config is the
+/// extension mechanism" principle.
+fn funnel_judge_concurrency() -> u32 {
+    std::env::var("DARKMUX_FUNNEL_JUDGE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+}
+
+/// The real, persisted Mission + three Phases (investigate / adjudicate /
+/// report — see `darkmux_lab::lab::funnel`'s module doc) a `pr-review run`
+/// dispatch creates before running the funnel graph. Phase boundaries here
+/// mark genuinely inspectable, self-contained artifacts an operator would
+/// want to see independently (deduped flags = "what's the review forming
+/// to be," judged flags = "what got confirmed") — a labeling/observability
+/// layer over the flat Task/Step graph `build_funnel_graph` builds, not a
+/// second scheduler.
+struct FunnelMissionPhases {
+    mission_id: String,
+    investigate_phase_id: String,
+    adjudicate_phase_id: String,
+    report_phase_id: String,
+}
+
+/// Sanitize a case identifier (`owner/repo@sha`, a worktree path, or
+/// `"local"`) into a valid Mission/Phase id: lowercase, alphanumeric +
+/// `-`/`_` only, everything else collapses to `-`. Mission/Phase ids flow
+/// into filesystem paths and flow-record fields, so the charset is
+/// deliberately conservative (mirrors `fleet::validate_identifier`'s own
+/// allowed set for the same reason).
+fn sanitize_mission_id(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_was_dash = false;
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Idempotent: if a Mission already exists at this id (a re-run of the same
+/// case — CI re-triggers, a retried dispatch), reuse it rather than
+/// erroring or duplicating — `darkmux pr-review run` has no "first run
+/// only" contract the way `mission propose`'s no-overwrite gate does.
+/// Best-effort (a persistence hiccup here must never block the review
+/// itself — the funnel graph still runs and produces a real envelope even
+/// if Mission/Phase persistence failed; only the mission-status/graph-lens
+/// VIEW of the run would be degraded, not the run itself).
+fn build_mission_for_funnel(case_id: &str, crew_name: &str) -> Result<FunnelMissionPhases> {
+    let mission_id = format!("pr-review-{}", sanitize_mission_id(case_id));
+    let investigate_phase_id = format!("{mission_id}-investigate");
+    let adjudicate_phase_id = format!("{mission_id}-adjudicate");
+    let report_phase_id = format!("{mission_id}-report");
+
+    let now = now_unix();
+    let mission_path = darkmux_crew::lifecycle::mission_path(&mission_id);
+    if !mission_path.exists() {
+        let mission = darkmux_crew::types::Mission {
+            id: mission_id.clone(),
+            description: format!("PR review — {case_id} (crew `{crew_name}`)"),
+            status: darkmux_crew::types::MissionStatus::Active,
+            phase_ids: vec![
+                investigate_phase_id.clone(),
+                adjudicate_phase_id.clone(),
+                report_phase_id.clone(),
+            ],
+            created_ts: now,
+            started_ts: Some(now),
+            closed_ts: None,
+            paused_ts: None,
+            source_input: None,
+            ticket: None,
+        };
+        if let Some(parent) = mission_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&mission) {
+            let _ = std::fs::write(&mission_path, format!("{json}\n"));
+        }
+
+        // (#1341) Phases are strictly linear — ordered purely by position
+        // in `mission.phase_ids` (already investigate/adjudicate/report
+        // above). No separate dependency declaration on the Phase itself.
+        let phases = [
+            (&investigate_phase_id, "investigate — bundle, probe every staffed seat, dedup"),
+            (&adjudicate_phase_id, "adjudicate — double-confirm judge over deduped flags"),
+            (&report_phase_id, "report — verify confirmed findings, synthesize tier counts"),
+        ];
+        for (phase_id, description) in phases {
+            let phase_path = darkmux_crew::lifecycle::phase_path(&mission_id, phase_id);
+            if phase_path.exists() {
+                continue;
+            }
+            let phase = darkmux_crew::types::Phase {
+                id: phase_id.clone(),
+                mission_id: mission_id.clone(),
+                description: description.to_string(),
+                status: darkmux_crew::types::PhaseStatus::Running,
+                created_ts: now,
+                started_ts: Some(now),
+                completed_ts: None,
+                abandoned_ts: None,
+                task_ids: Vec::new(),
+            };
+            if let Some(parent) = phase_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(&phase) {
+                let _ = std::fs::write(&phase_path, format!("{json}\n"));
+            }
+        }
+    }
+
+    Ok(FunnelMissionPhases { mission_id, investigate_phase_id, adjudicate_phase_id, report_phase_id })
+}
+
 /// Everything but `--from-envelope`: resolve the source + crew, build real
 /// bundles, and dispatch either `run_funnel` (the full pipeline) or
 /// `run_judge_only` (`--charges-file` — re-judge a saved flag list without
@@ -1362,65 +1505,14 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     // dispatch bookend / funnel records and the liveness trail always agree.
     let case_id = case.clone();
 
-    let inputs = FunnelInputs {
-        case_id,
-        crew: &crew,
-        // No separate title on this CLI surface (`--intent-file` is one
-        // blob) — the whole file becomes the body; `judge_prompt` renders
-        // an empty title as a blank line, same as Phase A's own
-        // title-absent case. See `RunOpts::intent_file`'s doc comment.
-        intent_title: "",
-        intent_body: &intent,
-        diff: diff_text,
-        mode,
-        probe_system: &probe_system,
-        judge_system: &judge_system,
-        verify_system: &verify_system,
-        bundles: Some(bundles),
-        // (#1260) The per-execution remote token allowance, resolved through
-        // the one precedence home (`env > config.remote.* > 500000`) — only
-        // endpoint-staffed seats draw from it.
-        remote_max_tokens_per_execution:
-            darkmux_types::config_access::remote_max_tokens_per_execution(),
-    };
-
-    // (#1272) Bookend identity, captured before `inputs`/`crew` are moved
-    // into the dispatch closures below — same case_id/handle `funnel.*`
-    // records already carry (`inputs.case_id` / `crew.name`), so the
-    // dispatch bookend and the funnel's own records group under identical
-    // session_id/handle in the viewer.
-    let case_id_for_bookends = inputs.case_id.clone();
+    // (#1272) Bookend identity — captured up front from data that outlives
+    // both branches below, so the dispatch bookend / funnel records and the
+    // liveness trail always agree regardless of which path runs.
+    let case_id_for_bookends = case_id.clone();
     let crew_name_for_bookends = crew.name.clone();
     let model_for_bookends = crew_model_summary(&crew);
+    let remote_max_tokens_per_execution = darkmux_types::config_access::remote_max_tokens_per_execution();
 
-    let timeout = opts.timeout;
-    // (#1260) Route on what the seat's profile declares (contract 1): an
-    // endpoint-bearing call goes through the hosted dialect (Azure
-    // api-version + Keychain auth + max_completion_tokens — the transport
-    // `dispatch_remote` proved); a local call goes through LMStudio. The
-    // system/user texts are identical either way (contract 6).
-    let mut chat = move |call: &ChatCall| -> Result<SingleShotReply> {
-        match call.endpoint {
-            Some(endpoint) => single_shot_chat_hosted(&HostedSingleShotRequest {
-                endpoint,
-                model: call.model,
-                system: call.system,
-                user: call.user,
-                max_tokens: call.max_tokens,
-                timeout_seconds: timeout,
-            }),
-            None => single_shot_chat(&SingleShotRequest {
-                base_url: None,
-                model: call.model,
-                system: call.system,
-                user: call.user,
-                temperature: call.temperature,
-                max_tokens: call.max_tokens,
-                timeout_seconds: timeout,
-            }),
-        }
-    };
-    let mut cycler = LmsCycler;
     let mut emitter = FleetFlowEmitter;
 
     // (#1311) The flow machinery is now the write target — the very layer #563
@@ -1442,6 +1534,42 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     );
 
     if let Some(charges_path) = &opts.charges_file {
+        let inputs = FunnelInputs {
+            case_id,
+            crew: &crew,
+            intent_title: "",
+            intent_body: &intent,
+            diff: diff_text,
+            mode,
+            probe_system: &probe_system,
+            judge_system: &judge_system,
+            verify_system: &verify_system,
+            bundles: Some(bundles),
+            remote_max_tokens_per_execution,
+        };
+        let timeout = opts.timeout;
+        let mut chat = move |call: &ChatCall| -> Result<SingleShotReply> {
+            match call.endpoint {
+                Some(endpoint) => single_shot_chat_hosted(&HostedSingleShotRequest {
+                    endpoint,
+                    model: call.model,
+                    system: call.system,
+                    user: call.user,
+                    max_tokens: call.max_tokens,
+                    timeout_seconds: timeout,
+                }),
+                None => single_shot_chat(&SingleShotRequest {
+                    base_url: None,
+                    model: call.model,
+                    system: call.system,
+                    user: call.user,
+                    temperature: call.temperature,
+                    max_tokens: call.max_tokens,
+                    timeout_seconds: timeout,
+                }),
+            }
+        };
+        let mut cycler = LmsCycler;
         let raw = std::fs::read_to_string(charges_path)
             .with_context(|| format!("reading --charges-file {}", charges_path.display()))?;
         let flags: Vec<ProbeFlag> = serde_json::from_str(&raw)
@@ -1454,12 +1582,76 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
             move |emitter| run_judge_only(flags, &inputs, &mut chat, &mut cycler, emitter),
         )
     } else {
+        // (#1230/#1341 DRY pass) The main funnel path now runs as a real,
+        // upfront-declared Task/Step graph — one Mission with three Phases
+        // (investigate/adjudicate/report) — instead of `run_funnel`'s
+        // sequential six-call driver. See `build_mission_for_funnel` +
+        // `darkmux_lab::lab::funnel::{build_funnel_graph, run_funnel_graph}`.
+        let seats = validate_funnel_crew(&crew)?;
+        let probes: Vec<_> = seats.probes.clone();
+        let judge = seats.judge.clone();
+        let verify = seats.verify.cloned();
+        let judge_identifier = darkmux_lab::lab::funnel::seat_identifier(&judge.pm);
+        let request_changes = crew.request_changes;
+
+        let ctx = Arc::new(FunnelStepContext {
+            case_id: case_id_for_bookends.clone(),
+            crew: crew.clone(),
+            intent_title: String::new(),
+            intent_body: intent,
+            diff: diff_text.to_string(),
+            probe_system,
+            judge_system,
+            verify_system,
+            bundles,
+            remote_max_tokens_per_execution,
+            timeout_seconds: opts.timeout,
+        });
+
+        let mission = build_mission_for_funnel(&case_id_for_bookends, &crew_name_for_bookends)?;
+        let graph = build_funnel_graph(
+            ctx.clone(),
+            judge.clone(),
+            verify.clone(),
+            &probes,
+            &mission.investigate_phase_id,
+            &mission.adjudicate_phase_id,
+            &mission.report_phase_id,
+            funnel_judge_concurrency(),
+        );
+        for task in &graph.tasks {
+            let _ = darkmux_crew::lifecycle::save_task(&mission.mission_id, task);
+        }
+
+        let fingerprint_val = darkmux_lab::lab::funnel::fingerprint(&judge_identifier, &ctx.judge_system);
+        let staffing_snapshot =
+            darkmux_lab::lab::funnel::staffing_snapshot(&probes, &judge, verify.as_ref(), request_changes);
+        let mission_id = mission.mission_id.clone();
+        let phase_id_of_step = graph.phase_id_of_step.clone();
+        // Cloned for the `move` closure's own use — `with_dispatch_bookends`
+        // ALSO borrows `crew_name_for_bookends` (as its 3rd argument) for the
+        // duration of the call, so the closure can't move the original out
+        // from under that borrow.
+        let crew_name_for_closure = crew_name_for_bookends.clone();
+
         with_dispatch_bookends(
             &mut emitter,
             &case_id_for_bookends,
             &crew_name_for_bookends,
             model_for_bookends.as_deref(),
-            move |emitter| run_funnel(&inputs, &mut chat, &mut cycler, emitter),
+            move |emitter| {
+                run_funnel_graph(&ctx, &crew_name_for_closure, mode, fingerprint_val, staffing_snapshot, graph, emitter)
+                    .map(|(env, steps)| {
+                        for (step_id, step) in &steps {
+                            let phase_id = phase_id_of_step
+                                .get(step_id)
+                                .map(String::as_str)
+                                .unwrap_or(&mission.report_phase_id);
+                            let _ = darkmux_crew::lifecycle::save_step(&mission_id, phase_id, step);
+                        }
+                        env
+                    })
+            },
         )
     }
 }

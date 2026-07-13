@@ -29,8 +29,8 @@ mod registry;
 mod types;
 
 pub use builtins::{
-    resolve_local_placement, DispatchInternalStepKind, DispatchSingleShotStepKind,
-    ProceduralNoopStepKind, ProceduralShellStepKind,
+    parse_failed_verifiers, resolve_local_placement, DispatchInternalStepKind,
+    DispatchSingleShotStepKind, FailedVerifier, ProceduralNoopStepKind, ProceduralShellStepKind,
 };
 pub use registry::StepKindRegistry;
 pub use types::{StepKind, StepOutcome};

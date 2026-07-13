@@ -20,7 +20,6 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 
 use crate::crew;
-use crate::crew::scheduler::{reachable, DependencyNode, PhaseNode};
 use crate::crew::types::{Mission, MissionStatus, Phase, PhaseStatus};
 use darkmux_types::{config_access, style};
 
@@ -81,8 +80,8 @@ fn reconcile_cmds(s: &Phase) -> Vec<String> {
 ///   - (#1230 Packet 5) an ACTIVE mission with ZERO complete phases whose
 ///     `started_ts` is older than `stale_days` — the `doom-loop-m4` case
 ///     (0/4 phases for ~20 days, no drift surfaced by either check above).
-///   - (#1230 Packet 5) a PLANNED phase whose dependency chain includes an
-///     Abandoned/Error phase, via Packet 2's `reachable()` — permanently
+///   - (#1230 Packet 5, revised #1341 for linear phases) a PLANNED phase
+///     with an earlier-in-mission-order Abandoned phase — permanently
 ///     stuck even though the phase itself is still Planned.
 fn detect_drift(m: &Mission, phases: &[&Phase], now: u64, stale_days: u64) -> Vec<Drift> {
     let mut out = Vec::new();
@@ -121,7 +120,7 @@ fn detect_drift(m: &Mission, phases: &[&Phase], now: u64, stale_days: u64) -> Ve
         out.push(d);
     }
 
-    out.extend(unreachable_phase_drifts(phases));
+    out.extend(unreachable_phase_drifts(m, phases));
 
     out
 }
@@ -154,34 +153,39 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
     })
 }
 
-/// A Planned phase whose dependency chain includes an Abandoned/Error
-/// phase — via Packet 2's `reachable()` through the existing
-/// `Phase -> DependencyNode` adapter (`PhaseNode`), no new graph-walking
-/// logic. This is the `doom-loop-m4` signal: `validate-cure` is still
-/// Planned but can never legally run because `file-match` (a dependency)
-/// was abandoned.
-fn unreachable_phase_drifts(phases: &[&Phase]) -> Vec<Drift> {
-    let nodes: Vec<PhaseNode> = phases.iter().map(|s| PhaseNode(s)).collect();
-    let by_id: BTreeMap<String, &PhaseNode> =
-        nodes.iter().map(|n| (n.node_id().to_string(), n)).collect();
+/// A Planned phase that can never legally run because an EARLIER phase in
+/// `Mission.phase_ids` order was Abandoned. (#1341) Phases are strictly
+/// linear now — no `depends_on` graph to walk (`reachable`/`PhaseNode` are
+/// gone) — so this is a linear scan: any phase abandoned before this one's
+/// position permanently blocks it (a strictly linear list has no
+/// alternate path around a dead predecessor, unlike the old DAG shape).
+/// This is the `doom-loop-m4` signal: `validate-cure` is still Planned but
+/// can never legally run because an earlier phase was abandoned.
+fn unreachable_phase_drifts(m: &Mission, phases: &[&Phase]) -> Vec<Drift> {
+    let phase_by_id: BTreeMap<&str, &&Phase> = phases.iter().map(|p| (p.id.as_str(), p)).collect();
 
-    phases
-        .iter()
-        .filter(|s| s.status == PhaseStatus::Planned)
-        .filter(|s| !reachable(&s.id, &by_id))
-        .map(|s| Drift {
-            kind: "unreachable-phase",
-            detail: format!(
-                "phase '{}' can never run — its dependency chain includes an \
-                 abandoned or errored phase",
-                s.id
-            ),
-            suggest: vec![format!(
-                "darkmux phase abandon {}   # dependency chain is permanently dead",
-                s.id
-            )],
-        })
-        .collect()
+    let mut out = Vec::new();
+    let mut dead_ancestor = false;
+    for phase_id in &m.phase_ids {
+        let Some(phase) = phase_by_id.get(phase_id.as_str()) else { continue };
+        if dead_ancestor && phase.status == PhaseStatus::Planned {
+            out.push(Drift {
+                kind: "unreachable-phase",
+                detail: format!(
+                    "phase '{}' can never run — an earlier phase in this mission was abandoned",
+                    phase.id
+                ),
+                suggest: vec![format!(
+                    "darkmux phase abandon {}   # blocked by an earlier abandoned phase",
+                    phase.id
+                )],
+            });
+        }
+        if phase.status == PhaseStatus::Abandoned {
+            dead_ancestor = true;
+        }
+    }
+    out
 }
 
 /// Entry from main.rs's dispatch. `--json` emits a structured board for the
@@ -368,7 +372,6 @@ mod tests {
             mission_id: mid.into(),
             description: "d".into(),
             status,
-            depends_on: vec![],
             created_ts: 0,
             started_ts: None,
             completed_ts: None,
@@ -491,12 +494,15 @@ mod tests {
     // ─── unreachable-phase (#1230 Packet 5) ────────────────────────────
 
     #[test]
-    fn planned_phase_depending_on_abandoned_phase_drifts() {
+    fn planned_phase_after_abandoned_phase_drifts() {
+        // (#1341) Phases are strictly linear — ordered by `Mission.phase_ids`
+        // — so "blocked depends on dead" is now expressed by list order:
+        // `dead` comes before `blocked`.
         let mut dead = phase("dead", "m1", PhaseStatus::Abandoned);
         dead.abandoned_ts = Some(1);
-        let mut blocked = phase("blocked", "m1", PhaseStatus::Planned);
-        blocked.depends_on = vec!["dead".to_string()];
-        let m = mission("m1", MissionStatus::Active);
+        let blocked = phase("blocked", "m1", PhaseStatus::Planned);
+        let mut m = mission("m1", MissionStatus::Active);
+        m.phase_ids = vec!["dead".to_string(), "blocked".to_string()];
 
         let d = detect_drift(&m, &[&dead, &blocked], 0, 14);
         assert!(d.iter().any(|dr| dr.kind == "unreachable-phase"
@@ -505,42 +511,45 @@ mod tests {
     }
 
     #[test]
-    fn planned_phase_with_healthy_dependency_is_not_flagged_unreachable() {
+    fn planned_phase_after_healthy_phase_is_not_flagged_unreachable() {
         let done = phase("done", "m1", PhaseStatus::Complete);
-        let mut next = phase("next", "m1", PhaseStatus::Planned);
-        next.depends_on = vec!["done".to_string()];
-        let m = mission("m1", MissionStatus::Active);
+        let next = phase("next", "m1", PhaseStatus::Planned);
+        let mut m = mission("m1", MissionStatus::Active);
+        m.phase_ids = vec!["done".to_string(), "next".to_string()];
 
         let d = detect_drift(&m, &[&done, &next], 0, 14);
         assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
     }
 
     #[test]
-    fn non_planned_phase_with_abandoned_dependency_is_not_flagged() {
+    fn non_planned_phase_after_abandoned_phase_is_not_flagged() {
         // Only PLANNED phases get flagged — a phase that already
         // completed/abandoned/started isn't "stuck", it already resolved.
         let dead = phase("dead", "m1", PhaseStatus::Abandoned);
-        let mut done = phase("done", "m1", PhaseStatus::Complete);
-        done.depends_on = vec!["dead".to_string()];
-        let m = mission("m1", MissionStatus::Active);
+        let done = phase("done", "m1", PhaseStatus::Complete);
+        let mut m = mission("m1", MissionStatus::Active);
+        m.phase_ids = vec!["dead".to_string(), "done".to_string()];
 
         let d = detect_drift(&m, &[&dead, &done], 0, 14);
         assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
     }
 
-    /// (#1230 Packet 5 acceptance) Reproduces the REAL `doom-loop-m4`
-    /// mission read from `~/.darkmux/missions/doom-loop-m4/` on disk:
-    /// `mission.json` (Active, `started_ts: 1782141824`) + its four
-    /// phases — `runtime-capture`/`sovereignty-verbs` (Planned),
-    /// `file-match` (Abandoned), `validate-cure` (Planned, depends on all
-    /// three, including the abandoned `file-match`). Same real shape
-    /// `scheduler::tests::doom_loop_m4_fixture_validate_cure_is_unreachable`
-    /// (#1230 Packet 2) already used for the scheduler-level check — this
-    /// is the `mission status` surfacing of the same real data. The mission
-    /// has sat at 0/4 phases since `started_ts`, which is `> stale_days`
-    /// ago as of any `now` after that timestamp — real elapsed wall-clock,
-    /// not a synthetic offset, since the operator's live board (read-only,
-    /// never mutated by this test) is the acceptance target.
+    /// (#1230 Packet 5 acceptance, revised #1341 for linear phases)
+    /// Reproduces the REAL `doom-loop-m4` mission read from
+    /// `~/.darkmux/missions/doom-loop-m4/` on disk: `mission.json` (Active,
+    /// `started_ts: 1782141824`) + its four phases IN ORDER —
+    /// `runtime-capture` (Planned), `file-match` (Abandoned),
+    /// `sovereignty-verbs` (Planned), `validate-cure` (Planned). Under the
+    /// pre-#1341 DAG shape only `validate-cure` (which explicitly declared
+    /// `file-match` as a dependency) was unreachable; under strict
+    /// linearity BOTH `sovereignty-verbs` and `validate-cure` are
+    /// unreachable, since they both sit after the abandoned `file-match`
+    /// in `Mission.phase_ids` order and a linear list has no alternate
+    /// path around a dead predecessor. The mission has sat at 0/4 phases
+    /// since `started_ts`, which is `> stale_days` ago as of any `now`
+    /// after that timestamp — real elapsed wall-clock, not a synthetic
+    /// offset, since the operator's live board (read-only, never mutated
+    /// by this test) is the acceptance target.
     #[test]
     fn doom_loop_m4_mission_status_fixture_flags_both_drift_variants() {
         let m = Mission {
@@ -566,12 +575,11 @@ mod tests {
         file_match.abandoned_ts = Some(1_782_147_136);
         let sovereignty_verbs =
             phase("sovereignty-verbs", "doom-loop-m4", PhaseStatus::Planned);
-        let mut validate_cure = phase("validate-cure", "doom-loop-m4", PhaseStatus::Planned);
-        validate_cure.depends_on = vec![
-            "runtime-capture".to_string(),
-            "file-match".to_string(),
-            "sovereignty-verbs".to_string(),
-        ];
+        // (#1341) `file-match` sits before `validate-cure` in
+        // `m.phase_ids` (set above) — that ordering alone now makes
+        // `validate-cure` unreachable once `file-match` is Abandoned; no
+        // separate `depends_on` declaration.
+        let validate_cure = phase("validate-cure", "doom-loop-m4", PhaseStatus::Planned);
         let phases: Vec<&Phase> =
             vec![&runtime_capture, &file_match, &sovereignty_verbs, &validate_cure];
 
@@ -585,11 +593,26 @@ mod tests {
         assert!(
             d.iter().any(|dr| dr.kind == "unreachable-phase"
                 && dr.detail.contains("validate-cure")),
-            "validate-cure depends on abandoned file-match — must flag unreachable-phase: {d:?}"
+            "validate-cure sits after abandoned file-match in phase_ids order — must flag \
+             unreachable-phase: {d:?}"
         );
-        // Exactly these two — no accidental extra/missing drift on this
+        // (#1341) Phases are strictly linear now — `sovereignty-verbs` ALSO
+        // sits after the abandoned `file-match` in `phase_ids` order, so it
+        // is genuinely blocked too (there's no such thing as an
+        // "independent phase" anymore under strict linearity — every
+        // phase depends on every phase before it in sequence). This is a
+        // real, correct behavior change from the pre-#1341 DAG-shaped
+        // fixture (where `sovereignty-verbs` had no explicit dependency on
+        // `file-match` and stayed reachable) — not a regression.
+        assert!(
+            d.iter().any(|dr| dr.kind == "unreachable-phase"
+                && dr.detail.contains("sovereignty-verbs")),
+            "sovereignty-verbs also sits after abandoned file-match — must flag too under \
+             strict linearity: {d:?}"
+        );
+        // Exactly these three — no accidental extra/missing drift on this
         // mission's real shape.
-        assert_eq!(d.len(), 2, "unexpected drift set: {d:?}");
+        assert_eq!(d.len(), 3, "unexpected drift set: {d:?}");
     }
 
     #[test]

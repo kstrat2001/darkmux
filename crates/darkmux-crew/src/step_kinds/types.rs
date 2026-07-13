@@ -1,6 +1,6 @@
 //! `StepKind` trait + `StepOutcome` — the step-kind execution contract.
 
-use crate::types::Step;
+use crate::types::{Step, Task};
 use anyhow::Result;
 use darkmux_flow::FlowRecord;
 use std::collections::BTreeMap;
@@ -35,9 +35,22 @@ pub struct StepOutcome {
 /// weave prior-step output into its own request (see
 /// `DispatchInternalStepKind`/`DispatchSingleShotStepKind` for the
 /// convention used).
+///
+/// `task` is the Step's OWNING `Task` — resolved by `run_step_graph` from
+/// `Step.task_id` (falling back to a synthetic empty `Task` if the graph's
+/// caller never registered one, e.g. a scheduler-level test exercising
+/// pure Step scheduling with no Task-assignment concerns — see
+/// `scheduler::run_step_graph`'s doc). A Task is the ASSIGNABLE unit
+/// (#1230/#1341) — like a Jira ticket assigned to one crew member,
+/// `task.role_id`/`task.profile_name`/`task.workdir`/`task.image` are
+/// properties of the whole job, fixed for its duration, not re-declared at
+/// every Step; a dispatch-shaped step kind (`DispatchInternalStepKind`)
+/// sources its assignment from THESE fields first, falling back to
+/// `Step.config` only when the Task leaves a field unset. Purely-procedural
+/// step kinds (`procedural.*`) ignore `task` entirely.
 pub trait StepKind: Send + Sync {
     fn id(&self) -> &'static str;
-    fn run(&self, step: &Step, input: &BTreeMap<String, String>) -> Result<StepOutcome>;
+    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome>;
 
     /// (#1230 Packet 3) Which local model, if any, this step needs
     /// resident before it can run — feeds `run_step_graph`'s per-step
@@ -49,7 +62,7 @@ pub trait StepKind: Send + Sync {
     /// e.g. `procedural.*`) classifies the step `Residency::Remote`:
     /// cap-bounded concurrency only, no RAM-safety wave reasoning. A
     /// dispatch-shaped local kind overrides this to resolve a real
-    /// `Placement` from its own config/role.
+    /// `Placement` from its own config/role/Task assignment.
     ///
     /// **Best-effort, fails open.** This is a SCHEDULING CLASSIFICATION
     /// hint, not the dispatch's own model resolution — the step's `run`
@@ -60,8 +73,8 @@ pub trait StepKind: Send + Sync {
     /// returns `None` rather than erroring — worst case the step is
     /// scheduled as `Remote` (today's behavior for every kind), never a
     /// hard failure purely from misclassification.
-    fn residency(&self, step: &Step) -> Option<darkmux_gestalt::Placement> {
-        let _ = step;
+    fn residency(&self, step: &Step, task: &Task) -> Option<darkmux_gestalt::Placement> {
+        let _ = (step, task);
         None
     }
 }
