@@ -3745,6 +3745,17 @@ mod tests {
     /// ride the `dispatch start` payload and `confirmed`/`needs_check`/
     /// `archived`/`degenerate` ride the terminal payload, via
     /// `with_dispatch_bookends`'s `start_extra` + its `Ok(env)` enrichment.
+    ///
+    /// `#[serial]`: this test's graph run emits real flow records (dispatch
+    /// bookends + five `step result`s) through the process-global default
+    /// sink, which resolves `DARKMUX_FLOWS_DIR` PER WRITE. Un-serialized,
+    /// those records land in whatever temp dir a concurrently-running
+    /// env-guarded serial test (e.g. `phase_cli`'s
+    /// `review_start_record_has_review_category_and_frontier_tier`) has
+    /// pointed the var at — its exact-count assertion then reads 7 instead
+    /// of 2. Reproduced at ~20-40% per full-bin run before this attribute
+    /// (#1365 frontier review + follow-up investigation).
+    #[serial_test::serial]
     #[test]
     fn with_dispatch_bookends_wraps_run_review_graph_with_no_inner_task_bookend_and_carries_tier_counts() {
         use darkmux_profiles::crews::ResolvedSeatStaffing;
@@ -3846,30 +3857,52 @@ mod tests {
     // ── #1365: mission/phase terminal-status finalization ─────────────────
 
     /// RAII guard: points `DARKMUX_CREW_DIR` (and therefore
-    /// `darkmux_crew::lifecycle::{mission_path, phase_path}`) at a fresh
-    /// `TempDir` for the test's duration, then restores (or unsets) on drop.
-    /// Same shape `darkmux-crew`'s own `loader.rs` test modules use — kept
-    /// local here since this crate can't reach that private test helper.
+    /// `darkmux_crew::lifecycle::{mission_path, phase_path}`) AND
+    /// `DARKMUX_FLOWS_DIR` at fresh `TempDir`s for the test's duration,
+    /// then restores (or unsets) both on drop. Mirrors `darkmux-crew`'s
+    /// own two-var `lifecycle.rs` `CrewGuard` — the right template for
+    /// tests that drive lifecycle transitions, because `phase_complete`/
+    /// `phase_abandon`/`mission_close` each emit a flow record through the
+    /// process-global default sink; without the flows-dir leg those
+    /// records land in the operator's REAL `~/.darkmux/flows` (and the
+    /// audit chain when enabled) on every `cargo test`, and leak into
+    /// sibling tests' exact-count assertions (#1365 frontier review,
+    /// reproduced empirically). Caveat inherited from that template: the
+    /// default sink is `OnceLock`-pinned process-wide, so isolation is
+    /// first-writer-ordering-dependent — the guard prevents the real-dir
+    /// write whenever a guarded test pins the sink first, matching the
+    /// existing crate discipline.
     struct CrewDirGuard {
-        prev: Option<String>,
-        _tmp: tempfile::TempDir,
+        prev_crew: Option<String>,
+        prev_flows: Option<String>,
+        _tmp_crew: tempfile::TempDir,
+        _tmp_flows: tempfile::TempDir,
     }
     impl CrewDirGuard {
         fn new() -> Self {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            let tmp_crew = tempfile::TempDir::new().unwrap();
+            let tmp_flows = tempfile::TempDir::new().unwrap();
+            let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+            let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
             // SAFETY: every caller is `#[serial_test::serial]`.
-            unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
-            Self { prev, _tmp: tmp }
+            unsafe {
+                std::env::set_var("DARKMUX_CREW_DIR", tmp_crew.path());
+                std::env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path());
+            }
+            Self { prev_crew, prev_flows, _tmp_crew: tmp_crew, _tmp_flows: tmp_flows }
         }
     }
     impl Drop for CrewDirGuard {
         fn drop(&mut self) {
             // SAFETY: every caller is `#[serial_test::serial]`.
             unsafe {
-                match &self.prev {
+                match &self.prev_crew {
                     Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
                     None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                }
+                match &self.prev_flows {
+                    Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                    None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
                 }
             }
         }
@@ -4070,7 +4103,12 @@ mod tests {
 
         for phase_id in [&mission.investigate_phase_id, &mission.adjudicate_phase_id, &mission.report_phase_id] {
             let status = phase_status(&mission.mission_id, phase_id);
-            assert_ne!(status, "running", "phase `{phase_id}` must not be left running: {status}");
+            // Exact-status pin (#1365 frontier review): `!= "running"` was
+            // also satisfied by the OLD is_ok() routing (which marked these
+            // Complete). Asserting `abandoned` makes this e2e a genuine
+            // full-pipeline regression test for the degenerate routing, not
+            // just for #1354's never-left-running half.
+            assert_eq!(status, "abandoned", "degenerate run must abandon phase `{phase_id}`, got: {status}");
         }
         assert_eq!(mission_status_str(&mission.mission_id), "closed");
     }
