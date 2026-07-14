@@ -75,6 +75,38 @@ jobs:
         # (and, inside the review dispatch, individual file contents via the
         # API) are read — so untrusted PR code never lands on the runner.
 
+      - name: Build the darkmux binary (trusted main checkout — #1359)
+        run: |
+          set -euo pipefail
+          # #1359: without this step the dispatch below fell through to
+          # whatever `darkmux` happened to be on the runner's PATH — in
+          # practice ~/.cargo/bin/darkmux from whatever `cargo install
+          # --path .` a maintainer last ran by hand. That binary silently
+          # drifts behind main; confirmed live 2026-07-13, a review run
+          # dispatched several merges of stale code and burned real
+          # diagnosis time on garbled output from long-superseded
+          # rendering logic. Building here, from the SAME trusted-main
+          # checkout the bundler plugin below already builds from,
+          # guarantees the dispatch always runs the code this workflow
+          # actually checked out.
+          #
+          # Built to a workflow-local path ($GITHUB_WORKSPACE/target/release)
+          # rather than `cargo install --path .` into the runner's global
+          # ~/.cargo/bin: the runner is also a developer machine, and this
+          # workflow has no business silently overwriting whatever binary
+          # the operator has manually installed there for their own use.
+          # The dispatch step below invokes this build's explicit path
+          # instead of relying on PATH resolution.
+          #
+          # Release profile on a full clean checkout is a real cold-start
+          # cost (multi-minute first build of the whole workspace), but the
+          # self-hosted runner's _work directory persists between runs, so
+          # every build after the first is an incremental `cargo build`
+          # against a warm target/ dir — fast.
+          cargo build --release --locked
+          echo "DARKMUX_BIN=$PWD/target/release/darkmux" >> "$GITHUB_ENV"
+          "$PWD/target/release/darkmux" --version
+
       - name: Build the Rust bundler plugin (#1319 reference --bundler implementation)
         run: |
           set -euo pipefail
@@ -173,7 +205,12 @@ jobs:
           # produced 0 bundles -> degenerate (darkmux#1319). Points at the
           # reference plugin built above, run through the SAME public
           # --bundler seam a third-party plugin author would use.
-          darkmux pr-review run \
+          #
+          # Invoked via the explicit $DARKMUX_BIN path built above (#1359),
+          # NOT a bare `darkmux` PATH lookup — guarantees this dispatch runs
+          # the binary built from this run's own trusted-main checkout, not
+          # whatever install happens to sit on the runner's PATH.
+          "$DARKMUX_BIN" pr-review run \
             --github "$REPO" \
             --head-sha "$HEAD_SHA" \
             --diff "$RUNNER_TEMP/qa/pr.diff" \
