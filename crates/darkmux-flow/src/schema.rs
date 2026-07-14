@@ -157,11 +157,12 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.17.0";
 //           `src/pr_review.rs`'s `with_dispatch_bookends`, which opens the
 //           canonical `dispatch start`/`dispatch complete`/`dispatch error`
 //           bookend around it (#1230 Packet 0); the inner `review.task`
-//           bookend now fires ONLY from the older, still-used sequential
-//           driver (`run_review`/`run_judge_only`), never from the Task/Step
-//           graph driver. Older readers that don't recognize the renamed
-//           actions degrade the same way 1.17.0 documented: additive,
-//           unknown-action-tolerant.
+//           bookend now fires ONLY from the still-used sequential
+//           `--charges-file` driver (`run_judge_only` — its sibling
+//           `run_review` was deleted as dead code in #1357), never from the
+//           Task/Step graph driver. Older readers that don't recognize the
+//           renamed actions degrade the same way 1.17.0 documented:
+//           additive, unknown-action-tolerant.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

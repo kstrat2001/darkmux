@@ -111,8 +111,51 @@ impl Default for LocalFileSink {
     }
 }
 
+/// The directory `LocalFileSink` resolves per write.
+///
+/// Production builds: exactly `flows_dir()` (env > config > default) —
+/// byte-identical behavior, this helper compiles down to that one call.
+///
+/// Test / `test-support` builds (#1355 review round): a test binary that
+/// never sets `DARKMUX_FLOWS_DIR` must NOT write into the operator's real
+/// `~/.darkmux/flows` day files through the process-global default sink.
+/// Measured before this gate existed: one `cargo test -p darkmux-lab` run
+/// leaked ~302 real flow records (205 `step result` work records with
+/// session_id "case-1" + 97 `telemetry.tokens` records) into the live
+/// fleet dashboard's day file — polluting the token odometer with mock
+/// dispatches whose `reply()` fixture bills 10 tokens each. This is the
+/// 4th+ recurrence of the leak class; per the structural-over-procedural
+/// doctrine the fix is by-construction here, NOT another per-test env
+/// guard (the OnceLock-pinned default sink makes env-guard ordering
+/// load-bearing and therefore fragile).
+///
+/// Resolution in test builds: a LIVE `DARKMUX_FLOWS_DIR` still wins,
+/// per write — the documented LocalFileSink contract ~9 downstream tests
+/// (binary `phase_cli`/`flow_cli`, crew) rely on via their FlowsDirGuard
+/// pattern. Only the FALLBACK tier changes: instead of the operator's
+/// real flows dir, a per-process temp dir
+/// (`$TMPDIR/darkmux-flow-test-<pid>`), created once per test binary.
+fn local_sink_dir() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if std::env::var_os("DARKMUX_FLOWS_DIR").is_none() {
+            static DIR: OnceLock<PathBuf> = OnceLock::new();
+            return DIR
+                .get_or_init(|| {
+                    let dir = std::env::temp_dir()
+                        .join(format!("darkmux-flow-test-{}", std::process::id()));
+                    let _ = std::fs::create_dir_all(&dir);
+                    dir
+                })
+                .clone();
+        }
+    }
+    flows_dir()
+}
+
 impl FlowSink for LocalFileSink {
-    // NOTE (#507): LocalFileSink still resolves `flows_dir()` per write,
+    // NOTE (#507): LocalFileSink still resolves its directory per write
+    // (via `local_sink_dir()` — `flows_dir()` in production builds),
     // unlike AuditFileSink (which captures its dir at construction below).
     // Capturing here too is the right end-state, but it changes the
     // default sink's "honor a live DARKMUX_FLOWS_DIR" behavior that ~9
@@ -124,7 +167,7 @@ impl FlowSink for LocalFileSink {
     // from tearing each other's lines — the best-effort, lock-free counterpart
     // to AuditFileSink's tear-proof `flock`.
     fn write(&self, record: &FlowRecord) -> Result<()> {
-        let dir = flows_dir();
+        let dir = local_sink_dir();
         let day = day_utc_now();
         let path = dir.join(format!("{day}.jsonl"));
         record_at(record, &path)
@@ -132,7 +175,7 @@ impl FlowSink for LocalFileSink {
 
     fn info(&self) -> SinkInfo {
         let mut config = std::collections::BTreeMap::new();
-        config.insert("flows_dir".to_string(), flows_dir().display().to_string());
+        config.insert("flows_dir".to_string(), local_sink_dir().display().to_string());
         SinkInfo { kind: "LocalFile".to_string(), config, children: vec![], raw_url: None }
     }
 }
@@ -1172,14 +1215,22 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
 /// Process-wide default sink. Initialized lazily on first call to
 /// `record()`; default selection reads env config at init time.
 ///
-/// `#[cfg(test)]`-only: scrubs `DARKMUX_REDIS_URL` / `DARKMUX_AUDIT_DIR`
+/// Test / `test-support` builds only: scrubs `DARKMUX_REDIS_URL`
 /// once before the sink is built so the cached sink doesn't capture
 /// the operator's daily-shell env. Critical because the OnceLock
 /// freezes the sink shape — any test that runs `record()` BEFORE
 /// other isolation runs would otherwise lock in a RedisSink pointing
 /// at the operator's real (possibly-unreachable) Redis. (#278)
+/// (#1355 review round) Widened from `cfg(test)` to
+/// `any(test, feature = "test-support")` — a plain `cfg(test)` only fires
+/// when darkmux-flow ITSELF is the test harness, so a downstream crate's
+/// test build (e.g. darkmux-lab's, whose review tests dispatch through the
+/// global `record()`) got NO scrub at all and could freeze a RedisSink
+/// against the operator's live shell env into the singleton. Downstream
+/// crates opt in via a dev-dependency on this crate's `test-support`
+/// feature — same wiring the binary already uses.
 fn default_sink() -> Arc<dyn FlowSink> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     isolate_test_env_once();
 
     static SINK: OnceLock<Arc<dyn FlowSink>> = OnceLock::new();

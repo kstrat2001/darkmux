@@ -3488,8 +3488,12 @@ use std::sync::Mutex as StdMutex;
 /// `ReviewInputs<'a>`'s borrows can't. Built ONCE by the orchestrator
 /// (`build_review_graph`) before the graph starts; every step kind holds an
 /// `Arc` clone. Mirrors `ReviewInputs` field-for-field, minus the injected
-/// `chat`/`cycler` (each step now resolves its own — see `dispatch_chat`
-/// and the direct `LmsCycler` construction in each dispatch-shaped step).
+/// `chat`/`cycler`: dispatch routes through `dispatch_chat` (below), and
+/// model residency is the scheduler's job — `run_step_graph`'s
+/// `host_factory` + each step kind's `residency()` placement, via gestalt's
+/// wave planner — so no step kind constructs a cycler of its own (there is
+/// no `ModelCycler` anywhere in the graph's dispatch path; `LmsCycler`
+/// survives only for `run_judge_only`'s sequential path).
 pub struct ReviewStepContext {
     pub case_id: String,
     pub crew: ResolvedCrew,
@@ -6046,6 +6050,108 @@ mod tests {
         let mut chat = |_call: &ChatCall| Ok(reply(FP_JSON));
         let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         assert_eq!(env.mode, "parallel", "a judge-only re-run of a parallel review keeps its provenance");
+    }
+
+    /// (#1355/#1357 review round) `finish_review`'s judge remote-budget
+    /// honesty gates are STILL PRODUCTION CODE via the `--charges-file`
+    /// path (`pr-review run --charges-file` -> `run_judge_only` ->
+    /// `finish_review`) — but every test that used to pin them routed
+    /// through the deleted `run_review` driver, so the migration would have
+    /// left them coverage-free. This ONE test pins all three gates through
+    /// the surviving caller (the graph path lacks these gates entirely —
+    /// that's the KNOWN GAP the migrated graph tests characterize):
+    ///
+    /// 1. the judge's per-pass budget rows reach `env.remote_budgets`;
+    /// 2. bucket exhaustion (`skipped > 0`) degrades the run with the
+    ///    reason named — never a silent pass (#1260);
+    /// 3. a remote judge dispatch failure is named in `env.warnings`
+    ///    UNCONDITIONALLY, whether or not the run also degrades (#1329's
+    ///    loud-beats-quiet half).
+    ///
+    /// Scripted remote-call order (flag-major, one call per pass, no retry
+    /// after a dispatch `Err` — same convention as the graph-path minority
+    /// test): f1.p1 errs (503) -> f1 archives, dispatch_error counted;
+    /// f2.p1 confirms at 600 tokens -> the 100-token pass-1 bucket is
+    /// exhausted after the spend; f2.p2 confirms (its OWN pass-2 bucket —
+    /// separate execution per #1260); f3.p1 is REFUSED by the exhausted
+    /// pass-1 bucket -> ruled Error with the reason, no chat call.
+    #[test]
+    fn run_judge_only_remote_budget_exhaustion_rows_degrade_and_warn() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
+        ]);
+        let mut inputs = ReviewInputs {
+            case_id: "c-judge-only-budget".to_string(),
+            crew: &crew,
+            intent_title: "t",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 100, // one 600-token ruling exhausts a pass bucket
+            bundles: None,
+        };
+        // Three flags in three different bundles (no anchors + distinct
+        // bundle_id ⇒ all survive dedup, in input order).
+        inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts"), bundle_input("c.ts")]);
+        let flags = vec![
+            flag("a.ts", "member-a", 0, "charge one"),
+            flag("b.ts", "member-a", 0, "charge two"),
+            flag("c.ts", "member-a", 0, "charge three"),
+        ];
+        let mut cycler = RecordingCycler::new();
+        let remote_calls = RefCell::new(0u32);
+        let mut chat = |call: &ChatCall| {
+            assert!(call.endpoint.is_some(), "judge-only + remote judge ⇒ every call is remote");
+            let idx = *remote_calls.borrow();
+            *remote_calls.borrow_mut() += 1;
+            if idx == 0 {
+                Err(anyhow!("endpoint 503"))
+            } else {
+                Ok(SingleShotReply {
+                    content: CONFIRM_JSON.to_string(),
+                    total_tokens: Some(600),
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: None,
+                })
+            }
+        };
+        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        assert_eq!(*remote_calls.borrow(), 3, "f1.p1(err) + f2.p1 + f2.p2 — f3.p1 never dispatched");
+
+        // Gate 1: BOTH per-pass budget rows land in the envelope.
+        let p1 = env.remote_budgets.iter().find(|r| r.stage == "judge-pass1").expect("judge-pass1 row");
+        assert!(p1.exhausted);
+        assert_eq!(p1.used_tokens, 600);
+        assert_eq!(p1.skipped_calls, 1, "f3's pass-1 was refused by the exhausted bucket");
+        let p2 = env.remote_budgets.iter().find(|r| r.stage == "judge-pass2").expect("judge-pass2 row — its own execution");
+        assert_eq!(p2.skipped_calls, 0, "pass-2 drew from its own fresh allowance");
+
+        // Gate 2: exhaustion degrades the run with the reason named.
+        let reason = env.degenerate.as_deref().expect("judge bucket exhaustion degrades the run");
+        assert!(reason.contains("remote judge token budget exhausted"), "got: {reason}");
+
+        // Gate 3: the dispatch failure is named in env.warnings even though
+        // the run ALSO degraded for the budget reason (#1329 — the warning
+        // channel stays complete regardless of which degenerate gate fired).
+        assert!(
+            env.warnings.iter().any(|w| w.contains("remote judge dispatch failed on 1 of 3 flag")),
+            "the #1329 warning must land unconditionally: {:?}",
+            env.warnings
+        );
+
+        // Per-flag honesty (unchanged `judge_one_flag_with_passes` logic):
+        // f1 archived on its dispatch error, f2 keeps its real double-confirm,
+        // f3 is ruled Error with the budget reason — never silently confirmed.
+        assert_eq!(env.judged.len(), 3);
+        assert_eq!(env.judged[0].tier, Tier::Archived, "f1's dispatch error archives it");
+        assert_eq!(env.judged[1].tier, Tier::Confirmed, "f2's real ruling survives");
+        assert_eq!(env.judged[2].pass1.ruling, JudgeRuling::Error, "f3 was refused, not faked");
+        assert!(env.judged[2].pass1.note_for_author.contains("remote token budget exhausted"));
     }
 
     // ── ExecMode auto-resolution (#1230 Packet 1: gestalt wave scheduler) ──
