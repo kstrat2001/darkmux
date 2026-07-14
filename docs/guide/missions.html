@@ -92,9 +92,9 @@ darkmux crew sync --dry-run      <span class="comment"># preview without writing
 <section>
   <div class="wrap">
     <h2>Missions + phases</h2>
-    <p>A <strong>mission</strong> is a named objective: a directory under <code>~/.darkmux/missions/&lt;mission-id&gt;/</code> holding <code>mission.json</code> (description, a list of <code>phase_ids</code>, and a status — active/closed/paused) plus the mission's own <code>phases/</code> subdirectory. A <strong>phase</strong> is a time-boxed work unit inside a mission: its own JSON file at <code>~/.darkmux/missions/&lt;mission-id&gt;/phases/&lt;phase-id&gt;.json</code> with status (planned/running/complete/abandoned), depends_on, and timestamps. Everything for one mission lives under that one directory — nothing is split across separate top-level <code>missions/</code> and <code>phases/</code> trees.</p>
+    <p>A <strong>mission</strong> is a named objective: a directory under <code>~/.darkmux/missions/&lt;mission-id&gt;/</code> holding <code>mission.json</code> (description, a list of <code>phase_ids</code>, and a status: active/closed/paused) plus the mission's own <code>phases/</code> subdirectory. A <strong>phase</strong> is a time-boxed work unit inside a mission: its own JSON file at <code>~/.darkmux/missions/&lt;mission-id&gt;/phases/&lt;phase-id&gt;.json</code> with status (planned/running/complete/abandoned), depends_on, and timestamps. Everything for one mission lives under that one directory. Nothing is split across separate top-level <code>missions/</code> and <code>phases/</code> trees.</p>
 
-    <p class="muted"><em>Note for operators with existing state:</em> earlier versions of darkmux nested everything under <code>~/.darkmux/crew/</code> (<code>roles/</code>, <code>missions/</code>, <code>phases/</code>) — the loader transparently falls back to that layout, and separately, a mission whose phase JSONs still live under a legacy <code>sprints/</code> subdirectory (pre-rename) instead of <code>phases/</code> also reads and writes there transparently. Run <code>darkmux doctor</code> for a copy-pasteable <code>mv</code> script to flatten onto the current layout when you're ready. One older layout is <em>not</em> transparent: the original flat <code>~/.darkmux/missions/&lt;id&gt;.json</code> + <code>~/.darkmux/phases/&lt;id&gt;.json</code> shape (pre-mission-scoped-directories) needs an explicit one-time <code>darkmux mission migrate</code> to move into the nested layout above before it'll load.</p>
+    <p class="muted"><em>Note for operators with existing state:</em> earlier versions of darkmux nested everything under <code>~/.darkmux/crew/</code> (<code>roles/</code>, <code>missions/</code>, <code>phases/</code>). The loader transparently falls back to that layout. Separately, a mission whose phase JSONs still live under a legacy <code>sprints/</code> subdirectory (pre-rename) instead of <code>phases/</code> also reads and writes there transparently. Run <code>darkmux doctor</code> for a copy-pasteable <code>mv</code> script to flatten onto the current layout when you're ready. One older layout is <em>not</em> transparent: the original flat <code>~/.darkmux/missions/&lt;id&gt;.json</code> + <code>~/.darkmux/phases/&lt;id&gt;.json</code> shape (pre-mission-scoped-directories) needs an explicit one-time <code>darkmux mission migrate</code> to move into the nested layout above before it'll load.</p>
 
     <h3>Authoring a mission (recommended)</h3>
     <p>The preferred path: use <code>darkmux mission propose</code>, which takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>) and dispatches the mission-compiler utility agent to emit a structured proposal you approve before any file lands.</p>
@@ -162,7 +162,7 @@ next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code
 }</code></pre>
 
     <h3>Phase JSON shape</h3>
-    <p>At <code>~/.darkmux/missions/deploy-rewrite/phases/deploy-s1-baseline.json</code> — note the file's own basename is the phase id; <code>mission_id</code> inside it is redundant with the parent directory but kept for self-description (a phase JSON is meaningful even copied out on its own):</p>
+    <p>At <code>~/.darkmux/missions/deploy-rewrite/phases/deploy-s1-baseline.json</code>. The file's own basename is the phase id; <code>mission_id</code> inside it is redundant with the parent directory but kept for self-description (a phase JSON is meaningful even copied out on its own):</p>
     <pre><code>{
   "id": "deploy-s1-baseline",
   "mission_id": "deploy-rewrite",
@@ -299,38 +299,38 @@ darkmux phase review --require-clean          <span class="comment"># exit 1 if 
 <section>
   <div class="wrap">
     <h2>The automated loop: <code>mission run</code> + <code>mission ship</code></h2>
-    <p>Everything the previous sections do by hand — create a worktree, dispatch a coder, review the diff, open a PR — has a built-in automated form. <code>darkmux mission run</code> takes a ready-to-run phase through a local sign-off gate in one call; <code>darkmux mission ship</code> finishes the loop from there. This is the recommended path for a phase whose work is "dispatch a coder, get a diff, review it" — the manual dance above is still there for anything that doesn't fit that shape, or when you want to drive each step yourself.</p>
+    <p>Everything the previous sections do by hand (create a worktree, dispatch a coder, review the diff, open a PR) has a built-in automated form. <code>darkmux mission run</code> takes a ready-to-run phase through a local sign-off gate in one call; <code>darkmux mission ship</code> finishes the loop from there. This is the recommended path for a phase whose work is "dispatch a coder, get a diff, review it." The manual dance above is still there for anything that doesn't fit that shape, or when you want to drive each step yourself.</p>
 
     <h3><code>mission run</code>: worktree → coder → QA, then stop</h3>
     <pre><code>darkmux mission run deploy-rewrite                        <span class="comment"># auto-selects the one ready phase</span>
 darkmux mission run deploy-rewrite --phase deploy-s1-baseline   <span class="comment"># explicit, when more than one phase is ready</span>
 darkmux mission run deploy-rewrite --role coder --base main --timeout 600</code></pre>
-    <p>What happens: darkmux creates an isolated git worktree + branch off <code>--base</code> (default <code>main</code>), dispatches the coder role into it (default role: <code>coder</code>), then runs the local <code>code-reviewer</code> QA against the resulting diff — the same QA <code>phase review</code> runs standalone, but wired in automatically here. It surfaces the coder's result, the tokens-off-meter figure, and the QA findings, then <strong>stops</strong>: nothing is committed, pushed, or PR'd yet. Adjudicating the findings is still your call (or the frontier orchestrator's) — <code>mission run</code> gets you to a reviewed diff, not to a merged PR.</p>
+    <p>What happens: darkmux creates an isolated git worktree + branch off <code>--base</code> (default <code>main</code>), dispatches the coder role into it (default role: <code>coder</code>), then runs the local <code>code-reviewer</code> QA against the resulting diff: the same QA <code>phase review</code> runs standalone, but wired in automatically here. It surfaces the coder's result, the tokens-off-meter figure, and the QA findings, then <strong>stops</strong>: nothing is committed, pushed, or PR'd yet. Adjudicating the findings is still your call (or the frontier orchestrator's). <code>mission run</code> gets you to a reviewed diff, not to a merged PR.</p>
     <p>If the phase isn't in a runnable state, or a worktree already exists for it, <code>mission run</code> bails loud rather than guessing.</p>
 
     <h3><code>mission ship</code>: commit → push → PR (→ merge, opt-in)</h3>
-    <pre><code>darkmux mission ship deploy-rewrite                       <span class="comment"># commit, push, open the PR — stops there</span>
+    <pre><code>darkmux mission ship deploy-rewrite                       <span class="comment"># commit, push, open the PR, then stop</span>
 darkmux mission ship deploy-rewrite --wait-ci              <span class="comment"># also block on CI, report green/red</span>
 darkmux mission ship deploy-rewrite --merge                <span class="comment"># squash-merge once CI is green, opt-in</span></code></pre>
-    <p>By default <code>ship</code> stops at the open PR — merging is an explicit act. Pass <code>--merge</code> to opt into a green-gated squash-merge: it refuses to merge if CI isn't green, and on success it flips the phase to <code>Complete</code> and tears down the worktree for you (skip <code>darkmux phase complete</code> by hand in that case — <code>ship --merge</code> already did it).</p>
+    <p>By default <code>ship</code> stops at the open PR. Merging is an explicit act. Pass <code>--merge</code> to opt into a green-gated squash-merge: it refuses to merge if CI isn't green, and on success it flips the phase to <code>Complete</code> and tears down the worktree for you (skip <code>darkmux phase complete</code> by hand in that case: <code>ship --merge</code> already did it).</p>
 
     <h3><code>mission abort</code>: clean teardown</h3>
-    <p>Decided not to ship a <code>mission run</code>'s work? <code>darkmux mission abort deploy-rewrite [--phase &lt;id&gt;]</code> removes the phase's worktree and branch and flips the phase to <code>Abandoned</code> — the explicit counterpart to <code>ship</code>, so a backed-out run doesn't leave an orphan worktree on disk.</p>
+    <p>Decided not to ship a <code>mission run</code>'s work? <code>darkmux mission abort deploy-rewrite [--phase &lt;id&gt;]</code> removes the phase's worktree and branch and flips the phase to <code>Abandoned</code>. It's the explicit counterpart to <code>ship</code>, so a backed-out run doesn't leave an orphan worktree on disk.</p>
 
     <div class="callout">
       <strong>Under the hood: Task/Step.</strong>
-      <p style="margin: 8px 0 0;">As of darkmux #1230, a phase's <code>mission run</code>/<code>ship</code> loop executes through a generic Task/Step dependency-graph scheduler (worktree → dispatch → QA → gate, each a Step within a Task) rather than hardcoded control flow — the same engine the PR-review pipeline runs on. This is implementation detail today: Task/Step aren't yet a CLI surface you author directly, and the viewer doesn't render the graph yet (that's a tracked follow-up). Mentioned here so the vocabulary isn't a surprise if you see <code>task_id</code>/<code>step_id</code> fields in a flow record's payload.</p>
+      <p style="margin: 8px 0 0;">As of darkmux #1230, a phase's <code>mission run</code>/<code>ship</code> loop executes through a generic Task/Step dependency-graph scheduler (worktree → dispatch → QA → gate, each a Step within a Task) rather than hardcoded control flow, the same engine the PR-review pipeline runs on. This is implementation detail today: Task/Step aren't yet a CLI surface you author directly, and the viewer doesn't render the graph yet (that's a tracked follow-up). Mentioned here so the vocabulary isn't a surprise if you see <code>task_id</code>/<code>step_id</code> fields in a flow record's payload.</p>
     </div>
 
     <h3>Fleet fan-out: <code>mission dispatch</code></h3>
-    <p>Everything above runs on this machine. If you're coordinating a fleet (multiple darkmux machines sharing a work queue), <code>darkmux mission dispatch &lt;mission&gt; --role &lt;role&gt;</code> fans every phase with no unmet dependencies out across the fleet in parallel instead of running one phase locally and synchronously — each phase becomes a work job the first available runner claims. This is the multi-machine sibling of <code>mission run</code>, not a replacement for it; a single-machine setup has no reason to reach for it.</p>
+    <p>Everything above runs on this machine. If you're coordinating a fleet (multiple darkmux machines sharing a work queue), <code>darkmux mission dispatch &lt;mission&gt; --role &lt;role&gt;</code> fans every phase with no unmet dependencies out across the fleet in parallel instead of running one phase locally and synchronously: each phase becomes a work job the first available runner claims. This is the multi-machine sibling of <code>mission run</code>, not a replacement for it; a single-machine setup has no reason to reach for it.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Putting it together: a typical agentic workflow</h2>
-    <p>The fully manual version — useful when you want to drive every step yourself, or the phase's work isn't a clean "dispatch a coder, review the diff" shape:</p>
+    <p>The fully manual version (useful when you want to drive every step yourself, or the phase's work isn't a clean "dispatch a coder, review the diff" shape):</p>
     <ol>
       <li>Write a mission JSON describing what you're trying to do, with phase ids planned.</li>
       <li>Write the first phase JSON.</li>
@@ -342,7 +342,7 @@ darkmux mission ship deploy-rewrite --merge                <span class="comment"
       <li>Repeat for subsequent phases. Discover scope mid-flight? <code>darkmux mission add-phase</code> rather than filing a separate mission.</li>
       <li><code>darkmux mission close &lt;m&gt;</code> when the plan is done.</li>
     </ol>
-    <p>The automated equivalent of steps 3–7 above: <code>darkmux mission start &lt;m&gt;</code>, then <code>darkmux mission run &lt;m&gt;</code>, adjudicate the QA findings it surfaces, then <code>darkmux mission ship &lt;m&gt; --merge</code> — see the previous section.</p>
+    <p>The automated equivalent of steps 3–7 above: <code>darkmux mission start &lt;m&gt;</code>, then <code>darkmux mission run &lt;m&gt;</code>, adjudicate the QA findings it surfaces, then <code>darkmux mission ship &lt;m&gt; --merge</code>. See the previous section.</p>
     <p>Every step writes a flow record. The viewer renders them as an annotated timeline. Wall-clock arcs on the dispatch + phase records show duration; the phase-progress widget shows N/M done.</p>
   </div>
 </section>
