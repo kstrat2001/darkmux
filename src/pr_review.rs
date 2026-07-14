@@ -1656,6 +1656,7 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<ReviewEnvelope> {
             bundles,
             remote_max_tokens_per_execution,
             timeout_seconds: opts.timeout,
+            chat_override: None,
         });
 
         let mission = build_mission_for_review(&case_id_for_bookends, &crew_name_for_bookends)?;
@@ -3746,6 +3747,7 @@ mod tests {
             bundles: Vec::new(),
             remote_max_tokens_per_execution: 500_000,
             timeout_seconds: 30,
+            chat_override: None,
         });
 
         let graph =
