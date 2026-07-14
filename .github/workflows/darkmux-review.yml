@@ -70,6 +70,18 @@ jobs:
     steps:
       - name: Checkout review tooling (trusted main — NOT the reviewed PR)
         uses: actions/checkout@v4
+        with:
+          # (#1359) checkout's default `clean: true` runs `git clean -ffdx`,
+          # whose -x deletes gitignored files — including target/ — so every
+          # run would pay a cold full-workspace release build in the
+          # binary-rebuild step below. `clean: false` keeps target/ warm
+          # between runs (incremental rebuild, ~20s measured vs multi-minute
+          # cold). Safe HERE specifically because this checkout is
+          # trusted-main-only by design (see the header): no untrusted ref
+          # ever lands in this tree, so stale-artifact poisoning from PR
+          # code isn't a vector. Tracked files still hard-sync to the
+          # dispatch ref on every run.
+          clean: false
         # Brings the review/posting script from this repo at the dispatch ref
         # (main). The reviewed PR's code is never checked out — only its diff
         # (and, inside the review dispatch, individual file contents via the
@@ -82,13 +94,16 @@ jobs:
           # whatever `darkmux` happened to be on the runner's PATH — in
           # practice ~/.cargo/bin/darkmux from whatever `cargo install
           # --path .` a maintainer last ran by hand. That binary silently
-          # drifts behind main; confirmed live 2026-07-13, a review run
-          # dispatched several merges of stale code and burned real
-          # diagnosis time on garbled output from long-superseded
-          # rendering logic. Building here, from the SAME trusted-main
-          # checkout the bundler plugin below already builds from,
-          # guarantees the dispatch always runs the code this workflow
-          # actually checked out.
+          # drifts behind main; confirmed live 2026-07-13, when two review
+          # runs dispatched with a binary several merges stale (predating
+          # the #1230 Mission/Task/Step wiring): no tokens or mission in
+          # the viewer, a retired record vocabulary in the flow stream,
+          # and long-fixed template bugs reappearing in the posted
+          # comment — all burning real diagnosis time before the stale
+          # binary was identified. Building here, from the SAME
+          # trusted-main checkout the bundler plugin below already builds
+          # from, guarantees the dispatch always runs the code this
+          # workflow actually checked out.
           #
           # Built to a workflow-local path ($GITHUB_WORKSPACE/target/release)
           # rather than `cargo install --path .` into the runner's global
@@ -98,11 +113,11 @@ jobs:
           # The dispatch step below invokes this build's explicit path
           # instead of relying on PATH resolution.
           #
-          # Release profile on a full clean checkout is a real cold-start
-          # cost (multi-minute first build of the whole workspace), but the
-          # self-hosted runner's _work directory persists between runs, so
-          # every build after the first is an incremental `cargo build`
-          # against a warm target/ dir — fast.
+          # Cost: with `clean: false` on the checkout above keeping
+          # target/ warm, this is an incremental build (~20s measured on
+          # the runner) after the first run; only a fresh runner or a
+          # manual clean pays the multi-minute cold build, well inside
+          # this job's 90-minute budget.
           cargo build --release --locked
           echo "DARKMUX_BIN=$PWD/target/release/darkmux" >> "$GITHUB_ENV"
           "$PWD/target/release/darkmux" --version
