@@ -1,0 +1,151 @@
+{
+  "id": "review",
+  "name": "PR Review",
+  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux pr-review run` builds by hand today: investigate (resolve bundles from the diff, probe every staffed seat, dedup the flags) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). Authored + validated in Packet 1; NOT YET wired into execution (Packet 3) -- run_review_graph still calls build_review_graph directly.",
+  "schema_version": "1.0",
+  "inputs": [
+    {
+      "name": "diff",
+      "description": "The unified diff text under review (ReviewStepContext.diff). Fed to every probe/judge/verify dispatch.",
+      "required": true
+    },
+    {
+      "name": "case_id",
+      "description": "Unique id for this review run (ReviewStepContext.case_id) -- correlates flow records and the review envelope.",
+      "required": true
+    },
+    {
+      "name": "intent_title",
+      "description": "PR title, gives probes/judges the change's stated intent (ReviewStepContext.intent_title).",
+      "required": true
+    },
+    {
+      "name": "intent_body",
+      "description": "PR body/description (ReviewStepContext.intent_body).",
+      "required": true
+    },
+    {
+      "name": "crew_staffing",
+      "description": "Resolved probe/judge/verify seat staffing (CrewStaffingSnapshot / ResolvedSeatStaffing) from the operator's crew config. Determines HOW MANY review.probe:<seat-name> tasks the investigate phase's probe-template task expands into at launch time -- see the 'review-probe-template' task's notes below. This is the single biggest thing this schema cannot express yet: a config-time repeat-per-staffed-seat primitive does not exist (#1284 Packet 1 finding; Packet 3 must decide how a launcher expands this task).",
+      "required": true
+    },
+    {
+      "name": "judge_concurrency",
+      "description": "Overrides the judge step's config.concurrency (darkmux_types::config_access::review_judge_concurrency, default 1). Optional -- the static config below ships the same default.",
+      "required": false
+    }
+  ],
+  "phases": [
+    {
+      "id": "investigate",
+      "description": "resolve review bundles from the diff, probe every staffed seat, dedup",
+      "tasks": [
+        {
+          "id": "review-bundle-task",
+          "description": "resolve review bundles from the diff",
+          "depends_on": [],
+          "steps": [
+            {
+              "id": "review-bundle-step",
+              "kind": "review.bundle",
+              "config": null
+            }
+          ]
+        },
+        {
+          "id": "review-probe-template-task",
+          "description": "PLACEHOLDER for the probe stage. build_review_graph builds ONE task/step PER STAFFED PROBE SEAT (kind `review.probe:<seat-name>`, ids `review-probe-{idx}-task` / `review-probe-{idx}-step`) -- a count and a set of names only known once `crew_staffing` (see inputs) resolves. This schema has no per-seat repeat primitive yet, so this single task stands in for the whole stage. Packet 3's launcher must expand it into N real tasks (one per staffed seat, each depends_on review-bundle-task) before this config becomes an executable graph.",
+          "depends_on": [
+            "review-bundle-task"
+          ],
+          "steps": [
+            {
+              "id": "review-probe-template-step",
+              "kind": "review.probe",
+              "config": null
+            }
+          ],
+          "expands_per_staffed_seat": true,
+          "notes": [
+            "kind is a TEMPLATE -- the real per-seat kind id is `review.probe:<seat-name>`, registered into a per-run StepKindRegistry at composition time (Tier 3, #1352), not this generic `review.probe`.",
+            "after expansion, review-dedup-task's depends_on must list every EXPANDED probe task id, not just this template's id."
+          ]
+        },
+        {
+          "id": "review-dedup-task",
+          "description": "dedup probe flags -- mechanism-family keying + anchor matching",
+          "depends_on": [
+            "review-probe-template-task"
+          ],
+          "steps": [
+            {
+              "id": "review-dedup-step",
+              "kind": "review.dedup",
+              "config": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "adjudicate",
+      "description": "double-confirm judge over deduped flags",
+      "tasks": [
+        {
+          "id": "review-judge-task",
+          "description": "double-confirm judge -- internal pass1/pass2 loop over deduped flags",
+          "depends_on": [
+            "review-dedup-task"
+          ],
+          "steps": [
+            {
+              "id": "review-judge-step",
+              "kind": "review.judge",
+              "config": {
+                "concurrency": 1
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "report",
+      "description": "verify confirmed findings, synthesize tier counts",
+      "tasks": [
+        {
+          "id": "review-verify-task",
+          "description": "verify -- adjudicate confirmed findings",
+          "depends_on": [
+            "review-judge-task"
+          ],
+          "steps": [
+            {
+              "id": "review-verify-step",
+              "kind": "review.verify",
+              "config": null
+            }
+          ],
+          "notes": [
+            "always present in the graph even when no verify seat is staffed -- ReviewVerifyStepKind itself no-ops on an absent seat; this config does not (yet) express that conditionality."
+          ]
+        },
+        {
+          "id": "review-synthesis-task",
+          "description": "synthesis -- finalize tier counts + needs-check clustering",
+          "depends_on": [
+            "review-dedup-task",
+            "review-verify-task"
+          ],
+          "steps": [
+            {
+              "id": "review-synthesis-step",
+              "kind": "review.synthesis",
+              "config": null
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

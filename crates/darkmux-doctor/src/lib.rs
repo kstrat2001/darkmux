@@ -118,6 +118,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_build_info(),
         check_profile_registry(),
         check_crew_validation(),
+        check_mission_config_registry(),
         check_lms_binary(),
         check_docker_runtime(),
         check_models_loaded(),
@@ -1962,6 +1963,125 @@ fn check_crew_validation() -> Check {
     }
 }
 
+/// (#1284 Packet 1) Registered mission configs — enumerates every
+/// discoverable mission-config document (`darkmux_crew::mission_config::
+/// list_ids()`, unioned user → on-disk → embedded), loads + `validate()`s
+/// each, and reports id / source tier / schema_version for all of them.
+///
+/// Two DISTINCT finding classes surface differently, on purpose:
+///
+/// - **Structural findings** (`FindingSeverity::Error` — dangling
+///   `depends_on`, empty ids, duplicate ids) and **schema_version drift**
+///   (`FindingSeverity::Warning` on the `schema_version` path) are real,
+///   actionable problems — either one flips this check to `Warn` and names
+///   the offending document(s).
+/// - **Unrecognized step-kind references** are checked ONLY against
+///   `StepKindRegistry::with_builtins()`'s four Tier 1 ids and are
+///   deliberately treated as INFORMATIONAL, never blocking: Tier 3 kinds
+///   (`review.*`, `mission.*`, #1352) register into their OWN per-mission
+///   registry at COMPOSITION time (`build_review_graph`,
+///   `default_phase_graph`), which this document-level check has no way
+///   to see. Both built-in configs shipped in this packet reference ONLY
+///   Tier 3 kinds, so an "unknown kind" hit is the EXPECTED steady state,
+///   not a sign anything is broken — surfaced in the message for
+///   visibility, but never flips the check's status on its own (a
+///   permanent Warn for an expected, unfixable-by-design condition would
+///   just teach operators to ignore this check).
+fn check_mission_config_registry() -> Check {
+    use darkmux_crew::mission_config::{self, FindingSeverity};
+    use darkmux_crew::step_kinds::StepKindRegistry;
+
+    let ids = mission_config::list_ids();
+    if ids.is_empty() {
+        return Check {
+            name: "mission config registry".into(),
+            status: Status::Pass,
+            message: "no mission configs registered".into(),
+            hint: None,
+        };
+    }
+
+    let known_kinds = StepKindRegistry::with_builtins().ids();
+    let known_kind_refs: Vec<&str> = known_kinds.iter().map(String::as_str).collect();
+
+    let mut summary_lines: Vec<String> = Vec::new();
+    let mut blocking: Vec<String> = Vec::new();
+    let mut kind_warning_ids: Vec<String> = Vec::new();
+
+    for id in &ids {
+        match mission_config::load(id) {
+            Ok(loaded) => {
+                let findings = loaded.config.validate(&known_kind_refs);
+                let errors: Vec<_> =
+                    findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();
+                let version_drift: Vec<_> = findings
+                    .iter()
+                    .filter(|f| f.severity == FindingSeverity::Warning && f.path == "schema_version")
+                    .collect();
+                let kind_warnings: Vec<_> = findings
+                    .iter()
+                    .filter(|f| f.severity == FindingSeverity::Warning && f.path.ends_with(".kind"))
+                    .collect();
+
+                let version = loaded.config.schema_version.as_deref().unwrap_or("(unset)");
+                summary_lines.push(format!("{id} ({}, schema {version})", loaded.source.label()));
+
+                if !errors.is_empty() {
+                    let joined = errors.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; ");
+                    blocking.push(format!("\"{id}\": {joined}"));
+                }
+                if !version_drift.is_empty() {
+                    let joined =
+                        version_drift.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; ");
+                    blocking.push(format!("\"{id}\": {joined}"));
+                }
+                if !kind_warnings.is_empty() {
+                    kind_warning_ids.push(id.clone());
+                }
+            }
+            Err(e) => blocking.push(format!("\"{id}\": failed to parse — {e}")),
+        }
+    }
+
+    if blocking.is_empty() {
+        let mut message =
+            format!("{} mission config(s) registered: {}", ids.len(), summary_lines.join(", "));
+        if !kind_warning_ids.is_empty() {
+            message.push_str(&format!(
+                "; {} reference step kinds outside this process's Tier 1 registry (expected — \
+                 Tier 3 kinds register at composition time, so this check can't see them): {}",
+                kind_warning_ids.len(),
+                kind_warning_ids.join(", ")
+            ));
+        }
+        Check {
+            name: "mission config registry".into(),
+            status: Status::Pass,
+            message,
+            hint: None,
+        }
+    } else {
+        Check {
+            name: "mission config registry".into(),
+            status: Status::Warn,
+            message: format!(
+                "{} mission config(s) registered, {} with issues: {}",
+                ids.len(),
+                blocking.len(),
+                blocking.join(" | ")
+            ),
+            hint: Some(
+                "fix the named document(s) under `~/.darkmux/mission-configs/<id>.json` (or the \
+                 checked-out `templates/builtin/mission-configs/<id>.json` for a built-in) — a \
+                 dangling depends_on, an empty id, or a schema_version your darkmux build \
+                 doesn't recognize. This packet only validates configs; nothing executes them \
+                 yet (#1284 Packet 3)."
+                    .into(),
+            ),
+        }
+    }
+}
+
 fn check_lms_binary() -> Check {
     let bin = env::var("DARKMUX_LMS_BIN").unwrap_or_else(|_| "lms".to_string());
     if which(&bin).is_some() {
@@ -3597,10 +3717,10 @@ mod tests {
         // remote-endpoint-credentials [#85/#91] + docker-runtime [#680] +
         // audit-write-drops [#877] + serve-daemon-auth [#881] + fleet.mode
         // [#933] + env-masks-config [#934] + binary-split-brain [#934] +
-        // crew-validation [#1269]) + one per active eureka rule. Every check
-        // should appear regardless of environment — even if the underlying
-        // probe couldn't read state.
-        let expected = 37 + darkmux_eureka::all_rules().len();
+        // crew-validation [#1269] + mission-config-registry [#1284]) + one
+        // per active eureka rule. Every check should appear regardless of
+        // environment — even if the underlying probe couldn't read state.
+        let expected = 38 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -4368,6 +4488,105 @@ mod tests {
         assert_eq!(check.status, Status::Warn);
         assert!(check.message.contains("bad-crew"));
         assert!(!check.message.contains("good-crew"));
+    }
+
+    // ─── #1284 Packet 1: check_mission_config_registry ───────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_passes_on_embedded_builtins_only() {
+        // Empty user dir — only the two embedded built-ins (`review`,
+        // `coder-phase`) resolve. Both reference exclusively Tier 3 step
+        // kinds, so the check must still PASS (unknown-kind warnings are
+        // informational, never blocking — see the check's own doc).
+        let _guard = CrewRootGuard::new();
+        let check = check_mission_config_registry();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("review"), "{}", check.message);
+        assert!(check.message.contains("coder-phase"), "{}", check.message);
+        assert!(check.message.contains("embedded"), "{}", check.message);
+        // The Tier-3-kind caveat is still surfaced for visibility, even
+        // though it doesn't flip status.
+        assert!(check.message.contains("Tier 3"), "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_warns_on_dangling_depends_on() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("broken-deps.json"),
+            r#"{
+                "id": "broken-deps",
+                "name": "Broken Deps",
+                "phases": [
+                    {"id": "p1", "tasks": [
+                        {"id": "t1", "depends_on": ["ghost-task"], "steps": [
+                            {"id": "s1", "kind": "dispatch.internal"}
+                        ]}
+                    ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("broken-deps"), "{}", check.message);
+        assert!(check.message.contains("ghost-task"), "{}", check.message);
+        assert!(check.hint.is_some());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_warns_on_schema_version_drift() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("future.json"),
+            r#"{"id":"future","name":"Future","schema_version":"99.0"}"#,
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("future"), "{}", check.message);
+        assert!(check.message.contains("schema_version"), "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_warns_on_malformed_json() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        std::fs::write(guard.path().join("mission-configs").join("busted.json"), "{not valid json").unwrap();
+
+        let check = check_mission_config_registry();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("busted"), "{}", check.message);
+        assert!(check.message.contains("failed to parse"), "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_reports_only_the_bad_config_when_mixed() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("good.json"),
+            r#"{"id":"good","name":"Good"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("bad.json"),
+            r#"{"id":"","name":"Bad"}"#,
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("\"bad\""), "{}", check.message);
     }
 
     // ─── #1282: check_profile_registry quarantine + n_ctx surface ───

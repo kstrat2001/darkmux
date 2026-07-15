@@ -78,6 +78,24 @@ impl StepKindRegistry {
         Ok(())
     }
 
+    /// Every registered step-kind id, sorted. (#1284 Packet 1) Lets a
+    /// caller that only has REGISTRY ACCESS — not the registration call
+    /// site — enumerate what's known, e.g. `darkmux doctor`'s mission-config
+    /// check validating `Step.kind`/`StepConfig.kind` references against
+    /// `StepKindRegistry::with_builtins()`'s Tier 1 ids. Deliberately does
+    /// NOT see Tier 2/3 kinds registered ad hoc inside a mission builder
+    /// (`build_review_graph`, `default_phase_graph`) — those register into
+    /// their OWN per-call registry instance, never this shared one; a
+    /// caller that only has `with_builtins()` structurally cannot know
+    /// about them (see the mission-config doctor check's own doc for why
+    /// an unknown Tier 3 id is a warning, not a failure).
+    pub fn ids(&self) -> Vec<String> {
+        let map = self.kinds.lock().expect("step-kind registry poisoned");
+        let mut keys: Vec<String> = map.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     /// Look up a step kind by id, returning an owned `Arc` clone —
     /// `'static` and `Send`, so the caller can move it into a
     /// `run_bounded` worker closure without holding the registry's
@@ -194,6 +212,33 @@ mod tests {
         ] {
             assert!(registry.get(id).is_ok(), "expected `{id}` to be registered");
         }
+    }
+
+    #[test]
+    fn ids_lists_every_registered_kind_sorted() {
+        let registry = StepKindRegistry::new();
+        registry.register(Arc::new(StubKind("zebra"))).unwrap();
+        registry.register(Arc::new(StubKind("alpha"))).unwrap();
+        assert_eq!(registry.ids(), vec!["alpha".to_string(), "zebra".to_string()]);
+    }
+
+    #[test]
+    fn ids_is_empty_for_a_fresh_registry() {
+        assert!(StepKindRegistry::new().ids().is_empty());
+    }
+
+    #[test]
+    fn with_builtins_ids_matches_the_four_known_tier_1_kinds() {
+        let registry = StepKindRegistry::with_builtins();
+        assert_eq!(
+            registry.ids(),
+            vec![
+                "dispatch.internal".to_string(),
+                "dispatch.single_shot".to_string(),
+                "procedural.noop".to_string(),
+                "procedural.shell".to_string(),
+            ]
+        );
     }
 
     #[test]

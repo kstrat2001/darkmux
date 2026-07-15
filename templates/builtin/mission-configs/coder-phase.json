@@ -1,0 +1,91 @@
+{
+  "id": "coder-phase",
+  "name": "Coder Phase",
+  "description": "Transcribed as data (#1284 Packet 1) from default_phase_graph (src/mission_run.rs), the 3-Task/3-Step graph `darkmux mission run` builds by hand today for one phase: prepare a git worktree, dispatch a specialist role into it, run mechanical verify (code-reviewer). A strict linear chain (worktree -> coder -> verify, each depends_on the last). Authored + validated in Packet 1; NOT YET wired into execution (Packet 3) -- mission_run::run() still calls default_phase_graph directly.",
+  "schema_version": "1.0",
+  "inputs": [
+    {
+      "name": "workdir",
+      "description": "The git worktree path (mission_run's wt_path) every task in this phase's dispatches run in. Set on Task.workdir at launch time -- this schema deliberately has no workdir field on TaskConfig (see mission_config.rs's TaskConfig doc): it is genuinely per-launch, not part of the static shape.",
+      "required": true
+    },
+    {
+      "name": "role",
+      "description": "Which specialist role the coder task dispatches (default_phase_graph's `role` param). Overrides the coder-task's role_id default of \"coder\" below.",
+      "required": false
+    },
+    {
+      "name": "image",
+      "description": "Optional container image override for the coder task's dispatch (default_phase_graph's `image` param). Absent -> the runtime's default image.",
+      "required": false
+    },
+    {
+      "name": "base",
+      "description": "Git base branch/ref the phase worktree branches from (mission_run's add_worktree `base` arg).",
+      "required": true
+    },
+    {
+      "name": "branch",
+      "description": "The worktree's new branch name (mission_run's add_worktree `branch` arg).",
+      "required": true
+    },
+    {
+      "name": "mission_id",
+      "description": "The owning Mission's id -- flows into every step kind's own emit_step_result flow record (mission.worktree/mission.coder/mission.verify all carry it).",
+      "required": true
+    }
+  ],
+  "phases": [
+    {
+      "id": "build",
+      "description": "prepare the phase worktree, dispatch a specialist role into it, run mechanical verify",
+      "tasks": [
+        {
+          "id": "build-worktree-task",
+          "description": "prepare the phase worktree",
+          "depends_on": [],
+          "steps": [
+            {
+              "id": "build-worktree-step",
+              "kind": "mission.worktree",
+              "config": null
+            }
+          ]
+        },
+        {
+          "id": "build-coder-task",
+          "description": "dispatch the coder role into the worktree",
+          "depends_on": [
+            "build-worktree-task"
+          ],
+          "role_id": "coder",
+          "steps": [
+            {
+              "id": "build-coder-step",
+              "kind": "mission.coder",
+              "config": null
+            }
+          ],
+          "notes": [
+            "role_id here is the DEFAULT; the `role` input can override it at launch time (default_phase_graph's `role` parameter is caller-supplied, not fixed to \"coder\")."
+          ]
+        },
+        {
+          "id": "build-verify-task",
+          "description": "local QA -- mechanical verify (code-reviewer)",
+          "depends_on": [
+            "build-coder-task"
+          ],
+          "role_id": "code-reviewer",
+          "steps": [
+            {
+              "id": "build-verify-step",
+              "kind": "mission.verify",
+              "config": null
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
