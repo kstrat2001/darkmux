@@ -20,7 +20,9 @@
 //! marks its check failed/neutral, never green.
 //!
 //! `darkmux pr-review run` (#1222 Phase B packet 5) is the PR-REVIEW
-//! verb: it drives `darkmux_lab::lab::review::{run_review, run_judge_only}`
+//! verb: it drives `darkmux_lab::lab::review::{build_review_graph,
+//! run_review_graph}` — plus `run_judge_only` for the `--charges-file`
+//! re-judge path —
 //! (packet 4 — bundle → probe(k draws) → dedup → double-confirm judge) using
 //! the REAL bundler (`darkmux_lab::lab::bundle::{build_bundles,
 //! external_bundles, slice_code}`, packet 3) and emits the same
@@ -1074,7 +1076,7 @@ fn merge_json_object(mut base: serde_json::Value, extra: serde_json::Value) -> s
 /// it's private to that crate). ALSO implements `ReviewEmitter` itself
 /// (trivial forward) so `with_dispatch_bookends` can re-borrow the guard's
 /// sink as a `&mut dyn ReviewEmitter` via `BookendGuard::sink_mut()` and
-/// hand that to `f` (`run_review`/`run_judge_only`) — those need the raw
+/// hand that to `f` (`run_review_graph`/`run_judge_only`) — those need the raw
 /// `ReviewEmitter` view, not the `BookendSink` one, so this concrete
 /// adapter type (not a type-erased `dyn BookendSink`) is what makes that
 /// re-lending possible without an unsafe downcast; see
@@ -1108,7 +1110,7 @@ impl ReviewEmitter for EmitterSink<'_> {
 /// run` ever emitted, so a real production review never showed up as a
 /// running dispatch anywhere in the viewer (#1272).
 ///
-/// `f` (the review dispatch itself — `run_review` or `run_judge_only`) is
+/// `f` (the review dispatch itself — `run_review_graph` or `run_judge_only`) is
 /// injected so a test can drive a scripted stand-in instead of a real crew
 /// and LMStudio round trip, and receives the SAME sink the bookend records
 /// go through (production: [`FleetFlowEmitter`]) — one sink for the whole
@@ -1502,7 +1504,8 @@ fn finalize_review_mission(mission_id: &str, phase_ids: &[&str], result: &Result
 }
 
 /// Everything but `--from-envelope`: resolve the source + crew, build real
-/// bundles, and dispatch either `run_review` (the full pipeline) or
+/// bundles, and dispatch either the review graph (`build_review_graph` +
+/// `run_review_graph` — the full pipeline) or
 /// `run_judge_only` (`--charges-file` — re-judge a saved flag list without
 /// re-running the probe; the bundler still runs since the judge needs the
 /// code each flag's `bundle_id` refers to).
@@ -1687,8 +1690,9 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<ReviewEnvelope> {
     } else {
         // (#1230/#1341 DRY pass) The main review path now runs as a real,
         // upfront-declared Task/Step graph — one Mission with three Phases
-        // (investigate/adjudicate/report) — instead of `run_review`'s
-        // sequential six-call driver. See `build_mission_for_review` +
+        // (investigate/adjudicate/report) — instead of the retired
+        // sequential six-call driver (`run_review`, deleted in #1357).
+        // See `build_mission_for_review` +
         // `darkmux_lab::lab::review::{build_review_graph, run_review_graph}`.
         let seats = validate_review_crew(&crew)?;
         let probes: Vec<_> = seats.probes.clone();
@@ -1709,6 +1713,7 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<ReviewEnvelope> {
             bundles,
             remote_max_tokens_per_execution,
             timeout_seconds: opts.timeout,
+            chat_override: None,
         });
 
         let mission = build_mission_for_review(&case_id_for_bookends, &crew_name_for_bookends)?;
@@ -3512,7 +3517,7 @@ mod tests {
         }
     }
 
-    /// A minimal, valid `FlowRecord` standing in for whatever `run_review`/
+    /// A minimal, valid `FlowRecord` standing in for whatever `run_review_graph`/
     /// `run_judge_only` would really emit through the injected `ReviewEmitter`
     /// mid-dispatch — the bookend wrapper doesn't inspect these records, only
     /// brackets them, so a bare action string is enough to prove ordering.
@@ -3794,6 +3799,7 @@ mod tests {
             bundles: Vec::new(),
             remote_max_tokens_per_execution: 500_000,
             timeout_seconds: 30,
+            chat_override: None,
         });
 
         let graph =
@@ -4063,6 +4069,9 @@ mod tests {
             bundles: Vec::new(), // zero bundles -> degenerate, offline
             remote_max_tokens_per_execution: 500_000,
             timeout_seconds: 30,
+            // (#1355) Real dispatch primitive, not that this offline test
+            // ever reaches it: zero bundles means zero chat calls.
+            chat_override: None,
         });
 
         let graph = build_review_graph(

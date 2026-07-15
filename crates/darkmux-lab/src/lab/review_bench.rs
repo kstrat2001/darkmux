@@ -972,6 +972,7 @@ fn run_funnel_case(
         // one precedence home (`env > config.remote.* > 500000`).
         remote_max_tokens_per_execution: darkmux_types::config_access::remote_max_tokens_per_execution(),
         timeout_seconds,
+        chat_override: None,
     });
 
     let graph = review::build_review_graph(

@@ -38,3 +38,13 @@ serial_test = "3.1"
 # tests never read the operator's real ~/.darkmux/config.json (e.g. default_role
 # / runtime-agents-dir / templates-dir resolution). Dev-dep only; off in release.
 darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
+# (#1355 review round) Route this crate's test build's process-global
+# `darkmux_flow::record()` writes into a per-process temp dir instead of the
+# operator's real ~/.darkmux/flows (and scrub DARKMUX_REDIS_URL before the
+# default sink freezes) — the review graph tests dispatch through the global
+# sink and were leaking ~302 mock records per `cargo test -p darkmux-lab` run
+# into the live fleet dashboard's day file. See darkmux-flow's
+# `local_sink_dir()`. Dev-dep only — cargo does not unify dev-dep features
+# into normal-dependency builds, so release builds stay off (verified via
+# `cargo tree -e features` in the #1355 review round).
+darkmux-flow = { path = "../darkmux-flow", features = ["test-support"] }
