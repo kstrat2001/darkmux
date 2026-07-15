@@ -133,6 +133,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::single_shot::SingleShotReply;
+use darkmux_crew::step_kinds::patterns::dedup::{dedup as pattern_dedup, DedupStrategy};
+use darkmux_crew::step_kinds::patterns::multi_pass_confirm::{multi_pass_confirm, ConfirmTier, PassClass};
 use darkmux_crew::telemetry_sampler::{sample_host, HostSample};
 // (#1230 Packet 1) LmsCycler's residency mechanism now routes through
 // gestalt's pure planner, executed via the real LmsHost/MacProbe port
@@ -1810,56 +1812,83 @@ fn is_code_identifier(run: &str) -> bool {
 ///
 /// Anchor extraction happens HERE, populating `ProbeFlag::anchor` on the
 /// surviving flags — `diff` is why this function needs it.
+///
+/// (#1352) The survivor-scan PROCEDURE around this predicate — first-match
+/// in input order, aggregate-on-collapse, never silently drop — is now the
+/// generic `darkmux_crew::step_kinds::patterns::dedup` Tier 2 pattern; the
+/// four-signal mechanism-family-keying predicate above stays here as a
+/// [`DedupStrategy`] impl ([`MechanismFamilyDedup`]) because — per #1352's
+/// own framing — the MATCHING ALGORITHM is legitimately bespoke review
+/// domain logic, while the scan procedure around it had no review-specific
+/// knowledge at all. Pure control-flow extraction: every `dedup_*` unit
+/// test below pins the exact same outcomes as the pre-#1352 hand-written
+/// loop.
 pub fn dedup_flags(flags: Vec<ProbeFlag>, diff: &str) -> (Vec<ProbeFlag>, DedupStats) {
-    let raw = flags.len();
-    struct Survivor {
-        bundle_id: String,
-        family: &'static str,
-        anchor: Option<String>,
-        symbols: std::collections::BTreeSet<String>,
-    }
-    let mut survivors: Vec<Survivor> = Vec::new();
-    let mut out: Vec<ProbeFlag> = Vec::new();
-    for mut f in flags {
-        let anchor = extract_new_side_anchor(&f.charge_text, diff);
-        let family = mechanism_family(&f.charge_text);
-        let symbols = referenced_symbols(&f.charge_text);
-        // First survivor (input order) satisfying the full AND-predicate.
-        let target = survivors.iter().position(|s| {
-            s.bundle_id == f.bundle_id
-                && s.family == family
-                && anchor.is_some()
-                && s.anchor == anchor
-                && !symbols.is_empty()
-                && !s.symbols.is_disjoint(&symbols)
-        });
-        // `survivors` and `out` are pushed together, so index `i` addresses
-        // the same finding in both.
-        match target {
-            Some(i) => {
-                survivors[i].symbols.extend(symbols);
-                // AGGREGATE, never discard (#1299 MUST_FIX): fold the
-                // absorbed finding's framing into the survivor so a rendered
-                // finding shows BOTH. The safety net — even a residual false
-                // cut degrades to "one bullet, two framings," never a
-                // vanished defect.
-                out[i].also_flagged.push(f.charge_text);
-                out[i].also_flagged.append(&mut f.also_flagged);
-            }
-            None => {
-                f.anchor = anchor.clone();
-                survivors.push(Survivor {
-                    bundle_id: f.bundle_id.clone(),
-                    family,
-                    anchor,
-                    symbols,
-                });
-                out.push(f);
-            }
+    let strategy = MechanismFamilyDedup { diff };
+    let outcome = pattern_dedup(
+        flags,
+        &strategy,
+        // New survivor: stamp the strategy's computed anchor onto the flag
+        // itself (`ProbeFlag::anchor` starts `None` at construction — see
+        // its own doc; this is where it gets populated for a real
+        // survivor).
+        |flag, key| flag.anchor = key.anchor.clone(),
+        // Collapse: AGGREGATE, never discard (#1299 MUST_FIX) — fold the
+        // absorbed finding's framing into the survivor so a rendered
+        // finding shows BOTH. The safety net — even a residual false cut
+        // degrades to "one bullet, two framings," never a vanished defect.
+        |survivor, candidate| {
+            survivor.also_flagged.push(candidate.charge_text);
+            survivor.also_flagged.extend(candidate.also_flagged);
+        },
+    );
+    (outcome.items, DedupStats { raw: outcome.raw, deduped: outcome.deduped })
+}
+
+/// [`dedup_flags`]'s per-survivor key material (#1352) — the four dedup
+/// signals ([`mechanism_family`], the diff anchor, the referenced-symbol
+/// set, plus the bundle id) computed once per flag.
+struct MechanismFamilyDedupKey {
+    bundle_id: String,
+    family: &'static str,
+    anchor: Option<String>,
+    symbols: std::collections::BTreeSet<String>,
+}
+
+/// [`dedup_flags`]'s [`DedupStrategy`] plug-in (#1352) — the review
+/// pipeline's mechanism-family-keying algorithm, unchanged from its
+/// pre-extraction form: two flags collapse only when ALL FOUR signals agree
+/// (same bundle, same mechanism family, an overlapping referenced symbol,
+/// an overlapping diff anchor — see [`dedup_flags`]'s own doc for the full
+/// asymmetric-objective reasoning).
+struct MechanismFamilyDedup<'a> {
+    diff: &'a str,
+}
+
+impl DedupStrategy<ProbeFlag> for MechanismFamilyDedup<'_> {
+    type Key = MechanismFamilyDedupKey;
+
+    fn key(&self, item: &ProbeFlag) -> Self::Key {
+        MechanismFamilyDedupKey {
+            bundle_id: item.bundle_id.clone(),
+            family: mechanism_family(&item.charge_text),
+            anchor: extract_new_side_anchor(&item.charge_text, self.diff),
+            symbols: referenced_symbols(&item.charge_text),
         }
     }
-    let deduped = out.len();
-    (out, DedupStats { raw, deduped })
+
+    fn matches(&self, survivor: &Self::Key, candidate: &Self::Key) -> bool {
+        survivor.bundle_id == candidate.bundle_id
+            && survivor.family == candidate.family
+            && candidate.anchor.is_some()
+            && survivor.anchor == candidate.anchor
+            && !candidate.symbols.is_empty()
+            && !survivor.symbols.is_disjoint(&candidate.symbols)
+    }
+
+    fn merge_key(&self, survivor: &mut Self::Key, candidate: Self::Key) {
+        survivor.symbols.extend(candidate.symbols);
+    }
 }
 
 // ─── needs_check clustering (tier-volume cap) ────────────────────────────
@@ -2634,6 +2663,22 @@ fn run_budgeted_pass(
 /// (Error → Archived, reason named); an exhausted confirmation bucket demotes
 /// a pass-1 confirm to NeedsCheck (Error is not agreement) — in both cases the
 /// run goes degraded downstream, never a silent pass.
+///
+/// (#1352) The outer control flow (pass 1, conditional confirmation passes,
+/// demote on the first disagreement — described in full above) is now the
+/// generic `darkmux_crew::step_kinds::patterns::multi_pass_confirm` Tier 2
+/// pattern; this function supplies the review-specific PARTS the pattern
+/// plugs in: which token bucket a pass draws from (pass 1 → `budgets.pass1`,
+/// every confirmation pass → `budgets.pass2`, via `run_budgeted_pass`'s own
+/// dispatch/retry/budget mechanics — unchanged), and how a [`JudgeRuling`]
+/// classifies against the confirm/demote decision
+/// ([`JudgeRuling::Confirmed`] → `Confirm`, [`JudgeRuling::NeedsCheck`] →
+/// `NeedsCheck`, everything else → `Reject`). Resource accounting
+/// (tokens/calls/wall-time/dispatch-error/served-model) is folded from the
+/// pattern's returned per-pass results below — the pattern itself has zero
+/// opinion on what a pass costs. This is a pure control-flow extraction: the
+/// `double_confirm_*`/`passes_*` unit tests pin the exact same outcomes as
+/// the pre-#1352 hand-written loop.
 #[allow(clippy::too_many_arguments)]
 fn judge_one_flag_with_passes(
     passes: u32,
@@ -2645,112 +2690,65 @@ fn judge_one_flag_with_passes(
     mut budgets: Option<&mut JudgeBudgets>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
 ) -> JudgeOutcome {
-    // `passes >= 1` is validated at crew resolution (`resolve_staffing`);
-    // clamp defensively so a hand-constructed 0 can never skip pass-1.
-    let passes = passes.max(1);
-
-    // Pass-1 — the breadth pass over every alive flag; draws from the pass-1
-    // bucket. Always runs.
-    let p1 = run_budgeted_pass(
-        1,
-        budgets.as_deref_mut().map(|b| &mut b.pass1),
-        model,
-        system,
-        prompt,
-        max_tokens,
-        endpoint,
-        chat,
-    );
-    // (#1300) Cloned rather than moved out of `p1` here — every return site
-    // below still needs `p1.record`/`p1.tokens`/etc, and the consensus-loop
-    // path may still overwrite this with a later pass's value.
-    let mut served_model = p1.served_model.clone();
-
-    // A non-confirmed pass-1 short-circuits identically for EVERY `passes`.
-    if p1.record.ruling != JudgeRuling::Confirmed {
-        let tier = match p1.record.ruling {
-            JudgeRuling::NeedsCheck => Tier::NeedsCheck,
+    let result = multi_pass_confirm(
+        passes,
+        |pass_no| {
+            let bucket = budgets
+                .as_deref_mut()
+                .map(|b| if pass_no == 1 { &mut b.pass1 } else { &mut b.pass2 });
+            run_budgeted_pass(pass_no as u8, bucket, model, system, prompt, max_tokens, endpoint, chat)
+        },
+        |p: &PassOutcome| match p.record.ruling {
+            JudgeRuling::Confirmed => PassClass::Confirm,
+            JudgeRuling::NeedsCheck => PassClass::NeedsCheck,
             // false_positive | unparsed | error
-            _ => Tier::Archived,
-        };
-        return JudgeOutcome {
-            tier,
-            demoted_by_pass2: false,
-            tokens: p1.tokens,
-            pass1_ms: p1.wall_ms,
-            pass2_ms: 0,
-            calls: p1.calls,
-            dispatch_error: p1.dispatch_error,
-            served_model,
-            pass1: p1.record,
-            pass2: None,
-        };
-    }
+            _ => PassClass::Reject,
+        },
+    );
 
-    // `passes: 1` — the confirm stands alone; no confirmation pass.
-    if passes == 1 {
-        return JudgeOutcome {
-            tier: Tier::Confirmed,
-            demoted_by_pass2: false,
-            tokens: p1.tokens,
-            pass1_ms: p1.wall_ms,
-            pass2_ms: 0,
-            calls: p1.calls,
-            dispatch_error: p1.dispatch_error,
-            served_model,
-            pass1: p1.record,
-            pass2: None,
-        };
-    }
-
-    // Unanimous consensus over confirmation passes `2..=passes`, early-exiting
-    // on the first non-confirm. Every confirmation pass draws from the pass-2
-    // bucket; totals span them all (#1260 accounting stays honest).
-    let mut tokens = p1.tokens;
-    let mut calls = p1.calls;
-    let mut later_ms = 0u64;
-    let mut dispatch_error = p1.dispatch_error;
-    let mut last: Option<JudgeRecord> = None;
-    let mut demoted = false;
-    for pass_no in 2..=passes {
-        let pn = run_budgeted_pass(
-            pass_no as u8,
-            budgets.as_deref_mut().map(|b| &mut b.pass2),
-            model,
-            system,
-            prompt,
-            max_tokens,
-            endpoint,
-            chat,
-        );
-        tokens += pn.tokens;
-        calls += pn.calls;
-        later_ms += pn.wall_ms;
-        dispatch_error |= pn.dispatch_error;
+    // Fold per-pass resource accounting across pass-1 + every confirmation
+    // pass that ran (#1260 accounting stays honest — the SAME fold the
+    // hand-written loop did, just driven off the pattern's returned Vec
+    // instead of accumulating inline).
+    let mut tokens = result.pass1.tokens;
+    let mut calls = result.pass1.calls;
+    let mut dispatch_error = result.pass1.dispatch_error;
+    // (#1300) Falls back to a later pass's served model when pass-1 had
+    // none — one seat means one served identity for the whole flag.
+    let mut served_model = result.pass1.served_model.clone();
+    let pass1_ms = result.pass1.wall_ms;
+    let mut pass2_ms = 0u64;
+    for p in &result.confirmation_passes {
+        tokens += p.tokens;
+        calls += p.calls;
+        dispatch_error |= p.dispatch_error;
         if served_model.is_none() {
-            served_model = pn.served_model.clone();
+            served_model = p.served_model.clone();
         }
-        let confirmed = pn.record.ruling == JudgeRuling::Confirmed;
-        last = Some(pn.record);
-        if !confirmed {
-            // One disagreement breaks unanimity — demote and stop (the same
-            // early-exit the double-confirm already used at N == 2).
-            demoted = true;
-            break;
-        }
+        pass2_ms += p.wall_ms;
     }
-    let tier = if demoted { Tier::NeedsCheck } else { Tier::Confirmed };
+
+    let tier = match result.tier {
+        ConfirmTier::Confirmed => Tier::Confirmed,
+        ConfirmTier::NeedsCheck => Tier::NeedsCheck,
+        ConfirmTier::Rejected => Tier::Archived,
+    };
+    // The `pass2` slot holds the LAST confirmation pass that ran (see this
+    // function's doc) — `confirmation_passes`' final entry, carrying its
+    // real pass number.
+    let pass2 = result.confirmation_passes.into_iter().last().map(|p| p.record);
+
     JudgeOutcome {
-        served_model,
-        pass1: p1.record,
-        pass2: last,
         tier,
-        demoted_by_pass2: demoted,
+        demoted_by_pass2: result.demoted_by_later_pass,
         tokens,
-        pass1_ms: p1.wall_ms,
-        pass2_ms: later_ms,
+        pass1_ms,
+        pass2_ms,
         calls,
         dispatch_error,
+        served_model,
+        pass1: result.pass1.record,
+        pass2,
     }
 }
 
@@ -3675,6 +3673,13 @@ fn emit_review_step_result(kind: &str, step_id: &str, case_id: &str, payload: se
 /// (`ReviewStepContext::bundles` — resolved once by the orchestrator before
 /// the graph starts, since bundling needs `&ReviewInputs<'a>`'s borrow,
 /// which can't cross into a `'static` step kind). Procedural — no dispatch.
+///
+/// **Tier 3 (#1352), on purpose.** Diff-parsing/bundle-resolution is
+/// genuinely specific to the review pipeline — no second consumer is
+/// visible today, and its whole job is unwrapping THIS module's own
+/// `ReviewStepContext`. Stays physically co-located here, not moved to
+/// `darkmux-crew`'s `step_kinds` — see that crate's `step_kinds::patterns`
+/// module doc for the three-tier picture this classification follows.
 pub struct ReviewBundleStepKind {
     pub ctx: Arc<ReviewStepContext>,
 }
@@ -3706,6 +3711,25 @@ impl StepKind for ReviewBundleStepKind {
 /// Reuses `probe_one_draw`/`probe_user_message`/`select_bundles_for_staffing`/
 /// `resolve_seat_max_tokens` VERBATIM — only the surrounding loop shape and
 /// telemetry are new.
+///
+/// **Tier 3 audit finding (#1352).** #1352 asked whether this (and
+/// [`ReviewVerifyStepKind`] below) are really `dispatch.single_shot`
+/// (Tier 1) wearing bespoke wrapping, collapsible with richer config —
+/// e.g. a "shared rate-bucket by reference" option. Audited honestly: NO,
+/// not without changing `dispatch.single_shot`'s behavior/envelope, which
+/// the pure-refactor constraint on this packet forbids. Concretely, this
+/// step is a whole BUNDLE × K-DRAW LOOP around potentially many
+/// `single_shot_chat` calls — `dispatch.single_shot`'s Tier 1 kind wraps
+/// exactly ONE such call per `Step` invocation, driven by upstream
+/// `Step.output`/`gather_inputs`, with no notion of an internal loop, a
+/// SHARED remote-token bucket across sibling step instances (`bucket:
+/// Arc<StdMutex<RemoteBucket>>`, cloned across every probe seat — see the
+/// field doc), or per-draw `MemberRecord`/warning accumulation into a
+/// cross-step shared handle. A "shared-rate-bucket-by-reference" config
+/// option doesn't exist on `dispatch.single_shot` today, and adding one
+/// would mean `dispatch.single_shot` gaining new cross-step-instance state
+/// plumbing it has never needed — a real behavior/envelope change, not a
+/// config tweak. Left as a documented follow-up candidate, not forced here.
 pub struct ReviewProbeStepKind {
     ctx: Arc<ReviewStepContext>,
     staffing: ResolvedSeatStaffing,
@@ -3876,6 +3900,14 @@ impl StepKind for ReviewProbeStepKind {
 /// (the mechanism-family keying + anchor-based matching — explicitly
 /// preserved, unchanged). Its OWN `StepOutcome.output` IS the phase's
 /// observable artifact: "what's the review forming to be."
+///
+/// **Tier classification (#1352).** This `StepKind` is Tier 3 — it's
+/// graph wiring specific to this pipeline (which upstream steps it
+/// `depends_on`, this pipeline's flow-record vocabulary). The dedup
+/// ALGORITHM it calls (`dedup_flags`) is a thin Tier 3 plug-in
+/// (`MechanismFamilyDedup`) over the generic Tier 2
+/// `darkmux_crew::step_kinds::patterns::dedup` procedure — see
+/// `dedup_flags`'s own doc.
 pub struct ReviewDedupStepKind {
     pub ctx: Arc<ReviewStepContext>,
 }
@@ -3932,6 +3964,14 @@ impl StepKind for ReviewDedupStepKind {
 /// bound here is the honest answer until an empirical ceiling exists.
 /// `concurrency: 1` (the default) is byte-identical in dispatch ORDER to
 /// the historical sequential loop.
+///
+/// **Tier classification (#1352).** This `StepKind` is Tier 3 — the
+/// concurrency/chunking loop, budget wiring, and review-specific telemetry
+/// below are graph wiring specific to this pipeline. The double-confirm
+/// control flow it dispatches per flag (`judge_one_flag_with_passes`) is a
+/// thin Tier 3 wrapper around the generic Tier 2
+/// `darkmux_crew::step_kinds::patterns::multi_pass_confirm` pattern — see
+/// that function's own doc.
 pub struct ReviewJudgeStepKind {
     pub ctx: Arc<ReviewStepContext>,
     pub judge: ResolvedSeatStaffing,
@@ -4165,6 +4205,16 @@ impl StepKind for ReviewJudgeStepKind {
 /// `judge`, and it only ever iterates `judge`'s CONFIRMED output — there is
 /// no separate "is the run degenerate" gate to forget. Reuses
 /// `verify_prompt`/`verify_pass_with_retry` VERBATIM.
+///
+/// **Tier 3 audit finding (#1352).** Same audit as [`ReviewProbeStepKind`]
+/// — see its doc for the full reasoning. This step is a FOR-EACH LOOP over
+/// a runtime-determined, judge-confirmed docket, with per-item mutation of
+/// a SHARED `judged` list (`j.tier`/`j.demoted_by_verify`/`j.verify` set in
+/// place) and its own remote-token bucket — not one `dispatch.single_shot`
+/// call. Collapsing it into Tier 1 config would require
+/// `dispatch.single_shot` to grow a per-item loop concept and shared
+/// cross-step mutation it doesn't have today; left as a documented
+/// follow-up candidate, not forced here.
 pub struct ReviewVerifyStepKind {
     pub ctx: Arc<ReviewStepContext>,
     pub verify: Option<ResolvedSeatStaffing>,
@@ -4334,6 +4384,12 @@ impl StepKind for ReviewVerifyStepKind {
 /// `ReviewEnvelope` (not the posted-comment `Rendered` markdown — that
 /// stays `pr_review.rs::synthesize_review`'s job; see the module doc's
 /// crate-boundary note).
+///
+/// **Tier 3 (#1352), on purpose.** Final-envelope assembly (tier-count
+/// recomputation, the degenerate-run honesty gates, GitHub-comment-shaped
+/// output) is genuinely specific to this pipeline's own `ReviewEnvelope`
+/// type — no second consumer is visible today. Stays physically co-located
+/// here.
 pub struct ReviewSynthesisStepKind {
     pub ctx: Arc<ReviewStepContext>,
     pub env: SharedReviewEnvelope,

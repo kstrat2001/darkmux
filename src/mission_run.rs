@@ -570,6 +570,18 @@ fn default_phase_graph(
 /// worktree creation succeeds). `darkmux-serve`'s `resolve_session` (the
 /// `/diff` endpoint) reads this exact record for its worktree/base/branch
 /// payload — see [`emit_step_result`]'s doc.
+///
+/// **Tier 3 audit (#1352).** `add_worktree` is a `git worktree` shell-out,
+/// which on its face looks like it could collapse into Tier 1's
+/// `procedural.shell`. Audited: NO — `darkmux-serve`'s `/diff` endpoint
+/// depends on the EXACT `kind: "mission.worktree"` flow-record payload
+/// shape emitted here (worktree/base/branch/role fields), which
+/// `procedural.shell`'s generic stdout-only output doesn't produce, and the
+/// CLI success styling (`style::success`) is mission-run-specific
+/// presentation. Collapsing would change a downstream consumer's contract
+/// — stays Tier 3, physically co-located with the mission module that owns
+/// it (see `darkmux-crew`'s `step_kinds::patterns` module doc for the
+/// three-tier picture).
 struct MissionWorktreeStepKind {
     repo_root: PathBuf,
     wt_path: PathBuf,
@@ -649,6 +661,19 @@ struct CoderStepResult {
 /// maps that onto `NodeStatus::Error`, which correctly makes `verify`
 /// unreachable (see `scheduler::reachable`) — the same "coder failed, skip
 /// QA entirely" behavior the pre-migration early-`return Ok(1)` had.
+///
+/// **Tier 3 audit finding (#1352).** This kind wraps THE SAME
+/// `crew::dispatch::dispatch` primitive Tier 1's `dispatch.internal` wraps
+/// — a genuine follow-up candidate for collapsing into `dispatch.internal`
+/// config someday. Not done in this packet: the CLI printing
+/// (`style::success`/`style::error` with mission-specific remediation
+/// text), the `mission.coder` flow-record vocabulary + `mission_id`/
+/// `phase_id`/`session_id` fields (a DIFFERENT shape from
+/// `dispatch.internal`'s own `"step result"`/`kind: "dispatch.internal"`
+/// record), and the `result_slot` mechanism `run()` reads back rich detail
+/// through are all real behavior/envelope differences a collapse would
+/// have to change or drop — outside this packet's pure-refactor scope.
+/// Left documented, not forced.
 struct MissionCoderStepKind {
     opts: Mutex<Option<crew::dispatch::DispatchOpts>>,
     wt_path: PathBuf,
@@ -764,6 +789,12 @@ impl StepKind for MissionCoderStepKind {
 /// `run()` role is ALWAYS `"code-reviewer"` — that's hardcoded inside
 /// `phase_review_output_at` itself (mirrors the standalone `darkmux
 /// phase review` verb), not something `mission run` overrides.
+///
+/// **Tier 3 (#1352), on purpose.** Wraps the whole `phase_cli`
+/// mechanical-review pipeline (a multi-step process of its own, not a
+/// single dispatch), with a hardcoded role and mission-run-specific
+/// CLI/result-slot plumbing. No second consumer visible today — stays
+/// physically co-located with the mission module that owns it.
 struct MissionVerifyStepKind {
     wt_path: PathBuf,
     base: String,
