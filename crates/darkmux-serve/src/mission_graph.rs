@@ -29,7 +29,18 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One node in the rendered graph — a Phase, a Task, or a Step.
+///
+/// **Wire casing contract:** serialized `camelCase` (`parentId`,
+/// `startedTs`, `completedTs`) because the CONSUMER is JS
+/// (`assets/mission-graph.html` reads `n.parentId` in `computeLayout`).
+/// The review gate on the first cut of this feature caught the mismatch
+/// (Rust emitted `parent_id`, JS read `parentId` — every task grouped
+/// under a missing parent and the whole layout collapsed to the origin);
+/// the `mission_graph_json_fan_in_shape` route test now pins the exact
+/// key the JS reads so a rename on either side fails a test instead of
+/// silently flattening the layout.
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct GraphNode {
     pub id: String,
     pub label: String,
@@ -50,8 +61,12 @@ pub struct GraphNode {
     pub depth: usize,
 }
 
-/// One edge in the rendered graph.
+/// One edge in the rendered graph. Same `camelCase` wire contract as
+/// [`GraphNode`] (a no-op for the current single-word field names, but the
+/// attribute keeps a future two-word field from re-introducing the
+/// casing trap).
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct GraphEdge {
     pub id: String,
     pub source: String,
@@ -62,6 +77,13 @@ pub struct GraphEdge {
 }
 
 /// The full graph payload for one mission.
+///
+/// Deliberately snake_case on the wire (NO `rename_all` — `mission_id`,
+/// `mission_status`, `generated_at_ms`), matching every other daemon
+/// endpoint's envelope convention (`/missions`, `/phases`, `/lab/*`), and
+/// the page's JS reads it that way (`g.mission_id`, `g.mission_status`).
+/// Only the node/edge OBJECTS are camelCase — see [`GraphNode`]'s casing
+/// contract. The `mission_graph_json_fan_in_shape` test pins both casings.
 #[derive(Debug, Clone, Serialize)]
 pub struct MissionGraph {
     pub mission_id: String,
@@ -106,23 +128,28 @@ fn node_status_str(s: NodeStatus) -> &'static str {
     }
 }
 
-/// Derive a Task's status from its Steps — `Task` carries no `status`
-/// field of its own (#1230/#1341: only `Step` is scheduler-driven).
+/// Derive a Task's status from its Steps' statuses — `Task` carries no
+/// `status` field of its own (#1230/#1341: only `Step` is
+/// scheduler-driven). The caller passes ONE status per `Task.step_ids`
+/// entry, substituting `Planned` for a step whose file doesn't exist yet
+/// (a mid-run graph — see `build_mission_graph`'s step synthesis), so a
+/// task whose only PERSISTED step is complete but whose later steps
+/// haven't materialized yet reads `Planned`-mixed (not `Complete`).
 /// Priority: any `Error` wins (a task with one failed step is a failed
 /// task); else any `Running` wins; else all-`Complete` (and non-empty)
 /// is `Complete`; else any `Abandoned` is `Abandoned`; else `Planned`
 /// (covers "no steps yet" and "all still Planned").
-fn derive_task_status(steps: &[&Step]) -> NodeStatus {
-    if steps.iter().any(|s| s.status == NodeStatus::Error) {
+fn derive_task_status(step_statuses: &[NodeStatus]) -> NodeStatus {
+    if step_statuses.contains(&NodeStatus::Error) {
         return NodeStatus::Error;
     }
-    if steps.iter().any(|s| s.status == NodeStatus::Running) {
+    if step_statuses.contains(&NodeStatus::Running) {
         return NodeStatus::Running;
     }
-    if !steps.is_empty() && steps.iter().all(|s| s.status == NodeStatus::Complete) {
+    if !step_statuses.is_empty() && step_statuses.iter().all(|s| *s == NodeStatus::Complete) {
         return NodeStatus::Complete;
     }
-    if steps.iter().any(|s| s.status == NodeStatus::Abandoned) {
+    if step_statuses.contains(&NodeStatus::Abandoned) {
         return NodeStatus::Abandoned;
     }
     NodeStatus::Planned
@@ -251,10 +278,30 @@ fn current_millis() -> u64 {
 }
 
 /// Build the full node-link graph for one mission. `Ok(None)` when no
-/// mission with this id exists (the route answers 404). Every filesystem
-/// read is best-effort (`unwrap_or_default`) — a partially-written or
-/// mid-migration mission degrades to whatever phases/tasks/steps DO parse
-/// rather than 500ing the whole page.
+/// mission with this id exists (the route answers 404).
+///
+/// **Degradation granularity is per-DIRECTORY, not per-file.** Every
+/// filesystem read here is `unwrap_or_default`, but the underlying
+/// `lifecycle::load_tasks_for_phase`/`load_steps_for_phase` readers
+/// (`load_json_dir`) `?`-propagate on the FIRST unreadable/corrupt file —
+/// so one corrupt step JSON drops that phase's ENTIRE step set (the page
+/// then shows that phase's steps as synthesized `planned` placeholders,
+/// see below), it does not skip just the one bad file. Per-file leniency
+/// would need a change in `darkmux-crew`'s `load_json_dir`, deliberately
+/// not made from this read-only viewer feature — a possible future
+/// improvement if corrupt single files show up in practice.
+///
+/// **Mid-run step synthesis:** the three production graph runners persist
+/// Step JSONs only AFTER `run_step_graph` returns (`mission_run.rs`,
+/// `mission_launch.rs`, `review.rs`) — so a page opened DURING a run sees
+/// tasks whose `step_ids` name steps with no file on disk yet. Rather
+/// than omitting those nodes (which would leave the SSE layer with no
+/// node to animate — the scheduler's `step start`/`step complete` records
+/// key on step id — and would leave cross-task dependency edges pointing
+/// at nonexistent nodes), every `step_ids` entry with no persisted file
+/// gets a synthesized `planned` step node (kind label `"unknown"` until
+/// the file exists). Self-contained fix on the read side; the writers are
+/// deliberately untouched.
 pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGraph>> {
     let missions = darkmux_crew::loader::load_missions().unwrap_or_default();
     let Some(mission) = missions.into_iter().find(|m: &Mission| m.id == mission_id) else {
@@ -271,6 +318,10 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
     let mut nodes: Vec<GraphNode> = Vec::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
     let mut any_tasks = false;
+    // Dedup guard for cross-task depends_on edges (duplicate `depends_on`
+    // entries on one Task would otherwise emit duplicate edge ids — React
+    // keys must be unique).
+    let mut seen_dep_edges: BTreeSet<String> = BTreeSet::new();
 
     // First pass: collect every Task across every phase (needed up front so
     // `layer_tasks_by_depth` sees the WHOLE mission's dependency graph —
@@ -323,15 +374,21 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
                 kind: "contains",
             });
 
-            let task_steps: Vec<&Step> = task
+            // One status per step_ids entry — a step whose file doesn't
+            // exist yet (mid-run; see the fn doc's synthesis note) counts
+            // as Planned, so a task can't read Complete while later steps
+            // haven't materialized.
+            let step_statuses: Vec<NodeStatus> = task
                 .step_ids
                 .iter()
-                .filter_map(|sid| steps.get(sid))
+                .map(|sid| steps.get(sid).map(|s| s.status).unwrap_or(NodeStatus::Planned))
                 .collect();
-            let status = derive_task_status(&task_steps);
-            let started_ts = task_steps.iter().filter_map(|s| s.started_ts).min();
+            let status = derive_task_status(&step_statuses);
+            let persisted: Vec<&Step> =
+                task.step_ids.iter().filter_map(|sid| steps.get(sid)).collect();
+            let started_ts = persisted.iter().filter_map(|s| s.started_ts).min();
             let completed_ts = if status == NodeStatus::Complete {
-                task_steps.iter().filter_map(|s| s.completed_ts).max()
+                persisted.iter().filter_map(|s| s.completed_ts).max()
             } else {
                 None
             };
@@ -348,31 +405,47 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
 
             // Intra-task step containment + sequence edges (step at index i
             // depends on step at index i-1 — see `Step`'s doc; no
-            // `Step::depends_on` field exists post-#1341).
+            // `Step::depends_on` field exists post-#1341). Every step_ids
+            // entry produces a node — synthesized `planned` when the file
+            // isn't on disk yet (see the fn doc) — so the SSE layer always
+            // has a node to flip and the dependency edges below always have
+            // both endpoints.
             for (i, step_id) in task.step_ids.iter().enumerate() {
-                let Some(step) = steps.get(step_id) else { continue };
-                nodes.push(GraphNode {
-                    id: step.id.clone(),
-                    label: step.kind.clone(),
-                    kind: "step",
-                    status: node_status_str(step.status),
-                    parent_id: Some(task.id.clone()),
-                    started_ts: step.started_ts,
-                    completed_ts: step.completed_ts,
-                    depth: *task_depth.get(&task.id).unwrap_or(&0),
-                });
+                let node = match steps.get(step_id) {
+                    Some(step) => GraphNode {
+                        id: step.id.clone(),
+                        label: step.kind.clone(),
+                        kind: "step",
+                        status: node_status_str(step.status),
+                        parent_id: Some(task.id.clone()),
+                        started_ts: step.started_ts,
+                        completed_ts: step.completed_ts,
+                        depth: *task_depth.get(&task.id).unwrap_or(&0),
+                    },
+                    None => GraphNode {
+                        id: step_id.clone(),
+                        label: "unknown".to_string(),
+                        kind: "step",
+                        status: node_status_str(NodeStatus::Planned),
+                        parent_id: Some(task.id.clone()),
+                        started_ts: None,
+                        completed_ts: None,
+                        depth: *task_depth.get(&task.id).unwrap_or(&0),
+                    },
+                };
+                nodes.push(node);
                 edges.push(GraphEdge {
-                    id: format!("contains:{}:{}", task.id, step.id),
+                    id: format!("contains:{}:{}", task.id, step_id),
                     source: task.id.clone(),
-                    target: step.id.clone(),
+                    target: step_id.clone(),
                     kind: "contains",
                 });
                 if i > 0 {
                     let prev = &task.step_ids[i - 1];
                     edges.push(GraphEdge {
-                        id: format!("depends_on:{}:{}", prev, step.id),
+                        id: format!("depends_on:{}:{}", prev, step_id),
                         source: prev.clone(),
-                        target: step.id.clone(),
+                        target: step_id.clone(),
                         kind: "depends_on",
                     });
                 }
@@ -382,11 +455,12 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
             // task's LAST step feeds a downstream task's FIRST step — this
             // is what keeps a fan-in (N probe steps -> one dedup step)
             // visually legible instead of collapsing to a single task-level
-            // edge. A dependency naming a task with no steps (or not found
-            // yet in this pass — cross-phase deps resolve fine since
-            // `all_tasks`/`task_depth` cover the whole mission, but the
-            // per-phase `steps` map above is scoped to THIS phase) is
-            // skipped rather than guessed at.
+            // edge. Both endpoints are guaranteed to exist as nodes (real or
+            // synthesized — see above). A dependency naming a task with no
+            // steps at all, or an unknown task id, is skipped rather than
+            // guessed at. Duplicate `depends_on` entries on a Task are
+            // deduped here (`seen_dep_edges`) so React never receives two
+            // edges with the same key.
             for dep_task_id in &task.depends_on {
                 let Some(dep_last_step) = all_tasks
                     .iter()
@@ -398,8 +472,12 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
                 let Some(first_step) = task.step_ids.first() else {
                     continue;
                 };
+                let edge_id = format!("depends_on:{}:{}", dep_last_step, first_step);
+                if !seen_dep_edges.insert(edge_id.clone()) {
+                    continue;
+                }
                 edges.push(GraphEdge {
-                    id: format!("depends_on:{}:{}", dep_last_step, first_step),
+                    id: edge_id,
                     source: dep_last_step.clone(),
                     target: first_step.clone(),
                     kind: "depends_on",
@@ -409,14 +487,17 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
     }
 
     let legacy = !any_tasks;
-    let note = if legacy {
+    // Empty-graph check FIRST: a mission with zero phase nodes is also
+    // `legacy` (no tasks anywhere), and the pre-registry wording would be
+    // nonsense over an empty canvas — "nothing to draw" is the honest note.
+    let note = if nodes.is_empty() {
+        Some("No phase data recorded for this mission yet.".to_string())
+    } else if legacy {
         Some(
             "This mission predates the Task/Step registry (or has no dispatch-bearing steps) — \
              showing phases only."
                 .to_string(),
         )
-    } else if nodes.is_empty() {
-        Some("No phase data recorded for this mission yet.".to_string())
     } else {
         None
     };
@@ -447,19 +528,6 @@ mod tests {
             profile_name: None,
             workdir: None,
             image: None,
-        }
-    }
-
-    fn step(id: &str, task_id: &str, status: NodeStatus) -> Step {
-        Step {
-            id: id.to_string(),
-            task_id: task_id.to_string(),
-            kind: "procedural.noop".to_string(),
-            status,
-            config: serde_json::Value::Null,
-            started_ts: None,
-            completed_ts: None,
-            output: None,
         }
     }
 
@@ -518,23 +586,26 @@ mod tests {
 
     #[test]
     fn derive_task_status_error_wins_over_everything() {
-        let s1 = step("s1", "t", NodeStatus::Complete);
-        let s2 = step("s2", "t", NodeStatus::Error);
-        assert_eq!(derive_task_status(&[&s1, &s2]), NodeStatus::Error);
+        assert_eq!(
+            derive_task_status(&[NodeStatus::Complete, NodeStatus::Error]),
+            NodeStatus::Error
+        );
     }
 
     #[test]
     fn derive_task_status_running_when_any_running() {
-        let s1 = step("s1", "t", NodeStatus::Complete);
-        let s2 = step("s2", "t", NodeStatus::Running);
-        assert_eq!(derive_task_status(&[&s1, &s2]), NodeStatus::Running);
+        assert_eq!(
+            derive_task_status(&[NodeStatus::Complete, NodeStatus::Running]),
+            NodeStatus::Running
+        );
     }
 
     #[test]
     fn derive_task_status_complete_when_all_complete() {
-        let s1 = step("s1", "t", NodeStatus::Complete);
-        let s2 = step("s2", "t", NodeStatus::Complete);
-        assert_eq!(derive_task_status(&[&s1, &s2]), NodeStatus::Complete);
+        assert_eq!(
+            derive_task_status(&[NodeStatus::Complete, NodeStatus::Complete]),
+            NodeStatus::Complete
+        );
     }
 
     #[test]
@@ -544,8 +615,12 @@ mod tests {
 
     #[test]
     fn derive_task_status_planned_when_mixed_planned_and_complete() {
-        let s1 = step("s1", "t", NodeStatus::Complete);
-        let s2 = step("s2", "t", NodeStatus::Planned);
-        assert_eq!(derive_task_status(&[&s1, &s2]), NodeStatus::Planned);
+        // Also the mid-run shape: a persisted-complete first step + a
+        // not-yet-materialized (synthesized Planned) second step must NOT
+        // read as a complete task.
+        assert_eq!(
+            derive_task_status(&[NodeStatus::Complete, NodeStatus::Planned]),
+            NodeStatus::Planned
+        );
     }
 }

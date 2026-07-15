@@ -121,7 +121,16 @@ function missionIdFromPath(){
 // right by `depth` (so dependency order reads left-to-right and a
 // fan-in/fan-out stays legible), steps stacked immediately below/right
 // of their owning task. ─────────────────────────────────────────────────
-var COL_W = 260, TASK_ROW_H = 92, STEP_ROW_H = 44, PHASE_LABEL_W = 40, BAND_GAP = 40, BAND_PAD = 56;
+var COL_W = 260, TASK_MIN_PITCH = 92, TASK_HEADER_H = 56, STEP_ROW_H = 44,
+    TASK_GAP = 18, PHASE_LABEL_W = 40, BAND_GAP = 40, BAND_PAD = 56;
+
+// Vertical space one task occupies INCLUDING its step stack — the per-task
+// pitch. A fixed pitch overlapped from the second step on (steps sat at
+// y+56+44*si while task rows advanced only 92), so the pitch now grows with
+// the task's step count (review-gate C3).
+function taskPitch(stepCount){
+  return Math.max(TASK_MIN_PITCH, TASK_HEADER_H + stepCount * STEP_ROW_H + TASK_GAP);
+}
 
 function computeLayout(nodes){
   var byId = {};
@@ -151,26 +160,25 @@ function computeLayout(nodes){
       maxDepth = Math.max(maxDepth, d);
       (byDepth[d] = byDepth[d] || []).push(t);
     });
-    var maxRows = 1;
+    var maxColumnHeight = 0;
     for (var d = 0; d <= maxDepth; d++){
       var atDepth = byDepth[d] || [];
-      maxRows = Math.max(maxRows, atDepth.length);
-      atDepth.forEach(function(t, i){
-        var x = PHASE_LABEL_W + COL_W + d * COL_W;
-        var y = bandTop + BAND_PAD + i * TASK_ROW_H;
-        positions[t.id] = {x: x, y: y};
+      var x = PHASE_LABEL_W + COL_W + d * COL_W;
+      var yCursor = bandTop + BAND_PAD;
+      atDepth.forEach(function(t){
         var steps = (stepsByTask[t.id] || []);
+        positions[t.id] = {x: x, y: yCursor};
         steps.forEach(function(s, si){
-          positions[s.id] = {x: x + 20, y: y + 56 + si * STEP_ROW_H};
+          positions[s.id] = {x: x + 20, y: yCursor + TASK_HEADER_H + si * STEP_ROW_H};
         });
+        yCursor += taskPitch(steps.length);
       });
+      maxColumnHeight = Math.max(maxColumnHeight, yCursor - (bandTop + BAND_PAD));
     }
     if (phase.id !== "__none__") {
       positions[phase.id] = {x: 0, y: bandTop + BAND_PAD};
     }
-    var stepRows = 0;
-    tasks.forEach(function(t){ stepRows = Math.max(stepRows, (stepsByTask[t.id]||[]).length); });
-    var bandHeight = Math.max(160, maxRows * TASK_ROW_H + stepRows * STEP_ROW_H + BAND_PAD * 2);
+    var bandHeight = Math.max(160, maxColumnHeight + BAND_PAD * 2);
     bandTop += bandHeight + BAND_GAP;
   });
   return positions;
@@ -237,6 +245,43 @@ function statusFromRecord(rec){
   return STATUS_ACTIONS[rec.action] || null;
 }
 
+// How advanced a node status is, for the merge in the reconcile poll.
+// planned < running < any terminal state. Terminal states share one rank —
+// a page-side "complete" is never overwritten by a disk-side "error" or
+// vice versa on rank alone (equal rank keeps the page's value; the SSE
+// delta that set it is more recent than the disk snapshot).
+var STATUS_RANK = { planned: 0, running: 1, complete: 2, error: 2, abandoned: 2,
+                    active: 1, closed: 2, paused: 1 };
+function statusRank(s){
+  return STATUS_RANK[s] !== undefined ? STATUS_RANK[s] : 0;
+}
+
+// Merge a freshly-fetched disk snapshot into the page's current graph
+// (review-gate MF2b). Structure (node/edge SET, labels, depths, timestamps)
+// refreshes from disk; per-node STATUS is monotone — disk wins only when
+// strictly MORE advanced than what the page already shows. The three
+// production runners persist steps only AFTER the whole graph finishes, so
+// mid-run the disk snapshot is all-planned; a replace would regress every
+// status the SSE stream had advanced (and the running pulse would flicker
+// off every 20 seconds).
+function mergeGraphs(prevGraph, fresh){
+  if (!prevGraph) return fresh;
+  var prevStatus = {};
+  prevGraph.nodes.forEach(function(n){ prevStatus[n.id] = n.status; });
+  var nodes = fresh.nodes.map(function(n){
+    var old = prevStatus[n.id];
+    // Disk wins ONLY when strictly more advanced; on equal rank the page's
+    // value stands (identical when the statuses match; when two terminal
+    // states disagree, the SSE delta that set the page's is more recent
+    // than the disk snapshot).
+    if (old !== undefined && statusRank(old) >= statusRank(n.status)) {
+      return Object.assign({}, n, {status: old});
+    }
+    return n;
+  });
+  return Object.assign({}, fresh, {nodes: nodes});
+}
+
 function App(){
   var missionId = missionIdFromPath();
   var _s = React.useState({loading:true, error:null, graph:null});
@@ -273,12 +318,9 @@ function App(){
   // known-node-id set is populated before any delta needs matching.
   React.useEffect(function(){
     if (!state.graph || typeof EventSource === "undefined") return;
-    var es = new EventSource("/flow/" + todayUtc() + "/stream");
-    esRef.current = es;
-    setLive(true);
-    es.onopen = function(){ setLive(true); };
-    es.onerror = function(){ setLive(false); }; // native EventSource keeps retrying
-    es.onmessage = function(ev){
+    var es = null;
+    var sseDate = null;
+    function onMessage(ev){
       var rec; try { rec = JSON.parse(ev.data); } catch(_e) { return; }
       if (!rec || typeof rec !== "object") return;
       var newStatus = statusFromRecord(rec);
@@ -291,17 +333,38 @@ function App(){
         });
         return Object.assign({}, prev, {graph: Object.assign({}, prev.graph, {nodes: nodes})});
       });
-    };
+    }
+    function openStream(){
+      if (es) es.close();
+      sseDate = todayUtc();
+      es = new EventSource("/flow/" + sseDate + "/stream");
+      esRef.current = es;
+      setLive(true);
+      es.onopen = function(){ setLive(true); };
+      es.onerror = function(){ setLive(false); }; // native EventSource keeps retrying
+      es.onmessage = onMessage;
+    }
+    openStream();
     // (#1151-style safety net) periodic reconcile in case an SSE gap
     // (a reconnect between the last delta and now) dropped a status flip —
-    // matches viewer.html's own reconcile-on-a-timer discipline.
+    // matches viewer.html's own reconcile-on-a-timer discipline. MERGES,
+    // never replaces (see mergeGraphs): mid-run the disk snapshot lags the
+    // stream, so a straight replace would regress live statuses every tick.
+    // The same tick also handles UTC midnight (review-gate C4): the flow
+    // stream is per-day, so a tab left open across midnight would otherwise
+    // tail yesterday's stream forever while looking live — re-open against
+    // the new day the first tick after rollover.
     var reconcile = setInterval(function(){
+      if (todayUtc() !== sseDate) openStream();
       fetchGraph().then(function(g){
         nodeIdsRef.current = new Set(g.nodes.map(function(n){ return n.id; }));
-        setState(function(prev){ return Object.assign({}, prev, {graph: g}); });
+        setState(function(prev){
+          if (!prev.graph) return prev;
+          return Object.assign({}, prev, {graph: mergeGraphs(prev.graph, g)});
+        });
       }).catch(function(){ /* best-effort; keep showing the last-known graph */ });
     }, 20000);
-    return function(){ es.close(); clearInterval(reconcile); };
+    return function(){ if (es) es.close(); clearInterval(reconcile); };
   }, [!!state.graph]);
 
   React.useEffect(function(){
@@ -350,9 +413,10 @@ function App(){
 var root = V.createRoot(document.getElementById("root"));
 root.render(h(App));
 
-// Exposed for anything that wants to sanity-check the layout function from
+// Exposed for anything that wants to sanity-check the pure functions from
 // the browser console during manual verification (not a formal test hook).
 window.__missionGraphComputeLayout = computeLayout;
+window.__missionGraphMergeGraphs = mergeGraphs;
 })();
 </script>
 </body>

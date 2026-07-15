@@ -7188,6 +7188,31 @@ mod tests {
         assert_eq!(node("task-a-step")["status"], "complete");
         assert_eq!(node("task-b-step")["status"], "running");
 
+        // ── Wire-casing CONTRACT (review-gate MF1). The page's JS reads
+        // `n.parentId` in computeLayout — the first cut serialized
+        // `parent_id` while the JS read `parentId`, so every task grouped
+        // under a missing parent and the whole layout collapsed to the
+        // origin. Pin the EXACT camelCase keys the JS reads on node
+        // objects, the ABSENCE of the snake_case forms, and the envelope's
+        // deliberate snake_case (the JS reads `g.mission_id`), so a rename
+        // on either side fails here instead of silently flattening the
+        // layout.
+        assert_eq!(node("task-a")["parentId"], "p1");
+        assert_eq!(node("task-a-step")["parentId"], "task-a");
+        assert!(
+            node("task-a")["parent_id"].is_null(),
+            "snake_case parent_id must NOT be on the wire (JS reads parentId)"
+        );
+        assert_eq!(node("task-a-step")["startedTs"], 1);
+        assert_eq!(node("task-a-step")["completedTs"], 2);
+        assert!(
+            node("task-a-step")["started_ts"].is_null(),
+            "snake_case started_ts must NOT be on the wire (camelCase contract)"
+        );
+        assert!(node("task-a")["depth"].is_number());
+        assert!(json["mission_id"].is_string(), "envelope stays snake_case (JS reads g.mission_id)");
+        assert!(json["mission_status"].is_string(), "envelope stays snake_case (JS reads g.mission_status)");
+
         let edges = json["edges"].as_array().unwrap();
         let has_edge = |source: &str, target: &str, kind: &str| {
             edges.iter().any(|e| e["source"] == source && e["target"] == target && e["kind"] == kind)
@@ -7199,6 +7224,147 @@ mod tests {
         // The fan-in: BOTH upstream steps converge on the same downstream step.
         assert!(has_edge("task-a-step", "task-c-step", "depends_on"));
         assert!(has_edge("task-b-step", "task-c-step", "depends_on"));
+
+        // (review-gate C7) No duplicate edge ids — React keys must be
+        // unique; a duplicate depends_on entry on a Task must not emit
+        // the same edge twice.
+        let mut ids: Vec<&str> = edges.iter().filter_map(|e| e["id"].as_str()).collect();
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "duplicate edge ids in {edges:?}");
+    }
+
+    /// (review-gate MF2a) The three production graph runners persist Step
+    /// JSONs only AFTER `run_step_graph` returns — so a page opened DURING
+    /// a run sees tasks whose `step_ids` name steps with no file on disk.
+    /// The builder must synthesize `planned` step nodes for those ids
+    /// (otherwise the SSE layer has no node to flip when the scheduler's
+    /// `step start` records arrive, and cross-task dependency edges point
+    /// at nodes that don't exist). This fixture is exactly that mid-run
+    /// shape: tasks persisted with `step_ids` + `depends_on`, ZERO step
+    /// files.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_synthesizes_planned_steps_for_unpersisted_step_files() {
+        let _guard = CrewDirGuard::new();
+        let mission_id = "midrun-mission";
+        save_test_mission(&minimal_mission(mission_id, vec!["p1".to_string()]));
+        save_test_phase(&minimal_phase("p1", mission_id));
+
+        let task_a = darkmux_crew::types::Task {
+            id: "task-a".to_string(),
+            phase_id: "p1".to_string(),
+            description: "task a".to_string(),
+            step_ids: vec!["task-a-step".to_string()],
+            depends_on: vec![],
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let task_b = darkmux_crew::types::Task {
+            id: "task-b".to_string(),
+            phase_id: "p1".to_string(),
+            description: "task b".to_string(),
+            // Two steps — the intra-task sequence edge must also resolve
+            // between two synthesized nodes.
+            step_ids: vec!["task-b-step-1".to_string(), "task-b-step-2".to_string()],
+            depends_on: vec!["task-a".to_string()],
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        for t in [&task_a, &task_b] {
+            darkmux_crew::lifecycle::save_task(mission_id, t).unwrap();
+        }
+        // Deliberately NO save_step calls — the mid-run disk state.
+
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mission/{mission_id}/graph.json"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["legacy"], false);
+
+        let nodes = json["nodes"].as_array().unwrap();
+        // 1 phase + 2 tasks + 3 synthesized steps.
+        assert_eq!(nodes.len(), 6, "{nodes:?}");
+        let node = |id: &str| {
+            nodes
+                .iter()
+                .find(|n| n["id"] == id)
+                .unwrap_or_else(|| panic!("missing node {id}: {nodes:?}"))
+        };
+        for step_id in ["task-a-step", "task-b-step-1", "task-b-step-2"] {
+            let n = node(step_id);
+            assert_eq!(n["kind"], "step");
+            assert_eq!(n["status"], "planned", "synthesized step must be planned: {n}");
+            assert_eq!(n["label"], "unknown", "synthesized step kind label: {n}");
+        }
+        assert_eq!(node("task-a")["status"], "planned");
+        assert_eq!(node("task-b")["status"], "planned");
+
+        // Every dependency edge's BOTH endpoints exist as nodes — the
+        // pre-fix builder emitted cross-task edges referencing step nodes
+        // it never created mid-run.
+        let node_ids: std::collections::BTreeSet<&str> =
+            nodes.iter().filter_map(|n| n["id"].as_str()).collect();
+        let edges = json["edges"].as_array().unwrap();
+        for e in edges {
+            for end in ["source", "target"] {
+                let id = e[end].as_str().unwrap();
+                assert!(node_ids.contains(id), "edge {e} references missing node {id}");
+            }
+        }
+        let has_edge = |source: &str, target: &str, kind: &str| {
+            edges.iter().any(|e| e["source"] == source && e["target"] == target && e["kind"] == kind)
+        };
+        // Cross-task dep edge between two synthesized steps.
+        assert!(has_edge("task-a-step", "task-b-step-1", "depends_on"));
+        // Intra-task sequence edge between two synthesized steps.
+        assert!(has_edge("task-b-step-1", "task-b-step-2", "depends_on"));
+    }
+
+    /// (review-gate C2) Pin the SSE action-string contract: the page's
+    /// STATUS_ACTIONS map must contain every action string the emitting
+    /// side actually writes (`scheduler::step_lifecycle_record`'s
+    /// "step start"/"step complete"/"step error";
+    /// `lifecycle::emit_phase_transition_record`'s "phase start"/
+    /// "phase complete"/"phase abandon"; the mission transition verbs).
+    /// A rename on either side must fail a test, not silently kill the
+    /// live animation. The emit side is pinned by darkmux-crew's own
+    /// `run_step_graph_emits_step_start_and_step_complete_records`; this
+    /// pins the page side against the same literals.
+    #[test]
+    fn mission_graph_page_pins_flow_action_strings() {
+        for action in [
+            "step start",
+            "step complete",
+            "step error",
+            "phase start",
+            "phase complete",
+            "phase abandon",
+            "mission start",
+            "mission close",
+            "mission pause",
+            "mission resume",
+        ] {
+            assert!(
+                MISSION_GRAPH_HTML.contains(&format!("\"{action}\"")),
+                "mission-graph.html lost the \"{action}\" entry from its STATUS_ACTIONS map — \
+                 the SSE delta layer silently stops animating that transition"
+            );
+        }
     }
 
     /// (item 7) Shape test against a REAL review-config-interpreted graph:

@@ -37,7 +37,7 @@ cargo fmt                # format
 cargo install --path .   # install to ~/.cargo/bin/darkmux
 ```
 
-The release binary is self-contained (~1.1 MB). Built-in workloads under `templates/builtin/workloads/*.json` are embedded at compile time via `include_str!` — `cargo install --path .` produces a binary that works from any directory without the source tree.
+The release binary is self-contained (~11 MB as of 1.18.x — embedded workloads, roles, mission configs, the viewer, and the mission-graph lens's vendored React Flow bundle all ride inside it via `include_str!`/`include_bytes!`). `cargo install --path .` produces a binary that works from any directory without the source tree.
 
 ## Releasing — dogfood the dispatch critical path first
 
