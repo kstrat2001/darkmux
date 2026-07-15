@@ -40,8 +40,9 @@
 //! dedup/judge/envelope) is written entirely against `BundleInput` and
 //! needed no changes once the real bundler landed.
 //!
-//! **Reconciled in packet 5** (`darkmux pr-review run`, `src/pr_review.rs`
-//! in the binary crate): rather than editing `bundles_from_diff`'s body
+//! **Reconciled in packet 5** (now `darkmux mission launch review`,
+//! `src/mission_launch_review.rs` in the binary crate — retired from
+//! `pr-review run` in #1284 Packet 4b): rather than editing `bundles_from_diff`'s body
 //! in place, [`ReviewInputs::bundles`] is the injection seam — packet 5
 //! builds real bundles via `build_bundles`/`external_bundles` + `slice_code`
 //! and passes `Some(..)`; [`run_judge_only`] uses those directly and never
@@ -73,8 +74,8 @@
 //! via a recording mock. The driver is deliberately SINK-AGNOSTIC: it never
 //! calls `darkmux_flow::record` itself and has no idea whether the records
 //! land on the real engagement-scoped flow stream or a per-run-local file —
-//! that choice belongs to the caller (`darkmux pr-review run` wires the real
-//! stream; `darkmux lab review-bench --review` wires a per-run-local JSONL
+//! that choice belongs to the caller (`darkmux mission launch review` wires
+//! the real stream; `darkmux lab review-bench --review` wires a per-run-local JSONL
 //! file, per the lab-vs-fleet scope boundary — a bench's hundreds of
 //! per-flag ruling records must never spam an operator's engagement
 //! stream). Three action families, vocabulary aligned with #1230/#1240's
@@ -126,7 +127,7 @@
 //! [`HostTelemetrySampler`]. Samples emit as `telemetry.process` records
 //! through the SAME injected [`ReviewEmitter`] the `review.*` action family
 //! above uses (so a bench run's samples stay per-run-local and a
-//! `pr-review run`'s samples ride the fleet stream, same split), with the
+//! `mission launch review`'s samples ride the fleet stream, same split), with the
 //! identical field shape `darkmux_crew::dispatch_internal`'s always-on
 //! sampler already produces — the run-monitor/viewer code that renders
 //! `telemetry.process` today applies unchanged.
@@ -2302,7 +2303,8 @@ pub struct ReviewInputs<'a> {
     /// [`BundleInput`] (via `slice_code` for the code text). `None` falls
     /// back to the provisional [`bundles_from_diff`] — kept ONLY so this
     /// module's own tests (written before packet 3 landed) keep working
-    /// unchanged. Production callers (`darkmux pr-review run`, packet 5)
+    /// unchanged. Production callers (`darkmux mission launch review`,
+    /// packet 5's `pr-review run` until #1284 Packet 4b retired it)
     /// always pass `Some` and never invoke the provisional bundler.
     pub bundles: Option<Vec<BundleInput>>,
     /// (#1260/#1177 — operator decision) The per-EXECUTION remote token
@@ -3498,7 +3500,7 @@ pub fn run_judge_only(
 // graph and returns the final `ReviewEnvelope` — it does NOT create the
 // Mission/Phase/Task records on disk (that needs `darkmux_crew::lifecycle`
 // plus a `mission_id`/case-scoped identity, which is the CALLER's concern:
-// `darkmux pr-review run` creates a real persisted Mission; a lab bench run
+// `darkmux mission launch review` creates a real persisted Mission; a lab bench run
 // stays per-run-local per the lab-vs-fleet boundary doctrine — same
 // caller-decides pattern `ReviewEmitter` already uses for flow-record
 // destination). It also does NOT render the posted-comment markdown
@@ -6198,7 +6200,7 @@ mod tests {
 
     /// (#1355/#1357 review round) `finish_review`'s judge remote-budget
     /// honesty gates are STILL PRODUCTION CODE via the `--charges-file`
-    /// path (`pr-review run --charges-file` -> `run_judge_only` ->
+    /// path (`mission launch review --param charges_file=...` -> `run_judge_only` ->
     /// `finish_review`) — but every test that used to pin them routed
     /// through the deleted `run_review` driver, so the migration would have
     /// left them coverage-free. This ONE test pins all three gates through

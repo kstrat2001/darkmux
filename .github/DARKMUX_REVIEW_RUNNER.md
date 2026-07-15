@@ -169,6 +169,10 @@ darkmux mission launch review \
   --param mode=sequential
 ```
 
+No `--timeout` needed: when it is omitted, the review launcher defaults each
+single-shot call to 3600 seconds — the same per-call ceiling the retired
+`pr-review run` used — not `mission launch`'s generic 600-second default.
+
 A clean run prints (or writes, if you pass `--param emit=<path>`) a `{mode,
 review, comment}` payload with `mode: "review"` and at least the judge seat's
 findings. If it comes back `degraded`, re-check step (b)/(c) before dispatching

@@ -116,12 +116,26 @@ const REVIEW_TIER3_KINDS: &[&str] =
 ///   `3` — QA could not run — manual review required (phase Running).
 ///   `4` — instance minted but NOT executed: the graph references step
 ///         kind(s) this launcher can't construct yet (Packet 4b).
+///
+/// `timeout_seconds` is the clap `--timeout` value, `None` when the
+/// operator omitted it — resolved PER CONFIG (#1284 Packet 4b review gate,
+/// must-fix 1): the generic/coder-phase path below resolves `None` -> 600
+/// (`mission run`'s own default); the `review` branch passes the `Option`
+/// through so `mission_launch_review::launch` can resolve `None` -> 3600
+/// (the retired `pr-review run`'s per-call default — a 600s ceiling would
+/// silently degrade any review whose judge pass runs long).
 pub fn launch(
     config_id: &str,
     input_file: Option<&Path>,
     params: &[String],
-    timeout_seconds: u32,
+    timeout_seconds: Option<u32>,
 ) -> Result<i32> {
+    // (#1311, C7 of the #1284 Packet 4b review gate) The dependency-free
+    // liveness floor's FIRST marker — before `mission_config::load` below,
+    // which reads the user-tier config dir (filesystem I/O that precedes
+    // any other observable output; a hang there is exactly the
+    // pre-flow-init black-box class the floor exists for).
+    darkmux_types::dispatch_liveness::liveness("process-start");
     fleet::validate_identifier("config_id", config_id)?;
 
     let loaded = mission_config::load(config_id).with_context(|| {
@@ -304,6 +318,11 @@ pub fn launch(
     // Real execution — build the registry (Tier 1 always, plus the
     // coder-phase Tier 3 kinds when the graph actually uses them), start
     // every real phase that has tasks, run the scheduler.
+    //
+    // Generic/coder-phase timeout default: `None` -> 600, matching
+    // `mission run`'s own default (see `launch`'s doc — `review` resolves
+    // its own 3600 default in `mission_launch_review::launch` instead).
+    let timeout_seconds = timeout_seconds.unwrap_or(600);
     let registry = crew::step_kinds::StepKindRegistry::with_builtins();
     let uses_coder_phase_kinds = steps.values().any(|s| CODER_PHASE_TIER3_KINDS.contains(&s.kind.as_str()));
     let coder_handles = if uses_coder_phase_kinds {
@@ -563,6 +582,23 @@ pub(crate) fn ensure_mission_and_phases(
     mission_id: &str,
     config: &MissionConfig,
 ) -> Result<(BTreeMap<String, String>, bool)> {
+    ensure_mission_and_phases_with_provenance(mission_id, config, None, None)
+}
+
+/// [`ensure_mission_and_phases`] with per-launcher PROVENANCE overrides
+/// (#1284 Packet 4b review gate, must-fix 2). A dedicated launcher whose
+/// instances are per-case (the review launcher: N CI reviews of N PRs)
+/// passes a case-bearing `description` ("PR review — owner/repo@sha (crew
+/// `x`)") and a case-bearing `reopen_reasoning` ("review re-run for case
+/// ...") so the mission board / viewer can tell the instances apart —
+/// falling back to the generic config-derived description and "relaunch of
+/// config `<id>`" reasoning when `None` (the generic `launch` path).
+pub(crate) fn ensure_mission_and_phases_with_provenance(
+    mission_id: &str,
+    config: &MissionConfig,
+    description: Option<&str>,
+    reopen_reasoning: Option<&str>,
+) -> Result<(BTreeMap<String, String>, bool)> {
     let real_phase_ids: BTreeMap<String, String> = config
         .phases
         .iter()
@@ -574,9 +610,10 @@ pub(crate) fn ensure_mission_and_phases(
         if let Ok(text) = std::fs::read_to_string(&mission_path) {
             if let Ok(mission) = serde_json::from_str::<Mission>(&text) {
                 if mission.status == MissionStatus::Closed {
+                    let default_reasoning = format!("relaunch of config `{}`", config.id);
                     crew::lifecycle::mission_reopen_with_reasoning(
                         mission_id,
-                        Some(&format!("relaunch of config `{}`", config.id)),
+                        Some(reopen_reasoning.unwrap_or(&default_reasoning)),
                     )?;
                 }
             }
@@ -625,7 +662,10 @@ pub(crate) fn ensure_mission_and_phases(
     let now = now_unix();
     let mission = Mission {
         id: mission_id.to_string(),
-        description: config.description.clone().unwrap_or_else(|| config.name.clone()),
+        description: description
+            .map(String::from)
+            .or_else(|| config.description.clone())
+            .unwrap_or_else(|| config.name.clone()),
         status: MissionStatus::Active,
         phase_ids: config.phases.iter().map(|p| real_phase_ids[&p.id].clone()).collect(),
         created_ts: now,
@@ -1241,7 +1281,7 @@ mod tests {
         let guard = LaunchTestGuard::new();
         guard.write_config("freeform-test-mission", FREEFORM_CONFIG);
 
-        let exit = launch("freeform-test-mission", None, &[], 600).expect("launch should succeed");
+        let exit = launch("freeform-test-mission", None, &[], None).expect("launch should succeed");
         assert_eq!(exit, 0);
 
         // No operator inputs at all -> the id derives from an empty map,
@@ -1276,7 +1316,7 @@ mod tests {
         assert!(crew::lifecycle::load_envelope(&mission_id).unwrap().is_none());
 
         // Idempotent relaunch: same (empty) inputs must derive the SAME id.
-        let exit2 = launch("freeform-test-mission", None, &[], 600).expect("relaunch should succeed");
+        let exit2 = launch("freeform-test-mission", None, &[], None).expect("relaunch should succeed");
         assert_eq!(exit2, 0);
         let mission_id2 = derive_mission_id("freeform-test-mission", &BTreeMap::new()).unwrap();
         assert_eq!(mission_id, mission_id2, "same inputs must derive the same instance id");
@@ -1288,7 +1328,7 @@ mod tests {
         let guard = LaunchTestGuard::new();
         guard.write_config("freeform-test-mission", FREEFORM_CONFIG);
 
-        launch("freeform-test-mission", None, &[], 600).unwrap();
+        launch("freeform-test-mission", None, &[], None).unwrap();
         let mission_id = derive_mission_id("freeform-test-mission", &BTreeMap::new()).unwrap();
 
         crew::lifecycle::mission_close_with_reasoning(&mission_id, Some("test close")).unwrap();
@@ -1300,7 +1340,7 @@ mod tests {
         // Relaunch: same config, same (empty) inputs -> reopens the SAME
         // instance (Packet 2 reopen semantics) rather than minting a
         // duplicate or erroring on "already exists".
-        let exit = launch("freeform-test-mission", None, &[], 600).unwrap();
+        let exit = launch("freeform-test-mission", None, &[], None).unwrap();
         assert_eq!(exit, 0);
         let reopened: Mission =
             serde_json::from_str(&std::fs::read_to_string(crew::lifecycle::mission_path(&mission_id)).unwrap())
@@ -1316,8 +1356,8 @@ mod tests {
         let guard = LaunchTestGuard::new();
         guard.write_config("freeform-test-mission", FREEFORM_CONFIG);
 
-        launch("freeform-test-mission", None, &["note=first".to_string()], 600).unwrap();
-        launch("freeform-test-mission", None, &["note=second".to_string()], 600).unwrap();
+        launch("freeform-test-mission", None, &["note=first".to_string()], None).unwrap();
+        launch("freeform-test-mission", None, &["note=second".to_string()], None).unwrap();
 
         let mut m1 = BTreeMap::new();
         m1.insert("note".to_string(), serde_json::Value::String("first".to_string()));
@@ -1338,7 +1378,7 @@ mod tests {
         // `coder-phase` is embedded — resolves with no user-tier file at all
         // (this test never writes one), and declares workdir/branch/base as
         // required inputs the operator hasn't supplied.
-        let err = launch("coder-phase", None, &[], 600).expect_err("missing required inputs must bail");
+        let err = launch("coder-phase", None, &[], None).expect_err("missing required inputs must bail");
         let msg = err.to_string();
         assert!(msg.contains("workdir"), "{msg}");
         assert!(msg.contains("branch"), "{msg}");
@@ -1618,7 +1658,7 @@ mod tests {
             }"#,
         );
 
-        let exit = launch("hydration-test", None, &[], 600).unwrap();
+        let exit = launch("hydration-test", None, &[], None).unwrap();
         assert_eq!(exit, 0);
 
         // Zero inputs -> bare config id (must-fix 3).
@@ -1679,7 +1719,7 @@ mod tests {
             }"#,
         );
 
-        let err = launch("undeclared-coder", None, &[], 600)
+        let err = launch("undeclared-coder", None, &[], None)
             .expect_err("must bail before minting when coder inputs are absent");
         let msg = err.to_string();
         assert!(msg.contains("workdir"), "{msg}");

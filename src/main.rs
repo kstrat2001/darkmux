@@ -837,10 +837,14 @@ enum MissionCmd {
         /// always wins over the same key in `--input`'s file.
         #[arg(long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
-        /// Coder dispatch timeout (seconds), for a config whose graph
-        /// executes a dispatch. Default 600.
-        #[arg(long, default_value = "600")]
-        timeout: u32,
+        /// Per-dispatch timeout (seconds), for a config whose graph
+        /// executes a dispatch. The default when omitted is PER CONFIG:
+        /// coder-phase (and gate-less generic graphs) default 600;
+        /// `review` defaults 3600 — the retired `pr-review run`'s own
+        /// per-call default, preserved so a long judge pass doesn't newly
+        /// time out (#1284 Packet 4b review gate, must-fix 1).
+        #[arg(long)]
+        timeout: Option<u32>,
     },
     /// Add a new Phase to an existing Mission mid-flight (#107).
     /// Operator-sovereign scope growth — alternative to either hand-

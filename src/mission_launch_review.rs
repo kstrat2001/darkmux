@@ -49,7 +49,7 @@
 //! | `--k`                    | `k`               |
 //! | `--envelope-out`         | `envelope_out`    |
 //! | `--emit`                 | `emit`            |
-//! | `--timeout`              | (unchanged — `mission launch`'s own `--timeout` flag) |
+//! | `--timeout`              | (`mission launch`'s own `--timeout` flag — NOT byte-identical at the default level: this launcher resolves an omitted `--timeout` to 3600, the retired CLI's own per-call default, while the generic coder-phase path resolves 600. #1284 Packet 4b review gate, must-fix 1.) |
 //! | `--profiles-file`        | `profiles`        |
 //! | `--attribution`          | `attribution`     |
 //! | `--bundler`              | `bundler`         |
@@ -160,7 +160,21 @@ fn resolve_source(collected: &BTreeMap<String, Value>) -> Result<FileSource> {
     let github = str_input(collected, "github");
     let head_sha = str_input(collected, "head_sha");
     match (&worktree, github, head_sha) {
-        (Some(w), None, _) => Ok(FileSource::worktree(w)),
+        (Some(w), None, sha) => {
+            // (C6, #1284 Packet 4b review gate) The retired clap surface
+            // rejected `--head-sha` without `--github` structurally; here
+            // a `head_sha` alongside `worktree` has nothing to shape —
+            // surface it loud rather than silently ignoring (operator
+            // sovereignty), but a warning is enough (no hard error).
+            if sha.is_some() {
+                eprintln!(
+                    "mission launch review: input `head_sha` ignored with `worktree` \
+                     (a local-checkout source reads the tree, not a commit SHA — \
+                     `head_sha` only pairs with `github`)"
+                );
+            }
+            Ok(FileSource::worktree(w))
+        }
         (None, Some(repo), Some(sha)) => Ok(FileSource::github_api(repo, sha)),
         (None, Some(_), None) => bail!("mission launch review: input `github` requires `head_sha`"),
         (None, None, _) => bail!(
@@ -525,23 +539,32 @@ fn finalize_review_mission(mission_id: &str, phase_ids: &[&str], result: &Result
     crew::envelope::finalize_mission(&envelope);
 }
 
+/// The review launcher's per-dispatch timeout default when `--timeout` is
+/// omitted — the retired `pr-review run`'s own `--timeout` default,
+/// preserved verbatim (#1284 Packet 4b review gate, must-fix 1: the
+/// generic `mission launch` default of 600 would have silently cut the
+/// per-call ceiling 6x, degrading long judge passes that used to pass).
+const REVIEW_DEFAULT_TIMEOUT_SECONDS: u32 = 3600;
+
 /// `darkmux mission launch review` entry point (dispatched from
 /// `mission_launch::launch` when `config.id == "review"`). Returns the
 /// process exit code — `0` on any produced review output (Clean/Degraded/
 /// Degenerate alike; CI-facing pass/fail comes from the rendered payload's
 /// `mode` field, not this code), propagating a hard `Err` (via `?`) for
 /// anything that fails before an envelope was ever produced.
+///
+/// The `#[1311]` liveness floor's `process-start` marker fires in
+/// `mission_launch::launch` (before the config load's user-tier dir I/O —
+/// C7 of the Packet 4b review gate), not here; this function picks the
+/// trail up with `run_dispatch`'s own `config-resolved`/`crew-resolved`/
+/// bundling markers and closes it with `synthesis`/`done` below.
 pub(crate) fn launch(
     config: &MissionConfig,
     input_file: Option<&Path>,
     params: &[String],
-    timeout_seconds: u32,
+    timeout_seconds: Option<u32>,
 ) -> Result<i32> {
-    // (#1311, part of #1278) The dependency-free liveness FLOOR — see
-    // `pr_review.rs`'s original doc for the finhub-adonisjs#563 signature
-    // this guards against (a hang before flow-sink init leaving zero
-    // trace).
-    liveness("process-start");
+    let timeout_seconds = timeout_seconds.unwrap_or(REVIEW_DEFAULT_TIMEOUT_SECONDS);
     let collected = mission_launch::collect_inputs(input_file, params)?;
 
     let diff_file = path_input(&collected, "diff_file").ok_or_else(|| {
@@ -776,14 +799,54 @@ fn run_dispatch(
         let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
         id_input.insert("case_id".to_string(), Value::String(case_id_for_bookends.clone()));
         let mission_id = mission_launch::derive_mission_id("review", &id_input)?;
-        let (real_phase_ids, _reused) = mission_launch::ensure_mission_and_phases(&mission_id, config)?;
+        // (must-fix 2, #1284 Packet 4b review gate) Case-bearing provenance,
+        // matching the retired `build_mission_for_review`'s board-facing
+        // strings: a fresh mint's description names the case + crew (N CI
+        // reviews must be distinguishable on `mission status`/the viewer —
+        // the config's own description is an 800-char transcription
+        // paragraph, useless as a board row), and a reopen's reasoning
+        // names the case being re-run.
+        //
+        // (C4, same review gate) Mission bookkeeping on this path is
+        // HARD-FAIL (`?`) — a DELIBERATE reversal of the retired
+        // `build_mission_for_review`'s best-effort `let _ =` discipline
+        // ("a persistence hiccup must never block the review"). An
+        // unwritable crew dir would break the envelope/step saves later in
+        // this same run anyway, leaving a half-recorded review; failing
+        // loud here, before any token is spent, beats that quiet partial
+        // state.
+        let description =
+            format!("PR review — {case_id_for_bookends} (crew `{crew_name_for_bookends}`)");
+        let reopen_reasoning = format!("review re-run for case `{case_id_for_bookends}`");
+        let (real_phase_ids, _reused) = mission_launch::ensure_mission_and_phases_with_provenance(
+            &mission_id,
+            config,
+            Some(&description),
+            Some(&reopen_reasoning),
+        )?;
         crew::lifecycle::save_config_snapshot(&mission_id, config)
             .context("persisting config-snapshot.json")?;
 
         let judge_concurrency = darkmux_types::config_access::review_judge_concurrency();
-        let investigate_phase_id = real_phase_ids["investigate"].clone();
-        let adjudicate_phase_id = real_phase_ids["adjudicate"].clone();
-        let report_phase_id = real_phase_ids["report"].clone();
+        // (C3, same review gate) `.get()` + a named error, never a raw
+        // index panic: a USER-TIER review.json with renamed phase ids
+        // lands exactly here (contract 7 — loud validation at the
+        // consumption point, never a hot-path panic).
+        let real_phase = |doc_id: &str| -> Result<String> {
+            real_phase_ids.get(doc_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "mission launch review: config `{}` does not declare a phase with id \
+                     `{doc_id}` — the review launcher requires the phase ids `investigate`, \
+                     `adjudicate`, and `report` (a user-tier ~/.darkmux/mission-configs/\
+                     review.json with renamed phases cannot be executed; declared: {})",
+                    config.id,
+                    real_phase_ids.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })
+        };
+        let investigate_phase_id = real_phase("investigate")?;
+        let adjudicate_phase_id = real_phase("adjudicate")?;
+        let report_phase_id = real_phase("report")?;
 
         let graph = build_review_graph(
             ctx.clone(),
@@ -1128,22 +1191,34 @@ mod tests {
         v["status"].as_str().unwrap().to_string()
     }
 
-    /// Mint a fresh review-config instance via the SAME generic primitive
-    /// `launch_review::run_dispatch` uses, returning `(mission_id,
-    /// [investigate, adjudicate, report])`.
+    /// Mint (or, on a rerun, reopen) a review-config instance via the SAME
+    /// provenance-bearing primitive `run_dispatch` uses, returning
+    /// `(mission_id, [investigate, adjudicate, report])`.
     fn mint_review_instance(case_id: &str) -> (String, [String; 3]) {
         let config = crew::mission_config::load("review").expect("review is embedded").config;
         let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
         id_input.insert("case_id".to_string(), Value::String(case_id.to_string()));
         let mission_id = mission_launch::derive_mission_id("review", &id_input).unwrap();
-        let (real_phase_ids, _) = mission_launch::ensure_mission_and_phases(&mission_id, &config).unwrap();
+        // Same call shape as `run_dispatch` (must-fix 2 provenance).
+        let description = format!("PR review — {case_id} (crew `test-crew`)");
+        let reopen_reasoning = format!("review re-run for case `{case_id}`");
+        let (real_phase_ids, _) = mission_launch::ensure_mission_and_phases_with_provenance(
+            &mission_id,
+            &config,
+            Some(&description),
+            Some(&reopen_reasoning),
+        )
+        .unwrap();
         // `ensure_mission_and_phases` mints phases Planned — `run_dispatch`'s
         // real flow flips each to Running via `phase_start` right after
         // minting (see its own "flip Planned/Abandoned -> Running" loop);
         // replicate that here so this fixture matches the real pre-dispatch
-        // state these tests exercise.
+        // state these tests exercise. `let _ =` (not unwrap): on a REUSE of
+        // a previously-CLEAN instance a phase is already terminal Complete
+        // and `phase_start` correctly refuses — same silent skip the
+        // production loop's status match performs.
         for real_id in real_phase_ids.values() {
-            crew::lifecycle::phase_start(real_id).unwrap();
+            let _ = crew::lifecycle::phase_start(real_id);
         }
         (
             mission_id,
@@ -1208,6 +1283,39 @@ mod tests {
             assert_eq!(phase_status(&mission_id, phase_id), "abandoned");
         }
         assert_eq!(mission_status_str(&mission_id), "closed");
+    }
+
+    /// (C5, #1284 Packet 4b review gate) The review-shaped RERUN path,
+    /// covering what the retired `reopen_terminal_mission_for_rerun` tests
+    /// covered: a re-run of the SAME case must REOPEN the prior terminal
+    /// instance — never error, never double-mint — with case-bearing
+    /// provenance on the reopened record (must-fix 2).
+    #[test]
+    #[serial_test::serial]
+    fn review_rerun_of_the_same_case_reopens_the_terminal_instance() {
+        let _guard = CrewDirGuard::new();
+        let case = "owner/repo@rerun4b";
+
+        let (mission_id, phase_ids) = mint_review_instance(case);
+        let clean: Result<ReviewEnvelope> = Ok(ReviewEnvelope { degenerate: None, ..Default::default() });
+        let ids: [&str; 3] = [&phase_ids[0], &phase_ids[1], &phase_ids[2]];
+        finalize_review_mission(&mission_id, &ids, &clean);
+        assert_eq!(mission_status_str(&mission_id), "closed");
+
+        // Re-run the SAME case through the same mint path.
+        let (mission_id2, _) = mint_review_instance(case);
+        assert_eq!(mission_id2, mission_id, "same case -> same instance id, reused not double-minted");
+        assert_eq!(mission_status_str(&mission_id), "active", "the terminal instance was reopened");
+
+        // Case-bearing provenance (must-fix 2): the board row names the
+        // case + crew, never the config's transcription paragraph.
+        let text = std::fs::read_to_string(crew::lifecycle::mission_path(&mission_id)).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["description"].as_str().unwrap(),
+            format!("PR review — {case} (crew `test-crew`)"),
+            "fresh-mint description must be case-bearing"
+        );
     }
 
     // ── structural guard (ported from the retired `pr_review.rs` test,
