@@ -255,7 +255,7 @@
   <div class="wrap">
     <h2>Why darkmux exists</h2>
     <h3>You don't have to rent every token — the AI workforce is already sitting in your Mac.</h3>
-    <p>darkmux started as a lab for testing faster local AI on Apple Silicon. The belief that came out of it: <strong>a frontier model is a brilliant strategist you rent by the token. Burning those tokens on compaction, scaffolding, test runs, and structuring is paying rent for busy work, plus handing your data to someone else's cloud to do it.</strong> The Apple Silicon you already bought runs capable open-source models locally — no cloud account, no per-token meter, nothing leaving your disk. Many Mac owners don't make full use of the hardware they paid for; darkmux gives you the tools to use that silicon.</p>
+    <p>darkmux started as a lab for testing faster local AI on Apple Silicon. The belief that came out of it: <strong>a frontier model is a brilliant strategist you rent by the token. Burning those tokens on compaction, scaffolding, test runs, and structuring is paying rent for busy work, plus handing your data to someone else's cloud to do it.</strong> The Apple Silicon you already bought runs capable open-source models locally: no cloud account, no per-token meter, nothing leaving your disk. Many Mac owners don't make full use of the hardware they paid for; darkmux gives you the tools to use that silicon.</p>
     <p class="muted">Every default in darkmux comes from a measured result, not a guess. The repo is the evidence locker; the <a href="https://substack.com/@DarklyEnergized">writing</a> is the narrative.</p>
     <figure class="shot">
       <img src="media/savings-hero-live.png" alt="darkmux live dashboard: 9,721,748 tokens off the meter in 24 hours, broken into 157k generated, 395k fresh input, 9.2M re-read input across 22 local dispatches on two machines, with an orchestrator note concluding the day's work" loading="lazy">
@@ -321,9 +321,10 @@
   <div class="wrap">
     <h2>Advanced: missions, phases, crew</h2>
     <h3>Structured agentic work, for operators using darkmux as the local-AI tier of an orchestrator workflow.</h3>
-    <p>Beyond the swap/lab CLI surface, darkmux ships a <em>crew</em> abstraction: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts, plus a <em>mission/phase</em> lifecycle that tracks multi-step plans as JSON files the operator owns. Optional — none of this is required to use darkmux as a CLI.</p>
+    <p>Beyond the swap/lab CLI surface, darkmux ships a <em>crew</em> abstraction: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts, plus a <em>mission/phase</em> lifecycle that tracks multi-step plans as JSON files the operator owns. Optional: none of this is required to use darkmux as a CLI.</p>
     <ul class="plain">
       <li><code>darkmux crew dispatch coder --message "..."</code> — invoke a named role; emits flow records</li>
+      <li><code>darkmux mission run</code> / <code>ship</code> — the automated dispatch-to-PR loop: worktree, coder, QA review, operator sign-off gate, PR</li>
       <li><code>darkmux phase review</code> — QA pass against the current branch's diff; dispatches code-reviewer, parses the SIGNOFF block</li>
       <li><code>darkmux mission start/close/pause/resume</code> + <code>phase start/complete/abandon</code> — drive lifecycle state</li>
       <li><code>darkmux mission add-phase --after &lt;s&gt;</code> — insert scope mid-mission without restructuring</li>
