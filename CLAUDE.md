@@ -305,16 +305,22 @@ crates/darkmux-crew/src/step_kinds/
                     here first, always, before writing new code.
     patterns/     — Tier 2: a genuinely new, reusable control-flow SHAPE,
                     with the domain-specific ALGORITHM plugged in as a
-                    registered strategy. multi_pass_confirm.rs (the
+                    caller-supplied strategy (deliberately NO runtime
+                    name-keyed strategy registry yet; dedup.rs's module
+                    doc names the upgrade path for when a second strategy
+                    needs runtime selection). multi_pass_confirm.rs (the
                     pass-1 → conditional confirmation passes → demote-on-
                     disagreement shape, generalized from the PR-review
-                    judge); dedup.rs (the "scan for the first survivor a
-                    candidate collapses into, per a pluggable match/merge
-                    strategy" procedure, generalized from the PR-review
-                    dedup stage). Neither submodule depends on any
-                    mission's own types — that's what keeps a Tier 2
-                    pattern actually reusable rather than one mission's
-                    code with extra ceremony.
+                    judge; pass count + confirm rule are parameterized,
+                    the demotion rule is currently fixed — a known,
+                    documented narrowing of #1352's spec, widen when a
+                    consumer needs a different demotion). dedup.rs (the
+                    "scan for the first survivor a candidate collapses
+                    into, per a pluggable match/merge strategy" procedure,
+                    generalized from the PR-review dedup stage). Neither
+                    submodule depends on any mission's own types, which is
+                    what keeps a Tier 2 pattern actually reusable rather
+                    than one mission's code with extra ceremony.
     types.rs      — the StepKind trait itself.
     registry.rs   — StepKindRegistry.
 ```
@@ -323,7 +329,7 @@ Tier 3 — genuinely bespoke, single-purpose kinds — **never lives in `darkmux
 
 **The physical location IS the enforceable test.** Is this in `step_kinds/builtins.rs`? Config it. Is it in `step_kinds/patterns/`? Reuse it, plug in your own strategy. Is it inside a mission's own module? It's bespoke on purpose — don't look here for shared infrastructure. A fresh agent session asking "where does my new Step behavior go" answers the question by reading the directory, not by re-deriving the decision procedure from a comment that may have drifted.
 
-Two audited findings worth knowing before proposing a collapse yourself: the PR-review pipeline's probe/verify kinds LOOK like `dispatch.single_shot` wearing bespoke wrapping, but audited honestly they are NOT a clean Tier 1 collapse — each is a whole per-item LOOP (probe's bundle × k-draw loop, verify's per-confirmed-flag loop) with cross-step shared state (a remote-token bucket shared across sibling probe steps, `MemberRecord` accumulation into a shared handle) that `dispatch.single_shot`'s one-call-per-`Step` shape doesn't have and can't gain without a real behavior/envelope change. Similarly, `mission run`'s coder kind wraps the SAME `crew::dispatch::dispatch` primitive Tier 1's `dispatch.internal` wraps — a genuine follow-up candidate — but its CLI printing, its OWN `mission.coder` flow-record vocabulary, and its `result_slot` readback mechanism are real differences a collapse would have to resolve first. Both are documented in place (code comments citing #1352) rather than forced — see the pure-refactor discipline this repo holds diffs to generally: a collapse that changes observable behavior isn't a tiering fix, it's a feature change wearing a tiering fix's clothes.
+Two audited findings worth knowing before proposing a collapse yourself. First: the PR-review pipeline's probe/verify kinds LOOK like `dispatch.single_shot` wearing bespoke wrapping, but audited honestly they are NOT a clean Tier 1 collapse. Each is a whole per-item LOOP (probe's bundle × k-draw loop, verify's per-confirmed-flag loop) with cross-step shared state (a remote-token bucket shared across sibling probe steps, `MemberRecord` accumulation into a shared handle) that `dispatch.single_shot`'s one-call-per-`Step` shape doesn't have and can't gain without a real behavior/envelope change. Second: `mission run`'s coder kind wraps the SAME `crew::dispatch::dispatch` primitive Tier 1's `dispatch.internal` wraps, a genuine follow-up candidate, but its CLI printing, its own `mission.coder` flow-record vocabulary, and its `result_slot` readback mechanism are real differences a collapse would have to resolve first. Both are documented in place (code comments citing #1352) rather than forced. The general rule: a collapse that changes observable behavior isn't a tiering fix, it's a feature change wearing a tiering fix's clothes.
 
 ## Versioning — rules schema
 
