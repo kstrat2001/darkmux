@@ -175,6 +175,11 @@ mod tests {
         env::set_current_dir(prev).unwrap();
     }
 
+    // `resolve` reads DARKMUX_HOME, which serial siblings in this module
+    // mutate — without the serial guard this can observe
+    // resolve_honors_darkmux_home_override's tempdir root and fail the
+    // `.darkmux` suffix assertion.
+    #[serial_test::serial]
     #[test]
     fn resolve_force_user_uses_home() {
         let paths = resolve(ResolveScope::ForceUser);
