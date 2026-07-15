@@ -78,8 +78,10 @@ pub struct DarkmuxConfig {
     pub fleet: Option<FleetConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteConfig>,
+    // Serde field name stays `mission` — only the Rust type was renamed
+    // MissionConfig -> MissionBoardConfig (#1284; see that struct's doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mission: Option<MissionConfig>,
+    pub mission: Option<MissionBoardConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewConfig>,
 
@@ -252,8 +254,17 @@ pub struct RemoteConfig {
 
 /// (#1230 Packet 5) Mission-board drift-detection knobs — consumed by
 /// `darkmux mission status`'s `detect_drift`.
+///
+/// Renamed from `MissionConfig` (#1284 Packet 1 review round): the
+/// mission-registry arc makes `darkmux_crew::mission_config::MissionConfig`
+/// (a mission GRAPH document — phases/tasks/steps) the arc's headline
+/// concept, and two unrelated `MissionConfig`s in one workspace invited
+/// exactly the confusion the review caught. This one is the mission BOARD's
+/// config block. Rust-only rename — the serde field name stays `mission`
+/// (see `DarkmuxConfig::mission`), so operator `config.json` files are
+/// untouched; pre-1.0 no-compat-baggage applies to the type name.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MissionConfig {
+pub struct MissionBoardConfig {
     /// How many days an Active mission may sit with zero `Complete` phases
     /// before `mission status` flags it as stale (default 14). The concrete
     /// motivating case: `doom-loop-m4` sat at 0/4 phases for ~20 days with
@@ -392,7 +403,7 @@ impl DarkmuxConfig {
                 concurrent_cap: Some(4),
                 extras: Default::default(),
             }),
-            mission: Some(MissionConfig {
+            mission: Some(MissionBoardConfig {
                 stale_active_days: Some(14),
                 extras: Default::default(),
             }),

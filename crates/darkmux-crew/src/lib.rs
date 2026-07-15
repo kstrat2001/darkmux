@@ -23,6 +23,10 @@ pub mod index;
 pub mod lessons;
 pub mod lifecycle;
 pub mod loader;
+// (#1284 Packet 1) Mission configs — missions as DATA. Schema + loader +
+// built-in transcriptions of `build_review_graph`/`default_phase_graph`'s
+// hand-built graphs. Does NOT wire configs into execution (Packet 3).
+pub mod mission_config;
 pub mod pins;
 pub mod select;
 // (#1230 Packet 2) Generic dependency-graph scheduler over `Step`/`Phase`

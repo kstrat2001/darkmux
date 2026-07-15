@@ -269,6 +269,18 @@ pub(crate) fn skills_dir() -> PathBuf {
     resolve_user_subdir("skills")
 }
 
+/// User-side mission-configs directory (#1284 Packet 1) — the top tier of
+/// `mission_config::load`'s user → on-disk → embedded resolution, mirroring
+/// `workloads::load`'s search order. `<root>/mission-configs/`, honoring the
+/// SAME `env(DARKMUX_CREW_DIR) > config.dirs.crew` override every other
+/// crew-state dir does (`user_state_root`'s doc). No legacy-layout fallback
+/// — mission configs postdate the Beat-33 flatten, so there's no
+/// `<root>/crew/mission-configs/` to have ever existed (per the "no compat
+/// baggage pre-1.0" doctrine — nothing to be compatible WITH here).
+pub fn mission_configs_dir() -> PathBuf {
+    user_state_root().join("mission-configs")
+}
+
 /// User-side role-model-pins.json path. Post-Beat-33:
 /// `<root>/role-model-pins.json`. Falls back to
 /// `<root>/crew/role-model-pins.json` for legacy.
