@@ -3067,7 +3067,6 @@ struct JudgeGateOutcome {
     degenerate_reason: Option<String>,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn judge_gate_outcome(
     is_remote: bool,
     judged_len: usize,
@@ -3111,7 +3110,7 @@ fn judge_gate_outcome(
             degen_reasons.push(format!(
                 "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
                  per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) ran out; \
-                 degraded run, never a silent pass"
+                 degenerate run, never a silent pass"
             ));
         }
     }
@@ -3362,7 +3361,14 @@ fn finish_review(
         env.warnings.push(w);
     }
     env.remote_budgets.extend(gate.remote_budget_rows);
-    env.degenerate = gate.degenerate_reason;
+    // Guarded assign (#1373 frontier review): an unconditional
+    // `env.degenerate = gate.degenerate_reason` would clobber a pre-set
+    // Some with None. Safe today only because run_judge_only's zero-flags
+    // case early-returns before reaching here; the graph twin uses this
+    // same guarded form, keep them matched.
+    if gate.degenerate_reason.is_some() {
+        env.degenerate = gate.degenerate_reason;
+    }
 
     // (#1260) The optional verify stage — one adjudication per confirmed
     // flag, AFTER the double-confirm judge and BEFORE the tier counts so a

@@ -1486,6 +1486,13 @@ fn build_mission_for_review(case_id: &str, crew_name: &str) -> Result<ReviewMiss
 /// regression is degenerate→clean, covered below) — named here rather
 /// than silently left unexplained.
 ///
+/// Known transient (#1372 frontier review): reopening a previously-CLEAN
+/// mission leaves it Active while its phases stay Complete for the
+/// duration of run 2, so `mission status`'s `done-not-closed` drift rule
+/// fires until finalize closes it again. The common CI re-trigger case.
+/// Suggest-only surface, self-heals at finalize — acceptable, but named
+/// so an operator seeing the transient knows it isn't a stuck mission.
+///
 /// Best-effort throughout (`let _ = ...`), same discipline as the rest of
 /// this function — a reopen hiccup must never block the review itself.
 fn reopen_terminal_mission_for_rerun(mission_id: &str, case_id: &str, phase_ids: &[&str]) {
@@ -1547,9 +1554,17 @@ fn review_result_to_mission_envelope(
             } else {
                 MissionOutcomeStatus::Clean
             };
-            let reason = env.degenerate.clone().or_else(|| {
-                (status == MissionOutcomeStatus::Degraded).then(|| env.warnings.join("; "))
-            });
+            // Prefix the degenerate reason so the board's close-reasoning
+            // stays self-describing ("review degenerate: no bundles..."),
+            // matching the pre-envelope finalize wording (#1373 frontier
+            // review, consider 2).
+            let reason = env
+                .degenerate
+                .as_deref()
+                .map(|r| format!("review degenerate: {r}"))
+                .or_else(|| {
+                    (status == MissionOutcomeStatus::Degraded).then(|| env.warnings.join("; "))
+                });
             let mut envelope = MissionEnvelope::new(mission_id, status, phase_ids);
             envelope.reason = reason;
             envelope.warnings = env.warnings.clone();
