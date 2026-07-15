@@ -1448,6 +1448,59 @@ fn build_mission_for_review(case_id: &str, crew_name: &str) -> Result<ReviewMiss
     Ok(ReviewMissionPhases { mission_id, investigate_phase_id, adjudicate_phase_id, report_phase_id })
 }
 
+/// (#1365) Finalize a `pr-review run`-owned Mission's three Phases once the
+/// dispatch is done, so `darkmux mission status`/the viewer's mission lens
+/// never shows a permanently "active, N running" review. Operator sovereignty
+/// (#44) forbids the system auto-completing an OPERATOR-authored mission, but
+/// this Mission is system-created ephemera — `build_mission_for_review`
+/// stood it up purely so the review's own Task/Step graph had somewhere to
+/// live — so the system closing out its own phases when the work IT launched
+/// finishes is consistent with that doctrine (the same shape `mission ship
+/// --merge` uses to flip its own phase to Complete in `mission_run.rs`).
+///
+/// **Why this can't key on `result.is_ok()` alone (the #1354 bug still
+/// present in this shape until now):** `run_review_graph` is deliberately
+/// degrade-gracefully — a scheduling failure, every probe drawing nothing, or
+/// every judge dispatch erroring all fold into `ReviewEnvelope.degenerate`
+/// rather than a returned `Err` (see that function's doc/body — it has no
+/// `?`/`bail!` of its own). So `Result<ReviewEnvelope>::is_ok()` is `true`
+/// for BOTH a clean run and a degenerate one; keying on it alone marked a
+/// mid-flight failure `phase_complete`/"review completed" — an honest-looking
+/// but WRONG terminal state, never the "stuck running forever" a drift check
+/// could catch. Only a genuinely clean run (`Ok(env)` with `env.degenerate ==
+/// None`) completes; a hard `Err` OR a degenerate `Ok(env)` both abandon the
+/// phases with the real reason recorded on the mission, so `darkmux mission
+/// status`'s drift detector (`src/mission_status.rs::is_terminal` treats
+/// `Complete`/`Abandoned` identically) sees a clean Closed mission either
+/// way — never a non-terminal phase on a Closed mission, never a Running
+/// phase left behind.
+///
+/// Best-effort throughout (`let _ = ...`), same discipline as
+/// `build_mission_for_review`: a persistence hiccup here must never fail the
+/// review itself — only the mission-status/graph-lens VIEW of the run would
+/// be degraded, not the run.
+fn finalize_review_mission(mission_id: &str, phase_ids: &[&str], result: &Result<ReviewEnvelope>) {
+    let clean = matches!(result, Ok(env) if env.degenerate.is_none());
+    if clean {
+        for phase_id in phase_ids {
+            let _ = darkmux_crew::lifecycle::phase_complete(phase_id);
+        }
+        let _ = darkmux_crew::lifecycle::mission_close_with_reasoning(mission_id, Some("review completed"));
+    } else {
+        let reason = match result {
+            Ok(env) => format!(
+                "review degenerate: {}",
+                env.degenerate.as_deref().unwrap_or("unknown reason")
+            ),
+            Err(e) => format!("review errored: {e:#}"),
+        };
+        for phase_id in phase_ids {
+            let _ = darkmux_crew::lifecycle::phase_abandon(phase_id);
+        }
+        let _ = darkmux_crew::lifecycle::mission_close_with_reasoning(mission_id, Some(&reason));
+    }
+}
+
 /// Everything but `--from-envelope`: resolve the source + crew, build real
 /// bundles, and dispatch either `run_review` (the full pipeline) or
 /// `run_judge_only` (`--charges-file` — re-judge a saved flag list without
@@ -1712,30 +1765,14 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<ReviewEnvelope> {
             },
         );
 
-        // (#1354) The Mission/Phases `build_mission_for_review` created
+        // (#1354/#1365) The Mission/Phases `build_mission_for_review` created
         // above start life Active/Running and, without this, never reach a
         // terminal status regardless of outcome — every PR review, clean or
         // errored, was left permanently "stuck" in `darkmux mission
-        // status`. Best-effort, same discipline as `build_mission_for_review`
-        // itself: a persistence hiccup here must never fail the review.
-        let phase_ids = [&investigate_phase_id, &adjudicate_phase_id, &report_phase_id];
-        if result.is_ok() {
-            for phase_id in phase_ids {
-                let _ = darkmux_crew::lifecycle::phase_complete(phase_id);
-            }
-            let _ = darkmux_crew::lifecycle::mission_close_with_reasoning(
-                &mission_id_for_status,
-                Some("review completed"),
-            );
-        } else {
-            for phase_id in phase_ids {
-                let _ = darkmux_crew::lifecycle::phase_abandon(phase_id);
-            }
-            let _ = darkmux_crew::lifecycle::mission_close_with_reasoning(
-                &mission_id_for_status,
-                Some("review errored"),
-            );
-        }
+        // status`. See `finalize_review_mission`'s doc for why the terminal
+        // choice can't key on `result.is_ok()` alone.
+        let phase_ids = [investigate_phase_id.as_str(), adjudicate_phase_id.as_str(), report_phase_id.as_str()];
+        finalize_review_mission(&mission_id_for_status, &phase_ids, &result);
 
         result
     }
@@ -3708,6 +3745,17 @@ mod tests {
     /// ride the `dispatch start` payload and `confirmed`/`needs_check`/
     /// `archived`/`degenerate` ride the terminal payload, via
     /// `with_dispatch_bookends`'s `start_extra` + its `Ok(env)` enrichment.
+    ///
+    /// `#[serial]`: this test's graph run emits real flow records (dispatch
+    /// bookends + five `step result`s) through the process-global default
+    /// sink, which resolves `DARKMUX_FLOWS_DIR` PER WRITE. Un-serialized,
+    /// those records land in whatever temp dir a concurrently-running
+    /// env-guarded serial test (e.g. `phase_cli`'s
+    /// `review_start_record_has_review_category_and_frontier_tier`) has
+    /// pointed the var at — its exact-count assertion then reads 7 instead
+    /// of 2. Reproduced at ~20-40% per full-bin run before this attribute
+    /// (#1365 frontier review + follow-up investigation).
+    #[serial_test::serial]
     #[test]
     fn with_dispatch_bookends_wraps_run_review_graph_with_no_inner_task_bookend_and_carries_tier_counts() {
         use darkmux_profiles::crews::ResolvedSeatStaffing;
@@ -3804,6 +3852,265 @@ mod tests {
         // ("never a silent pass"). This was the exact gap the prior version
         // of this assertion flagged as "out of scope, revisit later."
         assert_eq!(payload["degenerate"], "no bundles produced from the diff", "{payload}");
+    }
+
+    // ── #1365: mission/phase terminal-status finalization ─────────────────
+
+    /// RAII guard: points `DARKMUX_CREW_DIR` (and therefore
+    /// `darkmux_crew::lifecycle::{mission_path, phase_path}`) AND
+    /// `DARKMUX_FLOWS_DIR` at fresh `TempDir`s for the test's duration,
+    /// then restores (or unsets) both on drop. Mirrors `darkmux-crew`'s
+    /// own two-var `lifecycle.rs` `CrewGuard` — the right template for
+    /// tests that drive lifecycle transitions, because `phase_complete`/
+    /// `phase_abandon`/`mission_close` each emit a flow record through the
+    /// process-global default sink; without the flows-dir leg those
+    /// records land in the operator's REAL `~/.darkmux/flows` (and the
+    /// audit chain when enabled) on every `cargo test`, and leak into
+    /// sibling tests' exact-count assertions (#1365 frontier review,
+    /// reproduced empirically). Caveat inherited from that template: the
+    /// default sink is `OnceLock`-pinned process-wide, so isolation is
+    /// first-writer-ordering-dependent — the guard prevents the real-dir
+    /// write whenever a guarded test pins the sink first, matching the
+    /// existing crate discipline.
+    struct CrewDirGuard {
+        prev_crew: Option<String>,
+        prev_flows: Option<String>,
+        _tmp_crew: tempfile::TempDir,
+        _tmp_flows: tempfile::TempDir,
+    }
+    impl CrewDirGuard {
+        fn new() -> Self {
+            let tmp_crew = tempfile::TempDir::new().unwrap();
+            let tmp_flows = tempfile::TempDir::new().unwrap();
+            let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+            let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+            // SAFETY: every caller is `#[serial_test::serial]`.
+            unsafe {
+                std::env::set_var("DARKMUX_CREW_DIR", tmp_crew.path());
+                std::env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path());
+            }
+            Self { prev_crew, prev_flows, _tmp_crew: tmp_crew, _tmp_flows: tmp_flows }
+        }
+    }
+    impl Drop for CrewDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: every caller is `#[serial_test::serial]`.
+            unsafe {
+                match &self.prev_crew {
+                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                }
+                match &self.prev_flows {
+                    Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                    None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+                }
+            }
+        }
+    }
+
+    /// Read a phase's persisted `status` field back off disk — the only
+    /// thing these tests need to assert, so a raw `serde_json::Value` read
+    /// is simpler than pulling in `darkmux_crew::types::Phase` just for one
+    /// field.
+    fn phase_status(mission_id: &str, phase_id: &str) -> String {
+        let path = darkmux_crew::lifecycle::phase_path(mission_id, phase_id);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let v: Value = serde_json::from_str(&text).unwrap();
+        v["status"].as_str().unwrap().to_string()
+    }
+
+    fn mission_status_str(mission_id: &str) -> String {
+        let path = darkmux_crew::lifecycle::mission_path(mission_id);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let v: Value = serde_json::from_str(&text).unwrap();
+        v["status"].as_str().unwrap().to_string()
+    }
+
+    /// The headline regression test: a `pr-review run`-owned Mission whose
+    /// dispatch finishes CLEANLY (`Ok(env)`, `env.degenerate == None`) must
+    /// have every phase flip `running` -> `complete` and the mission itself
+    /// close — never left `active, N running` in `darkmux mission status`
+    /// (the exact symptom #1365 reports).
+    #[test]
+    #[serial_test::serial]
+    fn finalize_review_mission_completes_phases_and_closes_mission_on_clean_success() {
+        let _guard = CrewDirGuard::new();
+        let mission = build_mission_for_review("owner/repo@deadbeef", "test-crew").expect("mission built");
+        for phase_id in [&mission.investigate_phase_id, &mission.adjudicate_phase_id, &mission.report_phase_id] {
+            assert_eq!(phase_status(&mission.mission_id, phase_id), "running", "fresh phases start Running");
+        }
+
+        let result: Result<ReviewEnvelope> = Ok(ReviewEnvelope { degenerate: None, ..Default::default() });
+        let phase_ids =
+            [mission.investigate_phase_id.as_str(), mission.adjudicate_phase_id.as_str(), mission.report_phase_id.as_str()];
+        finalize_review_mission(&mission.mission_id, &phase_ids, &result);
+
+        for phase_id in [&mission.investigate_phase_id, &mission.adjudicate_phase_id, &mission.report_phase_id] {
+            assert_eq!(phase_status(&mission.mission_id, phase_id), "complete", "clean run completes every phase");
+        }
+        assert_eq!(mission_status_str(&mission.mission_id), "closed", "clean run closes the mission");
+    }
+
+    /// The core #1365 bug: `run_review_graph` never itself returns `Err` —
+    /// a mid-flight failure (every probe drawing nothing, every judge call
+    /// erroring, a scheduling failure) folds into `ReviewEnvelope.degenerate`
+    /// instead (see e.g. the zero-bundle case exercised two tests above,
+    /// whose terminal `payload["degenerate"]` is
+    /// `"no bundles produced from the diff"` while `result.is_ok()` is
+    /// still `true`). The OLD `if result.is_ok() { phase_complete } else {
+    /// phase_abandon }` shape therefore marked every degenerate run
+    /// `phase_complete`/"review completed" — a wrong but terminal state, not
+    /// literally the reported "stuck running forever," but the same root
+    /// defect: the completion decision never actually distinguished success
+    /// from failure. `finalize_review_mission` must route a degenerate
+    /// `Ok(env)` to `phase_abandon`, never `phase_complete` — and, either
+    /// way, the phase must reach a TERMINAL state (never left `running`).
+    #[test]
+    #[serial_test::serial]
+    fn finalize_review_mission_abandons_phases_on_degenerate_ok_result() {
+        let _guard = CrewDirGuard::new();
+        let mission = build_mission_for_review("owner/repo@degenerate", "test-crew").expect("mission built");
+
+        let result: Result<ReviewEnvelope> = Ok(ReviewEnvelope {
+            degenerate: Some("no bundles produced from the diff".to_string()),
+            ..Default::default()
+        });
+        let phase_ids =
+            [mission.investigate_phase_id.as_str(), mission.adjudicate_phase_id.as_str(), mission.report_phase_id.as_str()];
+        finalize_review_mission(&mission.mission_id, &phase_ids, &result);
+
+        for phase_id in [&mission.investigate_phase_id, &mission.adjudicate_phase_id, &mission.report_phase_id] {
+            let status = phase_status(&mission.mission_id, phase_id);
+            assert_eq!(status, "abandoned", "a degenerate Ok(env) must abandon, never complete: {status}");
+            assert_ne!(status, "running", "a degenerate run must never leave a phase stuck running");
+        }
+        assert_eq!(mission_status_str(&mission.mission_id), "closed", "the mission still reaches a terminal status");
+    }
+
+    /// A hard `Err` (a real dispatch-level failure, e.g. bundling or crew
+    /// resolution blew up before the graph even ran) must ALSO abandon every
+    /// phase and close the mission — the pre-existing #1354 behavior this
+    /// refactor must not regress.
+    #[test]
+    #[serial_test::serial]
+    fn finalize_review_mission_abandons_phases_on_hard_error() {
+        let _guard = CrewDirGuard::new();
+        let mission = build_mission_for_review("owner/repo@harderr", "test-crew").expect("mission built");
+
+        let result: Result<ReviewEnvelope> = Err(anyhow!("probe dispatch failed: connection refused"));
+        let phase_ids =
+            [mission.investigate_phase_id.as_str(), mission.adjudicate_phase_id.as_str(), mission.report_phase_id.as_str()];
+        finalize_review_mission(&mission.mission_id, &phase_ids, &result);
+
+        for phase_id in [&mission.investigate_phase_id, &mission.adjudicate_phase_id, &mission.report_phase_id] {
+            assert_eq!(phase_status(&mission.mission_id, phase_id), "abandoned");
+        }
+        assert_eq!(mission_status_str(&mission.mission_id), "closed");
+    }
+
+    /// End-to-end, offline (zero bundles — no LMStudio/network, same fixture
+    /// shape `run_review_graph_with_empty_bundles_completes_with_zero_dispatches`
+    /// and the `with_dispatch_bookends_wraps_run_review_graph_...` test above
+    /// use): wires `build_mission_for_review` -> `build_review_graph` ->
+    /// `run_review_graph` -> `finalize_review_mission` together exactly like
+    /// `run_dispatch`'s real call sequence, and confirms the mission this
+    /// produces is FULLY terminal — no phase left `running` — even though
+    /// the zero-bundle run is degenerate (per the assertion two tests above,
+    /// `env.degenerate` IS set here), which is the exact real-world shape
+    /// #1365's evidence mission was in.
+    #[test]
+    #[serial_test::serial]
+    fn pr_review_pipeline_leaves_no_running_phase_behind_on_a_degenerate_run() {
+        use darkmux_profiles::crews::ResolvedSeatStaffing;
+        use darkmux_types::ProfileModel;
+        use std::collections::BTreeMap;
+
+        let _guard = CrewDirGuard::new();
+
+        fn staffing(model_id: &str) -> ResolvedSeatStaffing {
+            ResolvedSeatStaffing {
+                name: "fast".into(),
+                pm: ProfileModel { id: model_id.into(), ..Default::default() },
+                k: 1,
+                passes: 2,
+                max_tokens: None,
+                selector: None,
+            }
+        }
+        let mut seats = BTreeMap::new();
+        seats.insert("review-probe".to_string(), vec![staffing("probe-model")]);
+        seats.insert("review-judge".to_string(), vec![staffing("judge-model")]);
+        let crew = ResolvedCrew { name: "test-crew".into(), seats, request_changes: false };
+
+        let mission = build_mission_for_review("owner/repo@e2e-degenerate", "test-crew").expect("mission built");
+
+        let seats_resolved = validate_review_crew(&crew).expect("valid crew");
+        let judge = seats_resolved.judge.clone();
+        let verify = seats_resolved.verify.cloned();
+        let probes: Vec<_> = seats_resolved.probes.clone();
+
+        let ctx = Arc::new(ReviewStepContext {
+            case_id: "e2e-degenerate".to_string(),
+            crew: crew.clone(),
+            intent_title: String::new(),
+            intent_body: String::new(),
+            diff: String::new(),
+            probe_system: "probe sys".to_string(),
+            judge_system: "judge sys".to_string(),
+            verify_system: "verify sys".to_string(),
+            bundles: Vec::new(), // zero bundles -> degenerate, offline
+            remote_max_tokens_per_execution: 500_000,
+            timeout_seconds: 30,
+        });
+
+        let graph = build_review_graph(
+            ctx.clone(),
+            judge.clone(),
+            verify.clone(),
+            &probes,
+            &mission.investigate_phase_id,
+            &mission.adjudicate_phase_id,
+            &mission.report_phase_id,
+            1,
+        );
+        let fingerprint_val =
+            darkmux_lab::lab::review::fingerprint(&darkmux_lab::lab::review::seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = darkmux_lab::lab::review::staffing_snapshot(&probes, &judge, verify.as_ref(), false);
+
+        let mut emitter = RecordingEmitter::default();
+        let result: Result<ReviewEnvelope> = with_dispatch_bookends(
+            &mut emitter,
+            "e2e-degenerate",
+            "test-crew",
+            None,
+            json!({}),
+            move |em| {
+                run_review_graph(&ctx, "test-crew", ExecMode::Sequential, fingerprint_val, staffing_snap, graph, em)
+                    .map(|(env, _steps)| env)
+            },
+        );
+        assert!(result.is_ok(), "the graph run itself never hard-errors: {result:?}");
+        assert!(
+            matches!(&result, Ok(env) if env.degenerate.is_some()),
+            "zero bundles must produce a degenerate envelope, proving is_ok() alone can't gate completion"
+        );
+
+        let phase_ids =
+            [mission.investigate_phase_id.as_str(), mission.adjudicate_phase_id.as_str(), mission.report_phase_id.as_str()];
+        finalize_review_mission(&mission.mission_id, &phase_ids, &result);
+
+        for phase_id in [&mission.investigate_phase_id, &mission.adjudicate_phase_id, &mission.report_phase_id] {
+            let status = phase_status(&mission.mission_id, phase_id);
+            // Exact-status pin (#1365 frontier review): `!= "running"` was
+            // also satisfied by the OLD is_ok() routing (which marked these
+            // Complete). Asserting `abandoned` makes this e2e a genuine
+            // full-pipeline regression test for the degenerate routing, not
+            // just for #1354's never-left-running half.
+            assert_eq!(status, "abandoned", "degenerate run must abandon phase `{phase_id}`, got: {status}");
+        }
+        assert_eq!(mission_status_str(&mission.mission_id), "closed");
     }
 
     #[test]
