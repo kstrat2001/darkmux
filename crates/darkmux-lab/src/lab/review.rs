@@ -3522,7 +3522,7 @@ pub fn run_judge_only(
 use darkmux_crew::scheduler::run_step_graph;
 use darkmux_crew::single_shot::{single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest, SingleShotRequest};
 use darkmux_crew::step_kinds::{StepKind, StepKindRegistry, StepOutcome};
-use darkmux_crew::types::{NodeStatus, Step, Task};
+use darkmux_crew::types::{Step, Task};
 use std::sync::Mutex as StdMutex;
 
 /// Everything a review Step kind needs, OWNED (not borrowed) and
@@ -4667,8 +4667,29 @@ pub struct BuiltReviewGraph {
 /// Caller persists `tasks`/`steps`, then runs the graph via
 /// [`run_review_graph`].
 ///
-/// `case_id` seeds every Step/Task id so a single mission running multiple
-/// PR reviews (unlikely today, but not precluded) never collides.
+/// (#1284 Packet 3) A THIN LAUNCHER as of this packet: loads the built-in
+/// "review" mission config (`darkmux_crew::mission_config::load`), resolves
+/// every genuinely per-launch value THIS FUNCTION's own parameters carry —
+/// the three real phase ids, the resolved judge concurrency, and the
+/// config's one documented per-staffed-seat expansion (`probe_seats`, this
+/// call's `probes` in staffing order) — into
+/// `mission_config::interpret::LaunchParams`, then calls
+/// `mission_config::interpret` to materialize the real `Vec<Task>` +
+/// `BTreeMap<String, Step>`. `interpret` does NOT construct `StepKind`
+/// instances (#1284 Packet 3's own scope, #1352's Tier 3 rule) — this
+/// function still owns registering every Tier 3 kind this pipeline needs,
+/// unconditionally (the config's graph SHAPE is fixed except for the
+/// probe-seat count, so every non-probe kind is always present).
+///
+/// **Ids are FIXED, not case-id-seeded** (fixing a pre-Packet-3 doc-drift
+/// finding): review.json's task/step ids are literal strings
+/// (`review-bundle-task`, `review-judge-step`, …), never derived from
+/// `ctx.case_id`. A single Mission running multiple PR reviews would
+/// collide on these Task/Step ids — what actually prevents that collision
+/// is `build_mission_for_review` (`src/pr_review.rs`) minting a
+/// CASE-ID-DERIVED Mission/Phase per review, so two reviews' identical
+/// Task/Step ids persist under different Phase directories, never the
+/// literal ids themselves varying by case.
 #[allow(clippy::too_many_arguments)]
 pub fn build_review_graph(
     ctx: Arc<ReviewStepContext>,
@@ -4680,10 +4701,52 @@ pub fn build_review_graph(
     report_phase_id: &str,
     judge_concurrency: u32,
 ) -> BuiltReviewGraph {
-    let mut steps = std::collections::BTreeMap::new();
-    let mut tasks = Vec::new();
+    use darkmux_crew::mission_config::{interpret, LaunchParams};
+
+    let loaded = darkmux_crew::mission_config::load("review")
+        .expect("built-in \"review\" mission config must load");
+
+    let mut phase_ids = std::collections::BTreeMap::new();
+    phase_ids.insert("investigate".to_string(), investigate_phase_id.to_string());
+    phase_ids.insert("adjudicate".to_string(), adjudicate_phase_id.to_string());
+    phase_ids.insert("report".to_string(), report_phase_id.to_string());
+
+    let mut expansions = std::collections::BTreeMap::new();
+    expansions.insert("probe_seats".to_string(), probes.iter().map(|p| p.name.clone()).collect());
+
+    // (#1284 Packet 3 worklist) `judge_concurrency` is ALWAYS an override,
+    // never read back out of review.json's own static
+    // `config.concurrency`. The caller (`src/pr_review.rs`,
+    // `review_bench.rs`) already resolves it via
+    // `darkmux_types::config_access::review_judge_concurrency()` (env >
+    // config.review.judge_concurrency > 1) before calling this function —
+    // the JSON's static value is a documented DEFAULT for a human reading
+    // the file, not a load-bearing fallback the launcher trusts.
+    let mut step_config_overrides = std::collections::BTreeMap::new();
+    step_config_overrides.insert(
+        "review-judge-step".to_string(),
+        json!({ "concurrency": judge_concurrency }),
+    );
+
+    let params = LaunchParams {
+        phase_ids,
+        task_overrides: std::collections::BTreeMap::new(),
+        step_config_overrides,
+        expansions,
+    };
+
+    let (tasks, steps) = interpret(&loaded.config, &params)
+        .expect("built-in \"review\" config interprets cleanly");
+
+    // `step_id -> Task.phase_id`, derived once from `tasks` (each Task
+    // already carries both) rather than threaded through every push site
+    // above.
     let mut phase_id_of_step = std::collections::BTreeMap::new();
-    let registry = StepKindRegistry::new();
+    for task in &tasks {
+        for step_id in &task.step_ids {
+            phase_id_of_step.insert(step_id.clone(), task.phase_id.clone());
+        }
+    }
 
     // (#1373) Built EARLY (moved up from its former place right before
     // `ReviewSynthesisStepKind`'s construction) so `ReviewDedupStepKind`/
@@ -4695,32 +4758,8 @@ pub fn build_review_graph(
         ..Default::default()
     }));
 
-    let bundle_step_id = "review-bundle-step".to_string();
-    let bundle_task_id = "review-bundle-task".to_string();
-    tasks.push(Task {
-        id: bundle_task_id.clone(),
-        phase_id: investigate_phase_id.to_string(),
-        description: "resolve review bundles from the diff".to_string(),
-        step_ids: vec![bundle_step_id.clone()],
-        depends_on: Vec::new(),
-        role_id: None,
-        profile_name: None,
-        workdir: None,
-        image: None,
-    });
-    steps.insert(
-        bundle_step_id.clone(),
-        Step {
-            id: bundle_step_id.clone(),
-            task_id: bundle_task_id.clone(),
-            kind: "review.bundle".to_string(),
-            status: NodeStatus::Planned,
-            config: serde_json::Value::Null,
-            started_ts: None,
-            completed_ts: None,
-            output: None,
-        },
-    );
+    let registry = StepKindRegistry::new();
+
     let bundle_kind = Arc::new(ReviewBundleStepKind { ctx: ctx.clone() });
     registry.register(bundle_kind.clone()).expect("review.bundle registered once");
     // (#1349) Legacy alias — a `Step.kind` persisted before the funnel->review
@@ -4737,34 +4776,11 @@ pub fn build_review_graph(
     // `run_step_graph` returns.
     let probe_members = Arc::new(StdMutex::new(Vec::new()));
     let probe_warnings = Arc::new(StdMutex::new(Vec::new()));
-    let mut probe_task_ids = Vec::new();
-    for (idx, staffing) in probes.iter().enumerate() {
-        let step_id = format!("review-probe-{idx}-step");
-        let task_id = format!("review-probe-{idx}-task");
+    for staffing in probes {
         let kind_id = format!("review.probe:{}", staffing.name);
-        tasks.push(Task {
-            id: task_id.clone(),
-            phase_id: investigate_phase_id.to_string(),
-            description: format!("probe seat `{}`", staffing.name),
-            step_ids: vec![step_id.clone()],
-            depends_on: vec![bundle_task_id.clone()],
-            role_id: None,
-            profile_name: None,
-            workdir: None,
-            image: None,
-        });
-        steps.insert(
-            step_id.clone(),
-            Step {
-                id: step_id.clone(),
-                task_id: task_id.clone(),
-                kind: kind_id.clone(),
-                status: NodeStatus::Planned,
-                config: serde_json::Value::Null,
-                started_ts: None,
-                completed_ts: None,
-                output: None,
-            },
+        debug_assert!(
+            steps.values().any(|s| s.kind == kind_id),
+            "the interpreted graph must have expanded a `{kind_id}` step for every staffed probe seat"
         );
         let kind = Arc::new(ReviewProbeStepKind::new(
             ctx.clone(),
@@ -4778,35 +4794,8 @@ pub fn build_review_graph(
         registry
             .register_alias(&format!("funnel.probe:{}", staffing.name), kind)
             .expect("each probe seat's legacy funnel alias id is unique per staffing name");
-        probe_task_ids.push(task_id);
     }
 
-    let dedup_step_id = "review-dedup-step".to_string();
-    let dedup_task_id = "review-dedup-task".to_string();
-    tasks.push(Task {
-        id: dedup_task_id.clone(),
-        phase_id: investigate_phase_id.to_string(),
-        description: "dedup probe flags — mechanism-family keying + anchor matching".to_string(),
-        step_ids: vec![dedup_step_id.clone()],
-        depends_on: probe_task_ids,
-        role_id: None,
-        profile_name: None,
-        workdir: None,
-        image: None,
-    });
-    steps.insert(
-        dedup_step_id.clone(),
-        Step {
-            id: dedup_step_id.clone(),
-            task_id: dedup_task_id.clone(),
-            kind: "review.dedup".to_string(),
-            status: NodeStatus::Planned,
-            config: serde_json::Value::Null,
-            started_ts: None,
-            completed_ts: None,
-            output: None,
-        },
-    );
     let dedup_kind = Arc::new(ReviewDedupStepKind { ctx: ctx.clone(), env: shared_env.clone() });
     registry.register(dedup_kind.clone()).expect("review.dedup registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
@@ -4814,32 +4803,6 @@ pub fn build_review_graph(
         .register_alias("funnel.dedup", dedup_kind)
         .expect("funnel.dedup legacy alias registered once");
 
-    let judge_step_id = "review-judge-step".to_string();
-    let judge_task_id = "review-judge-task".to_string();
-    tasks.push(Task {
-        id: judge_task_id.clone(),
-        phase_id: adjudicate_phase_id.to_string(),
-        description: "double-confirm judge — internal pass1/pass2 loop over deduped flags".to_string(),
-        step_ids: vec![judge_step_id.clone()],
-        depends_on: vec![dedup_task_id.clone()],
-        role_id: None,
-        profile_name: None,
-        workdir: None,
-        image: None,
-    });
-    steps.insert(
-        judge_step_id.clone(),
-        Step {
-            id: judge_step_id.clone(),
-            task_id: judge_task_id.clone(),
-            kind: "review.judge".to_string(),
-            status: NodeStatus::Planned,
-            config: json!({ "concurrency": judge_concurrency }),
-            started_ts: None,
-            completed_ts: None,
-            output: None,
-        },
-    );
     let judge_kind = Arc::new(ReviewJudgeStepKind {
         ctx: ctx.clone(),
         judge,
@@ -4852,32 +4815,6 @@ pub fn build_review_graph(
         .register_alias("funnel.judge", judge_kind)
         .expect("funnel.judge legacy alias registered once");
 
-    let verify_step_id = "review-verify-step".to_string();
-    let verify_task_id = "review-verify-task".to_string();
-    tasks.push(Task {
-        id: verify_task_id.clone(),
-        phase_id: report_phase_id.to_string(),
-        description: "verify — adjudicate confirmed findings".to_string(),
-        step_ids: vec![verify_step_id.clone()],
-        depends_on: vec![judge_task_id],
-        role_id: None,
-        profile_name: None,
-        workdir: None,
-        image: None,
-    });
-    steps.insert(
-        verify_step_id.clone(),
-        Step {
-            id: verify_step_id.clone(),
-            task_id: verify_task_id.clone(),
-            kind: "review.verify".to_string(),
-            status: NodeStatus::Planned,
-            config: serde_json::Value::Null,
-            started_ts: None,
-            completed_ts: None,
-            output: None,
-        },
-    );
     let verify_kind = Arc::new(ReviewVerifyStepKind {
         ctx: ctx.clone(),
         verify,
@@ -4890,32 +4827,25 @@ pub fn build_review_graph(
         .register_alias("funnel.verify", verify_kind)
         .expect("funnel.verify legacy alias registered once");
 
-    let synthesis_step_id = "review-synthesis-step".to_string();
-    let synthesis_task_id = "review-synthesis-task".to_string();
-    tasks.push(Task {
-        id: synthesis_task_id.clone(),
-        phase_id: report_phase_id.to_string(),
-        description: "synthesis — finalize tier counts + needs-check clustering".to_string(),
-        step_ids: vec![synthesis_step_id.clone()],
-        depends_on: vec![dedup_task_id.clone(), verify_task_id.clone()],
-        role_id: None,
-        profile_name: None,
-        workdir: None,
-        image: None,
-    });
-    steps.insert(
-        synthesis_step_id.clone(),
-        Step {
-            id: synthesis_step_id.clone(),
-            task_id: synthesis_task_id,
-            kind: "review.synthesis".to_string(),
-            status: NodeStatus::Planned,
-            config: serde_json::Value::Null,
-            started_ts: None,
-            completed_ts: None,
-            output: None,
-        },
-    );
+    // The interpreted graph's fixed ids for the two upstream tasks
+    // `ReviewSynthesisStepKind` reads from — derived from the ACTUAL
+    // interpreted `steps` map (never hardcoded) so a document/interpreter
+    // drift surfaces as a clear panic here, not a silent mismatch.
+    let dedup_task_id = steps
+        .values()
+        .find(|s| s.kind == "review.dedup")
+        .map(|s| s.task_id.clone())
+        .expect("interpreted \"review\" graph must have a review.dedup step");
+    let verify_task_id = steps
+        .values()
+        .find(|s| s.kind == "review.verify")
+        .map(|s| s.task_id.clone())
+        .expect("interpreted \"review\" graph must have a review.verify step");
+    let synthesis_step_id = steps
+        .values()
+        .find(|s| s.kind == "review.synthesis")
+        .map(|s| s.id.clone())
+        .expect("interpreted \"review\" graph must have a review.synthesis step");
 
     let synthesis_kind = Arc::new(ReviewSynthesisStepKind {
         ctx: ctx.clone(),
@@ -4928,15 +4858,6 @@ pub fn build_review_graph(
     registry
         .register_alias("funnel.synthesis", synthesis_kind)
         .expect("funnel.synthesis legacy alias registered once");
-
-    // `step_id -> Task.phase_id`, derived once from `tasks` (each Task
-    // already carries both) rather than threaded through every push site
-    // above.
-    for task in &tasks {
-        for step_id in &task.step_ids {
-            phase_id_of_step.insert(step_id.clone(), task.phase_id.clone());
-        }
-    }
 
     BuiltReviewGraph {
         tasks,
@@ -5132,6 +5053,10 @@ pub fn run_review_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `NodeStatus` is used only by this test module as of #1284 Packet 3
+    // (`build_review_graph` stopped constructing `Step` literals directly
+    // once it became a thin `mission_config::interpret` launcher).
+    use darkmux_crew::types::NodeStatus;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 

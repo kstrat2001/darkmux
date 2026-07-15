@@ -1,8 +1,8 @@
 {
   "id": "review",
   "name": "PR Review",
-  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux pr-review run` builds by hand today: investigate (resolve bundles from the diff, probe every staffed seat, dedup the flags) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). Authored + validated in Packet 1; NOT YET wired into execution (Packet 3) -- run_review_graph still calls build_review_graph directly.",
-  "schema_version": "1.0",
+  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux pr-review run` builds: investigate (resolve bundles from the diff, probe every staffed seat, dedup the flags) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of Packet 3, this document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config, resolves crew_staffing into the probe-template task's `expand` collection, and calls mission_config::interpret.",
+  "schema_version": "1.1",
   "inputs": [
     {
       "name": "diff",
@@ -31,8 +31,8 @@
     },
     {
       "name": "judge_concurrency",
-      "description": "Overrides the judge step's config.concurrency (darkmux_types::config_access::review_judge_concurrency, default 1). Optional -- the static config below ships the same default.",
-      "required": false
+      "description": "The judge step's real config.concurrency, resolved by the launcher from darkmux_types::config_access::review_judge_concurrency() (env > config.review.judge_concurrency > 1). ALWAYS supplied by the launcher as a step_config_override on review-judge-step -- the static `config.concurrency: 1` below is a documented DEFAULT for a human reading this file, never load-bearing at launch (the launcher always resolves+overrides it, it never reads the static value back out of this document).",
+      "required": true
     }
   ],
   "phases": [
@@ -54,7 +54,7 @@
         },
         {
           "id": "review-probe-template-task",
-          "description": "PLACEHOLDER for the probe stage. build_review_graph builds ONE task/step PER STAFFED PROBE SEAT (kind `review.probe:<seat-name>`, ids `review-probe-{idx}-task` / `review-probe-{idx}-step`) -- a count and a set of names only known once `crew_staffing` (see inputs) resolves. This schema has no per-seat repeat primitive yet, so this single task stands in for the whole stage. Packet 3's launcher must expand it into N real tasks (one per staffed seat, each depends_on review-bundle-task) before this config becomes an executable graph.",
+          "description": "TEMPLATE for the probe stage. build_review_graph builds ONE task/step PER STAFFED PROBE SEAT (kind `review.probe:<seat-name>`, ids `review-probe-{index}-task` / `review-probe-{index}-step`) -- a count and a set of names only known once `crew_staffing` (see inputs) resolves. The `expand` block below (#1284 Packet 3, schema 1.1) is the typed, interpretable primitive mission_config::interpret uses to turn this ONE template into N real tasks at launch -- the launcher resolves `probe_seats` from crew_staffing's staffed probe seats (in staffing order) and passes it as a LaunchParams.expansions entry.",
           "depends_on": [
             "review-bundle-task"
           ],
@@ -65,11 +65,13 @@
               "config": null
             }
           ],
-          "expands_per_staffed_seat": true,
-          "notes": [
-            "kind is a TEMPLATE -- the real per-seat kind id is `review.probe:<seat-name>`, registered into a per-run StepKindRegistry at composition time (Tier 3, #1352), not this generic `review.probe`.",
-            "after expansion, review-dedup-task's depends_on must list every EXPANDED probe task id, not just this template's id."
-          ]
+          "expand": {
+            "over": "probe_seats",
+            "task_id_pattern": "review-probe-{index}-task",
+            "step_id_pattern": "review-probe-{index}-step",
+            "kind_pattern": "{kind}:{name}",
+            "description_pattern": "probe seat `{name}`"
+          }
         },
         {
           "id": "review-dedup-task",

@@ -115,6 +115,40 @@ pub fn mission_path(mission_id: &str) -> PathBuf {
     mission_dir(mission_id).join("mission.json")
 }
 
+/// The `MissionEnvelope` JSON path under the per-mission directory, beside
+/// `mission.json` (#1284 Packet 3). Not versioned per-run — a mission
+/// re-run (e.g. `pr-review run`'s idempotent re-use of the same case id,
+/// see `build_mission_for_review`'s doc) overwrites the prior envelope with
+/// the new run's, matching how `mission.json`/the phase JSONs themselves
+/// already get overwritten by a re-run's own transitions.
+pub fn envelope_path(mission_id: &str) -> PathBuf {
+    mission_dir(mission_id).join("envelope.json")
+}
+
+/// Persist a [`crate::envelope::MissionEnvelope`] via the same atomic-rename
+/// `save_json` every other entity in this module uses — makes the envelope
+/// a real on-disk artifact instead of constructed-and-dropped, and is what
+/// makes a future graph-lens viewer (#1284 Packet 5) able to read a
+/// mission's last-run outcome without re-deriving it from flow records.
+pub fn save_envelope(mission_id: &str, envelope: &crate::envelope::MissionEnvelope) -> Result<()> {
+    save_json(&envelope_path(mission_id), envelope)
+}
+
+/// Load a mission's persisted [`crate::envelope::MissionEnvelope`], if one
+/// exists (a mission that hasn't finished a run yet, or predates Packet 3,
+/// has none — `Ok(None)`, not an error).
+pub fn load_envelope(mission_id: &str) -> Result<Option<crate::envelope::MissionEnvelope>> {
+    let path = envelope_path(mission_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let envelope = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(envelope))
+}
+
 /// Directory holding the mission's phase JSONs.
 ///
 /// **Sprint→Phase rename read-fallback:** pre-rename mission data nests its

@@ -1,0 +1,621 @@
+//! Config → executable graph interpreter (#1284 Packet 3, closes #1356's
+//! promise structurally — see the module doc on `mission_config` and
+//! `crates/darkmux-crew/src/mission_config/mod.rs`'s `ExpansionSpec`).
+//!
+//! [`interpret`] turns a parsed [`super::MissionConfig`] plus launch-time
+//! [`LaunchParams`] into the `Vec<Task>` + `BTreeMap<String, Step>` shape
+//! `darkmux-crew`'s `scheduler::run_step_graph` consumes — the SAME shape
+//! `build_review_graph` (`darkmux-lab::lab::review`) and `default_phase_graph`
+//! (`src/mission_run.rs`) used to build by hand. This module owns exactly
+//! three things, and only these three (per the packet's own scope — Tier 3
+//! `StepKind` construction/registration stays mission-owned, #1352):
+//!
+//!   1. the placeholder-prefix phase-id substitution rule ([`TaskConfig`]'s
+//!      doc in `mod.rs`) applied to every task/step id;
+//!   2. `depends_on` edge resolution, INCLUDING rewriting a dependency that
+//!      named a template task's id into the full set of that task's
+//!      expanded real copies;
+//!   3. the expansion primitive itself ([`super::ExpansionSpec`]) — turning
+//!      one `TaskConfig` template into N real Task/Step copies, one per
+//!      named item in a launcher-supplied collection.
+//!
+//! [`interpret`] does NOT construct `StepKind` instances, does NOT build a
+//! `StepKindRegistry`, and does NOT know what any `Step.kind` id actually
+//! DOES at runtime — a launcher calls [`interpret`], gets back real
+//! `Task`/`Step` values, and separately registers its own Tier 3 kinds
+//! against the SAME kind ids [`interpret`] produced (see
+//! `darkmux_lab::lab::review::build_review_graph` and `mission_run.rs`'s
+//! `default_phase_graph` for the two production launchers).
+//!
+//! [`interpret`] assumes the config is well-formed (document-wide-unique
+//! ids, no dangling `depends_on`) — the SAME assumption every other
+//! `mission_config` consumer makes; semantic validation is
+//! [`super::MissionConfig::validate`]'s separate job (contract 7), never
+//! re-run here. A malformed config produces an `Err` from a dangling
+//! `depends_on` reference (defensive, not a substitute for `validate`).
+
+use super::{MissionConfig, StepConfig};
+use crate::types::{NodeStatus, Step, Task};
+use anyhow::{bail, Result};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+/// Per-task overrides a launcher supplies at interpretation time, keyed by
+/// the [`TaskConfig`]'s OWN (pre-substitution, pre-expansion) `id` — stable
+/// across launches since it's the literal string in the document, unlike
+/// the composed real id (which depends on the launcher's own real phase
+/// id). Every field defaults to "keep the document's own value" — a
+/// launcher only sets what it actually needs to override.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskOverride {
+    pub role_id: Option<String>,
+    pub profile_name: Option<String>,
+    pub workdir: Option<PathBuf>,
+    pub image: Option<String>,
+    /// Overrides the whole rendered description (e.g. the coder-phase
+    /// launcher's `dispatch \`{role}\` into the worktree`, where `{role}`
+    /// is only known at launch).
+    pub description: Option<String>,
+}
+
+/// Everything a launcher supplies to [`interpret`] beyond the static
+/// document — every genuinely per-launch value [`super::MissionConfig::inputs`]
+/// documents the config as needing from its caller.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchParams {
+    /// `PhaseConfig.id` (the document's own id, possibly a placeholder
+    /// prefix) → the launcher's REAL composed phase id. A phase absent
+    /// from this map keeps its document id verbatim — the common case for
+    /// a config whose phase id already IS what the launcher wants.
+    pub phase_ids: BTreeMap<String, String>,
+    /// `TaskConfig.id` → override — see [`TaskOverride`].
+    pub task_overrides: BTreeMap<String, TaskOverride>,
+    /// `StepConfig.id` → replacement `config` value. REPLACES, never
+    /// merges, the document's own `config` — e.g. the review launcher
+    /// overriding `review-judge-step`'s `concurrency` with the operator's
+    /// resolved `config_access::review_judge_concurrency()`, never the
+    /// document's own static default (see `CLAUDE.md`'s judge_concurrency
+    /// decision for why the static JSON value is a documented default
+    /// only, never load-bearing at launch).
+    pub step_config_overrides: BTreeMap<String, serde_json::Value>,
+    /// [`super::ExpansionSpec::over`] → the ordered item NAMES the launcher
+    /// resolved for that collection (e.g. every staffed probe seat's name,
+    /// in staffing order). A task whose `expand.over` names a collection
+    /// missing from this map interprets as an EMPTY expansion (zero real
+    /// copies) — the same "reduced coverage, not a hard error" posture a
+    /// zero-seat crew already takes elsewhere in the review pipeline.
+    pub expansions: BTreeMap<String, Vec<String>>,
+}
+
+/// See the module doc. Returns the real `Vec<Task>` (document order,
+/// expanded tasks appearing in place of their template) + `BTreeMap<String,
+/// Step>` a `StepKindRegistry`-equipped caller hands to
+/// `scheduler::run_step_graph`.
+pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<Task>, BTreeMap<String, Step>)> {
+    let mut tasks: Vec<Task> = Vec::new();
+    let mut steps: BTreeMap<String, Step> = BTreeMap::new();
+    // Document-level TaskConfig.id -> the real Task id(s) it produced (len
+    // 1 for a non-expanding task, len N for an expanding one). Drives BOTH
+    // the depends_on rewrite pass below AND is how a dependent task's
+    // reference to a template resolves to every real expanded copy.
+    let mut expansion_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for phase in &config.phases {
+        let real_phase_id = substitute_phase_id(&phase.id, params);
+        for task_cfg in &phase.tasks {
+            let override_ = params.task_overrides.get(&task_cfg.id);
+            match &task_cfg.expand {
+                Some(spec) => {
+                    let step_cfg = task_cfg.steps.first().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "task `{}` declares `expand` but has no steps to expand",
+                            task_cfg.id
+                        )
+                    })?;
+                    let items = params.expansions.get(&spec.over).cloned().unwrap_or_default();
+                    let mut real_ids = Vec::with_capacity(items.len());
+                    for (index, name) in items.iter().enumerate() {
+                        let real_task_id = render(&spec.task_id_pattern, index, name);
+                        let real_step_id = render(&spec.step_id_pattern, index, name);
+                        let real_kind = render_kind(&spec.kind_pattern, &step_cfg.kind, index, name);
+                        let description = spec
+                            .description_pattern
+                            .as_deref()
+                            .map(|p| render(p, index, name))
+                            .or_else(|| task_cfg.description.clone())
+                            .unwrap_or_default();
+                        push_task(
+                            &mut tasks,
+                            &real_task_id,
+                            &real_phase_id,
+                            description,
+                            vec![real_step_id.clone()],
+                            override_,
+                            task_cfg.role_id.as_deref(),
+                        );
+                        push_step(
+                            &mut steps,
+                            &real_step_id,
+                            &real_task_id,
+                            &real_kind,
+                            step_config_for(step_cfg, params),
+                        );
+                        real_ids.push(real_task_id);
+                    }
+                    expansion_of.insert(task_cfg.id.clone(), real_ids);
+                }
+                None => {
+                    let real_task_id = substitute_id(&task_cfg.id, &phase.id, &real_phase_id);
+                    let mut step_ids = Vec::with_capacity(task_cfg.steps.len());
+                    for step_cfg in &task_cfg.steps {
+                        let real_step_id = substitute_id(&step_cfg.id, &phase.id, &real_phase_id);
+                        step_ids.push(real_step_id.clone());
+                        push_step(
+                            &mut steps,
+                            &real_step_id,
+                            &real_task_id,
+                            &step_cfg.kind,
+                            step_config_for(step_cfg, params),
+                        );
+                    }
+                    let description =
+                        task_cfg.description.clone().unwrap_or_default();
+                    push_task(
+                        &mut tasks,
+                        &real_task_id,
+                        &real_phase_id,
+                        description,
+                        step_ids,
+                        override_,
+                        task_cfg.role_id.as_deref(),
+                    );
+                    expansion_of.insert(task_cfg.id.clone(), vec![real_task_id]);
+                }
+            }
+        }
+    }
+
+    // Second pass: resolve every TaskConfig's `depends_on` now that
+    // `expansion_of` is complete for the WHOLE document — a dependency
+    // that named a template task's id resolves to ALL of that template's
+    // real expanded copies (dedup depending on every real probe task,
+    // never just the template's single placeholder id).
+    let real_index: BTreeMap<String, usize> =
+        tasks.iter().enumerate().map(|(i, t)| (t.id.clone(), i)).collect();
+    for phase in &config.phases {
+        for task_cfg in &phase.tasks {
+            let mut resolved_depends: Vec<String> = Vec::new();
+            for dep in &task_cfg.depends_on {
+                match expansion_of.get(dep) {
+                    Some(real_ids) => resolved_depends.extend(real_ids.iter().cloned()),
+                    None => bail!(
+                        "task `{}` depends_on unknown task id `{dep}` — the config must \
+                         validate cleanly (MissionConfig::validate) before interpretation",
+                        task_cfg.id
+                    ),
+                }
+            }
+            if resolved_depends.is_empty() {
+                continue;
+            }
+            if let Some(real_ids) = expansion_of.get(&task_cfg.id) {
+                for real_id in real_ids {
+                    if let Some(&idx) = real_index.get(real_id.as_str()) {
+                        tasks[idx].depends_on = resolved_depends.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((tasks, steps))
+}
+
+fn substitute_phase_id(doc_phase_id: &str, params: &LaunchParams) -> String {
+    params
+        .phase_ids
+        .get(doc_phase_id)
+        .cloned()
+        .unwrap_or_else(|| doc_phase_id.to_string())
+}
+
+/// The placeholder-prefix rule (`TaskConfig`'s doc in `mod.rs`): if `id` is
+/// literally prefixed by `"<doc_phase_id>-"`, replace that PREFIX with
+/// `"<real_phase_id>-"`, keeping everything after it unchanged. An id with
+/// no such prefix (the FIXED-id convention, e.g. `build_review_graph`'s
+/// `review-bundle-task`) passes through verbatim. Requires the literal `-`
+/// separator (not just any shared prefix) so a phase id like `"build"`
+/// doesn't accidentally match an unrelated id like `"buildup-task"`.
+fn substitute_id(id: &str, doc_phase_id: &str, real_phase_id: &str) -> String {
+    if real_phase_id == doc_phase_id {
+        return id.to_string();
+    }
+    let prefix = format!("{doc_phase_id}-");
+    match id.strip_prefix(prefix.as_str()) {
+        Some(rest) => format!("{real_phase_id}-{rest}"),
+        None => id.to_string(),
+    }
+}
+
+fn render(pattern: &str, index: usize, name: &str) -> String {
+    pattern.replace("{index}", &index.to_string()).replace("{name}", name)
+}
+
+fn render_kind(pattern: &str, template_kind: &str, index: usize, name: &str) -> String {
+    pattern
+        .replace("{kind}", template_kind)
+        .replace("{index}", &index.to_string())
+        .replace("{name}", name)
+}
+
+fn step_config_for(step_cfg: &StepConfig, params: &LaunchParams) -> serde_json::Value {
+    params
+        .step_config_overrides
+        .get(&step_cfg.id)
+        .cloned()
+        .unwrap_or_else(|| step_cfg.config.clone())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_task(
+    tasks: &mut Vec<Task>,
+    real_task_id: &str,
+    real_phase_id: &str,
+    description: String,
+    step_ids: Vec<String>,
+    override_: Option<&TaskOverride>,
+    doc_role_id: Option<&str>,
+) {
+    let role_id = override_
+        .and_then(|o| o.role_id.clone())
+        .or_else(|| doc_role_id.map(String::from));
+    let description = override_.and_then(|o| o.description.clone()).unwrap_or(description);
+    let profile_name = override_.and_then(|o| o.profile_name.clone());
+    let workdir = override_.and_then(|o| o.workdir.clone());
+    let image = override_.and_then(|o| o.image.clone());
+    tasks.push(Task {
+        id: real_task_id.to_string(),
+        phase_id: real_phase_id.to_string(),
+        description,
+        step_ids,
+        depends_on: Vec::new(),
+        role_id,
+        profile_name,
+        workdir,
+        image,
+    });
+}
+
+fn push_step(
+    steps: &mut BTreeMap<String, Step>,
+    real_step_id: &str,
+    real_task_id: &str,
+    kind: &str,
+    config: serde_json::Value,
+) {
+    steps.insert(
+        real_step_id.to_string(),
+        Step {
+            id: real_step_id.to_string(),
+            task_id: real_task_id.to_string(),
+            kind: kind.to_string(),
+            status: NodeStatus::Planned,
+            config,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mission_config::{ExpansionSpec, PhaseConfig, TaskConfig};
+    use std::collections::BTreeMap as Map;
+
+    fn step(id: &str, kind: &str, config: serde_json::Value) -> StepConfig {
+        StepConfig { id: id.to_string(), kind: kind.to_string(), config, extras: Map::new() }
+    }
+
+    fn task(id: &str, depends_on: &[&str], role_id: Option<&str>, steps: Vec<StepConfig>) -> TaskConfig {
+        TaskConfig {
+            id: id.to_string(),
+            description: Some(format!("do {id}")),
+            depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+            role_id: role_id.map(String::from),
+            steps,
+            expand: None,
+            extras: Map::new(),
+        }
+    }
+
+    fn phase(id: &str, tasks: Vec<TaskConfig>) -> PhaseConfig {
+        PhaseConfig { id: id.to_string(), description: None, tasks, extras: Map::new() }
+    }
+
+    fn doc(phases: Vec<PhaseConfig>) -> MissionConfig {
+        MissionConfig {
+            id: "m".to_string(),
+            name: "M".to_string(),
+            description: None,
+            schema_version: None,
+            inputs: Vec::new(),
+            phases,
+            extras: Map::new(),
+        }
+    }
+
+    #[test]
+    fn fixed_ids_pass_through_verbatim_when_phase_id_differs() {
+        // Mirrors review.json's convention — task/step ids never carry the
+        // phase-config id as a prefix, so substitution is a no-op even
+        // though the launcher supplies a DIFFERENT real phase id.
+        let cfg = doc(vec![phase(
+            "investigate",
+            vec![task("review-bundle-task", &[], None, vec![step("review-bundle-step", "review.bundle", serde_json::Value::Null)])],
+        )]);
+        let mut phase_ids = Map::new();
+        phase_ids.insert("investigate".to_string(), "pr-review-123-investigate".to_string());
+        let params = LaunchParams { phase_ids, ..Default::default() };
+
+        let (tasks, steps) = interpret(&cfg, &params).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "review-bundle-task", "fixed ids stay verbatim");
+        assert_eq!(tasks[0].phase_id, "pr-review-123-investigate", "Task.phase_id is still the REAL phase id");
+        assert_eq!(steps["review-bundle-step"].kind, "review.bundle");
+    }
+
+    #[test]
+    fn placeholder_prefix_ids_substitute_the_real_phase_id() {
+        // Mirrors coder-phase.json's convention — `build-coder` prefixed by
+        // the phase-config id `build`.
+        let cfg = doc(vec![phase(
+            "build",
+            vec![task("build-coder", &[], Some("coder"), vec![step("build-coder-step", "mission.coder", serde_json::Value::Null)])],
+        )]);
+        let mut phase_ids = Map::new();
+        phase_ids.insert("build".to_string(), "s1".to_string());
+        let params = LaunchParams { phase_ids, ..Default::default() };
+
+        let (tasks, steps) = interpret(&cfg, &params).unwrap();
+        assert_eq!(tasks[0].id, "s1-coder");
+        assert_eq!(tasks[0].phase_id, "s1");
+        assert!(steps.contains_key("s1-coder-step"));
+    }
+
+    #[test]
+    fn task_overrides_apply_role_workdir_image_and_description() {
+        let cfg = doc(vec![phase(
+            "build",
+            vec![task("build-coder", &[], Some("coder"), vec![step("build-coder-step", "mission.coder", serde_json::Value::Null)])],
+        )]);
+        let mut phase_ids = Map::new();
+        phase_ids.insert("build".to_string(), "s1".to_string());
+        let mut task_overrides = Map::new();
+        task_overrides.insert(
+            "build-coder".to_string(),
+            TaskOverride {
+                role_id: Some("reviewer-bot".to_string()),
+                workdir: Some(PathBuf::from("/tmp/wt")),
+                image: Some("rust:slim".to_string()),
+                description: Some("dispatch `reviewer-bot` into the worktree".to_string()),
+                ..Default::default()
+            },
+        );
+        let params = LaunchParams { phase_ids, task_overrides, ..Default::default() };
+
+        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        assert_eq!(tasks[0].role_id.as_deref(), Some("reviewer-bot"));
+        assert_eq!(tasks[0].workdir, Some(PathBuf::from("/tmp/wt")));
+        assert_eq!(tasks[0].image.as_deref(), Some("rust:slim"));
+        assert_eq!(tasks[0].description, "dispatch `reviewer-bot` into the worktree");
+    }
+
+    #[test]
+    fn doc_role_id_survives_when_no_override_is_supplied() {
+        let cfg = doc(vec![phase(
+            "build",
+            vec![task("build-verify", &["build-coder"], Some("code-reviewer"), vec![step("build-verify-step", "mission.verify", serde_json::Value::Null)]),
+                 task("build-coder", &[], Some("coder"), vec![step("build-coder-step", "mission.coder", serde_json::Value::Null)])],
+        )]);
+        let mut phase_ids = Map::new();
+        phase_ids.insert("build".to_string(), "s1".to_string());
+        let params = LaunchParams { phase_ids, ..Default::default() };
+
+        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        let verify = tasks.iter().find(|t| t.id == "s1-verify").unwrap();
+        assert_eq!(verify.role_id.as_deref(), Some("code-reviewer"));
+    }
+
+    #[test]
+    fn step_config_override_replaces_the_document_default() {
+        let cfg = doc(vec![phase(
+            "adjudicate",
+            vec![task(
+                "review-judge-task",
+                &[],
+                None,
+                vec![step("review-judge-step", "review.judge", serde_json::json!({"concurrency": 1}))],
+            )],
+        )]);
+        let mut step_config_overrides = Map::new();
+        step_config_overrides.insert("review-judge-step".to_string(), serde_json::json!({"concurrency": 5}));
+        let params = LaunchParams { step_config_overrides, ..Default::default() };
+
+        let (_tasks, steps) = interpret(&cfg, &params).unwrap();
+        assert_eq!(steps["review-judge-step"].config, serde_json::json!({"concurrency": 5}));
+    }
+
+    #[test]
+    fn step_config_falls_back_to_document_default_when_not_overridden() {
+        let cfg = doc(vec![phase(
+            "adjudicate",
+            vec![task(
+                "review-judge-task",
+                &[],
+                None,
+                vec![step("review-judge-step", "review.judge", serde_json::json!({"concurrency": 1}))],
+            )],
+        )]);
+        let params = LaunchParams::default();
+
+        let (_tasks, steps) = interpret(&cfg, &params).unwrap();
+        assert_eq!(steps["review-judge-step"].config, serde_json::json!({"concurrency": 1}));
+    }
+
+    /// The expansion primitive's central case — a template task expanding
+    /// into N real copies, one per staffed seat, AND a dependent task's
+    /// `depends_on` rewriting from the template id to every real expanded
+    /// id. Mirrors review.json's probe stage exactly.
+    #[test]
+    fn expansion_primitive_produces_one_copy_per_item_and_rewrites_dependents() {
+        let cfg = doc(vec![phase(
+            "investigate",
+            vec![
+                task("review-bundle-task", &[], None, vec![step("review-bundle-step", "review.bundle", serde_json::Value::Null)]),
+                TaskConfig {
+                    id: "review-probe-template-task".to_string(),
+                    description: Some("PLACEHOLDER".to_string()),
+                    depends_on: vec!["review-bundle-task".to_string()],
+                    role_id: None,
+                    steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
+                    expand: Some(ExpansionSpec {
+                        over: "probe_seats".to_string(),
+                        task_id_pattern: "review-probe-{index}-task".to_string(),
+                        step_id_pattern: "review-probe-{index}-step".to_string(),
+                        kind_pattern: "{kind}:{name}".to_string(),
+                        description_pattern: Some("probe seat `{name}`".to_string()),
+                        extras: Map::new(),
+                    }),
+                    extras: Map::new(),
+                },
+                task(
+                    "review-dedup-task",
+                    &["review-probe-template-task"],
+                    None,
+                    vec![step("review-dedup-step", "review.dedup", serde_json::Value::Null)],
+                ),
+            ],
+        )]);
+        let mut phase_ids = Map::new();
+        phase_ids.insert("investigate".to_string(), "investigate".to_string());
+        let mut expansions = Map::new();
+        expansions.insert("probe_seats".to_string(), vec!["alpha".to_string(), "bravo".to_string()]);
+        let params = LaunchParams { phase_ids, expansions, ..Default::default() };
+
+        let (tasks, steps) = interpret(&cfg, &params).unwrap();
+
+        // bundle + 2 expanded probes + dedup = 4 real tasks.
+        assert_eq!(tasks.len(), 4);
+        let by_id: BTreeMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        assert!(by_id.contains_key("review-probe-0-task"));
+        assert!(by_id.contains_key("review-probe-1-task"));
+        assert_eq!(by_id["review-probe-0-task"].description, "probe seat `alpha`");
+        assert_eq!(by_id["review-probe-1-task"].description, "probe seat `bravo`");
+        assert_eq!(by_id["review-probe-0-task"].depends_on, vec!["review-bundle-task".to_string()]);
+        assert_eq!(by_id["review-probe-1-task"].depends_on, vec!["review-bundle-task".to_string()]);
+
+        assert_eq!(steps["review-probe-0-step"].kind, "review.probe:alpha");
+        assert_eq!(steps["review-probe-1-step"].kind, "review.probe:bravo");
+
+        // the dedup task's depends_on rewrote from the SINGLE template id
+        // to BOTH real expanded probe task ids.
+        assert_eq!(
+            by_id["review-dedup-task"].depends_on,
+            vec!["review-probe-0-task".to_string(), "review-probe-1-task".to_string()]
+        );
+    }
+
+    #[test]
+    fn zero_items_in_the_expansion_collection_produces_zero_real_copies_and_an_empty_dependency() {
+        let cfg = doc(vec![phase(
+            "investigate",
+            vec![
+                TaskConfig {
+                    id: "review-probe-template-task".to_string(),
+                    description: None,
+                    depends_on: vec![],
+                    role_id: None,
+                    steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
+                    expand: Some(ExpansionSpec {
+                        over: "probe_seats".to_string(),
+                        task_id_pattern: "review-probe-{index}-task".to_string(),
+                        step_id_pattern: "review-probe-{index}-step".to_string(),
+                        kind_pattern: "{kind}:{name}".to_string(),
+                        description_pattern: None,
+                        extras: Map::new(),
+                    }),
+                    extras: Map::new(),
+                },
+                task(
+                    "review-dedup-task",
+                    &["review-probe-template-task"],
+                    None,
+                    vec![step("review-dedup-step", "review.dedup", serde_json::Value::Null)],
+                ),
+            ],
+        )]);
+        // NO "probe_seats" entry in expansions at all -- zero staffed seats.
+        let params = LaunchParams::default();
+
+        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        let by_id: BTreeMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        assert!(!by_id.contains_key("review-probe-0-task"), "zero seats -> zero expanded copies");
+        assert!(by_id["review-dedup-task"].depends_on.is_empty(), "an empty expansion resolves to an empty dependency, not a dangling reference");
+    }
+
+    #[test]
+    fn cross_phase_depends_on_resolves_through_expansion_map() {
+        // Mirrors `build_review_graph`'s synthesis -> dedup (investigate) +
+        // verify (report) cross-phase edge.
+        let cfg = doc(vec![
+            phase(
+                "investigate",
+                vec![task("review-dedup-task", &[], None, vec![step("review-dedup-step", "review.dedup", serde_json::Value::Null)])],
+            ),
+            phase(
+                "report",
+                vec![
+                    task("review-verify-task", &["review-dedup-task"], None, vec![step("review-verify-step", "review.verify", serde_json::Value::Null)]),
+                    task(
+                        "review-synthesis-task",
+                        &["review-dedup-task", "review-verify-task"],
+                        None,
+                        vec![step("review-synthesis-step", "review.synthesis", serde_json::Value::Null)],
+                    ),
+                ],
+            ),
+        ]);
+        let (tasks, _steps) = interpret(&cfg, &LaunchParams::default()).unwrap();
+        let by_id: BTreeMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        assert_eq!(
+            by_id["review-synthesis-task"].depends_on,
+            vec!["review-dedup-task".to_string(), "review-verify-task".to_string()]
+        );
+    }
+
+    #[test]
+    fn dangling_depends_on_errors_rather_than_panicking() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![task("t1", &["ghost"], None, vec![step("s1", "dispatch.internal", serde_json::Value::Null)])],
+        )]);
+        let err = interpret(&cfg, &LaunchParams::default()).unwrap_err();
+        assert!(err.to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn every_produced_step_has_planned_status_and_no_timestamps() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![task("t1", &[], None, vec![step("s1", "dispatch.internal", serde_json::Value::Null)])],
+        )]);
+        let (_tasks, steps) = interpret(&cfg, &LaunchParams::default()).unwrap();
+        let s = &steps["s1"];
+        assert_eq!(s.status, NodeStatus::Planned);
+        assert!(s.started_ts.is_none());
+        assert!(s.completed_ts.is_none());
+        assert!(s.output.is_none());
+    }
+}

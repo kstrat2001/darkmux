@@ -468,98 +468,61 @@ use std::sync::{Arc, Mutex};
 /// directly rather than through `task.role_id`). The worktree Task is
 /// purely procedural (git plumbing, no crew assignment) — its resource
 /// fields stay `None`.
+///
+/// (#1284 Packet 3) A THIN LAUNCHER as of this packet: loads the built-in
+/// "coder-phase" mission config (`crew::mission_config::load`), resolves
+/// this call's own per-launch parameters (the real phase id, the dispatched
+/// role, the worktree path, the image override) into
+/// `crew::mission_config::interpret::LaunchParams::task_overrides`, and
+/// calls `crew::mission_config::interpret` to materialize the real
+/// `Vec<Task>`/`BTreeMap<String, Step>`. Still builds the graph SHAPE only,
+/// not the registry — same contract as before this packet.
 fn default_phase_graph(
     phase_id: &str,
     role: &str,
     wt_path: &Path,
     image: Option<&str>,
 ) -> (Vec<Task>, std::collections::BTreeMap<String, crew::types::Step>) {
-    let worktree_task_id = format!("{phase_id}-worktree");
-    let coder_task_id = format!("{phase_id}-coder");
-    let verify_task_id = format!("{phase_id}-verify");
-    let worktree_step_id = format!("{phase_id}-worktree-step");
-    let coder_step_id = format!("{phase_id}-coder-step");
-    let verify_step_id = format!("{phase_id}-verify-step");
+    use crew::mission_config::{interpret, LaunchParams, TaskOverride};
 
-    let tasks = vec![
-        Task {
-            id: worktree_task_id.clone(),
-            phase_id: phase_id.to_string(),
-            description: "prepare the phase worktree".to_string(),
-            step_ids: vec![worktree_step_id.clone()],
-            depends_on: Vec::new(),
-            role_id: None,
-            profile_name: None,
-            workdir: None,
-            image: None,
-        },
-        Task {
-            id: coder_task_id.clone(),
-            phase_id: phase_id.to_string(),
-            description: format!("dispatch `{role}` into the worktree"),
-            step_ids: vec![coder_step_id.clone()],
-            depends_on: vec![worktree_task_id.clone()],
+    let loaded =
+        crew::mission_config::load("coder-phase").expect("built-in \"coder-phase\" mission config must load");
+
+    let mut phase_ids = std::collections::BTreeMap::new();
+    phase_ids.insert("build".to_string(), phase_id.to_string());
+
+    let mut task_overrides = std::collections::BTreeMap::new();
+    // `role`/`description` are ALWAYS overridden dynamically (matching the
+    // pre-Packet-3 hand-built Task literal above, which always wrote
+    // `role_id: Some(role.to_string())` and a dynamic `dispatch \`{role}\`
+    // into the worktree` description regardless of whether `role` happens
+    // to equal the document's own default "coder").
+    task_overrides.insert(
+        "build-coder".to_string(),
+        TaskOverride {
             role_id: Some(role.to_string()),
-            // (#984) mission run uses the default registry — no
-            // --profiles-file support on this verb.
-            profile_name: None,
             workdir: Some(wt_path.to_path_buf()),
             image: image.map(String::from),
+            description: Some(format!("dispatch `{role}` into the worktree")),
+            ..Default::default()
         },
-        Task {
-            id: verify_task_id.clone(),
-            phase_id: phase_id.to_string(),
-            description: "local QA — mechanical verify (code-reviewer)".to_string(),
-            step_ids: vec![verify_step_id.clone()],
-            depends_on: vec![coder_task_id.clone()],
-            role_id: Some("code-reviewer".to_string()),
-            profile_name: None,
-            workdir: Some(wt_path.to_path_buf()),
-            image: None,
-        },
-    ];
+    );
+    // The verify task's role_id ("code-reviewer") and description already
+    // match the document's own static defaults — only `workdir` (genuinely
+    // per-launch) needs an override.
+    task_overrides.insert(
+        "build-verify".to_string(),
+        TaskOverride { workdir: Some(wt_path.to_path_buf()), ..Default::default() },
+    );
 
-    let mut steps = std::collections::BTreeMap::new();
-    steps.insert(
-        worktree_step_id.clone(),
-        crew::types::Step {
-            id: worktree_step_id.clone(),
-            task_id: worktree_task_id,
-            kind: "mission.worktree".to_string(),
-            status: NodeStatus::Planned,
-            config: serde_json::Value::Null,
-            started_ts: None,
-            completed_ts: None,
-            output: None,
-        },
-    );
-    steps.insert(
-        coder_step_id.clone(),
-        crew::types::Step {
-            id: coder_step_id.clone(),
-            task_id: coder_task_id,
-            kind: "mission.coder".to_string(),
-            status: NodeStatus::Planned,
-            config: serde_json::Value::Null,
-            started_ts: None,
-            completed_ts: None,
-            output: None,
-        },
-    );
-    steps.insert(
-        verify_step_id.clone(),
-        crew::types::Step {
-            id: verify_step_id,
-            task_id: verify_task_id,
-            kind: "mission.verify".to_string(),
-            status: NodeStatus::Planned,
-            config: serde_json::Value::Null,
-            started_ts: None,
-            completed_ts: None,
-            output: None,
-        },
-    );
-    (tasks, steps)
+    let params = LaunchParams {
+        phase_ids,
+        task_overrides,
+        step_config_overrides: std::collections::BTreeMap::new(),
+        expansions: std::collections::BTreeMap::new(),
+    };
+
+    interpret(&loaded.config, &params).expect("built-in \"coder-phase\" config interprets cleanly")
 }
 
 /// Wraps the worktree-creation half of the old hand-written sequence
@@ -4402,6 +4365,29 @@ mod tests {
         for s in steps.values() {
             assert_eq!(s.status, NodeStatus::Planned);
         }
+    }
+
+    /// (#1284 Packet 3) The prior test only exercises `role == "coder"` —
+    /// the built-in `coder-phase` config's own DEFAULT, which can't
+    /// distinguish "the config's default happened to match" from "the
+    /// launcher's override is actually wired." A non-default role proves
+    /// the `TaskOverride` path: role_id AND the dynamic `dispatch
+    /// \`{role}\` into the worktree` description both come from the
+    /// LAUNCHER's override, not the document; the verify Task's role_id
+    /// stays "code-reviewer" (unaffected — it's a document default, not
+    /// something the coder role touches) and the image override threads
+    /// through unchanged.
+    #[test]
+    fn default_phase_graph_with_a_non_default_role_overrides_role_and_description() {
+        let wt_path = std::path::Path::new("/tmp/wt-s2");
+        let (tasks, _steps) = default_phase_graph("s2", "reviewer-bot", wt_path, Some("rust:slim"));
+
+        let by_id: std::collections::BTreeMap<&str, &Task> =
+            tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        assert_eq!(by_id["s2-coder"].role_id.as_deref(), Some("reviewer-bot"));
+        assert_eq!(by_id["s2-coder"].description, "dispatch `reviewer-bot` into the worktree");
+        assert_eq!(by_id["s2-coder"].image.as_deref(), Some("rust:slim"));
+        assert_eq!(by_id["s2-verify"].role_id.as_deref(), Some("code-reviewer"), "verify's role is untouched by the coder role override");
     }
 
     /// `MissionWorktreeStepKind` against a REAL git repo (no LMStudio, no

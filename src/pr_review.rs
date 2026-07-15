@@ -4360,4 +4360,73 @@ mod tests {
         let crew = ResolvedCrew { name: "empty-crew".into(), seats: std::collections::BTreeMap::new(), request_changes: false };
         assert_eq!(crew_model_summary(&crew), None);
     }
+
+    /// (#1284 Packet 3, closes #1356's promise STRUCTURALLY) `darkmux
+    /// pr-review run` (this file's `run_dispatch`, above) and `darkmux lab
+    /// review-bench --review` (`darkmux-lab`'s `review_bench.rs`, migrated
+    /// in #1355) must build their Task/Step graphs through the SAME
+    /// construction path — `review::build_review_graph` +
+    /// `review::run_review_graph`, which this packet made a thin
+    /// `mission_config::interpret` launcher — never a second, bespoke
+    /// graph-building function either module maintains on its own.
+    ///
+    /// A SOURCE-LEVEL structural check, mirroring #1352's StepKind-tiering
+    /// doctrine ("the physical location IS the enforceable test") one layer
+    /// up: neither call site can be exercised end-to-end in a unit test
+    /// without a live LMStudio, so this pins the invariant a runtime
+    /// assertion can't cheaply cover. #1356's own evidence was exactly this
+    /// class of regression — review-bench silently forked onto a separate
+    /// pre-#1348 driver (`run_review`/`run_review_impl`) after the graph
+    /// engine landed, undetected until a swarm audit found it. This test
+    /// fails BEFORE that class of regression ships again.
+    #[test]
+    fn pr_review_run_and_review_bench_construct_graphs_through_the_same_launcher() {
+        const PR_REVIEW_SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pr_review.rs"));
+        const REVIEW_BENCH_SRC: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/crates/darkmux-lab/src/lab/review_bench.rs"
+        ));
+
+        // A function DEFINITION line's name, given a source line trimmed of
+        // leading whitespace/visibility/async — `None` for a non-`fn` line.
+        fn defined_fn_name(line: &str) -> Option<&str> {
+            let t = line.trim_start();
+            let t = t.strip_prefix("pub(crate) ").or_else(|| t.strip_prefix("pub ")).unwrap_or(t);
+            let t = t.strip_prefix("async ").unwrap_or(t);
+            let rest = t.strip_prefix("fn ")?;
+            let end = rest.find(['(', '<', ' '])?;
+            Some(&rest[..end])
+        }
+
+        for (label, src) in [("pr_review.rs", PR_REVIEW_SRC), ("review_bench.rs", REVIEW_BENCH_SRC)] {
+            assert!(
+                src.contains("build_review_graph("),
+                "{label} must dispatch through review::build_review_graph"
+            );
+            assert!(
+                src.contains("run_review_graph("),
+                "{label} must dispatch through review::run_review_graph"
+            );
+            // Neither module DEFINES its own graph-building function — the
+            // two known launcher-name conventions this arc established
+            // (`build_review_graph`, `default_phase_graph`) both start with
+            // `build_`/`default_` and end with `_graph`; a bespoke second
+            // launcher (whatever its own name) would be caught by this
+            // shape unless deliberately misnamed to dodge it — a weaker
+            // guarantee than a real registry, but the physical-source-check
+            // precedent (#1352) accepts that tradeoff for the same reason.
+            let bespoke_graph_fns: Vec<&str> = src
+                .lines()
+                .filter_map(defined_fn_name)
+                .filter(|name| {
+                    (name.starts_with("build_") || name.starts_with("default_")) && name.ends_with("_graph")
+                })
+                .collect();
+            assert!(
+                bespoke_graph_fns.is_empty(),
+                "{label} defines its own graph-building fn(s) {bespoke_graph_fns:?} — \
+                 the config-driven launcher lives in ONE place (darkmux_lab::lab::review)"
+            );
+        }
+    }
 }

@@ -30,7 +30,9 @@ pub mod lifecycle;
 pub mod loader;
 // (#1284 Packet 1) Mission configs — missions as DATA. Schema + loader +
 // built-in transcriptions of `build_review_graph`/`default_phase_graph`'s
-// hand-built graphs. Does NOT wire configs into execution (Packet 3).
+// former hand-built graphs. Packet 3 added `mission_config::interpret`,
+// which those two functions (`darkmux-lab::lab::review`, `src/mission_run.rs`)
+// now call as thin launchers — the configs ARE the executable graphs.
 pub mod mission_config;
 pub mod pins;
 pub mod select;
