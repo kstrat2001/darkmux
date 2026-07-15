@@ -2448,7 +2448,7 @@ function renderMission(){
 
   const closedWarn = mstat==="closed" && phases.some(s=>s.status!=="complete"&&s.status!=="abandoned")
     ? `<div class="burnlbl"><span class="wallerr">⚠ mission Closed but a phase isn't terminal — see <code>darkmux mission status</code></span></div>` : '';
-  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)} ${missionBadge(mstat)}</h2>
+  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)} ${missionBadge(mstat)} <a class="splink" href="${"/mission/"+encodeURIComponent(mid)+"/graph"}" target="_blank" rel="noopener">graph →</a></h2>
     <div class="mgoal">${total} phase${total===1?'':'s'} · ${done} complete</div>
     <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} phases complete · ${pct}%</div>${closedWarn}</div>
     <div class="track"><div class="lbl">phases · run › qa › gate › ship</div>${rows}</div></div>`;
@@ -2479,7 +2479,7 @@ function renderMissionFromFlow(mid, mstat){
   const pct=total?Math.round(done/total*100):0;
   const machs=[...new Set(sessions.map(s=>s.machine))];
   const rows=sessions.map(s=>`<div class="sprow" data-act="session" data-arg="${esc(s.sid)}"><span class="sps ${s.status}">${s.status}</span><span class="spt">${esc(s.role)} · ${esc(s.machine)}</span><span class="spa">${esc(s.model)}</span></div>`).join("")||`<div class="none">no dispatches at this point in the timeline</div>`;
-  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)} ${missionBadge(mstat)}</h2>
+  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)} ${missionBadge(mstat)} <a class="splink" href="${"/mission/"+encodeURIComponent(mid)+"/graph"}" target="_blank" rel="noopener">graph →</a></h2>
     <div class="mgoal">${total} dispatch${total===1?'':'es'} across ${machs.length} machine${machs.length===1?'':'s'}${machs.length?' · '+esc(machs.join(', ')):''}</div>
     <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} dispatches complete · ${pct}%${active?' · '+active+' in flight':''}${errored?` · <span class="wallerr">${errored} errored</span>`:''}</div></div>
     <div class="track"><div class="lbl">dispatches</div>${rows}</div></div>`;
