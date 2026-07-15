@@ -1,38 +1,103 @@
 {
   "id": "review",
   "name": "PR Review",
-  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux pr-review run` builds: investigate (resolve bundles from the diff, probe every staffed seat, dedup the flags) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of Packet 3, this document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config, resolves crew_staffing into the probe-template task's `expand` collection, and calls mission_config::interpret.",
+  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired from `darkmux pr-review run` in Packet 4b): investigate (resolve bundles from the diff, probe every staffed seat, dedup the flags) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of Packet 3, this document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config, resolves crew_staffing into the probe-template task's `expand` collection, and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
   "schema_version": "1.1",
   "inputs": [
     {
-      "name": "diff",
-      "description": "The unified diff text under review (ReviewStepContext.diff). Fed to every probe/judge/verify dispatch.",
+      "name": "diff_file",
+      "description": "Path to the unified diff file under review. `mission_launch_review::launch` reads it into ReviewStepContext.diff and feeds it to every probe/judge/verify dispatch. Required unconditionally -- even a `from_envelope` synthesis-only launch needs it, to resolve each finding's quoted anchor back to a diff line. Old flag: `--diff`.",
       "required": true
     },
     {
       "name": "case_id",
-      "description": "Unique id for this review run (ReviewStepContext.case_id) -- correlates flow records and the review envelope.",
-      "required": true
+      "description": "Unique id for this review run (ReviewStepContext.case_id) -- correlates flow records and the review envelope, and seeds the minted mission's instance id. LAUNCHER-DERIVED when absent: `owner/repo@head_sha` for a GitHub source, the worktree path, or `local` -- an explicit value always wins. Never asked of the operator by the generic missing-inputs gate (mirrors `coder-phase`'s `mission_id` input).",
+      "required": false
+    },
+    {
+      "name": "worktree",
+      "description": "Local checkout directory to bundle from. Alternative to `github` + `head_sha` (mutually exclusive; exactly one source is required unless `from_envelope`). Old flag: `--worktree`.",
+      "required": false
+    },
+    {
+      "name": "github",
+      "description": "GitHub source `owner/repo` -- bundles via the GitHub API, no local checkout. Requires `head_sha`. Old flag: `--github`.",
+      "required": false
+    },
+    {
+      "name": "head_sha",
+      "description": "Commit SHA to read file content at (GitHub source only). Old flag: `--head-sha`.",
+      "required": false
+    },
+    {
+      "name": "intent_file",
+      "description": "Path to a file carrying the author's stated intent for the change (PR title + description, one blob), fed into the JUDGE prompt only (ReviewStepContext.intent_body; intent_title stays empty -- matches the retired CLI). Absent -> \"(no description provided)\". Old flag: `--intent-file`.",
+      "required": false
+    },
+    {
+      "name": "crew",
+      "description": "Crew name from profiles.json's \"crews\" map, staffing the review-probe/review-judge/review-verify seats. Required unless `from_envelope` (synthesis-only needs no crew). Old flag: `--crew`.",
+      "required": false
+    },
+    {
+      "name": "mode",
+      "description": "Model-cycling mode: sequential | parallel | auto (default auto). Old flag: `--mode`.",
+      "required": false
+    },
+    {
+      "name": "k",
+      "description": "Overrides every review-probe staffing's draw count (k). Old flag: `--k`.",
+      "required": false
+    },
+    {
+      "name": "envelope_out",
+      "description": "Path to write the full review envelope (pretty JSON). Old flag: `--envelope-out`.",
+      "required": false
+    },
+    {
+      "name": "emit",
+      "description": "Path to write the rendered `{mode, review, comment}` payload. `-` (or omitted) writes to stdout -- a CONTRACT the CI workflow parses byte-for-byte, so `mission launch` prints no decorative banner ahead of it for this config. Old flag: `--emit`.",
+      "required": false
+    },
+    {
+      "name": "profiles",
+      "description": "Override path for profiles.json (else DARKMUX_PROFILES / the default resolution). Old flag: `--profiles-file`.",
+      "required": false
+    },
+    {
+      "name": "attribution",
+      "description": "Attribution text for the posted footer (#1113) -- the default derives \"where the model ran\" from the envelope's own member records. Old flag: `--attribution`.",
+      "required": false
+    },
+    {
+      "name": "bundler",
+      "description": "External bundler command (`<cmd> --worktree <dir> --diff <file>`), standing in for the built-in bundler. Old flag: `--bundler`.",
+      "required": false
+    },
+    {
+      "name": "charges_file",
+      "description": "Re-judge a previously-recorded flag list without re-running the probe (run_judge_only) -- the bundler still runs, since the judge needs the code each flag's bundle_id refers to. Mints NO mission (same as the retired CLI). Old flag: `--charges-file`.",
+      "required": false
+    },
+    {
+      "name": "from_envelope",
+      "description": "Synthesis-only: read a previously-written envelope_out and emit the rendered payload -- zero model calls, zero bundling, zero mission minted. The CI-testable path. Old flag: `--from-envelope`.",
+      "required": false
     },
     {
       "name": "intent_title",
-      "description": "PR title, gives probes/judges the change's stated intent (ReviewStepContext.intent_title).",
-      "required": true
-    },
-    {
-      "name": "intent_body",
-      "description": "PR body/description (ReviewStepContext.intent_body).",
-      "required": true
+      "description": "INTERNALLY DERIVED, never operator-supplied -- `mission_launch_review::run_dispatch` always passes an empty string (matches the retired CLI's own RunOpts shape, which carried one intent blob with no separate title field). ReviewStepContext.intent_title.",
+      "required": false
     },
     {
       "name": "crew_staffing",
-      "description": "Resolved probe/judge/verify seat staffing (CrewStaffingSnapshot / ResolvedSeatStaffing) from the operator's crew config. Determines HOW MANY review.probe:<seat-name> tasks the investigate phase's probe-template task expands into at launch time -- see the 'review-probe-template' task's notes below. This is the single biggest thing this schema cannot express yet: a config-time repeat-per-staffed-seat primitive does not exist (#1284 Packet 1 finding; Packet 3 must decide how a launcher expands this task).",
-      "required": true
+      "description": "Resolved probe/judge/verify seat staffing (CrewStaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from the resolved `crew` input -- never a literal CLI input. Determines HOW MANY review.probe:<seat-name> tasks the investigate phase's probe-template task expands into at launch time -- see the 'review-probe-template' task's notes below.",
+      "required": false
     },
     {
       "name": "judge_concurrency",
-      "description": "The judge step's real config.concurrency, resolved by the launcher from darkmux_types::config_access::review_judge_concurrency() (env > config.review.judge_concurrency > 1). ALWAYS supplied by the launcher as a step_config_override on review-judge-step -- the static `config.concurrency: 1` below is a documented DEFAULT for a human reading this file, never load-bearing at launch (the launcher always resolves+overrides it, it never reads the static value back out of this document).",
-      "required": true
+      "description": "The judge step's real config.concurrency, resolved by the launcher from darkmux_types::config_access::review_judge_concurrency() (env > config.review.judge_concurrency > 1) -- never a literal CLI input. ALWAYS supplied by the launcher as a step_config_override on review-judge-step -- the static `config.concurrency: 1` below is a documented DEFAULT for a human reading this file, never load-bearing at launch.",
+      "required": false
     }
   ],
   "phases": [

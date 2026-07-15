@@ -833,8 +833,8 @@ fn review_from_funnel(env: &super::review::ReviewEnvelope) -> Review {
 /// (#1247 Part 1, lab-vs-fleet scope boundary) Per-run-local JSONL sink for
 /// the funnel driver's observability records — `review-bench --funnel`'s
 /// wiring of `review::ReviewEmitter`. Deliberately NOT `darkmux_flow::record`
-/// (the real, engagement-scoped flow stream `darkmux pr-review run` writes
-/// through): a bench run dispatches many cases in one process and can emit
+/// (the real, engagement-scoped flow stream `darkmux mission launch review`
+/// writes through): a bench run dispatches many cases in one process and can emit
 /// hundreds of per-flag ruling records, and that volume must never spam an
 /// operator's real engagement flow stream — see the "lab vs fleet scope
 /// boundary" project memory. `path` is `funnel-events.jsonl`, written beside
@@ -940,8 +940,8 @@ fn run_funnel_case(
         .with_context(|| format!("slicing bundle code for case {}", c.id))?;
 
     // (#1355 follow-up) Dispatches through the SAME `build_review_graph` +
-    // `run_review_graph` engine `darkmux pr-review run` uses in production
-    // — not the old sequential `run_review`/`run_review_impl` driver. Bench
+    // `run_review_graph` engine `darkmux mission launch review` uses in
+    // production — not the old sequential `run_review`/`run_review_impl` driver. Bench
     // was already doing REAL dispatch (its retired `chat` closure was a
     // byte-for-byte duplicate of `dispatch_chat`, per its own "Texts
     // identical either way (contract 6)" comment) — the only thing this
@@ -3042,9 +3042,9 @@ mod tests {
     /// `LocalJsonlEmitter` — never the fleet stream — and (the new
     /// assertion) carry no `dispatch start`/`dispatch complete`/`dispatch
     /// error` bookends. Honest scope note: the REAL enforcement is the
-    /// crate graph — `pr-review run`'s `with_dispatch_bookends` wrapper
-    /// lives in the binary's `pr_review` module, which this crate cannot
-    /// depend on, so `run_funnel_case` structurally cannot reach it and
+    /// crate graph — `mission launch review`'s `with_dispatch_bookends`
+    /// wrapper lives in the binary's `mission_launch_review` module, which
+    /// this crate cannot depend on, so `run_funnel_case` structurally cannot reach it and
     /// this test cannot fail from that wrapper specifically being wired
     /// in. What it DOES pin is the observable contract that the bench
     /// emitter's stream stays pure funnel vocabulary: a future bookend

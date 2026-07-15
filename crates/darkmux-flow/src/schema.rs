@@ -122,7 +122,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.17.0";
 //           No struct/field change — same `payload` blob every other richer
 //           action already uses. Additive: older readers ignore the unknown
 //           actions. Emitted through TWO sinks depending on caller
-//           (lab-vs-fleet scope boundary): `darkmux pr-review run` writes to
+//           (lab-vs-fleet scope boundary): `darkmux mission launch review` writes to
 //           the real flow stream via this crate; `darkmux lab review-bench
 //           --funnel` writes to a per-run-local `funnel-events.jsonl` file
 //           instead, never this stream — so existing AuditFileSink chains are

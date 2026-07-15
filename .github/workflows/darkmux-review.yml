@@ -13,8 +13,8 @@
 # launches it (`gh workflow run darkmux-review.yml -f pr=<n>`), and even then the
 # job NEVER checks out the reviewed PR's code: it reads only the PR *diff* via
 # the API (data, not executed) and feeds it to the sandboxed, network-isolated
-# internal runtime. The review pipeline's `--github` file source (inside the `darkmux
-# pr-review run` dispatch below) fetches changed-file + one-hop-import
+# internal runtime. The review pipeline's `github` input (inside the `darkmux
+# mission launch review` dispatch below) fetches changed-file + one-hop-import
 # CONTENTS via the same GitHub API — also read as data and never executed,
 # the same trust class as the diff. The repo checkout below is of trusted
 # `main` (the review tooling), not the PR. Runner registration + prerequisites:
@@ -206,7 +206,7 @@ jobs:
             case "$K" in *[!0-9]*) echo "k input must be digits only"; exit 1 ;; esac
           fi
           # Model selection lives on the MACHINE, not in this public workflow
-          # (#1054): `--crew` NAMES a crew (default review-deep, overridable via
+          # (#1054): `crew` NAMES a crew (default review-deep, overridable via
           # the `crew` workflow input, or without editing this file via the
           # DARKMUX_REVIEW_CREW repo/environment variable) whose seats and
           # staffing profiles/models are defined in the runner's
@@ -215,27 +215,35 @@ jobs:
           # Resilient: a hiccup leaves no/empty envelope; the review dispatch's own
           # degraded-mode handling (below) turns that into a loud comment plus
           # a failed run rather than a silent green check.
-          # --bundler: darkmux-public's own source is Rust, not the
+          # `bundler`: darkmux-public's own source is Rust, not the
           # built-in bundler's TypeScript — without this every self-review
           # produced 0 bundles -> degenerate (darkmux#1319). Points at the
           # reference plugin built above, run through the SAME public
-          # --bundler seam a third-party plugin author would use.
+          # `bundler` input seam a third-party plugin author would use.
           #
           # Invoked via the explicit $DARKMUX_BIN path built above (#1359),
           # NOT a bare `darkmux` PATH lookup — guarantees this dispatch runs
           # the binary built from this run's own trusted-main checkout, not
           # whatever install happens to sit on the runner's PATH.
-          "$DARKMUX_BIN" pr-review run \
-            --github "$REPO" \
-            --head-sha "$HEAD_SHA" \
-            --diff "$RUNNER_TEMP/qa/pr.diff" \
-            --intent-file "$RUNNER_TEMP/qa/intent.txt" \
-            --crew "$CREW" \
-            --mode "$MODE" \
-            --bundler "$BUNDLER_RUST_BIN" \
-            ${K:+--k "$K"} \
-            --envelope-out "$RUNNER_TEMP/qa/envelope.json" \
-            --emit "$RUNNER_TEMP/qa/rendered.json" \
+          #
+          # (#1284 Packet 4b) `pr-review run` retired into `mission launch
+          # review` — every old CLI flag maps one-to-one onto a `--param
+          # key=value` input declared in templates/builtin/mission-configs/
+          # review.json; see that config's own `inputs` doc for the mapping
+          # table. `--timeout` is the ONE exception: it stayed the generic
+          # `mission launch` CLI flag every config-launched dispatch shares,
+          # rather than becoming its own `--param`.
+          "$DARKMUX_BIN" mission launch review \
+            --param "github=$REPO" \
+            --param "head_sha=$HEAD_SHA" \
+            --param "diff_file=$RUNNER_TEMP/qa/pr.diff" \
+            --param "intent_file=$RUNNER_TEMP/qa/intent.txt" \
+            --param "crew=$CREW" \
+            --param "mode=$MODE" \
+            --param "bundler=$BUNDLER_RUST_BIN" \
+            ${K:+--param "k=$K"} \
+            --param "envelope_out=$RUNNER_TEMP/qa/envelope.json" \
+            --param "emit=$RUNNER_TEMP/qa/rendered.json" \
             --timeout 3600 || true
 
       - name: Post the review (inline comments, or summary fallback)

@@ -664,7 +664,10 @@ fn persist_and_maybe_start(
     }
     if start {
         eprintln!("mission propose: --start flag set, launching `{}` …", p.mission.id);
-        crate::mission_launch::launch(&p.mission.id, None, &[], 600)
+        // `None` -> per-config default (600 for the generic path; a proposed
+        // config is never `review`, but the resolution lives in one place —
+        // see `mission_launch::launch`'s doc).
+        crate::mission_launch::launch(&p.mission.id, None, &[], None)
     } else {
         eprintln!(
             "next: `darkmux mission launch {}` to begin (or pass `--start` next time)",

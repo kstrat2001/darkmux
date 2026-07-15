@@ -276,7 +276,7 @@ pub struct MissionBoardConfig {
 
 /// (#1349) The PR-review pipeline's own tuning knobs — separate from
 /// `RuntimeBehaviorConfig`/`RemoteConfig` because they're specific to
-/// `darkmux pr-review run`'s driver (`darkmux_lab::lab::review`), not
+/// `darkmux mission launch review`'s driver (`darkmux_lab::lab::review`), not
 /// general dispatch behavior.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReviewConfig {

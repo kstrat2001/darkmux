@@ -1187,7 +1187,8 @@ fn crew_dispatch_message_from_file_flag_contract() {
         );
 }
 
-// ── pr-review run integration tests (#1222 Phase B packet 5) ──────────────
+// ── `mission launch review` integration tests (#1284 Packet 4b — retired
+// from `pr-review run`, #1222 Phase B packet 5) ────────────────────────────
 
 /// A small diff whose one added line ("const b = 2;") lands at new-side
 /// line 2 of src/x.ts — the anchor the canned envelope's confirmed flag
@@ -1259,14 +1260,15 @@ fn pr_review_run_from_envelope_synthesizes_confirmed_review_to_stdout() {
     let output = Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "pr-review",
-            "run",
-            "--from-envelope",
-            envelope_path.to_str().unwrap(),
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--emit",
-            "-",
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            "emit=-",
         ])
         .output()
         .unwrap();
@@ -1308,16 +1310,17 @@ fn pr_review_run_from_envelope_also_writes_envelope_out() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "pr-review",
-            "run",
-            "--from-envelope",
-            envelope_path.to_str().unwrap(),
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--envelope-out",
-            out_path.to_str().unwrap(),
-            "--emit",
-            emit_path.to_str().unwrap(),
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            &format!("envelope_out={}", out_path.to_str().unwrap()),
+            "--param",
+            &format!("emit={}", emit_path.to_str().unwrap()),
         ])
         .assert()
         .success();
@@ -1332,12 +1335,13 @@ fn pr_review_run_from_envelope_also_writes_envelope_out() {
     assert_eq!(r["mode"], "review");
 }
 
-/// (#1311, part of #1278) The dependency-free liveness FLOOR: `pr-review run`
-/// emits phase markers to BOTH stderr and a `<darkmux-home>/liveness/<pid>.log`
-/// heartbeat file, in order. Driven offline via `--from-envelope` (no model,
-/// no keychain, no network) so it exercises `cmd_run`'s early path — the
-/// markers a real hang would leave behind. `DARKMUX_HOME` points the floor's
-/// home resolution at the tempdir so the heartbeat file is inspectable.
+/// (#1311, part of #1278) The dependency-free liveness FLOOR: `mission
+/// launch review` emits phase markers to BOTH stderr and a
+/// `<darkmux-home>/liveness/<pid>.log` heartbeat file, in order. Driven
+/// offline via `from_envelope` (no model, no keychain, no network) so it
+/// exercises `mission_launch_review::launch`'s early path — the markers a
+/// real hang would leave behind. `DARKMUX_HOME` points the floor's home
+/// resolution at the tempdir so the heartbeat file is inspectable.
 #[test]
 fn pr_review_run_emits_liveness_floor_markers_in_order() {
     let tmp = TempDir::new().unwrap();
@@ -1350,14 +1354,15 @@ fn pr_review_run_emits_liveness_floor_markers_in_order() {
         .unwrap()
         .env("DARKMUX_HOME", tmp.path())
         .args([
-            "pr-review",
-            "run",
-            "--from-envelope",
-            envelope_path.to_str().unwrap(),
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--emit",
-            "-",
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            "emit=-",
         ])
         .output()
         .unwrap();
@@ -1400,8 +1405,10 @@ fn assert_in_order(haystack: &str, needles: &[&str], label: &str) {
     }
 }
 
-/// `--worktree` and `--github` are mutually exclusive — clap catches it
-/// before any handler code runs (no live LMStudio / bundler needed).
+/// `worktree` and `github` are mutually exclusive — `mission_launch_review::
+/// resolve_source` enforces it manually now (`mission launch` has no clap
+/// `conflicts_with`/`requires` pairing across `--param` inputs the way the
+/// retired `pr-review run` flags did).
 #[test]
 fn pr_review_run_worktree_and_github_conflict() {
     let tmp = TempDir::new().unwrap();
@@ -1411,25 +1418,26 @@ fn pr_review_run_worktree_and_github_conflict() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "pr-review",
-            "run",
-            "--worktree",
-            tmp.path().to_str().unwrap(),
-            "--github",
-            "kstrat2001/darkmux",
-            "--head-sha",
-            "deadbeef",
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--crew",
-            "whatever",
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("worktree={}", tmp.path().to_str().unwrap()),
+            "--param",
+            "github=kstrat2001/darkmux",
+            "--param",
+            "head_sha=deadbeef",
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            "crew=whatever",
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
+        .stderr(predicate::str::contains("mutually exclusive"));
 }
 
-/// `--github` without `--head-sha` is also rejected by clap (`requires`).
+/// `github` without `head_sha` is also rejected — loud and named.
 #[test]
 fn pr_review_run_github_without_head_sha_rejected() {
     let tmp = TempDir::new().unwrap();
@@ -1439,21 +1447,22 @@ fn pr_review_run_github_without_head_sha_rejected() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "pr-review",
-            "run",
-            "--github",
-            "kstrat2001/darkmux",
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--crew",
-            "whatever",
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            "github=kstrat2001/darkmux",
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            "crew=whatever",
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("head-sha").or(predicate::str::contains("head_sha")));
+        .stderr(predicate::str::contains("head_sha"));
 }
 
-/// A real (non `--from-envelope`) run with no `--crew` fails loud, naming
+/// A real (non `from_envelope`) run with no `crew` input fails loud, naming
 /// the requirement, before any bundling/dispatch happens.
 #[test]
 fn pr_review_run_missing_crew_errors_loudly() {
@@ -1465,18 +1474,19 @@ fn pr_review_run_missing_crew_errors_loudly() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "pr-review",
-            "run",
-            "--worktree",
-            tmp.path().to_str().unwrap(),
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--profiles-file",
-            missing_profiles.to_str().unwrap(),
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("worktree={}", tmp.path().to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            &format!("profiles={}", missing_profiles.to_str().unwrap()),
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--crew is required"));
+        .stderr(predicate::str::contains("input `crew` is required"));
 }
 
 // ─── review-bench --funnel flag plumbing (#1222 Phase B packet 7) ─────────
@@ -1966,26 +1976,27 @@ fn pr_review_run_envelope_out_unwritable_dir_fails_loudly() {
     let output = Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "pr-review",
-            "run",
-            "--from-envelope",
-            envelope_path.to_str().unwrap(),
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--envelope-out",
-            bad_out.to_str().unwrap(),
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            &format!("envelope_out={}", bad_out.to_str().unwrap()),
         ])
         .output()
         .unwrap();
     assert_eq!(
         output.status.code(),
         Some(1),
-        "an unwritable --envelope-out dir must exit 1, stdout={} stderr={}",
+        "an unwritable envelope_out dir must exit 1, stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("writing --envelope-out"), "{stderr}");
+    assert!(stderr.contains("writing envelope_out"), "{stderr}");
 }
 
 /// A degenerate envelope routed through `--from-envelope` still exits
@@ -2015,14 +2026,15 @@ fn pr_review_run_from_envelope_degenerate_exits_zero_with_degraded_mode() {
     let output = Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "pr-review",
-            "run",
-            "--from-envelope",
-            envelope_path.to_str().unwrap(),
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--emit",
-            "-",
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            "emit=-",
         ])
         .output()
         .unwrap();
@@ -2091,42 +2103,41 @@ fn pr_review_run_malformed_charges_file_errors_loudly() {
     let output = Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "pr-review",
-            "run",
-            "--worktree",
-            worktree_dir.to_str().unwrap(),
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--crew",
-            "test-crew",
-            "--profiles-file",
-            profiles_path.to_str().unwrap(),
-            "--bundler",
-            bundler_path.to_str().unwrap(),
-            "--charges-file",
-            charges_path.to_str().unwrap(),
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("worktree={}", worktree_dir.to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            "crew=test-crew",
+            "--param",
+            &format!("profiles={}", profiles_path.to_str().unwrap()),
+            "--param",
+            &format!("bundler={}", bundler_path.to_str().unwrap()),
+            "--param",
+            &format!("charges_file={}", charges_path.to_str().unwrap()),
         ])
         .output()
         .unwrap();
     assert_eq!(
         output.status.code(),
         Some(1),
-        "malformed --charges-file must exit loud, stdout={} stderr={}",
+        "malformed charges_file must exit loud, stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("charges-file"), "{stderr}");
+    assert!(stderr.contains("charges_file"), "{stderr}");
     assert!(stderr.contains("flag list"), "{stderr}");
 }
 
-/// `cmd_run`'s `--from-envelope` ignored-flag warning (src/pr_review.rs)
-/// now surfaces `--bundler` as a dispatch-shaping flag with nothing to
-/// shape when synthesis-only (`--k` follows the same `ignored` Vec and
-/// warning path) — operator sovereignty: surface, never silently ignore.
-/// Fixed in the #1222 Phase B follow-up (formerly an `#[ignore]`d
-/// intended-behavior test pinned against a bug found during the packet-5
-/// coverage sweep).
+/// `mission_launch_review::launch`'s `from_envelope` ignored-input warning
+/// (src/mission_launch_review.rs) surfaces `bundler` as a dispatch-shaping
+/// input with nothing to shape when synthesis-only (`k` follows the same
+/// `ignored` Vec and warning path) — operator sovereignty: surface, never
+/// silently ignore.
 #[test]
 fn pr_review_run_bundler_should_warn_ignored_with_from_envelope() {
     let tmp = TempDir::new().unwrap();
@@ -2138,23 +2149,24 @@ fn pr_review_run_bundler_should_warn_ignored_with_from_envelope() {
     let output = Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "pr-review",
-            "run",
-            "--from-envelope",
-            envelope_path.to_str().unwrap(),
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--bundler",
-            "/nonexistent-bundler-binary",
-            "--emit",
-            "-",
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("from_envelope={}", envelope_path.to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            "bundler=/nonexistent-bundler-binary",
+            "--param",
+            "emit=-",
         ])
         .output()
         .unwrap();
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--bundler"),
-        "expected an ignored-flag warning naming --bundler: {stderr}"
+        stderr.contains("bundler"),
+        "expected an ignored-flag warning naming `bundler`: {stderr}"
     );
 }
