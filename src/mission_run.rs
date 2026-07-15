@@ -71,7 +71,11 @@ fn emit_run_record(
 /// `cycleStage()`, `darkmux-serve`'s `resolve_session` (the `/diff`
 /// endpoint), and `session_failed_verifiers` below all filter on `kind`
 /// rather than a per-purpose action string now.
-fn emit_step_result(
+// (#1284 Packet 4a) `pub(crate)` — `mission_launch.rs` reuses this exact
+// helper for the SAME `"step result"` flow-record shape when it runs the
+// coder-phase graph through the config-launched path, rather than
+// reinventing a second vocabulary for the same event.
+pub(crate) fn emit_step_result(
     level: flow::Level,
     kind: &str,
     step_id: &str,
@@ -122,7 +126,9 @@ fn worktrees_base() -> PathBuf {
 /// `git worktree list --porcelain` is always the main working tree, so it
 /// yields the stable repo name AND a valid dir to run worktree teardown from
 /// (git refuses to remove the worktree you are standing in).
-fn repo_root() -> Result<PathBuf> {
+// (#1284 Packet 4a) `pub(crate)` — `mission_launch.rs`'s coder-phase
+// execution path resolves the SAME repo root `mission run` does.
+pub(crate) fn repo_root() -> Result<PathBuf> {
     let out = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -560,15 +566,22 @@ fn default_phase_graph(
 /// — stays Tier 3, physically co-located with the mission module that owns
 /// it (see `darkmux-crew`'s `step_kinds::patterns` module doc for the
 /// three-tier picture).
-struct MissionWorktreeStepKind {
-    repo_root: PathBuf,
-    wt_path: PathBuf,
-    branch: String,
-    base: String,
-    mission_id: String,
-    phase_id: String,
-    session_id: String,
-    role: String,
+// (#1284 Packet 4a) `pub(crate)` (struct + every field) — `mission_launch.rs`
+// registers this SAME Tier 3 kind (#1352) when it runs the `coder-phase`
+// config through the config-launched path, the proving case for the
+// instance-model collapse. Reusing the type directly (rather than a second
+// near-identical struct) keeps the `mission.worktree` flow-record shape and
+// `darkmux-serve`'s `/diff` contract (see this struct's own doc above)
+// byte-identical across both launchers.
+pub(crate) struct MissionWorktreeStepKind {
+    pub(crate) repo_root: PathBuf,
+    pub(crate) wt_path: PathBuf,
+    pub(crate) branch: String,
+    pub(crate) base: String,
+    pub(crate) mission_id: String,
+    pub(crate) phase_id: String,
+    pub(crate) session_id: String,
+    pub(crate) role: String,
 }
 
 impl StepKind for MissionWorktreeStepKind {
@@ -615,9 +628,12 @@ impl StepKind for MissionWorktreeStepKind {
 /// `StepOutcome.output: String` contract. `run()` reads it after
 /// `run_step_graph` returns to reconstruct the exact detail the
 /// pre-migration inline code had at hand.
-struct CoderStepResult {
-    failed_verifiers: Vec<crew::step_kinds::FailedVerifier>,
-    tokens_total: u32,
+// (#1284 Packet 4a) `pub(crate)` — read back by `mission_launch.rs` after
+// `run_step_graph` returns, same as `run()` does below, to build its own
+// `MissionEnvelope` summary.
+pub(crate) struct CoderStepResult {
+    pub(crate) failed_verifiers: Vec<crew::step_kinds::FailedVerifier>,
+    pub(crate) tokens_total: u32,
 }
 
 /// Wraps the coder-dispatch half of the old hand-written sequence
@@ -652,14 +668,15 @@ struct CoderStepResult {
 /// through are all real behavior/envelope differences a collapse would
 /// have to change or drop — outside this packet's pure-refactor scope.
 /// Left documented, not forced.
-struct MissionCoderStepKind {
-    opts: Mutex<Option<crew::dispatch::DispatchOpts>>,
-    wt_path: PathBuf,
-    mission_id: String,
-    phase_id: String,
-    session_id: String,
-    role_id: String,
-    result_slot: Arc<Mutex<Option<CoderStepResult>>>,
+// (#1284 Packet 4a) `pub(crate)` — see `MissionWorktreeStepKind`'s doc.
+pub(crate) struct MissionCoderStepKind {
+    pub(crate) opts: Mutex<Option<crew::dispatch::DispatchOpts>>,
+    pub(crate) wt_path: PathBuf,
+    pub(crate) mission_id: String,
+    pub(crate) phase_id: String,
+    pub(crate) session_id: String,
+    pub(crate) role_id: String,
+    pub(crate) result_slot: Arc<Mutex<Option<CoderStepResult>>>,
 }
 
 impl StepKind for MissionCoderStepKind {
@@ -773,11 +790,12 @@ impl StepKind for MissionCoderStepKind {
 /// single dispatch), with a hardcoded role and mission-run-specific
 /// CLI/result-slot plumbing. No second consumer visible today — stays
 /// physically co-located with the mission module that owns it.
-struct MissionVerifyStepKind {
-    wt_path: PathBuf,
-    base: String,
-    phase_id: String,
-    result_slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>,
+// (#1284 Packet 4a) `pub(crate)` — see `MissionWorktreeStepKind`'s doc.
+pub(crate) struct MissionVerifyStepKind {
+    pub(crate) wt_path: PathBuf,
+    pub(crate) base: String,
+    pub(crate) phase_id: String,
+    pub(crate) result_slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>,
 }
 
 impl StepKind for MissionVerifyStepKind {
@@ -856,8 +874,8 @@ pub fn run(
         .find(|m| m.id == mission_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "mission `{mission_id}` not found. Run `darkmux mission propose` first \
-                 or check the id."
+                "mission `{mission_id}` not found. Run `darkmux mission propose` then \
+                 `darkmux mission launch <config-id>` first, or check the id."
             )
         })?;
     if !matches!(mission.status, crew::types::MissionStatus::Active) {
@@ -1512,7 +1530,11 @@ fn resolved_git_identity(dir: &Path) -> String {
 /// IS the brief, the constraints never reached the coder. The tagged block
 /// follows the model-facing prompt doctrine: AI-convention framing, with
 /// the tag itself carrying the provenance a clean-context model needs.
-fn coder_brief(
+// (#1284 Packet 4a) `pub(crate)` — `mission_launch.rs`'s coder-phase
+// execution path builds its dispatch brief through the SAME function
+// (called with empty lessons/corrections/cautions slices — a freshly
+// launched instance has no prior-dispatch history to carry forward).
+pub(crate) fn coder_brief(
     phase: &crew::types::Phase,
     mission: &crew::types::Mission,
     lessons: &[String],
@@ -2455,7 +2477,9 @@ use crew::step_kinds::{parse_failed_verifiers, FailedVerifier};
 /// list is what lets the operator cross-check the coder's SIGNOFF: a "tests
 /// pass" claim sitting next to "the test command never ran" is the
 /// contradiction this exists to surface.
-fn print_unverified_banner(failed: &[FailedVerifier]) {
+// (#1284 Packet 4a) `pub(crate)` — `mission_launch.rs`'s coder-phase gate
+// prints the SAME banner at the same decision point.
+pub(crate) fn print_unverified_banner(failed: &[FailedVerifier]) {
     if failed.is_empty() {
         return;
     }

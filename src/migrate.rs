@@ -14,6 +14,7 @@
 //!   `darkmux mission migrate --apply` — idempotent; already-migrated is a no-op
 
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::crew::lifecycle;
@@ -30,6 +31,12 @@ pub struct MigratePlan {
     /// Legacy phase files whose `mission_id` field doesn't match any mission
     /// on disk (flat or nested). Skipped during apply; operator must handle manually.
     pub orphan_phases: Vec<PathBuf>,
+    /// (#1284 Packet 4a) Mission ids already on the per-mission nested
+    /// layout (or landing there via `mission_moves` in THIS same plan) that
+    /// have no `config-snapshot.json` yet — legacy hand-authored instances
+    /// (pre-dating `mission launch`'s config-launched instance model) that
+    /// need one synthesized. Sorted for deterministic output.
+    pub config_snapshots_missing: Vec<String>,
 }
 
 impl MigratePlan {
@@ -38,6 +45,7 @@ impl MigratePlan {
         self.mission_moves.is_empty()
             && self.phase_moves.is_empty()
             && self.orphan_phases.is_empty()
+            && self.config_snapshots_missing.is_empty()
     }
 }
 
@@ -165,6 +173,21 @@ pub fn plan_migration() -> Result<MigratePlan> {
         }
     }
 
+    // ── Config-snapshot synthesis (#1284 Packet 4a) ────────────────────────
+    // Every mission id already known (nested on disk, or landing there via
+    // this same plan's mission_moves) that has no config-snapshot.json yet
+    // — a legacy hand-authored instance minted before `mission launch`
+    // existed. Checked here (read-only) so a dry-run preview shows the
+    // synthesis work too; `apply_migration` does the actual write, AFTER
+    // the file moves above land (a still-flat mission has no nested
+    // mission.json/phases/ to read from yet).
+    let mut config_snapshots_missing: Vec<String> = known_missions
+        .into_iter()
+        .filter(|id| !lifecycle::config_snapshot_path(id).is_file())
+        .collect();
+    config_snapshots_missing.sort();
+    plan.config_snapshots_missing = config_snapshots_missing;
+
     Ok(plan)
 }
 
@@ -173,7 +196,11 @@ pub fn plan_migration() -> Result<MigratePlan> {
 /// Idempotent: if a source file no longer exists when `apply` runs (e.g. re-run
 /// after partial success), the move is skipped silently. Orphan phases are
 /// never touched.
-pub fn apply_migration(plan: &MigratePlan) -> Result<()> {
+///
+/// Returns the number of config snapshots ACTUALLY synthesized (#1284
+/// review round, consider 10: a per-mission synthesis failure warns and
+/// skips, so the caller's summary must count successes, never attempts).
+pub fn apply_migration(plan: &MigratePlan) -> Result<usize> {
     for (src, dst) in &plan.mission_moves {
         if !src.is_file() {
             continue; // already moved (re-run case)
@@ -211,7 +238,70 @@ pub fn apply_migration(plan: &MigratePlan) -> Result<()> {
         std::fs::rename(src, dst)
             .with_context(|| format!("moving {} -> {}", src.display(), dst.display()))?;
     }
-    Ok(())
+
+    // (#1284 Packet 4a) Synthesize config-snapshot.json for every legacy
+    // instance the plan named — AFTER the moves above, so a mission that
+    // was still flat at plan time now has a real nested mission.json +
+    // phases/ to read from. Best-effort per mission: one mission's drifted
+    // phase_ids (references a phase JSON that no longer exists) surfaces a
+    // warning and is skipped, never aborting the rest of the batch —
+    // re-running `mission migrate --apply` picks it up again once fixed
+    // (idempotent: a mission that already got a snapshot this round, or on
+    // a prior run, is a no-op here).
+    let mut synthesized = 0usize;
+    for mission_id in &plan.config_snapshots_missing {
+        match synthesize_config_snapshot(mission_id) {
+            Ok(()) => synthesized += 1,
+            Err(e) => {
+                eprintln!("mission migrate: config-snapshot synthesis warning for `{mission_id}`: {e:#}");
+            }
+        }
+    }
+
+    Ok(synthesized)
+}
+
+/// Build a trivial, task-less [`darkmux_crew::mission_config::MissionConfig`]
+/// from a legacy instance's OWN `mission.json` + `phases/<id>.json` files and
+/// persist it as that mission's `config-snapshot.json` (#1284 Packet 4a).
+/// Every phase becomes a freeform `PhaseConfig` (a hand-authored instance
+/// never had a Task/Step graph to transcribe) — exactly the shape
+/// `mission_launch::launch` already treats as "mint + start, leave phase
+/// transitions operator-driven", so a migrated instance's snapshot describes
+/// it honestly: a manual mission, not an automated one.
+fn synthesize_config_snapshot(mission_id: &str) -> Result<()> {
+    use darkmux_crew::mission_config::{MissionConfig, PhaseConfig, MISSION_CONFIG_SCHEMA};
+    use darkmux_crew::types::{Mission, Phase};
+
+    let mission_text = std::fs::read_to_string(lifecycle::mission_path(mission_id))
+        .with_context(|| format!("reading mission.json for `{mission_id}`"))?;
+    let mission: Mission = serde_json::from_str(&mission_text)
+        .with_context(|| format!("parsing mission.json for `{mission_id}`"))?;
+
+    let mut phases = Vec::with_capacity(mission.phase_ids.len());
+    for phase_id in &mission.phase_ids {
+        let phase_text = std::fs::read_to_string(lifecycle::phase_path(mission_id, phase_id))
+            .with_context(|| format!("reading phase `{phase_id}` for mission `{mission_id}`"))?;
+        let phase: Phase = serde_json::from_str(&phase_text)
+            .with_context(|| format!("parsing phase `{phase_id}` for mission `{mission_id}`"))?;
+        phases.push(PhaseConfig {
+            id: phase.id,
+            description: Some(phase.description),
+            tasks: Vec::new(),
+            extras: BTreeMap::new(),
+        });
+    }
+
+    let config = MissionConfig {
+        id: mission_id.to_string(),
+        name: mission_id.to_string(),
+        description: Some(mission.description),
+        schema_version: Some(MISSION_CONFIG_SCHEMA.to_string()),
+        inputs: Vec::new(),
+        phases,
+        extras: BTreeMap::new(),
+    };
+    lifecycle::save_config_snapshot(mission_id, &config)
 }
 
 /// Print a human-readable dry-run preview (or summary) of a [`MigratePlan`].
@@ -243,11 +333,21 @@ pub fn print_plan(plan: &MigratePlan) {
         println!("  (Run with --apply to migrate everything else and leave orphans in place,");
         println!("  then manually move or rm orphan files yourself.)");
     }
+    if !plan.config_snapshots_missing.is_empty() {
+        println!(
+            "Config snapshots to synthesize ({} — legacy instance(s) with no config-snapshot.json):",
+            plan.config_snapshots_missing.len()
+        );
+        for id in &plan.config_snapshots_missing {
+            println!("  {id}  (freeform — every phase becomes task-less)");
+        }
+    }
     println!(
-        "\nSummary: {} mission(s), {} phase(s), {} orphan(s).",
+        "\nSummary: {} mission(s), {} phase(s), {} orphan(s), {} config-snapshot(s) to synthesize.",
         plan.mission_moves.len(),
         plan.phase_moves.len(),
         plan.orphan_phases.len(),
+        plan.config_snapshots_missing.len(),
     );
 }
 
@@ -376,6 +476,140 @@ mod tests {
                 0,
                 "should skip when target already exists"
             );
+        });
+    }
+
+    // ── Config-snapshot synthesis (#1284 Packet 4a) ─────────────────────
+
+    fn write_nested_mission(mission_id: &str, description: &str, phase_ids: &[&str]) {
+        let mission = serde_json::json!({
+            "id": mission_id,
+            "description": description,
+            "status": "active",
+            "phase_ids": phase_ids,
+            "created_ts": 1,
+        });
+        let path = lifecycle::mission_path(mission_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&mission).unwrap()).unwrap();
+    }
+
+    fn write_nested_phase(mission_id: &str, phase_id: &str, description: &str) {
+        let phase = serde_json::json!({
+            "id": phase_id,
+            "mission_id": mission_id,
+            "description": description,
+            "status": "planned",
+            "created_ts": 1,
+        });
+        let path = lifecycle::phase_path(mission_id, phase_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&phase).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn plan_reports_missing_config_snapshot_for_an_already_nested_mission() {
+        with_test_root(|_root| {
+            write_nested_mission("legacy-1", "a legacy hand-authored mission", &["p1"]);
+            write_nested_phase("legacy-1", "p1", "the only phase");
+
+            let plan = plan_migration().unwrap();
+            assert!(plan.config_snapshots_missing.contains(&"legacy-1".to_string()));
+            assert!(!plan.is_empty(), "a missing config-snapshot alone must not read as empty");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn apply_synthesizes_a_config_snapshot_with_the_expected_freeform_shape() {
+        with_test_root(|_root| {
+            write_nested_mission("legacy-2", "legacy mission body", &["p1", "p2"]);
+            write_nested_phase("legacy-2", "p1", "first phase");
+            write_nested_phase("legacy-2", "p2", "second phase");
+
+            let plan = plan_migration().unwrap();
+            assert!(plan.config_snapshots_missing.contains(&"legacy-2".to_string()));
+            apply_migration(&plan).unwrap();
+
+            let snapshot = lifecycle::load_config_snapshot("legacy-2")
+                .expect("load_config_snapshot must succeed")
+                .expect("a config-snapshot.json must now exist");
+            assert_eq!(snapshot.id, "legacy-2");
+            assert_eq!(snapshot.description.as_deref(), Some("legacy mission body"));
+            assert_eq!(
+                snapshot.schema_version.as_deref(),
+                Some(darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA)
+            );
+            assert_eq!(snapshot.phases.len(), 2);
+            assert_eq!(snapshot.phases[0].id, "p1");
+            assert_eq!(snapshot.phases[1].id, "p2");
+            assert!(
+                snapshot.phases.iter().all(|p| p.tasks.is_empty()),
+                "a legacy hand-authored instance never had a Task/Step graph — every synthesized phase is task-less"
+            );
+            assert!(snapshot.is_valid(&[]), "the synthesized document must itself validate cleanly");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn apply_config_snapshot_synthesis_is_idempotent() {
+        with_test_root(|_root| {
+            write_nested_mission("legacy-3", "idempotent check", &[]);
+
+            let plan1 = plan_migration().unwrap();
+            let synthesized = apply_migration(&plan1).unwrap();
+            assert_eq!(synthesized, 1, "one snapshot actually synthesized");
+            assert!(lifecycle::config_snapshot_path("legacy-3").is_file());
+
+            // Second pass: nothing left to do.
+            let plan2 = plan_migration().unwrap();
+            assert!(
+                plan2.config_snapshots_missing.is_empty(),
+                "a mission with a snapshot already on disk must not be re-listed"
+            );
+            assert_eq!(apply_migration(&plan2).unwrap(), 0, "no-op re-apply synthesizes zero");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn apply_counts_actual_syntheses_not_attempts() {
+        // (#1284 review round 1, consider 10) A mission whose phase_ids
+        // reference a MISSING phase JSON fails synthesis (warned, skipped)
+        // — the returned count must reflect only real successes.
+        with_test_root(|_root| {
+            write_nested_mission("good-one", "synthesizes fine", &[]);
+            write_nested_mission("drifted-one", "phase_ids points at a ghost", &["ghost-phase"]);
+            // deliberately NO phase JSON for ghost-phase.
+
+            let plan = plan_migration().unwrap();
+            assert_eq!(plan.config_snapshots_missing.len(), 2, "both are planned");
+            let synthesized = apply_migration(&plan).unwrap();
+            assert_eq!(synthesized, 1, "only the intact mission actually synthesized");
+            assert!(lifecycle::config_snapshot_path("good-one").is_file());
+            assert!(!lifecycle::config_snapshot_path("drifted-one").exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn apply_migration_synthesizes_snapshots_for_missions_it_just_moved_from_flat() {
+        // The flat->nested move and the snapshot synthesis compose in one
+        // `--apply` pass — a mission that was still flat at plan time gets
+        // BOTH its move and its snapshot in the same `apply_migration` call.
+        with_test_root(|root| {
+            write_flat_mission(root, "was-flat");
+            write_flat_phase(root, "s1", "was-flat");
+
+            let plan = plan_migration().unwrap();
+            assert!(plan.config_snapshots_missing.contains(&"was-flat".to_string()));
+            apply_migration(&plan).unwrap();
+
+            assert!(root.join("missions/was-flat/mission.json").is_file());
+            let snapshot = lifecycle::load_config_snapshot("was-flat").unwrap();
+            assert!(snapshot.is_some(), "the just-migrated mission must have a synthesized snapshot");
         });
     }
 }

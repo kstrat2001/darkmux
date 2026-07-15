@@ -149,6 +149,56 @@ pub fn load_envelope(mission_id: &str) -> Result<Option<crate::envelope::Mission
     Ok(Some(envelope))
 }
 
+/// The mission-config SNAPSHOT JSON path under the per-mission directory,
+/// beside `mission.json` (#1284 Packet 4a). A `mission launch`-minted
+/// instance carries a frozen copy of the FULLY-RESOLVED config it was
+/// launched from — the same self-description precedent the review
+/// pipeline's crew-staffing snapshot already established (freeze the
+/// resolved shape into the run's own artifact rather than re-reading a
+/// mutable source live), applied one level up: even if the operator later
+/// edits or deletes the source `~/.darkmux/mission-configs/<id>.json`,
+/// this instance keeps its own record of the graph shape it actually ran.
+pub fn config_snapshot_path(mission_id: &str) -> PathBuf {
+    mission_dir(mission_id).join("config-snapshot.json")
+}
+
+/// Persist a mission config snapshot via the same atomic-rename
+/// `save_json` every other entity in this module uses.
+pub fn save_config_snapshot(mission_id: &str, config: &crate::mission_config::MissionConfig) -> Result<()> {
+    save_json(&config_snapshot_path(mission_id), config)
+}
+
+/// Load a mission's persisted config snapshot, if one exists. A
+/// hand-authored pre-Packet-4a instance has none until `mission migrate`
+/// synthesizes one — `Ok(None)`, not an error.
+pub fn load_config_snapshot(mission_id: &str) -> Result<Option<crate::mission_config::MissionConfig>> {
+    let path = config_snapshot_path(mission_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let config = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(config))
+}
+
+/// Persist a freshly-minted [`Mission`] (or overwrite an existing one) via
+/// the same atomic-rename `save_json` every other entity in this module
+/// uses (#1284 Packet 4a) — `mission launch`'s instance-minting path uses
+/// this instead of a raw `std::fs::write`, so a new mission's initial JSON
+/// gets the same crash-safety every subsequent lifecycle transition already
+/// has.
+pub fn save_mission(mission: &Mission) -> Result<()> {
+    save_json(&mission_path(&mission.id), mission)
+}
+
+/// Persist a freshly-minted [`Phase`] (or overwrite an existing one) — see
+/// [`save_mission`]'s doc.
+pub fn save_phase(phase: &Phase) -> Result<()> {
+    save_json(&phase_path(&phase.mission_id, &phase.id), phase)
+}
+
 /// Directory holding the mission's phase JSONs.
 ///
 /// **Sprint→Phase rename read-fallback:** pre-rename mission data nests its
