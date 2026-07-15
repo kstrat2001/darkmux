@@ -1963,6 +1963,17 @@ fn check_crew_validation() -> Check {
     }
 }
 
+/// Parse a `"MAJOR.MINOR"` schema string into its two components — `None`
+/// for anything that doesn't fit that shape (extra segments beyond the
+/// second are tolerated and ignored, matching `mission_config`'s own
+/// lenient major-parse).
+fn parse_major_minor(v: &str) -> Option<(u32, u32)> {
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 /// (#1284 Packet 1) Registered mission configs — enumerates every
 /// discoverable mission-config document (`darkmux_crew::mission_config::
 /// list_ids()`, unioned user → on-disk → embedded), loads + `validate()`s
@@ -2034,6 +2045,38 @@ fn check_mission_config_registry() -> Check {
                     let joined =
                         version_drift.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; ");
                     blocking.push(format!("\"{id}\": {joined}"));
+                }
+                // (#1284 review round 2, consider 7) A USER-tier copy whose
+                // schema MINOR trails the binary's is silently missing
+                // additive fields newer launchers rely on — concretely, a
+                // 1.0-era user copy of "review" has no typed `expand` block,
+                // so the probe stage interprets to ZERO probe tasks. Major
+                // drift is `validate()`'s job (either direction); this
+                // minor-trailing check is user-tier-only because the
+                // embedded/on-disk built-ins ship with the binary and can't
+                // trail it.
+                if loaded.source == mission_config::MissionConfigSource::User {
+                    if let Some((doc_major, doc_minor)) = loaded
+                        .config
+                        .schema_version
+                        .as_deref()
+                        .and_then(parse_major_minor)
+                    {
+                        let (bin_major, bin_minor) =
+                            parse_major_minor(mission_config::MISSION_CONFIG_SCHEMA)
+                                .expect("MISSION_CONFIG_SCHEMA is a valid MAJOR.MINOR constant");
+                        if doc_major == bin_major && doc_minor < bin_minor {
+                            blocking.push(format!(
+                                "\"{id}\": user-tier copy declares schema {doc_major}.{doc_minor}, \
+                                 but this binary's mission-config schema is \
+                                 {bin_major}.{bin_minor} — the user copy predates additive \
+                                 fields newer launchers rely on (e.g. a 1.0-era \"review\" \
+                                 copy has no `expand` block, so its probe stage interprets \
+                                 to zero probe tasks); re-derive it from the current \
+                                 built-in or delete it to fall back to the embedded tier"
+                            ));
+                        }
+                    }
                 }
                 if !kind_warnings.is_empty() {
                     kind_warning_ids.push(id.clone());
@@ -4591,6 +4634,40 @@ mod tests {
         let check = check_mission_config_registry();
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("\"bad\""), "{}", check.message);
+    }
+
+    /// (#1284 review round 2, consider 7) A USER-tier copy of a built-in
+    /// whose schema MINOR trails the binary's warns loudly — the concrete
+    /// hazard: a 1.0-era user copy of "review" has no typed `expand` block,
+    /// so its probe stage interprets to ZERO probe tasks; doctor should say
+    /// so BEFORE a launch does. Same-major-lower-minor only — a same-version
+    /// copy (or major drift, which `validate()` already covers) doesn't
+    /// trip this.
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_warns_when_user_tier_minor_trails_the_binary() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        // A structurally-valid 1.0-era user override of the "review"
+        // built-in (schema major matches the binary's, minor trails it).
+        std::fs::write(
+            guard.path().join("mission-configs").join("review.json"),
+            r#"{"id":"review","name":"PR Review (stale user copy)","schema_version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("user-tier copy declares schema 1.0"), "{}", check.message);
+        assert!(check.message.contains("zero probe tasks"), "{}", check.message);
+    }
+
+    #[test]
+    fn parse_major_minor_accepts_two_part_versions_and_rejects_garbage() {
+        assert_eq!(parse_major_minor("1.1"), Some((1, 1)));
+        assert_eq!(parse_major_minor("1.0.5"), Some((1, 0)), "extra segments tolerated");
+        assert_eq!(parse_major_minor("1"), None, "no minor segment");
+        assert_eq!(parse_major_minor("not-a-version"), None);
     }
 
     // ─── #1282: check_profile_registry quarantine + n_ctx surface ───

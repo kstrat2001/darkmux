@@ -1836,7 +1836,7 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<ReviewEnvelope> {
             &mission.adjudicate_phase_id,
             &mission.report_phase_id,
             review_judge_concurrency(),
-        );
+        )?;
         for task in &graph.tasks {
             let _ = darkmux_crew::lifecycle::save_task(&mission.mission_id, task);
         }
@@ -3913,7 +3913,8 @@ mod tests {
         });
 
         let graph =
-            build_review_graph(ctx.clone(), judge.clone(), verify.clone(), &probes, "investigate", "adjudicate", "report", 1);
+            build_review_graph(ctx.clone(), judge.clone(), verify.clone(), &probes, "investigate", "adjudicate", "report", 1)
+                .expect("built-in review config builds cleanly");
         let fingerprint_val = darkmux_lab::lab::review::fingerprint(
             &darkmux_lab::lab::review::seat_identifier(&judge.pm),
             &ctx.judge_system,
@@ -4291,7 +4292,8 @@ mod tests {
             &mission.adjudicate_phase_id,
             &mission.report_phase_id,
             1,
-        );
+        )
+        .expect("built-in review config builds cleanly");
         let fingerprint_val =
             darkmux_lab::lab::review::fingerprint(&darkmux_lab::lab::review::seat_identifier(&judge.pm), &ctx.judge_system);
         let staffing_snap = darkmux_lab::lab::review::staffing_snapshot(&probes, &judge, verify.as_ref(), false);
@@ -4398,13 +4400,20 @@ mod tests {
             Some(&rest[..end])
         }
 
+        // (#1284 review round 2, consider 6) The positive needles are built
+        // via `concat!` so this test's OWN source cannot satisfy them — a
+        // plain `"build_review_graph("` literal here would match itself in
+        // PR_REVIEW_SRC (this test lives in pr_review.rs), making the
+        // pr_review.rs half of the check self-satisfying.
+        let build_needle = concat!("build_review", "_graph(");
+        let run_needle = concat!("run_review", "_graph(");
         for (label, src) in [("pr_review.rs", PR_REVIEW_SRC), ("review_bench.rs", REVIEW_BENCH_SRC)] {
             assert!(
-                src.contains("build_review_graph("),
+                src.contains(build_needle),
                 "{label} must dispatch through review::build_review_graph"
             );
             assert!(
-                src.contains("run_review_graph("),
+                src.contains(run_needle),
                 "{label} must dispatch through review::run_review_graph"
             );
             // Neither module DEFINES its own graph-building function — the

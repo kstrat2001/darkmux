@@ -1,0 +1,153 @@
+{
+  "steps": {
+    "review-bundle-step": {
+      "config": null,
+      "id": "review-bundle-step",
+      "kind": "review.bundle",
+      "status": "planned",
+      "task_id": "review-bundle-task"
+    },
+    "review-dedup-step": {
+      "config": null,
+      "id": "review-dedup-step",
+      "kind": "review.dedup",
+      "status": "planned",
+      "task_id": "review-dedup-task"
+    },
+    "review-judge-step": {
+      "config": {
+        "concurrency": 3
+      },
+      "id": "review-judge-step",
+      "kind": "review.judge",
+      "status": "planned",
+      "task_id": "review-judge-task"
+    },
+    "review-probe-0-step": {
+      "config": null,
+      "id": "review-probe-0-step",
+      "kind": "review.probe:alpha",
+      "status": "planned",
+      "task_id": "review-probe-0-task"
+    },
+    "review-probe-1-step": {
+      "config": null,
+      "id": "review-probe-1-step",
+      "kind": "review.probe:bravo",
+      "status": "planned",
+      "task_id": "review-probe-1-task"
+    },
+    "review-probe-2-step": {
+      "config": null,
+      "id": "review-probe-2-step",
+      "kind": "review.probe:charlie",
+      "status": "planned",
+      "task_id": "review-probe-2-task"
+    },
+    "review-synthesis-step": {
+      "config": null,
+      "id": "review-synthesis-step",
+      "kind": "review.synthesis",
+      "status": "planned",
+      "task_id": "review-synthesis-task"
+    },
+    "review-verify-step": {
+      "config": null,
+      "id": "review-verify-step",
+      "kind": "review.verify",
+      "status": "planned",
+      "task_id": "review-verify-task"
+    }
+  },
+  "tasks": [
+    {
+      "depends_on": [],
+      "description": "resolve review bundles from the diff",
+      "id": "review-bundle-task",
+      "phase_id": "pr-review-golden-investigate",
+      "step_ids": [
+        "review-bundle-step"
+      ]
+    },
+    {
+      "depends_on": [
+        "review-bundle-task"
+      ],
+      "description": "probe seat `alpha`",
+      "id": "review-probe-0-task",
+      "phase_id": "pr-review-golden-investigate",
+      "step_ids": [
+        "review-probe-0-step"
+      ]
+    },
+    {
+      "depends_on": [
+        "review-bundle-task"
+      ],
+      "description": "probe seat `bravo`",
+      "id": "review-probe-1-task",
+      "phase_id": "pr-review-golden-investigate",
+      "step_ids": [
+        "review-probe-1-step"
+      ]
+    },
+    {
+      "depends_on": [
+        "review-bundle-task"
+      ],
+      "description": "probe seat `charlie`",
+      "id": "review-probe-2-task",
+      "phase_id": "pr-review-golden-investigate",
+      "step_ids": [
+        "review-probe-2-step"
+      ]
+    },
+    {
+      "depends_on": [
+        "review-probe-0-task",
+        "review-probe-1-task",
+        "review-probe-2-task"
+      ],
+      "description": "dedup probe flags — mechanism-family keying + anchor matching",
+      "id": "review-dedup-task",
+      "phase_id": "pr-review-golden-investigate",
+      "step_ids": [
+        "review-dedup-step"
+      ]
+    },
+    {
+      "depends_on": [
+        "review-dedup-task"
+      ],
+      "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
+      "id": "review-judge-task",
+      "phase_id": "pr-review-golden-adjudicate",
+      "step_ids": [
+        "review-judge-step"
+      ]
+    },
+    {
+      "depends_on": [
+        "review-judge-task"
+      ],
+      "description": "verify — adjudicate confirmed findings",
+      "id": "review-verify-task",
+      "phase_id": "pr-review-golden-report",
+      "step_ids": [
+        "review-verify-step"
+      ]
+    },
+    {
+      "depends_on": [
+        "review-dedup-task",
+        "review-verify-task"
+      ],
+      "description": "synthesis — finalize tier counts + needs-check clustering",
+      "id": "review-synthesis-task",
+      "phase_id": "pr-review-golden-report",
+      "step_ids": [
+        "review-synthesis-step"
+      ]
+    }
+  ]
+}

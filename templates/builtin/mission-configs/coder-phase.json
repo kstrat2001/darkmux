@@ -73,7 +73,7 @@
         },
         {
           "id": "build-verify",
-          "description": "local QA -- mechanical verify (code-reviewer)",
+          "description": "local QA — mechanical verify (code-reviewer)",
           "depends_on": [
             "build-coder"
           ],

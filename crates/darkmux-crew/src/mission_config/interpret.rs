@@ -92,6 +92,8 @@ pub struct LaunchParams {
 /// Step>` a `StepKindRegistry`-equipped caller hands to
 /// `scheduler::run_step_graph`.
 pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<Task>, BTreeMap<String, Step>)> {
+    check_params_reference_the_document(config, params)?;
+
     let mut tasks: Vec<Task> = Vec::new();
     let mut steps: BTreeMap<String, Step> = BTreeMap::new();
     // Document-level TaskConfig.id -> the real Task id(s) it produced (len
@@ -106,6 +108,21 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<T
             let override_ = params.task_overrides.get(&task_cfg.id);
             match &task_cfg.expand {
                 Some(spec) => {
+                    // (#1284 review round 2) A multi-step template would
+                    // silently drop every step after the first — refuse it
+                    // loudly instead. `validate()` flags the same document
+                    // shape ahead of time; this is the interpret-side guard
+                    // for a caller that skipped validation.
+                    if task_cfg.steps.len() > 1 {
+                        bail!(
+                            "task `{}` declares `expand` with {} steps — an expanding \
+                             template task must have exactly ONE step (the expansion \
+                             primitive clones one task/step pair per item; extra steps \
+                             would be silently dropped)",
+                            task_cfg.id,
+                            task_cfg.steps.len()
+                        );
+                    }
                     let step_cfg = task_cfg.steps.first().ok_or_else(|| {
                         anyhow::anyhow!(
                             "task `{}` declares `expand` but has no steps to expand",
@@ -132,14 +149,14 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<T
                             vec![real_step_id.clone()],
                             override_,
                             task_cfg.role_id.as_deref(),
-                        );
+                        )?;
                         push_step(
                             &mut steps,
                             &real_step_id,
                             &real_task_id,
                             &real_kind,
                             step_config_for(step_cfg, params),
-                        );
+                        )?;
                         real_ids.push(real_task_id);
                     }
                     expansion_of.insert(task_cfg.id.clone(), real_ids);
@@ -156,7 +173,7 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<T
                             &real_task_id,
                             &step_cfg.kind,
                             step_config_for(step_cfg, params),
-                        );
+                        )?;
                     }
                     let description =
                         task_cfg.description.clone().unwrap_or_default();
@@ -168,7 +185,7 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<T
                         step_ids,
                         override_,
                         task_cfg.role_id.as_deref(),
-                    );
+                    )?;
                     expansion_of.insert(task_cfg.id.clone(), vec![real_task_id]);
                 }
             }
@@ -209,6 +226,79 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<T
     }
 
     Ok((tasks, steps))
+}
+
+/// (#1284 review round 2, consider 4) Every launcher-supplied key must
+/// reference something that actually EXISTS in the document — a typo'd key
+/// silently matching nothing is worse than an error, because the launch
+/// proceeds with the document's static value instead of the operator's
+/// resolved one. The concrete hazard that motivated this: the
+/// `"review-judge-step"` literal lives UNLINKED in both `review.rs` (the
+/// launcher's `step_config_overrides` key) and `review.json` (the step id)
+/// — if either side drifts, the judge's concurrency silently reverts to
+/// the document's static `1`, discarding the operator's
+/// `config.review.judge_concurrency`. `interpret` holds the whole document,
+/// so the cross-check is cheap; drift now fails the launch loudly, naming
+/// the dangling key.
+fn check_params_reference_the_document(config: &MissionConfig, params: &LaunchParams) -> Result<()> {
+    let phase_ids: std::collections::BTreeSet<&str> =
+        config.phases.iter().map(|p| p.id.as_str()).collect();
+    let mut task_ids = std::collections::BTreeSet::new();
+    let mut step_ids = std::collections::BTreeSet::new();
+    let mut expansion_names = std::collections::BTreeSet::new();
+    for phase in &config.phases {
+        for task_cfg in &phase.tasks {
+            task_ids.insert(task_cfg.id.as_str());
+            for step_cfg in &task_cfg.steps {
+                step_ids.insert(step_cfg.id.as_str());
+            }
+            if let Some(spec) = &task_cfg.expand {
+                expansion_names.insert(spec.over.as_str());
+            }
+        }
+    }
+
+    for key in params.phase_ids.keys() {
+        if !phase_ids.contains(key.as_str()) {
+            bail!(
+                "LaunchParams.phase_ids names phase id `{key}`, which does not exist in \
+                 mission config `{}` — a dangling key would silently leave the document's \
+                 placeholder ids in persisted artifacts",
+                config.id
+            );
+        }
+    }
+    for key in params.task_overrides.keys() {
+        if !task_ids.contains(key.as_str()) {
+            bail!(
+                "LaunchParams.task_overrides names task id `{key}`, which does not exist in \
+                 mission config `{}` — a dangling key would silently discard the launcher's \
+                 override",
+                config.id
+            );
+        }
+    }
+    for key in params.step_config_overrides.keys() {
+        if !step_ids.contains(key.as_str()) {
+            bail!(
+                "LaunchParams.step_config_overrides names step id `{key}`, which does not \
+                 exist in mission config `{}` — a dangling key would silently discard the \
+                 launcher's override and run with the document's static step config",
+                config.id
+            );
+        }
+    }
+    for key in params.expansions.keys() {
+        if !expansion_names.contains(key.as_str()) {
+            bail!(
+                "LaunchParams.expansions names collection `{key}`, which no task's \
+                 `expand.over` in mission config `{}` declares — a dangling key would \
+                 silently expand nothing",
+                config.id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn substitute_phase_id(doc_phase_id: &str, params: &LaunchParams) -> String {
@@ -265,7 +355,19 @@ fn push_task(
     step_ids: Vec<String>,
     override_: Option<&TaskOverride>,
     doc_role_id: Option<&str>,
-) {
+) -> Result<()> {
+    // (#1284 review round 2, consider 5) Post-substitution/expansion FINAL
+    // ids must be unique — an expansion pattern with neither `{index}` nor
+    // `{name}` (or a substitution collision) would otherwise produce
+    // same-id copies, and only this collision check catches the rendered
+    // (post-pattern) form. `Vec::contains` over a graph-sized Vec is fine —
+    // graphs here are tens of tasks, not thousands.
+    if tasks.iter().any(|t| t.id == real_task_id) {
+        bail!(
+            "interpreted graph produced duplicate task id `{real_task_id}` — expansion \
+             patterns must render a distinct id per item (include `{{index}}` or `{{name}}`)"
+        );
+    }
     let role_id = override_
         .and_then(|o| o.role_id.clone())
         .or_else(|| doc_role_id.map(String::from));
@@ -284,6 +386,7 @@ fn push_task(
         workdir,
         image,
     });
+    Ok(())
 }
 
 fn push_step(
@@ -292,20 +395,27 @@ fn push_step(
     real_task_id: &str,
     kind: &str,
     config: serde_json::Value,
-) {
-    steps.insert(
-        real_step_id.to_string(),
-        Step {
-            id: real_step_id.to_string(),
-            task_id: real_task_id.to_string(),
-            kind: kind.to_string(),
-            status: NodeStatus::Planned,
-            config,
-            started_ts: None,
-            completed_ts: None,
-            output: None,
-        },
-    );
+) -> Result<()> {
+    let step = Step {
+        id: real_step_id.to_string(),
+        task_id: real_task_id.to_string(),
+        kind: kind.to_string(),
+        status: NodeStatus::Planned,
+        config,
+        started_ts: None,
+        completed_ts: None,
+        output: None,
+    };
+    // (#1284 review round 2, consider 5) The steps BTreeMap would silently
+    // keep exactly one of two same-id steps — detect the collision on the
+    // rendered final id instead (see `push_task`'s twin check).
+    if steps.insert(real_step_id.to_string(), step).is_some() {
+        bail!(
+            "interpreted graph produced duplicate step id `{real_step_id}` — expansion \
+             patterns must render a distinct id per item (include `{{index}}` or `{{name}}`)"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -617,5 +727,115 @@ mod tests {
         assert!(s.started_ts.is_none());
         assert!(s.completed_ts.is_none());
         assert!(s.output.is_none());
+    }
+
+    // ── (#1284 review round 2, consider 4) dangling launcher keys ─────
+
+    fn simple_doc() -> MissionConfig {
+        doc(vec![phase(
+            "p1",
+            vec![task("t1", &[], None, vec![step("s1", "dispatch.internal", serde_json::Value::Null)])],
+        )])
+    }
+
+    #[test]
+    fn dangling_task_override_key_bails_naming_the_key() {
+        let mut task_overrides = Map::new();
+        task_overrides.insert("t1-typo".to_string(), TaskOverride::default());
+        let params = LaunchParams { task_overrides, ..Default::default() };
+        let err = interpret(&simple_doc(), &params).unwrap_err();
+        assert!(err.to_string().contains("t1-typo"), "{err:#}");
+    }
+
+    #[test]
+    fn dangling_step_config_override_key_bails_naming_the_key() {
+        // The concrete hazard this guards (review round 2): the
+        // "review-judge-step" literal lives unlinked in review.rs and
+        // review.json — if the document renames the step, a silent no-match
+        // would revert the operator's judge concurrency to the static 1.
+        let mut step_config_overrides = Map::new();
+        step_config_overrides.insert("review-judge-step-typo".to_string(), serde_json::json!({"concurrency": 4}));
+        let params = LaunchParams { step_config_overrides, ..Default::default() };
+        let err = interpret(&simple_doc(), &params).unwrap_err();
+        assert!(err.to_string().contains("review-judge-step-typo"), "{err:#}");
+    }
+
+    #[test]
+    fn dangling_expansion_key_bails_naming_the_key() {
+        let mut expansions = Map::new();
+        expansions.insert("probe_seatz".to_string(), vec!["alpha".to_string()]);
+        let params = LaunchParams { expansions, ..Default::default() };
+        let err = interpret(&simple_doc(), &params).unwrap_err();
+        assert!(err.to_string().contains("probe_seatz"), "{err:#}");
+    }
+
+    #[test]
+    fn dangling_phase_id_key_bails_naming_the_key() {
+        let mut phase_ids = Map::new();
+        phase_ids.insert("p1-typo".to_string(), "real-p1".to_string());
+        let params = LaunchParams { phase_ids, ..Default::default() };
+        let err = interpret(&simple_doc(), &params).unwrap_err();
+        assert!(err.to_string().contains("p1-typo"), "{err:#}");
+    }
+
+    // ── (#1284 review round 2, consider 5) template + collision guards ─
+
+    fn expanding_task(task_id_pattern: &str, step_id_pattern: &str, steps: Vec<StepConfig>) -> TaskConfig {
+        TaskConfig {
+            id: "template".to_string(),
+            description: None,
+            depends_on: vec![],
+            role_id: None,
+            steps,
+            expand: Some(ExpansionSpec {
+                over: "items".to_string(),
+                task_id_pattern: task_id_pattern.to_string(),
+                step_id_pattern: step_id_pattern.to_string(),
+                kind_pattern: "{kind}:{name}".to_string(),
+                description_pattern: None,
+                extras: Map::new(),
+            }),
+            extras: Map::new(),
+        }
+    }
+
+    fn two_item_params() -> LaunchParams {
+        let mut expansions = Map::new();
+        expansions.insert("items".to_string(), vec!["a".to_string(), "b".to_string()]);
+        LaunchParams { expansions, ..Default::default() }
+    }
+
+    #[test]
+    fn multi_step_template_task_is_a_loud_error_not_a_silent_drop() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![expanding_task(
+                "t-{index}",
+                "s-{index}",
+                vec![
+                    step("tpl-s1", "review.probe", serde_json::Value::Null),
+                    step("tpl-s2", "review.probe", serde_json::Value::Null),
+                ],
+            )],
+        )]);
+        let err = interpret(&cfg, &two_item_params()).unwrap_err();
+        assert!(err.to_string().contains("exactly ONE step"), "{err:#}");
+    }
+
+    #[test]
+    fn expansion_patterns_without_placeholders_collide_and_bail() {
+        // Neither {index} nor {name} in the patterns — both copies render
+        // the SAME task/step id; the steps BTreeMap would silently keep one
+        // without the collision check.
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![expanding_task(
+                "t-fixed",
+                "s-fixed",
+                vec![step("tpl-s1", "review.probe", serde_json::Value::Null)],
+            )],
+        )]);
+        let err = interpret(&cfg, &two_item_params()).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err:#}");
     }
 }

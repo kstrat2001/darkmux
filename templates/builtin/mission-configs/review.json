@@ -75,7 +75,7 @@
         },
         {
           "id": "review-dedup-task",
-          "description": "dedup probe flags -- mechanism-family keying + anchor matching",
+          "description": "dedup probe flags — mechanism-family keying + anchor matching",
           "depends_on": [
             "review-probe-template-task"
           ],
@@ -95,7 +95,7 @@
       "tasks": [
         {
           "id": "review-judge-task",
-          "description": "double-confirm judge -- internal pass1/pass2 loop over deduped flags",
+          "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
           "depends_on": [
             "review-dedup-task"
           ],
@@ -117,7 +117,7 @@
       "tasks": [
         {
           "id": "review-verify-task",
-          "description": "verify -- adjudicate confirmed findings",
+          "description": "verify — adjudicate confirmed findings",
           "depends_on": [
             "review-judge-task"
           ],
@@ -134,7 +134,7 @@
         },
         {
           "id": "review-synthesis-task",
-          "description": "synthesis -- finalize tier counts + needs-check clustering",
+          "description": "synthesis — finalize tier counts + needs-check clustering",
           "depends_on": [
             "review-dedup-task",
             "review-verify-task"

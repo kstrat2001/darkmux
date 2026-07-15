@@ -418,6 +418,55 @@ impl MissionConfig {
                     }
                 }
 
+                // (#1284 review round 2, consider 5) `expand` template
+                // integrity — these mirror `interpret`'s own loud-error
+                // guards so the problems surface at doctor/validate time,
+                // before a launch trips over them.
+                if let Some(spec) = &task.expand {
+                    let expand_path = format!("{task_path}.expand");
+                    if spec.over.trim().is_empty() {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Error,
+                            path: format!("{expand_path}.over"),
+                            message: format!(
+                                "task \"{}\" declares `expand` with an empty `over` — the \
+                                 launcher has no collection name to resolve",
+                                task.id
+                            ),
+                        });
+                    }
+                    for (field, pattern) in [
+                        ("task_id_pattern", &spec.task_id_pattern),
+                        ("step_id_pattern", &spec.step_id_pattern),
+                    ] {
+                        if !pattern.contains("{index}") && !pattern.contains("{name}") {
+                            findings.push(ValidationFinding {
+                                severity: FindingSeverity::Error,
+                                path: format!("{expand_path}.{field}"),
+                                message: format!(
+                                    "task \"{}\"'s `expand.{field}` \"{pattern}\" contains \
+                                     neither {{index}} nor {{name}} — every expanded copy \
+                                     would render the SAME id and collide",
+                                    task.id
+                                ),
+                            });
+                        }
+                    }
+                    if task.steps.len() > 1 {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Error,
+                            path: format!("{task_path}.steps"),
+                            message: format!(
+                                "task \"{}\" declares `expand` with {} steps — an expanding \
+                                 template task must have exactly ONE step (the expansion \
+                                 primitive clones one task/step pair per item)",
+                                task.id,
+                                task.steps.len()
+                            ),
+                        });
+                    }
+                }
+
                 for (si, step) in task.steps.iter().enumerate() {
                     let step_path = format!("{task_path}.steps[{si}]");
                     if step.id.trim().is_empty() {
@@ -710,6 +759,91 @@ mod tests {
             message: "test message".to_string(),
         };
         assert_eq!(f.to_string(), "[warning] phases[0].id: test message");
+    }
+
+    // ── (#1284 review round 2, consider 5) ExpansionSpec validation ────
+
+    fn expanding_task_with(over: &str, task_pat: &str, step_pat: &str, steps: Vec<StepConfig>) -> TaskConfig {
+        TaskConfig {
+            id: "template".to_string(),
+            description: None,
+            depends_on: vec![],
+            role_id: None,
+            steps,
+            expand: Some(ExpansionSpec {
+                over: over.to_string(),
+                task_id_pattern: task_pat.to_string(),
+                step_id_pattern: step_pat.to_string(),
+                kind_pattern: "{kind}:{name}".to_string(),
+                description_pattern: None,
+                extras: BTreeMap::new(),
+            }),
+            extras: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn expand_with_empty_over_is_an_error() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![expanding_task_with("", "t-{index}", "s-{index}", vec![step("s1", "review.probe")])],
+        )]);
+        let findings = cfg.validate(&[]);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == FindingSeverity::Error && f.path.ends_with(".expand.over")),
+            "expected an empty-over error, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn expand_patterns_without_index_or_name_are_errors() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![expanding_task_with("items", "t-fixed", "s-fixed", vec![step("s1", "review.probe")])],
+        )]);
+        let findings = cfg.validate(&[]);
+        for field in ["task_id_pattern", "step_id_pattern"] {
+            assert!(
+                findings.iter().any(|f| f.severity == FindingSeverity::Error
+                    && f.path.ends_with(&format!(".expand.{field}"))),
+                "expected a collision error on {field}, got {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_template_with_more_than_one_step_is_an_error() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![expanding_task_with(
+                "items",
+                "t-{index}",
+                "s-{index}",
+                vec![step("s1", "review.probe"), step("s2", "review.probe")],
+            )],
+        )]);
+        let findings = cfg.validate(&[]);
+        assert!(
+            findings.iter().any(|f| f.severity == FindingSeverity::Error
+                && f.message.contains("exactly ONE step")),
+            "expected a multi-step-template error, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn well_formed_expand_block_validates_clean() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![expanding_task_with(
+                "items",
+                "t-{index}",
+                "s-{name}",
+                vec![step("s1", "review.probe")],
+            )],
+        )]);
+        assert!(cfg.is_valid(&[]));
     }
 
     // ─── Built-in config golden-shape tests (#1284 Packet 1) ──────────
