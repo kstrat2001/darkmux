@@ -196,7 +196,11 @@ pub fn plan_migration() -> Result<MigratePlan> {
 /// Idempotent: if a source file no longer exists when `apply` runs (e.g. re-run
 /// after partial success), the move is skipped silently. Orphan phases are
 /// never touched.
-pub fn apply_migration(plan: &MigratePlan) -> Result<()> {
+///
+/// Returns the number of config snapshots ACTUALLY synthesized (#1284
+/// review round, consider 10: a per-mission synthesis failure warns and
+/// skips, so the caller's summary must count successes, never attempts).
+pub fn apply_migration(plan: &MigratePlan) -> Result<usize> {
     for (src, dst) in &plan.mission_moves {
         if !src.is_file() {
             continue; // already moved (re-run case)
@@ -244,13 +248,17 @@ pub fn apply_migration(plan: &MigratePlan) -> Result<()> {
     // re-running `mission migrate --apply` picks it up again once fixed
     // (idempotent: a mission that already got a snapshot this round, or on
     // a prior run, is a no-op here).
+    let mut synthesized = 0usize;
     for mission_id in &plan.config_snapshots_missing {
-        if let Err(e) = synthesize_config_snapshot(mission_id) {
-            eprintln!("mission migrate: config-snapshot synthesis warning for `{mission_id}`: {e:#}");
+        match synthesize_config_snapshot(mission_id) {
+            Ok(()) => synthesized += 1,
+            Err(e) => {
+                eprintln!("mission migrate: config-snapshot synthesis warning for `{mission_id}`: {e:#}");
+            }
         }
     }
 
-    Ok(())
+    Ok(synthesized)
 }
 
 /// Build a trivial, task-less [`darkmux_crew::mission_config::MissionConfig`]
@@ -551,7 +559,8 @@ mod tests {
             write_nested_mission("legacy-3", "idempotent check", &[]);
 
             let plan1 = plan_migration().unwrap();
-            apply_migration(&plan1).unwrap();
+            let synthesized = apply_migration(&plan1).unwrap();
+            assert_eq!(synthesized, 1, "one snapshot actually synthesized");
             assert!(lifecycle::config_snapshot_path("legacy-3").is_file());
 
             // Second pass: nothing left to do.
@@ -560,7 +569,27 @@ mod tests {
                 plan2.config_snapshots_missing.is_empty(),
                 "a mission with a snapshot already on disk must not be re-listed"
             );
-            apply_migration(&plan2).unwrap(); // no-op; must not error
+            assert_eq!(apply_migration(&plan2).unwrap(), 0, "no-op re-apply synthesizes zero");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn apply_counts_actual_syntheses_not_attempts() {
+        // (#1284 review round 1, consider 10) A mission whose phase_ids
+        // reference a MISSING phase JSON fails synthesis (warned, skipped)
+        // — the returned count must reflect only real successes.
+        with_test_root(|_root| {
+            write_nested_mission("good-one", "synthesizes fine", &[]);
+            write_nested_mission("drifted-one", "phase_ids points at a ghost", &["ghost-phase"]);
+            // deliberately NO phase JSON for ghost-phase.
+
+            let plan = plan_migration().unwrap();
+            assert_eq!(plan.config_snapshots_missing.len(), 2, "both are planned");
+            let synthesized = apply_migration(&plan).unwrap();
+            assert_eq!(synthesized, 1, "only the intact mission actually synthesized");
+            assert!(lifecycle::config_snapshot_path("good-one").is_file());
+            assert!(!lifecycle::config_snapshot_path("drifted-one").exists());
         });
     }
 

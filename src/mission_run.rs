@@ -874,8 +874,8 @@ pub fn run(
         .find(|m| m.id == mission_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "mission `{mission_id}` not found. Run `darkmux mission propose` first \
-                 or check the id."
+                "mission `{mission_id}` not found. Run `darkmux mission propose` then \
+                 `darkmux mission launch <config-id>` first, or check the id."
             )
         })?;
     if !matches!(mission.status, crew::types::MissionStatus::Active) {
@@ -2477,7 +2477,9 @@ use crew::step_kinds::{parse_failed_verifiers, FailedVerifier};
 /// list is what lets the operator cross-check the coder's SIGNOFF: a "tests
 /// pass" claim sitting next to "the test command never ran" is the
 /// contradiction this exists to surface.
-fn print_unverified_banner(failed: &[FailedVerifier]) {
+// (#1284 Packet 4a) `pub(crate)` — `mission_launch.rs`'s coder-phase gate
+// prints the SAME banner at the same decision point.
+pub(crate) fn print_unverified_banner(failed: &[FailedVerifier]) {
     if failed.is_empty() {
         return;
     }

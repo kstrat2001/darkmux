@@ -191,7 +191,7 @@ All of the following are **shipped**:
 
 | Verb | What it does | Where |
 |---|---|---|
-| `darkmux mission propose` | Reads unstructured intent → dispatches the **mission-compiler** utility role → renders a Mission + Phases proposal → **mandatory operator approve/edit/reject/regenerate gate** → persists only on approval (atomic rollback on partial write). | `src/mission_propose.rs`; `src/main.rs:542-577` |
+| `darkmux mission propose` | Reads unstructured intent → dispatches the **mission-compiler** utility role → renders a Mission + Phases proposal → **mandatory operator approve/edit/reject/regenerate gate** → persists a mission CONFIG draft to `~/.darkmux/mission-configs/<id>.json` only on approval; `darkmux mission launch <id>` then mints the running instance (#1284 Packet 4a). | `src/mission_propose.rs`; `src/mission_launch.rs` |
 | `darkmux phase estimate` | Reads a `WorkloadSpec` → deterministic per-turn token math → recommends the smallest adequate profile → optional 4B narration. | `src/phase_cli.rs:233-310, 500-514`; `src/main.rs:459-471` |
 | `darkmux phase review` | Auto-detects base branch → computes the git diff → dispatches the **code-reviewer** role → parses the `QA-REVIEW-SIGNOFF` block (`BLOCK`/`FLAG`/`NIT`) → emits a verdict (`clean` / `flags-only` / `blockers`, or `indeterminate` when the reviewer output doesn't match the expected format). | `src/phase_cli.rs:683-970`; `src/main.rs:472-485` |
 | `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, fans out its ready phases (`depends_on == []`) as work jobs onto the single global fleet work queue (`darkmux:work`); waits or returns session ids. | `src/main.rs:642-662`, `1453-1721` |

@@ -849,16 +849,17 @@ enum MissionCmd {
         /// pipelines and tests.
         #[arg(long)]
         yes: bool,
-        /// After approval, immediately invoke `darkmux mission start <id>`
-        /// on the newly-persisted mission. Skips the manual two-step.
-        /// Defaults to false — operators who want to inspect the persisted
-        /// files before starting can omit this flag.
+        /// After approval, immediately invoke `darkmux mission launch <id>`
+        /// on the newly-persisted mission config. Skips the manual
+        /// two-step. Defaults to false — operators who want to inspect the
+        /// persisted config before launching can omit this flag.
         #[arg(long)]
         start: bool,
         /// Work-item / ticket id this mission realizes (e.g. `SYS-2598`).
-        /// Stamped on the mission record; referenced as `{ticket}` by the
-        /// repo's `.darkmux/conventions.json` templates (#816) for branch
-        /// names, commit subjects, and PR titles.
+        /// Stamped into the config draft and, at `mission launch`, onto the
+        /// launched mission record; referenced as `{ticket}` by the repo's
+        /// `.darkmux/conventions.json` templates (#816) for branch names,
+        /// commit subjects, and PR titles.
         #[arg(long, value_name = "ID")]
         ticket: Option<String>,
     },
@@ -870,14 +871,23 @@ enum MissionCmd {
     /// `--param` (bailing with a copy-pasteable example if any required
     /// input is missing), then mints `mission.json` + one phase per
     /// declared phase + a `config-snapshot.json` freezing the resolved
-    /// config alongside the instance. When the graph has tasks this
-    /// launcher knows how to execute, it runs them through the real
-    /// scheduler and finalizes via a `MissionEnvelope`; a graph with no
-    /// tasks anywhere (a freeform/manual config) mints the instance and
-    /// starts the mission but leaves every phase transition
-    /// operator-driven. Same `--input`/`--param` values always derive the
-    /// SAME instance id — relaunching reopens a terminal instance rather
-    /// than minting a duplicate.
+    /// config alongside the instance. A graph with no tasks anywhere (a
+    /// freeform/manual config) mints the instance and starts the mission
+    /// but leaves every phase transition operator-driven. A coder-phase
+    /// graph executes worktree → coder → QA and then STOPS at the same
+    /// operator sign-off gate `mission run` stops at — the phase stays
+    /// Running and `mission ship`/`mission abort` finish the loop; launch
+    /// never auto-closes past the gate. With no `--input`/`--param` the
+    /// instance id IS the config id; with inputs the id gets a
+    /// deterministic per-inputs suffix — either way, relaunching with the
+    /// same values reuses (and reopens, if terminal) the SAME instance
+    /// rather than minting a duplicate.
+    ///
+    /// Exit codes: `0` freeform mint, or coder ran with QA
+    /// clean/flags-only (gate banner, phase Running); `1` coder dispatch
+    /// error; `2` QA found blocker(s) — resolve before shipping; `3` QA
+    /// could not run — manual review required; `4` instance minted but the
+    /// graph references step kind(s) this launcher can't construct yet.
     Launch {
         /// Mission config id to launch — a built-in (e.g. `coder-phase`)
         /// or a `darkmux mission propose`-drafted user-tier config.
@@ -2383,11 +2393,12 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
                 }
                 return Ok(0);
             }
-            migrate::apply_migration(&plan)?;
+            let synthesized = migrate::apply_migration(&plan)?;
             if !plan.is_empty() {
                 println!(
-                    "\nmigrate: applied {} move(s), synthesized {} config-snapshot(s).",
+                    "\nmigrate: applied {} move(s), synthesized {} of {} config-snapshot(s).",
                     plan.mission_moves.len() + plan.phase_moves.len(),
+                    synthesized,
                     plan.config_snapshots_missing.len()
                 );
             }
@@ -2457,7 +2468,7 @@ fn cmd_mission_dispatch(
         .find(|m| m.id == mission_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
-            "mission `{mission_id}` not found. Run `darkmux mission propose` first or check the id."
+            "mission `{mission_id}` not found. Run `darkmux mission propose` then `darkmux mission launch <config-id>` first, or check the id."
         )
         })?;
     if !matches!(mission.status, crew::types::MissionStatus::Active) {
