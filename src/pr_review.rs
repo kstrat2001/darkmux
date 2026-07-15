@@ -4069,6 +4069,9 @@ mod tests {
             bundles: Vec::new(), // zero bundles -> degenerate, offline
             remote_max_tokens_per_execution: 500_000,
             timeout_seconds: 30,
+            // (#1355) Real dispatch primitive, not that this offline test
+            // ever reaches it: zero bundles means zero chat calls.
+            chat_override: None,
         });
 
         let graph = build_review_graph(
