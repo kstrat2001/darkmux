@@ -7,6 +7,14 @@
 //! Required keys are named in each kind's doc comment; a missing
 //! required key is a loud `Err`, never a silent default that would mask
 //! an operator/caller typo.
+//!
+//! **This is Tier 1 (#1352).** Every kind below is generic AND
+//! config-driven — no per-mission control flow, only values read from
+//! `Step.config`. This is the DEFAULT: before writing a new `StepKind`
+//! anywhere (this crate's `step_kinds::patterns`, or bespoke inside a
+//! mission's own module), check whether the actual need is just new
+//! CONFIG on one of these four kinds. See `step_kinds::patterns`'s module
+//! doc for the full three-tier picture.
 
 use super::types::{StepKind, StepOutcome};
 use crate::types::{Step, Task};

@@ -23,8 +23,21 @@
 //!   `MutexGuard` can't outlive the lookup call. Storing `Arc<dyn
 //!   StepKind>` lets the scheduler clone an owned, `Send + Sync` handle
 //!   into the job closure.
+//!
+//! **Physical tiering (#1352).** `builtins` (this module's `Tier 1`) is
+//! generic and config-driven — every `Step` kind here reads its behavior
+//! entirely from `Step.config`, with no per-mission control flow baked in.
+//! `patterns` (`Tier 2`) holds genuinely new, reusable control-flow SHAPES
+//! whose domain-specific algorithm plugs in as a caller-supplied strategy —
+//! see that module's own doc. Tier 3 (genuinely bespoke, single-purpose
+//! kinds) never lives in this crate at all: it stays physically co-located
+//! with the mission module that owns it (`darkmux-lab`'s `review.rs`, the
+//! `darkmux` binary's own `mission_run.rs`) — see `step_kinds::patterns`'s
+//! module doc for the full three-tier picture and `CLAUDE.md`'s "StepKind
+//! tiering" section for the doctrine this physical layout enforces.
 
 mod builtins;
+pub mod patterns;
 mod registry;
 mod types;
 
