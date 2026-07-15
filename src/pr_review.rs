@@ -1382,6 +1382,21 @@ fn now_unix() -> u64 {
 /// itself — the review graph still runs and produces a real envelope even
 /// if Mission/Phase persistence failed; only the mission-status/graph-lens
 /// VIEW of the run would be degraded, not the run itself).
+///
+/// **(#1372) Reuse of a TERMINAL mission is reopened, never silently
+/// adopted.** `finalize_review_mission` (#1365) reaches a terminal
+/// mission/phase status on EVERY run, clean or not — so a re-run of the
+/// same case id (this function's own reuse path) would otherwise adopt an
+/// already-Closed mission, and every one of THAT run's own finalize
+/// transitions bails silently (`phase_complete` refuses an Abandoned
+/// phase, `mission_close` refuses an already-Closed mission — both
+/// `let _ = ...` best-effort, so the failure was invisible). Concrete
+/// symptom: a degenerate first run retried into a clean second run still
+/// showed "Abandoned / review degenerate: ..." on the board forever.
+/// `reopen_terminal_mission_for_rerun` below fixes it — reopens the
+/// mission via the new `mission_reopen` transition and restarts any
+/// Abandoned phase via the EXISTING `phase_start` Abandoned→Running
+/// support, so this run's own finalize can reach a real terminal state.
 fn build_mission_for_review(case_id: &str, crew_name: &str) -> Result<ReviewMissionPhases> {
     let mission_id = format!("pr-review-{}", sanitize_mission_id(case_id));
     let investigate_phase_id = format!("{mission_id}-investigate");
@@ -1445,62 +1460,142 @@ fn build_mission_for_review(case_id: &str, crew_name: &str) -> Result<ReviewMiss
                 let _ = std::fs::write(&phase_path, format!("{json}\n"));
             }
         }
+    } else {
+        reopen_terminal_mission_for_rerun(
+            &mission_id,
+            case_id,
+            &[&investigate_phase_id, &adjudicate_phase_id, &report_phase_id],
+        );
     }
 
     Ok(ReviewMissionPhases { mission_id, investigate_phase_id, adjudicate_phase_id, report_phase_id })
 }
 
-/// (#1365) Finalize a `pr-review run`-owned Mission's three Phases once the
-/// dispatch is done, so `darkmux mission status`/the viewer's mission lens
-/// never shows a permanently "active, N running" review. Operator sovereignty
-/// (#44) forbids the system auto-completing an OPERATOR-authored mission, but
-/// this Mission is system-created ephemera — `build_mission_for_review`
-/// stood it up purely so the review's own Task/Step graph had somewhere to
-/// live — so the system closing out its own phases when the work IT launched
-/// finishes is consistent with that doctrine (the same shape `mission ship
-/// --merge` uses to flip its own phase to Complete in `mission_run.rs`).
+/// (#1372) On reuse of an EXISTING `pr-review run` mission (a re-run of the
+/// same case id), reopen it if the PRIOR run left it terminal — reopen the
+/// mission (Closed → Active, the new `mission_reopen` transition) and
+/// restart any phase the prior run abandoned (Abandoned → Running, the
+/// EXISTING `phase_start` support). A phase the prior run COMPLETED is
+/// left as-is: `finalize_review_mission`'s own transitions are idempotent-
+/// safe (`phase_complete` on an already-Complete phase bails harmlessly),
+/// so a clean-run retry that's ALSO clean ends up Complete either way —
+/// the residual gap is a clean-then-DEGENERATE retry, where a
+/// previously-Complete phase can't be abandoned (`phase_abandon` refuses a
+/// terminal Complete phase, by design — see `lifecycle`'s state table).
+/// That narrower case is out of THIS fix's scope (the task's own
+/// regression is degenerate→clean, covered below) — named here rather
+/// than silently left unexplained.
 ///
-/// **Why this can't key on `result.is_ok()` alone (the #1354 bug still
-/// present in this shape until now):** `run_review_graph` is deliberately
-/// degrade-gracefully — a scheduling failure, every probe drawing nothing, or
-/// every judge dispatch erroring all fold into `ReviewEnvelope.degenerate`
-/// rather than a returned `Err` (see that function's doc/body — it has no
-/// `?`/`bail!` of its own). So `Result<ReviewEnvelope>::is_ok()` is `true`
-/// for BOTH a clean run and a degenerate one; keying on it alone marked a
-/// mid-flight failure `phase_complete`/"review completed" — an honest-looking
-/// but WRONG terminal state, never the "stuck running forever" a drift check
-/// could catch. Only a genuinely clean run (`Ok(env)` with `env.degenerate ==
-/// None`) completes; a hard `Err` OR a degenerate `Ok(env)` both abandon the
-/// phases with the real reason recorded on the mission, so `darkmux mission
-/// status`'s drift detector (`src/mission_status.rs::is_terminal` treats
-/// `Complete`/`Abandoned` identically) sees a clean Closed mission either
-/// way — never a non-terminal phase on a Closed mission, never a Running
-/// phase left behind.
-///
-/// Best-effort throughout (`let _ = ...`), same discipline as
-/// `build_mission_for_review`: a persistence hiccup here must never fail the
-/// review itself — only the mission-status/graph-lens VIEW of the run would
-/// be degraded, not the run.
-fn finalize_review_mission(mission_id: &str, phase_ids: &[&str], result: &Result<ReviewEnvelope>) {
-    let clean = matches!(result, Ok(env) if env.degenerate.is_none());
-    if clean {
-        for phase_id in phase_ids {
-            let _ = darkmux_crew::lifecycle::phase_complete(phase_id);
+/// Best-effort throughout (`let _ = ...`), same discipline as the rest of
+/// this function — a reopen hiccup must never block the review itself.
+fn reopen_terminal_mission_for_rerun(mission_id: &str, case_id: &str, phase_ids: &[&str]) {
+    let mission_path = darkmux_crew::lifecycle::mission_path(mission_id);
+    if let Ok(text) = std::fs::read_to_string(&mission_path) {
+        if let Ok(mission) = serde_json::from_str::<darkmux_crew::types::Mission>(&text) {
+            if mission.status == darkmux_crew::types::MissionStatus::Closed {
+                let _ = darkmux_crew::lifecycle::mission_reopen_with_reasoning(
+                    mission_id,
+                    Some(&format!("review re-run for case `{case_id}`")),
+                );
+            }
         }
-        let _ = darkmux_crew::lifecycle::mission_close_with_reasoning(mission_id, Some("review completed"));
-    } else {
-        let reason = match result {
-            Ok(env) => format!(
-                "review degenerate: {}",
-                env.degenerate.as_deref().unwrap_or("unknown reason")
-            ),
-            Err(e) => format!("review errored: {e:#}"),
-        };
-        for phase_id in phase_ids {
-            let _ = darkmux_crew::lifecycle::phase_abandon(phase_id);
-        }
-        let _ = darkmux_crew::lifecycle::mission_close_with_reasoning(mission_id, Some(&reason));
     }
+    for phase_id in phase_ids {
+        let phase_path = darkmux_crew::lifecycle::phase_path(mission_id, phase_id);
+        if let Ok(text) = std::fs::read_to_string(&phase_path) {
+            if let Ok(phase) = serde_json::from_str::<darkmux_crew::types::Phase>(&text) {
+                if phase.status == darkmux_crew::types::PhaseStatus::Abandoned {
+                    let _ = darkmux_crew::lifecycle::phase_start(phase_id);
+                }
+            }
+        }
+    }
+}
+
+/// (#1284 Packet 2) Map a review dispatch's `Result<ReviewEnvelope>` onto
+/// the generalized [`darkmux_crew::envelope::MissionEnvelope`] contract —
+/// the review-pipeline-specific half of the status decision documented on
+/// `MissionEnvelope`'s own module doc:
+///
+/// - `Err` → `Error` (a hard failure before any envelope was produced).
+/// - `Ok(env)` with `env.degenerate.is_some()` → `Degenerate` (the
+///   operator-decision "no usable signal" gate fired — see
+///   `ReviewEnvelope::degenerate`'s own doc).
+/// - `Ok(env)` with `env.degenerate.is_none()` but `!env.warnings.is_empty()`
+///   → `Degraded` (real, postable output, but some sub-stage was
+///   constrained — a remote budget exhausted, a bounded-retry failure
+///   reduced coverage).
+/// - `Ok(env)` with `env.degenerate.is_none()` and `env.warnings.is_empty()`
+///   → `Clean`.
+///
+/// The FULL `ReviewEnvelope` rides in `MissionEnvelope::payload` — mapped
+/// INTO, never replacing `ReviewEnvelope`'s own shape (deliverable 1's
+/// design constraint).
+fn review_result_to_mission_envelope(
+    mission_id: &str,
+    phase_ids: &[&str],
+    result: &Result<ReviewEnvelope>,
+) -> darkmux_crew::envelope::MissionEnvelope {
+    use darkmux_crew::envelope::{MissionEnvelope, MissionOutcomeStatus, RemoteBudgetRow};
+
+    match result {
+        Ok(env) => {
+            let status = if env.degenerate.is_some() {
+                MissionOutcomeStatus::Degenerate
+            } else if !env.warnings.is_empty() {
+                MissionOutcomeStatus::Degraded
+            } else {
+                MissionOutcomeStatus::Clean
+            };
+            let reason = env.degenerate.clone().or_else(|| {
+                (status == MissionOutcomeStatus::Degraded).then(|| env.warnings.join("; "))
+            });
+            let mut envelope = MissionEnvelope::new(mission_id, status, phase_ids);
+            envelope.reason = reason;
+            envelope.warnings = env.warnings.clone();
+            envelope.remote_budgets = env
+                .remote_budgets
+                .iter()
+                .map(|r| RemoteBudgetRow {
+                    stage: r.stage.clone(),
+                    max_tokens: r.max_tokens,
+                    used_tokens: r.used_tokens,
+                    exhausted: r.exhausted,
+                    skipped_calls: r.skipped_calls,
+                })
+                .collect();
+            envelope.payload = serde_json::to_value(env).unwrap_or(serde_json::Value::Null);
+            envelope
+        }
+        Err(e) => {
+            let mut envelope =
+                MissionEnvelope::new(mission_id, MissionOutcomeStatus::Error, phase_ids);
+            envelope.reason = Some(format!("review errored: {e:#}"));
+            envelope
+        }
+    }
+}
+
+/// (#1365, generalized #1284 Packet 2) Finalize a `pr-review run`-owned
+/// Mission's three Phases once the dispatch is done, so `darkmux mission
+/// status`/the viewer's mission lens never shows a permanently "active, N
+/// running" review. Operator sovereignty (#44) forbids the system
+/// auto-completing an OPERATOR-authored mission, but this Mission is
+/// system-created ephemera — `build_mission_for_review` stood it up purely
+/// so the review's own Task/Step graph had somewhere to live — so the
+/// system closing out its own phases when the work IT launched finishes is
+/// consistent with that doctrine (the same shape `mission ship --merge`
+/// uses to flip its own phase to Complete in `mission_run.rs`).
+///
+/// A thin call: `review_result_to_mission_envelope` decides the status
+/// (see its own doc for why `result.is_ok()` alone was never enough — the
+/// #1354 bug this shape fixed), then
+/// `darkmux_crew::envelope::finalize_mission` drives the actual phase/
+/// mission terminal transitions — the SAME function every other mission
+/// type will call once config-launched missions land (#1284 Packet 3+).
+fn finalize_review_mission(mission_id: &str, phase_ids: &[&str], result: &Result<ReviewEnvelope>) {
+    let envelope = review_result_to_mission_envelope(mission_id, phase_ids, result);
+    darkmux_crew::envelope::finalize_mission(&envelope);
 }
 
 /// Everything but `--from-envelope`: resolve the source + crew, build real
@@ -4014,6 +4109,104 @@ mod tests {
             assert_eq!(phase_status(&mission.mission_id, phase_id), "abandoned");
         }
         assert_eq!(mission_status_str(&mission.mission_id), "closed");
+    }
+
+    // ── #1372: retried runs reopen a terminal mission, never adopt it ──────
+
+    /// The headline #1372 regression: a degenerate first run followed by a
+    /// CLEAN retry of the SAME case must end up Complete/Closed on the
+    /// board — not stuck `Abandoned`/"review degenerate: ..." forever, the
+    /// exact symptom #1372 reports (a retried run silently adopting the
+    /// prior run's terminal mission, so every one of ITS OWN finalize
+    /// transitions bails on an already-terminal state).
+    #[test]
+    #[serial_test::serial]
+    fn build_mission_for_review_reopens_a_closed_mission_on_reuse() {
+        let _guard = CrewDirGuard::new();
+        let case = "owner/repo@retry1372";
+
+        // First run: degenerate.
+        let mission = build_mission_for_review(case, "test-crew").expect("mission built");
+        let phase_ids = [
+            mission.investigate_phase_id.as_str(),
+            mission.adjudicate_phase_id.as_str(),
+            mission.report_phase_id.as_str(),
+        ];
+        let degenerate: Result<ReviewEnvelope> = Ok(ReviewEnvelope {
+            degenerate: Some("no bundles produced from the diff".to_string()),
+            ..Default::default()
+        });
+        finalize_review_mission(&mission.mission_id, &phase_ids, &degenerate);
+        for phase_id in &phase_ids {
+            assert_eq!(phase_status(&mission.mission_id, phase_id), "abandoned");
+        }
+        assert_eq!(mission_status_str(&mission.mission_id), "closed");
+
+        // Retry of the SAME case: `build_mission_for_review` must reuse the
+        // SAME mission id (never mint a fresh one) AND reopen it — the
+        // mission back to Active, the abandoned phases back to Running —
+        // so this run's own eventual `finalize_review_mission` call can
+        // reach a real terminal state instead of silently bailing.
+        let mission2 = build_mission_for_review(case, "test-crew").expect("mission reused");
+        assert_eq!(mission2.mission_id, mission.mission_id, "same case id -> same mission id, reused not duplicated");
+        assert_eq!(mission_status_str(&mission.mission_id), "active", "reopen puts the mission back to active");
+        for phase_id in &phase_ids {
+            assert_eq!(phase_status(&mission.mission_id, phase_id), "running", "reopen restarts abandoned phases");
+        }
+
+        // Second run: clean. The board must now show Complete/Closed — not
+        // stuck Abandoned from the first attempt.
+        let clean: Result<ReviewEnvelope> = Ok(ReviewEnvelope { degenerate: None, ..Default::default() });
+        finalize_review_mission(&mission2.mission_id, &phase_ids, &clean);
+        for phase_id in &phase_ids {
+            assert_eq!(
+                phase_status(&mission.mission_id, phase_id),
+                "complete",
+                "the retried clean run completes every phase"
+            );
+        }
+        assert_eq!(
+            mission_status_str(&mission.mission_id),
+            "closed",
+            "the retried clean run closes the mission — board shows Complete/Closed, not stuck Abandoned"
+        );
+    }
+
+    /// A re-run of a case whose prior run was CLEAN (mission Closed, phases
+    /// already Complete) is a no-op reopen — `reopen_terminal_mission_for_
+    /// rerun` only acts on `Closed`/`Abandoned`, and `Complete` phases stay
+    /// untouched (the documented residual gap named on that function's own
+    /// doc — a clean-then-degenerate retry can't abandon an already-
+    /// Complete phase). This test pins the SUPPORTED half: reuse doesn't
+    /// panic or corrupt state, and the mission still gets reopened to
+    /// Active so its OWN finalize call (even a repeat-clean one) has
+    /// something legal to close.
+    #[test]
+    #[serial_test::serial]
+    fn build_mission_for_review_reuse_after_a_clean_run_reopens_the_mission() {
+        let _guard = CrewDirGuard::new();
+        let case = "owner/repo@retry1372-clean";
+
+        let mission = build_mission_for_review(case, "test-crew").expect("mission built");
+        let phase_ids = [
+            mission.investigate_phase_id.as_str(),
+            mission.adjudicate_phase_id.as_str(),
+            mission.report_phase_id.as_str(),
+        ];
+        let clean: Result<ReviewEnvelope> = Ok(ReviewEnvelope { degenerate: None, ..Default::default() });
+        finalize_review_mission(&mission.mission_id, &phase_ids, &clean);
+        assert_eq!(mission_status_str(&mission.mission_id), "closed");
+
+        let mission2 = build_mission_for_review(case, "test-crew").expect("mission reused");
+        assert_eq!(mission2.mission_id, mission.mission_id);
+        assert_eq!(mission_status_str(&mission.mission_id), "active", "reuse reopens the mission");
+        for phase_id in &phase_ids {
+            assert_eq!(
+                phase_status(&mission.mission_id, phase_id),
+                "complete",
+                "a previously-Complete phase is left untouched on reopen"
+            );
+        }
     }
 
     /// End-to-end, offline (zero bundles — no LMStudio/network, same fixture

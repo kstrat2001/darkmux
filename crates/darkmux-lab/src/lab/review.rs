@@ -2874,6 +2874,40 @@ fn verify_pass_with_retry(
 /// Emits its own `review.step`/`review.ruling` records under `step_id =
 /// "verify"` through the same bookend guard (contract 2 — the stage runs
 /// inside the run's existing liveness envelope).
+/// (#1373 gates a/c, verify half) The verify stage's remote-budget
+/// exhaustion warning + budget row — the SAME decision `run_verify_stage`
+/// (`finish_review`'s path, via `run_judge_only`) has always applied,
+/// extracted so `ReviewVerifyStepKind` (the graph path) can apply it too
+/// without the two callers drifting (CLAUDE.md's #1352 tiering: "shared
+/// logic that both `run_judge_only` and the graph path use should live
+/// once"). `bucket.record()` returns `None` when the stage made no remote
+/// calls at all (a local verify seat, or zero confirmed docket before this
+/// is even reached) — both fields come back empty in that case.
+struct VerifyBudgetOutcome {
+    warning: Option<String>,
+    remote_budget_row: Option<RemoteBudgetRecord>,
+}
+
+fn verify_budget_outcome(bucket: &RemoteBucket, docket: usize) -> VerifyBudgetOutcome {
+    let rec = bucket.record();
+    let warning = rec.as_ref().filter(|r| r.skipped_calls > 0).map(|r| {
+        // (#1260, ruling applied) Verify-bucket exhaustion degrades the
+        // STAGE, not the run: findings already adjudicated `verified` still
+        // post as frontier-verified, and each flag whose adjudication was
+        // SKIPPED keeps its `Confirmed` tier WITH the manual-verification
+        // marker. The posted review + envelope carry a loud warning naming
+        // the exhaustion — never a silent pass.
+        let adjudicated = docket.saturating_sub(r.skipped_calls as usize);
+        format!(
+            "verify budget exhausted after {adjudicated} of {docket} adjudications — the \
+             remaining {} confirmed finding(s) keep the manual-verification marker (the \
+             per-execution allowance of {} tokens ran out)",
+            r.skipped_calls, r.max_tokens
+        )
+    });
+    VerifyBudgetOutcome { warning, remote_budget_row: rec }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_verify_stage(
     env: &mut ReviewEnvelope,
@@ -2998,31 +3032,113 @@ fn run_verify_stage(
     }
     guard.step_finished("verify", finished);
 
-    if let Some(rec) = bucket.record() {
-        if rec.skipped_calls > 0 {
-            // (#1260, ruling applied) Verify-bucket exhaustion degrades the
-            // STAGE, not the run: findings already adjudicated `verified`
-            // still post as frontier-verified, and each flag whose
-            // adjudication was SKIPPED keeps its `Confirmed` tier WITH the
-            // manual-verification marker (recorded per-flag as `Error` in the
-            // loop above, honored by `synthesize_review`). The posted review +
-            // envelope carry a loud warning naming the exhaustion. It NEVER
-            // sets run-level `degenerate` — routing the whole run to
-            // "degraded" would discard findings already verified and read as
-            // "produced no signal", which is factually false. This matches the
-            // sibling verify-dispatch-error path (an inconclusive adjudication
-            // keeps the marker, never a silent pass).
-            let adjudicated = docket.saturating_sub(rec.skipped_calls as usize);
-            env.warnings.push(format!(
-                "verify budget exhausted after {adjudicated} of {docket} adjudications — the \
-                 remaining {} confirmed finding(s) keep the manual-verification marker (the \
-                 per-execution allowance of {} tokens ran out)",
-                rec.skipped_calls, rec.max_tokens
-            ));
-        }
+    // (#1373 gates a/c) Shared with the graph path's `ReviewVerifyStepKind`
+    // — see `verify_budget_outcome`'s own doc. NEVER sets run-level
+    // `degenerate` — routing the whole run to "degraded" would discard
+    // findings already verified and read as "produced no signal", which is
+    // factually false.
+    let outcome = verify_budget_outcome(&bucket, docket);
+    if let Some(w) = outcome.warning {
+        env.warnings.push(w);
+    }
+    if let Some(rec) = outcome.remote_budget_row {
         env.remote_budgets.push(rec);
     }
     Ok(())
+}
+
+/// (#1373 gates a/b/c + the reason-specificity fix) One judge stage's
+/// honesty-gate decision — the SAME budget-exhaustion / dispatch-error /
+/// no-usable-ruling logic `finish_review` has always applied, extracted so
+/// `ReviewJudgeStepKind` (the graph path) can apply it too without the two
+/// callers drifting again (CLAUDE.md's #1352 tiering: "shared logic that
+/// both `run_judge_only` and the graph path use should live once").
+///
+/// At most ONE `degenerate_reason` ever comes back — budget exhaustion
+/// wins over the "no usable ruling" gate, mirroring the original
+/// `degen_reasons.is_empty()` short-circuit this was extracted from (never
+/// a "combine every reason" accumulator, #1329). `dispatch_error_warning`
+/// is independent and UNCONDITIONAL (#1329's loud-beats-quiet half) —
+/// present whenever a remote judge had ANY per-flag dispatch failure,
+/// whether or not the run also degenerates.
+struct JudgeGateOutcome {
+    remote_budget_rows: Vec<RemoteBudgetRecord>,
+    dispatch_error_warning: Option<String>,
+    degenerate_reason: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn judge_gate_outcome(
+    is_remote: bool,
+    judged_len: usize,
+    usable: usize,
+    dispatch_errors: usize,
+    budgets: Option<&JudgeBudgets>,
+    remote_max_tokens_per_execution: u64,
+) -> JudgeGateOutcome {
+    let mut degen_reasons: Vec<String> = Vec::new();
+    let mut remote_budget_rows = Vec::new();
+
+    // (#1329 fix) A REMOTE judge dispatch failure on a MINORITY of flags is
+    // already handled honestly at the per-flag level (archive/demote, never
+    // silently confirmed) — but the "loud beats quiet" doctrine still wants
+    // it NAMED even on an otherwise-healthy run, so this warning fires
+    // unconditionally whenever a remote judge saw ANY dispatch error,
+    // independent of whether a `degenerate_reason` below also fires.
+    let dispatch_error_warning = if is_remote && dispatch_errors > 0 {
+        Some(format!(
+            "remote judge dispatch failed on {dispatch_errors} of {judged_len} flag(s) after bounded \
+             retries — each affected flag was conservatively archived (if its own pass-1 failed) \
+             or demoted to needs-check (if pass-1 confirmed but a later pass failed), never \
+             silently confirmed"
+        ))
+    } else {
+        None
+    };
+
+    // Gate 1: a REMOTE judge whose per-pass token bucket EXHAUSTED (a
+    // load-bearing stage — operator decision, DARKMUX_REMOTE_MAX_TOKENS_
+    // PER_EXECUTION). Any exhaustion degrades the run regardless of scale.
+    if let Some(b) = budgets {
+        if let Some(rec) = b.pass1.record() {
+            remote_budget_rows.push(rec);
+        }
+        if let Some(rec) = b.pass2.record() {
+            remote_budget_rows.push(rec);
+        }
+        let skipped = b.pass1.skipped + b.pass2.skipped;
+        if skipped > 0 {
+            degen_reasons.push(format!(
+                "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
+                 per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) ran out; \
+                 degraded run, never a silent pass"
+            ));
+        }
+    }
+
+    // Gate 2: the judge-dead honesty gate — NO flag produced a usable
+    // pass-1 ruling, so the whole judge phase produced no signal worth
+    // rendering. Names the specific "remote dispatch failed on N of M"
+    // shape when that's the cause, rather than the generic wording, so the
+    // operator sees WHY the judge went dead, not just THAT it did.
+    if degen_reasons.is_empty() && judged_len > 0 && usable == 0 {
+        if is_remote && dispatch_errors > 0 {
+            degen_reasons.push(format!(
+                "remote judge dispatch failed on {dispatch_errors} of {judged_len} flag(s) after \
+                 bounded retries — degraded run, the affected flag(s) carry no adjudication"
+            ));
+        } else {
+            degen_reasons.push(format!(
+                "judge produced no usable ruling on any of {judged_len} flags (all errored/unparsed)"
+            ));
+        }
+    }
+
+    JudgeGateOutcome {
+        remote_budget_rows,
+        dispatch_error_warning,
+        degenerate_reason: if degen_reasons.is_empty() { None } else { Some(degen_reasons.join("; ")) },
+    }
 }
 
 // ─── shared finish (probe→dedup→judge→envelope), reused by run_judge_only ─
@@ -3219,85 +3335,12 @@ fn finish_review(
         );
     }
 
-    // (#1260, revised #1329) Judge-stage degeneracy is decided BEFORE the
-    // optional verify stage so a run the judge already doomed never spends
-    // frontier money on verify (CONSIDER g). Two writers can push a
-    // `degen_reasons` entry; `degen_reasons.is_empty()` gates the second on
-    // the first, so AT MOST ONE reason string ends up in `env.degenerate` —
-    // this is no longer a "combine every reason" accumulator (that was the
-    // pre-#1329 shape). The per-flag dispatch-error WARNING below is the
-    // channel that stays complete regardless of which (if either) gate
-    // fired, so provenance is never silently dropped even when a reason
-    // string is superseded:
-    //
-    //  1. a REMOTE judge whose per-pass token bucket EXHAUSTED (a
-    //     load-bearing stage — operator decision, documented in
-    //     DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION). Any exhaustion degrades
-    //     the run regardless of scale — this IS the deliberate policy.
-    //  2. the judge-dead honesty gate: `usable == 0` — NO flag produced a
-    //     usable pass-1 ruling (Confirmed/NeedsCheck/FalsePositive), so the
-    //     whole judge phase produced no signal worth rendering. This is the
-    //     ONE run-level gate for per-flag adjudication failures, and it
-    //     covers three causes uniformly: unparsed judge output surviving its
-    //     retry, a dead LOCAL judge, and (#1329) a REMOTE judge whose
-    //     dispatch failed after bounded retries.
-    //
-    // (#1329 fix) A REMOTE judge dispatch failure on a MINORITY of flags is
-    // already handled honestly at the per-flag level: a pass-1 failure
-    // archives just that flag (invisible in the report, present in the
-    // envelope); a pass-2 failure demotes just that flag to NeedsCheck
-    // (visible, flagged "(no note from the judge)") — never a silent fake
-    // confirm either way. The prior code ALSO forced the entire run
-    // degenerate on ANY dispatch_errors > 0, which is the asymmetry that
-    // produced the bug: a `Confirmed`-then-`Unparsed` pass-2 outcome (same
-    // "transient technical failure" class) was already exempt from this
-    // check (`judge_dispatch_errors` only counts `Error`, never `Unparsed`)
-    // and rendered fine; only the `Error` variant nuked the whole docket. A
-    // single flag's timeout among 37 discarded 9 confirmed + 9 needs-check
-    // real findings and false-alarmed CI on a fully successful run
-    // (darkmux#1329). Fix: dispatch errors are counted and folded into
-    // `usable` like every other per-flag outcome — the run only goes
-    // degenerate via gate 2 when NO usable signal survived, exactly as
-    // `Unparsed` already worked. This is a consistency fix, not new policy.
-    //
-    // But swinging from "always nukes the run" to "always silent when the
-    // run stays green" would trade one honesty gap for another (this repo's
-    // doctrine: "no blind runs," loud beats quiet) — the PROBE stage already
-    // sets this precedent (a remote probe seat's bounded-retry failure pushes
-    // a named `env.warnings` entry: "reduced coverage", never silent). The
-    // judge side gets the same treatment: any remote dispatch error is named
-    // in `env.warnings` UNCONDITIONALLY, whether or not it also ends up
-    // being (or contributing to) the run-level `degenerate` reason.
-    let mut degen_reasons: Vec<String> = Vec::new();
-
-    if judge.pm.is_remote() && judge_dispatch_errors > 0 {
-        env.warnings.push(format!(
-            "remote judge dispatch failed on {judge_dispatch_errors} of {} flag(s) after bounded \
-             retries — each affected flag was conservatively archived (if its own pass-1 failed) \
-             or demoted to needs-check (if pass-1 confirmed but a later pass failed), never \
-             silently confirmed",
-            judged.len()
-        ));
-    }
-
-    if let Some(b) = &judge_budgets {
-        if let Some(rec) = b.pass1.record() {
-            env.remote_budgets.push(rec);
-        }
-        if let Some(rec) = b.pass2.record() {
-            env.remote_budgets.push(rec);
-        }
-        let skipped = b.pass1.skipped + b.pass2.skipped;
-        if skipped > 0 {
-            degen_reasons.push(format!(
-                "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
-                 per-execution allowance ({} tokens per stage) ran out; degraded run, never a \
-                 silent pass",
-                inputs.remote_max_tokens_per_execution
-            ));
-        }
-    }
-
+    // (#1260, revised #1329, extracted #1373) Judge-stage degeneracy is
+    // decided BEFORE the optional verify stage so a run the judge already
+    // doomed never spends frontier money on verify (CONSIDER g — see the
+    // `env.degenerate.is_none()` gate below). `judge_gate_outcome` is the
+    // SAME decision `ReviewJudgeStepKind` (the graph path) applies — see
+    // its own doc for the two-gate/one-warning shape.
     let usable = judged
         .iter()
         .filter(|j| {
@@ -3307,24 +3350,19 @@ fn finish_review(
             )
         })
         .count();
-    if degen_reasons.is_empty() && !judged.is_empty() && usable == 0 {
-        if judge.pm.is_remote() && judge_dispatch_errors > 0 {
-            degen_reasons.push(format!(
-                "remote judge dispatch failed on {judge_dispatch_errors} of {} flag(s) after \
-                 bounded retries — degraded run, the affected flag(s) carry no adjudication",
-                judged.len()
-            ));
-        } else {
-            degen_reasons.push(format!(
-                "judge produced no usable ruling on any of {} flags (all errored/unparsed)",
-                judged.len()
-            ));
-        }
+    let gate = judge_gate_outcome(
+        judge.pm.is_remote(),
+        judged.len(),
+        usable,
+        judge_dispatch_errors,
+        judge_budgets.as_ref(),
+        inputs.remote_max_tokens_per_execution,
+    );
+    if let Some(w) = gate.dispatch_error_warning {
+        env.warnings.push(w);
     }
-
-    if !degen_reasons.is_empty() {
-        env.degenerate = Some(degen_reasons.join("; "));
-    }
+    env.remote_budgets.extend(gate.remote_budget_rows);
+    env.degenerate = gate.degenerate_reason;
 
     // (#1260) The optional verify stage — one adjudication per confirmed
     // flag, AFTER the double-confirm judge and BEFORE the tier counts so a
@@ -3910,6 +3948,14 @@ impl StepKind for ReviewProbeStepKind {
 /// `dedup_flags`'s own doc.
 pub struct ReviewDedupStepKind {
     pub ctx: Arc<ReviewStepContext>,
+    /// (#1373 gate e) Shared cross-cutting envelope this step writes the
+    /// TRUE pre-dedup flag count into (`env.raw_flags`) the moment it's
+    /// known. `ReviewSynthesisStepKind` only ever sees THIS step's OWN
+    /// `StepOutcome.output` (the already-deduped list, since that's the
+    /// data judge/verify need to consume), so without this write it has no
+    /// way to recover the true raw count — the field silently read the
+    /// deduped count instead (`raw_flags == deduped_flags` always).
+    pub env: SharedReviewEnvelope,
 }
 
 impl StepKind for ReviewDedupStepKind {
@@ -3926,6 +3972,10 @@ impl StepKind for ReviewDedupStepKind {
             raw.extend(flags);
         }
         let raw_count = raw.len();
+        {
+            let mut env = self.env.lock().expect("shared review envelope mutex poisoned");
+            env.raw_flags = env.raw_flags.max(raw_count);
+        }
         let (deduped, _stats) = dedup_flags(raw, &self.ctx.diff);
         let wall_ms = t0.elapsed().as_millis() as u64;
         emit_review_step_result(
@@ -3979,6 +4029,13 @@ pub struct ReviewJudgeStepKind {
     /// writes its `MemberRecord`s to — one collector for every dispatching
     /// step kind, merged into `shared_env` once `run_step_graph` returns.
     pub members: Arc<StdMutex<Vec<MemberRecord>>>,
+    /// (#1373 gates a/b/c) Shared cross-cutting envelope this step writes
+    /// its remote-budget rows, the #1329 dispatch-error warning, and (when
+    /// this stage is itself doomed) the run's `degenerate` reason into —
+    /// the SAME handle `ReviewSynthesisStepKind` reads at the end and
+    /// `ReviewVerifyStepKind` reads BEFORE dispatching (gate d — no
+    /// frontier spend on a run this stage already doomed, CONSIDER g).
+    pub env: SharedReviewEnvelope,
 }
 
 /// One deduped flag's judged outcome, in dispatch order — the shared
@@ -4125,6 +4182,39 @@ impl StepKind for ReviewJudgeStepKind {
 
         let judged: Vec<JudgedFlag> = results.into_iter().map(|r| r.judged).collect();
 
+        // (#1373 gates a/b/c) The SAME honesty-gate decision `finish_review`
+        // applies, via the shared `judge_gate_outcome` helper — see its own
+        // doc. `judge_budgets`'s scope (the `std::thread::scope` above) has
+        // already joined, so `into_inner()` is safe here on the main thread.
+        let usable = judged
+            .iter()
+            .filter(|j| {
+                matches!(
+                    j.pass1.ruling,
+                    JudgeRuling::Confirmed | JudgeRuling::NeedsCheck | JudgeRuling::FalsePositive
+                )
+            })
+            .count();
+        let budgets_final = judge_budgets.map(|m| m.into_inner().expect("judge budgets mutex poisoned"));
+        let gate = judge_gate_outcome(
+            judge_endpoint.is_some(),
+            judged.len(),
+            usable,
+            judge_dispatch_errors,
+            budgets_final.as_ref(),
+            self.ctx.remote_max_tokens_per_execution,
+        );
+        {
+            let mut env = self.env.lock().expect("shared review envelope mutex poisoned");
+            env.remote_budgets.extend(gate.remote_budget_rows);
+            if let Some(w) = gate.dispatch_error_warning {
+                env.warnings.push(w);
+            }
+            if gate.degenerate_reason.is_some() {
+                env.degenerate = gate.degenerate_reason;
+            }
+        }
+
         emit_review_step_result(
             "review.judge",
             &step.id,
@@ -4221,6 +4311,13 @@ pub struct ReviewVerifyStepKind {
     /// (#1354 follow-up) Same shared accumulator as `ReviewJudgeStepKind`'s
     /// — see its doc.
     pub members: Arc<StdMutex<Vec<MemberRecord>>>,
+    /// (#1373 gates a/c/d) Same shared handle as `ReviewJudgeStepKind`'s —
+    /// this step reads it FIRST to skip dispatching entirely when the
+    /// judge stage already doomed the run (gate d — no frontier spend on a
+    /// doomed run, CONSIDER g, mirroring `finish_review`'s `if env.
+    /// degenerate.is_none() { run_verify_stage(...) }` gate), and writes
+    /// its own remote-budget row + exhaustion warning into it (gates a/c).
+    pub env: SharedReviewEnvelope,
 }
 
 impl StepKind for ReviewVerifyStepKind {
@@ -4245,6 +4342,18 @@ impl StepKind for ReviewVerifyStepKind {
 
         let docket_count = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
         if docket_count == 0 {
+            let output = serde_json::to_string(&judged).context("serializing judged flags")?;
+            return Ok(StepOutcome { output, flow_records: Vec::new() });
+        }
+
+        // (#1373 gate d) No frontier spend on a run the judge stage already
+        // doomed (CONSIDER g — the judge task always completes before this
+        // one, since `verify_task.depends_on == [judge_task]`, so
+        // `env.degenerate` already reflects `ReviewJudgeStepKind`'s own
+        // gate by the time this runs). Confirmed flags pass through
+        // untouched — no verify marker, no dispatch, byte-identical to a
+        // crew with no verify seat at all.
+        if self.env.lock().expect("shared review envelope mutex poisoned").degenerate.is_some() {
             let output = serde_json::to_string(&judged).context("serializing judged flags")?;
             return Ok(StepOutcome { output, flow_records: Vec::new() });
         }
@@ -4343,6 +4452,21 @@ impl StepKind for ReviewVerifyStepKind {
                 endpoint: endpoint_host,
                 served_model,
             });
+        }
+
+        // (#1373 gates a/c) Shared with `run_verify_stage` (`finish_review`'s
+        // path) via `verify_budget_outcome` — see its own doc. NEVER sets
+        // `env.degenerate` — verify-bucket exhaustion degrades the STAGE,
+        // not the run (findings already adjudicated `verified` still post).
+        let outcome = verify_budget_outcome(&bucket, docket_count);
+        if outcome.warning.is_some() || outcome.remote_budget_row.is_some() {
+            let mut env = self.env.lock().expect("shared review envelope mutex poisoned");
+            if let Some(w) = outcome.warning {
+                env.warnings.push(w);
+            }
+            if let Some(rec) = outcome.remote_budget_row {
+                env.remote_budgets.push(rec);
+            }
         }
 
         let output = serde_json::to_string(&judged).context("serializing verified flags")?;
@@ -4555,6 +4679,16 @@ pub fn build_review_graph(
     let mut phase_id_of_step = std::collections::BTreeMap::new();
     let registry = StepKindRegistry::new();
 
+    // (#1373) Built EARLY (moved up from its former place right before
+    // `ReviewSynthesisStepKind`'s construction) so `ReviewDedupStepKind`/
+    // `ReviewJudgeStepKind`/`ReviewVerifyStepKind` can ALSO hold a clone —
+    // see each kind's own doc for what it reads/writes here (gates a-e).
+    let shared_env: SharedReviewEnvelope = Arc::new(StdMutex::new(ReviewEnvelope {
+        case_id: ctx.case_id.clone(),
+        bundles: ctx.bundles.len(),
+        ..Default::default()
+    }));
+
     let bundle_step_id = "review-bundle-step".to_string();
     let bundle_task_id = "review-bundle-task".to_string();
     tasks.push(Task {
@@ -4667,7 +4801,7 @@ pub fn build_review_graph(
             output: None,
         },
     );
-    let dedup_kind = Arc::new(ReviewDedupStepKind { ctx: ctx.clone() });
+    let dedup_kind = Arc::new(ReviewDedupStepKind { ctx: ctx.clone(), env: shared_env.clone() });
     registry.register(dedup_kind.clone()).expect("review.dedup registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
     registry
@@ -4700,7 +4834,12 @@ pub fn build_review_graph(
             output: None,
         },
     );
-    let judge_kind = Arc::new(ReviewJudgeStepKind { ctx: ctx.clone(), judge, members: probe_members.clone() });
+    let judge_kind = Arc::new(ReviewJudgeStepKind {
+        ctx: ctx.clone(),
+        judge,
+        members: probe_members.clone(),
+        env: shared_env.clone(),
+    });
     registry.register(judge_kind.clone()).expect("review.judge registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
     registry
@@ -4733,7 +4872,12 @@ pub fn build_review_graph(
             output: None,
         },
     );
-    let verify_kind = Arc::new(ReviewVerifyStepKind { ctx: ctx.clone(), verify, members: probe_members.clone() });
+    let verify_kind = Arc::new(ReviewVerifyStepKind {
+        ctx: ctx.clone(),
+        verify,
+        members: probe_members.clone(),
+        env: shared_env.clone(),
+    });
     registry.register(verify_kind.clone()).expect("review.verify registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
     registry
@@ -4767,11 +4911,6 @@ pub fn build_review_graph(
         },
     );
 
-    let shared_env: SharedReviewEnvelope = Arc::new(StdMutex::new(ReviewEnvelope {
-        case_id: ctx.case_id.clone(),
-        bundles: ctx.bundles.len(),
-        ..Default::default()
-    }));
     let synthesis_kind = Arc::new(ReviewSynthesisStepKind {
         ctx: ctx.clone(),
         env: shared_env.clone(),
@@ -7595,27 +7734,27 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     //   `run_review_graph`'s doc); an equivalent belongs in
     //   `src/pr_review.rs`'s own test suite, not here.
     //
-    // ── a real, distinct gap found DURING this migration ────────────────
+    // ── a real, distinct gap found DURING the #1355/#1357 migration ─────
     //
-    // Three tests below (`remote_judge_budget_exhaustion_is_an_honest_
-    // degraded_run`, `remote_verify_budget_exhaustion_degrades_the_stage_
-    // not_the_run`, `verify_stage_skipped_when_judge_already_degraded`) are
-    // migrated as CHARACTERIZATION tests of a real gap, not clean 1:1 ports:
-    // `finish_review` (still alive via `run_judge_only`) applies judge/
-    // verify remote-budget honesty gates that `ReviewJudgeStepKind`/
-    // `ReviewVerifyStepKind`/`ReviewSynthesisStepKind` do NOT reproduce — a
-    // judge/verify remote bucket's exhaustion never reaches
-    // `env.remote_budgets`, a fully-exhausted judge bucket doesn't degrade
-    // the run when at least one flag got a real ruling first, a partial
-    // judge dispatch failure's warning never reaches `env.warnings`, and
-    // verify never skips on an already-doomed judge stage. This is a
-    // PRODUCTION gap, not a test gap — fixing it means porting logic onto
-    // the step kinds, which is a redesign out of THIS packet's scope
-    // (tests + dead-code removal only). Per this repo's "loud beats quiet"
-    // doctrine, the assertions below pin the CURRENT (gap) behavior
-    // explicitly rather than silently dropping the coverage — a future fix
-    // will fail these assertions, which is the intended signal to update
-    // them alongside the fix.
+    // FIXED by #1284 Packet 2 (#1373). `finish_review` (still alive via
+    // `run_judge_only`) applied judge/verify remote-budget honesty gates
+    // that `ReviewJudgeStepKind`/`ReviewVerifyStepKind`/
+    // `ReviewSynthesisStepKind` did NOT reproduce — a judge/verify remote
+    // bucket's exhaustion never reached `env.remote_budgets`, a
+    // fully-exhausted judge bucket didn't degrade the run when at least
+    // one flag got a real ruling first, a partial judge dispatch failure's
+    // warning never reached `env.warnings`, and verify never skipped on an
+    // already-doomed judge stage. Ported onto the step kinds via two
+    // shared helpers (`judge_gate_outcome`, `verify_budget_outcome`) both
+    // `finish_review` and the graph path now call, plus a `SharedReviewEnvelope`
+    // handle threaded onto `ReviewDedupStepKind`/`ReviewJudgeStepKind`/
+    // `ReviewVerifyStepKind` (see each kind's own doc). The tests below
+    // — `graph_remote_judge_budget_exhaustion_is_an_honest_degraded_run`,
+    // `graph_remote_verify_budget_exhaustion_degrades_the_stage_not_the_
+    // run`, `graph_verify_stage_skipped_when_judge_already_degraded`, plus
+    // the raw_flags (gate e) and minority-warning (gate c) pins elsewhere
+    // in this module — were CHARACTERIZATION tests of the gap; they now
+    // pin the FIXED (positive) behavior instead.
 
     /// Migrates `envelope_counts_and_steps_are_internally_consistent`'s
     /// INTENT (tier/count internal consistency) minus its `env.steps`
@@ -7637,21 +7776,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
         assert!(env.degenerate.is_none());
         assert_eq!(env.bundles, 1, "one changed file in the fixture diff");
-        // KNOWN GAP (found 2026-07-14 during this migration, same class as
-        // the judge/verify budget gaps documented above): on the old
-        // driver, `finish_review` sets `env.raw_flags = raw_flags.len()`
-        // BEFORE dedup runs — the true pre-dedup count (2 draws here). On
-        // the graph path, `ReviewSynthesisStepKind::run` instead sets
-        // `env.raw_flags = env.raw_flags.max(flags.len())` where `flags` is
-        // the DEDUP STEP'S OWN OUTPUT (already deduped) — so `raw_flags` and
-        // `deduped_flags` always read the SAME number on the graph path,
-        // losing the "N raw collapsed to M" observability signal the field
-        // name promises. If this assertion starts failing, the gap has
-        // been closed — flip it back to the true pre-dedup count (2).
+        // (#1373 gate e, FIXED) `ReviewDedupStepKind` now writes the TRUE
+        // pre-dedup count (2 draws here) into the shared envelope the
+        // moment it's known, so `raw_flags` and `deduped_flags` diverge
+        // again on the graph path — the "N raw collapsed to M"
+        // observability signal the field name promises.
         assert_eq!(
-            env.raw_flags, 1,
-            "KNOWN GAP: env.raw_flags reads the DEDUPED count (1), not the true pre-dedup \
-             draw count (2), on the graph path"
+            env.raw_flags, 2,
+            "env.raw_flags reads the true pre-dedup draw count, not the deduped count"
         );
         assert_eq!(env.deduped_flags, 1, "identical anchor+family collapses to one");
         assert_eq!(env.flags.len(), env.deduped_flags);
@@ -8051,13 +8183,16 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         );
     }
 
-    /// Was `remote_judge_budget_exhaustion_is_an_honest_degraded_run`. NOW
-    /// A CHARACTERIZATION TEST OF A REAL GAP — see the "a real, distinct
-    /// gap" note above this section. The per-FLAG accounting (the
-    /// PRESERVED `judge_one_flag_with_passes` function) is still correct;
-    /// the RUN-LEVEL honesty gate `finish_review` applies is missing.
+    /// Was `remote_judge_budget_exhaustion_is_an_honest_degraded_run`, then
+    /// (temporarily) `graph_remote_judge_budget_exhaustion_gap_flag_level_
+    /// is_honest_run_level_is_not` while #1373 gates a/b were an open,
+    /// characterized gap. FIXED (#1373): `ReviewJudgeStepKind` now applies
+    /// the SAME run-level honesty gate `finish_review` always has, via the
+    /// shared `judge_gate_outcome` helper — a partially-exhausted remote
+    /// judge bucket degrades the whole run, and its pass1/pass2 budget rows
+    /// reach `env.remote_budgets`.
     #[test]
-    fn graph_remote_judge_budget_exhaustion_gap_flag_level_is_honest_run_level_is_not() {
+    fn graph_remote_judge_budget_exhaustion_is_an_honest_degraded_run() {
         let crew = crew_with(vec![
             ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
             ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
@@ -8093,27 +8228,23 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             .expect("the post-exhaustion flag is ruled Error, never silently confirmed");
         assert!(skipped.pass1.note_for_author.contains("remote token budget exhausted"));
 
-        // KNOWN GAP (found 2026-07-14 during the #1355/#1357 migration, not
-        // yet its own tracked issue): `finish_review` would mark this run
-        // `env.degenerate` unconditionally on ANY judge-bucket exhaustion
-        // (operator decision, #1260) — the graph path's ONLY judge
-        // degenerate gate is "zero usable pass-1 rulings across the whole
-        // set", which this scenario does NOT trip (one flag DID get a real
-        // ruling before the bucket ran out). If this assertion starts
-        // failing, the gap has been closed — flip it to `is_some()` and
-        // check the reason text.
+        // (#1373 gate b, FIXED) ANY judge-bucket exhaustion degrades the
+        // whole run (operator decision, #1260) — even though this scenario
+        // has one flag that DID get a real ruling before the bucket ran
+        // out (the "zero usable pass-1 rulings" gate alone would NOT have
+        // caught this; the budget-exhaustion gate is the one that fires).
+        let reason = env.degenerate.as_deref().expect("a partially-exhausted remote judge degrades the run");
+        assert!(reason.contains("remote judge token budget exhausted"), "got: {reason}");
+        // (#1373 gate a, FIXED) judge-pass1/pass2 budget rows now reach
+        // `env.remote_budgets` alongside probe's own bucket row.
         assert!(
-            env.degenerate.is_none(),
-            "KNOWN GAP: a partially-exhausted remote judge should degrade the whole run \
-             (finish_review's behavior) but the graph path currently renders it clean: {:?}",
-            env.degenerate
+            env.remote_budgets.iter().any(|r| r.stage == "judge-pass1"),
+            "judge-pass1 budget row must reach the envelope: {:?}",
+            env.remote_budgets
         );
-        // KNOWN GAP (same finding): judge-pass1/pass2 budget rows never
-        // reach `env.remote_budgets` on the graph path — only probe's
-        // bucket is threaded through (`BuiltReviewGraph::probe_bucket`).
         assert!(
-            !env.remote_budgets.iter().any(|r| r.stage.starts_with("judge")),
-            "KNOWN GAP: judge budget rows are absent from env.remote_budgets on the graph path: {:?}",
+            env.remote_budgets.iter().any(|r| r.stage == "judge-pass2"),
+            "judge-pass2 budget row must reach the envelope: {:?}",
             env.remote_budgets
         );
     }
@@ -8269,11 +8400,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     }
 
     /// Was `remote_verify_budget_exhaustion_degrades_the_stage_not_the_
-    /// run`. NOW A CHARACTERIZATION TEST OF THE SAME GAP CLASS as
-    /// `graph_remote_judge_budget_exhaustion_gap_flag_level_is_honest_
-    /// run_level_is_not` above — see the "a real, distinct gap" note.
+    /// run`, then (temporarily) `graph_remote_verify_budget_exhaustion_
+    /// gap_flag_level_is_honest_bucket_row_is_not` while #1373 gates a/c's
+    /// verify half were an open, characterized gap. FIXED (#1373):
+    /// `ReviewVerifyStepKind` now applies the SAME warning + budget-row
+    /// logic `run_verify_stage` always has, via the shared
+    /// `verify_budget_outcome` helper.
     #[test]
-    fn graph_remote_verify_budget_exhaustion_gap_flag_level_is_honest_bucket_row_is_not() {
+    fn graph_remote_verify_budget_exhaustion_degrades_the_stage_not_the_run() {
         let crew = crew_with(vec![
             ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
             ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
@@ -8311,44 +8445,42 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(skipped.tier, Tier::Confirmed);
         assert!(skipped.verify.as_ref().unwrap().note_for_author.contains("remote token budget exhausted"));
 
-        // KNOWN GAP: `run_verify_stage` (the old driver) pushes a loud
-        // `env.warnings` entry ("verify budget exhausted after N of M
-        // adjudications") and a `env.remote_budgets` row for the verify
-        // bucket; `ReviewVerifyStepKind` computes the same bucket but never
-        // surfaces either. If either assertion starts failing, the gap has
-        // been closed for that half.
+        // (#1373 gates a/c, FIXED) `env.warnings` now carries the loud
+        // "verify budget exhausted after N of M adjudications" entry, and
+        // `env.remote_budgets` carries the verify bucket's own row.
         assert!(
-            !env.warnings.iter().any(|w| w.contains("verify budget exhausted")),
-            "KNOWN GAP: no 'verify budget exhausted' warning reaches env.warnings on the graph path: {:?}",
+            env.warnings.iter().any(|w| w.contains("verify budget exhausted after 1 of 2 adjudications")),
+            "the exhaustion warning must reach env.warnings: {:?}",
             env.warnings
         );
         assert!(
-            !env.remote_budgets.iter().any(|r| r.stage == "verify"),
-            "KNOWN GAP: the verify budget row never reaches env.remote_budgets on the graph path: {:?}",
+            env.remote_budgets.iter().any(|r| r.stage == "verify"),
+            "the verify budget row must reach env.remote_budgets: {:?}",
             env.remote_budgets
         );
     }
 
-    /// Was `verify_stage_skipped_when_judge_already_degraded`. NOW A
-    /// CHARACTERIZATION TEST OF THE SAME GAP CLASS — see the "a real,
-    /// distinct gap" note. `finish_review` gates the whole verify stage on
-    /// `env.degenerate.is_none()` (CONSIDER g — no frontier spend on a run
-    /// the judge already doomed); `ReviewVerifyStepKind` has no such gate
-    /// (it only sees its own input, never the shared envelope's degenerate
-    /// state) — so a judge-exhausted run STILL spends on verify's confirmed
-    /// survivors on the graph path today.
+    /// Was `verify_stage_skipped_when_judge_already_degraded`, then
+    /// (temporarily) `graph_verify_stage_gap_still_dispatches_on_a_judge_
+    /// doomed_run` while #1373 gate d was an open, characterized gap.
+    /// FIXED (#1373): `ReviewVerifyStepKind` now gates on the shared
+    /// envelope's `degenerate` state (set by `ReviewJudgeStepKind` before
+    /// verify's task ever becomes ready, since `verify_task.depends_on ==
+    /// [judge_task]`) — CONSIDER g, no frontier spend on a run the judge
+    /// already doomed.
     #[test]
-    fn graph_verify_stage_gap_still_dispatches_on_a_judge_doomed_run() {
+    fn graph_verify_stage_skipped_when_judge_already_degraded() {
         let crew = crew_with(vec![
             ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
             ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
             ("review-verify", vec![graph_staffing("frontier", "verify-model", 1)]),
         ]);
         let bundles = vec![bundle_input("a.ts"), bundle_input("b.ts")];
-        let verify_dispatched = std::sync::atomic::AtomicBool::new(false);
+        let verify_dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let verify_dispatched_write = verify_dispatched.clone();
         let ctx = step_ctx_with_chat_and_budget(&crew, bundles, 100, move |call: &ChatCall| {
             if call.model == "darkmux:verify-model" {
-                verify_dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
+                verify_dispatched_write.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(reply("```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"e\", \"note_for_author\": \"n\"}\n```"))
             } else if call.endpoint.is_some() {
                 Ok(SingleShotReply {
@@ -8363,13 +8495,21 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
         });
         let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
-        // One flag confirmed before the judge's remote bucket exhausted, so
-        // verify's docket is non-empty and (per the gap) it dispatches.
-        assert_eq!(env.confirmed, 1);
+        // One flag confirmed before the judge's remote bucket exhausted —
+        // the SAME preserved per-flag logic as
+        // `graph_remote_judge_budget_exhaustion_is_an_honest_degraded_run`
+        // — but the run is now degenerate (gate b), so verify's non-empty
+        // docket never dispatches at all.
+        assert_eq!(env.confirmed, 1, "the pre-exhaustion flag stays confirmed — verify never touches it");
+        assert!(env.degenerate.is_some(), "the judge-bucket exhaustion still degrades the run (gate b)");
         assert!(
-            env.members.iter().any(|m| m.seat == "review-verify"),
-            "KNOWN GAP: verify still dispatches on a judge-doomed run (CONSIDER g's skip has no \
-             graph-path equivalent) — env.members should have no review-verify row here once fixed"
+            !verify_dispatched.load(std::sync::atomic::Ordering::SeqCst),
+            "no verify-model chat call must fire on a judge-doomed run"
+        );
+        assert!(
+            !env.members.iter().any(|m| m.seat == "review-verify"),
+            "no review-verify member row — verify never ran: {:?}",
+            env.members
         );
     }
 
@@ -8428,14 +8568,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     }
 
     /// Was `remote_judge_dispatch_failure_degrades_the_run`. The run still
-    /// goes degenerate (the outcome #1260 requires) — only the exact reason
-    /// TEXT differs from the old driver's ("judge produced no usable
-    /// ruling..." via the shared #1355 gate, not "remote judge dispatch
-    /// failed on 1 of 1 flag") because the graph path's judge-dead gate
-    /// doesn't special-case the all-remote-dispatch-error variant the way
-    /// `finish_review` does. That's harmless wording drift, not the gap
-    /// documented above (which is about a PARTIAL failure never degrading
-    /// at all — see the next test).
+    /// goes degenerate (the outcome #1260 requires). (#1373 reason-
+    /// specificity fix) The reason TEXT now matches `finish_review`'s own
+    /// wording exactly — `judge_gate_outcome` special-cases the
+    /// all-remote-dispatch-error variant on BOTH paths, naming the failure
+    /// shape ("remote judge dispatch failed on N of M flags") rather than
+    /// the generic "no usable ruling" — so the operator sees WHY the judge
+    /// went dead, not just THAT it did.
     #[test]
     fn graph_remote_judge_dispatch_failure_degrades_the_run() {
         let crew = crew_with(vec![
@@ -8451,14 +8590,19 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         });
         let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
         let reason = env.degenerate.as_deref().expect("remote judge dispatch failure degrades the run");
-        assert!(reason.contains("no usable ruling"), "got: {reason}");
+        assert!(
+            reason.contains("remote judge dispatch failed on 1 of 1 flag"),
+            "got: {reason}"
+        );
     }
 
     /// Was `remote_judge_dispatch_error_on_minority_of_flags_does_not_
     /// degrade_the_run` (#1329). The "does not degrade" + per-flag demotion
     /// behavior is preserved (both live in `judge_one_flag_with_passes`,
-    /// unchanged); the "must be named in env.warnings" assertion is a
-    /// KNOWN GAP — see the note above — dropped here, not silently kept.
+    /// unchanged). (#1373 gate c, FIXED) The "must be named in
+    /// env.warnings" half — dropped as a KNOWN GAP during the #1355/#1357
+    /// migration — is restored: `ReviewJudgeStepKind` now pushes the SAME
+    /// unconditional #1329 warning `finish_review` always has.
     #[test]
     fn graph_remote_judge_dispatch_error_on_minority_of_flags_does_not_degrade_the_run() {
         let crew = crew_with(vec![
@@ -8497,15 +8641,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let demoted = &env.judged[1];
         assert_eq!(demoted.tier, Tier::NeedsCheck);
         assert!(demoted.demoted_by_pass2);
-        // KNOWN GAP: `finish_review` names this transient failure in
-        // `env.warnings` even on an otherwise-healthy run (the loud-beats-
-        // quiet fix from #1329); `ReviewJudgeStepKind` computes the same
-        // `judge_dispatch_errors` count but only reaches its own flow-record
-        // payload with it, never `env.warnings`.
+        // `finish_review` names this transient failure in `env.warnings`
+        // even on an otherwise-healthy run (the loud-beats-quiet fix from
+        // #1329) — the graph path now does too.
         assert!(
-            env.warnings.is_empty(),
-            "KNOWN GAP: a minority judge dispatch error is not named in env.warnings on the graph \
-             path (finish_review names it): {:?}",
+            env.warnings.iter().any(|w| w.contains("remote judge dispatch failed on 1 of 3 flag")),
+            "a minority judge dispatch error must be named in env.warnings: {:?}",
             env.warnings
         );
     }

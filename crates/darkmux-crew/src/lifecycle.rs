@@ -43,12 +43,12 @@
 //!   This is the only transition that clears a `*_ts` field.
 //!
 //! Mission:
-//!   | from     | start             | close                | pause                 | resume                |
-//!   |----------|-------------------|----------------------|-----------------------|-----------------------|
-//!   | `Active` | error if          | → Closed ✓           | → Paused ✓            | error: already Active |
-//!   |          | started_ts set ²  |                      |                       |                       |
-//!   | `Paused` | error: use resume | → Closed ✓           | error: already Paused | → Active ³            |
-//!   | `Closed` | error: terminal   | error: already       | error: terminal       | error: terminal       |
+//!   | from     | start             | close                | pause                 | resume                | reopen ⁴              |
+//!   |----------|-------------------|----------------------|-----------------------|------------------------|-----------------------|
+//!   | `Active` | error if          | → Closed ✓           | → Paused ✓            | error: already Active | error: not Closed     |
+//!   |          | started_ts set ²  |                      |                       |                        |                       |
+//!   | `Paused` | error: use resume | → Closed ✓           | error: already Paused | → Active ³            | error: use resume     |
+//!   | `Closed` | error: terminal   | error: already       | error: terminal       | error: terminal       | → Active ⁴ ✓          |
 //!
 //! ² `mission_start` requires a fresh start — it stamps `started_ts=now()`
 //!   on first invocation and errors thereafter. Use `mission resume` to
@@ -56,6 +56,15 @@
 //!   mission running.
 //! ³ Resume does NOT clear `paused_ts` — operator may want to see when
 //!   the most recent pause occurred even after resuming.
+//! ⁴ `mission_reopen` (#1372) is the ONLY way out of `Closed` — Closed is
+//!   terminal for every OTHER transition, by design, so a fresh path was
+//!   needed rather than loosening `start`/`resume`'s own guards. Clears
+//!   `closed_ts` (mirrors `phase_start`'s "restart clears the prior
+//!   terminal timestamp" convention — the attempt starting now supersedes
+//!   the old closure). System-triggered only today (no CLI verb — see
+//!   `mission_reopen_with_reasoning`'s own doc); a human-operator-facing
+//!   `darkmux mission reopen` verb is a natural follow-up, out of scope
+//!   here.
 //!
 //! Missions have no `created_ts → started_ts` distinction at creation
 //! time; `start` is the explicit "this mission is now being worked on"
@@ -728,6 +737,45 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
     Ok(mission)
 }
 
+/// `mission reopen <id>` — Closed → Active (#1372). The ONLY legal
+/// transition OUT of Closed — every other verb treats Closed as terminal
+/// by design (see the module doc's state table), so a re-run that reuses a
+/// finalized mission id needs this dedicated path rather than a loosened
+/// `start`/`resume` guard.
+///
+/// Clears `closed_ts` (mirrors `phase_start`'s "restart clears the prior
+/// terminal timestamp" convention, `Abandoned → Running`) — the attempt
+/// starting now supersedes the old closure; a caller checking `closed_ts`
+/// for "when did this mission last finish" shouldn't see a stale value
+/// from before the reopen. `started_ts` is left untouched (the mission's
+/// original start time is still meaningful provenance).
+///
+/// System-triggered only today — `build_mission_for_review`'s reuse-of-a-
+/// terminal-mission fix (#1372) is the only caller. A human-operator-
+/// facing `darkmux mission reopen` CLI verb is a natural follow-up (the
+/// same operator-sovereignty question every other lifecycle verb already
+/// answers — see `CLAUDE.md`'s "Operator sovereignty" section) but is out
+/// of this fix's scope: the mission this fix reopens is SYSTEM-created
+/// ephemera (`build_mission_for_review` stood it up purely so the review's
+/// own Task/Step graph had somewhere to live), so the system reopening its
+/// own closed mission when it re-launches the same case is consistent with
+/// that doctrine the same way `finalize_review_mission`'s auto-close is
+/// (#1365's own doc makes the identical argument for auto-CLOSING this
+/// class of mission).
+pub fn mission_reopen_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
+    let mut mission = load_mission(id)?;
+    match mission.status {
+        MissionStatus::Closed => {}
+        MissionStatus::Active => bail!("mission `{id}` is already Active"),
+        MissionStatus::Paused => bail!("mission `{id}` is Paused — use `mission resume` instead"),
+    }
+    mission.status = MissionStatus::Active;
+    mission.closed_ts = None; // reopen clears the prior closure, mirrors phase_start
+    save_json(&mission_path(id), &mission)?;
+    emit_mission_transition_record_with_reasoning(id, "mission reopen", reasoning);
+    Ok(mission)
+}
+
 // ─── Mission scope growth ──────────────────────────────────────────────
 
 /// `mission add-phase` — operator-sovereign scope growth (#107).
@@ -1156,6 +1204,39 @@ mod tests {
         seed_mission("m7", MissionStatus::Active);
         let err = mission_resume("m7").unwrap_err();
         assert!(err.to_string().contains("already Active"));
+    }
+
+    // ─── mission_reopen (#1372) ─────────────────────────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn mission_reopen_from_closed_sets_active_and_clears_closed_ts() {
+        let _g = CrewGuard::new();
+        let mut m = seed_mission("m8", MissionStatus::Closed);
+        m.closed_ts = Some(1_700_000_900);
+        save_json(&mission_path("m8"), &m).unwrap();
+
+        let reopened = mission_reopen_with_reasoning("m8", Some("review re-run")).unwrap();
+        assert_eq!(reopened.status, MissionStatus::Active);
+        assert!(reopened.closed_ts.is_none(), "reopen clears the prior closure, mirroring phase_start");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn mission_reopen_from_active_errors() {
+        let _g = CrewGuard::new();
+        seed_mission("m9", MissionStatus::Active);
+        let err = mission_reopen_with_reasoning("m9", None).unwrap_err();
+        assert!(err.to_string().contains("already Active"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn mission_reopen_from_paused_errors_with_resume_hint() {
+        let _g = CrewGuard::new();
+        seed_mission("m10", MissionStatus::Paused);
+        let err = mission_reopen_with_reasoning("m10", None).unwrap_err();
+        assert!(err.to_string().contains("resume"));
     }
 
     // ─── Error paths ──────────────────────────────────────────────────
