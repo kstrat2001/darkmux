@@ -228,6 +228,15 @@ impl MissionEnvelope {
 /// `phase_complete` on an already-Complete phase bails harmlessly) — this
 /// function never checks current state itself, it just applies the
 /// declared outcome and lets `lifecycle` do the legality check.
+///
+/// (#1284 Packet 3) ALSO persists `envelope` itself via
+/// `lifecycle::save_envelope` (`envelope.json` beside `mission.json`,
+/// atomic-rename write like every other lifecycle save) — makes the
+/// envelope a real on-disk artifact instead of constructed-and-dropped, and
+/// is what makes a future graph-lens viewer (#1284 Packet 5) able to read a
+/// mission's last-run outcome without re-deriving it from flow records.
+/// Best-effort like everything else here: a persistence hiccup degrades
+/// only the VIEW, never the run itself (already finished by this point).
 pub fn finalize_mission(envelope: &MissionEnvelope) {
     for phase in &envelope.phases {
         match phase.outcome {
@@ -244,6 +253,7 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
         .clone()
         .unwrap_or_else(|| envelope.status.default_reason().to_string());
     let _ = lifecycle::mission_close_with_reasoning(&envelope.mission_id, Some(&reason));
+    let _ = lifecycle::save_envelope(&envelope.mission_id, envelope);
 }
 
 #[cfg(test)]
@@ -427,5 +437,40 @@ mod tests {
         let back: MissionEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back.payload["confirmed"], serde_json::json!(3));
         assert_eq!(back.payload["needs_check"], serde_json::json!(1));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn finalize_mission_persists_envelope_json_beside_mission_json() {
+        // (#1284 Packet 3) `envelope.json` is a real artifact, not
+        // constructed-and-dropped — verifies BOTH the path (beside
+        // `mission.json`, per `lifecycle::envelope_path`'s doc) and that
+        // the round-tripped content matches what was finalized.
+        let _g = CrewGuard::new();
+        seed_mission("m6");
+        seed_phase("m6", "p1");
+
+        let mut envelope = MissionEnvelope::new("m6", MissionOutcomeStatus::Degraded, &["p1"]);
+        envelope.warnings = vec!["remote probe token budget exhausted".to_string()];
+        envelope.payload = serde_json::json!({"confirmed": 2});
+        finalize_mission(&envelope);
+
+        let path = lifecycle::envelope_path("m6");
+        assert_eq!(path, lifecycle::mission_path("m6").parent().unwrap().join("envelope.json"));
+        let persisted = lifecycle::load_envelope("m6")
+            .expect("load_envelope must succeed")
+            .expect("an envelope.json must exist after finalize_mission");
+        assert_eq!(persisted.mission_id, "m6");
+        assert_eq!(persisted.status, MissionOutcomeStatus::Degraded);
+        assert_eq!(persisted.warnings, vec!["remote probe token budget exhausted".to_string()]);
+        assert_eq!(persisted.payload["confirmed"], serde_json::json!(2));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn load_envelope_returns_none_when_no_envelope_json_exists_yet() {
+        let _g = CrewGuard::new();
+        seed_mission("m7");
+        assert!(lifecycle::load_envelope("m7").unwrap().is_none());
     }
 }

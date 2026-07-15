@@ -1,0 +1,63 @@
+{
+  "steps": {
+    "s9-coder-step": {
+      "config": null,
+      "id": "s9-coder-step",
+      "kind": "mission.coder",
+      "status": "planned",
+      "task_id": "s9-coder"
+    },
+    "s9-verify-step": {
+      "config": null,
+      "id": "s9-verify-step",
+      "kind": "mission.verify",
+      "status": "planned",
+      "task_id": "s9-verify"
+    },
+    "s9-worktree-step": {
+      "config": null,
+      "id": "s9-worktree-step",
+      "kind": "mission.worktree",
+      "status": "planned",
+      "task_id": "s9-worktree"
+    }
+  },
+  "tasks": [
+    {
+      "depends_on": [],
+      "description": "prepare the phase worktree",
+      "id": "s9-worktree",
+      "phase_id": "s9",
+      "step_ids": [
+        "s9-worktree-step"
+      ]
+    },
+    {
+      "depends_on": [
+        "s9-worktree"
+      ],
+      "description": "dispatch `analyst` into the worktree",
+      "id": "s9-coder",
+      "image": "rust:slim",
+      "phase_id": "s9",
+      "role_id": "analyst",
+      "step_ids": [
+        "s9-coder-step"
+      ],
+      "workdir": "/tmp/wt-golden"
+    },
+    {
+      "depends_on": [
+        "s9-coder"
+      ],
+      "description": "local QA — mechanical verify (code-reviewer)",
+      "id": "s9-verify",
+      "phase_id": "s9",
+      "role_id": "code-reviewer",
+      "step_ids": [
+        "s9-verify-step"
+      ],
+      "workdir": "/tmp/wt-golden"
+    }
+  ]
+}

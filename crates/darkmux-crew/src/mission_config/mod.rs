@@ -3,14 +3,19 @@
 //! A mission config is a named JSON document declaring a mission's graph
 //! SHAPE: phases (ordered), each phase's tasks, each task's steps, each
 //! step naming a REGISTERED step-kind id (`step_kinds::StepKind::id()`)
-//! plus a kind-specific `config` object. A later packet (#1284 Packet 3)
-//! interprets a resolved config into an executable `Task`/`Step` graph —
-//! the same shape `build_review_graph` (`darkmux-lab`'s `lab::review`) and
-//! `default_phase_graph` (the `darkmux` binary's `mission_run.rs`) build BY
-//! HAND today, one Rust function per mission type. This packet builds the
-//! schema, the loader, the built-in transcriptions of those two graphs, and
-//! the `darkmux doctor` surface — it does NOT wire configs into execution
-//! (Packet 3) and does NOT touch `mission propose` (Packet 4).
+//! plus a kind-specific `config` object. [`interpret`] (#1284 Packet 3)
+//! turns a resolved config into the executable `Vec<Task>`/`BTreeMap<String,
+//! Step>` shape `darkmux-crew`'s `scheduler::run_step_graph` consumes — the
+//! SAME shape `build_review_graph` (`darkmux-lab`'s `lab::review`) and
+//! `default_phase_graph` (the `darkmux` binary's `mission_run.rs`) used to
+//! build BY HAND, one Rust function per mission type, before Packet 3 cut
+//! both over to load their config through this module and call
+//! [`interpret`] instead. Packet 1 built the schema, the loader, the
+//! built-in transcriptions of those two graphs, and the `darkmux doctor`
+//! surface. Packet 3 added [`interpret`] itself plus the typed expansion
+//! primitive ([`ExpansionSpec`]) that replaced review.json's original
+//! `expands_per_staffed_seat` placeholder bool (schema 1.0 → 1.1, additive
+//! per contract 5).
 //!
 //! **Lenient-on-read (contract 7, `CLAUDE.md` "Cross-system contracts"):**
 //! every struct here carries `#[serde(flatten)] extras` overflow, optional
@@ -28,8 +33,10 @@
 //! (Rust-only rename; the serde field stays `mission`, so operator
 //! config.json files are untouched).
 
+pub mod interpret;
 pub mod load;
 
+pub use interpret::{interpret, LaunchParams, TaskOverride};
 pub use load::{load, list_ids, LoadedMissionConfig, MissionConfigSource};
 
 use serde::{Deserialize, Serialize};
@@ -38,11 +45,14 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Current schema version for mission config documents. Plain semver
 /// applied to the DATA SHAPE — mirrors `RULES_SCHEMA_VERSION`
 /// (`darkmux-eureka`), `FLOW_SCHEMA_VERSION` (`darkmux-flow`),
-/// `CONFIG_SCHEMA_VERSION` (`darkmux-types::config`). Starts at "1.0"
-/// (#1284 Packet 1). Bump discipline (see `CLAUDE.md`'s "Versioning" —
-/// same rule, different data shape): additive field/section → minor;
-/// rename/retype/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "1.0";
+/// `CONFIG_SCHEMA_VERSION` (`darkmux-types::config`). Started at "1.0"
+/// (#1284 Packet 1); bumped to "1.1" in Packet 3 — additive: [`TaskConfig`]
+/// gained the optional `expand` field ([`ExpansionSpec`]), replacing
+/// review.json's original `expands_per_staffed_seat` prose-`notes` bool
+/// placeholder with a typed, interpretable primitive. Bump discipline (see
+/// `CLAUDE.md`'s "Versioning" — same rule, different data shape): additive
+/// field/section → minor; rename/retype/new-required-field → major.
+pub const MISSION_CONFIG_SCHEMA: &str = "1.1";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -167,8 +177,70 @@ pub struct TaskConfig {
     /// purely positional intra-task ordering).
     #[serde(default)]
     pub steps: Vec<StepConfig>,
+    /// (#1284 Packet 3, schema 1.1) When present, this `TaskConfig` is a
+    /// TEMPLATE: [`interpret::interpret`] does not emit it as one real
+    /// Task/Step pair — it emits N copies, one per item in the launcher's
+    /// [`interpret::LaunchParams::expansions`] collection named by
+    /// [`ExpansionSpec::over`]. Replaces the pre-1.1 `expands_per_staffed_seat`
+    /// bool + prose `notes` extras review.json originally shipped (#1284
+    /// Packet 1) — this is the typed, actually-interpretable version of
+    /// that same placeholder. See [`ExpansionSpec`]'s own doc for the
+    /// expansion mechanics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expand: Option<ExpansionSpec>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+/// Declares that the owning [`TaskConfig`] is a TEMPLATE expanded into N
+/// real Task/Step copies at interpretation time — the general primitive
+/// review.json's probe stage needs (one `review.probe:<seat-name>` Task per
+/// STAFFED seat, a count only known once crew staffing resolves at launch)
+/// but written so no field names "probe" or "seat" — any future mission
+/// needing "one Task per item in a launch-resolved collection" reuses this
+/// same shape.
+///
+/// `{index}` (0-based position) and `{name}` (the item's own name) are the
+/// only placeholders every pattern field supports; [`kind_pattern`] also
+/// supports `{kind}` (the template step's own `kind`, e.g. `"review.probe"`
+/// expanding to `"review.probe:alpha"`).
+///
+/// [`kind_pattern`]: ExpansionSpec::kind_pattern
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpansionSpec {
+    /// Name of the launch-time collection [`interpret::LaunchParams::expansions`]
+    /// resolves this task's copies from — e.g. `"probe_seats"`. The schema
+    /// only records the NAME; the launcher decides what populates it (the
+    /// review launcher resolves it from `crew_staffing`'s staffed probe
+    /// seats, in staffing order).
+    pub over: String,
+    /// Real Task-id pattern for one expanded copy, e.g.
+    /// `"review-probe-{index}-task"`.
+    pub task_id_pattern: String,
+    /// Real Step-id pattern for one expanded copy's (single) step, e.g.
+    /// `"review-probe-{index}-step"`.
+    pub step_id_pattern: String,
+    /// Real step-kind pattern — e.g. `"{kind}:{name}"` (the default),
+    /// which turns the template step's `kind: "review.probe"` into
+    /// `"review.probe:alpha"` for the `alpha` seat. A mission whose
+    /// per-item `StepKind`s don't need a distinct registered id per copy
+    /// (all copies dispatch through the SAME registered kind, keyed by
+    /// `input`/`config` alone) sets this to the literal `"{kind}"`.
+    #[serde(default = "default_kind_pattern")]
+    pub kind_pattern: String,
+    /// Description pattern for one expanded copy, e.g. "probe seat
+    /// `{name}`" (rendered as an actual seat name at interpretation time).
+    /// Falls back to the template `TaskConfig.description` verbatim
+    /// (unrendered) when absent — adequate for a mission that doesn't need
+    /// a per-copy description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_pattern: Option<String>,
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+fn default_kind_pattern() -> String {
+    "{kind}:{name}".to_string()
 }
 
 /// One step, as data. `kind` names a REGISTERED `step_kinds::StepKind` id —
@@ -346,6 +418,55 @@ impl MissionConfig {
                     }
                 }
 
+                // (#1284 review round 2, consider 5) `expand` template
+                // integrity — these mirror `interpret`'s own loud-error
+                // guards so the problems surface at doctor/validate time,
+                // before a launch trips over them.
+                if let Some(spec) = &task.expand {
+                    let expand_path = format!("{task_path}.expand");
+                    if spec.over.trim().is_empty() {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Error,
+                            path: format!("{expand_path}.over"),
+                            message: format!(
+                                "task \"{}\" declares `expand` with an empty `over` — the \
+                                 launcher has no collection name to resolve",
+                                task.id
+                            ),
+                        });
+                    }
+                    for (field, pattern) in [
+                        ("task_id_pattern", &spec.task_id_pattern),
+                        ("step_id_pattern", &spec.step_id_pattern),
+                    ] {
+                        if !pattern.contains("{index}") && !pattern.contains("{name}") {
+                            findings.push(ValidationFinding {
+                                severity: FindingSeverity::Error,
+                                path: format!("{expand_path}.{field}"),
+                                message: format!(
+                                    "task \"{}\"'s `expand.{field}` \"{pattern}\" contains \
+                                     neither {{index}} nor {{name}} — every expanded copy \
+                                     would render the SAME id and collide",
+                                    task.id
+                                ),
+                            });
+                        }
+                    }
+                    if task.steps.len() > 1 {
+                        findings.push(ValidationFinding {
+                            severity: FindingSeverity::Error,
+                            path: format!("{task_path}.steps"),
+                            message: format!(
+                                "task \"{}\" declares `expand` with {} steps — an expanding \
+                                 template task must have exactly ONE step (the expansion \
+                                 primitive clones one task/step pair per item)",
+                                task.id,
+                                task.steps.len()
+                            ),
+                        });
+                    }
+                }
+
                 for (si, step) in task.steps.iter().enumerate() {
                     let step_path = format!("{task_path}.steps[{si}]");
                     if step.id.trim().is_empty() {
@@ -502,6 +623,7 @@ mod tests {
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             role_id: None,
             steps,
+            expand: None,
             extras: BTreeMap::new(),
         }
     }
@@ -639,6 +761,91 @@ mod tests {
         assert_eq!(f.to_string(), "[warning] phases[0].id: test message");
     }
 
+    // ── (#1284 review round 2, consider 5) ExpansionSpec validation ────
+
+    fn expanding_task_with(over: &str, task_pat: &str, step_pat: &str, steps: Vec<StepConfig>) -> TaskConfig {
+        TaskConfig {
+            id: "template".to_string(),
+            description: None,
+            depends_on: vec![],
+            role_id: None,
+            steps,
+            expand: Some(ExpansionSpec {
+                over: over.to_string(),
+                task_id_pattern: task_pat.to_string(),
+                step_id_pattern: step_pat.to_string(),
+                kind_pattern: "{kind}:{name}".to_string(),
+                description_pattern: None,
+                extras: BTreeMap::new(),
+            }),
+            extras: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn expand_with_empty_over_is_an_error() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![expanding_task_with("", "t-{index}", "s-{index}", vec![step("s1", "review.probe")])],
+        )]);
+        let findings = cfg.validate(&[]);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == FindingSeverity::Error && f.path.ends_with(".expand.over")),
+            "expected an empty-over error, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn expand_patterns_without_index_or_name_are_errors() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![expanding_task_with("items", "t-fixed", "s-fixed", vec![step("s1", "review.probe")])],
+        )]);
+        let findings = cfg.validate(&[]);
+        for field in ["task_id_pattern", "step_id_pattern"] {
+            assert!(
+                findings.iter().any(|f| f.severity == FindingSeverity::Error
+                    && f.path.ends_with(&format!(".expand.{field}"))),
+                "expected a collision error on {field}, got {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_template_with_more_than_one_step_is_an_error() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![expanding_task_with(
+                "items",
+                "t-{index}",
+                "s-{index}",
+                vec![step("s1", "review.probe"), step("s2", "review.probe")],
+            )],
+        )]);
+        let findings = cfg.validate(&[]);
+        assert!(
+            findings.iter().any(|f| f.severity == FindingSeverity::Error
+                && f.message.contains("exactly ONE step")),
+            "expected a multi-step-template error, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn well_formed_expand_block_validates_clean() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![expanding_task_with(
+                "items",
+                "t-{index}",
+                "s-{name}",
+                vec![step("s1", "review.probe")],
+            )],
+        )]);
+        assert!(cfg.is_valid(&[]));
+    }
+
     // ─── Built-in config golden-shape tests (#1284 Packet 1) ──────────
     // Mirrors `workloads::types::tests::
     // medium_coding_embedded_manifest_has_expected_shape`'s style: no
@@ -710,15 +917,24 @@ mod tests {
             vec!["review-dedup-task", "review-verify-task"]
         );
 
-        // The probe-template task documents the dynamic-expansion limitation
-        // via extras (no schema field for it yet — see the config's own
-        // "notes"/"expands_per_staffed_seat" keys).
+        // (#1284 Packet 3) The probe-template task declares its dynamic
+        // per-staffed-seat expansion via the typed `expand` field — the
+        // real primitive that replaced the pre-1.1 `expands_per_staffed_seat`
+        // bool + prose `notes` extras placeholder.
         let probe_template = &investigate.tasks[1];
-        assert_eq!(
-            probe_template.extras.get("expands_per_staffed_seat"),
-            Some(&serde_json::Value::Bool(true))
-        );
-        assert!(probe_template.extras.contains_key("notes"));
+        let expand = probe_template
+            .expand
+            .as_ref()
+            .expect("probe-template task must declare an `expand` block");
+        assert_eq!(expand.over, "probe_seats");
+        assert_eq!(expand.task_id_pattern, "review-probe-{index}-task");
+        assert_eq!(expand.step_id_pattern, "review-probe-{index}-step");
+        assert_eq!(expand.kind_pattern, "{kind}:{name}");
+        assert_eq!(probe_template.steps[0].kind, "review.probe");
+        // after expansion, review-dedup-task's depends_on must resolve to
+        // every EXPANDED probe task id, not just this template's id — see
+        // `interpret::interpret`'s tests for that mechanics assertion.
+        assert_eq!(investigate.tasks[2].depends_on, vec!["review-probe-template-task"]);
     }
 
     #[test]

@@ -984,7 +984,8 @@ fn run_funnel_case(
         "adjudicate",
         "report",
         darkmux_types::config_access::review_judge_concurrency(),
-    );
+    )
+    .with_context(|| format!("building review graph for case {}", c.id))?;
     let fingerprint_val = review::fingerprint(&judge_identifier, &step_ctx.judge_system);
     let staffing_snapshot =
         review::staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.crew.request_changes);
