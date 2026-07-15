@@ -48,21 +48,28 @@
 //! graphs with NO gate semantics (a Tier-1-only graph); a freeform config
 //! mints + starts and finalizes nothing.
 //!
-//! `review` (the 3-phase PR-review config) is NOT executable through this
-//! verb yet — its `review.*` Tier 3 kinds need crew-staffing resolution
-//! (`crew_staffing`, `judge_concurrency` — see `templates/builtin/
-//! mission-configs/review.json`'s own `inputs` doc) that only
-//! `crates/darkmux-lab/src/lab/review.rs::build_review_graph` currently
-//! knows how to do. In practice a `mission launch review` attempt bails at
-//! the missing-required-input gate (step 2 above) before anything is
-//! minted — no special-casing needed, the generic gate already produces the
-//! honest failure. A config whose graph references a step kind this
-//! launcher can't construct AT ALL (step 4's `executable` check below) gets
-//! a GUARDED punt instead: the instance is still minted (so its Task/Step
-//! records show the intended graph shape for inspection), but nothing is
-//! dispatched and `launch` returns exit code `4`. Wiring `review`'s
-//! crew-staffing resolution through this generic verb is named Packet 4b
-//! work in the epic, not forced here.
+//! `review` (the 3-phase PR-review config, #1284 Packet 4b, the clean verb
+//! break that retired `darkmux pr-review run`) is executable through this
+//! verb too, but via a DEDICATED launcher (`crate::mission_launch_review`)
+//! rather than steps 2-4 above: `launch` branches to it as early as
+//! possible (right after config load + validation, before this module's own
+//! `--input`/`--param` collection or its generic header banner — review's
+//! rendered payload is a stdout CONTRACT the CI workflow parses, so nothing
+//! decorative may precede it). `review.*` Tier 3 kinds need crew-staffing
+//! resolution (`crew_staffing`, `judge_concurrency` — see `templates/
+//! builtin/mission-configs/review.json`'s own `inputs` doc) that
+//! `crates/darkmux-lab/src/lab/review.rs::build_review_graph` already knows
+//! how to do — `mission_launch_review::launch` is a NEW CALLER of that
+//! SAME driver (the former `pr_review.rs::run_dispatch`), not a second
+//! graph builder; see that module's doc for why review does not collapse
+//! into steps 2-4's generic `mission_config::interpret` + `crew::
+//! scheduler::run_step_graph` path (an audited non-collapse per
+//! `CLAUDE.md`'s StepKind tiering section). A config whose graph
+//! references a step kind THIS generic path can't construct at all (step
+//! 4's `executable` check below, still reachable by any non-`review`
+//! config) gets a GUARDED punt: the instance is still minted (so its
+//! Task/Step records show the intended graph shape for inspection), but
+//! nothing is dispatched and `launch` returns exit code `4`.
 
 use crate::crew;
 use crate::fleet;
@@ -80,6 +87,22 @@ use std::sync::{Arc, Mutex};
 /// graph (#1352) — the only Tier 3 kinds this launcher knows how to
 /// construct in Packet 4a. See the module doc's scope boundary.
 const CODER_PHASE_TIER3_KINDS: &[&str] = &["mission.worktree", "mission.coder", "mission.verify"];
+
+/// The six Tier 3 step kinds `crates/darkmux-lab/src/lab/review.rs` defines
+/// for `review`'s graph (#1352) — wired through as of Packet 4b, but via a
+/// DEDICATED launcher ([`crate::mission_launch_review::launch`]), not this
+/// module's generic `mission_config::interpret` + `crew::scheduler::
+/// run_step_graph` path. `build_review_graph`/`run_review_graph` already
+/// carry real, working, tested cross-step behavior (a shared remote-token
+/// bucket, host telemetry sampling, post-run envelope merges) a generic
+/// collapse would either lose or have to re-derive — an audited non-collapse
+/// per `CLAUDE.md`'s StepKind tiering section ("a collapse that changes
+/// observable behavior isn't a tiering fix, it's a feature change wearing a
+/// tiering fix's clothes"). Named here purely so `known_kinds`'s
+/// doctor-style `validate()` pass never warns "unknown kind" on review's own
+/// document.
+const REVIEW_TIER3_KINDS: &[&str] =
+    &["review.bundle", "review.probe", "review.dedup", "review.judge", "review.verify", "review.synthesis"];
 
 /// `darkmux mission launch <config-id>` entry point. Returns the process
 /// exit code — the coder-phase rows mirror `mission_run::run`'s own exit
@@ -119,6 +142,7 @@ pub fn launch(
     let tier1_ids = crew::step_kinds::StepKindRegistry::with_builtins().ids();
     let mut known_kinds: Vec<&str> = tier1_ids.iter().map(String::as_str).collect();
     known_kinds.extend(CODER_PHASE_TIER3_KINDS.iter().copied());
+    known_kinds.extend(REVIEW_TIER3_KINDS.iter().copied());
     let findings = config.validate(&known_kinds);
     let errors: Vec<_> = findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();
     if !errors.is_empty() {
@@ -127,6 +151,21 @@ pub fn launch(
     }
     for f in findings.iter().filter(|f| f.severity == FindingSeverity::Warning) {
         eprintln!("{}", style::warn(&f.to_string()));
+    }
+
+    // (#1284 Packet 4b) `review` gets a DEDICATED launcher rather than
+    // falling through the generic interpret/scheduler path below — see
+    // `REVIEW_TIER3_KINDS`'s doc for why. Review has no operator sign-off
+    // gate (unlike coder-phase): its envelope finalizes generically via
+    // `crew::envelope::finalize_mission` inside that module, and this
+    // function's own exit-code/gate machinery never runs for it. Branches
+    // BEFORE the generic header banner below (never AFTER): review's
+    // rendered `{mode, review, comment}` JSON is a stdout CONTRACT the CI
+    // workflow parses byte-for-byte on `--param emit=-`, so nothing
+    // decorative may land on stdout ahead of it — `mission_launch_review::
+    // launch` prints its own (stderr-only) diagnostics instead.
+    if config.id == "review" {
+        return crate::mission_launch_review::launch(config, input_file, params, timeout_seconds);
     }
 
     println!(
@@ -376,7 +415,7 @@ pub fn launch(
 
 /// Parse `--input <file.json>` (a flat object) and `--param key=value`
 /// (repeatable; wins over the file) into one collected-inputs map.
-fn collect_inputs(
+pub(crate) fn collect_inputs(
     input_file: Option<&Path>,
     params: &[String],
 ) -> Result<BTreeMap<String, serde_json::Value>> {
@@ -462,7 +501,7 @@ fn missing_inputs_message(config: &MissionConfig, missing: &[&mission_config::Mi
 /// JSON of `collected`, so the SAME inputs always derive the SAME instance
 /// id (idempotent relaunch) while different inputs derive a distinct one (a
 /// genuinely new instance). No CLI flag needed — see the module doc.
-fn derive_mission_id(config_id: &str, collected: &BTreeMap<String, serde_json::Value>) -> Result<String> {
+pub(crate) fn derive_mission_id(config_id: &str, collected: &BTreeMap<String, serde_json::Value>) -> Result<String> {
     let id = if collected.is_empty() {
         config_id.to_string()
     } else {
@@ -520,7 +559,7 @@ fn new_planned_phase(mission_id: &str, real_id: &str, description: Option<&str>,
 ///
 /// Returns the doc phase id → real (composed) phase id map every subsequent
 /// step needs, plus whether an EXISTING instance was reused.
-fn ensure_mission_and_phases(
+pub(crate) fn ensure_mission_and_phases(
     mission_id: &str,
     config: &MissionConfig,
 ) -> Result<(BTreeMap<String, String>, bool)> {

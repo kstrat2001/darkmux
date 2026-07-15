@@ -117,8 +117,8 @@ pub fn mission_path(mission_id: &str) -> PathBuf {
 
 /// The `MissionEnvelope` JSON path under the per-mission directory, beside
 /// `mission.json` (#1284 Packet 3). Not versioned per-run — a mission
-/// re-run (e.g. `pr-review run`'s idempotent re-use of the same case id,
-/// see `build_mission_for_review`'s doc) overwrites the prior envelope with
+/// re-run (e.g. `mission launch review`'s idempotent re-use of the same case
+/// id, see `mission_launch::ensure_mission_and_phases`'s doc) overwrites the prior envelope with
 /// the new run's, matching how `mission.json`/the phase JSONs themselves
 /// already get overwritten by a re-run's own transitions.
 pub fn envelope_path(mission_id: &str) -> PathBuf {

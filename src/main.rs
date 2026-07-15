@@ -41,6 +41,7 @@ mod mission_propose;
 mod mission_status;
 mod mission_run;
 mod mission_launch;
+mod mission_launch_review;
 mod notebook;
 mod optimize;
 mod pr_review;
@@ -391,24 +392,18 @@ enum RecommendationsCmd {
     },
 }
 
-// The `Dispatch` variant aggregates the full operator-visible dispatch
-// surface (role + message + ~15 flags) and crosses clippy's enum-size
-// threshold relative to the smaller `List`/`Show` variants. Boxing the
-// variant would require pattern-match adjustments throughout the
-// dispatch handler; the variant is constructed once per CLI invocation
-// so the stack-size hit doesn't matter at runtime.
-// `Run`'s field count (source + crew + review-pipeline knobs + I/O paths) crosses
-// clippy's large-enum-variant threshold relative to the much smaller
-// `Render` variant — same rationale as `CrewCmd::Dispatch` below; boxing
-// would ripple through every match arm for a per-invocation, not hot-path,
-// cost.
-#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum PrReviewCmd {
     /// Render a dispatch envelope + diff into a GitHub PR-review payload:
     /// resolve each finding's quoted `anchor` to a new-side line, build the
     /// inline comments + summary, and emit `{mode, review, comment}` JSON to
     /// stdout (or to `--emit <path>`). The thin workflow YAML posts it.
+    ///
+    /// The review-FUNNEL dispatch (bundle -> probe -> dedup -> judge ->
+    /// synthesis) that used to live at `pr-review run` retired in #1284
+    /// Packet 4b — it's now `darkmux mission launch review` (see that
+    /// verb's `--param` inputs, one-to-one with the old flags, documented
+    /// in `src/mission_launch_review.rs`'s module doc).
     Render {
         /// Path to the darkmux `--json` dispatch envelope.
         #[arg(long)]
@@ -425,76 +420,6 @@ enum PrReviewCmd {
         /// The workflow knows where the model ran; darkmux doesn't guess.
         #[arg(long)]
         attribution: Option<String>,
-    },
-    /// (#1222 Phase B packet 5) The review-FUNNEL verb: bundle -> probe(k
-    /// draws) -> dedup -> double-confirm judge -> three-tier synthesis,
-    /// emitting the same `{mode, review, comment}` payload `render` does.
-    /// Source the bundler from either a local checkout (`--worktree`) or
-    /// the GitHub API (`--github` + `--head-sha`) — mutually exclusive.
-    Run {
-        /// GitHub source `owner/repo` — bundles via the GitHub API, no
-        /// local checkout. Requires --head-sha. Mutually exclusive with
-        /// --worktree.
-        #[arg(long, requires = "head_sha", conflicts_with = "worktree")]
-        github: Option<String>,
-        /// Commit SHA to read file content at (GitHub source only).
-        #[arg(long = "head-sha", requires = "github")]
-        head_sha: Option<String>,
-        /// Local worktree directory — bundles via a real checkout.
-        /// Alternative to --github/--head-sha.
-        #[arg(long)]
-        worktree: Option<std::path::PathBuf>,
-        /// Path to the PR unified diff.
-        #[arg(long)]
-        diff: std::path::PathBuf,
-        /// File carrying the author's stated intent for the change, fed
-        /// into probe/judge prompts. Omitted -> "(no description
-        /// provided)".
-        #[arg(long = "intent-file")]
-        intent_file: Option<std::path::PathBuf>,
-        /// Crew name (from profiles.json's "crews" map) staffing the
-        /// review-probe / review-judge seats. Required unless
-        /// --from-envelope.
-        #[arg(long)]
-        crew: Option<String>,
-        /// Model-cycling mode: sequential | parallel | auto (auto resolves
-        /// per hardware tier).
-        #[arg(long, default_value = "auto")]
-        mode: String,
-        /// Override every review-probe staffing's draw count (k).
-        #[arg(long)]
-        k: Option<u32>,
-        /// Write the full review envelope (pretty JSON) here.
-        #[arg(long = "envelope-out")]
-        envelope_out: Option<std::path::PathBuf>,
-        /// Write the rendered `{mode, review, comment}` payload here. `-`
-        /// (or omitted) writes to stdout.
-        #[arg(long)]
-        emit: Option<std::path::PathBuf>,
-        /// Per-dispatch timeout in seconds.
-        #[arg(long, default_value = "3600")]
-        timeout: u32,
-        /// Profiles-registry path (profiles.json). Overrides
-        /// DARKMUX_PROFILES.
-        #[arg(long = "profiles-file")]
-        profiles: Option<String>,
-        /// (#1113) Attribution text for the posted footer.
-        #[arg(long)]
-        attribution: Option<String>,
-        /// External bundler command (`<cmd> --worktree <dir> --diff
-        /// <file>`) standing in for the built-in bundler.
-        #[arg(long)]
-        bundler: Option<String>,
-        /// Re-judge a previously-recorded flag list without re-running the
-        /// probe (skips prosecution — the bundler still runs, since the
-        /// judge needs the code each flag's bundle_id refers to).
-        #[arg(long = "charges-file")]
-        charges_file: Option<std::path::PathBuf>,
-        /// Synthesis-only: read a previously-written --envelope-out and
-        /// emit the rendered payload — zero model calls, zero bundling.
-        /// The CI-testable path.
-        #[arg(long = "from-envelope")]
-        from_envelope: Option<std::path::PathBuf>,
     },
 }
 
@@ -877,17 +802,29 @@ enum MissionCmd {
     /// graph executes worktree → coder → QA and then STOPS at the same
     /// operator sign-off gate `mission run` stops at — the phase stays
     /// Running and `mission ship`/`mission abort` finish the loop; launch
-    /// never auto-closes past the gate. With no `--input`/`--param` the
-    /// instance id IS the config id; with inputs the id gets a
-    /// deterministic per-inputs suffix — either way, relaunching with the
-    /// same values reuses (and reopens, if terminal) the SAME instance
-    /// rather than minting a duplicate.
+    /// never auto-closes past the gate. `review` (#1284 Packet 4b — the
+    /// retired `pr-review run`) is dispatched through its OWN dedicated
+    /// launcher instead: bundle → probe → dedup → judge → verify →
+    /// synthesis, with no operator sign-off gate — its mission/phase
+    /// envelope finalizes generically once the run completes, and the old
+    /// CLI flags map one-to-one onto `--param key=value` (see
+    /// `templates/builtin/mission-configs/review.json`'s own `inputs` doc
+    /// for the mapping table). With no `--input`/`--param` the instance id
+    /// IS the config id; with inputs the id gets a deterministic
+    /// per-inputs suffix — either way, relaunching with the same values
+    /// reuses (and reopens, if terminal) the SAME instance rather than
+    /// minting a duplicate.
     ///
-    /// Exit codes: `0` freeform mint, or coder ran with QA
-    /// clean/flags-only (gate banner, phase Running); `1` coder dispatch
-    /// error; `2` QA found blocker(s) — resolve before shipping; `3` QA
-    /// could not run — manual review required; `4` instance minted but the
-    /// graph references step kind(s) this launcher can't construct yet.
+    /// Exit codes (coder-phase / gate-less generic graphs): `0` freeform
+    /// mint, or coder ran with QA clean/flags-only (gate banner, phase
+    /// Running); `1` coder dispatch error; `2` QA found blocker(s) —
+    /// resolve before shipping; `3` QA could not run — manual review
+    /// required; `4` instance minted but the graph references step
+    /// kind(s) this launcher can't construct yet. `review` exits `0` on
+    /// any produced output (Clean/Degraded/Degenerate alike — CI-facing
+    /// pass/fail comes from the rendered payload's `mode` field, not this
+    /// code), propagating a hard failure for anything that fails before an
+    /// envelope was ever produced.
     Launch {
         /// Mission config id to launch — a built-in (e.g. `coder-phase`)
         /// or a `darkmux mission propose`-drafted user-tier config.
@@ -3169,41 +3106,6 @@ fn cmd_pr_review(sub: PrReviewCmd) -> Result<i32> {
         PrReviewCmd::Render { envelope, diff, emit, attribution } => {
             pr_review::cmd_render(&envelope, &diff, emit.as_ref(), attribution.as_deref())
         }
-        PrReviewCmd::Run {
-            github,
-            head_sha,
-            worktree,
-            diff,
-            intent_file,
-            crew,
-            mode,
-            k,
-            envelope_out,
-            emit,
-            timeout,
-            profiles,
-            attribution,
-            bundler,
-            charges_file,
-            from_envelope,
-        } => pr_review::cmd_run(pr_review::RunOpts {
-            github,
-            head_sha,
-            worktree,
-            diff,
-            intent_file,
-            crew,
-            mode,
-            k,
-            envelope_out,
-            emit,
-            timeout,
-            profiles,
-            attribution,
-            bundler,
-            charges_file,
-            from_envelope,
-        }),
     }
 }
 

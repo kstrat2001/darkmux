@@ -320,8 +320,8 @@ pub(crate) fn load_role_prompt(role_id: &str) -> Option<String> {
 }
 
 /// Public accessor for [`load_role_prompt`] (#1222 Phase B packet 5
-/// reconciliation). `darkmux pr-review run` (the `darkmux` binary crate,
-/// `src/pr_review.rs`) dispatches `review-probe`/`review-judge` through
+/// reconciliation). `darkmux mission launch review` (the `darkmux` binary
+/// crate, `src/mission_launch_review.rs`) dispatches `review-probe`/`review-judge` through
 /// `darkmux_crew::single_shot::single_shot_chat`, not
 /// `darkmux_crew::dispatch`/`dispatch_internal` — so it needs the raw
 /// system-prompt text itself rather than a full role dispatch, and

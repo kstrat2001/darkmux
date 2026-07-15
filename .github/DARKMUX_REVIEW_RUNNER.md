@@ -23,7 +23,7 @@ gh workflow run darkmux-review.yml -f pr=<PR_NUMBER>
 (or the **Run workflow** button under Actions → *darkmux self-review*). The job
 reads the PR **diff** plus its **title and description** via the GitHub API —
 all data, never checked out or executed — and dispatches them to `darkmux
-pr-review run`, which drives the named crew's seats (a `review-probe` seat
+mission launch review`, which drives the named crew's seats (a `review-probe` seat
 that argues the diff, then a `review-judge` seat that weighs the probes'
 findings) in the sandboxed, network-isolated internal runtime. The pipeline's
 own GitHub file source (used when a probe or the judge wants to see more of a
@@ -71,9 +71,9 @@ comment launches it — still maintainer-only.
      `review-judge` seats (#1054, #1222 Phase B packet 1). See the **Studio
      migration checklist** below for a copy-pasteable example.
    - `jq` + `gh` on PATH (GitHub's runner image bundles both). The review
-     payload is rendered as part of `darkmux pr-review run` (`--emit`) — no
-     `python3` needed; `jq` just splits the rendered `{mode, review, comment}`
-     for `gh`.
+     payload is rendered as part of `darkmux mission launch review`
+     (`--param emit=...`) — no `python3` needed; `jq` just splits the
+     rendered `{mode, review, comment}` for `gh`.
 
 ## Studio migration checklist (moving from the single-reviewer setup)
 
@@ -162,15 +162,15 @@ job or, in a future release, a remote-staffed seat.
 **(e) Verify.**
 
 ```bash
-darkmux pr-review run \
-  --worktree <any local repo> \
-  --diff <small.diff> \
-  --crew review-deep \
-  --mode sequential
+darkmux mission launch review \
+  --param worktree=<any local repo> \
+  --param diff_file=<small.diff> \
+  --param crew=review-deep \
+  --param mode=sequential
 ```
 
-A clean run prints (or writes, if you pass `--emit`) a `{mode, review,
-comment}` payload with `mode: "review"` and at least the judge seat's
+A clean run prints (or writes, if you pass `--param emit=<path>`) a `{mode,
+review, comment}` payload with `mode: "review"` and at least the judge seat's
 findings. If it comes back `degraded`, re-check step (b)/(c) before dispatching
 against a real PR.
 
