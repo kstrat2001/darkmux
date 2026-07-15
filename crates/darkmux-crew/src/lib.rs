@@ -19,6 +19,11 @@ pub mod cli;
 pub mod concurrent_dispatch;
 pub mod dispatch;
 pub mod dispatch_internal;
+// (#1284 Packet 2) The standard output contract every mission emits +
+// generalized finalization. `ReviewEnvelope` (darkmux-lab) maps INTO
+// `MissionEnvelope::payload` — this crate has no reverse dependency on
+// darkmux-lab, so the mapping lives at the caller (`src/pr_review.rs`).
+pub mod envelope;
 pub mod index;
 pub mod lessons;
 pub mod lifecycle;
