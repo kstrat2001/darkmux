@@ -50,14 +50,20 @@ comment launches it — still maintainer-only.
      online when you dispatch a review.
 
 2. **Prerequisites on the laptop** (the runner shells out to these):
-   - `darkmux` on PATH (`cargo install --path .` from this repo, or `brew install darkmux`).
-   - A **Rust toolchain** (`cargo`) — the workflow builds the reference `--bundler`
-     plugin (`darkmux-bundler-rust`, #1319) from the trusted `main` checkout on
-     every run, since darkmux's own source is Rust and the built-in bundler is
-     TypeScript-only. If your runner setup only ever installed the `darkmux`
-     binary via `brew` (no local toolchain), install one (`rustup` or `brew
-     install rust`) — this is the same toolchain `cargo install --path .` above
-     already needs if you built `darkmux` from source.
+   - A **Rust toolchain** (`cargo`) — the workflow now builds the `darkmux`
+     binary itself, fresh, from the trusted `main` checkout on every run
+     (#1359), and separately builds the reference `--bundler` plugin
+     (`darkmux-bundler-rust`, #1319) from that same checkout, since darkmux's
+     own source is Rust and the built-in bundler is TypeScript-only. Install
+     one if the runner doesn't have it (`rustup` or `brew install rust`).
+     **You do NOT need `darkmux` pre-installed on PATH for this workflow** —
+     it builds its own copy into the job's workspace
+     (`target/release/darkmux`) and invokes that explicit path, never a
+     `~/.cargo/bin/darkmux` (or `brew`-installed) binary that could silently
+     drift stale behind `main` (the bug #1359 fixed). Still handy to have
+     `darkmux` on PATH for your own interactive use (`darkmux doctor`, the
+     verification step below) — just know it's decoupled from what this
+     workflow dispatches.
    - The `darkmux-runtime` Docker image present (Docker running; `darkmux` pulls/uses
      `darkmux-runtime:latest`).
    - A **`review-deep` crew** in the runner's `~/.darkmux/profiles.json`, naming
