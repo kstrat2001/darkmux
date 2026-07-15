@@ -19,6 +19,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Mission graph builder for `GET /mission/:id/graph.json` (#1284 Packet 5).
+/// Kept as its own module (rather than inlined here, unlike most of this
+/// crate's small single-file surface) because it owns a real data shape
+/// (`GraphNode`/`GraphEdge`/`MissionGraph`) plus a unit-tested pure layering
+/// function — see that module's doc for the schema-deviation note
+/// (post-#1341, dependency edges are derived from `Task::depends_on`, not a
+/// `Step::depends_on` that no longer exists).
+mod mission_graph;
+
 /// (#925) Per-route request timeout for the NON-streaming routes. Bounds a
 /// slow/hung request; the long-lived `/flow/:date/stream` SSE route is
 /// deliberately excluded.
@@ -88,6 +97,24 @@ fn is_valid_date(date: &str) -> Option<&str> {
 /// live and playback viewers only exist where there's a daemon to talk to
 /// (operator's localhost or tailnet). See #624.
 const VIEWER_HTML: &str = include_str!("../assets/viewer.html");
+
+/// Mission graph lens page (#1284 Packet 5) — a SEPARATE file from
+/// `VIEWER_HTML` by design; see `assets/mission-graph.html`'s own header
+/// comment for why the two rendering models (flow-record timeline vs.
+/// Phase/Task/Step node-link graph) don't share one file. Served at
+/// `GET /mission/:id/graph`.
+const MISSION_GRAPH_HTML: &str = include_str!("../assets/mission-graph.html");
+
+/// Vendored React + ReactDOM + reactflow, bundled into one minified IIFE —
+/// see `assets/vendor/README.md` for the pinned versions, licenses (all
+/// MIT), and rebuild recipe. No CDN, no source map; served same-origin at
+/// `GET /vendor/reactflow-bundle.min.js` so the mission-graph page never
+/// makes an external network request.
+const VENDOR_REACTFLOW_JS: &str = include_str!("../assets/vendor/reactflow-bundle.min.js");
+
+/// reactflow's own stylesheet, minified — see `assets/vendor/README.md`.
+/// Served at `GET /vendor/reactflow-bundle.min.css`.
+const VENDOR_REACTFLOW_CSS: &str = include_str!("../assets/vendor/reactflow-bundle.min.css");
 
 /// Inject a `<meta name="darkmux-mode">` tag right after `<head>` so the
 /// viewer's `boot()` can read it before any data-fetching logic runs.
@@ -250,6 +277,10 @@ pub(crate) fn build_router_full(
         .route("/machine/memory", get(machine_memory_handler))
         .route("/missions", get(missions_handler))
         .route("/phases", get(phases_handler))
+        .route("/mission/:id/graph", get(mission_graph_html))
+        .route("/mission/:id/graph.json", get(mission_graph_json_handler))
+        .route("/vendor/reactflow-bundle.min.js", get(vendor_reactflow_js))
+        .route("/vendor/reactflow-bundle.min.css", get(vendor_reactflow_css))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .route("/fleet/machines/live", get(fleet_machines_live_handler))
         .route("/lab/runs", get(lab_runs_handler))
@@ -1303,6 +1334,86 @@ async fn phases_handler() -> axum::Json<serde_json::Value> {
         "phases": phases,
         "generated_at_ms": current_millis(),
     }))
+}
+
+// ─── Mission graph lens (#1284 Packet 5) ────────────────────────────────
+
+/// `GET /mission/:id/graph` — the dedicated mission-graph HTML page. Static
+/// bytes (no per-mission templating; the id is already in the URL the
+/// browser loaded, and the page's own JS reads it from `location.pathname`
+/// — see `assets/mission-graph.html`'s `missionIdFromPath()`). Never 404s
+/// on an unknown mission id here — that's `graph.json`'s job; the page
+/// itself always loads and reports the fetch error inline (item 6's
+/// graceful-degradation posture extends to "id doesn't exist" too, not just
+/// "mission has no task/step data").
+async fn mission_graph_html() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/html; charset=utf-8")],
+        MISSION_GRAPH_HTML,
+    )
+}
+
+/// `GET /mission/:id/graph.json` — the node/edge snapshot
+/// `mission_graph::build_mission_graph` builds from the persisted
+/// Phase/Task/Step JSON. `404` when no mission with this id exists;
+/// otherwise always `200` — a mission with phases but no task/step graph
+/// still returns a (phases-only) graph with `legacy: true` + a `note`,
+/// never an error (item 6).
+async fn mission_graph_json_handler(Path(id): Path<String>) -> axum::response::Response {
+    if !is_valid_catalog_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid mission id (alphanumeric + -_.: , <=128 chars)",
+        )
+            .into_response();
+    }
+    let id_owned = id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || mission_graph::build_mission_graph(&id_owned)).await;
+    match result {
+        Ok(Ok(Some(graph))) => axum::Json(graph).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            format!("no mission with id `{id}` found\n"),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to build mission graph: {e:#}\n"),
+        )
+            .into_response(),
+        Err(_join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "mission graph builder task panicked\n",
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /vendor/reactflow-bundle.min.js` — same-origin vendored bundle
+/// (see `assets/vendor/README.md`). Long `Cache-Control` is safe: the
+/// bundle is content-addressed by the daemon's own build (a new darkmux
+/// version ships a new bundle at a byte-identical URL, but daemons are
+/// short-lived personal processes, not a CDN-fronted deploy — a stale
+/// browser cache is cleared by a normal page reload after upgrade, matching
+/// how `VIEWER_HTML` itself is served with no special caching headers
+/// either way).
+async fn vendor_reactflow_js() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "application/javascript; charset=utf-8")],
+        VENDOR_REACTFLOW_JS,
+    )
+}
+
+/// `GET /vendor/reactflow-bundle.min.css` — see `vendor_reactflow_js`'s doc.
+async fn vendor_reactflow_css() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/css; charset=utf-8")],
+        VENDOR_REACTFLOW_CSS,
+    )
 }
 
 fn current_millis() -> u64 {
@@ -6703,5 +6814,457 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ─── Mission graph lens (#1284 Packet 5) ────────────────────────────
+
+    /// Redirects `darkmux-crew`'s mission/phase/task/step storage into a
+    /// fresh temp dir for the lifetime of the guard, mirroring the
+    /// `CrewDirGuard` pattern used throughout `darkmux-crew`'s own tests
+    /// (`cli.rs`, `index.rs`) — `DARKMUX_CREW_DIR` is the top tier of
+    /// `darkmux_types::config_access::crew_dir_override()`, read live per
+    /// call, so no process restart is needed for the override to take
+    /// effect. Callers of anything backed by this guard MUST be
+    /// `#[serial_test::serial]` (env var mutation isn't thread-safe).
+    struct CrewDirGuard {
+        prev: Option<String>,
+        // Held only to keep the temp dir alive for the guard's lifetime
+        // (RAII) — never read after construction, hence the underscore.
+        _tmp: TempDir,
+    }
+    impl CrewDirGuard {
+        fn new() -> Self {
+            let tmp = TempDir::new().unwrap();
+            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            unsafe {
+                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+            }
+            Self { prev, _tmp: tmp }
+        }
+    }
+    impl Drop for CrewDirGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                }
+            }
+        }
+    }
+
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn save_test_mission(mission: &darkmux_crew::types::Mission) {
+        darkmux_crew::lifecycle::save_mission(mission).expect("save mission");
+    }
+    fn save_test_phase(phase: &darkmux_crew::types::Phase) {
+        darkmux_crew::lifecycle::save_phase(phase).expect("save phase");
+    }
+
+    fn minimal_mission(id: &str, phase_ids: Vec<String>) -> darkmux_crew::types::Mission {
+        darkmux_crew::types::Mission {
+            id: id.to_string(),
+            description: format!("test mission {id}"),
+            status: darkmux_crew::types::MissionStatus::Active,
+            phase_ids,
+            created_ts: now_unix(),
+            started_ts: None,
+            closed_ts: None,
+            paused_ts: None,
+            source_input: None,
+            ticket: None,
+        }
+    }
+
+    fn minimal_phase(id: &str, mission_id: &str) -> darkmux_crew::types::Phase {
+        darkmux_crew::types::Phase {
+            id: id.to_string(),
+            mission_id: mission_id.to_string(),
+            description: format!("phase {id}"),
+            status: darkmux_crew::types::PhaseStatus::Running,
+            created_ts: now_unix(),
+            started_ts: Some(now_unix()),
+            completed_ts: None,
+            abandoned_ts: None,
+            task_ids: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mission_graph_html_serves_the_page() {
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mission/any-id/graph")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(html.contains("/vendor/reactflow-bundle.min.js"));
+        assert!(html.contains("/vendor/reactflow-bundle.min.css"));
+        // Same XSS-hardening posture as viewer.html: no raw HTML injection
+        // sink. React's `createElement` escapes text content by
+        // construction; this page must never reach for the one API that
+        // opts back OUT of that (`dangerouslySetInnerHTML`).
+        assert!(!html.contains("dangerouslySetInnerHTML"));
+        assert!(!html.to_lowercase().contains("javascript:"));
+    }
+
+    #[tokio::test]
+    async fn vendor_reactflow_js_served_with_correct_content_type() {
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/vendor/reactflow-bundle.min.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        let bytes = to_bytes(response.into_body(), 8 << 20).await.unwrap();
+        assert!(bytes.len() > 10_000, "vendor bundle unexpectedly tiny: {} bytes", bytes.len());
+        let js = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(js.contains("MissionGraphVendor"));
+    }
+
+    #[tokio::test]
+    async fn vendor_reactflow_css_served_with_correct_content_type() {
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/vendor/reactflow-bundle.min.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/css; charset=utf-8");
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    /// (#881 parity) The graph.json route must ride the SAME remote-only
+    /// bearer gate as `/missions`/`/phases`/`/lab/runs` — guards against a
+    /// future refactor special-casing the mission-graph surface out of
+    /// `auth_mw`. Mirrors `lab_runs_requires_token_from_remote_peer`
+    /// exactly.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_requires_token_from_remote_peer() {
+        unsafe {
+            std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN);
+        }
+        let app = build_router(PathBuf::new());
+        let mut req = Request::builder()
+            .uri("/mission/some-mission/graph.json")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(remote_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        unsafe {
+            std::env::remove_var("DARKMUX_SERVE_TOKEN");
+        }
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Same parity check for the HTML page and the vendor bundle routes —
+    /// all three ride the same `timed` router group as `/`/`/play/:date`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_html_and_vendor_bundle_require_token_from_remote_peer() {
+        unsafe {
+            std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN);
+        }
+        let app = build_router(PathBuf::new());
+        for uri in ["/mission/some-mission/graph", "/vendor/reactflow-bundle.min.js", "/vendor/reactflow-bundle.min.css"] {
+            let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            req.extensions_mut().insert(remote_peer());
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri} should require a token from a remote peer");
+        }
+        unsafe {
+            std::env::remove_var("DARKMUX_SERVE_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_returns_404_for_unknown_mission() {
+        let _guard = CrewDirGuard::new();
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mission/does-not-exist/graph.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_rejects_invalid_id() {
+        let _guard = CrewDirGuard::new();
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mission/..%2F..%2Fetc/graph.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A mission with phase data but NO task/step graph underneath any
+    /// phase (a legacy pre-registry instance, or a freeform hand-authored
+    /// mission) renders phases-only with a note — never an error (item 6,
+    /// graceful degradation).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_legacy_mission_is_phases_only_with_a_note() {
+        let _guard = CrewDirGuard::new();
+        let mission = minimal_mission("legacy-mission", vec!["only-phase".to_string()]);
+        save_test_mission(&mission);
+        save_test_phase(&minimal_phase("only-phase", "legacy-mission"));
+
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mission/legacy-mission/graph.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["legacy"], true);
+        assert!(json["note"].is_string(), "legacy mission must carry a note: {json}");
+        let nodes = json["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1, "phases-only: exactly the one phase node, no tasks/steps: {nodes:?}");
+        assert_eq!(nodes[0]["kind"], "phase");
+        assert_eq!(nodes[0]["id"], "only-phase");
+        assert_eq!(json["edges"].as_array().unwrap().len(), 0);
+    }
+
+    /// Full shape test: a hand-built mission with a fan-in (two upstream
+    /// tasks feeding one downstream task) exercises phase→task containment,
+    /// task→step containment, AND the derived step-level `depends_on` edges
+    /// (module doc: an upstream task's LAST step feeds a downstream task's
+    /// FIRST step) — the "N converging edges into one step" legibility
+    /// requirement.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_fan_in_shape() {
+        let _guard = CrewDirGuard::new();
+        let mission_id = "fanin-mission";
+        let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
+        save_test_mission(&mission);
+        save_test_phase(&minimal_phase("p1", mission_id));
+
+        let task_a = darkmux_crew::types::Task {
+            id: "task-a".to_string(),
+            phase_id: "p1".to_string(),
+            description: "task a".to_string(),
+            step_ids: vec!["task-a-step".to_string()],
+            depends_on: vec![],
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let task_b = darkmux_crew::types::Task {
+            id: "task-b".to_string(),
+            phase_id: "p1".to_string(),
+            description: "task b".to_string(),
+            step_ids: vec!["task-b-step".to_string()],
+            depends_on: vec![],
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let task_c = darkmux_crew::types::Task {
+            id: "task-c".to_string(),
+            phase_id: "p1".to_string(),
+            description: "task c (dedup-like)".to_string(),
+            step_ids: vec!["task-c-step".to_string()],
+            depends_on: vec!["task-a".to_string(), "task-b".to_string()],
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        for t in [&task_a, &task_b, &task_c] {
+            darkmux_crew::lifecycle::save_task(mission_id, t).unwrap();
+        }
+        let step_a = darkmux_crew::types::Step {
+            id: "task-a-step".to_string(),
+            task_id: "task-a".to_string(),
+            kind: "procedural.noop".to_string(),
+            status: darkmux_crew::types::NodeStatus::Complete,
+            config: serde_json::Value::Null,
+            started_ts: Some(1),
+            completed_ts: Some(2),
+            output: None,
+        };
+        let step_b = darkmux_crew::types::Step {
+            id: "task-b-step".to_string(),
+            task_id: "task-b".to_string(),
+            kind: "procedural.noop".to_string(),
+            status: darkmux_crew::types::NodeStatus::Running,
+            config: serde_json::Value::Null,
+            started_ts: Some(1),
+            completed_ts: None,
+            output: None,
+        };
+        let step_c = darkmux_crew::types::Step {
+            id: "task-c-step".to_string(),
+            task_id: "task-c".to_string(),
+            kind: "procedural.noop".to_string(),
+            status: darkmux_crew::types::NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        for s in [&step_a, &step_b, &step_c] {
+            darkmux_crew::lifecycle::save_step(mission_id, "p1", s).unwrap();
+        }
+
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mission/{mission_id}/graph.json"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["legacy"], false);
+
+        let nodes = json["nodes"].as_array().unwrap();
+        // 1 phase + 3 tasks + 3 steps.
+        assert_eq!(nodes.len(), 7, "{nodes:?}");
+        let node = |id: &str| nodes.iter().find(|n| n["id"] == id).unwrap_or_else(|| panic!("missing node {id}: {nodes:?}"));
+        assert_eq!(node("task-a")["status"], "complete");
+        assert_eq!(node("task-b")["status"], "running");
+        assert_eq!(node("task-c")["status"], "planned");
+        assert_eq!(node("task-a-step")["status"], "complete");
+        assert_eq!(node("task-b-step")["status"], "running");
+
+        let edges = json["edges"].as_array().unwrap();
+        let has_edge = |source: &str, target: &str, kind: &str| {
+            edges.iter().any(|e| e["source"] == source && e["target"] == target && e["kind"] == kind)
+        };
+        assert!(has_edge("p1", "task-a", "contains"));
+        assert!(has_edge("p1", "task-b", "contains"));
+        assert!(has_edge("p1", "task-c", "contains"));
+        assert!(has_edge("task-a", "task-a-step", "contains"));
+        // The fan-in: BOTH upstream steps converge on the same downstream step.
+        assert!(has_edge("task-a-step", "task-c-step", "depends_on"));
+        assert!(has_edge("task-b-step", "task-c-step", "depends_on"));
+    }
+
+    /// (item 7) Shape test against a REAL review-config-interpreted graph:
+    /// loads the embedded `review` mission config, interprets it with a
+    /// launcher supplying two probe seats (mirroring how `pr-review run`
+    /// would resolve `crew_staffing` at launch), persists the resulting
+    /// Mission/Phase/Task/Step graph, and asserts the graph.json node
+    /// counts match what `review.json`'s own shape (3 phases; investigate
+    /// = bundle + N probe + dedup; adjudicate = judge; report = verify +
+    /// synthesis) predicts for N=2 probe seats: 3 phase nodes, 7 task nodes
+    /// (bundle, probe-0, probe-1, dedup, judge, verify, synthesis), 7 step
+    /// nodes (every task here is single-step).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_review_config_interpreted_shape() {
+        let _guard = CrewDirGuard::new();
+        let loaded = darkmux_crew::mission_config::load("review").expect("embedded review config loads");
+
+        let mut expansions = std::collections::BTreeMap::new();
+        expansions.insert(
+            "probe_seats".to_string(),
+            vec!["seat-a".to_string(), "seat-b".to_string()],
+        );
+        let params = darkmux_crew::mission_config::LaunchParams {
+            phase_ids: std::collections::BTreeMap::new(),
+            task_overrides: std::collections::BTreeMap::new(),
+            step_config_overrides: std::collections::BTreeMap::new(),
+            expansions,
+        };
+        let (tasks, steps) = darkmux_crew::mission_config::interpret(&loaded.config, &params)
+            .expect("interpret succeeds against the embedded review config");
+
+        let mission_id = "review-shape-mission";
+        let phase_ids: Vec<String> = loaded.config.phases.iter().map(|p| p.id.clone()).collect();
+        save_test_mission(&minimal_mission(mission_id, phase_ids.clone()));
+        for phase_id in &phase_ids {
+            save_test_phase(&minimal_phase(phase_id, mission_id));
+        }
+        for task in &tasks {
+            darkmux_crew::lifecycle::save_task(mission_id, task).unwrap();
+        }
+        for step in steps.values() {
+            darkmux_crew::lifecycle::save_step(mission_id, &tasks.iter().find(|t| t.id == step.task_id).unwrap().phase_id, step).unwrap();
+        }
+
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mission/{mission_id}/graph.json"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["legacy"], false);
+
+        let nodes = json["nodes"].as_array().unwrap();
+        let count_kind = |kind: &str| nodes.iter().filter(|n| n["kind"] == kind).count();
+        assert_eq!(count_kind("phase"), 3, "{nodes:?}");
+        assert_eq!(count_kind("task"), 7, "expected bundle+2 probes+dedup+judge+verify+synthesis: {nodes:?}");
+        assert_eq!(count_kind("step"), 7, "every task in review.json is single-step: {nodes:?}");
+        assert_eq!(tasks.len(), 7);
+        assert_eq!(steps.len(), 7);
     }
 }
