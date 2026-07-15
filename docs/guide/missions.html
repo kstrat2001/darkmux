@@ -94,10 +94,10 @@ darkmux crew sync --dry-run      <span class="comment"># preview without writing
     <h2>Missions + phases</h2>
     <p>A <strong>mission</strong> is a named objective: a directory under <code>~/.darkmux/missions/&lt;mission-id&gt;/</code> holding <code>mission.json</code> (description, a list of <code>phase_ids</code>, and a status: active/closed/paused) plus the mission's own <code>phases/</code> subdirectory. A <strong>phase</strong> is a time-boxed work unit inside a mission: its own JSON file at <code>~/.darkmux/missions/&lt;mission-id&gt;/phases/&lt;phase-id&gt;.json</code> with status (planned/running/complete/abandoned), depends_on, and timestamps. Everything for one mission lives under that one directory. Nothing is split across separate top-level <code>missions/</code> and <code>phases/</code> trees.</p>
 
-    <p class="muted"><em>Note for operators with existing state:</em> earlier versions of darkmux nested everything under <code>~/.darkmux/crew/</code> (<code>roles/</code>, <code>missions/</code>, <code>phases/</code>). The loader transparently falls back to that layout. Separately, a mission whose phase JSONs still live under a legacy <code>sprints/</code> subdirectory (pre-rename) instead of <code>phases/</code> also reads and writes there transparently. Run <code>darkmux doctor</code> for a copy-pasteable <code>mv</code> script to flatten onto the current layout when you're ready. One older layout is <em>not</em> transparent: the original flat <code>~/.darkmux/missions/&lt;id&gt;.json</code> + <code>~/.darkmux/phases/&lt;id&gt;.json</code> shape (pre-mission-scoped-directories) needs an explicit one-time <code>darkmux mission migrate</code> to move into the nested layout above before it'll load.</p>
+    <p class="muted"><em>Note for operators with existing state:</em> earlier versions of darkmux nested everything under <code>~/.darkmux/crew/</code> (<code>roles/</code>, <code>missions/</code>, <code>phases/</code>). The loader transparently falls back to that layout. Separately, a mission whose phase JSONs still live under a legacy <code>sprints/</code> subdirectory (pre-rename) instead of <code>phases/</code> also reads and writes there transparently. Run <code>darkmux doctor</code> for a copy-pasteable <code>mv</code> script to flatten onto the current layout when you're ready. One older layout is <em>not</em> transparent: the original flat <code>~/.darkmux/missions/&lt;id&gt;.json</code> + <code>~/.darkmux/phases/&lt;id&gt;.json</code> shape (pre-mission-scoped-directories) needs an explicit one-time <code>darkmux mission migrate</code> to move into the nested layout above before it'll load. That same verb also synthesizes a <code>config-snapshot.json</code> for any nested-layout mission that predates <code>mission launch</code> and doesn't have one yet: a trivial, task-less config built from the mission's own JSON, so an old hand-authored instance reads honestly as the freeform/manual mission it always was. <code>darkmux mission migrate</code> (dry run) then <code>--apply</code> covers both.</p>
 
     <h3>Authoring a mission (recommended)</h3>
-    <p>The preferred path: use <code>darkmux mission propose</code>, which takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>) and dispatches the mission-compiler utility agent to emit a structured proposal you approve before any file lands.</p>
+    <p>The preferred path is two verbs: <code>darkmux mission propose</code>, which takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>) and dispatches the mission-compiler utility agent to emit a structured proposal you approve before anything lands; then <code>darkmux mission launch &lt;id&gt;</code>, which mints a running mission instance from what got persisted. Config-launched is the only instance-creation path (see the next section): <code>propose</code> writes the CONFIG, <code>launch</code> mints the INSTANCE.</p>
 
     <h4>Worked example: proposing a mission from stdin</h4>
     <pre><code><span class="comment"># Pipe operator intent into the compiler</span>
@@ -118,16 +118,17 @@ pbpaste | darkmux mission propose --from-stdin
 └─────────────────────────────────────────
 
 Approve [y] · Edit/regenerate with hint [e] · Reject [n]: y
-mission propose: persisted 1 mission + 2 phases
-next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code>--start</code> next time)</code></pre>
+mission propose: persisted mission config `draft-blog-post` (2 phase(s))
+wrote mission config: ~/.darkmux/mission-configs/draft-blog-post.json
+next: <code>darkmux mission launch draft-blog-post</code> to begin (or pass <code>--start</code> next time)</code></pre>
 
-    <p>The proposal is persisted to disk as JSON files under <code>~/.darkmux/missions/</code> and <code>~/.darkmux/phases/</code>. Pass <code>--start</code> to transition immediately:</p>
+    <p>The approved proposal is persisted as a mission CONFIG at <code>~/.darkmux/mission-configs/draft-blog-post.json</code>, not a running instance. Pass <code>--start</code> to launch it immediately instead of stopping after persist:</p>
     <pre><code>darkmux mission propose --from-stdin --start
-<span class="comment"># ... proposal approved, files written, mission → Active</span></code></pre>
+<span class="comment"># ... proposal approved, config written, then launched (mission → Active)</span></code></pre>
 
-    <h3>Authoring by hand (low-level alternative)</h3>
-    <p>If you prefer to skip the propose step or are building automation, you can write the JSON files directly. This is the escape hatch: recommended for operators who want full control or are scripting workflows.</p>
-    <p>These are <strong>operator-edited JSON files</strong>. darkmux doesn't require a creation verb; you write the file directly, then use the CLI to transition status.</p>
+    <h3>Authoring a mission config by hand (low-level alternative)</h3>
+    <p>If you prefer to skip the propose step or are building automation, you can write the config JSON directly at <code>~/.darkmux/mission-configs/&lt;id&gt;.json</code>, then run <code>darkmux mission launch &lt;id&gt;</code>. This is the escape hatch: recommended for operators who want full control or are scripting workflows. See <a href="#config-authoring">config authoring</a> below for the shape.</p>
+    <p>Hand-authoring the running <strong>instance</strong> JSON directly (writing <code>mission.json</code>/<code>phases/&lt;id&gt;.json</code> yourself under <code>~/.darkmux/missions/</code>) is <strong>not a documented path any more</strong>. Those files still exist on disk exactly as before, and they're still plain, human-readable JSON you can open and inspect; but they're now system-managed state that <code>mission launch</code> writes for you, the same way a database's on-disk pages are real files you could technically hand-edit but aren't meant to. Write a config; launch it.</p>
 
     <h3>When to use missions vs. not</h3>
     <p>Mission/phase is overhead. It pays back only when you'd benefit from <em>durable state</em> for the work. Three patterns to pick from:</p>
@@ -151,20 +152,50 @@ next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code
     </table>
     <p>The practical heuristic: <strong>if you can't articulate what the viewer would show you at the end of the mission, you probably don't need a mission.</strong> If the answer is <em>"a 3-arc timeline with these durations and these dispatch records"</em>, missions earn their keep.</p>
 
+    <h3 id="config-authoring">Mission config shape</h3>
+    <p>A mission config is the DATA a mission is launched FROM. It declares the phases the launched instance will have, plus (optionally) the runtime-only <code>inputs</code> the launcher needs supplied at launch time (a worktree path, a case id, resolved crew staffing) that don't belong baked into a reusable document. Save it at <code>~/.darkmux/mission-configs/&lt;id&gt;.json</code>:</p>
+    <pre><code>{
+  "id": "draft-blog-post",
+  "name": "Draft Blog Post",
+  "description": "Draft a blog post on local-AI bounded-task patterns.",
+  "schema_version": "1.1",
+  "phases": [
+    {
+      "id": "s1-outline",
+      "description": "Write a one-page outline: thesis, three supporting sections, closing reframe."
+    },
+    {
+      "id": "s2-draft",
+      "description": "Flesh out the outline into a full first draft."
+    }
+  ]
+}</code></pre>
+    <p>A phase with no <code>tasks</code> array (as both phases above) is a valid, common shape: a <strong>freeform/manual phase</strong> whose work happens by hand, or via ad-hoc <code>darkmux crew dispatch</code> calls, rather than an automated Task/Step graph. Phase order is the list position; there's no separate dependency field to set.</p>
+
+    <h3>Launching a config: <code>mission launch</code></h3>
+    <pre><code>darkmux mission launch draft-blog-post</code></pre>
+    <p>This resolves the config (user tier first, then any on-disk template, then an embedded built-in), validates it, and mints a running mission INSTANCE: <code>mission.json</code>, one <code>phases/&lt;id&gt;.json</code> per declared phase, and a <code>config-snapshot.json</code>, a frozen copy of the resolved config alongside the instance, so a later edit to the source config never orphans an already-running instance's own record of what it ran. For a config whose phases have no tasks (as above), <code>launch</code> mints the instance and starts the mission, then leaves every phase transition operator-driven from there: <code>darkmux phase start s1-outline</code>, and so on, exactly as before.</p>
+    <p>A config can declare runtime-only <code>inputs</code> it needs from its launcher (see the built-in <code>coder-phase</code> config for a worked example: it needs a worktree path, a branch, and a base ref). Supply them with a JSON file or individual overrides:</p>
+    <pre><code>darkmux mission launch coder-phase \
+  --input inputs.json \
+  --param role=coder \
+  --param branch=my-feature</code></pre>
+    <p><code>--param</code> always wins over the same key in <code>--input</code>'s file. Launching a config with a missing required input bails loud, listing exactly what's missing plus a copy-pasteable example of both forms. Launching the SAME config with the SAME inputs twice is idempotent: it derives the same instance id both times and reopens a terminal (closed) instance rather than minting a duplicate.</p>
+
     <h3>Mission JSON shape</h3>
-    <p>At <code>~/.darkmux/missions/deploy-rewrite/mission.json</code>:</p>
+    <p>Generated by <code>mission launch</code> at <code>~/.darkmux/missions/deploy-rewrite/mission.json</code>. This is system-managed state now (see the note above): still plain JSON you can open and read, just not a file you're expected to hand-author:</p>
     <pre><code>{
   "id": "deploy-rewrite",
   "description": "Rewrite the deploy pipeline to use the new artifact store",
   "status": "active",
-  "phase_ids": ["deploy-s1-baseline", "deploy-s2-cutover"],
+  "phase_ids": ["deploy-rewrite-s1-baseline", "deploy-rewrite-s2-cutover"],
   "created_ts": 1778685866
 }</code></pre>
 
     <h3>Phase JSON shape</h3>
-    <p>At <code>~/.darkmux/missions/deploy-rewrite/phases/deploy-s1-baseline.json</code>. The file's own basename is the phase id; <code>mission_id</code> inside it is redundant with the parent directory but kept for self-description (a phase JSON is meaningful even copied out on its own):</p>
+    <p>Also generated by <code>mission launch</code>, at <code>~/.darkmux/missions/deploy-rewrite/phases/deploy-rewrite-s1-baseline.json</code>. The file's own basename is the phase id; <code>mission_id</code> inside it is redundant with the parent directory but kept for self-description (a phase JSON is meaningful even copied out on its own):</p>
     <pre><code>{
-  "id": "deploy-s1-baseline",
+  "id": "deploy-rewrite-s1-baseline",
   "mission_id": "deploy-rewrite",
   "description": "Capture a baseline of current deploy timing + artifact sizes",
   "status": "planned",
@@ -173,42 +204,31 @@ next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code
 }</code></pre>
 
     <h3>Worked example: a minimum-viable mission</h3>
-    <p>The smallest useful shape: one mission, one phase. Just enough to see the lifecycle move and the cyan records land in the viewer.</p>
+    <p>The smallest useful shape: one config, one phase. Just enough to see the lifecycle move and the cyan records land in the viewer.</p>
 
-    <h4>1. Make sure the directories exist</h4>
-    <pre><code>mkdir -p ~/.darkmux/missions/draft-blog-post/phases</code></pre>
+    <h4>1. Make sure the directory exists</h4>
+    <pre><code>mkdir -p ~/.darkmux/mission-configs</code></pre>
 
-    <h4>2. Pick a current Unix epoch timestamp</h4>
-    <p>The <code>created_ts</code> field is just <em>seconds since the Unix epoch</em>. Get one:</p>
-    <pre><code>date +%s
-<span class="comment"># 1778685866   (your value will differ)</span></code></pre>
-
-    <h4>3. Save the mission JSON</h4>
-    <p>Save the following at <code>~/.darkmux/missions/draft-blog-post/mission.json</code> (replace the timestamp with what <code>date +%s</code> just gave you):</p>
+    <h4>2. Save the mission config</h4>
+    <p>Save the following at <code>~/.darkmux/mission-configs/draft-blog-post.json</code>:</p>
     <pre><code>{
   "id": "draft-blog-post",
+  "name": "Draft Blog Post",
   "description": "Draft a blog post on local-AI bounded-task patterns.",
-  "status": "active",
-  "phase_ids": ["draft-blog-post-s1-outline"],
-  "created_ts": 1778685866
+  "phases": [
+    {
+      "id": "s1-outline",
+      "description": "Write a one-page outline: thesis, three supporting sections, closing reframe."
+    }
+  ]
 }</code></pre>
 
-    <h4>4. Save the phase JSON</h4>
-    <p>Save at <code>~/.darkmux/missions/draft-blog-post/phases/draft-blog-post-s1-outline.json</code>:</p>
-    <pre><code>{
-  "id": "draft-blog-post-s1-outline",
-  "mission_id": "draft-blog-post",
-  "description": "Write a one-page outline: thesis, three supporting sections, closing reframe.",
-  "status": "planned",
-  "depends_on": [],
-  "created_ts": 1778685866
-}</code></pre>
+    <h4>3. Launch it</h4>
+    <pre><code>darkmux mission launch draft-blog-post
+<span class="comment"># mission `draft-blog-post` minted, Active, phase `draft-blog-post-s1-outline` Planned</span></code></pre>
 
-    <h4>5. Drive the lifecycle</h4>
-    <pre><code>darkmux mission start draft-blog-post
-<span class="comment"># mission `draft-blog-post` → Active</span>
-
-darkmux phase start draft-blog-post-s1-outline
+    <h4>4. Drive the lifecycle</h4>
+    <pre><code>darkmux phase start draft-blog-post-s1-outline
 <span class="comment"># phase `draft-blog-post-s1-outline` → Running</span>
 
 <span class="comment"># …do the work, by hand or via `darkmux crew dispatch scribe ...`…</span>
@@ -219,22 +239,19 @@ darkmux mission close draft-blog-post
     <p>Every transition emits a flow record. Open <a href="../flow/">darkmux.com/flow/</a>, click <strong>Connect</strong>, and you'll see the cyan operator-tier records as the lifecycle moves.</p>
 
     <h3>Mission without phases (duration container)</h3>
-    <p>You can omit phases entirely. A mission with <code>phase_ids: []</code> is valid: it's just a start/close timestamp container for an engagement-level chunk of work that isn't decomposable.</p>
+    <p>You can omit phases entirely. A config with <code>phases: []</code> is valid: launching it is just a start/close timestamp container for an engagement-level chunk of work that isn't decomposable.</p>
     <pre><code>{
   "id": "japan-trip-2026-05",
-  "description": "10-day Japan trip, May 20-30.",
-  "status": "active",
-  "phase_ids": [],
-  "created_ts": 1778685866
+  "name": "Japan Trip 2026-05",
+  "description": "10-day Japan trip, May 20-30."
 }</code></pre>
-    <p>Then just <code>darkmux mission start japan-trip-2026-05</code> when the trip begins and <code>darkmux mission close japan-trip-2026-05</code> when it ends. The viewer will show the wall-clock duration.</p>
+    <p>Then <code>darkmux mission launch japan-trip-2026-05</code> once, when the trip begins, and <code>darkmux mission close japan-trip-2026-05</code> when it ends. The viewer will show the wall-clock duration.</p>
 
     <p>You can also <code>mission add-phase</code> later if structure emerges mid-trip. The empty-phase mission grows into a decomposed one as needed.</p>
 
     <h3>Growing the plan: the multi-phase shape</h3>
-    <p>For mission-shaped work with clear decomposition (a campaign, a deploy, a multi-week research arc), the natural pattern is one mission JSON + one phase JSON per planned step. Same shape as the minimum-viable example, just more phase files.</p>
-    <p>For example, a marketing-campaign mission might have three phases: positioning research, messaging draft, launch checklist. Each phase JSON references the mission via <code>mission_id</code>, declares <code>depends_on</code> if it must follow another phase, and the mission's <code>phase_ids</code> array lists them all.</p>
-    <p>The depends_on edges encode <em>"must complete first"</em>, not display order. Display order in the viewer follows the mission's <code>phase_ids</code> array.</p>
+    <p>For mission-shaped work with clear decomposition (a campaign, a deploy, a multi-week research arc), the natural pattern is one config with one phase entry per planned step. Same shape as the minimum-viable example, just more phases in the array.</p>
+    <p>For example, a marketing-campaign config might declare three phases: positioning research, messaging draft, launch checklist. Display order in the viewer follows the config's phase array order, which becomes the launched mission's <code>phase_ids</code> array order; there's no separate dependency field to set at the phase level.</p>
 
     <div class="callout">
       <strong>Mission/phase is a generic plan abstraction.</strong>
@@ -299,7 +316,8 @@ darkmux phase review --require-clean          <span class="comment"># exit 1 if 
 <section>
   <div class="wrap">
     <h2>The automated loop: <code>mission run</code> + <code>mission ship</code></h2>
-    <p>Everything the previous sections do by hand (create a worktree, dispatch a coder, review the diff, open a PR) has a built-in automated form. <code>darkmux mission run</code> takes a ready-to-run phase through a local sign-off gate in one call; <code>darkmux mission ship</code> finishes the loop from there. This is the recommended path for a phase whose work is "dispatch a coder, get a diff, review it." The manual dance above is still there for anything that doesn't fit that shape, or when you want to drive each step yourself.</p>
+    <p>Everything the previous sections do by hand (create a worktree, dispatch a coder, review the diff, open a PR) has a built-in automated form. <code>darkmux mission run</code> takes a ready-to-run phase, on an already-launched mission, through a local sign-off gate in one call; <code>darkmux mission ship</code> finishes the loop from there. This is the recommended path for a phase whose work is "dispatch a coder, get a diff, review it." The manual dance above is still there for anything that doesn't fit that shape, or when you want to drive each step yourself.</p>
+    <p>The same worktree-coder-QA shape is also available as a config: the built-in <code>coder-phase</code> mission config declares exactly this graph, so <code>darkmux mission launch coder-phase --param workdir=&lt;path&gt; --param branch=&lt;name&gt; --param base=main</code> mints a brand-new instance and runs it end to end in one call, an ALTERNATE path to the same outcome, not a replacement for <code>mission run</code>. Use <code>mission run</code> when you're working an existing, already-launched mission phase by phase; use <code>mission launch coder-phase</code> when you want one call to mint and run a standalone worktree-coder-QA cycle from scratch.</p>
 
     <h3><code>mission run</code>: worktree → coder → QA, then stop</h3>
     <pre><code>darkmux mission run deploy-rewrite                        <span class="comment"># auto-selects the one ready phase</span>

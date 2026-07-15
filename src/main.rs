@@ -40,6 +40,7 @@ mod conventions;
 mod mission_propose;
 mod mission_status;
 mod mission_run;
+mod mission_launch;
 mod notebook;
 mod optimize;
 mod pr_review;
@@ -861,6 +862,39 @@ enum MissionCmd {
         #[arg(long, value_name = "ID")]
         ticket: Option<String>,
     },
+    /// Launch a named mission CONFIG into a new (or idempotently reused)
+    /// mission INSTANCE (#1284 Packet 4a). Resolves `<config-id>` through
+    /// the mission-config registry (user → on-disk → embedded — see
+    /// `darkmux doctor`'s mission-config-registry check), validates it
+    /// loud, collects its declared runtime-only `inputs` from `--input` /
+    /// `--param` (bailing with a copy-pasteable example if any required
+    /// input is missing), then mints `mission.json` + one phase per
+    /// declared phase + a `config-snapshot.json` freezing the resolved
+    /// config alongside the instance. When the graph has tasks this
+    /// launcher knows how to execute, it runs them through the real
+    /// scheduler and finalizes via a `MissionEnvelope`; a graph with no
+    /// tasks anywhere (a freeform/manual config) mints the instance and
+    /// starts the mission but leaves every phase transition
+    /// operator-driven. Same `--input`/`--param` values always derive the
+    /// SAME instance id — relaunching reopens a terminal instance rather
+    /// than minting a duplicate.
+    Launch {
+        /// Mission config id to launch — a built-in (e.g. `coder-phase`)
+        /// or a `darkmux mission propose`-drafted user-tier config.
+        config_id: String,
+        /// JSON file supplying the config's declared inputs (a flat
+        /// object: input name → value).
+        #[arg(long, value_name = "FILE")]
+        input: Option<std::path::PathBuf>,
+        /// An individual input override in `key=value` form. Repeatable;
+        /// always wins over the same key in `--input`'s file.
+        #[arg(long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
+        /// Coder dispatch timeout (seconds), for a config whose graph
+        /// executes a dispatch. Default 600.
+        #[arg(long, default_value = "600")]
+        timeout: u32,
+    },
     /// Add a new Phase to an existing Mission mid-flight (#107).
     /// Operator-sovereign scope growth — alternative to either hand-
     /// editing JSON or filing a separate Mission for work that
@@ -898,11 +932,21 @@ enum MissionCmd {
     /// per-mission nested layout (`<crew>/missions/<id>/mission.json`,
     /// `<crew>/missions/<id>/phases/<phase-id>.json`).
     ///
-    /// Dry-run by default — prints the proposed moves without touching any
-    /// files. Pass `--apply` to commit the migration. Idempotent: re-running
+    /// ALSO synthesizes `config-snapshot.json` for every nested-layout
+    /// instance that doesn't have one yet (#1284 Packet 4a) — a
+    /// hand-authored mission minted before `mission launch` existed. Each
+    /// gets a trivial, task-less config built from its own mission/phase
+    /// JSONs, so it reads (in `mission status`, a future graph lens) as the
+    /// freeform/manual instance it always was, without hand-editing.
+    ///
+    /// Dry-run by default — prints the proposed moves + synthesis without
+    /// touching any files. Pass `--apply` to commit. Idempotent: re-running
     /// after a successful apply is a no-op. Orphan phases (whose
     /// `mission_id` has no matching mission on disk) are reported but never
-    /// auto-moved; operator resolves them manually.
+    /// auto-moved; operator resolves them manually. A mission whose
+    /// `phase_ids` reference a missing phase JSON skips ONLY that mission's
+    /// snapshot synthesis (warned, not fatal) — existing flat→nested
+    /// migration behavior is otherwise unchanged.
     Migrate {
         /// Apply the migration. Without this flag, only the proposed
         /// moves are printed (dry-run).
@@ -2303,6 +2347,9 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             start,
             ticket,
         } => mission_propose::propose(from_stdin, from_file.as_deref(), yes, start, ticket.as_deref()),
+        MissionCmd::Launch { config_id, input, params, timeout } => {
+            mission_launch::launch(&config_id, input.as_deref(), &params, timeout)
+        }
         MissionCmd::AddPhase {
             mission_id,
             phase_id,
@@ -2339,8 +2386,9 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             migrate::apply_migration(&plan)?;
             if !plan.is_empty() {
                 println!(
-                    "\nmigrate: applied {} move(s).",
-                    plan.mission_moves.len() + plan.phase_moves.len()
+                    "\nmigrate: applied {} move(s), synthesized {} config-snapshot(s).",
+                    plan.mission_moves.len() + plan.phase_moves.len(),
+                    plan.config_snapshots_missing.len()
                 );
             }
             Ok(0)

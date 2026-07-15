@@ -527,130 +527,131 @@ fn prompt_decision() -> Result<Decision> {
     }
 }
 
+/// Build a mission CONFIG document (#1284 Packet 4a) from a parsed
+/// `Proposal` — the artifact `persist` now writes, replacing the pre-
+/// Packet-4a direct Mission+Phase instance emission. Every phase becomes a
+/// trivial, TASK-LESS `PhaseConfig` (the mission-compiler's schema has no
+/// notion of a Task/Step graph — it only ever proposed the freeform/manual
+/// shape), so a launched proposal always takes the "mint + start, leave
+/// phase transitions operator-driven" path `mission_launch::launch`
+/// documents for zero-task configs.
+///
+/// Phase ORDER follows `mission.phase_ids` (the compiler's own intended
+/// execution order, matching `PhaseConfig`'s #1341 strictly-linear-phase
+/// doctrine — list POSITION is the only ordering a config expresses).
+/// `ProposedPhase.depends_on` is validated for cross-reference sanity by
+/// `validate_proposal_invariants` upstream but has no field on
+/// `PhaseConfig` to land in — dropped here, same as it always was silently
+/// dropped by the pre-Packet-4a `crew::types::Phase` (no `depends_on`
+/// field there either).
+///
+/// `source_input`/`ticket` are genuinely PER-INSTANCE data with no home in
+/// `MissionConfig`'s schema (a config is meant to be launched more than
+/// once) — preserved anyway, in `extras` (the schema's forward-compat
+/// overflow bag), so the operator's original words + ticket id aren't
+/// silently discarded. `mission_launch::launch` doesn't read them back
+/// today; a future minor schema bump can promote them to real fields if a
+/// consumer needs them.
+fn build_mission_config(
+    p: &Proposal,
+    source_input: &str,
+    ticket: Option<&str>,
+) -> darkmux_crew::mission_config::MissionConfig {
+    use darkmux_crew::mission_config::{MissionConfig, PhaseConfig, MISSION_CONFIG_SCHEMA};
+    use std::collections::BTreeMap;
+
+    let mut extras = BTreeMap::new();
+    if !source_input.trim().is_empty() {
+        extras.insert("source_input".to_string(), serde_json::Value::String(source_input.to_string()));
+    }
+    if let Some(t) = ticket.map(str::trim).filter(|t| !t.is_empty()) {
+        extras.insert("ticket".to_string(), serde_json::Value::String(t.to_string()));
+    }
+
+    let by_id: std::collections::HashMap<&str, &ProposedPhase> =
+        p.phases.iter().map(|s| (s.id.as_str(), s)).collect();
+    let phases: Vec<PhaseConfig> = p
+        .mission
+        .phase_ids
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()))
+        .map(|s| PhaseConfig {
+            id: s.id.clone(),
+            description: Some(s.description.clone()),
+            tasks: Vec::new(),
+            extras: BTreeMap::new(),
+        })
+        .collect();
+
+    MissionConfig {
+        id: p.mission.id.clone(),
+        name: humanize(&p.mission.id),
+        description: Some(p.mission.description.clone()),
+        schema_version: Some(MISSION_CONFIG_SCHEMA.to_string()),
+        inputs: Vec::new(),
+        phases,
+        extras,
+    }
+}
+
+/// `"my-trip-plan"` -> `"My Trip Plan"` — a readable default `name` derived
+/// from the compiler's own `id` (the compiler schema has no separate
+/// human-readable name field; `MissionConfig.name` is required non-empty).
+fn humanize(id: &str) -> String {
+    id.split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Persist the operator-approved proposal as a mission CONFIG JSON at the
+/// user tier (`~/.darkmux/mission-configs/<id>.json`, #1284 Packet 4a —
+/// deferred from Packet 1). The old direct Mission+Phase INSTANCE emission
+/// is retired (clean break, pre-1.0 posture — no compat alias); `darkmux
+/// mission launch <id>` is now the follow-up verb, printed below on success.
 fn persist(p: &Proposal, source_input: &str, ticket: Option<&str>) -> Result<i32> {
-    use crate::crew::lifecycle;
+    use crate::crew::loader;
 
     // (#867 security boundary) Re-assert id safety at the path-construction
-    // site — persist builds `lifecycle::{mission,phase}_path` via raw join, so
-    // a model-supplied `../`/`/`-id must never reach here even if a future
-    // caller skips `validate_proposal_invariants`. This function, not its
-    // callers, owns the path-write boundary.
+    // site — a model-supplied `../`/`/`-id must never reach here even if a
+    // future caller skips `validate_proposal_invariants`. This function,
+    // not its callers, owns the path-write boundary.
     validate_proposal_ids(p)?;
 
-    // Stamp created_ts on everything that has 0 (the schema convention
-    // the mission-compiler emits — see role .md).
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let config = build_mission_config(p, source_input, ticket);
 
-    let mut mission = p.mission.clone();
-    if mission.created_ts == 0 {
-        mission.created_ts = now;
-    }
-    // (#815) Stamp the operator's verbatim input onto the mission record —
-    // the compiled descriptions are the STRUCTURE; this is the WORDS. A
-    // trimmed-empty input (shouldn't happen — propose rejects empty) stays
-    // None rather than persisting an empty block.
-    if !source_input.trim().is_empty() {
-        mission.source_input = Some(source_input.to_string());
-    }
-    // (#816) Ticket id from the operator's --ticket flag, verbatim.
-    if let Some(t) = ticket.map(str::trim).filter(|t| !t.is_empty()) {
-        mission.ticket = Some(t.to_string());
-    }
+    let dir = loader::mission_configs_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    // Ensure the per-mission dir + its phases/ subdir exist before any
-    // existence checks or writes. create_dir_all is idempotent and also
-    // creates the parent mission dir, so one call covers both.
-    let phases_dir = lifecycle::phases_dir(&mission.id);
-    std::fs::create_dir_all(&phases_dir)
-        .with_context(|| format!("creating {}", phases_dir.display()))?;
-
-    // Refuse to overwrite existing mission file.
-    let mission_path = lifecycle::mission_path(&mission.id);
-    if mission_path.exists() {
+    let path = dir.join(format!("{}.json", config.id));
+    if path.exists() {
         return Err(anyhow!(
-            "mission propose: mission `{}` already exists at {} — aborting (no overwrite)",
-            mission.id,
-            mission_path.display()
+            "mission propose: mission config `{}` already exists at {} — aborting (no overwrite)",
+            config.id,
+            path.display()
         ));
     }
 
-    // Same for each phase — scoped to the mission's phases/ subdir.
-    for s in &p.phases {
-        let sp = lifecycle::phase_path(&mission.id, &s.id);
-        if sp.exists() {
-            return Err(anyhow!(
-                "mission propose: phase `{}` already exists at {} — aborting (no overwrite)",
-                s.id,
-                sp.display()
-            ));
-        }
-    }
-
-    // Atomic-ish persist: track every file we land on disk, and if any
-    // write later in the sequence fails, roll back the earlier ones so
-    // a partial-failure mid-loop (disk full, EPERM, signal) doesn't
-    // leave the operator with a half-written mission whose retry
-    // confusingly fails on the no-overwrite gate.
-    let mut written: Vec<std::path::PathBuf> = Vec::new();
-    let result = write_all(p, &mission, &mission_path, now, &mut written);
-    if let Err(e) = result {
-        for path in &written {
-            let _ = std::fs::remove_file(path);
-        }
-        eprintln!(
-            "mission propose: write failed mid-flight — rolled back {} file(s); state on disk matches pre-call",
-            written.len()
-        );
-        return Err(e);
-    }
+    let json = serde_json::to_string_pretty(&config).context("serializing mission config")?;
+    std::fs::write(&path, format!("{json}\n")).with_context(|| format!("writing {}", path.display()))?;
 
     eprintln!(
-        "mission propose: persisted {} mission + {} phases",
-        1,
-        p.phases.len()
+        "mission propose: persisted mission config `{}` ({} phase(s))",
+        config.id,
+        config.phases.len()
     );
+    println!("wrote mission config: {}", path.display());
     Ok(0)
 }
 
-/// Inner write loop, factored so persist() can roll back on any failure.
-/// Pushes each successfully-written path into `written` BEFORE moving
-/// on to the next write — so the rollback in persist() sees only files
-/// that actually landed.
-fn write_all(
-    p: &Proposal,
-    mission: &ProposedMission,
-    mission_path: &std::path::Path,
-    now: u64,
-    written: &mut Vec<std::path::PathBuf>,
-) -> Result<()> {
-    use crate::crew::lifecycle;
-
-    let mission_json = serde_json::to_string_pretty(mission).context("serializing mission")?;
-    std::fs::write(mission_path, format!("{mission_json}\n"))
-        .with_context(|| format!("writing {}", mission_path.display()))?;
-    written.push(mission_path.to_path_buf());
-    println!("wrote mission: {}", mission_path.display());
-
-    for s in &p.phases {
-        let mut phase = s.clone();
-        if phase.created_ts == 0 {
-            phase.created_ts = now;
-        }
-        let sp = lifecycle::phase_path(&mission.id, &phase.id);
-        let phase_json = serde_json::to_string_pretty(&phase).context("serializing phase")?;
-        std::fs::write(&sp, format!("{phase_json}\n"))
-            .with_context(|| format!("writing {}", sp.display()))?;
-        written.push(sp.clone());
-        println!("wrote phase:  {}", sp.display());
-    }
-
-    Ok(())
-}
-
-/// Helper that persists a proposal and optionally starts the mission.
+/// Helper that persists a proposal and optionally launches it.
 fn persist_and_maybe_start(
     p: &Proposal,
     start: bool,
@@ -662,21 +663,15 @@ fn persist_and_maybe_start(
         return Ok(exit);
     }
     if start {
-        eprintln!("mission propose: --start flag set, transitioning mission to Running …");
-        let m = crate::crew::lifecycle::mission_start(&p.mission.id)
-            .context("mission_start failed after successful persist")?;
-        println!(
-            "mission `{}` → Active  started_ts={}",
-            m.id,
-            m.started_ts.unwrap_or(0)
-        );
+        eprintln!("mission propose: --start flag set, launching `{}` …", p.mission.id);
+        crate::mission_launch::launch(&p.mission.id, None, &[], 600)
     } else {
         eprintln!(
-            "next: `darkmux mission start {}` to begin (or pass `--start` next time)",
+            "next: `darkmux mission launch {}` to begin (or pass `--start` next time)",
             p.mission.id
         );
+        Ok(0)
     }
-    Ok(0)
 }
 
 #[cfg(test)]
@@ -869,74 +864,52 @@ some epilogue"#;
 
     #[serial_test::serial]
     #[test]
-    fn persist_fails_on_existing_mission() {
-        // Regression: persist must refuse to overwrite an existing
-        // mission file so a duplicate proposal can't clobber operator
-        // state. Wrapped in CrewDirGuard so the test runs in an
-        // isolated TempDir — earlier version of this test wrote into
-        // the operator's REAL ~/.darkmux/crew/missions/ which was a
-        // footgun on every CI run.
+    fn persist_fails_on_existing_mission_config() {
+        // Regression: persist must refuse to overwrite an existing mission
+        // CONFIG so a duplicate proposal can't clobber an operator's
+        // hand-edited config. Wrapped in CrewDirGuard so the test runs in
+        // an isolated TempDir — never touches the operator's real
+        // ~/.darkmux/mission-configs/.
         let _guard = CrewDirGuard::new(TempDir::new().unwrap());
 
-        // Seed the new nested layout: missions/<id>/mission.json
-        let existing_path = crate::crew::lifecycle::mission_path("test-existing-mission");
+        let existing_path = crate::crew::loader::mission_configs_dir().join("test-existing-mission.json");
         std::fs::create_dir_all(existing_path.parent().unwrap()).unwrap();
-        std::fs::write(&existing_path, r#"{"id":"test-existing-mission","description":"existing","status":"active","phase_ids":[],"created_ts":0}"#)
-            .expect("writing existing mission");
+        std::fs::write(&existing_path, r#"{"id":"test-existing-mission","name":"Existing"}"#)
+            .expect("writing existing mission config");
 
         let proposal = sample_proposal("test-existing-mission", &[]);
-        let err = persist(&proposal, "test input", None).expect_err("persist should fail for existing mission");
+        let err = persist(&proposal, "test input", None).expect_err("persist should fail for existing config");
         assert!(err.to_string().contains("already exists"));
     }
 
-    #[cfg(unix)]
     #[serial_test::serial]
     #[test]
-    fn persist_rolls_back_mission_when_phase_write_fails() {
-        // Atomicity regression: if a phase write fails mid-loop, the
-        // mission file + any EARLIER successfully-written phase files must be
-        // cleaned up so the operator's retry sees a clean slate.
-        //
-        // Triggering a WRITE-time (not exists-pre-flight) failure on the
-        // SECOND phase with VALID ids — `/`-bearing ids are now rejected up
-        // front by validate_identifier (#867) — needs a path that PASSES the
-        // `.exists()` pre-flight yet FAILS the write. A symlink whose target's
-        // parent is missing does exactly that: `Path::exists()` follows it and
-        // sees the absent target (pre-flight passes), while `std::fs::write`
-        // follows it and ENOENTs on the missing parent (rollback fires). So
-        // mission + phase-1 land, phase-2 fails, and both are rolled back.
-        // (Previously this used a `deep/test-s2` slashed id, which #867 now
-        // correctly refuses.)
-        use std::os::unix::fs::symlink;
+    fn persist_writes_a_mission_config_with_the_expected_shape() {
+        // (#1284 Packet 4a) persist's output is now a MissionConfig
+        // document, not a Mission+Phase instance — every phase is
+        // task-less (the mission-compiler never proposed a Task/Step
+        // graph), phase order follows mission.phase_ids, and the id/
+        // schema_version land as documented.
         let _guard = CrewDirGuard::new(TempDir::new().unwrap());
 
-        let proposal = sample_proposal("test-rollback", &["test-s1", "test-s2"]);
-        let phases_dir = crate::crew::lifecycle::phases_dir("test-rollback");
-        std::fs::create_dir_all(&phases_dir).unwrap();
-        let s2_path = crate::crew::lifecycle::phase_path("test-rollback", "test-s2");
-        // Symlink s2's .json at a target whose parent dir doesn't exist.
-        symlink(phases_dir.join("missing-parent").join("target.json"), &s2_path)
-            .expect("pre-create the failing symlink at the s2 json path");
+        let proposal = sample_proposal("test-config-shape", &["s1", "s2"]);
+        persist(&proposal, "test input", Some("SYS-1")).expect("persist should succeed");
 
-        let err = persist(&proposal, "test input", None).expect_err("persist should fail mid-loop");
-        assert!(
-            err.to_string().contains("writing"),
-            "expected a write error, got: {err}"
-        );
-
-        // Mission file and the first phase file must both be cleaned up.
-        let mission_path = crate::crew::lifecycle::mission_path("test-rollback");
-        let phase1_path = crate::crew::lifecycle::phase_path("test-rollback", "test-s1");
-        assert!(
-            !mission_path.exists(),
-            "mission file should have been rolled back; found {}",
-            mission_path.display()
-        );
-        assert!(
-            !phase1_path.exists(),
-            "phase 1 file should have been rolled back; found {}",
-            phase1_path.display()
-        );
+        let path = crate::crew::loader::mission_configs_dir().join("test-config-shape.json");
+        assert!(path.is_file(), "expected a mission config at {}", path.display());
+        let cfg: darkmux_crew::mission_config::MissionConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.id, "test-config-shape");
+        assert_eq!(cfg.schema_version.as_deref(), Some(darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA));
+        assert!(cfg.inputs.is_empty(), "a freeform-only proposal declares no runtime inputs");
+        assert_eq!(cfg.phases.len(), 2);
+        assert_eq!(cfg.phases[0].id, "s1");
+        assert_eq!(cfg.phases[1].id, "s2");
+        assert!(cfg.phases.iter().all(|p| p.tasks.is_empty()), "compiler proposals are always freeform");
+        assert_eq!(cfg.extras.get("source_input"), Some(&serde_json::json!("test input")));
+        assert_eq!(cfg.extras.get("ticket"), Some(&serde_json::json!("SYS-1")));
+        // (contract 7) The document must itself validate cleanly.
+        assert!(cfg.is_valid(&[]));
     }
 
     #[test]
