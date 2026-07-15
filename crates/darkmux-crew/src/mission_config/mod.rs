@@ -20,12 +20,13 @@
 //! load path ([`load`] never calls it).
 //!
 //! **Naming note.** This `MissionConfig` is a MISSION GRAPH document
-//! (phases/tasks/steps) — a completely different concept from
-//! `darkmux_types::config::MissionConfig`, the OPERATOR `config.json`
-//! `mission{}` block (drift-detection knobs like `stale_active_days`). The
-//! two share a bare name only because each is the obvious name in ITS OWN
-//! module; always reach this one through its module path
-//! (`darkmux_crew::mission_config::MissionConfig`) to keep them apart.
+//! (phases/tasks/steps) — a completely different concept from the OPERATOR
+//! `config.json` `mission{}` block (drift-detection knobs like
+//! `stale_active_days`), which was `darkmux_types::config::MissionConfig`
+//! until the #1284 review round renamed it `MissionBoardConfig` precisely
+//! so THIS type could own the bare name as the arc's headline concept
+//! (Rust-only rename; the serde field stays `mission`, so operator
+//! config.json files are untouched).
 
 pub mod load;
 
@@ -132,6 +133,22 @@ pub struct PhaseConfig {
 /// belong in [`MissionConfig::inputs`], not the static document; see the
 /// packet report for how the two built-in configs use `role_id` as an
 /// overridable default and push workdir/image to `inputs` entirely.
+///
+/// **Placeholder-prefix rule (task AND step ids).** When the Rust builder a
+/// config transcribes composes its `Task`/`Step` ids from a caller-supplied
+/// phase id (`default_phase_graph`'s `format!("{phase_id}-worktree")` /
+/// `-coder` / `-verify`, steps appending `-step`), the config writes those
+/// ids with the owning [`PhaseConfig::id`] as a LITERAL prefix — that
+/// literal prefix stands in for the real phase id: at launch (#1284
+/// Packet 3), the launcher substitutes its composed phase id for the
+/// phase-config id wherever it prefixes a task/step id, so the persisted
+/// ids match what the Rust builder produces today byte for byte (task ids
+/// surface in `mission status`, the viewer, and lifecycle records — a
+/// silent id-scheme change at cutover is exactly what this rule prevents).
+/// A config whose builder uses FIXED ids (`build_review_graph`'s
+/// `review-bundle-task` etc.) writes them verbatim — no substitution. Each
+/// built-in config names which convention it uses in its own top-level
+/// `description`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskConfig {
     pub id: String,
@@ -626,9 +643,22 @@ mod tests {
     // Mirrors `workloads::types::tests::
     // medium_coding_embedded_manifest_has_expected_shape`'s style: no
     // separate golden-file mechanism exists in this codebase — "golden"
-    // means the expected shape is locked in code. These load through the
-    // real `load::load` (embedded tier), not a hand-built `MissionConfig`,
-    // so a change to the JSON files themselves is what these tests guard.
+    // means the expected shape is locked in code. These parse the EMBEDDED
+    // constants directly (`load::find_embedded`), NOT through `load::load`'s
+    // user → on-disk → embedded chain (#1284 review round 1): they are
+    // goldens for the embedded documents, and going through the chain both
+    // tested the wrong thing and was unisolated — it raced the loader's
+    // `#[serial]` tests that write user-tier stubs (serial_test does not
+    // block non-serial tests), and would deterministically read a real
+    // operator override at `~/.darkmux/mission-configs/<id>.json`. Chain
+    // resolution of the embedded tier keeps its own `#[serial]` test in
+    // `load::tests::embedded_resolves_with_no_user_or_on_disk_copy`.
+
+    fn embedded_config(id: &str) -> MissionConfig {
+        let raw = load::find_embedded(id)
+            .unwrap_or_else(|| panic!("`{id}` must be in EMBEDDED_MISSION_CONFIGS"));
+        serde_json::from_str(raw).unwrap_or_else(|e| panic!("embedded `{id}` must parse: {e}"))
+    }
 
     fn known_kinds() -> Vec<String> {
         crate::step_kinds::StepKindRegistry::with_builtins().ids()
@@ -640,8 +670,7 @@ mod tests {
 
     #[test]
     fn review_builtin_has_the_expected_graph_shape() {
-        let loaded = load::load("review").expect("built-in `review` config must load");
-        let cfg = &loaded.config;
+        let cfg = &embedded_config("review");
         assert_eq!(cfg.id, "review");
         assert_eq!(cfg.schema_version.as_deref(), Some(MISSION_CONFIG_SCHEMA));
         assert!(!cfg.inputs.is_empty(), "review declares its runtime-only inputs");
@@ -694,8 +723,7 @@ mod tests {
 
     #[test]
     fn coder_phase_builtin_has_the_expected_graph_shape() {
-        let loaded = load::load("coder-phase").expect("built-in `coder-phase` config must load");
-        let cfg = &loaded.config;
+        let cfg = &embedded_config("coder-phase");
         assert_eq!(cfg.id, "coder-phase");
         assert_eq!(cfg.schema_version.as_deref(), Some(MISSION_CONFIG_SCHEMA));
         assert!(
@@ -707,12 +735,25 @@ mod tests {
         let phase = &cfg.phases[0];
         assert_eq!(phase.id, "build");
 
+        // Task ids match `default_phase_graph`'s exact construction
+        // (`{phase_id}-worktree` / `-coder` / `-verify` — NO `-task`
+        // suffix), with the literal `build-` prefix standing in for the
+        // launcher-composed phase id per the placeholder-prefix rule (see
+        // `TaskConfig`'s doc). #1284 review round 1 caught the original
+        // `-task`-suffixed divergence — persisted Task.ids surface in
+        // `mission status`, the viewer, and lifecycle records, so the
+        // config must not silently change them at Packet 3 cutover.
         let task_ids: Vec<&str> = phase.tasks.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(task_ids, vec!["build-worktree-task", "build-coder-task", "build-verify-task"]);
+        assert_eq!(task_ids, vec!["build-worktree", "build-coder", "build-verify"]);
 
         assert!(phase.tasks[0].depends_on.is_empty());
-        assert_eq!(phase.tasks[1].depends_on, vec!["build-worktree-task"]);
-        assert_eq!(phase.tasks[2].depends_on, vec!["build-coder-task"]);
+        assert_eq!(phase.tasks[1].depends_on, vec!["build-worktree"]);
+        assert_eq!(phase.tasks[2].depends_on, vec!["build-coder"]);
+
+        // Step ids likewise match the Rust scheme: `{phase_id}-<name>-step`.
+        assert_eq!(phase.tasks[0].steps[0].id, "build-worktree-step");
+        assert_eq!(phase.tasks[1].steps[0].id, "build-coder-step");
+        assert_eq!(phase.tasks[2].steps[0].id, "build-verify-step");
 
         assert_eq!(phase.tasks[0].steps[0].kind, "mission.worktree");
         assert_eq!(phase.tasks[1].steps[0].kind, "mission.coder");
@@ -720,6 +761,14 @@ mod tests {
 
         assert_eq!(phase.tasks[1].role_id.as_deref(), Some("coder"));
         assert_eq!(phase.tasks[2].role_id.as_deref(), Some("code-reviewer"));
+
+        // The coder task's description matches the Rust builder's dynamic
+        // form with the default role substituted (`dispatch `{role}` into
+        // the worktree`) — the `role` input overrides both at launch.
+        assert_eq!(
+            phase.tasks[1].description.as_deref(),
+            Some("dispatch `coder` into the worktree")
+        );
     }
 
     #[test]
@@ -727,8 +776,8 @@ mod tests {
         let known = known_kinds();
         let known_refs = known_kinds_refs(&known);
         for id in ["review", "coder-phase"] {
-            let loaded = load::load(id).unwrap_or_else(|e| panic!("`{id}` must load: {e}"));
-            let findings = loaded.config.validate(&known_refs);
+            let cfg = embedded_config(id);
+            let findings = cfg.validate(&known_refs);
             let errors: Vec<&ValidationFinding> = findings
                 .iter()
                 .filter(|f| f.severity == FindingSeverity::Error)
@@ -738,7 +787,7 @@ mod tests {
                 "`{id}` must validate with zero Error findings, got: {errors:?}"
             );
             assert!(
-                loaded.config.is_valid(&known_refs),
+                cfg.is_valid(&known_refs),
                 "`{id}` must report is_valid() true (Warnings don't block usability)"
             );
         }
@@ -755,8 +804,8 @@ mod tests {
         let known = known_kinds();
         let known_refs = known_kinds_refs(&known);
         for id in ["review", "coder-phase"] {
-            let loaded = load::load(id).unwrap();
-            let findings = loaded.config.validate(&known_refs);
+            let cfg = embedded_config(id);
+            let findings = cfg.validate(&known_refs);
             let warnings: Vec<&ValidationFinding> = findings
                 .iter()
                 .filter(|f| f.severity == FindingSeverity::Warning && f.path.ends_with(".kind"))
@@ -771,10 +820,10 @@ mod tests {
     #[test]
     fn both_builtins_round_trip_through_json() {
         for id in ["review", "coder-phase"] {
-            let loaded = load::load(id).unwrap();
-            let json = serde_json::to_string(&loaded.config).unwrap();
+            let cfg = embedded_config(id);
+            let json = serde_json::to_string(&cfg).unwrap();
             let back: MissionConfig = serde_json::from_str(&json).unwrap();
-            assert_eq!(loaded.config, back, "`{id}` must round-trip through JSON unchanged");
+            assert_eq!(cfg, back, "`{id}` must round-trip through JSON unchanged");
         }
     }
 

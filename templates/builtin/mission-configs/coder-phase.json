@@ -1,7 +1,7 @@
 {
   "id": "coder-phase",
   "name": "Coder Phase",
-  "description": "Transcribed as data (#1284 Packet 1) from default_phase_graph (src/mission_run.rs), the 3-Task/3-Step graph `darkmux mission run` builds by hand today for one phase: prepare a git worktree, dispatch a specialist role into it, run mechanical verify (code-reviewer). A strict linear chain (worktree -> coder -> verify, each depends_on the last). Authored + validated in Packet 1; NOT YET wired into execution (Packet 3) -- mission_run::run() still calls default_phase_graph directly.",
+  "description": "Transcribed as data (#1284 Packet 1) from default_phase_graph (src/mission_run.rs), the 3-Task/3-Step graph `darkmux mission run` builds by hand today for one phase: prepare a git worktree, dispatch a specialist role into it, run mechanical verify (code-reviewer). A strict linear chain (worktree -> coder -> verify, each depends_on the last). Authored + validated in Packet 1; NOT YET wired into execution (Packet 3) -- mission_run::run() still calls default_phase_graph directly. ID SCHEME (placeholder-prefix rule): default_phase_graph composes every task/step id from its CALLER-SUPPLIED phase id (`{phase_id}-worktree`, `{phase_id}-coder`, `{phase_id}-verify`; steps append `-step`). The literal `build-` prefix on every task/step id below is a PLACEHOLDER standing in for that real phase id -- at launch, the launcher (Packet 3) substitutes its composed phase id for this document's phase-config id wherever it prefixes a task/step id, so persisted ids match what the Rust builder produces today byte for byte.",
   "schema_version": "1.0",
   "inputs": [
     {
@@ -11,7 +11,7 @@
     },
     {
       "name": "role",
-      "description": "Which specialist role the coder task dispatches (default_phase_graph's `role` param). Overrides the coder-task's role_id default of \"coder\" below.",
+      "description": "Which specialist role the coder task dispatches (default_phase_graph's `role` param). Overrides the coder task's role_id default of \"coder\" below, and is substituted into that task's description -- the Rust builder writes the description dynamically as `dispatch \\`{role}\\` into the worktree`.",
       "required": false
     },
     {
@@ -41,7 +41,7 @@
       "description": "prepare the phase worktree, dispatch a specialist role into it, run mechanical verify",
       "tasks": [
         {
-          "id": "build-worktree-task",
+          "id": "build-worktree",
           "description": "prepare the phase worktree",
           "depends_on": [],
           "steps": [
@@ -53,10 +53,10 @@
           ]
         },
         {
-          "id": "build-coder-task",
-          "description": "dispatch the coder role into the worktree",
+          "id": "build-coder",
+          "description": "dispatch `coder` into the worktree",
           "depends_on": [
-            "build-worktree-task"
+            "build-worktree"
           ],
           "role_id": "coder",
           "steps": [
@@ -67,14 +67,15 @@
             }
           ],
           "notes": [
-            "role_id here is the DEFAULT; the `role` input can override it at launch time (default_phase_graph's `role` parameter is caller-supplied, not fixed to \"coder\")."
+            "role_id here is the DEFAULT; the `role` input can override it at launch time (default_phase_graph's `role` parameter is caller-supplied, not fixed to \"coder\").",
+            "`coder` in the description is likewise the default role name -- the Rust builder writes the description dynamically (`dispatch \\`{role}\\` into the worktree`), so the launcher substitutes the resolved role at launch."
           ]
         },
         {
-          "id": "build-verify-task",
+          "id": "build-verify",
           "description": "local QA -- mechanical verify (code-reviewer)",
           "depends_on": [
-            "build-coder-task"
+            "build-coder"
           ],
           "role_id": "code-reviewer",
           "steps": [

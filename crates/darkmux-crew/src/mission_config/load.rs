@@ -1,9 +1,13 @@
 //! Load mission configs by id from any of several known locations.
 //! Search order: user dir → on-disk built-in template dirs → binary-embedded
-//! built-ins. Mirrors `darkmux_lab::workloads::load`'s resolution EXACTLY
-//! (#1284 Packet 1) — see that module's doc for the precedent this copies:
-//! same three-tier shape, same `templates_override_dirs()` override
-//! accessor, same cwd/home/system candidate tree.
+//! built-ins. Closely mirrors `darkmux_lab::workloads::load`'s resolution
+//! (#1284 Packet 1) — same three-tier shape, same
+//! `templates_override_dirs()` override accessor, same cwd/home/system
+//! candidate tree — with one deliberate omission: workloads also resolve a
+//! nested `<dir>/<id>/workload.json` form (for manifests that ship sibling
+//! on-disk resources like sandbox seeds); mission configs are pure data
+//! with no sibling files, so only the flat `<dir>/<id>.json` form exists
+//! here.
 
 use super::MissionConfig;
 use anyhow::{bail, Context, Result};
@@ -35,7 +39,17 @@ const EMBEDDED_MISSION_CONFIGS: &[(&str, &str)] = &[
     ),
 ];
 
-fn find_embedded(id: &str) -> Option<&'static str> {
+/// The raw embedded JSON for a built-in id. `pub(crate)` (#1284 review
+/// round 1) so `mission_config`'s golden tests can parse the EMBEDDED
+/// documents directly — they are goldens for the embedded constants, and
+/// loading them through the full user → on-disk → embedded chain both
+/// tested the wrong thing and was unisolated (it raced this module's own
+/// `#[serial]` tests that write user-tier stubs, and would read a real
+/// operator override at `~/.darkmux/mission-configs/<id>.json` on a dev
+/// machine). The chain's embedded-tier resolution keeps its own
+/// `#[serial]`-guarded test below
+/// (`embedded_resolves_with_no_user_or_on_disk_copy`).
+pub(crate) fn find_embedded(id: &str) -> Option<&'static str> {
     EMBEDDED_MISSION_CONFIGS
         .iter()
         .find(|(name, _)| *name == id)

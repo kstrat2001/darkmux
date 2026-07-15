@@ -2064,8 +2064,12 @@ fn check_mission_config_registry() -> Check {
         Check {
             name: "mission config registry".into(),
             status: Status::Warn,
+            // `blocking` holds one entry per FINDING GROUP, not per config
+            // (one document can contribute a structural-error entry AND a
+            // schema-drift entry), so the count is worded as issues, never
+            // as a config count (#1284 review round 1).
             message: format!(
-                "{} mission config(s) registered, {} with issues: {}",
+                "{} mission config(s) registered, {} issue(s): {}",
                 ids.len(),
                 blocking.len(),
                 blocking.join(" | ")
