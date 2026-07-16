@@ -26,8 +26,6 @@ serde_json = "1.0"
 dirs = "5.0"
 # #163 — AuditFileSink: BLAKE3 hash-chained audit sink (edits detected by `flow integrity-check`).
 blake3 = "1.5"
-# libc: flock(2) for cross-process locking on the per-day audit file.
-libc = "0.2"
 # #162 Phase 3 — Redis client for the live-coordination flow sink.
 redis = { version = "0.27", default-features = false, features = ["streams"] }
 # #640 — stable machine identity (IOPlatformUUID) for presence beats.

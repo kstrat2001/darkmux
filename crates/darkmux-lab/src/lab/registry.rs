@@ -124,44 +124,13 @@ impl LabRegistry {
     where
         F: FnOnce(&mut LabRegistry) -> Result<T>,
     {
-        use std::os::unix::io::AsRawFd;
-
         let lock_path = registry_lock_path(path);
-        if let Some(parent) = lock_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-        }
-        let lock_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("opening registry lock {}", lock_path.display()))?;
-
-        // Acquire exclusive cross-process lock; released on guard drop.
-        let fd = lock_file.as_raw_fd();
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-            return Err(anyhow!(
-                "flock(LOCK_EX) failed on registry lock {}: {}",
-                lock_path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        struct FlockGuard(std::os::unix::io::RawFd);
-        impl Drop for FlockGuard {
-            fn drop(&mut self) {
-                unsafe { libc::flock(self.0, libc::LOCK_UN) };
-            }
-        }
-        let _guard = FlockGuard(fd);
-
-        let mut registry = Self::load(path)?;
-        let out = f(&mut registry)?;
-        registry.save(path)?;
-        Ok(out)
+        darkmux_types::flock::with_locked_file(&lock_path, |_lock_file| {
+            let mut registry = Self::load(path)?;
+            let out = f(&mut registry)?;
+            registry.save(path)?;
+            Ok(out)
+        })
     }
 
     /// Non-unix fallback for [`Self::with_locked`] — plain
@@ -269,7 +238,7 @@ impl LabRegistry {
             .with_context(|| format!("canonicalizing {}", fixture_dir.display()))?;
         let content_hash = hash_sandbox_dir(&abs_path)
             .with_context(|| format!("hashing {}", abs_path.display()))?;
-        let hashed_at = chrono_like_utc_now();
+        let hashed_at = darkmux_flow::ts_utc_now();
 
         let entry = RegisteredFixture {
             path: abs_path,
@@ -318,57 +287,6 @@ impl LabRegistry {
             .iter()
             .find(|(_, f)| f.satisfies.as_deref() == Some(requirement))
     }
-}
-
-/// ISO 8601 UTC timestamp without pulling in `chrono`. Format
-/// matches the audit-log convention used elsewhere in the codebase
-/// (e.g. flow.rs records).
-fn chrono_like_utc_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Convert epoch seconds to YYYY-MM-DDTHH:MM:SSZ without chrono.
-    // Operator-readability matters; precision beyond seconds is not
-    // load-bearing for the registry's purpose.
-    let (year, month, day, h, m, s) = epoch_to_utc_components(secs);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, h, m, s
-    )
-}
-
-/// Decompose epoch seconds into (year, month, day, hour, minute, second).
-/// Self-contained; no dep. Standard Gregorian calendar, UTC.
-/// `total_days` is `u64` so this stays correct past year 2106 (where
-/// `u32 days` overflows). Pre-1.0 we wouldn't care, but a silent
-/// wrong-result at year-2106 is harder to debug than the trivial fix.
-fn epoch_to_utc_components(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let s = (secs % 60) as u32;
-    let m = ((secs / 60) % 60) as u32;
-    let h = ((secs / 3600) % 24) as u32;
-    let total_days: u64 = secs / 86400;
-
-    // Days since 1970-01-01.
-    let (year, month, day) = days_to_civil_date(total_days);
-    (year, month, day, h, m, s)
-}
-
-/// Howard Hinnant's days_from_civil inverse — convert days since
-/// 1970-01-01 to (year, month, day). Public domain algorithm.
-fn days_to_civil_date(days: u64) -> (u32, u32, u32) {
-    let z = days as i64 + 719468;
-    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
-    let doe = (z - era * 146097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
-    let yr = (y + if m <= 2 { 1 } else { 0 }) as u32;
-    (yr, m, d)
 }
 
 #[cfg(test)]
@@ -536,24 +454,6 @@ mod tests {
         let mut reg = LabRegistry::default();
         reg.register(&fixture_dir, None, false).unwrap();
         assert!(reg.find_satisfying("other@1.0").is_none());
-    }
-
-    #[test]
-    fn epoch_to_utc_components_known_dates() {
-        // 1970-01-01 00:00:00 UTC = epoch 0 (the canonical anchor).
-        let (y, mo, d, h, mi, s) = epoch_to_utc_components(0);
-        assert_eq!((y, mo, d, h, mi, s), (1970, 1, 1, 0, 0, 0));
-        // 2000-01-01 00:00:00 UTC = epoch 946684800 (Y2K anchor).
-        let (y, mo, d, h, mi, s) = epoch_to_utc_components(946684800);
-        assert_eq!((y, mo, d, h, mi, s), (2000, 1, 1, 0, 0, 0));
-        // 2024-02-29 00:00:00 UTC = epoch 1709164800 (leap day; tests
-        // Hinnant's calendar handling around leap years).
-        let (y, mo, d, h, mi, s) = epoch_to_utc_components(1709164800);
-        assert_eq!((y, mo, d, h, mi, s), (2024, 2, 29, 0, 0, 0));
-        // Time-of-day components: 2024-02-29 13:45:07 UTC =
-        // 1709164800 + 13*3600 + 45*60 + 7 = 1709164800 + 49507.
-        let (y, mo, d, h, mi, s) = epoch_to_utc_components(1709164800 + 49507);
-        assert_eq!((y, mo, d, h, mi, s), (2024, 2, 29, 13, 45, 7));
     }
 
     #[test]

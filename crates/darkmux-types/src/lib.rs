@@ -8,7 +8,10 @@
 pub mod config;
 pub mod config_access;
 pub mod dispatch_liveness;
+#[cfg(unix)]
+pub mod flock;
 pub mod paths;
+pub mod size;
 pub mod style;
 pub mod workdir;
 

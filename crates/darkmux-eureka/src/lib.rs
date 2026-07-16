@@ -61,7 +61,17 @@ use serde::{Deserialize, Serialize};
 ///
 /// Major-bumped to 2.0.0 in #1405: six `RuleKind` variants that diagnosed
 /// the removed openclaw shell-out runtime's config file were deleted.
-pub const RULES_SCHEMA_VERSION: &str = "2.0.0";
+///
+/// Major-bumped again to 3.0.0 (simplification batch): the `AggressiveSampler`
+/// variant was a permanent stub — `evaluate_one` always returned
+/// `Verdict::Skipped("not yet implemented")` for it, with no evaluator ever
+/// implemented, so it carried zero operator value while still occupying a
+/// `RuleKind` discriminant. Removing a variant changes the `RuleKind` enum
+/// encoding, which the schema table calls out explicitly as a major-bump
+/// case (see `CLAUDE.md`'s "Versioning — rules schema" section) — not a
+/// minor bump, since an old consumer keying on this discriminant would
+/// break, not just see one fewer rule to safely ignore.
+pub const RULES_SCHEMA_VERSION: &str = "3.0.0";
 
 /// Stable identifiers for the active rule set. Add new ones to the bottom.
 /// The `kind` field on `RuleDef` carries this discriminant in the wire
@@ -69,8 +79,6 @@ pub const RULES_SCHEMA_VERSION: &str = "2.0.0";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RuleKind {
-    /// (Reserved — not evaluated in this version. See follow-up issue.)
-    AggressiveSampler,
     /// Estimated KV pre-allocation + working set exceeds unified memory
     /// budget. Dispatch will likely OOM mid-run.
     MemoryHeadroomTight,
@@ -126,16 +134,6 @@ pub fn all_rules() -> Vec<RuleDef> {
         &str,
         &str,
     )] = &[
-        (
-            "aggressive-sampler",
-            RuleKind::AggressiveSampler,
-            "Aggressive sampler config",
-            "sampler",
-            Severity::Warn,
-            "(Reserved — sampler heuristic evaluation deferred. Manually verify your \
-             Top-K / Min-P / temperature combination is stable for tool-call generation.)",
-            "See follow-up issue tracking this rule's implementation.",
-        ),
         (
             "memory-headroom-tight",
             RuleKind::MemoryHeadroomTight,
@@ -232,7 +230,6 @@ pub fn evaluate_all(ctx: &Context) -> Vec<(RuleDef, Verdict)> {
 
 fn evaluate_one(kind: &RuleKind, ctx: &Context) -> Verdict {
     match kind {
-        RuleKind::AggressiveSampler => Verdict::Skipped("not yet implemented".into()),
         RuleKind::MemoryHeadroomTight => eval_memory_headroom(ctx),
     }
 }
@@ -257,7 +254,7 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
     let mut estimated_gb: f64 = 0.0;
     let mut unparseable: Vec<String> = Vec::new();
     for m in &ctx.loaded_models {
-        match parse_size_gb(&m.size) {
+        match darkmux_types::size::parse_size_gb(&m.size) {
             Some(size_gb) => {
                 let kv_gb = 0.5 * (m.context as f64) / 32_768.0;
                 estimated_gb += size_gb + kv_gb;
@@ -287,29 +284,6 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
         }
     } else {
         Verdict::Pass
-    }
-}
-
-pub fn parse_size_gb(s: &str) -> Option<f64> {
-    // LMStudio reports sizes like "18.45 GB", "2.15 GB", or "18.45 GiB".
-    // (#904) Tolerate the binary (`GiB`/`MiB`/`TiB`) suffixes and a missing
-    // space (`18.45GB`) — the old `split_once(' ')` + GB/MB/TB-only match
-    // dropped all of those to `None`, which the caller then summed as 0,
-    // undercounting the working set so the headroom warning under-fired. For
-    // a headroom *estimate* the binary-vs-decimal gap is within the noise, so
-    // the `i`-variants map to the same magnitude. Returns `None` on anything
-    // genuinely unparseable (a localized comma, no unit) — the caller now
-    // surfaces that as Skipped rather than a silent 0.
-    let s = s.trim();
-    // Split the leading number from the trailing unit, with or without a space.
-    let split = s.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
-    let (num_str, unit_raw) = s.split_at(split);
-    let num: f64 = num_str.trim().parse().ok()?;
-    match unit_raw.trim().to_ascii_uppercase().as_str() {
-        "GB" | "GIB" => Some(num),
-        "MB" | "MIB" => Some(num / 1024.0),
-        "TB" | "TIB" => Some(num * 1024.0),
-        _ => None,
     }
 }
 
@@ -379,22 +353,6 @@ mod tests {
         for r in all_rules() {
             assert!(json.contains(r.id.as_str()), "missing rule id `{}` in output", r.id);
         }
-    }
-
-    #[test]
-    fn parse_size_gb_tolerates_gib_binary_and_missing_space() {
-        // (#904) The old parser dropped all of these to None → summed as 0.
-        assert_eq!(parse_size_gb("18.45 GB"), Some(18.45));
-        assert_eq!(parse_size_gb("18.45GB"), Some(18.45)); // no space
-        assert_eq!(parse_size_gb("18.45 GiB"), Some(18.45)); // binary suffix
-        assert_eq!(parse_size_gb("512 MB"), Some(0.5));
-        assert_eq!(parse_size_gb("512MiB"), Some(0.5));
-        assert_eq!(parse_size_gb("2 TB"), Some(2048.0));
-        assert_eq!(parse_size_gb("2TiB"), Some(2048.0));
-        // Genuinely unparseable → None (caller surfaces it as Skipped, not 0).
-        assert_eq!(parse_size_gb("18,45 GB"), None); // localized comma
-        assert_eq!(parse_size_gb("nonsense"), None);
-        assert_eq!(parse_size_gb("18.45"), None); // no unit
     }
 
     #[test]

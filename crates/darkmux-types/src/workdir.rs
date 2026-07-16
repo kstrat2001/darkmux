@@ -112,13 +112,19 @@ pub fn validate_workdir(path: &Path) -> Result<PathBuf> {
 
 /// Resolve the per-machine darkmux worktrees base directory:
 /// `~/.darkmux/worktrees` (HOME-less fallback `/tmp/darkmux/worktrees`).
-/// Mirrors `worktrees_base_dir()` from darkmux-serve and `worktrees_base()`
-/// from mission_run — kept here so the queue-boundary validator can use it
-/// without pulling in darkmux-serve as a dependency.
-fn worktrees_base_dir() -> PathBuf {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".darkmux").join("worktrees"))
+///
+/// The single canonical implementation — previously triplicated across
+/// `mission_run.rs`, this module, and `darkmux-serve/src/lib.rs`, two of
+/// which resolved HOME via `std::env::var("HOME")` while the third used
+/// `dirs::home_dir()`. The two can disagree (e.g. HOME set but malformed
+/// UTF-8, or a platform where `dirs::home_dir()` consults an API beyond
+/// the env var), and the serve copy feeds the worktree containment check
+/// (security-adjacent — see `validate_remote_workdir` below and
+/// `worktree_contained` in darkmux-serve). Unified on `dirs::home_dir()`
+/// semantics here; both other call sites now re-point at this function.
+pub fn worktrees_base_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".darkmux").join("worktrees"))
         .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/worktrees"))
 }
 

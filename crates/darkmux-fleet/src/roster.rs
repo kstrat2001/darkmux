@@ -149,40 +149,28 @@ where
 
     #[cfg(unix)]
     {
-        use std::os::unix::io::AsRawFd;
+        // Open-coded rather than routed through
+        // `darkmux_types::flock::with_locked_file`'s closure wrapper
+        // (#1352-adjacent cleanup): that helper releases the lock as
+        // soon as the closure returns, which for a transaction ending
+        // in a plain load→mutate→save would be equivalent timing here
+        // too — but this call site's correctness has been reviewed
+        // specifically for "lock held through the atomic rename," and
+        // keeping the acquire/release explicit keeps that guarantee
+        // visible at the call site rather than implicit in a shared
+        // helper's contract. Still uses the ONE shared `FlockGuard`
+        // type (`darkmux_types::flock`), so the RAII shape itself is
+        // deduplicated — only the acquire/drop orchestration stays
+        // local.
         let lock_path = path.with_extension("json.lock");
-        let lock_file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("opening fleet lock file {}", lock_path.display()))?;
-        let fd = lock_file.as_raw_fd();
-        // Blocking exclusive lock — auto-released on file drop OR on
-        // explicit LOCK_UN below (RAII guard).
-        let lock_ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
-        if lock_ret != 0 {
-            return Err(anyhow!(
-                "flock(LOCK_EX) failed on fleet lock {}: errno {}",
-                lock_path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        struct FlockGuard(std::os::unix::io::RawFd);
-        impl Drop for FlockGuard {
-            fn drop(&mut self) {
-                unsafe { libc::flock(self.0, libc::LOCK_UN) };
-            }
-        }
-        let _guard = FlockGuard(fd);
+        let guard = darkmux_types::flock::lock_exclusive(&lock_path)?;
 
         let mut roster = load_roster()?;
         let result = f(&mut roster)?;
         save_roster(&roster)?;
-        // `lock_file` lives to here — explicit drop after save so the
-        // lock isn't released until the rename has completed.
-        drop(lock_file);
+        // Explicit drop after save so the lock isn't released until
+        // the atomic rename has completed.
+        drop(guard);
         Ok(result)
     }
 

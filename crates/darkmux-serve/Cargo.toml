@@ -14,7 +14,6 @@ darkmux-types = { path = "../darkmux-types" }
 darkmux-flow = { path = "../darkmux-flow" }
 darkmux-profiles = { path = "../darkmux-profiles" }
 darkmux-crew = { path = "../darkmux-crew" }
-darkmux-eureka = { path = "../darkmux-eureka" }
 darkmux-fleet = { path = "../darkmux-fleet" }
 darkmux-doctor = { path = "../darkmux-doctor" }
 # (#1247 Part 3) Lab observer lens — reuses `lab::review::ReviewEnvelope` +

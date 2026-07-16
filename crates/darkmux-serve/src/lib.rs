@@ -9,6 +9,7 @@ use axum::{
     routing::get,
     Router,
 };
+use darkmux_types::workdir::worktrees_base_dir;
 use futures::stream::{self, Stream};
 use std::collections::VecDeque;
 use std::io::{BufRead, IsTerminal};
@@ -893,15 +894,6 @@ async fn health() -> axum::Json<serde_json::Value> {
         "darkmux_version": env!("CARGO_PKG_VERSION"),
         "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
     }))
-}
-
-/// Resolve the base directory holding per-phase worktrees:
-/// `~/.darkmux/worktrees` (HOME-less fallback `/tmp/darkmux/worktrees`).
-fn worktrees_base_dir() -> PathBuf {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".darkmux").join("worktrees"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/worktrees"))
 }
 
 /// Validate a base ref string: must match `^[A-Za-z0-9][A-Za-z0-9_/.-]*$`.
@@ -2112,7 +2104,7 @@ fn read_ram_free_for_ai_bytes() -> Option<u64> {
         .map(|models| {
             models
                 .iter()
-                .filter_map(|m| darkmux_eureka::parse_size_gb(&m.size))
+                .filter_map(|m| darkmux_types::size::parse_size_gb(&m.size))
                 .sum::<f64>()
         })
         .unwrap_or(0.0);

@@ -16,8 +16,6 @@ darkmux-crew = { path = "../darkmux-crew" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# libc: flock(2) for the roster/queue file locking.
-libc = "0.2"
 # Redis work queue (XADD/XREAD): the cross-machine dispatch substrate.
 redis = { version = "0.27", default-features = false, features = ["streams"] }
 

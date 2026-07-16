@@ -12,7 +12,6 @@ rust-version = "1.80"
 [dependencies]
 darkmux-types = { path = "../darkmux-types" }
 darkmux-crew = { path = "../darkmux-crew" }
-darkmux-eureka = { path = "../darkmux-eureka" }
 # (#1198) machine fingerprint for the scores.json fit key + RFC3339 ts.
 darkmux-flow = { path = "../darkmux-flow" }
 darkmux-hardware = { path = "../darkmux-hardware" }
@@ -27,9 +26,6 @@ serde_json = "1.0"
 dirs = "5.0"
 # BLAKE3 — content hashing for sandbox baseline/final hashes (#487).
 blake3 = "1.5"
-# libc: flock(2) for the cross-process registry read-modify-write lock
-# (#496), mirroring darkmux-flow's AuditFileSink pattern.
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10"

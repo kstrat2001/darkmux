@@ -69,10 +69,6 @@ redis = { version = "0.27", default-features = false, features = ["streams"] }
 # hashing — the chain check is a linear walk recomputing each hash
 # and comparing against the stored value.
 blake3 = "1.5"
-# libc: flock(2) for cross-process locking on the per-day audit file.
-# Already a transitive dep (via tokio); declared explicitly here so
-# the unsafe blocks in src/flow.rs read against a known direct interface.
-libc = "0.2"
 
 # #275 PR-B — synchronous HTTP client for `darkmux fleet status --deep`
 # (and any future CLI verb that fetches another daemon's REST surface).
