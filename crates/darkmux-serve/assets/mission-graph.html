@@ -2,8 +2,22 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>darkmux · mission graph</title>
+<!-- (#1403) Standalone-app shell — same as viewer.html. The operator reaches
+     this page as a chromeless home-screen shortcut, so browser back can never
+     be assumed; the manifest + app metas make an installed shortcut behave
+     like an app, and every asset is served same-origin by the daemon (the
+     page is self-contained by convention — no external fetches anywhere;
+     there is no CSP header). -->
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="darkmux">
+<meta name="theme-color" content="#0a0a0b">
 <!--
   Mission graph lens (#1284 Packet 5) — a DEDICATED page, separate from
   viewer.html on purpose (that file's own header explains why it stays one
@@ -99,6 +113,112 @@
   .react-flow__controls button{background:var(--panel);border-bottom:1px solid var(--line);fill:var(--text)}
   .react-flow__minimap{background:var(--bg2)}
   .react-flow__attribution{display:none}
+
+  /* (#1403) In-site navigation — explicit, not the wordmark. The operator
+     runs this page as a chromeless home-screen shortcut, so browser back can
+     never be assumed; these are the ONLY way out of the page. */
+  .nav{display:inline-flex;align-items:center;gap:8px}
+  .nav a{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);text-decoration:none;border:1px solid var(--line);border-radius:5px;padding:5px 9px;background:none}
+  .nav a:hover{color:var(--text);border-color:var(--amber-dim)}
+
+  /* (#1403) Header live token/turn readout — mission-scoped, local vs cloud
+     honesty split, same convention as the main viewer's savings hero. */
+  .mmeter{display:inline-flex;align-items:baseline;gap:6px;font:11px/1 'JetBrains Mono',monospace;color:var(--muted)}
+  .mmeter b{color:var(--amber);font-weight:700}
+  .mmeter .split{color:var(--muted)}
+  .mmeter .cloud{color:var(--warn)}
+
+  /* (#1403) Per-step token/turn meter on an AI-dispatching step row. */
+  .mn-step-meter{margin-left:auto;flex:0 0 auto;display:inline-flex;gap:6px;font:10px/1 'JetBrains Mono',monospace;color:var(--muted);white-space:nowrap}
+  .mn-step-meter .tok{color:var(--amber)}
+  .mn-step-meter .tok.cloud{color:var(--warn)}
+  .mn-step-meter .idle{opacity:.45}
+  .mnode .mn-step-row{gap:6px}
+
+  /* (#1403) Mission-scoped events panel — a right-side rail on desktop, a
+     bottom sheet on phones. Newest first, this mission's flow records only. */
+  .evbtn{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:5px 9px;background:none;cursor:pointer}
+  .evbtn:hover{color:var(--text);border-color:var(--amber-dim)}
+  .evbtn.on{color:var(--amber);border-color:var(--amber)}
+  .body{flex:1 1 auto;display:flex;min-height:0;position:relative}
+  .body .canvas{flex:1 1 auto}
+  .evpanel{flex:0 0 340px;border-left:1px solid var(--line);background:var(--bg2);display:flex;flex-direction:column;min-height:0}
+  .evpanel .evhd{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);font:600 11px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+  .evpanel .evhd .evx{margin-left:auto;cursor:pointer;color:var(--muted);border:none;background:none;font-size:15px;line-height:1}
+  .evpanel .evhd .evx:hover{color:var(--text)}
+  .evlist{flex:1 1 auto;overflow-y:auto;padding:6px 0}
+  .evrow{display:flex;gap:8px;align-items:baseline;padding:5px 12px;font:11px/1.35 'JetBrains Mono',monospace;border-bottom:1px solid var(--line)}
+  .evrow .evt{flex:0 0 auto;color:var(--muted);font-size:10px}
+  .evrow .eva{flex:0 0 auto;color:var(--text)}
+  .evrow .evh{flex:1 1 auto;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .evrow.telemetry .eva{color:var(--amber-dim)}
+  .evrow.review .eva,.evrow.work .eva{color:var(--text)}
+  .evrow.err .eva{color:var(--bad)}
+  .evempty{padding:20px 12px;color:var(--muted);font:12px 'Inter',sans-serif}
+
+  /* (#1404) Mobile vertical phase timeline — the narrow-viewport renderer.
+     Below the ~700px breakpoint the React Flow canvas (pan/zoom/minimap, a
+     touch failure mode on a portrait phone) is REPLACED by this plain-DOM
+     vertical list: phases stack top-to-bottom, task cards stack inside each
+     phase, tap a card to expand step detail. Consumes the SAME merged graph
+     state as the canvas — one data source, two renderers. */
+  .timeline{flex:1 1 auto;overflow-y:auto;padding:12px 12px 40px;display:flex;flex-direction:column;gap:16px}
+  .tlphase{border:1px solid var(--amber-dim);border-radius:8px;background:var(--bg2);overflow:hidden}
+  .tlphase .tlph-hd{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line)}
+  .tlphase .tlph-hd .tlph-dot{flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:var(--line)}
+  .tlphase.s-running .tlph-dot{background:var(--run);animation:lpulse 1.1s ease-in-out infinite}
+  .tlphase.s-complete .tlph-dot{background:var(--good)}
+  .tlphase.s-error .tlph-dot{background:var(--bad)}
+  .tlphase.s-abandoned{opacity:.6}
+  .tlphase .tlph-hd .tlph-name{font:600 13px/1.3 'JetBrains Mono',monospace;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tlphase .tlph-hd .tlph-tag{margin-left:auto;font:10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  .tltasks{display:flex;flex-direction:column;gap:8px;padding:10px}
+  .tltask{border:1px solid var(--line);border-radius:7px;background:var(--panel);overflow:hidden}
+  .tltask .tlt-hd{display:flex;align-items:center;gap:8px;padding:10px 11px;cursor:pointer;min-height:44px}
+  .tltask .tlt-hd .tlt-dot{flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:var(--line)}
+  .tltask.s-running{border-color:var(--run)}
+  .tltask.s-running .tlt-dot{background:var(--run);animation:lpulse 1.1s ease-in-out infinite}
+  .tltask.s-running .tlt-name{color:var(--run)}
+  .tltask.s-complete{border-color:var(--good)}
+  .tltask.s-complete .tlt-dot{background:var(--good)}
+  .tltask.s-error{border-color:var(--bad)}
+  .tltask.s-error .tlt-dot{background:var(--bad)}
+  .tltask.s-abandoned{opacity:.6}
+  .tltask .tlt-name{font:600 12px/1.3 'JetBrains Mono',monospace;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tltask .tlt-chev{margin-left:auto;flex:0 0 auto;color:var(--muted);font-size:11px;transition:transform .15s}
+  .tltask.open .tlt-chev{transform:rotate(90deg)}
+  .tltask .tlt-waits{padding:0 11px 8px;font:10px/1.3 'JetBrains Mono',monospace;color:var(--muted)}
+  .tltask .tlt-steps{border-top:1px solid var(--line);padding:8px 11px;display:flex;flex-direction:column;gap:7px}
+  .tltask .tlt-step{display:flex;align-items:center;gap:7px;font:11px/1.3 'JetBrains Mono',monospace;color:var(--muted)}
+  .tltask .tlt-step .tlt-sdot{flex:0 0 auto;width:6px;height:6px;border-radius:50%;background:var(--line)}
+  .tltask .tlt-step.s-running .tlt-sdot{background:var(--run);animation:lpulse 1.1s ease-in-out infinite}
+  .tltask .tlt-step.s-running{color:var(--run)}
+  .tltask .tlt-step.s-complete .tlt-sdot{background:var(--good)}
+  .tltask .tlt-step.s-error .tlt-sdot{background:var(--bad)}
+  .tltask .tlt-step .tlt-slabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tlnote{padding:14px;color:var(--muted);font:12px/1.4 'Inter',sans-serif;background:var(--panel);border:1px solid var(--line);border-radius:6px;margin:12px}
+
+  /* (#1404) Compact single-line header on phones — the desktop header wrapped
+     to three lines on a portrait phone (operator repro). Mission id truncates
+     with an ellipsis; the status legend hides behind a tap (the .legend below
+     the breakpoint becomes a popover). */
+  .legendpop{position:absolute;top:44px;right:8px;z-index:30;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;display:none;flex-direction:column;gap:6px}
+  .legendpop.on{display:flex}
+  .legbtn{display:none}
+  @media (max-width:700px){
+    html,body{overflow:hidden}
+    .top{gap:8px;padding:0 10px}
+    .brand{font-size:12px}
+    .brand .sub{display:none}
+    .midname{font-size:11px;max-width:34vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .legend{display:none}
+    .legbtn{display:inline-block}
+    .nav a{padding:6px 8px}
+    /* Bottom-sheet events panel on phones. */
+    .body{flex-direction:column}
+    .evpanel{flex:0 0 45vh;border-left:none;border-top:1px solid var(--line)}
+    .evrow{padding:9px 12px}
+  }
 </style>
 </head>
 <body>
@@ -192,13 +312,42 @@ function computeLayout(nodes){
 // (server-resolved via the fallback chain — #1402) + a status dot; a
 // running row's dot pulses via the `.mn-step-row.s-running` CSS rule. A
 // phase node has no `steps` array (empty), so `mnSteps` is a no-op for it.
+// (#1403) A per-step token/turn meter element from the step's precomputed
+// `_meter` (attached in `toRfNodes`). Shared by the canvas node and — via the
+// same `stepMeterFor` data — the mobile timeline. `null` for a procedural step
+// with no metrics (procedural kinds show none). An AI kind with no data yet
+// renders an idle placeholder so the meter's absence never reads as "this
+// step isn't AI-dispatching".
+function stepMeterEl(meter){
+  if (!meter || !meter.show) return null;
+  if (!meter.tokens && !meter.turns) {
+    return h("span", {className:"mn-step-meter"}, h("span", {className:"idle"}, "· tok"));
+  }
+  var children = [];
+  if (meter.tokens) {
+    children.push(h("span", {key:"t", className:"tok" + (meter.cloud ? " cloud" : "")}, fmtTok(meter.tokens) + " tok"));
+  }
+  if (meter.turns) {
+    children.push(h("span", {key:"n"}, meter.turns + (meter.turns === 1 ? " turn" : " turns")));
+  }
+  return h("span", {className:"mn-step-meter"}, children);
+}
+// The `_meter` descriptor for one step given the live metrics map. Pure, so
+// both renderers stay on one code path.
+function stepMeterFor(step, metrics){
+  var d = stepDisplayMetrics(metrics[step.id]);
+  var show = isAiKind(step.kind) || d.has;
+  return { show: show, tokens: d.tokens, turns: d.turns, cloud: d.cloud };
+}
+
 function MissionNode(props){
   var d = props.data;
   var mnSteps = (d.steps && d.steps.length)
     ? h("div", {className:"mn-steps"}, d.steps.map(function(s){
         return h("div", {key: s.id, className: "mn-step-row s-" + s.status, title: s.label},
           h("span", {className:"mn-step-dot"}),
-          h("span", {className:"mn-step-label"}, s.label)
+          h("span", {className:"mn-step-label"}, s.label),
+          stepMeterEl(s._meter)
         );
       }))
     : null;
@@ -213,9 +362,15 @@ function MissionNode(props){
 var nodeTypes = { missionNode: MissionNode };
 
 // ─── graph.json -> React Flow shape ─────────────────────────────────────
-function toRfNodes(graphNodes, positions){
+function toRfNodes(graphNodes, positions, metrics){
+  metrics = metrics || {};
   return graphNodes.map(function(n){
     var pos = positions[n.id] || {x:0, y:0};
+    // (#1403) Attach a live `_meter` to each step so the canvas node re-renders
+    // when metrics change (new data objects each render → React Flow updates).
+    var steps = (n.steps || []).map(function(s){
+      return Object.assign({}, s, { _meter: stepMeterFor(s, metrics) });
+    });
     return {
       id: n.id,
       type: "missionNode",
@@ -226,7 +381,7 @@ function toRfNodes(graphNodes, positions){
       // the coder's dispatch brief) stays available without crowding the
       // card. (#1401) `steps` is the task's own row list; empty on a
       // phase node.
-      data: { label: n.label, kind: n.kind, status: n.status, description: n.description, steps: n.steps || [] },
+      data: { label: n.label, kind: n.kind, status: n.status, description: n.description, steps: steps },
       draggable: true,
     };
   });
@@ -333,10 +488,235 @@ function mergeGraphs(prevGraph, fresh){
 function indexGraph(g){
   var nodeIds = new Set(g.nodes.map(function(n){ return n.id; }));
   var stepToTask = {};
+  var stepIds = new Set();
+  var taskIds = new Set();
+  var phaseIds = new Set();
+  var sessionToStep = {};   // "step:<stepId>" -> stepId (dispatch.internal default session)
+  var sessions = new Set();  // every session id a mission record could carry
   g.nodes.forEach(function(n){
-    (n.steps || []).forEach(function(s){ stepToTask[s.id] = n.id; });
+    if (n.kind === "phase") phaseIds.add(n.id);
+    if (n.kind === "task") { taskIds.add(n.id); sessions.add("task:" + n.id); }
+    (n.steps || []).forEach(function(s){
+      stepToTask[s.id] = n.id;
+      stepIds.add(s.id);
+      sessionToStep["step:" + s.id] = s.id;
+      sessions.add("step:" + s.id);
+    });
   });
-  return { nodeIds: nodeIds, stepToTask: stepToTask };
+  return { nodeIds: nodeIds, stepToTask: stepToTask, stepIds: stepIds,
+           taskIds: taskIds, phaseIds: phaseIds, sessionToStep: sessionToStep,
+           sessions: sessions };
+}
+
+// ─── (#1403) Work metrics: correlating flow records to step rows ──────────
+// Step token/turn attribution binds to what the SSE stream ALREADY carries —
+// no new server-side emission. Three correlation keys, in order:
+//   1. a `"step result"` record's `payload.step_id` (review.* + mission.coder/
+//      verify use this — their `handle` is the crew/`"mission-run"` label, not
+//      the step id);
+//   2. a dispatch record whose `session_id` is the `step:<id>` default a
+//      `dispatch.internal` step sets (the live per-turn token/turn climb);
+//   3. `handle === stepId` (the scheduler's step-lifecycle records + a hosted
+//      single-shot `"step result"`).
+// An AI-DISPATCHING kind gates the meter (dispatch.*, review.probe/judge/
+// verify, mission.coder/verify); procedural kinds (procedural.*, review.bundle/
+// dedup, mission.worktree) show none.
+function isAiKind(kind){
+  if (!kind) return false;
+  if (kind.indexOf("dispatch.") === 0) return true;
+  if (kind === "mission.coder" || kind === "mission.verify") return true;
+  if (kind.indexOf("review.probe") === 0 || kind.indexOf("review.judge") === 0
+      || kind.indexOf("review.verify") === 0) return true;
+  return false;
+}
+function stepForRecord(rec, idx){
+  var p = rec.payload;
+  if (p && p.step_id && idx.stepIds.has(p.step_id)) return p.step_id;
+  if (rec.session_id && idx.sessionToStep[rec.session_id]) return idx.sessionToStep[rec.session_id];
+  if (rec.handle && idx.stepIds.has(rec.handle)) return rec.handle;
+  return null;
+}
+// Fold one record into the per-step metric accumulator, returning a NEW object
+// only when something changed (so a no-op record doesn't churn React state).
+function applyRecordToMetrics(metrics, rec, idx){
+  var sid = stepForRecord(rec, idx);
+  if (!sid) return metrics;
+  var p = rec.payload || {};
+  var cur = metrics[sid] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, cloud:false };
+  var next = { tokRun:cur.tokRun, tokFinal:cur.tokFinal, turnRun:cur.turnRun, turnFinal:cur.turnFinal, cloud:cur.cloud };
+  var action = rec.action || "";
+  var isTok = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
+  var isTurn = action === "dispatch.turn";
+  var isComplete = action === "dispatch complete" || action === "dispatch.complete";
+  var isStepResult = action === "step result";
+  if (p.endpoint) next.cloud = true;
+  if (isTok) { next.tokRun += (p.total_tokens || 0); }
+  else if (isTurn) { next.turnRun += 1; }
+  else if (isComplete) {
+    if (p.total_tokens) next.tokFinal = Math.max(next.tokFinal, p.total_tokens);
+    if (p.total_turns) next.turnFinal = Math.max(next.turnFinal, p.total_turns);
+  } else if (isStepResult) {
+    if (p.total_tokens) next.tokFinal = Math.max(next.tokFinal, p.total_tokens);
+  }
+  if (next.tokRun === cur.tokRun && next.tokFinal === cur.tokFinal
+      && next.turnRun === cur.turnRun && next.turnFinal === cur.turnFinal
+      && next.cloud === cur.cloud) return metrics;
+  var out = Object.assign({}, metrics);
+  out[sid] = next;
+  return out;
+}
+// The number a step row shows: the finalized total when the dispatch closed,
+// else the running per-turn sum.
+function stepDisplayMetrics(m){
+  if (!m) return { tokens:0, turns:0, cloud:false, has:false };
+  var tokens = m.tokFinal || m.tokRun || 0;
+  var turns = m.turnFinal || m.turnRun || 0;
+  return { tokens: tokens, turns: turns, cloud: !!m.cloud, has: tokens > 0 || turns > 0 };
+}
+function missionTotals(metrics){
+  var local = 0, cloud = 0, turns = 0;
+  for (var k in metrics) {
+    if (!Object.prototype.hasOwnProperty.call(metrics, k)) continue;
+    var d = stepDisplayMetrics(metrics[k]);
+    if (d.cloud) cloud += d.tokens; else local += d.tokens;
+    turns += d.turns;
+  }
+  return { local: local, cloud: cloud, total: local + cloud, turns: turns };
+}
+// Does this record belong to THIS mission? (the events panel filter). Matches
+// on any handle/id/session/mission the page already knows from the snapshot.
+function recordInMission(rec, idx, missionId){
+  if (rec.mission_id && rec.mission_id === missionId) return true;
+  if (rec.phase_id && idx.phaseIds.has(rec.phase_id)) return true;
+  if (rec.handle && (idx.nodeIds.has(rec.handle) || idx.stepIds.has(rec.handle))) return true;
+  if (rec.session_id && idx.sessions.has(rec.session_id)) return true;
+  if (rec.payload && rec.payload.step_id && idx.stepIds.has(rec.payload.step_id)) return true;
+  return false;
+}
+// Compact token formatting for the meters — 12345 -> "12.3k".
+function fmtTok(n){
+  if (n == null) return "0";
+  if (n < 1000) return String(n);
+  if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k";
+  return (n / 1000000).toFixed(1) + "m";
+}
+function hhmmss(ts){
+  var d = new Date(ts);
+  if (isNaN(d.getTime())) return "";
+  var p = function(x){ return String(x).padStart(2, "0"); };
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+var EVENTS_CAP = 250;
+// (#1404) The renderer breakpoint, kept `<= 700` to MATCH the CSS
+// `@media (max-width:700px)` (inclusive at exactly 700px) — a `< 700` here
+// would show the mobile header chrome with the desktop canvas at 700px even.
+function isNarrowViewport(){
+  return typeof window !== "undefined" && window.innerWidth <= 700;
+}
+
+// ─── (#1404) Mobile vertical-timeline renderer (plain DOM, no React Flow) ──
+// Same merged graph state as the canvas, different presentation: phases stack
+// top-to-bottom in depth order, task cards stack inside each phase, tap a card
+// to expand its step rows. The status semantics are identical — the same
+// `n.status`/`s.status` the canvas reads, fed by the same SSE handler + merge.
+function legendDots(){
+  var mk = function(color, label){
+    return h("span", {key: label}, h("span", {className:"dot", style:{background:color}}), label);
+  };
+  return [ mk("var(--muted)","planned"), mk("var(--run)","running"),
+           mk("var(--good)","complete"), mk("var(--bad)","error"),
+           mk("var(--muted)","abandoned") ];
+}
+// Aggregate a task's step metrics for the collapsed task-card summary.
+function taskAggMetrics(task, metrics){
+  var tokens = 0, turns = 0, cloud = false;
+  (task.steps || []).forEach(function(s){
+    var d = stepDisplayMetrics(metrics[s.id]);
+    tokens += d.tokens; turns += d.turns; if (d.cloud) cloud = true;
+  });
+  var ai = (task.steps || []).some(function(s){ return isAiKind(s.kind); });
+  return { show: ai || tokens > 0 || turns > 0, tokens: tokens, turns: turns, cloud: cloud };
+}
+function renderMissionTimeline(g, metrics, expanded, toggleTask){
+  var out = [];
+  if (g.note) out.push(h("div", {key:"note", className:"tlnote"}, g.note));
+  var nodeLabel = {};
+  g.nodes.forEach(function(n){ nodeLabel[n.id] = n.label; });
+  // Task id -> the labels of tasks it waits on (from depends_on edges).
+  var waitsOn = {};
+  (g.edges || []).forEach(function(e){
+    if (e.kind !== "depends_on") return;
+    (waitsOn[e.target] = waitsOn[e.target] || []).push(nodeLabel[e.source] || e.source);
+  });
+  var phases = g.nodes.filter(function(n){ return n.kind === "phase"; })
+    .sort(function(a,b){ return a.depth - b.depth; });
+  var tasksByPhase = {};
+  g.nodes.filter(function(n){ return n.kind === "task"; }).forEach(function(n){
+    (tasksByPhase[n.parentId || "__none__"] = tasksByPhase[n.parentId || "__none__"] || []).push(n);
+  });
+  Object.keys(tasksByPhase).forEach(function(k){
+    tasksByPhase[k].sort(function(a,b){ return a.depth - b.depth; });
+  });
+  var phaseList = phases.length ? phases : [];
+  // Freeform mission with tasks but no phase nodes → one implicit section.
+  if (!phaseList.length && (tasksByPhase["__none__"] || []).length) {
+    phaseList = [{ id:"__none__", label:"tasks", status:"planned", description:"" }];
+  }
+  phaseList.forEach(function(phase){
+    var tasks = tasksByPhase[phase.id] || [];
+    out.push(h("div", {key: phase.id, className: "tlphase s-" + phase.status},
+      h("div", {className:"tlph-hd"},
+        h("span", {className:"tlph-dot"}),
+        h("span", {className:"tlph-name", title: phase.description || phase.label}, phase.label),
+        h("span", {className:"tlph-tag"}, phase.status)
+      ),
+      h("div", {className:"tltasks"}, tasks.length ? tasks.map(function(task){
+        var open = !!expanded[task.id];
+        var deps = waitsOn[task.id] || [];
+        var agg = taskAggMetrics(task, metrics);
+        return h("div", {key: task.id, className: "tltask s-" + task.status + (open ? " open" : "")},
+          h("div", {className:"tlt-hd", role:"button", tabIndex:0,
+                    onClick: function(){ toggleTask(task.id); },
+                    onKeyDown: function(ev){ if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggleTask(task.id); } }},
+            h("span", {className:"tlt-dot"}),
+            h("span", {className:"tlt-name", title: task.description || task.label}, task.label),
+            stepMeterEl(agg),
+            h("span", {className:"tlt-chev"}, "▸")
+          ),
+          deps.length ? h("div", {className:"tlt-waits"}, "waits on: " + deps.join(", ")) : null,
+          open ? h("div", {className:"tlt-steps"}, (task.steps || []).length
+            ? task.steps.map(function(s){
+                return h("div", {key: s.id, className: "tlt-step s-" + s.status},
+                  h("span", {className:"tlt-sdot"}),
+                  h("span", {className:"tlt-slabel", title: s.label}, s.label),
+                  stepMeterEl(stepMeterFor(s, metrics))
+                );
+              })
+            : h("div", {className:"tlt-step"}, h("span", {className:"tlt-slabel"}, "no steps"))) : null
+        );
+      }) : h("div", {className:"tlt-waits", style:{padding:"6px 4px"}}, "no tasks in this phase"))
+    ));
+  });
+  return out;
+}
+// (#1403) The mission-scoped events panel body (header + newest-first list).
+function eventsPanelEls(events, closePanel){
+  return [
+    h("div", {key:"hd", className:"evhd"}, "events · " + events.length,
+      h("button", {className:"evx", title:"close", onClick: function(){ closePanel(); }}, "✕")),
+    h("div", {key:"list", className:"evlist"}, events.length
+      ? events.map(function(e){
+          var cls = e.category === "telemetry" ? "telemetry"
+                  : (e.level === "error" || e.level === "warn") ? "err"
+                  : (e.category || "work");
+          return h("div", {key: e.id, className: "evrow " + cls},
+            h("span", {className:"evt"}, hhmmss(e.ts)),
+            h("span", {className:"eva"}, e.action),
+            h("span", {className:"evh", title: e.handle}, e.handle)
+          );
+        })
+      : h("div", {className:"evempty"}, "no events for this mission yet — live records stream here."))
+  ];
 }
 
 function App(){
@@ -345,13 +725,34 @@ function App(){
   var state = _s[0], setState = _s[1];
   var _live = React.useState(false);
   var live = _live[0], setLive = _live[1];
-  // (#1401) `nodeIdsRef` — phase/task ids a record's `handle` can name
-  // directly. `stepToTaskRef` — step id -> owning task's node id, since a
-  // step-lifecycle record's `handle` is a STEP id but a step renders as a
-  // ROW inside its task's card now, not its own node (see `indexGraph`).
-  var nodeIdsRef = React.useRef(new Set());
-  var stepToTaskRef = React.useRef({});
+  // (#1403) Live work metrics (stepId -> accumulator) + the mission-scoped
+  // events buffer, both fed by the SSE handler from records the stream already
+  // carries. (#1404) `isMobile` selects the renderer; `viewMode` is the manual
+  // override; `expanded` tracks open task cards in the timeline.
+  var _m = React.useState({});
+  var metrics = _m[0], setMetrics = _m[1];
+  var _e = React.useState([]);
+  var events = _e[0], setEvents = _e[1];
+  var _mob = React.useState(isNarrowViewport());
+  var isMobile = _mob[0], setIsMobile = _mob[1];
+  var _vm = React.useState("auto");            // "auto" | "canvas" | "timeline"
+  var viewMode = _vm[0], setViewMode = _vm[1];
+  var _ev = React.useState(!isNarrowViewport());
+  var evOpen = _ev[0], setEvOpen = _ev[1];
+  var _exp = React.useState({});
+  var expanded = _exp[0], setExpanded = _exp[1];
+  var _leg = React.useState(false);
+  var legendOpen = _leg[0], setLegendOpen = _leg[1];
+  // (#1401/#1403) One index ref carrying every lookup the SSE handler needs:
+  // node ids (a record whose `handle` names a phase/task node), step->task
+  // mapping (a step-lifecycle record's `handle` is a STEP id, rendered as a
+  // ROW), plus the id/session sets the metric + events correlation keys on.
+  var idxRef = React.useRef(indexGraph({nodes:[], edges:[]}));
   var esRef = React.useRef(null);
+  var evSeqRef = React.useRef(0);
+  var toggleTask = React.useCallback(function(id){
+    setExpanded(function(prev){ var n = Object.assign({}, prev); n[id] = !n[id]; return n; });
+  }, []);
 
   function fetchGraph(){
     return fetch("/mission/" + encodeURIComponent(missionId) + "/graph.json", {headers:{accept:"application/json"}})
@@ -367,9 +768,7 @@ function App(){
     var cancelled = false;
     fetchGraph().then(function(g){
       if (cancelled) return;
-      var idx = indexGraph(g);
-      nodeIdsRef.current = idx.nodeIds;
-      stepToTaskRef.current = idx.stepToTask;
+      idxRef.current = indexGraph(g);
       setState({loading:false, error:null, graph:g});
     }).catch(function(e){
       if (cancelled) return;
@@ -377,6 +776,14 @@ function App(){
     });
     return function(){ cancelled = true; };
   }, [missionId]);
+
+  // (#1404) Track the viewport-width breakpoint so the renderer switches
+  // between the React Flow canvas (wide) and the vertical timeline (narrow).
+  React.useEffect(function(){
+    var onResize = function(){ setIsMobile(isNarrowViewport()); };
+    window.addEventListener("resize", onResize);
+    return function(){ window.removeEventListener("resize", onResize); };
+  }, []);
 
   // SSE subscription — starts once the initial graph has loaded so the
   // known-node-id / step-to-task index is populated before any delta needs
@@ -388,15 +795,42 @@ function App(){
     function onMessage(ev){
       var rec; try { rec = JSON.parse(ev.data); } catch(_e) { return; }
       if (!rec || typeof rec !== "object") return;
+      var idx = idxRef.current;
+      // (#1403) Metrics + events accumulate from ALL mission-scoped records,
+      // not just status transitions — token/turn records carry no status, and
+      // the events panel wants every record for this mission. Run these BEFORE
+      // the status-transition early-return below.
+      setMetrics(function(prev){ return applyRecordToMetrics(prev, rec, idx); });
+      if (recordInMission(rec, idx, missionId)) {
+        var seq = evSeqRef.current++;
+        setEvents(function(prev){
+          var row = { id: seq, ts: rec.ts, action: rec.action || "",
+                      handle: rec.handle || "", category: rec.category || "",
+                      level: rec.level || "" };
+          var next = [row].concat(prev);
+          return next.length > EVENTS_CAP ? next.slice(0, EVENTS_CAP) : next;
+        });
+      }
       var newStatus = statusFromRecord(rec);
       var handle = rec.handle;
       if (!newStatus || !handle) return;
-      if (nodeIdsRef.current.has(handle)) {
+      // (#1403 gate remediation) SSE flips are rank-guarded with the SAME
+      // monotone rule the reconcile poll's mergeGraphs applies: a delta may
+      // never regress a status to a lower rank (a stale or replayed record
+      // arriving after a terminal state stays a no-op). Equal rank still
+      // applies — a NEWER delta wins between two same-rank states (e.g. two
+      // terminal states disagreeing), matching mergeGraphs's "the more recent
+      // source wins on equal rank" reasoning. The invariant is now enforced
+      // at BOTH ingest points instead of relying on record ordering.
+      var advance = function(oldStatus){
+        return statusRank(newStatus) >= statusRank(oldStatus) ? newStatus : oldStatus;
+      };
+      if (idx.nodeIds.has(handle)) {
         // A phase (or task) node id directly — flip that node's own status.
         setState(function(prev){
           if (!prev.graph) return prev;
           var nodes = prev.graph.nodes.map(function(n){
-            return n.id === handle ? Object.assign({}, n, {status: newStatus}) : n;
+            return n.id === handle ? Object.assign({}, n, {status: advance(n.status)}) : n;
           });
           return Object.assign({}, prev, {graph: Object.assign({}, prev.graph, {nodes: nodes})});
         });
@@ -405,14 +839,14 @@ function App(){
       // (#1401) A step id — find its owning task's node and flip ONLY that
       // row's status, leaving every other row (and the task node's own
       // aggregate status, refreshed by the reconcile poll below) alone.
-      var taskId = stepToTaskRef.current[handle];
+      var taskId = idx.stepToTask[handle];
       if (!taskId) return;
       setState(function(prev){
         if (!prev.graph) return prev;
         var nodes = prev.graph.nodes.map(function(n){
           if (n.id !== taskId || !n.steps) return n;
           var steps = n.steps.map(function(s){
-            return s.id === handle ? Object.assign({}, s, {status: newStatus}) : s;
+            return s.id === handle ? Object.assign({}, s, {status: advance(s.status)}) : s;
           });
           return Object.assign({}, n, {steps: steps});
         });
@@ -442,9 +876,7 @@ function App(){
     var reconcile = setInterval(function(){
       if (todayUtc() !== sseDate) openStream();
       fetchGraph().then(function(g){
-        var idx = indexGraph(g);
-        nodeIdsRef.current = idx.nodeIds;
-        stepToTaskRef.current = idx.stepToTask;
+        idxRef.current = indexGraph(g);
         setState(function(prev){
           if (!prev.graph) return prev;
           return Object.assign({}, prev, {graph: mergeGraphs(prev.graph, g)});
@@ -462,25 +894,19 @@ function App(){
   if (state.error) return h("div", {className:"msg"}, "darkmux mission graph: " + state.error);
 
   var g = state.graph;
-  var positions = computeLayout(g.nodes);
-  var rfNodes = toRfNodes(g.nodes, positions);
-  var rfEdges = toRfEdges(g.edges);
+  // (#1404) One data source, two renderers. Timeline is the narrow-viewport
+  // default (viewMode "auto" + mobile) and available anywhere via the toggle.
+  var useTimeline = viewMode === "timeline" || (viewMode === "auto" && isMobile);
+  var tot = missionTotals(metrics);
 
-  return h(React.Fragment, null,
-    h("div", {className:"top"},
-      h("div", {className:"brand"}, h("a", {href:"/"}, h("b", null, "darkmux"), " · mission graph")),
-      h("span", {className:"midname"}, g.mission_id),
-      h("span", {className:"mstatus " + g.mission_status}, g.mission_status),
-      h("span", {className:"livepill" + (live ? " on" : "")}, live ? "● live" : "○ reconnecting"),
-      h("div", {className:"legend"},
-        h("span", null, h("span", {className:"dot", style:{background:"var(--muted)"}}), "planned"),
-        h("span", null, h("span", {className:"dot", style:{background:"var(--run)"}}), "running"),
-        h("span", null, h("span", {className:"dot", style:{background:"var(--good)"}}), "complete"),
-        h("span", null, h("span", {className:"dot", style:{background:"var(--bad)"}}), "error"),
-        h("span", null, h("span", {className:"dot", style:{background:"var(--muted)"}}), "abandoned")
-      )
-    ),
-    h("div", {className:"canvas"},
+  var body;
+  if (useTimeline) {
+    body = h("div", {className:"timeline"}, renderMissionTimeline(g, metrics, expanded, toggleTask));
+  } else {
+    var positions = computeLayout(g.nodes);
+    var rfNodes = toRfNodes(g.nodes, positions, metrics);
+    var rfEdges = toRfEdges(g.edges);
+    body = h("div", {className:"canvas"},
       g.note ? h("div", {className:"note"}, g.note) : null,
       h(ReactFlowProvider, null,
         h(ReactFlow, {
@@ -493,6 +919,40 @@ function App(){
           h(MiniMap, {pannable:true, zoomable:true, style:{background:"#131316"}})
         )
       )
+    );
+  }
+
+  // (#1403) Mission-scoped live token readout, local vs cloud honesty split.
+  var meterEl = tot.total || tot.turns ? h("span", {className:"mmeter"},
+    tot.total ? h("b", null, fmtTok(tot.total) + " tok") : null,
+    (tot.total && tot.cloud) ? h("span", {className:"split"},
+      fmtTok(tot.local) + " local + ", h("span", {className:"cloud"}, fmtTok(tot.cloud) + " cloud")) : null,
+    tot.turns ? h("span", {className:"split"}, "· " + tot.turns + (tot.turns === 1 ? " turn" : " turns")) : null
+  ) : null;
+
+  return h(React.Fragment, null,
+    h("div", {className:"top"},
+      // (#1403) Explicit in-site nav — the ONLY way out on a chromeless
+      // home-screen shortcut, so it reads as navigation, not a logo.
+      h("div", {className:"nav"}, h("a", {href:"/", title:"back to the darkmux viewer"}, "‹ viewer")),
+      h("div", {className:"brand"}, h("a", {href:"/"}, h("b", null, "darkmux"), h("span", {className:"sub"}, " · mission"))),
+      h("span", {className:"midname", title: g.mission_id}, g.mission_id),
+      h("span", {className:"mstatus " + g.mission_status}, g.mission_status),
+      h("span", {className:"livepill" + (live ? " on" : "")}, live ? "● live" : "○ reconnecting"),
+      meterEl,
+      h("button", {className:"evbtn", title:"switch renderer",
+                   onClick: function(){ setViewMode(useTimeline ? "canvas" : "timeline"); }},
+        useTimeline ? "graph" : "list"),
+      h("button", {className:"evbtn" + (evOpen ? " on" : ""), title:"mission events",
+                   onClick: function(){ setEvOpen(!evOpen); }}, "events"),
+      h("button", {className:"legbtn", title:"status legend",
+                   onClick: function(){ setLegendOpen(!legendOpen); }}, "legend"),
+      h("div", {className:"legend"}, legendDots()),
+      legendOpen ? h("div", {className:"legendpop on"}, legendDots()) : null
+    ),
+    h("div", {className:"body"},
+      body,
+      evOpen ? h("div", {className:"evpanel"}, eventsPanelEls(events, function(){ setEvOpen(false); })) : null
     )
   );
 }

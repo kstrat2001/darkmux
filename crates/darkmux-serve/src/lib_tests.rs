@@ -3434,6 +3434,84 @@
         assert!(!bytes.is_empty());
     }
 
+    /// (#1403) The standalone-shell manifest serves at the well-known path with
+    /// the manifest content type and declares `display: standalone` (an
+    /// installed home-screen shortcut opens chromeless).
+    #[tokio::test]
+    async fn web_manifest_served_standalone() {
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(Request::builder().uri("/manifest.webmanifest").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert!(ct.starts_with("application/manifest+json"), "content-type was `{ct}`");
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["display"], "standalone");
+        assert!(json["icons"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
+    }
+
+    /// (#1403) Each app-icon route serves real PNG bytes (magic header) as
+    /// `image/png` — the iOS home-screen icon + the manifest icons.
+    #[tokio::test]
+    async fn app_icons_served_as_png() {
+        for path in ["/apple-touch-icon.png", "/icon-192.png", "/icon-512.png"] {
+            let app = build_router(PathBuf::new());
+            let response = app
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path} status");
+            assert_eq!(response.headers().get("content-type").unwrap(), "image/png", "{path} ct");
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            // PNG signature: 89 50 4E 47 0D 0A 1A 0A.
+            assert!(bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]), "{path} not a PNG");
+        }
+    }
+
+    /// (#1403) Both HTML shells (the viewer and the mission-graph page) declare
+    /// the standalone-app shell — manifest link + apple-touch-icon — so a
+    /// future edit that drops the shell fails a test rather than silently
+    /// breaking the home-screen-shortcut experience.
+    #[test]
+    fn html_shells_declare_standalone_app() {
+        for (name, html) in [("viewer", VIEWER_HTML), ("mission-graph", MISSION_GRAPH_HTML)] {
+            assert!(
+                html.contains("rel=\"manifest\"") && html.contains("/manifest.webmanifest"),
+                "{name}.html lost its web-manifest link (#1403 standalone shell)"
+            );
+            assert!(
+                html.contains("apple-touch-icon"),
+                "{name}.html lost its apple-touch-icon link (#1403 standalone shell)"
+            );
+            assert!(
+                html.contains("apple-mobile-web-app-capable"),
+                "{name}.html lost the apple-mobile-web-app-capable meta (#1403)"
+            );
+        }
+    }
+
+    /// (#1403) The graph.json StepRow wire contract now carries the raw `kind`
+    /// the page gates the per-step token/turn meter on. Pins it so a
+    /// rename/removal fails here rather than silently disabling every step
+    /// meter on the mission-graph page.
+    #[test]
+    fn step_row_serializes_raw_kind() {
+        let row = crate::mission_graph::StepRow {
+            id: "s1".to_string(),
+            label: "Dispatch".to_string(),
+            kind: "dispatch.internal".to_string(),
+            status: "running",
+            started_ts: None,
+            completed_ts: None,
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["kind"], "dispatch.internal");
+        assert_eq!(v["label"], "Dispatch");
+    }
+
     /// (#881 parity) The graph.json route must ride the SAME remote-only
     /// bearer gate as `/missions`/`/phases`/`/lab/runs` — guards against a
     /// future refactor special-casing the mission-graph surface out of
