@@ -92,8 +92,12 @@ darkmux role show coder          <span class="comment"># full details for one ro
     <p>The preferred path is two verbs: <code>darkmux mission propose</code>, which takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>) and dispatches the mission-compiler utility agent to emit a structured proposal you approve before anything lands; then <code>darkmux mission launch &lt;id&gt;</code>, which mints a running mission instance from what got persisted. Config-launched is the only instance-creation path (see the next section): <code>propose</code> writes the CONFIG, <code>launch</code> mints the INSTANCE.</p>
 
     <h4>Worked example: proposing a mission from stdin</h4>
+    <p>The input is any text on stdin — the pipe is the interface, so the tools you already have are the source adapters. Pull an issue with <code>gh</code>, a web page with <code>curl</code>, a local file with <code>cat</code>, or the clipboard with <code>pbpaste</code>:</p>
     <pre><code><span class="comment"># Pipe operator intent into the compiler</span>
-pbpaste | darkmux mission propose --from-stdin
+pbpaste            | darkmux mission propose --from-stdin
+gh issue view 42   | darkmux mission propose --from-stdin
+curl -s &lt;url&gt;      | darkmux mission propose --from-stdin
+cat notes.md       | darkmux mission propose --from-stdin
 <span class="comment"># or use a file:  darkmux mission propose --from-file intent.txt</span></code></pre>
 
     <p>The compiler returns a proposal summary:</p>

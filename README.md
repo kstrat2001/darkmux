@@ -152,10 +152,10 @@ darkmux doctor          # pre-flight checks: registry, LMStudio, models, runtime
 
 Doctor returns exit 0 if everything's wired up, exit 1 if a fail-level check needs fixing. Fail/warn lines include actionable hints.
 
-Once doctor is green, point your profiles at real models. The fastest path is `darkmux scan`: it lists the models LMStudio has downloaded that aren't yet in any profile and suggests which are worth adding, so you don't have to hand-match ids:
+Once doctor is green, point your profiles at real models. The fastest path is `darkmux profile scan`: it lists the models LMStudio has downloaded that aren't yet in any profile and suggests which are worth adding, so you don't have to hand-match ids:
 
 ```bash
-darkmux scan                # see downloaded models not yet in a profile, with suggestions
+darkmux profile scan        # see downloaded models not yet in a profile, with suggestions
 ```
 
 Or edit `~/.darkmux/profiles.json` directly and replace each `<your-worker-model-id>` placeholder with an actual id from `lms ls`. Either way, doctor will warn if profiles don't match your loaded models; that's the moment to fix them.
@@ -183,14 +183,14 @@ Optional integrations (Redis coordination, the audit log) are blocks you turn on
 ### First useful commands
 
 ```bash
-darkmux profiles                  # list configured profiles
-darkmux status                    # what's loaded; which profile (if any) matches
-darkmux swap fast                 # swap to the "fast" profile (loads model into LMStudio)
-darkmux lab characterize          # one-command "QA my Mac": dispatch a smoke workload, get a verdict
-darkmux lab run quick-q           # the smoke workload directly
-darkmux lab runs --limit 5        # see your recent runs
-darkmux lab inspect <run-id>      # full per-run breakdown
-darkmux notebook draft <run-id>   # ask the active role to author a lab-style notebook entry
+darkmux profile list                  # list configured profiles
+darkmux status                        # what's loaded; which profile (if any) matches
+darkmux swap fast                     # swap to the "fast" profile (loads model into LMStudio)
+darkmux lab characterize              # one-command "QA my Mac": dispatch a smoke workload, get a verdict
+darkmux lab run quick-q               # the smoke workload directly
+darkmux lab runs --limit 5            # see your recent runs
+darkmux lab inspect <run-id>          # full per-run breakdown
+darkmux lab notebook draft <run-id>   # ask the active role to author a lab-style notebook entry
 darkmux mission propose --from-stdin   # AI-built-in: vague intent → a structured mission config
 darkmux mission launch <id>            # mint + start a running mission instance from a config
 ```
@@ -312,7 +312,7 @@ If you run darkmux on more than one machine and want a single notebook that coll
 ```bash
 export DARKMUX_NOTEBOOK_DIR="$HOME/Library/Mobile Documents/com~apple~CloudDocs/darkmux-notebook"
 export DARKMUX_MACHINE_ID="m5-max-128gb-home"  # naming is yours; appears in entry headers
-darkmux notebook draft <run-id>
+darkmux lab notebook draft <run-id>
 ```
 
 Set the same `DARKMUX_NOTEBOOK_DIR` on each machine; give each a distinct `DARKMUX_MACHINE_ID`. Entries get tagged with their machine of origin in the header comment, so cross-machine readouts are unambiguous.
@@ -322,17 +322,17 @@ If `DARKMUX_MACHINE_ID` is unset, darkmux falls back to an auto-derived fingerpr
 You can also override the machine id for a single draft via `--machine`:
 
 ```bash
-darkmux notebook draft <run-id> --machine my-work-mac
+darkmux lab notebook draft <run-id> --machine my-work-mac
 ```
 
 To list all entries in the notebook directory (optionally filtered by machine):
 
 ```bash
-darkmux notebook list           # all entries
-darkmux notebook list --machine m5-home  # only this machine's entries
+darkmux lab notebook list           # all entries
+darkmux lab notebook list --machine m5-home  # only this machine's entries
 ```
 
-`notebook list` outputs columns: **date | machine | run | path** (aligned, newest first). The `--machine` flag filters to only entries matching that machine id.
+`lab notebook list` outputs columns: **date | machine | run | path** (aligned, newest first). The `--machine` flag filters to only entries matching that machine id.
 
 ## Instrumentation
 

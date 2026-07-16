@@ -1,7 +1,7 @@
 {
   "id": "pr-reviewer-agentic",
   "role_family": "specialist",
-  "description": "PR reviewer with the repository checked out: reads the diff AND explores the surrounding code with tools (read files, search, run read-only commands) before concluding. Emits a freeform review with MUST FIX / CONSIDER marker blocks that `darkmux pr-review render` resolves to inline pull-request comments. Deliberately has NO output_schema: a grammar-constrained output combined with tools makes the model skip tool-calling and fabricate (verified 2026-07-04) — the freeform marker contract is the tool-compatible replacement.",
+  "description": "PR reviewer with the repository checked out: reads the diff AND explores the surrounding code with tools (read files, search, run read-only commands) before concluding. Emits a freeform review with MUST FIX / CONSIDER marker blocks that darkmux resolves to inline pull-request comments. Deliberately has NO output_schema: a grammar-constrained output combined with tools makes the model skip tool-calling and fabricate (verified 2026-07-04) — the freeform marker contract is the tool-compatible replacement.",
   "skills": [
     "code-reviewing"
   ],

@@ -86,7 +86,7 @@ For non-validated tiers, skip this step; tell the operator to download whatever 
 Check whether `~/.darkmux/profiles.json` has profiles:
 
 ```bash
-darkmux profiles 2>&1 | head -20
+darkmux profile list 2>&1 | head -20
 ```
 
 Outcomes:

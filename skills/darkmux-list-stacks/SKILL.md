@@ -12,7 +12,7 @@ ARGUMENTS: none — this skill takes no arguments.
 ## Step 1 — List
 
 ```bash
-darkmux profiles
+darkmux profile list
 ```
 
 ## Step 2 — Output shape
