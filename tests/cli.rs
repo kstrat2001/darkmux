@@ -950,6 +950,34 @@ fn crew_dispatch_message_from_file_flag_contract() {
         );
 }
 
+/// (#1405 gate remediation) The licensed-adjacent ACK gate fires on the
+/// internal dispatch path BEFORE any Docker work. The gate was moved into
+/// `dispatch_internal::dispatch()` when the openclaw branch (its previous
+/// only caller) was removed; this pins the moved-but-unwired regression
+/// class structurally: a non-TTY dispatch of `health-research` with no
+/// prior ack must bail at the gate — no Docker preflight, no container
+/// spawn — so the test needs no Docker and is CI-safe.
+#[test]
+fn crew_dispatch_licensed_adjacent_role_bails_at_ack_gate_before_docker() {
+    let ack_dir = TempDir::new().unwrap(); // empty — no prior ack on file
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_ACK_DIR", ack_dir.path())
+        .args(["crew", "dispatch", "health-research", "-m", "smoke"])
+        // assert_cmd pipes stdin (not a TTY), so the gate's non-interactive
+        // arm bails rather than prompting for ACKNOWLEDGE.
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("requires operator acknowledgment")
+                // Bailed BEFORE the Docker preflight / container spawn: the
+                // "runtime=internal — image:" line prints only after the
+                // gate, and no docker error can have surfaced.
+                .and(predicate::str::contains("runtime=internal").not())
+                .and(predicate::str::contains("docker").not()),
+        );
+}
+
 // ── `mission launch review` integration tests (#1284 Packet 4b — retired
 // from `pr-review run`, #1222 Phase B packet 5) ────────────────────────────
 

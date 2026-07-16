@@ -564,6 +564,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_xreadgroup_malformed_on_retired_openclaw_runtime() {
+        use redis::Value as V;
+        // (#1405) Wire-compat pin: a fleet peer on a pre-2.0 release can
+        // still publish a WorkJob with the retired `"runtime": "openclaw"`.
+        // The record is otherwise fully valid, but the variant no longer
+        // exists — the claim boundary must route it to Malformed (work_id
+        // surfaced so the runner XACKs it), never Err or a panic. Pins the
+        // lenient old-peer boundary the openclaw removal created.
+        let record = br#"{
+            "role_id": "coder",
+            "message": "hi",
+            "session_id": "s-1",
+            "runtime": "openclaw",
+            "timeout_seconds": 300,
+            "published_at_unix_ms": 0,
+            "attempt": 1
+        }"#;
+        let response = V::Array(vec![V::Array(vec![
+            V::BulkString(b"darkmux:work".to_vec()),
+            V::Array(vec![V::Array(vec![
+                V::BulkString(b"1716192000000-8".to_vec()),
+                V::Array(vec![
+                    V::BulkString(b"record".to_vec()),
+                    V::BulkString(record.to_vec()),
+                ]),
+            ])]),
+        ])]);
+        let ClaimOutcome::Malformed { work_id, reason } =
+            parse_xreadgroup_response(&response).unwrap()
+        else {
+            panic!("expected ClaimOutcome::Malformed for a retired-runtime job");
+        };
+        assert_eq!(work_id, "1716192000000-8");
+        assert!(reason.contains("invalid WorkJob JSON"), "{reason}");
+        assert!(reason.contains("openclaw"), "reason should name the offending variant: {reason}");
+    }
+
+    #[test]
     fn parse_xreadgroup_malformed_on_non_array_fields() {
         use redis::Value as V;
         // (#903) A valid entry-id but a non-array fields slot — the work_id is

@@ -180,20 +180,14 @@ pub struct DispatchOpts {
     /// `--workdir` — see `dispatch_internal`'s workspace setup.
     pub workdir: Option<PathBuf>,
     /// Optional phase id binding this dispatch to a phase in a
-    /// mission (#146 Stage 1). When set:
-    ///
-    ///   1. The dispatcher loads the phase manifest and resolves its
-    ///      predecessor. When the predecessor has a recorded output
-    ///      file (`<phase-id>-output.txt`), that text is prepended to
-    ///      the dispatch message as a "Prior phase outputs" context
-    ///      block. One-hop only — transitive ancestors are NOT walked.
-    ///   2. After the dispatch returns, the agent's reply text is
-    ///      persisted to `<phase-id>-output.txt` alongside the phase
-    ///      manifest, so downstream phases with this phase as their
-    ///      predecessor can read it on their own dispatch.
-    ///
-    /// When `None`, the dispatcher behaves as before — no phase
-    /// awareness, no output persistence. Backwards-compatible default.
+    /// mission. When set, the dispatch's flow records are stamped with
+    /// `phase_id` (and the owning `mission_id`, resolved via
+    /// [`resolve_mission_for_phase`]) so the viewer groups the dispatch
+    /// under its mission. Provenance stamping ONLY — no message
+    /// rewriting, no output persistence (the #146 Stage 1 cross-phase
+    /// context injection was removed in #1405; `mission run`'s
+    /// `coder_brief()` is the mechanism that carries context between
+    /// phases now). When `None`, records carry no mission/phase fields.
     pub phase_id: Option<String>,
     /// Which agent runtime to dispatch through. See [`Runtime`].
     /// The in-house container-bounded runtime is the only value.

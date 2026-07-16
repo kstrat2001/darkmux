@@ -254,7 +254,7 @@ src/
     types.rs                 Role + Skill + Capability schema; capabilities() derivation; is_specialist()
     select.rs                select_model(role, profile) — dispatch model selection (phase-1 stub, E14)
     dispatch_internal.rs     Internal-runtime dispatch path (typed-config consumer)
-    dispatch.rs              Runtime-neutral dispatch plumbing (ack gate, phase context, flow-record builders, fleet routing)
+    dispatch.rs              Runtime-neutral dispatch plumbing (ack gate, identity augmentation, flow-record builders, fleet routing)
 runtime/                      Internal-runtime crate (built into darkmux-runtime Docker image)
   src/loop_runner.rs          Agent loop; budget caps; inactivity deadline; detector + recovery wiring
   src/compaction.rs           Narrative + structured-slot compaction; JSON repair; escalation

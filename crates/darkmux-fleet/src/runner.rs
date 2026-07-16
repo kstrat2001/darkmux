@@ -157,12 +157,16 @@ fn runner_main() {
                 // unparseable, so it can NEVER be dispatched. ACK it to drop it
                 // from the pending-entries list — otherwise it sits pending
                 // forever (the `>` cursor never redelivers it). Log loudly: a
-                // malformed entry means a buggy or hostile peer published it.
+                // malformed entry means a buggy or hostile peer published it —
+                // or, more likely, plain version skew (#1405: a pre-2.0 peer
+                // publishing the retired openclaw runtime lands here).
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
-                        "darkmux-runner: dropping unparseable work entry {work_id} ({reason}); \
-                         XACK to clear it from the pending-entries list"
+                        "darkmux-runner: dropping work entry {work_id} ({reason}) — malformed \
+                         or from an incompatible darkmux version (e.g. a pre-2.0 peer \
+                         publishing a retired runtime); XACK to clear it from the \
+                         pending-entries list"
                     ))
                 );
                 let _ = ack_job(&client, RUNNER_CONSUMER_GROUP, &work_id);

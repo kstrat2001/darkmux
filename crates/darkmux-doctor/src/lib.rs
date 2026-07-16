@@ -2984,7 +2984,8 @@ mod tests {
 
     #[test]
     fn docker_status_binary_missing_warns_not_fails() {
-        // Warn, never Fail — openclaw-only operators legitimately have no Docker.
+        // Warn, never Fail — swap-only operators (profile multiplexing, no
+        // crew dispatches) legitimately have no Docker.
         use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
         let c = docker_status_to_check(DockerRuntimeStatus::BinaryMissing);
         assert_eq!(c.status, Status::Warn);

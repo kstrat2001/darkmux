@@ -322,10 +322,9 @@ pub enum PhaseStatus {
 /// on a Task in an EARLIER Phase (this is how cross-phase data actually
 /// flows, e.g. `adjudicate`'s `judge` Task depending on `investigate`'s
 /// `dedup` Task); Phase itself carries no dependency semantics to check.
-/// "The phase before this one" (needed by `dispatch::
-/// augment_message_with_phase_context`'s one-hop context injection and
-/// `mission_run::select_phase`'s "next runnable phase" scan) is simply
-/// `Mission::phase_ids[i - 1]` for a phase at index `i`.
+/// "The phase before this one" (needed by `mission_run::select_phase`'s
+/// "next runnable phase" scan) is simply `Mission::phase_ids[i - 1]` for
+/// a phase at index `i`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Phase {
     pub id: String,
@@ -414,12 +413,11 @@ pub struct Step {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_ts: Option<u64>,
     /// The step kind's own output text on success (or an error summary on
-    /// `NodeStatus::Error`). Generalizes the one-hop
-    /// `<phase-id>-output.txt` context file `dispatch.rs`'s `phase_id`
-    /// plumbing already writes — a downstream Step (same-task successor, or
+    /// `NodeStatus::Error`). A downstream Step (same-task successor, or
     /// the first step of a Task naming this one's Task in its own
     /// `Task.depends_on`) reads a completed dependency's `output` as its
-    /// own input (see `scheduler::gather_inputs`).
+    /// own input (see `scheduler::gather_inputs`) — this is the mechanism
+    /// that carries results between steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
 }

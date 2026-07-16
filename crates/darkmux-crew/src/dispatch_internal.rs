@@ -8,9 +8,7 @@
 //! shell-out runtime and its `--runtime` opt-in flag).
 //!
 //! No `--workdir` symlink injection (workspace is a fresh tempdir per
-//! dispatch); no watched-path post-dispatch echo (`DispatchResult.watched_state`
-//! is always empty — the workspace is ephemeral, not a fixed path to
-//! snapshot); no model pin enforcement (probes whatever LMStudio currently
+//! dispatch); no model pin enforcement (probes whatever LMStudio currently
 //! has loaded via `crew::select`, a different mechanism than the retired
 //! `role-model-pins.json` table).
 //!
@@ -991,6 +989,15 @@ fn try_resolve_remote_target(
     Ok(Some((role, system_prompt, pm)))
 }
 
+/// Data-boundary predicate: operator identity (`~/.darkmux/identity.md`)
+/// never leaves the machine — identity augmentation applies only when the
+/// dispatch's resolved brain is locally served (data-boundary decision,
+/// #1405 review). `remote_brained` is true when the resolved target is a
+/// remote endpoint, whether single-shot or agentic-remote container.
+fn identity_augmentation_allowed(remote_brained: bool) -> bool {
+    !remote_brained
+}
+
 /// The chat-completions URL: `{base}/chat/completions` (+ `?api-version=` for
 /// Azure). The operator's `endpoint.url` is the base up to `/chat/completions`
 /// (an Azure deployment URL, or e.g. `https://api.openai.com/v1`).
@@ -1727,9 +1734,19 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     } else {
         role_prompt
     };
-    // (#147, #1405) Augment with operator-identity from
-    // ~/.darkmux/identity.md if present. No-op when absent.
-    let system_prompt = crate::dispatch::augment_prompt_with_identity(&system_prompt);
+    // (#147) Operator-identity augmentation (~/.darkmux/identity.md), no-op
+    // when the file is absent. Data-boundary rule: operator identity never
+    // leaves the machine — local dispatches only (data-boundary decision,
+    // #1405 review). A dispatch whose resolved brain is a remote endpoint is
+    // skipped here (the agentic-remote container path, where `agentic_pm` is
+    // set) and never augmented on the single-shot `dispatch_remote` path
+    // above (whose system prompt comes from `try_resolve_remote_target`,
+    // which builds it without identity).
+    let system_prompt = if identity_augmentation_allowed(agentic_pm.is_some()) {
+        crate::dispatch::augment_prompt_with_identity(&system_prompt)
+    } else {
+        system_prompt
+    };
     // #340 — surface unknown role-vocab tokens loudly. Unknown tokens
     // (typos like "exce" for "exec", future tokens not yet wired)
     // get silently dropped by `role_to_runtime`; without this warning
@@ -4194,6 +4211,20 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    // ─── #1405 review: operator identity is local-only ────────────────────
+
+    #[test]
+    fn identity_augmentation_is_local_only() {
+        // Data-boundary pin: identity augmentation applies to locally-served
+        // dispatches only; any remote-brained dispatch (single-shot or
+        // agentic-remote container) skips it.
+        assert!(identity_augmentation_allowed(false), "local dispatch augments");
+        assert!(
+            !identity_augmentation_allowed(true),
+            "remote-brained dispatch must never carry operator identity"
+        );
+    }
+
     // ─── #1312: operator-declared key_env override (563 root fix) ────────
 
     #[test]
@@ -5828,7 +5859,6 @@ mod tests {
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
-                config_path: None,
                 context_tokens: None,
                 compaction: Some(RuntimeCompactionConfig {
                     strategy: Some(CompactionStrategy::StructuredSlot),
@@ -5871,7 +5901,6 @@ mod tests {
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
-                config_path: None,
                 context_tokens: None,
                 compaction: Some(RuntimeCompactionConfig {
                     strategy: None,
@@ -6002,7 +6031,6 @@ mod tests {
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
-                config_path: None,
                 context_tokens: None,
                 compaction: Some(RuntimeCompactionConfig {
                     strategy: None,
@@ -6039,7 +6067,6 @@ mod tests {
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
-                config_path: None,
                 context_tokens: None,
                 compaction: Some(RuntimeCompactionConfig {
                     strategy: None,
@@ -6089,7 +6116,6 @@ mod tests {
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
-                config_path: None,
                 context_tokens: None,
                 compaction: Some(RuntimeCompactionConfig {
                     strategy: None,
@@ -6143,7 +6169,6 @@ mod tests {
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
-                config_path: None,
                 context_tokens: None,
                 compaction: Some(RuntimeCompactionConfig {
                     strategy: None,
@@ -6186,7 +6211,6 @@ mod tests {
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
-                config_path: None,
                 context_tokens: None,
                 compaction: Some(RuntimeCompactionConfig {
                     strategy: None,
@@ -6243,7 +6267,6 @@ mod tests {
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
-                config_path: None,
                 context_tokens: None,
                 compaction: Some(RuntimeCompactionConfig {
                     strategy: None,
