@@ -56,8 +56,8 @@ pub struct DoctorReport {
 /// This is the caller-supplied-check-input pattern for doctor: `run()` gathers
 /// everything doctor can read for itself, and a check that needs root-crate
 /// state (which this crate cannot depend on) is invoked separately by `main.rs`
-/// with the state passed in and its result appended to the report — the same
-/// shape as `probe_remote_endpoints`, but taking an input.
+/// with the state passed in and its result appended to the report. It is the
+/// same shape as `probe_remote_endpoints`, but taking an input.
 #[derive(Debug, Clone)]
 pub struct EmbeddedSkill {
     pub name: String,
@@ -175,25 +175,25 @@ const SKILLS_FRESHNESS_CHECK_NAME: &str = "darkmux skills freshness";
 /// (#1426) Compare the installed `darkmux-*` skill directories against the
 /// binary's embedded copies and warn when they drift, so an operator who
 /// upgraded darkmux but never re-ran `darkmux init` learns their skills are
-/// stale from the structural surface rather than by memory. Closes the upgrade
-/// loop: `brew upgrade` -> doctor warns -> `darkmux init` -> clean.
+/// stale from the structural surface rather than by memory. This closes the
+/// upgrade loop: `brew upgrade` then doctor warns then `darkmux init` then
+/// clean.
 ///
-/// Scope is the `darkmux-*` namespace ONLY — a non-darkmux entry in the skills
+/// Scope is the `darkmux-*` namespace ONLY. A non-darkmux entry in the skills
 /// directory is the operator's own state and is never inspected or reported
-/// (the namespace contract). Two conditions are surfaced but do NOT warn,
-/// because `darkmux init` cannot resolve either and a warning whose fix_hint
-/// can't fix it is noise:
-///   - an embedded skill that is not installed (a minimal install is a
-///     legitimate operator choice, not drift);
-///   - an installed `darkmux-*` skill the binary no longer bundles (a retired
-///     skill left on disk — `init` refreshes, it does not prune).
-/// The WARN driver is exclusively an installed `darkmux-*` skill whose content
-/// differs from the embedded copy.
+/// (the namespace contract). The WARN driver is exclusively an installed
+/// `darkmux-*` skill whose content differs from the embedded copy. Two other
+/// conditions are surfaced informationally but do NOT warn, because `darkmux
+/// init` cannot resolve either and a warning whose fix_hint can't fix it is
+/// noise: an embedded skill that is not installed (a minimal install is a
+/// legitimate operator choice, not drift), and an installed `darkmux-*` skill
+/// the binary no longer bundles (a retired skill left on disk, which `init`
+/// does not prune).
 ///
 /// Pure evaluator: `targets` (the install directories) and `embedded` (the
 /// reference set) are supplied by the caller (`main.rs`, the root crate that
-/// owns the `include_str!` embed) — this crate cannot depend on the root binary
-/// crate where the skills live.
+/// owns the `include_str!` embed), because this crate cannot depend on the root
+/// binary crate where the skills live.
 pub fn check_installed_skills_freshness(targets: &[PathBuf], embedded: &[EmbeddedSkill]) -> Check {
     let mut matched = 0usize;
     let mut stale: Vec<String> = Vec::new();
@@ -277,7 +277,7 @@ pub fn check_installed_skills_freshness(targets: &[PathBuf], embedded: &[Embedde
             name: SKILLS_FRESHNESS_CHECK_NAME.into(),
             status: Status::Warn,
             message,
-            hint: Some("installed from an older darkmux — run `darkmux init` to refresh".into()),
+            hint: Some("installed from an older darkmux; run `darkmux init` to refresh".into()),
         }
     }
 }
@@ -286,8 +286,8 @@ pub fn check_installed_skills_freshness(targets: &[PathBuf], embedded: &[Embedde
 /// install target in order and returning the first hit. `None` = not installed
 /// in any target (or the directory exists but its `SKILL.md` does not).
 /// An existing-but-unreadable `SKILL.md` returns `Some("")`, which will not
-/// match the embedded copy and is therefore reported as stale — a broken /
-/// partial install that `darkmux init` fixes. (#1426)
+/// match the embedded copy and is therefore reported as stale (a broken or
+/// partial install that `darkmux init` fixes). (#1426)
 fn installed_skill_content(targets: &[PathBuf], name: &str) -> Option<String> {
     for target in targets {
         let skill_md = target.join(name).join("SKILL.md");
