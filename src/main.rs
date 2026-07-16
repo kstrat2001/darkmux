@@ -457,6 +457,26 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
 
 fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
     let mut report = doctor::run();
+
+    // (#1426) Installed darkmux-* skills freshness. The check lives in the
+    // doctor crate as a pure evaluator; the embedded reference set and install
+    // targets are supplied here from the root crate that owns the `include_str!`
+    // skill embed (the doctor crate can't depend on this binary crate). Appended
+    // after `run()` — the same shape as the endpoint probes below, but taking an
+    // input rather than reading it for itself.
+    let embedded_skills: Vec<doctor::EmbeddedSkill> = skills::embedded_skills()
+        .iter()
+        .map(|(name, content)| doctor::EmbeddedSkill {
+            name: (*name).to_string(),
+            content: (*content).to_string(),
+        })
+        .collect();
+    let skill_targets = skills::install_target_dirs().unwrap_or_default();
+    report.checks.push(doctor::check_installed_skills_freshness(
+        &skill_targets,
+        &embedded_skills,
+    ));
+
     // (#1177) Opt-in live endpoint probes append to the same report so they
     // share the verdict/exit-code path — a failed probe exits 1 like any
     // failed check.
@@ -1925,6 +1945,10 @@ fn cmd_skills(sub: SkillsCmd) -> Result<i32> {
                 target,
                 force,
                 dry_run,
+                // (#1426) The standalone `skills install` verb keeps its
+                // force-gated overwrite behavior; only `darkmux init` opts into
+                // the darkmux-* refresh.
+                refresh_darkmux: false,
             })?;
             println!("source: {}", report.source.display());
             println!(

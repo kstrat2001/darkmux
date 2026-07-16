@@ -46,6 +46,24 @@ pub struct DoctorReport {
     pub checks: Vec<Check>,
 }
 
+/// (#1426) A darkmux skill compiled into the binary, threaded into the doctor
+/// from the root crate (which owns the `include_str!` embed) so this crate
+/// stays a pure evaluator. `content` is the reference `SKILL.md` body; the
+/// freshness check byte-compares it against the installed copy, so there is no
+/// hash-algorithm agreement to keep in sync between the producer (the root
+/// crate) and the evaluator (this crate).
+///
+/// This is the caller-supplied-check-input pattern for doctor: `run()` gathers
+/// everything doctor can read for itself, and a check that needs root-crate
+/// state (which this crate cannot depend on) is invoked separately by `main.rs`
+/// with the state passed in and its result appended to the report — the same
+/// shape as `probe_remote_endpoints`, but taking an input.
+#[derive(Debug, Clone)]
+pub struct EmbeddedSkill {
+    pub name: String,
+    pub content: String,
+}
+
 impl DoctorReport {
     pub fn worst_status(&self) -> Status {
         let mut worst = Status::Pass;
@@ -149,6 +167,135 @@ pub fn run() -> DoctorReport {
     ];
     let checks = [checks, eureka_checks()].concat();
     DoctorReport { checks }
+}
+
+/// Name of the installed-skills freshness check (#1426).
+const SKILLS_FRESHNESS_CHECK_NAME: &str = "darkmux skills freshness";
+
+/// (#1426) Compare the installed `darkmux-*` skill directories against the
+/// binary's embedded copies and warn when they drift, so an operator who
+/// upgraded darkmux but never re-ran `darkmux init` learns their skills are
+/// stale from the structural surface rather than by memory. Closes the upgrade
+/// loop: `brew upgrade` -> doctor warns -> `darkmux init` -> clean.
+///
+/// Scope is the `darkmux-*` namespace ONLY — a non-darkmux entry in the skills
+/// directory is the operator's own state and is never inspected or reported
+/// (the namespace contract). Two conditions are surfaced but do NOT warn,
+/// because `darkmux init` cannot resolve either and a warning whose fix_hint
+/// can't fix it is noise:
+///   - an embedded skill that is not installed (a minimal install is a
+///     legitimate operator choice, not drift);
+///   - an installed `darkmux-*` skill the binary no longer bundles (a retired
+///     skill left on disk — `init` refreshes, it does not prune).
+/// The WARN driver is exclusively an installed `darkmux-*` skill whose content
+/// differs from the embedded copy.
+///
+/// Pure evaluator: `targets` (the install directories) and `embedded` (the
+/// reference set) are supplied by the caller (`main.rs`, the root crate that
+/// owns the `include_str!` embed) — this crate cannot depend on the root binary
+/// crate where the skills live.
+pub fn check_installed_skills_freshness(targets: &[PathBuf], embedded: &[EmbeddedSkill]) -> Check {
+    let mut matched = 0usize;
+    let mut stale: Vec<String> = Vec::new();
+    let mut not_installed: Vec<String> = Vec::new();
+
+    for skill in embedded {
+        // Defense in depth: the embedded set is `darkmux-*` by construction,
+        // but assert the namespace contract at the point of read anyway.
+        if !skill.name.starts_with("darkmux-") {
+            continue;
+        }
+        match installed_skill_content(targets, &skill.name) {
+            Some(content) if content == skill.content => matched += 1,
+            Some(_) => stale.push(skill.name.clone()),
+            None => not_installed.push(skill.name.clone()),
+        }
+    }
+
+    // Installed `darkmux-*` skills the binary no longer ships (retired). Scanned
+    // straight from disk, filtered HARD to the `darkmux-*` namespace so a
+    // non-darkmux user skill is never even looked at.
+    let embedded_names: std::collections::HashSet<&str> =
+        embedded.iter().map(|s| s.name.as_str()).collect();
+    let mut retired: Vec<String> = Vec::new();
+    for target in targets {
+        let Ok(entries) = std::fs::read_dir(target) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // NEVER inspect non-`darkmux-*` entries — user state, off-limits.
+            if !name.starts_with("darkmux-") {
+                continue;
+            }
+            if !path.is_dir() || !path.join("SKILL.md").exists() {
+                continue;
+            }
+            let owned = name.to_string();
+            if !embedded_names.contains(name) && !retired.contains(&owned) {
+                retired.push(owned);
+            }
+        }
+    }
+
+    stale.sort();
+    not_installed.sort();
+    retired.sort();
+
+    let mut detail: Vec<String> = vec![format!("{matched} up to date")];
+    if !stale.is_empty() {
+        detail.push(format!("{} stale ({})", stale.len(), stale.join(", ")));
+    }
+    if !not_installed.is_empty() {
+        detail.push(format!(
+            "{} embedded but not installed ({})",
+            not_installed.len(),
+            not_installed.join(", ")
+        ));
+    }
+    if !retired.is_empty() {
+        detail.push(format!(
+            "{} installed but no longer bundled ({})",
+            retired.len(),
+            retired.join(", ")
+        ));
+    }
+    let message = format!("darkmux-* skills: {}", detail.join("; "));
+
+    if stale.is_empty() {
+        Check {
+            name: SKILLS_FRESHNESS_CHECK_NAME.into(),
+            status: Status::Pass,
+            message,
+            hint: None,
+        }
+    } else {
+        Check {
+            name: SKILLS_FRESHNESS_CHECK_NAME.into(),
+            status: Status::Warn,
+            message,
+            hint: Some("installed from an older darkmux — run `darkmux init` to refresh".into()),
+        }
+    }
+}
+
+/// Read the installed `SKILL.md` body for a skill named `name`, searching each
+/// install target in order and returning the first hit. `None` = not installed
+/// in any target (or the directory exists but its `SKILL.md` does not).
+/// An existing-but-unreadable `SKILL.md` returns `Some("")`, which will not
+/// match the embedded copy and is therefore reported as stale — a broken /
+/// partial install that `darkmux init` fixes. (#1426)
+fn installed_skill_content(targets: &[PathBuf], name: &str) -> Option<String> {
+    for target in targets {
+        let skill_md = target.join(name).join("SKILL.md");
+        if skill_md.exists() {
+            return Some(std::fs::read_to_string(&skill_md).unwrap_or_default());
+        }
+    }
+    None
 }
 
 /// Surface profiles whose `runtime.compaction.extras` map still carries
@@ -2906,6 +3053,112 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── (#1426) installed darkmux-* skills freshness ───────────────────────
+
+    /// Write an installed `SKILL.md` for `name` under `target/<name>/`.
+    fn write_installed_skill(target: &std::path::Path, name: &str, body: &str) {
+        let dir = target.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    fn embedded(name: &str, content: &str) -> EmbeddedSkill {
+        EmbeddedSkill {
+            name: name.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn skills_freshness_passes_when_all_match() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().to_path_buf();
+        write_installed_skill(&target, "darkmux-alpha", "body-a");
+        write_installed_skill(&target, "darkmux-beta", "body-b");
+        let embedded_set = vec![embedded("darkmux-alpha", "body-a"), embedded("darkmux-beta", "body-b")];
+
+        let c = check_installed_skills_freshness(&[target], &embedded_set);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.hint.is_none());
+        assert!(c.message.contains("2 up to date"), "{}", c.message);
+    }
+
+    #[test]
+    fn skills_freshness_warns_when_a_file_differs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().to_path_buf();
+        write_installed_skill(&target, "darkmux-alpha", "body-a");
+        // Stale copy of beta — content drifted from the embedded reference.
+        write_installed_skill(&target, "darkmux-beta", "OLD-body-b");
+        let embedded_set = vec![embedded("darkmux-alpha", "body-a"), embedded("darkmux-beta", "body-b")];
+
+        let c = check_installed_skills_freshness(&[target], &embedded_set);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("darkmux-beta"), "{}", c.message);
+        assert!(
+            c.hint.as_deref().unwrap().contains("darkmux init"),
+            "fix_hint points at the refresh command: {:?}",
+            c.hint
+        );
+    }
+
+    #[test]
+    fn skills_freshness_ignores_non_darkmux_dirs_entirely() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().to_path_buf();
+        write_installed_skill(&target, "darkmux-alpha", "body-a");
+        // A decoy operator-owned skill that DIFFERS from nothing darkmux ships —
+        // and whose content would look "stale" if it were ever compared. It must
+        // be invisible to the check.
+        write_installed_skill(&target, "my-personal-skill", "user-owned content");
+        let embedded_set = vec![embedded("darkmux-alpha", "body-a")];
+
+        let c = check_installed_skills_freshness(&[target], &embedded_set);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(
+            !c.message.contains("my-personal-skill"),
+            "non-darkmux entries are never reported: {}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn skills_freshness_informational_when_embedded_not_installed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().to_path_buf();
+        write_installed_skill(&target, "darkmux-alpha", "body-a");
+        // beta is embedded but not installed — a minimal install, not drift.
+        let embedded_set = vec![embedded("darkmux-alpha", "body-a"), embedded("darkmux-beta", "body-b")];
+
+        let c = check_installed_skills_freshness(&[target], &embedded_set);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.hint.is_none());
+        assert!(
+            c.message.contains("embedded but not installed") && c.message.contains("darkmux-beta"),
+            "the not-installed skill is noted informationally: {}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn skills_freshness_notes_retired_installed_skill_without_warning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().to_path_buf();
+        write_installed_skill(&target, "darkmux-alpha", "body-a");
+        // A darkmux-* skill the binary no longer bundles — informational, not a
+        // warn (init refreshes, it does not prune).
+        write_installed_skill(&target, "darkmux-retired", "leftover");
+        let embedded_set = vec![embedded("darkmux-alpha", "body-a")];
+
+        let c = check_installed_skills_freshness(&[target], &embedded_set);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(
+            c.message.contains("no longer bundled") && c.message.contains("darkmux-retired"),
+            "{}",
+            c.message
+        );
+    }
 
     #[test]
     fn openai_base_url_classify_covers_unset_match_and_divergence() {

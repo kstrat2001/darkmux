@@ -80,11 +80,34 @@ const EMBEDDED_SKILLS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The skills compiled into this binary, as `(name, SKILL.md content)`. The
+/// doctor's freshness check (#1426) consumes this via `main.rs` so the
+/// `darkmux-doctor` crate — which cannot depend on this root binary crate —
+/// stays a pure evaluator over caller-supplied input.
+pub fn embedded_skills() -> &'static [(&'static str, &'static str)] {
+    EMBEDDED_SKILLS
+}
+
+/// The directories `darkmux init` installs skills into (`~/.claude/skills`,
+/// `~/.gemini/config/skills`). Exposed so the doctor's freshness check (#1426)
+/// evaluates the same install locations `init` writes, with no target-
+/// resolution logic duplicated into the doctor crate.
+pub fn install_target_dirs() -> Result<Vec<PathBuf>> {
+    default_skills_targets()
+}
+
 #[derive(Debug, Default)]
 pub struct InstallOptions {
     pub target: Option<PathBuf>,
     pub force: bool,
     pub dry_run: bool,
+    /// (#1426) Overwrite an already-installed `darkmux-*` skill even when
+    /// `force` is false. `darkmux init` sets this so a re-run after a binary
+    /// upgrade refreshes the bundled skills (the doctor freshness fix_hint
+    /// depends on the refresh happening). Only ever affects `darkmux-*` names,
+    /// and the installer only ever writes `darkmux-*` skills, so user skills
+    /// are never touched regardless.
+    pub refresh_darkmux: bool,
 }
 
 #[derive(Debug, Default)]
@@ -178,7 +201,11 @@ fn install_from_disk(
         let dst_skill_md = dst_skill_dir.join("SKILL.md");
 
         let already_exists = dst_skill_md.exists();
-        if already_exists && !opts.force {
+        // (#1426) `refresh_darkmux` refreshes an already-installed darkmux-*
+        // skill without requiring --force, so `darkmux init` re-runs pick up
+        // an upgraded binary's skills. Never applies to non-darkmux names.
+        let refresh = opts.refresh_darkmux && skill_name.starts_with("darkmux-");
+        if already_exists && !opts.force && !refresh {
             report.skipped.push(skill_name.clone());
             continue;
         }
@@ -214,7 +241,10 @@ fn install_from_embedded(target: &Path, opts: &InstallOptions) -> Result<Install
         let dst_skill_md = dst_skill_dir.join("SKILL.md");
 
         let already_exists = dst_skill_md.exists();
-        if already_exists && !opts.force {
+        // (#1426) See install_from_disk: refresh darkmux-* skills on init
+        // re-run without requiring --force.
+        let refresh = opts.refresh_darkmux && skill_name.starts_with("darkmux-");
+        if already_exists && !opts.force && !refresh {
             report.skipped.push((*skill_name).to_string());
             continue;
         }
@@ -365,6 +395,7 @@ mod tests {
             target: Some(target.clone()),
             force: false,
             dry_run: false,
+            refresh_darkmux: false,
         })
         .unwrap();
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
@@ -391,6 +422,7 @@ mod tests {
             target: Some(target.clone()),
             force: false,
             dry_run: false,
+            refresh_darkmux: false,
         })
         .unwrap();
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
@@ -415,12 +447,75 @@ mod tests {
             target: Some(target.clone()),
             force: true,
             dry_run: false,
+            refresh_darkmux: false,
         })
         .unwrap();
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
 
         assert!(report.overwritten.contains(&"alpha".to_string()));
         assert_eq!(fs::read_to_string(target.join("alpha/SKILL.md")).unwrap(), "v2-source");
+    }
+
+    /// (#1426) `refresh_darkmux: true` (what `darkmux init` passes) overwrites an
+    /// already-installed `darkmux-*` skill WITHOUT requiring `--force`, so a
+    /// re-run after a binary upgrade refreshes the bundled skills.
+    #[serial_test::serial]
+    #[test]
+    fn refresh_darkmux_overwrites_existing_darkmux_skill_without_force() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("skills");
+        write_skill(&src, "darkmux-alpha", "v2-source");
+        let target = tmp.path().join("dest");
+        fs::create_dir_all(target.join("darkmux-alpha")).unwrap();
+        fs::write(target.join("darkmux-alpha/SKILL.md"), "v1-stale").unwrap();
+
+        unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
+        let report = install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: false,
+            dry_run: false,
+            refresh_darkmux: true,
+        })
+        .unwrap();
+        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
+
+        assert!(report.overwritten.contains(&"darkmux-alpha".to_string()));
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            fs::read_to_string(target.join("darkmux-alpha/SKILL.md")).unwrap(),
+            "v2-source"
+        );
+    }
+
+    /// (#1426) `refresh_darkmux` is scoped to the `darkmux-*` namespace: a
+    /// non-darkmux skill that happens to be in the install source is NOT
+    /// refreshed without `--force` — user state is off-limits by construction.
+    #[serial_test::serial]
+    #[test]
+    fn refresh_darkmux_does_not_touch_non_darkmux_skill_without_force() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("skills");
+        write_skill(&src, "plain-skill", "v2-source");
+        let target = tmp.path().join("dest");
+        fs::create_dir_all(target.join("plain-skill")).unwrap();
+        fs::write(target.join("plain-skill/SKILL.md"), "user-owned").unwrap();
+
+        unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
+        let report = install_skills(&InstallOptions {
+            target: Some(target.clone()),
+            force: false,
+            dry_run: false,
+            refresh_darkmux: true,
+        })
+        .unwrap();
+        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
+
+        assert!(report.skipped.contains(&"plain-skill".to_string()));
+        assert!(report.overwritten.is_empty());
+        assert_eq!(
+            fs::read_to_string(target.join("plain-skill/SKILL.md")).unwrap(),
+            "user-owned"
+        );
     }
 
     #[serial_test::serial]
@@ -436,6 +531,7 @@ mod tests {
             target: Some(target.clone()),
             force: false,
             dry_run: true,
+            refresh_darkmux: false,
         })
         .unwrap();
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
@@ -461,6 +557,7 @@ mod tests {
             target: Some(target.clone()),
             force: false,
             dry_run: false,
+            refresh_darkmux: false,
         })
         .unwrap();
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
@@ -484,6 +581,7 @@ mod tests {
             target: Some(target.clone()),
             force: false,
             dry_run: false,
+            refresh_darkmux: false,
         });
         env::set_current_dir(prev).unwrap();
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
