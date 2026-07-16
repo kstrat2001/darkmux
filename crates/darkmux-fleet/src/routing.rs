@@ -273,7 +273,7 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
                 matches_was_explicit: true,
             } => {
                 eprintln!(
-                    "darkmux crew dispatch: --machine={target} matches local machine_id; \
+                    "darkmux dispatch: --machine={target} matches local machine_id; \
                      routing locally."
                 );
             }
@@ -288,7 +288,7 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
-                        "darkmux crew dispatch: WARNING — local DARKMUX_MACHINE_ID is unresolvable. \
+                        "darkmux dispatch: WARNING — local DARKMUX_MACHINE_ID is unresolvable. \
                          --machine={target} routes via the queue regardless. \
                          If you intended a local dispatch, set DARKMUX_MACHINE_ID to make \
                          tier-routing decisions deterministic."
@@ -333,7 +333,7 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
 /// Publish a dispatch to the single global fleet work queue instead of
 /// running it locally (#246 PR-C.3). Called from `dispatch_routed` when
 /// `opts.machine` is set to a non-local id. If `opts.wait` is true (the
-/// default for `crew dispatch`), blocks on the runner's
+/// default for `dispatch`), blocks on the runner's
 /// `dispatch.complete` flow record before returning; otherwise returns
 /// immediately with a fire-and-forget synthetic result.
 /// `target_machine: Some(id)` stamps the WorkJob's advisory hint field so
@@ -395,7 +395,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
     let work_id = publish_job(&client, &job).context("publishing WorkJob to fleet queue")?;
 
     eprintln!(
-        "darkmux crew dispatch: published work_id={work_id} \
+        "darkmux dispatch: published work_id={work_id} \
          target_machine={} session={session_id}",
         target_machine.unwrap_or("<any>"),
     );
@@ -420,7 +420,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
     let wait_timeout =
         std::time::Duration::from_secs((opts.timeout_seconds as u64).saturating_add(30));
     eprintln!(
-        "darkmux crew dispatch: waiting for dispatch.complete (session={session_id}, \
+        "darkmux dispatch: waiting for dispatch.complete (session={session_id}, \
          timeout={}s)…",
         wait_timeout.as_secs()
     );
@@ -428,7 +428,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
         .context("waiting for remote dispatch completion")?;
 
     eprintln!(
-        "darkmux crew dispatch: completed session={} result={} wall_ms={:?}",
+        "darkmux dispatch: completed session={} result={} wall_ms={:?}",
         completion.session_id, completion.result_class, completion.wall_ms
     );
 

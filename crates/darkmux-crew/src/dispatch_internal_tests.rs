@@ -200,7 +200,7 @@
         assert_eq!(both["max_completion_tokens"], 8000, "an explicit cap wins");
     }
 
-    /// (#1260, FIX 2) A bare remote `crew dispatch` is metered as ONE
+    /// (#1260, FIX 2) A bare remote `dispatch` is metered as ONE
     /// execution: any positive per-execution allowance admits the single
     /// hosted call; a zero allowance (a hard operator opt-out) refuses it
     /// with a typed error NAMING the bucket, never dispatching off the meter.
@@ -1509,7 +1509,7 @@
         assert_eq!(c.context_window, None);
     }
 
-    // (#632 regression) A `default()` compaction — what bare `crew dispatch`
+    // (#632 regression) A `default()` compaction — what bare `dispatch`
     // and the lab `prompt` provider build — must emit `--context-window`
     // once the guard fills it, so the runtime can derive its compaction
     // threshold instead of hard-erroring.

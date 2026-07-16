@@ -103,7 +103,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         } => cmd_status(profiles.as_deref(), json),
         Cmd::Lab { sub } => lab_cli::cmd_lab(sub),
         // (#1426) `dispatch` promoted to a top-level verb — the task-grain
-        // execution entry. Relocated out of the `crew` family (`crew dispatch`
+        // execution entry. Relocated out of the `crew` family (`dispatch`
         // retired) with the message reshaped to a positional + stdin source.
         Cmd::Dispatch {
             role,
@@ -1349,7 +1349,7 @@ struct DispatchInvocation {
 }
 
 /// (#1426) `darkmux dispatch <role> [MESSAGE]` — the task-grain execution
-/// entry, promoted from the retired `crew dispatch`. The plumbing is unchanged
+/// entry, promoted from the retired `dispatch`. The plumbing is unchanged
 /// (`fleet::dispatch_routed`); only the message source is reshaped: the message
 /// is a positional argument, falls back to stdin when omitted, and can still be
 /// read from a file via `--message-from-file`.

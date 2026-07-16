@@ -205,7 +205,7 @@ pub struct DispatchOpts {
     pub machine: Option<String>,
     /// Whether to block on completion when the dispatch routes to a
     /// remote machine (#246 PR-C.3). `true` — the default for
-    /// `crew dispatch` — tails the local flow stream for the matching
+    /// `dispatch` — tails the local flow stream for the matching
     /// `session_id`'s `dispatch.complete` record and returns the
     /// outcome (preserves today's "spawn, block, see result" CLI
     /// ergonomics). `false` returns immediately with a synthetic
@@ -431,11 +431,11 @@ pub struct DispatchResult {
 /// wall-clock micros component collides (loops faster than the system clock).
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Generate a fresh, unique session id for an unscoped `crew dispatch` call.
+/// Generate a fresh, unique session id for an unscoped `dispatch` call.
 /// Shape: `crew-dispatch-<role>-<unix_micros>-<process_counter>`.
 ///
 /// The micros component distinguishes calls across processes (different
-/// invocations of `darkmux crew dispatch` from a shell each get their own
+/// invocations of `darkmux dispatch` from a shell each get their own
 /// process start time). The counter component distinguishes calls within
 /// the same process (scripted callers or future server backends could call
 /// faster than microsecond resolution allows). Together they guarantee no
@@ -535,7 +535,7 @@ pub(crate) fn resolve_mission_for_phase(phase_id: Option<&str>) -> Option<String
         Ok(s) => Some(s.mission_id),
         Err(_) => {
             eprintln!(
-                "darkmux crew dispatch: phase `{phase_id}` not found; \
+                "darkmux dispatch: phase `{phase_id}` not found; \
                  flow records won't carry a mission_id."
             );
             None

@@ -94,7 +94,7 @@ pub(crate) fn build_review_record(
 const NARRATE_MODEL_ID: &str = "darkmux:qwen3-4b-instruct-2507";
 
 /// Bounded wait for the narrate completion call. This is a raw one-shot
-/// curl POST, not a crew dispatch through `DispatchOpts::timeout_seconds`,
+/// curl POST, not a dispatch through `DispatchOpts::timeout_seconds`,
 /// so there is no natural existing timeout source to share. 120s is a
 /// generous fixed ceiling for a call this small (`max_tokens: 200`), so a
 /// hung or unresponsive LMStudio degrades to the deterministic output
@@ -449,7 +449,7 @@ fn narrate_curl_args(url: &str, payload_str: &str) -> Vec<String> {
 /// (#1413) This call used to emit NO flow records at all (invisible to
 /// every liveness surface) and had no timeout on the curl argv. It now
 /// bookend-guards a `dispatch start`/`dispatch complete`/`dispatch error`
-/// pair (the same vocabulary `crew dispatch` uses, contract 2 in
+/// pair (the same vocabulary `dispatch` uses, contract 2 in
 /// CLAUDE.md) so the call is liveness-visible and every exit path
 /// (success, a `curl`/parse failure, or a panic) fires a matching
 /// terminal record; the curl argv now carries `-m NARRATE_TIMEOUT_SECONDS`
@@ -1106,8 +1106,8 @@ pub(crate) fn phase_review_output_at(
                     phase_id,
                 ),
             );
-            eprintln!("warning: crew dispatch failed ({e}); emitting empty review");
-            return Err(anyhow::anyhow!("crew dispatch failed: {e}"));
+            eprintln!("warning: dispatch failed ({e}); emitting empty review");
+            return Err(anyhow::anyhow!("dispatch failed: {e}"));
         }
     };
 

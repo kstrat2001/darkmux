@@ -1,4 +1,4 @@
-//! Model-selection for crew dispatches (#450 / #590).
+//! Model-selection for dispatches (#450 / #590).
 //!
 //! Capability-scored selection over the profile's `models[]`: matches the
 //! role's requested capability vector ([`crate::types::Role::capabilities`])

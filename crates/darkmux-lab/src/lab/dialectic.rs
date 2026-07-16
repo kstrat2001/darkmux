@@ -1,5 +1,5 @@
 //! (#1222) Dialectic (adversarial) review orchestration — review-bench's
-//! dialectic mode. Three chained crew dispatches per case:
+//! dialectic mode. Three chained dispatches per case:
 //!
 //! ```text
 //! prosecutor(diff + repo) → defender(diff + repo + charges) → judge(record)
@@ -917,7 +917,7 @@ pub fn synthesize_review(charges: &[Charge], rulings: &Rulings) -> Review {
 // ─── the chain ───────────────────────────────────────────────────────────
 
 /// Run one case through prosecutor → defender → judge. `dispatch` performs
-/// one seat's crew dispatch and returns the raw `--json` envelope stdout
+/// one seat's dispatch and returns the raw `--json` envelope stdout
 /// (the closure owns profile/workdir mapping — debug phase: one local 35B
 /// profile fills every seat). Dispatch-level errors propagate; contract
 /// failures degrade honestly (a degenerate prosecutor or an unparseable

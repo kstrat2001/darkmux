@@ -257,7 +257,7 @@ pub fn max_tokens_per_call() -> Option<u32> {
 // ── Remote (hosted-endpoint) dispatch (#1260/#1177) ──
 /// The per-EXECUTION remote token allowance — an execution is one pipeline
 /// stage (the review pipeline's probe pass, each judge pass, the verify pass; a bare
-/// crew dispatch is one execution). Only REMOTE (endpoint-staffed) calls
+/// dispatch is one execution). Only REMOTE (endpoint-staffed) calls
 /// draw from it. Resolves `env(DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) >
 /// config.remote.max_tokens_per_execution > 500000` (operator decision on
 /// #1260 — tokens only, never currency).
@@ -423,7 +423,7 @@ fn flows_dir_default() -> std::path::PathBuf {
 }
 
 /// (#703) Host cache dir for the extracted static `darkmux-runtime` binary,
-/// bind-mounted into operator-named images (`crew dispatch --image <tag>`)
+/// bind-mounted into operator-named images (`dispatch --image <tag>`)
 /// so darkmux can inject its agent into ANY Linux image rather than ship a
 /// per-language image catalog. `~/.darkmux/runtime` (HOME-less fallback
 /// `/tmp/darkmux/runtime`). Internal cache — no env/config override tier.

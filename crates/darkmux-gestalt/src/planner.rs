@@ -24,7 +24,7 @@
 //!   ([`Reason::ForeignDuplicateNoCapacity`]). A foreign copy listed ahead
 //!   of a darkmux copy also no longer shadows it (ownership partitions
 //!   before matching — see [`decide_residency`]).
-//! - **Dispatch preflight** (crew dispatch path): the #408-derived behavior
+//! - **Dispatch preflight** (dispatch path): the #408-derived behavior
 //!   of adopting a foreign resident — reusing it when sufficient, unloading
 //!   and reloading it when undersized — is REMOVED, superseded by the
 //!   operator decision. A user-loaded copy of the right model has unknown

@@ -572,7 +572,7 @@ pub const PROFILES_SCHEMA_VERSION: &str = "1.5";
 ///
 /// `seats` is keyed by **crew role id** (e.g. `"review-probe"`,
 /// `"review-judge"`) — the same role-id vocabulary
-/// `crates/darkmux-crew` already uses for `crew dispatch <role-id>`, so a
+/// `crates/darkmux-crew` already uses for `dispatch <role-id>`, so a
 /// crew assignment slots directly onto existing roles rather than inventing
 /// a parallel naming scheme. **This packet does not validate role ids
 /// against the role manifest registry** — a pipeline's specific seat

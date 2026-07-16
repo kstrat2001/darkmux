@@ -11,7 +11,7 @@
 //! registry LOAD is deliberately lenient on crew content — one bad crew
 //! must not fail the whole registry and take unrelated `--profile`
 //! dispatch down with it). Every consumer that needs a specific crew calls
-//! through here directly: `crew dispatch`, the review-bench `--funnel`
+//! through here directly: `dispatch`, the review-bench `--funnel`
 //! preflight (`resolve_funnel_ctx`), `pr_review`, and `darkmux doctor`'s per-crew
 //! validation check. This mirrors `get_profile`'s loud-named-error style:
 //! every failure names the crew, the seat, the staffing position, and the
@@ -88,7 +88,7 @@ pub struct ResolvedCrew {
 /// crew-side legislation of which profiles are allowed. The v1
 /// "crews are local-only" rejection was a deadline fence around
 /// unimplemented executor branches, not a design position — the executor
-/// (the review, `crew dispatch`) now routes on what the profile
+/// (the review, `dispatch`) now routes on what the profile
 /// declares: endpoint present ⇒ hosted dialect, no cycling, remote token
 /// accounting. Remote models carry no `n_ctx` (#1282 — nothing is loaded
 /// locally), so the `require_n_ctx` gate applies to local staffing only.
