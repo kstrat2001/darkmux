@@ -2018,8 +2018,8 @@ function wtSumPanel(sid){
   if(!d||!d.available)return "";
   const files=d.files||0, adds=d.adds||0, dels=d.dels||0, path=d.path||"";
   const changed=files
-    ? `${files} file${files===1?'':'s'} changed · <span style="color:var(--good)">+${esc(adds)}</span> <span style="color:var(--bad)">−${esc(dels)}</span> vs ${esc(d.base)}`
-    : `no changes yet — the worktree matches ${esc(d.base)}`;
+    ? `${esc(files)} file${files===1?'':'s'} changed · <span style="color:var(--good)">+${esc(adds)}</span> <span style="color:var(--bad)">−${esc(dels)}</span> vs ${esc(d.base)}`
+    : `no tracked changes vs ${esc(d.base)}`;
   const handoff=path
     ? `<div class="wtpath"><code>${esc(path)}</code>
       <button type="button" class="wtcopy" data-act="copywt" data-arg="${esc(path)}">copy path</button>

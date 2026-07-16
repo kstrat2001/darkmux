@@ -3594,17 +3594,26 @@ mod tests {
             panel.contains("if(!document.body.classList.contains('live-mode'))return \"\";"),
             "wtSumPanel must early-return outside live mode (static demo / playback never fetch)"
         );
-        // Every daemon-derived string must pass through esc() — the base ref
-        // label and the worktree path (both the `<code>` text and the zed
-        // href, which is additionally URI-encoded first).
-        for needle in ["${esc(d.base)}", "${esc(path)}", "${esc(encodeURI(path))}"] {
+        // Every daemon-derived value must pass through esc() — the base ref
+        // label, the worktree path (both the `<code>` text and the zed href,
+        // which is additionally URI-encoded first), and the numeric totals
+        // (numbers today, but the panel's invariant is esc-at-the-template-
+        // edge for everything daemon-derived — no unescaped drift).
+        for needle in [
+            "${esc(d.base)}",
+            "${esc(path)}",
+            "${esc(encodeURI(path))}",
+            "${esc(files)}",
+            "${esc(adds)}",
+            "${esc(dels)}",
+        ] {
             assert!(
                 panel.contains(needle),
                 "wtSumPanel lost the esc() wrap on `{needle}` — daemon-derived \
-                 strings must be output-encoded"
+                 values must be output-encoded"
             );
         }
-        for raw in ["${d.base}", "${path}", "${encodeURI(path)}"] {
+        for raw in ["${d.base}", "${path}", "${encodeURI(path)}", "${files}", "${adds}", "${dels}"] {
             assert!(
                 !panel.contains(raw),
                 "wtSumPanel interpolates `{raw}` without esc()"
@@ -5896,7 +5905,10 @@ mod tests {
     }
 
     /// `compute_diff_summary` must count files and sum additions/deletions
-    /// correctly from `git diff --numstat` — and (the #1387 invariant this
+    /// correctly from `git diff --numstat` — including a BINARY file, whose
+    /// numstat line is `-\t-\t<path>`: it counts as a changed FILE but
+    /// contributes nothing to the add/del totals (the `parse_numstat_count`
+    /// "-" arm, pinned here by a direct test). And (the #1387 invariant this
     /// replaces the old cap tests with) it must never read or return diff
     /// TEXT: only the three `u64` totals come back, whatever the change size.
     #[test]
@@ -5915,6 +5927,8 @@ mod tests {
         git(&["config", "user.name", "T"]);
         fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
         fs::write(dir.join("b.txt"), "x\n").unwrap();
+        // A binary file (NUL byte forces git's binary detection).
+        fs::write(dir.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
         git(&["add", "."]);
         git(&["commit", "-m", "base"]);
         let base = String::from_utf8(
@@ -5930,17 +5944,19 @@ mod tests {
         .to_string();
 
         // a.txt: +1/-2 lines (replace both with one new line); b.txt: +1/-0
-        // (append a line). Two files changed, 2 additions, 2 deletions total.
+        // (append a line); blob.bin: modified binary (numstat `-\t-\t...`).
+        // Three files changed, still 2 additions and 2 deletions total.
         fs::write(dir.join("a.txt"), "three\n").unwrap();
         fs::write(dir.join("b.txt"), "x\ny\n").unwrap();
+        fs::write(dir.join("blob.bin"), [0u8, 1, 2, 3, 4]).unwrap();
         git(&["add", "."]);
         git(&["commit", "-m", "change"]);
 
         let (files, adds, dels) =
             compute_diff_summary(dir, &base).expect("compute_diff_summary");
-        assert_eq!(files, 2, "expected two changed files");
-        assert_eq!(adds, 2, "expected 2 total additions");
-        assert_eq!(dels, 2, "expected 2 total deletions");
+        assert_eq!(files, 3, "expected three changed files (two text + one binary)");
+        assert_eq!(adds, 2, "expected 2 total additions (binary contributes none)");
+        assert_eq!(dels, 2, "expected 2 total deletions (binary contributes none)");
     }
 
     #[tokio::test]
