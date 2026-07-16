@@ -86,7 +86,7 @@ The third one is opt-in (the daemon binds localhost by default for safety). To e
 |---|---|---|
 | **[LMStudio](https://lmstudio.ai/)** | Loads/unloads models. darkmux drives it via the `lms` CLI. | macOS / Windows / Linux installer |
 | **At least one model in LMStudio** | Nothing to swap to without one. | Download via the LMStudio UI; verify with `lms ls`. |
-| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime, the default for `darkmux dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the image from GHCR on demand (or `docker build -t darkmux-runtime:latest runtime/` from a source checkout). **Required only for that dispatch + lab path:** the `swap` / `status` / `profiles` core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
+| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime, the default for `darkmux dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the image from GHCR on demand (or `docker build -t darkmux-runtime:latest runtime/` from a source checkout). **Required only for that dispatch + lab path:** the `swap` / `status` / `profile` core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
 
 > **`brew install` needs no toolchain.** Homebrew handles the build for you (and bottled binaries, once published, ship precompiled). The **Rust toolchain** is required only if you build from source (Option B below), which documents `rustup` at its first step.
 
@@ -117,7 +117,7 @@ brew services start darkmux
 
 The brew formula installs both the `darkmux` binary AND a keychain-aware wrapper script (`libexec/darkmux-serve-wrapped`) that resolves `DARKMUX_REDIS_URL` from macOS Keychain at process-start, so the Redis password never lives in the launchd plist. See [the always-on hub guide](docs/guide/always-on-hub.html) for the production-grade setup.
 
-**Scope of the brew install.** What you get: the `darkmux` CLI (swap, profiles, status, doctor, fleet, flow, init), the `serve` daemon, the keychain wrapper, and the bundled skills. The `darkmux-runtime` Docker image that `darkmux dispatch` / `darkmux lab run` need is **not bundled in the formula** but you don't build it by hand: on the first dispatch with no local image, darkmux **pulls the version-pinned image from GHCR on demand** (`ghcr.io/kstrat2001/darkmux-runtime:<version>`, [#759](https://github.com/kstrat2001/darkmux/issues/759)). You just need Docker running. (A `runtime/` source checkout + `docker build` is the offline/dev alternative.) So the brew path is a complete install end to end: the `swap` / `status` / `profiles` core, the hub posture (Redis + serve), **and** local dispatches.
+**Scope of the brew install.** What you get: the `darkmux` CLI (swap, profile, status, doctor, fleet, flow, init), the `serve` daemon, the keychain wrapper, and the bundled skills. The `darkmux-runtime` Docker image that `darkmux dispatch` / `darkmux lab run` need is **not bundled in the formula** but you don't build it by hand: on the first dispatch with no local image, darkmux **pulls the version-pinned image from GHCR on demand** (`ghcr.io/kstrat2001/darkmux-runtime:<version>`, [#759](https://github.com/kstrat2001/darkmux/issues/759)). You just need Docker running. (A `runtime/` source checkout + `docker build` is the offline/dev alternative.) So the brew path is a complete install end to end: the `swap` / `status` / `profile` core, the hub posture (Redis + serve), **and** local dispatches.
 
 **Option B: from source via cargo** (for dev work, contributors, or if you need the `darkmux-runtime` Docker image alongside the binary):
 
@@ -291,7 +291,7 @@ The `m-series-128` provider's rules are empirically validated against lab measur
 docker build -t darkmux-runtime:latest runtime/
 ```
 
-The `lab` subcommand mirrors `dispatch`'s contract — the internal runtime, no external agent runtime to install or configure. The `swap` / `status` / `profiles` subcommands don't depend on any runtime at all. They orchestrate LMStudio directly.
+The `lab` subcommand mirrors `dispatch`'s contract — the internal runtime, no external agent runtime to install or configure. The `swap` / `status` / `profile` subcommands don't depend on any runtime at all. They orchestrate LMStudio directly.
 
 This means **darkmux's profile-multiplexing needs nothing beyond Docker + LMStudio**: `dispatch` ships with a self-contained internal runtime, so a new user never installs a second agent-runtime tool to get going. The empirical findings in the article series were measured against this runtime.
 
@@ -359,10 +359,10 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 **Shipped:**
 
-- ✅ Profile registry + `swap`/`status`/`profiles`/`scan` CLI
+- ✅ Profile registry + `swap`/`status`/`profile list`/`profile scan` CLI
 - ✅ Lab subcommands (`run`/`inspect`/`compare`/`characterize`/`tune`/`runs`), `WorkloadProvider` trait, embedded smoke workloads, always-on cross-layer flow telemetry (#557)
 - ✅ Lab reproducibility (#487): per-run copy-on-write sandbox isolation (source never mutated), `baseline_hash` + `final_hash` content hashing in the run manifest, a fixture registry with `lab register`/`unregister`/`fixtures`/`doctor` verbs, workload `requires_fixture` resolution, and `scripts/lab-init.sh` + the built-in `demo-tiny-py` fixture
-- ✅ Notebook (`notebook draft`/`list`), cross-machine via `DARKMUX_NOTEBOOK_DIR`
+- ✅ Lab notebook (`lab notebook draft`/`list`), cross-machine via `DARKMUX_NOTEBOOK_DIR`
 - ✅ Agent-invocable skills bundle (12 skills including `/darkmux-bootstrap`)
 - ✅ Crew + Role + Mission + Phase schema with SQLite-backed index; `mission propose` + `phase estimate` utility-AI verbs; mission configs + `mission launch` as the config-launched instance-creation path
 - ✅ Per-role `agent.model` pinning (#160) with bake-off-derived defaults; doctor surfaces drift

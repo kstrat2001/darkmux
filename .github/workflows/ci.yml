@@ -281,8 +281,12 @@ jobs:
         run: |
           # 'admin' role family was renamed to 'utility' with NO compat alias —
           # crates/darkmux-crew validate_role_family REJECTS 'admin' at load time.
+          # Scanned set: the user-facing doc surfaces PLUS packaging/ — the
+          # brew formula's caveats are printed to every installing user, and a
+          # retired-verb spelling slipped through there once precisely because
+          # packaging/ was outside this set (#1426 phase-2 gate finding).
           PAT='admin[- ]agent|admin</code>'
-          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ 2>/dev/null); then
+          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null); then
             echo "::error::Retired term in user-facing docs — use 'utility', not 'admin' (the role_family loader rejects 'admin'):"
             echo "$bad"
             exit 1
@@ -304,7 +308,7 @@ jobs:
           # legitimately quote old verbs — excluded by the -v filter; live prose
           # never carries that bold-version marker.
           VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew dispatch)\b'
-          if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
+          if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
             echo "::error::Retired verb spelling in user-facing docs (#1426) — use profile list / profile scan / lab notebook / mission launch review / pipe into mission propose / dispatch (not crew dispatch) / init (not skills):"
             echo "$bad"
             exit 1

@@ -1046,26 +1046,72 @@ fn dispatch_stdin_message_reaches_ack_gate() {
         );
 }
 
-/// (#1426) The TTY guard's sibling branch: with no positional MESSAGE and
-/// stdin NOT a terminal (assert_cmd always pipes stdin), darkmux reads stdin
-/// byte-faithfully rather than hitting the "no message given" terminal-guard.
-/// An empty pipe yields an empty message and the dispatch still reaches the
-/// ACK gate — proving the no-positional, non-TTY branch does not hang and does
-/// not trip the guard. (The guard's error text itself only fires for a real
-/// terminal, which assert_cmd cannot emulate.)
+/// (#1426) Empty piped stdin bails LOUDLY with its own error — distinct from
+/// the terminal-guard's "no message given" text — instead of dispatching a
+/// blank brief (an empty `git diff |` is the most common accident). The
+/// dispatch never starts: no ACK-gate text, no docker.
 #[test]
-fn dispatch_absent_message_non_tty_reads_stdin_not_guard() {
+fn dispatch_empty_stdin_bails_loudly() {
     let ack_dir = TempDir::new().unwrap();
     Command::cargo_bin("darkmux")
         .unwrap()
         .env("DARKMUX_ACK_DIR", ack_dir.path())
         .args(["dispatch", "health-research"])
-        .write_stdin("") // explicit empty pipe → empty message, no hang
+        .write_stdin("") // empty pipe → loud bail, not a blank dispatch
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("requires operator acknowledgment")
-                .and(predicate::str::contains("no message given").not()),
+            predicate::str::contains("stdin was empty")
+                // Distinct from the TTY-absent guard's error.
+                .and(predicate::str::contains("no message given").not())
+                // Bailed before any dispatch machinery.
+                .and(predicate::str::contains("requires operator acknowledgment").not())
+                .and(predicate::str::contains("docker").not()),
+        );
+}
+
+/// (#1426) A whitespace-only pipe (`echo |` produces a lone "\n" — the second
+/// most common accident) gets the same loud empty-stdin bail. The emptiness
+/// check trims for the CHECK only; a message with real content is still
+/// delivered byte-faithfully (covered by dispatch_stdin_message_reaches_ack_gate).
+#[test]
+fn dispatch_whitespace_only_stdin_bails_loudly() {
+    let ack_dir = TempDir::new().unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_ACK_DIR", ack_dir.path())
+        .args(["dispatch", "health-research"])
+        .write_stdin("\n")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("stdin was empty")
+                .and(predicate::str::contains("requires operator acknowledgment").not()),
+        );
+}
+
+/// (#1426) An empty (or whitespace-only) --message-from-file gets the same
+/// trim-empty bail for consistency, with a distinct error naming the file
+/// path — resolved at the top of the handler, before any dispatch setup.
+#[test]
+fn dispatch_empty_message_file_bails_loudly() {
+    let tmp = TempDir::new().unwrap();
+    let brief = tmp.path().join("blank-brief.md");
+    fs::write(&brief, "  \n\n").unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "dispatch",
+            "code-reviewer",
+            "--message-from-file",
+            brief.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("is empty")
+                .and(predicate::str::contains("blank-brief.md"))
+                .and(predicate::str::contains("docker").not()),
         );
 }
 

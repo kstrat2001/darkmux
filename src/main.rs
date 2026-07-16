@@ -1374,14 +1374,29 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     // (#1426) Resolve the message in precedence order: positional MESSAGE >
     // `--message-from-file` > stdin. clap makes the positional and the file
     // flag mutually exclusive, so at most one of the first two is present.
-    // When neither is given, read stdin to EOF byte-faithfully (no trim) so
-    // pipe composition works: `git diff | darkmux dispatch pr-reviewer`. A
-    // terminal stdin with no piped input would block forever waiting for EOF,
-    // so refuse loudly with usage guidance instead of hanging.
+    // When neither is given, read stdin to EOF byte-faithfully (no trim on the
+    // delivered message) so pipe composition works:
+    // `git diff | darkmux dispatch pr-reviewer`. A terminal stdin with no
+    // piped input would block forever waiting for EOF, so refuse loudly with
+    // usage guidance instead of hanging. An empty or whitespace-only source
+    // (empty `git diff`, a stray `echo |`, a blank brief file) likewise bails
+    // loudly rather than burning a container run on a blank brief — the trim
+    // is only the emptiness CHECK; real content is passed through unmodified.
     let message = match (message, message_from_file) {
         (Some(m), _) => m,
-        (None, Some(path)) => std::fs::read_to_string(&path)
-            .with_context(|| format!("reading --message-from-file {}", path.display()))?,
+        (None, Some(path)) => {
+            let m = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading --message-from-file {}", path.display()))?;
+            if m.trim().is_empty() {
+                anyhow::bail!(
+                    "--message-from-file {} is empty (or whitespace-only) — refusing to \
+                     dispatch a blank brief. Write the message into the file, or pass it \
+                     as the positional MESSAGE argument.",
+                    path.display()
+                );
+            }
+            m
+        }
         (None, None) => {
             use std::io::{IsTerminal, Read};
             if std::io::stdin().is_terminal() {
@@ -1397,6 +1412,13 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
             std::io::stdin()
                 .read_to_string(&mut buf)
                 .context("reading the dispatch message from stdin")?;
+            if buf.trim().is_empty() {
+                anyhow::bail!(
+                    "stdin was empty — the pipe produced no message (empty git diff?). \
+                     Pass a positional MESSAGE, pipe non-empty content, or use \
+                     --message-from-file."
+                );
+            }
             buf
         }
     };

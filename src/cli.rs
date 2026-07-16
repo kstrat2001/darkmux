@@ -118,7 +118,9 @@ pub(crate) enum Cmd {
         /// Message body for the dispatch (positional). When omitted, the
         /// message is read from stdin (`git diff | darkmux dispatch
         /// pr-reviewer`); darkmux refuses to run if stdin is a terminal and
-        /// no message was given, rather than hang waiting for input. A
+        /// no message was given, rather than hang waiting for input, and an
+        /// empty or whitespace-only pipe (e.g. an empty `git diff`) is
+        /// refused loudly rather than dispatched as a blank brief. A
         /// message that begins with `-` needs the standard `--` separator:
         /// `darkmux dispatch coder -- -starts-with-dash`.
         message: Option<String>,

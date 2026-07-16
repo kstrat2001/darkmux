@@ -434,6 +434,10 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Generate a fresh, unique session id for an unscoped `dispatch` call.
 /// Shape: `crew-dispatch-<role>-<unix_micros>-<process_counter>`.
 ///
+/// The `crew-dispatch-` prefix is a FROZEN data-contract identifier —
+/// presence tests key on it. It predates the #1426 verb rename (`crew
+/// dispatch` -> `dispatch`); do NOT rename it in a spelling-cleanup sweep.
+///
 /// The micros component distinguishes calls across processes (different
 /// invocations of `darkmux dispatch` from a shell each get their own
 /// process start time). The counter component distinguishes calls within
@@ -714,6 +718,9 @@ pub fn build_dispatch_record_with_payload(
         handle: role_id.to_string(),
         phase_id: phase_id.map(String::from),
         session_id: Some(session_id.to_string()),
+        // FROZEN data-contract value: consumed by the viewer's source join and
+        // test-asserted. Predates the #1426 verb rename (`crew dispatch` ->
+        // `dispatch`); do NOT rename in a spelling-cleanup sweep.
         source: Some("crew_dispatch".to_string()),
         model: model.map(String::from),
         reasoning: None,
