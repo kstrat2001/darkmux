@@ -387,7 +387,7 @@ pub fn launch(
     // immutable borrow of the same map — both read-only, no conflict). The
     // bulk save loop right after this call stays in place as a cheap,
     // idempotent final reconcile.
-    crew::scheduler::run_step_graph(
+    let graph_result = crew::scheduler::run_step_graph(
         &mut steps,
         &tasks_by_id,
         &registry,
@@ -411,7 +411,18 @@ pub fn launch(
                 );
             }
         },
-    )?;
+    );
+
+    // (#1406, F4) A scheduler-level `Err` mid-run would otherwise `?`-return
+    // here with NO finalize, stranding the mission Active with `Running`
+    // phases + steps forever. Reconcile the stranded steps and drive the
+    // mission to a terminal Error status BEFORE propagating the failure —
+    // the failure is still surfaced to the caller (loud, non-zero exit), the
+    // mission board just no longer lies about a dead run being active.
+    if let Err(e) = graph_result {
+        reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e);
+        return Err(e);
+    }
 
     for task in &tasks {
         for step_id in &task.step_ids {
@@ -1233,13 +1244,79 @@ pub(crate) fn lazy_start_phase_for_step(
     }
 }
 
+/// (#1406) Derive each executed phase's finalization outcome from THAT
+/// phase's OWN step statuses, rather than stamping every phase with one
+/// uniform run-level outcome. The old uniform mapping marked a never-started
+/// (`Planned`) phase `Complete` on a `Degraded` run; `finalize_mission` then
+/// called `phase_complete` on a `Planned` phase, which the state machine
+/// refuses, leaving a Closed mission with a permanently `Planned` phase whose
+/// `envelope.json` disagreed with disk. The honest per-phase rules:
+///
+/// - all of the phase's steps `Complete` (and it has at least one) → Complete
+/// - any errored step → Abandoned (errored)
+/// - a phase the scheduler never reached (no started steps) → Abandoned
+/// - any step left non-terminal (`Running`/`Planned`) → Abandoned
+///
+/// A phase is `Complete` ONLY when it genuinely finished. Everything else is
+/// honestly Abandoned — `PhaseOutcomeKind` has no `Error` variant, so an
+/// errored phase abandons, matching the existing terminal status vocabulary.
+/// Only phases that actually had tasks in this run are named (a phase with no
+/// tasks is a freeform/manual phase this launcher doesn't drive).
+fn derive_phase_outcomes(
+    config: &MissionConfig,
+    real_phase_ids: &BTreeMap<String, String>,
+    tasks: &[crew::types::Task],
+    steps: &BTreeMap<String, crew::types::Step>,
+) -> Vec<crew::envelope::PhaseOutcome> {
+    use crew::envelope::PhaseOutcome;
+    config
+        .phases
+        .iter()
+        .filter_map(|p| {
+            let real_id = &real_phase_ids[&p.id];
+            let phase_step_ids: Vec<&str> = tasks
+                .iter()
+                .filter(|t| &t.phase_id == real_id)
+                .flat_map(|t| t.step_ids.iter().map(String::as_str))
+                .collect();
+            if phase_step_ids.is_empty() {
+                // Not an executed phase (no tasks/steps) — nothing to finalize.
+                return None;
+            }
+            let phase_steps: Vec<&crew::types::Step> =
+                phase_step_ids.iter().filter_map(|sid| steps.get(*sid)).collect();
+            let (outcome, reason) = phase_finalization(&phase_steps);
+            Some(PhaseOutcome { phase_id: real_id.clone(), outcome, reason })
+        })
+        .collect()
+}
+
+/// (#1406) The per-phase outcome + provenance for one phase's step slice —
+/// see [`derive_phase_outcomes`] for the rules.
+fn phase_finalization(phase_steps: &[&crew::types::Step]) -> (crew::envelope::PhaseOutcomeKind, Option<String>) {
+    use crew::envelope::PhaseOutcomeKind;
+    let errored = phase_steps.iter().filter(|s| s.status == NodeStatus::Error).count();
+    let any_started = phase_steps.iter().any(|s| s.status != NodeStatus::Planned);
+    let all_complete = !phase_steps.is_empty() && phase_steps.iter().all(|s| s.status == NodeStatus::Complete);
+    if all_complete {
+        (PhaseOutcomeKind::Complete, None)
+    } else if errored > 0 {
+        (PhaseOutcomeKind::Abandoned, Some(format!("{errored} step(s) errored")))
+    } else if !any_started {
+        (PhaseOutcomeKind::Abandoned, Some("phase never started (scheduler did not reach it)".to_string()))
+    } else {
+        (PhaseOutcomeKind::Abandoned, Some("phase did not complete (steps left non-terminal)".to_string()))
+    }
+}
+
 /// Fold the interpreted graph's final step statuses into a
 /// [`crew::envelope::MissionEnvelope`] — the generic (mission-type-
 /// agnostic) status decision: every step Complete → Clean; some Complete
 /// and some Error → Degraded (real output produced, but part of the run was
-/// constrained); every relevant step Error (nothing completed) → Error. See
-/// `envelope.rs`'s own module doc for the phase/mission-outcome mapping
-/// this status feeds into.
+/// constrained); every relevant step Error (nothing completed) → Error.
+/// Per-phase finalization outcomes come from [`derive_phase_outcomes`] — the
+/// run-level `status` is NOT stamped uniformly onto every phase (#1406). See
+/// `envelope.rs`'s own module doc for the phase/mission-outcome mapping.
 fn build_envelope(
     mission_id: &str,
     config: &MissionConfig,
@@ -1283,17 +1360,12 @@ fn build_envelope(
         )
     };
 
-    let executed_phase_ids: Vec<&str> = config
-        .phases
-        .iter()
-        .filter(|p| {
-            let real_id = &real_phase_ids[&p.id];
-            tasks.iter().any(|t| &t.phase_id == real_id)
-        })
-        .map(|p| real_phase_ids[&p.id].as_str())
-        .collect();
-
-    let mut envelope = MissionEnvelope::new(mission_id, status, &executed_phase_ids);
+    // (#1406) Per-phase outcomes derived from each phase's OWN steps — NOT
+    // the run-level `status` stamped uniformly (which marked a never-started
+    // phase Complete on a Degraded run). `new(.., &[])` seeds the schema
+    // version + defaults; the honest phases override the (empty) default.
+    let mut envelope = MissionEnvelope::new(mission_id, status, &[]);
+    envelope.phases = derive_phase_outcomes(config, real_phase_ids, tasks, steps);
     envelope.reason = reason;
     if !errored.is_empty() && !completed.is_empty() {
         envelope.warnings = vec![format!("{} of {} step(s) errored during launch execution", errored.len(), steps.len())];
@@ -1303,6 +1375,79 @@ fn build_envelope(
         "errored_steps": errored,
     });
     envelope
+}
+
+/// (#1406, F4) Error-path reconcile. A scheduler-level `Err` mid-run (a step
+/// kind lookup failure, a `run_bounded` failure) propagates through
+/// `run_step_graph`'s `?` BEFORE the normal finalize runs, leaving steps
+/// persisted as `Running` and the mission Active with `Running` phases
+/// forever — the same stranded-Active drift class an operator hit at scale
+/// (10 Active missions whose phases were stranded `running` with no process
+/// behind them, mobile report 2026-07-16). This brings the failed run to an
+/// honest terminal state, exactly as the review launcher already does by
+/// always finalizing off its captured `Result` (never `?`-propagating past
+/// the finalize): flip every still-`Running` step to `Error` (persisting it),
+/// then finalize the mission with an Error-status envelope whose PER-PHASE
+/// outcomes come from each phase's own steps ([`derive_phase_outcomes`]) — a
+/// phase that fully completed before the failure still reads `Complete`;
+/// everything the failure interrupted or never reached abandons.
+///
+/// Best-effort throughout, matching [`crew::envelope::finalize_mission`]'s
+/// own discipline: the caller still propagates the original `Err`, so the
+/// failure is never swallowed — a persistence hiccup here degrades only the
+/// mission-board VIEW.
+fn reconcile_and_finalize_on_error(
+    mission_id: &str,
+    config: &MissionConfig,
+    real_phase_ids: &BTreeMap<String, String>,
+    tasks: &[crew::types::Task],
+    steps: &mut BTreeMap<String, crew::types::Step>,
+    err: &anyhow::Error,
+) {
+    use crew::envelope::{MissionEnvelope, MissionOutcomeStatus};
+
+    // step id → owning phase id, so a flipped step persists under the right
+    // phase directory.
+    let phase_of_step: BTreeMap<&str, &str> = tasks
+        .iter()
+        .flat_map(|t| t.step_ids.iter().map(move |sid| (sid.as_str(), t.phase_id.as_str())))
+        .collect();
+
+    let mut reconciled = 0usize;
+    for step in steps.values_mut() {
+        if step.status == NodeStatus::Running {
+            step.status = NodeStatus::Error;
+            if step.output.is_none() {
+                step.output = Some("interrupted by a mission-level error before completion".to_string());
+            }
+            reconciled += 1;
+            if let Some(phase_id) = phase_of_step.get(step.id.as_str()) {
+                if let Err(e) = crew::lifecycle::save_step(mission_id, phase_id, step) {
+                    eprintln!(
+                        "{}",
+                        style::dim(&format!("mission launch: reconcile step persist warning: {e:#}"))
+                    );
+                }
+            }
+        }
+    }
+
+    let mut envelope = MissionEnvelope::new(mission_id, MissionOutcomeStatus::Error, &[]);
+    envelope.phases = derive_phase_outcomes(config, real_phase_ids, tasks, steps);
+    envelope.reason = Some(format!("mission launch errored mid-run: {err:#}"));
+    if reconciled > 0 {
+        envelope.warnings =
+            vec![format!("{reconciled} running step(s) reconciled to error on the failure path")];
+    }
+    let completed: Vec<&str> =
+        steps.values().filter(|s| s.status == NodeStatus::Complete).map(|s| s.id.as_str()).collect();
+    let errored: Vec<&str> =
+        steps.values().filter(|s| s.status == NodeStatus::Error).map(|s| s.id.as_str()).collect();
+    envelope.payload = serde_json::json!({
+        "completed_steps": completed,
+        "errored_steps": errored,
+    });
+    crew::envelope::finalize_mission(&envelope);
 }
 
 fn print_run_summary(mission_id: &str, steps: &BTreeMap<String, crew::types::Step>) {

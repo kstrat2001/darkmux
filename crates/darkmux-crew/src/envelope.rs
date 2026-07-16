@@ -70,6 +70,7 @@
 //! indistinguishable from a stuck mission in `darkmux mission status`).
 
 use crate::lifecycle;
+use crate::types::PhaseStatus;
 use serde::{Deserialize, Serialize};
 
 /// Current schema version for `MissionEnvelope` documents. Plain semver
@@ -217,17 +218,25 @@ impl MissionEnvelope {
 /// then close the mission — the generalized #1365 finalization shape,
 /// absorbing `src/pr_review.rs::finalize_review_mission`'s logic.
 ///
-/// Best-effort throughout (`let _ = ...`), matching the discipline
-/// `finalize_review_mission` already established: a persistence hiccup
-/// here must never propagate as a caller-visible error — only the
-/// mission-status/graph-lens VIEW of the run would be degraded, not the
-/// run itself (the run already finished by the time this is called).
+/// Best-effort throughout, matching the discipline `finalize_review_mission`
+/// already established: a persistence hiccup here must never propagate as a
+/// caller-visible error — only the mission-status/graph-lens VIEW of the run
+/// would be degraded, not the run itself (the run already finished by the
+/// time this is called).
 ///
-/// Every phase/mission transition here is IDEMPOTENT-SAFE via the
-/// underlying `lifecycle` verbs' own state-machine guards (e.g.
-/// `phase_complete` on an already-Complete phase bails harmlessly) — this
-/// function never checks current state itself, it just applies the
-/// declared outcome and lets `lifecycle` do the legality check.
+/// (#1406) A refused phase transition is NO LONGER silently swallowed
+/// (`let _`). The underlying `lifecycle` verbs are idempotent-safe via their
+/// own state-machine guards, so a BENIGN no-op — the phase is already in the
+/// terminal state the declared outcome asks for (e.g. a reopen re-finalizing
+/// a phase a prior run already completed) — stays quiet. But a GENUINE drift
+/// refusal — the phase is in a state the declared outcome can't reach (e.g. a
+/// `Planned` phase asked to `Complete`, the exact #1406 bug the honest
+/// per-phase derivation upstream is meant to prevent) — is surfaced as a loud
+/// warning naming the phase, the intended outcome, and the refusal, instead
+/// of leaving a Closed mission whose envelope disagrees with disk with no
+/// signal. This function still applies the declared outcome and lets
+/// `lifecycle` do the legality check; it only inspects current state to
+/// classify a refusal, never to gate the transition.
 ///
 /// (#1284 Packet 3) ALSO persists `envelope` itself via
 /// `lifecycle::save_envelope` (`envelope.json` beside `mission.json`,
@@ -239,12 +248,26 @@ impl MissionEnvelope {
 /// only the VIEW, never the run itself (already finished by this point).
 pub fn finalize_mission(envelope: &MissionEnvelope) {
     for phase in &envelope.phases {
-        match phase.outcome {
-            PhaseOutcomeKind::Complete => {
-                let _ = lifecycle::phase_complete(&phase.phase_id);
-            }
-            PhaseOutcomeKind::Abandoned => {
-                let _ = lifecycle::phase_abandon(&phase.phase_id);
+        let result = match phase.outcome {
+            PhaseOutcomeKind::Complete => lifecycle::phase_complete(&phase.phase_id),
+            PhaseOutcomeKind::Abandoned => lifecycle::phase_abandon(&phase.phase_id),
+        };
+        if let Err(e) = result {
+            // (#1406) Classify the refusal: a phase ALREADY in the outcome's
+            // terminal state is a benign idempotent no-op (a reopen
+            // re-finalizing an already-terminal phase); anything else is real
+            // drift worth a loud, named warning.
+            let already_terminal = matches!(
+                (phase.outcome, lifecycle::load_phase_by_id(&phase.phase_id).map(|p| p.status)),
+                (PhaseOutcomeKind::Complete, Ok(PhaseStatus::Complete))
+                    | (PhaseOutcomeKind::Abandoned, Ok(PhaseStatus::Abandoned))
+            );
+            if !already_terminal {
+                eprintln!(
+                    "warning: mission `{}` finalize could not drive phase `{}` to {:?}: {e:#} \
+                     — phase left as-is; reconcile with `darkmux phase` verbs (#1406)",
+                    envelope.mission_id, phase.phase_id, phase.outcome
+                );
             }
         }
     }
