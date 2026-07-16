@@ -69,6 +69,112 @@ const PRESERVE_TAIL: usize = 4;
 /// are load-bearing for the agent to know what it's doing.
 const PRESERVE_HEAD: usize = 2;
 
+// ─── #1389: compaction hardening (sanitize / floor / min-reduction) ──
+//
+// Three cheap, procedural, output-side guards for the compactor's
+// returned summary. Design convergence with xai-org/grok-build
+// (Apache-2.0), `crates/common/xai-grok-compaction`; independently
+// implemented here, no code copied. All three target failure modes small
+// local compactor models hit harder than frontier ones: echoing their own
+// structural delimiters, returning near-empty degenerate output, and
+// producing a "summary" that barely compresses.
+
+/// (#1389 mechanism 1) Zero-width space (U+200B) inserted to neutralize a
+/// structural delimiter echoed inside a summary body. Invisible to a human
+/// reader; breaks the literal token so the artifact can't prime the NEXT
+/// model turn into emitting a fake structural block.
+const NEUTRALIZE_ZWSP: char = '\u{200B}';
+
+/// (#1389 mechanism 1) Structural delimiter sequences that must not survive
+/// verbatim inside an INSTALLED summary body. grok-build's analog is the
+/// compactor echoing its own `</summary>` tag; ours is the summary echoing
+/// a code fence, the narrative compaction marker, or one of the plain-text
+/// tool-call open markers the promoter scans for — any of which, left
+/// verbatim in the rebuilt context, can prime the next turn into emitting a
+/// fake fence / compaction block / tool call.
+///
+/// KEEP IN SYNC with `plain_text_tool_calls.rs`'s recognized open markers
+/// (the XML / Harmony / bracket-terminator sentinels). A promoter format
+/// added there without a matching entry here would leave a smuggling path;
+/// `sanitize_neutralizes_every_promoter_open_marker` is the guard test.
+const SUMMARY_STRUCTURAL_DELIMITERS: &[&str] = &[
+    "```",                // markdown code fence
+    "[compacted:",        // narrative compaction marker prefix
+    "<tool_call>",        // Qwen 3.x XML tool-call open (plain_text_tool_calls.rs)
+    "<function=",         // XML function open
+    "<|channel|>",        // Harmony channel marker
+    "<|message|>",        // Harmony message marker
+    "<|call|>",           // Harmony call marker
+    "[END_TOOL_REQUEST]", // bracket-format terminator
+];
+
+/// (#1389 mechanism 2) Minimum char count for a summary to be accepted as a
+/// real compaction rather than degenerate output. A cleaned summary under
+/// this floor is treated as a transient compactor failure (retried within
+/// the path's budget, then escalated) instead of being installed and
+/// poisoning the rebuilt context. Deliberately MORE conservative than the
+/// grok-build prior art's 500 chars: darkmux only compacts a LARGE thread,
+/// but a legitimately terse summary of one should not be rejected, so the
+/// floor targets the clearly-degenerate near-empty case and leaves the
+/// barely-compressed case to the min-reduction guard below.
+pub const MIN_SUMMARY_CHARS: usize = 200;
+
+/// (#1389 mechanism 3) Minimum fractional reduction a compaction must
+/// achieve (summary vs. the middle it replaces) to be worth installing.
+/// A summary that shrinks the middle by less than this is all risk (lossy
+/// replacement) and almost no benefit (context barely freed), AND it leaves
+/// the thread near its pre-compaction size so `needs_compaction` re-fires
+/// immediately — a compaction loop. grok-build discards below a 20%
+/// reduction; we match that.
+pub const MIN_REDUCTION_RATIO: f32 = 0.20;
+
+/// (#1389 mechanism 1) Neutralize any structural delimiter the compactor
+/// echoed into its summary, by inserting a zero-width space after the
+/// delimiter's first byte. The text reads identically to a human; the
+/// literal token no longer matches a fence / marker / tool-call scan.
+///
+/// Idempotent: after one pass each delimiter carries the ZWSP and no longer
+/// matches, so a second pass is a no-op. UTF-8 safe: every delimiter starts
+/// with an ASCII byte, so the `[..1]` split is always on a char boundary,
+/// and `str::replace` preserves the (possibly multibyte) surrounding text.
+/// Handles unclosed / malformed / out-of-order tags — each open marker is
+/// neutralized independently, no balanced-tag assumption.
+pub fn sanitize_compactor_summary(summary: &str) -> String {
+    let mut out = summary.to_string();
+    for delim in SUMMARY_STRUCTURAL_DELIMITERS {
+        if !out.contains(delim) {
+            continue;
+        }
+        let mut neutralized =
+            String::with_capacity(delim.len() + NEUTRALIZE_ZWSP.len_utf8());
+        neutralized.push_str(&delim[..1]);
+        neutralized.push(NEUTRALIZE_ZWSP);
+        neutralized.push_str(&delim[1..]);
+        out = out.replace(delim, &neutralized);
+    }
+    out
+}
+
+/// (#1389 mechanism 2) True when a cleaned summary is too short to be a
+/// real compaction. Measured in CHARS (not bytes) so a dense multibyte
+/// summary isn't falsely rejected. Whitespace-only counts as degenerate.
+pub fn is_degenerate_summary(summary: &str) -> bool {
+    summary.trim().chars().count() < MIN_SUMMARY_CHARS
+}
+
+/// (#1389 mechanism 3) True when a compaction did not shrink its input by
+/// at least [`MIN_REDUCTION_RATIO`]. `original_len` is the byte length of
+/// the rendered middle being replaced; `replacement_len` is the byte length
+/// of the installed summary message. A replacement that GREW the content
+/// (ratio negative) or an empty original both count as insufficient.
+pub fn insufficient_reduction(original_len: usize, replacement_len: usize) -> bool {
+    if original_len == 0 {
+        return true;
+    }
+    let ratio = 1.0 - (replacement_len as f32 / original_len as f32);
+    ratio < MIN_REDUCTION_RATIO
+}
+
 /// Operator-tunable compaction config. Constructed on the host from
 /// `profile.runtime.compaction.*` and passed into the runtime as
 /// explicit CLI args (#368) — replaces the pre-fix env-var read path
@@ -498,13 +604,46 @@ pub fn compact(
          (preserving {PRESERVE_HEAD} head + {PRESERVE_TAIL} tail)"
     );
 
-    let response = client.chat(&request)?;
-    let summary = response
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .ok_or_else(|| anyhow!("compactor model returned no content"))?;
+    // (#1389 mechanism 2) Retry-within-budget on a degenerate summary. The
+    // narrative path was single-shot pre-#1389: whatever the compactor
+    // returned got installed. Now a summary that is empty / near-empty after
+    // sanitizing is retried ONCE (transient sampling noise), then escalated
+    // via Err rather than installed. This mirrors the structured path's
+    // retry-then-fail contract; the Err propagates through `run_loop`'s `?`
+    // to the dispatch's existing error envelope (no garbage summary is ever
+    // spliced in).
+    const MAX_NARRATIVE_ATTEMPTS: u32 = 2;
+    let mut attempt: u32 = 0;
+    let summary = loop {
+        attempt += 1;
+        let response = client.chat(&request)?;
+        let raw = response
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .ok_or_else(|| anyhow!("compactor model returned no content"))?;
+        // (#1389 mechanism 1) Neutralize any structural delimiter the summary
+        // echoed BEFORE the floor check + install, so a delimiter-heavy
+        // degenerate output can't sneak past the floor on raw length either.
+        let cleaned = sanitize_compactor_summary(&raw);
+        if is_degenerate_summary(&cleaned) {
+            if attempt < MAX_NARRATIVE_ATTEMPTS {
+                eprintln!(
+                    "darkmux-runtime: compaction #{generation} attempt {attempt} produced a \
+                     degenerate summary ({} chars < {MIN_SUMMARY_CHARS}-char floor) — retrying once (#1389)",
+                    cleaned.trim().chars().count()
+                );
+                continue;
+            }
+            return Err(anyhow!(
+                "compaction #{generation} produced a degenerate summary below the \
+                 {MIN_SUMMARY_CHARS}-char floor after {attempt} attempt(s); not installing it \
+                 as rebuilt context — escalating instead (#1389)"
+            ));
+        }
+        break cleaned;
+    };
 
     eprintln!(
         "darkmux-runtime: compaction #{generation} — summary {} chars",
@@ -516,6 +655,24 @@ pub fn compact(
     // guessing it from a fixed `messages` index (which silently misreports
     // if PRESERVE_HEAD ever changes).
     let replacement_content = format!("[compacted:{generation}] {summary}");
+
+    // (#1389 mechanism 3) Min-reduction guard. If the summary barely shrank
+    // the middle it replaces, discard it and escalate rather than looping
+    // another pass on the same input (re-summarizing identical input yields a
+    // same-size result — a wasted call). `messages` is untouched at this
+    // point, so the Err leaves the conversation intact for the caller's
+    // error path.
+    if insufficient_reduction(middle_rendered.len(), replacement_content.len()) {
+        return Err(anyhow!(
+            "compaction #{generation} shrank the middle by less than {}% \
+             ({} -> {} chars) — discarding and escalating rather than looping another \
+             pass on the same input (#1389)",
+            (MIN_REDUCTION_RATIO * 100.0) as u32,
+            middle_rendered.len(),
+            replacement_content.len()
+        ));
+    }
+
     let summary_chars = replacement_content.len();
     let replacement = Message::user(replacement_content);
     messages.splice(middle_start..middle_end, std::iter::once(replacement));
@@ -649,7 +806,20 @@ pub fn structured_compact(
         capped.compaction_metadata.max_tokens_per_call = Some(b.max_tokens_per_call);
     }
 
-    let markdown = render_structured_output_as_markdown(&capped, middle_count);
+    // (#1389 mechanism 1) Neutralize any structural delimiter a slot value
+    // echoed (a code fence, a tool-call open marker, the narrative marker),
+    // so the installed SYSTEM message can't prime the next turn into emitting
+    // a fake block. Applied to the fully-rendered markdown: our own template
+    // headers (`###`, `**`) aren't in the delimiter set, so only slot content
+    // is touched. The floor + min-reduction guards are deliberately NOT
+    // applied to the structured path — its degenerate-output class is already
+    // handled by the parse -> lexical-repair -> schema-patch -> retry chain
+    // (#401), and a naive length floor would fight that intentional
+    // partial-salvage and false-positive on the fixed markdown boilerplate.
+    let markdown = sanitize_compactor_summary(&render_structured_output_as_markdown(
+        &capped,
+        middle_count,
+    ));
     // Build the synthetic SYSTEM-role replacement message. Per #354
     // Q3: system-message attention bias keeps the compacted state
     // load-bearing across subsequent turns.
@@ -1345,13 +1515,21 @@ mod tests {
     fn dummy_messages_long_enough_to_compact() -> Vec<Message> {
         // PRESERVE_HEAD=2 + 1 middle + PRESERVE_TAIL=4 = 7 minimum.
         // Use 10 to make middle = 4 messages (so we can confirm splice).
+        //
+        // (#1389) The middle-region messages carry LONG content so the
+        // narrative path's min-reduction guard (a real summary must shrink
+        // the middle by >= MIN_REDUCTION_RATIO) is satisfiable with a
+        // realistic summary. Content size is irrelevant to the structured
+        // tests' splice-count / rollback assertions, so enlarging it is safe
+        // across every consumer of this helper.
+        let filler = "detailed step output ".repeat(30); // ~630 chars each
         vec![
             Message::system("you are an agent"),
             Message::user("initial task framing"),
-            Message::user("turn 1 stuff"),
-            Message::user("turn 2 stuff"),
-            Message::user("turn 3 stuff"),
-            Message::user("turn 4 stuff"),
+            Message::user(format!("turn 1 stuff — {filler}")),
+            Message::user(format!("turn 2 stuff — {filler}")),
+            Message::user(format!("turn 3 stuff — {filler}")),
+            Message::user(format!("turn 4 stuff — {filler}")),
             Message::user("turn 5 stuff"),
             Message::user("turn 6 stuff"),
             Message::user("turn 7 stuff"),
@@ -1428,12 +1606,21 @@ mod tests {
     #[serial_test::serial]
     fn compact_tail_boundary_orphans_tool_result() {
         let server = MockServer::start();
+        // (#1389) A realistic summary that clears the degenerate floor; the
+        // middle messages below carry long content so the min-reduction guard
+        // is satisfied (this test's subject is the orphan invariant, not the
+        // guards, so the fixtures are sized to pass them).
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
-            then.status(200)
-                .json_body(chat_response_with_json_content("summary of the middle"));
+            then.status(200).json_body(chat_response_with_json_content(
+                "Read the target file and confirmed the parser entry point. The middle \
+                 turns opened the file, inspected the tokenizer, and located the boundary \
+                 bug. Next step is to patch the slice to clamp to a char boundary and add \
+                 a regression test for the multibyte case before running the suite.",
+            ));
         });
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let middle_filler = "inspected the tokenizer boundary handling ".repeat(15);
 
         // n = 8. Raw middle = [2..4]; raw tail = [4,5,6,7].
         // index 3: assistant WITH tool_calls id="call_A" (raw middle).
@@ -1457,16 +1644,16 @@ mod tests {
         };
         let tool_result = Message {
             role: "tool".into(),
-            content: Some("file contents".into()),
+            content: Some(format!("file contents: {middle_filler}")),
             tool_calls: None,
             tool_call_id: Some("call_A".into()),
             name: None,
             reasoning_content: None,
         };
         let mut messages = vec![
-            Message::system("sys"),          // 0 head
-            Message::user("task"),           // 1 head
-            Message::user("middle step"),    // 2 middle
+            Message::system("sys"),                          // 0 head
+            Message::user("task"),                           // 1 head
+            Message::user(format!("middle step {middle_filler}")), // 2 middle
             assistant_with_call,             // 3 middle — parent
             tool_result,                     // 4 raw tail[0] — must not orphan
             Message::assistant("more work"), // 5 tail
@@ -1513,7 +1700,14 @@ mod tests {
     #[serial_test::serial]
     fn compact_returns_inserted_summary_char_count() {
         let server = MockServer::start();
-        let summary = "Decided to refactor the auth module; ran cargo test (passed).";
+        // (#1389) >= MIN_SUMMARY_CHARS and no structural delimiters, so it
+        // clears the degenerate-summary floor and passes through the
+        // sanitizer unchanged; the enlarged middle (see the helper) clears
+        // the min-reduction guard.
+        let summary = "Decided to refactor the auth module into a dedicated crate. \
+                       Ran cargo test and cargo clippy, both passed clean. Next: wire \
+                       the new crate into the workspace manifest, update the two call \
+                       sites in main, and re-run the full suite before opening the PR.";
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200)
@@ -2975,5 +3169,216 @@ mod tests {
         let md = render_structured_output_as_markdown(&out, 6);
         assert!(md.contains("(0 remaining)"), "saturating sub on turns");
         assert!(md.contains("Cumulative completion tokens: 300000 of 250000 used (0 remaining)"));
+    }
+
+    // ─── #1389: compaction hardening (sanitize / floor / min-reduction) ─
+
+    const ZWSP: char = '\u{200B}';
+
+    #[test]
+    fn sanitize_neutralizes_code_fence() {
+        let s = "here is code:\n```rust\nfn x() {}\n```\ndone";
+        let out = sanitize_compactor_summary(s);
+        assert!(!out.contains("```"), "raw triple-backtick fence must not survive");
+        // The backtick run is broken by a ZWSP, not deleted.
+        assert!(out.contains('`') && out.contains(ZWSP));
+        // Human-readable text (fence stripped of the ZWSP) is unchanged.
+        assert_eq!(out.replace(ZWSP, ""), s);
+    }
+
+    #[test]
+    fn sanitize_neutralizes_compacted_marker() {
+        let s = "the earlier turn wrote [compacted:2] into the log";
+        let out = sanitize_compactor_summary(s);
+        assert!(!out.contains("[compacted:"), "narrative marker must be broken");
+        assert_eq!(out.replace(ZWSP, ""), s, "text is unchanged modulo the ZWSP");
+    }
+
+    #[test]
+    fn sanitize_neutralizes_every_promoter_open_marker() {
+        // Guard: every plain-text tool-call open marker the promoter scans for
+        // must be neutralized so a summary echoing one can't prime a fake tool
+        // call on the next turn. Keep this list aligned with
+        // plain_text_tool_calls.rs.
+        let markers = [
+            "<tool_call>",
+            "<function=",
+            "<|channel|>",
+            "<|message|>",
+            "<|call|>",
+            "[END_TOOL_REQUEST]",
+        ];
+        for m in markers {
+            let s = format!("model said {m} in its summary");
+            let out = sanitize_compactor_summary(&s);
+            assert!(
+                !out.contains(m),
+                "marker `{m}` must be neutralized but survived: {out:?}"
+            );
+            assert_eq!(out.replace(ZWSP, ""), s, "text unchanged modulo the ZWSP");
+        }
+    }
+
+    #[test]
+    fn sanitize_is_idempotent() {
+        let s = "```\ncode\n``` and <tool_call> and [compacted:1]";
+        let once = sanitize_compactor_summary(s);
+        let twice = sanitize_compactor_summary(&once);
+        assert_eq!(once, twice, "second pass must be a no-op");
+    }
+
+    #[test]
+    fn sanitize_preserves_delimiter_free_text() {
+        let s = "A perfectly ordinary summary with no structural tokens at all.";
+        assert_eq!(sanitize_compactor_summary(s), s);
+    }
+
+    #[test]
+    fn sanitize_handles_multibyte_content_around_delimiters() {
+        // Delimiters embedded in CJK / emoji text — the ZWSP insertion is at
+        // the ASCII delimiter boundary, and the multibyte surroundings must
+        // round-trip intact (no mid-codepoint corruption).
+        let s = "実装した 🎉 ```py``` を確認 <tool_call> 完了 🚀";
+        let out = sanitize_compactor_summary(s);
+        assert!(!out.contains("```"));
+        assert!(!out.contains("<tool_call>"));
+        assert_eq!(out.replace(ZWSP, ""), s, "multibyte text round-trips");
+    }
+
+    #[test]
+    fn degenerate_summary_floor_rejects_short_and_empty() {
+        assert!(is_degenerate_summary(""), "empty is degenerate");
+        assert!(is_degenerate_summary("   \n  "), "whitespace-only is degenerate");
+        assert!(is_degenerate_summary("OK."), "one-liner is degenerate");
+        // Just under the floor.
+        assert!(is_degenerate_summary(&"a".repeat(MIN_SUMMARY_CHARS - 1)));
+        // At the floor is accepted.
+        assert!(!is_degenerate_summary(&"a".repeat(MIN_SUMMARY_CHARS)));
+    }
+
+    #[test]
+    fn degenerate_summary_floor_counts_chars_not_bytes() {
+        // MIN_SUMMARY_CHARS multibyte chars = many bytes but exactly the floor
+        // count — must be accepted (the floor measures content, not encoding).
+        let s = "あ".repeat(MIN_SUMMARY_CHARS);
+        assert!(!is_degenerate_summary(&s), "char-count floor, not byte-count");
+    }
+
+    #[test]
+    fn insufficient_reduction_flags_barely_and_grown_summaries() {
+        // 90% reduction — plenty, accepted.
+        assert!(!insufficient_reduction(1000, 100));
+        // exactly 20% reduction — at the floor, accepted.
+        assert!(!insufficient_reduction(1000, 800));
+        // 10% reduction — below floor, rejected.
+        assert!(insufficient_reduction(1000, 900));
+        // grew — rejected.
+        assert!(insufficient_reduction(1000, 1200));
+        // empty original — rejected (nothing to compact / div-by-zero guard).
+        assert!(insufficient_reduction(0, 0));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compact_retries_then_errors_on_degenerate_summary() {
+        // Compactor returns a below-floor summary on BOTH attempts → the
+        // narrative path retries once, then escalates via Err WITHOUT
+        // installing the garbage. messages stay intact for the caller's
+        // error path.
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(chat_response_with_json_content("OK done."));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let original_len = messages.len();
+
+        let result = compact(&client, &mut messages, 1, &CompactionConfig::never_compact());
+        assert!(result.is_err(), "degenerate summary must not be installed");
+        assert!(
+            result.unwrap_err().to_string().contains("degenerate summary"),
+            "error names the floor rejection"
+        );
+        assert_eq!(mock.hits(), 2, "one initial + one retry attempt");
+        assert_eq!(
+            messages.len(),
+            original_len,
+            "messages NOT mutated when the summary is rejected (rollback)"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compact_errors_on_insufficient_reduction_without_looping() {
+        // A summary that clears the floor (>= MIN_SUMMARY_CHARS) but barely
+        // shrinks the middle → escalate via Err rather than looping another
+        // pass. Here the "summary" is LONGER than the small middle, so the
+        // reduction is negative. Exactly ONE compactor call (no re-summarize
+        // of identical input).
+        let server = MockServer::start();
+        let long_summary = "This summary is deliberately verbose and long enough to clear the \
+                            degenerate-output floor, but the conversation middle it replaces is \
+                            tiny, so installing it would barely reduce — or even grow — the \
+                            transcript, which the min-reduction guard must reject outright."
+            .to_string();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(chat_response_with_json_content(&long_summary));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        // SMALL middle: default short messages so the middle renders tiny.
+        let mut messages = vec![
+            Message::system("sys"),
+            Message::user("task"),
+            Message::user("a"),
+            Message::user("b"),
+            Message::user("c"),
+            Message::user("d"),
+            Message::user("e"),
+            Message::user("f"),
+            Message::user("g"),
+            Message::user("h"),
+        ];
+        let original_len = messages.len();
+
+        let result = compact(&client, &mut messages, 1, &CompactionConfig::never_compact());
+        assert!(result.is_err(), "barely-reducing compaction must be discarded");
+        assert!(
+            result.unwrap_err().to_string().contains("less than"),
+            "error names the min-reduction guard"
+        );
+        assert_eq!(mock.hits(), 1, "no re-summarize of identical input");
+        assert_eq!(messages.len(), original_len, "messages NOT mutated on discard");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compact_installs_sanitized_summary_on_good_output() {
+        // A good summary (clears floor + reduction) that ALSO echoes a code
+        // fence gets installed with the fence neutralized (the happy path
+        // still applies the sanitizer).
+        let server = MockServer::start();
+        let good = "Refactored the auth module and verified the change. ```rust\nfn ok(){}\n``` \
+                    Ran the full test suite plus clippy, both clean. Remaining work is to \
+                    update the workspace manifest and re-run before opening the PR for review."
+            .to_string();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(chat_response_with_json_content(&good));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+
+        let summary_chars = compact(&client, &mut messages, 4, &CompactionConfig::never_compact())
+            .expect("good summary installs");
+        assert_eq!(mock.hits(), 1, "one call, no retry on a good summary");
+        let inserted = messages[PRESERVE_HEAD].content.as_ref().unwrap();
+        assert!(inserted.starts_with("[compacted:4] "));
+        assert!(!inserted.contains("```"), "installed summary is sanitized");
+        assert_eq!(summary_chars, inserted.len());
     }
 }

@@ -1048,6 +1048,25 @@ pub fn run(
                     ));
                 }
 
+                // (#1391) Soft-trim OLD oversized tool-result bodies before the
+                // compaction trigger is evaluated. This is a zero-model-call,
+                // purely mechanical byte reclaim (head + tail kept, middle
+                // elided behind a marker) that shrinks the transcript and pushes
+                // the FIRST compaction out — on a tight window that can be one
+                // fewer compaction per dispatch. The recent thread is protected
+                // (see TOOL_RESULT_TRIM_PRESERVE_RECENT), so the model never
+                // loses context it is actively reasoning over. Runs every turn;
+                // idempotent on bodies already reclaimed.
+                let trim_stats =
+                    crate::tool_result_prune::soft_trim_old_tool_results(&mut messages);
+                if trim_stats.results_trimmed > 0 {
+                    eprintln!(
+                        "darkmux-runtime: soft-trimmed {} old tool result(s), reclaiming {} bytes \
+                         of transcript before the compaction check (#1391)",
+                        trim_stats.results_trimmed, trim_stats.bytes_reclaimed
+                    );
+                }
+
                 // (#854) When the endpoint's reported count is stale (frozen
                 // across turns while the thread grew), it can't gate compaction
                 // — it silently suppressed it into a degenerate cycle. Substitute
