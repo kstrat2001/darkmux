@@ -218,24 +218,26 @@ pub(crate) fn build_router_with_worktrees_base(
 /// rather than a parallel builder), so the auth layers below land in exactly
 /// one place.
 ///
-/// **Auth wiring (#881):** when a bearer token is configured
-/// (`darkmux_flow::serve_token_present()`), two gates are added — otherwise the
-/// router is byte-for-byte today's behavior (zero friction for the loopback-only
-/// default install):
-///   - `/diff/:session_id` gets an **always-on** token gate (`route_layer`), so
-///     the most sensitive endpoint (live in-flight source) requires the token
-///     even on loopback.
-///   - a **remote-only** gate (`auth_mw`) wraps the whole router: loopback peers
-///     pass (the operator's own machine + the bundled viewer keep working),
-///     non-loopback peers must present the token. `/health` is always exempt
-///     (doctor's reachability probe). Layered INNER of CORS so preflight is
-///     handled by the CORS layer first.
+/// **Auth wiring (#881, narrowed #1387):** when a bearer token is configured
+/// (`darkmux_flow::serve_token_present()`), a **remote-only** gate (`auth_mw`)
+/// wraps the whole router — otherwise the router is byte-for-byte today's
+/// behavior (zero friction for the loopback-only default install). Loopback
+/// peers pass (the operator's own machine + the bundled viewer keep working),
+/// non-loopback peers must present the token. `/health` is always exempt
+/// (doctor's reachability probe). Layered INNER of CORS so preflight is
+/// handled by the CORS layer first.
 ///
-/// **`/lab/*` auth (#1247 Part 3):** the lab routes ride the SAME remote-only
-/// gate as everything but `/diff` — read-only local-run artifacts are no more
-/// sensitive than flow records, and the lab lens is machine-local by design
-/// (never federated), so there's no reason to single them out for the
-/// always-on `/diff`-style gate.
+/// Prior to #1387 there was a SECOND, always-on gate wrapping only
+/// `/diff/:session_id` (the live-diff endpoint, which shipped worktree source
+/// text over HTTP and required the token even on loopback). That route and
+/// its dedicated gate are retired — `/worktree-summary/:session_id` is its
+/// numbers-only replacement and rides this same general remote-only gate like
+/// every other read route; there is no route-specific gate left in this
+/// router.
+///
+/// **`/lab/*` auth (#1247 Part 3):** the lab routes ride the same remote-only
+/// gate — read-only local-run artifacts are no more sensitive than flow
+/// records, and the lab lens is machine-local by design (never federated).
 pub(crate) fn build_router_full(
     flows_dir: PathBuf,
     worktrees_base: PathBuf,
@@ -248,13 +250,6 @@ pub(crate) fn build_router_full(
         lab_dir,
     };
     let auth_on = darkmux_flow::serve_token_present();
-
-    // /diff is gated unconditionally when a token exists (even on loopback).
-    let diff_route = if auth_on {
-        get(diff_handler).route_layer(from_fn(diff_auth_mw))
-    } else {
-        get(diff_handler)
-    };
 
     // (#925) Keep the long-lived SSE stream route SEPARATE so the per-route
     // request timeout below never applies to it (it's meant to stay open).
@@ -286,7 +281,7 @@ pub(crate) fn build_router_full(
         .route("/lab/runs", get(lab_runs_handler))
         .route("/lab/run/detail", get(lab_run_detail_handler))
         .route("/lab/run/events", get(lab_run_events_handler))
-        .route("/diff/:session_id", diff_route)
+        .route("/worktree-summary/:session_id", get(worktree_summary_handler))
         .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(
             REQUEST_TIMEOUT_SECS,
         )));
@@ -351,17 +346,7 @@ fn request_token_ok(headers: &axum::http::HeaderMap) -> bool {
     tokens_match(presented.trim().as_bytes(), token.expose_for_compare().as_bytes())
 }
 
-/// (#881) Always-on token gate for `/diff/:session_id` — the most sensitive
-/// endpoint (live in-flight agent-produced source), gated even on loopback.
-async fn diff_auth_mw(req: Request, next: Next) -> Response {
-    if request_token_ok(req.headers()) {
-        next.run(req).await
-    } else {
-        unauthorized()
-    }
-}
-
-/// (#881) Remote-only token gate for the rest of the surface. Loopback peers
+/// (#881) Remote-only token gate for the whole read surface. Loopback peers
 /// pass (the operator's own machine + the bundled same-origin viewer keep
 /// working with zero friction); non-loopback peers must present the token.
 /// `/health` is always exempt so doctor's reachability probe (and external
@@ -371,8 +356,7 @@ async fn diff_auth_mw(req: Request, next: Next) -> Response {
 /// **Trust assumption:** "loopback is trusted" holds for darkmux's deployment —
 /// bound directly (no reverse proxy) over a Tailscale tailnet that preserves the
 /// real peer IP. Behind a connection-terminating reverse proxy every peer would
-/// appear loopback and this gate would be bypassed (`/diff` would still be
-/// gated — it ignores `ConnectInfo`). If darkmux ever grows a
+/// appear loopback and this gate would be bypassed. If darkmux ever grows a
 /// multi-tenant/shared-host or behind-proxy mode, revisit this exemption.
 async fn auth_mw(req: Request, next: Next) -> Response {
     if req.uri().path() == "/health" {
@@ -405,8 +389,8 @@ fn bind_requires_token(bind: &str, token_present: bool) -> Result<(), String> {
     } else {
         Err(format!(
             "refusing to bind the serve daemon to a non-loopback address ({bind}) without a token \
-configured — the daemon would expose flow records, machine specs, mission state, and the live \
-git diff of in-flight worktrees to any reachable peer, unauthenticated.\n\
+configured — the daemon would expose flow records, machine specs, mission state, and worktree \
+what-changed summaries of in-flight dispatches to any reachable peer, unauthenticated.\n\
   Fix: set a token — `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` (macOS) \
 plus `daemon_auth_enabled: true` in ~/.darkmux/config.json, OR export DARKMUX_SERVE_TOKEN=… — then \
 re-run. Or bind to 127.0.0.1 (the default) for a loopback-only daemon."
@@ -694,7 +678,7 @@ fn build_startup_banner(
     let non_loopback = !addr.ip().is_loopback();
     if token_present {
         lines.push(format!(
-            "  auth:           {} (remote reads + /diff require a bearer token; loopback open)",
+            "  auth:           {} (remote reads require a bearer token; loopback open)",
             darkmux_types::style::success("token set")
         ));
     } else if non_loopback {
@@ -885,8 +869,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // loopback one (exempt). If this is ever downgraded to a plain
         // `into_make_service()`, `auth_mw` sees no `ConnectInfo`, treats EVERY
         // peer as loopback, and the remote gate becomes a silent no-op. Do not
-        // change without re-checking `auth_mw`. (`/diff` stays gated regardless,
-        // as its `route_layer` doesn't consult `ConnectInfo`.)
+        // change without re-checking `auth_mw`.
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -1038,49 +1021,12 @@ pub fn resolve_session(
     best
 }
 
-/// Compute the git diff for a worktree against its base ref.
-pub fn compute_git_diff(
-    worktree: &StdPath,
-    base: &str,
-) -> Result<(String, Vec<DiffFile>, Vec<String>, bool), String> {
-    // Hard cap on the returned diff text. Applied by STREAMING git's stdout
-    // (below) so a pathological diff never fully materializes in RAM, then
-    // again as a char-boundary truncation on the returned string.
-    const DIFF_TEXT_CAP: usize = 262_144;
-
-    // 1) unified diff text — stream stdout with the cap instead of buffering
-    //    all of it (a stray node_modules / regenerated lockfile / huge binary
-    //    change would otherwise buffer git's entire output before the cap
-    //    discards it). Read at most DIFF_TEXT_CAP+1 bytes; the +1 detects
-    //    that there was more, so the result is marked truncated.
-    let mut child = Command::new("git")
-        .current_dir(worktree)
-        .args(["diff", "--no-color", base])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|_| "git error".to_string())?;
-    let mut diff_bytes: Vec<u8> = Vec::new();
-    let read_result = if let Some(mut out) = child.stdout.take() {
-        use std::io::Read;
-        out.by_ref()
-            .take(DIFF_TEXT_CAP as u64 + 1)
-            .read_to_end(&mut diff_bytes)
-            .map(|_| ())
-            .map_err(|_| "git error".to_string())
-    } else {
-        Ok(())
-    };
-    // Stop + reap git BEFORE propagating a read error, so an I/O failure never
-    // leaks the child. If the diff exceeded the cap we stopped reading, so git
-    // may still be writing into a now-full pipe; `git diff` is read-only (no
-    // index lock), so killing it is safe.
-    let _ = child.kill();
-    let _ = child.wait();
-    read_result?;
-    let diff_text = String::from_utf8_lossy(&diff_bytes).to_string();
-
-    // 2) numstat (additions/deletions per file)
+/// Compute a what-changed SUMMARY for a worktree against its base ref: file
+/// count + total additions/deletions, from `git diff --numstat` alone. This
+/// is the numbers-only replacement (#1387) for the retired `compute_git_diff`
+/// (#756) — it never reads or returns diff TEXT, so worktree source content
+/// never leaves the process, let alone the server.
+pub fn compute_diff_summary(worktree: &StdPath, base: &str) -> Result<(u64, u64, u64), String> {
     let numstat_out = Command::new("git")
         .current_dir(worktree)
         .args(["diff", "--numstat", base])
@@ -1088,56 +1034,23 @@ pub fn compute_git_diff(
         .map_err(|_| "git error".to_string())?;
     let numstat_text = String::from_utf8_lossy(&numstat_out.stdout);
 
-    // 3) untracked files
-    let ls_out = Command::new("git")
-        .current_dir(worktree)
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .output()
-        .map_err(|_| "git error".to_string())?;
-    let untracked: Vec<String> = String::from_utf8_lossy(&ls_out.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .take(200)
-        .map(|s| s.to_string())
-        .collect();
-
-    // Parse numstat lines.
-    let mut files: Vec<DiffFile> = Vec::new();
+    let mut files = 0u64;
+    let mut adds = 0u64;
+    let mut dels = 0u64;
     for line in numstat_text.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() < 3 {
             continue;
         }
-        let additions = parse_numstat_count(parts[0]);
-        let deletions = parse_numstat_count(parts[1]);
-        let path = parts[2].to_string();
-        files.push(DiffFile {
-            path,
-            additions,
-            deletions,
-        });
+        files += 1;
+        if let Some(n) = parse_numstat_count(parts[0]) {
+            adds += n;
+        }
+        if let Some(n) = parse_numstat_count(parts[1]) {
+            dels += n;
+        }
     }
-
-    // Cap diff text at DIFF_TEXT_CAP bytes (char boundary).
-    let mut truncated = false;
-    let diff_text = if diff_text.len() > DIFF_TEXT_CAP {
-        // Truncate at a char boundary.
-        let mut end = DIFF_TEXT_CAP;
-        while end > 0 && !diff_text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == 0 {
-            truncated = true;
-            diff_text.clone()
-        } else {
-            truncated = true;
-            diff_text[..end].to_string()
-        }
-    } else {
-        diff_text
-    };
-
-    Ok((diff_text, files, untracked, truncated))
+    Ok((files, adds, dels))
 }
 
 /// Parse a numstat count field: "-" means binary (null), otherwise parse as u64.
@@ -1149,9 +1062,11 @@ fn parse_numstat_count(s: &str) -> Option<u64> {
     }
 }
 
-/// Diff response struct.
+/// Worktree what-changed summary response (#1387). Numbers + the worktree
+/// path only — never diff content. `path` is what the viewer renders as the
+/// copy/`zed://file/` handoff to the operator's own editor.
 #[derive(serde::Serialize)]
-pub struct DiffResponse {
+pub struct WorktreeSummaryResponse {
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -1160,29 +1075,24 @@ pub struct DiffResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub files: Option<Vec<DiffFile>>,
+    pub files: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub untracked: Option<Vec<String>>,
+    pub adds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub diff: Option<String>,
+    pub dels: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated: Option<bool>,
+    pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
-/// Per-file diff stats.
-#[derive(serde::Serialize)]
-pub struct DiffFile {
-    pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub additions: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deletions: Option<u64>,
-}
-
-/// GET /diff/:session_id — returns the running git diff of a mission-run worktree.
-pub(crate) async fn diff_handler(
+/// GET /worktree-summary/:session_id — file count + aggregate adds/dels for
+/// a mission-run worktree, plus the worktree path (#1387). Replaces the
+/// retired `/diff/:session_id` (#756): that route shipped the worktree's
+/// unified diff TEXT over HTTP behind its own always-on auth gate; this one
+/// returns numbers + the path only, and rides the general remote-read gate
+/// like every other route (see `build_router_full`'s auth-wiring doc).
+pub(crate) async fn worktree_summary_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
@@ -1202,15 +1112,15 @@ pub(crate) async fn diff_handler(
     let (worktree, base, branch) = match resolved {
         Some((wt, b, br)) => (wt, b, br),
         None => {
-            return axum::Json(DiffResponse {
+            return axum::Json(WorktreeSummaryResponse {
                 available: false,
                 session_id: None,
                 base: None,
                 branch: None,
                 files: None,
-                untracked: None,
-                diff: None,
-                truncated: None,
+                adds: None,
+                dels: None,
+                path: None,
                 reason: Some("no mission-run record for session".to_string()),
             })
             .into_response();
@@ -1219,15 +1129,15 @@ pub(crate) async fn diff_handler(
 
     // 2. Security: containment check.
     if !worktree_contained(StdPath::new(&worktree), &worktrees_base) {
-        return axum::Json(DiffResponse {
+        return axum::Json(WorktreeSummaryResponse {
             available: false,
             session_id: None,
             base: None,
             branch: None,
             files: None,
-            untracked: None,
-            diff: None,
-            truncated: None,
+            adds: None,
+            dels: None,
+            path: None,
             reason: Some("worktree outside managed base".to_string()),
         })
         .into_response();
@@ -1235,56 +1145,56 @@ pub(crate) async fn diff_handler(
 
     // 3. Security: base ref validation.
     if !validate_base_ref(&base) {
-        return axum::Json(DiffResponse {
+        return axum::Json(WorktreeSummaryResponse {
             available: false,
             session_id: None,
             base: None,
             branch: None,
             files: None,
-            untracked: None,
-            diff: None,
-            truncated: None,
+            adds: None,
+            dels: None,
+            path: None,
             reason: Some("invalid base ref".to_string()),
         })
         .into_response();
     }
 
-    // 4. Compute diff — three git subprocesses + file scans, offloaded to the
-    // blocking pool so a slow/hung git can't starve the async runtime.
-    let diff_result = tokio::task::spawn_blocking({
+    // 4. Compute the summary — one git subprocess, offloaded to the blocking
+    // pool so a slow/hung git can't starve the async runtime.
+    let summary_result = tokio::task::spawn_blocking({
         let worktree = worktree.clone();
         let base = base.clone();
-        move || compute_git_diff(StdPath::new(&worktree), &base)
+        move || compute_diff_summary(StdPath::new(&worktree), &base)
     })
     .await
-    .unwrap_or_else(|_| Err("diff task panicked".to_string()));
-    let (diff_text, files, untracked, truncated) = match diff_result {
+    .unwrap_or_else(|_| Err("worktree summary task panicked".to_string()));
+    let (files, adds, dels) = match summary_result {
         Ok(r) => r,
         Err(reason) => {
-            return axum::Json(DiffResponse {
+            return axum::Json(WorktreeSummaryResponse {
                 available: false,
                 session_id: None,
                 base: None,
                 branch: None,
                 files: None,
-                untracked: None,
-                diff: None,
-                truncated: None,
+                adds: None,
+                dels: None,
+                path: None,
                 reason: Some(reason),
             })
             .into_response();
         }
     };
 
-    axum::Json(DiffResponse {
+    axum::Json(WorktreeSummaryResponse {
         available: true,
         session_id: Some(session_id),
         base: Some(base),
         branch: Some(branch),
         files: Some(files),
-        untracked: Some(untracked),
-        diff: Some(diff_text),
-        truncated: Some(truncated),
+        adds: Some(adds),
+        dels: Some(dels),
+        path: Some(worktree),
         reason: None,
     })
     .into_response()
@@ -3659,12 +3569,15 @@ mod tests {
         }
     }
 
-    /// (#756) The live-diff panel renders model-authored diff text — it must
-    /// stay output-encoded at the template edge and must never fetch outside
-    /// live mode (playback and the static demo have no daemon). Lock both
-    /// invariants in source so a refactor can't quietly drop them.
+    /// (#1387) The what-changed panel renders daemon-derived strings (the
+    /// worktree path, the base ref) — it must stay output-encoded at the
+    /// template edge and must never fetch outside live mode (playback and
+    /// the static demo have no daemon). Lock both invariants in source so a
+    /// refactor can't quietly drop them. Replaces the retired #756
+    /// `diff_panel_is_live_gated_and_escaped` (the live-diff panel it
+    /// covered no longer exists).
     #[test]
-    fn diff_panel_is_live_gated_and_escaped() {
+    fn wt_sum_panel_is_live_gated_and_escaped() {
         let html = include_str!("../assets/viewer.html");
         // The esc() implementation the assertions below depend on must itself
         // exist — if a refactor drops it, every wrapped interpolation throws
@@ -3674,26 +3587,36 @@ mod tests {
             "viewer.html lost the esc() helper the output-encoding invariant rests on"
         );
         let panel = html
-            .split("function diffPanel(")
+            .split("function wtSumPanel(")
             .nth(1)
-            .expect("viewer.html lost the #756 diffPanel function");
+            .expect("viewer.html lost the #1387 wtSumPanel function");
         assert!(
             panel.contains("if(!document.body.classList.contains('live-mode'))return \"\";"),
-            "diffPanel must early-return outside live mode (static demo / playback never fetch)"
+            "wtSumPanel must early-return outside live mode (static demo / playback never fetch)"
         );
-        // Every record/daemon-derived string must pass through esc() — the
-        // diff body line, the file path chips, and the base ref label.
-        for needle in ["${esc(l)", "${esc(f.path)}", "${esc(d.base)}", "${esc(p)}"] {
+        // Every daemon-derived value must pass through esc() — the base ref
+        // label, the worktree path (both the `<code>` text and the zed href,
+        // which is additionally URI-encoded first), and the numeric totals
+        // (numbers today, but the panel's invariant is esc-at-the-template-
+        // edge for everything daemon-derived — no unescaped drift).
+        for needle in [
+            "${esc(d.base)}",
+            "${esc(path)}",
+            "${esc(encodeURI(path))}",
+            "${esc(files)}",
+            "${esc(adds)}",
+            "${esc(dels)}",
+        ] {
             assert!(
                 panel.contains(needle),
-                "diffPanel lost the esc() wrap on `{needle}` — diff content is \
-                 model-authored text and must be output-encoded"
+                "wtSumPanel lost the esc() wrap on `{needle}` — daemon-derived \
+                 values must be output-encoded"
             );
         }
-        for raw in ["${l}", "${f.path}", "${d.base}", "${d.diff}"] {
+        for raw in ["${d.base}", "${path}", "${encodeURI(path)}", "${files}", "${adds}", "${dels}"] {
             assert!(
                 !panel.contains(raw),
-                "diffPanel interpolates `{raw}` without esc()"
+                "wtSumPanel interpolates `{raw}` without esc()"
             );
         }
     }
@@ -4646,70 +4569,45 @@ mod tests {
         ConnectInfo("10.0.0.9:5555".parse::<SocketAddr>().unwrap())
     }
 
+    /// (#1387) `/worktree-summary/:session_id` (the numbers-only replacement
+    /// for the retired `/diff/:session_id`) must ride the SAME remote-only
+    /// bearer gate as the rest of the read surface — there is no longer a
+    /// route-specific always-on gate anywhere in this router. Mirrors
+    /// `lab_runs_requires_token_from_remote_peer`.
     #[tokio::test]
     #[serial_test::serial]
-    async fn diff_requires_token_when_configured() {
+    async fn worktree_summary_requires_token_from_remote_peer() {
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
         let app = build_router(PathBuf::new());
-        let resp = app
-            .oneshot(Request::builder().uri("/diff/some-session").body(Body::empty()).unwrap())
-            .await
+        let mut req = Request::builder()
+            .uri("/worktree-summary/some-session")
+            .body(Body::empty())
             .unwrap();
+        req.extensions_mut().insert(remote_peer());
+        let resp = app.oneshot(req).await.unwrap();
         unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
-        // /diff is gated even on loopback when a token is set.
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// Companion to the above: unlike the retired `/diff` gate,
+    /// `/worktree-summary` is open on LOOPBACK even when a token is
+    /// configured — a oneshot request has no `ConnectInfo` and is treated
+    /// as loopback, same as every other route on the general gate.
     #[tokio::test]
     #[serial_test::serial]
-    async fn diff_accepts_matching_bearer_token() {
+    async fn worktree_summary_open_on_loopback_even_with_token() {
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
         let app = build_router(PathBuf::new());
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/diff/some-session")
-                    .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                    .uri("/worktree-summary/some-session")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
-        // The matching token passes the gate (the handler then runs).
-        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn diff_rejects_wrong_bearer_token() {
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
-        let app = build_router(PathBuf::new());
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/diff/some-session")
-                    .header("Authorization", "Bearer not-the-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn diff_open_when_no_token_configured() {
-        // Default install: no token → /diff is NOT gated (the bundled viewer
-        // keeps working on loopback).
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
-        let app = build_router(PathBuf::new());
-        let resp = app
-            .oneshot(Request::builder().uri("/diff/some-session").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -5908,7 +5806,9 @@ mod tests {
         }
     }
 
-    // ─── #756: diff endpoint tests ─────────────────────────────────────
+    // ─── #1387: worktree-summary endpoint tests (shared session-resolution
+    // infra below predates it — kept from #756, still exercised by the
+    // current handler) ──────────────────────────────────────────────────
 
     #[test]
     fn validate_base_ref_accepts_valid_refs() {
@@ -6004,12 +5904,15 @@ mod tests {
         assert!(result.is_none(), "expected no match for unknown session");
     }
 
-    /// A diff larger than the 256KB cap must come back truncated and bounded.
-    /// This exercises the streaming read path in `compute_git_diff` (which caps
-    /// git's stdout as it reads instead of buffering the whole diff first) and
-    /// asserts the returned text never exceeds the cap.
+    /// `compute_diff_summary` must count files and sum additions/deletions
+    /// correctly from `git diff --numstat` — including a BINARY file, whose
+    /// numstat line is `-\t-\t<path>`: it counts as a changed FILE but
+    /// contributes nothing to the add/del totals (the `parse_numstat_count`
+    /// "-" arm, pinned here by a direct test). And (the #1387 invariant this
+    /// replaces the old cap tests with) it must never read or return diff
+    /// TEXT: only the three `u64` totals come back, whatever the change size.
     #[test]
-    fn compute_git_diff_caps_a_huge_diff() {
+    fn compute_diff_summary_counts_files_and_totals() {
         let wt = TempDir::new().unwrap();
         let dir = wt.path();
         let git = |args: &[&str]| {
@@ -6022,7 +5925,10 @@ mod tests {
         git(&["init"]);
         git(&["config", "user.email", "t@t.com"]);
         git(&["config", "user.name", "T"]);
-        fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        fs::write(dir.join("b.txt"), "x\n").unwrap();
+        // A binary file (NUL byte forces git's binary detection).
+        fs::write(dir.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
         git(&["add", "."]);
         git(&["commit", "-m", "base"]);
         let base = String::from_utf8(
@@ -6037,69 +5943,28 @@ mod tests {
         .trim()
         .to_string();
 
-        // Commit a file far larger than the 256KB cap, then diff HEAD vs base.
-        fs::write(dir.join("big.txt"), "x".repeat(600 * 1024)).unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-m", "add big"]);
-
-        let (diff_text, _files, _untracked, truncated) =
-            compute_git_diff(dir, &base).expect("compute_git_diff");
-
-        assert!(truncated, "a >256KB diff must be marked truncated");
-        assert!(
-            diff_text.len() <= 262_144,
-            "diff text must be capped at 256KB, was {} bytes",
-            diff_text.len()
-        );
-    }
-
-    /// The other half of the cap contract: a normal sub-cap diff comes back with
-    /// the FULL text and `truncated == false` (guards against a cap-logic change
-    /// silently flipping small diffs to truncated).
-    #[test]
-    fn compute_git_diff_small_diff_not_truncated() {
-        let wt = TempDir::new().unwrap();
-        let dir = wt.path();
-        let git = |args: &[&str]| {
-            Command::new("git")
-                .current_dir(dir)
-                .args(args)
-                .output()
-                .expect("git command");
-        };
-        git(&["init"]);
-        git(&["config", "user.email", "t@t.com"]);
-        git(&["config", "user.name", "T"]);
-        fs::write(dir.join("f.txt"), "one\n").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-m", "base"]);
-        let base = String::from_utf8(
-            Command::new("git")
-                .current_dir(dir)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-        fs::write(dir.join("f.txt"), "two\n").unwrap();
+        // a.txt: +1/-2 lines (replace both with one new line); b.txt: +1/-0
+        // (append a line); blob.bin: modified binary (numstat `-\t-\t...`).
+        // Three files changed, still 2 additions and 2 deletions total.
+        fs::write(dir.join("a.txt"), "three\n").unwrap();
+        fs::write(dir.join("b.txt"), "x\ny\n").unwrap();
+        fs::write(dir.join("blob.bin"), [0u8, 1, 2, 3, 4]).unwrap();
         git(&["add", "."]);
         git(&["commit", "-m", "change"]);
 
-        let (diff_text, _files, _untracked, truncated) =
-            compute_git_diff(dir, &base).expect("compute_git_diff");
-        assert!(!truncated, "a small diff must not be truncated");
-        assert!(diff_text.contains("two"), "diff must carry the full change");
+        let (files, adds, dels) =
+            compute_diff_summary(dir, &base).expect("compute_diff_summary");
+        assert_eq!(files, 3, "expected three changed files (two text + one binary)");
+        assert_eq!(adds, 2, "expected 2 total additions (binary contributes none)");
+        assert_eq!(dels, 2, "expected 2 total deletions (binary contributes none)");
     }
 
     #[tokio::test]
-    // (#881) serial: the always-on /diff gate keys on DARKMUX_SERVE_TOKEN, which
-    // the serial auth tests set/scrub — without this, that token can leak into
-    // this test's build_router window and 401 the request (CI-only race).
+    // (#881) serial: DARKMUX_SERVE_TOKEN is set/scrubbed by the serial auth
+    // tests — without this, that token can leak into this test's
+    // build_router window and 401 the request (CI-only race).
     #[serial_test::serial]
-    async fn diff_handler_returns_available_true_with_git_diff() {
+    async fn worktree_summary_handler_returns_available_true_with_totals() {
         // Create a temp dir acting as the worktrees base containing a real git repo.
         let wt_base = TempDir::new().unwrap();
 
@@ -6149,14 +6014,14 @@ mod tests {
             .stdout;
         let base_ref = String::from_utf8(base_ref).unwrap().trim().to_string();
 
-        // Modify the file and add an untracked one.
+        // Modify the file (no separate untracked file needed — the
+        // #1387 response never enumerates untracked paths).
         fs::write(&test_file, "modified content\n").unwrap();
         Command::new("git")
             .current_dir(&wt_dir)
             .args(["add", "."])
             .output()
             .expect("git add");
-        fs::write(wt_dir.join("new.txt"), "untracked\n").unwrap();
 
         // Create a flows dir with a day file pointing at this worktree.
         let flows_dir = TempDir::new().unwrap();
@@ -6184,7 +6049,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/diff/test-session-1")
+                    .uri("/worktree-summary/test-session-1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6199,33 +6064,24 @@ mod tests {
         assert_eq!(json["session_id"].as_str(), Some("test-session-1"));
         assert!(!json["base"].as_str().unwrap_or("").is_empty());
         assert!(!json["branch"].as_str().unwrap_or("").is_empty());
+        assert_eq!(json["path"].as_str(), Some(wt_dir.to_str().unwrap()));
 
-        // files[] should contain "hello.txt" with additions/deletions.
-        let files = json["files"].as_array().expect("expected files array");
-        assert!(!files.is_empty(), "expected at least one file in files[]");
-        let hello = files.iter().find(|f| f["path"] == "hello.txt");
-        assert!(hello.is_some(), "expected hello.txt in files[]");
+        // One file changed (hello.txt), one line added and one removed.
+        assert_eq!(json["files"].as_u64(), Some(1), "expected one changed file");
+        assert_eq!(json["adds"].as_u64(), Some(1), "expected one addition");
+        assert_eq!(json["dels"].as_u64(), Some(1), "expected one deletion");
 
-        // untracked should contain "new.txt".
-        let untracked = json["untracked"].as_array().expect("expected untracked array");
-        assert!(
-            untracked.iter().any(|u| u == "new.txt"),
-            "expected new.txt in untracked: {untracked:?}"
-        );
-
-        // diff text should contain the change.
-        let diff = json["diff"].as_str().unwrap_or("");
-        assert!(
-            diff.contains("original content") || diff.contains("modified content"),
-            "expected diff text to contain file content; got: {diff}"
-        );
+        // No diff TEXT and no per-file breakdown ever leave the server — the
+        // whole point of #1387.
+        assert!(json.get("diff").is_none(), "response must never carry diff text");
+        assert!(json.get("untracked").is_none(), "response must never carry an untracked list");
     }
 
     #[tokio::test]
-    // (#881) serial — see diff_handler_returns_available_true_with_git_diff:
-    // the /diff gate keys on DARKMUX_SERVE_TOKEN set by the serial auth tests.
+    // (#881) serial — see worktree_summary_handler_returns_available_true_with_totals:
+    // the general remote gate keys on DARKMUX_SERVE_TOKEN set by the serial auth tests.
     #[serial_test::serial]
-    async fn diff_handler_returns_available_false_for_unknown_session() {
+    async fn worktree_summary_handler_returns_available_false_for_unknown_session() {
         let flows_dir = TempDir::new().unwrap();
         // No records at all.
 
@@ -6233,7 +6089,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/diff/nonexistent")
+                    .uri("/worktree-summary/nonexistent")
                     .body(Body::empty())
                     .unwrap(),
             )
