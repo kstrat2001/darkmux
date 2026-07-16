@@ -1138,6 +1138,12 @@ pub fn run(
     let est = crew::step_kinds::FixedEstimator::default();
     let tasks_by_id: std::collections::BTreeMap<String, Task> =
         tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
+    // (#1397) `persist` durably saves each step at ITS OWN transition
+    // (Running at dispatch, Complete/Error at completion) — not just at
+    // the end of the whole run — so a graph-lens page opened mid-run
+    // reads a truthful, non-stale step status instead of the pre-run
+    // `Planned` snapshot. The bulk save loop right after this call stays
+    // in place as a cheap, idempotent final reconcile.
     run_step_graph(
         &mut steps,
         &tasks_by_id,
@@ -1148,6 +1154,14 @@ pub fn run(
         &crew::concurrent_dispatch::lms_host_factory,
         &mut |record| {
             let _ = flow::record(record);
+        },
+        &mut |step| {
+            if let Err(e) = crew::lifecycle::save_step(mission_id, &phase.id, step) {
+                eprintln!(
+                    "{}",
+                    style::dim(&format!("darkmux mission run: step persist warning (transition): {e:#}"))
+                );
+            }
         },
     )?;
 

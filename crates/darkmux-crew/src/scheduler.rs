@@ -306,11 +306,28 @@ pub struct SchedulerReport {
 /// Rejects a cyclic Task graph up front via `detect_cycles` rather than
 /// looping forever on a Task that can never become ready.
 ///
-/// Argument count exceeds clippy's default threshold (8 vs 7) since #1360's
-/// `host_factory` addition — mirrors the same accepted trade-off as
-/// `WorkloadProvider::run()`'s own `#[allow(clippy::too_many_arguments)]`:
-/// each parameter is inherent to the call (graph state, planning inputs,
-/// the emission sink, now the injectable host), not incidental bloat.
+/// Argument count exceeds clippy's default threshold (9 vs 7) since #1360's
+/// `host_factory` addition and #1397's `persist` addition — mirrors the
+/// same accepted trade-off as `WorkloadProvider::run()`'s own
+/// `#[allow(clippy::too_many_arguments)]`: each parameter is inherent to
+/// the call (graph state, planning inputs, the emission sink, the
+/// injectable host, now the durable-persistence hook), not incidental
+/// bloat.
+///
+/// `persist` (#1397 — "persist step transitions at transition time") is
+/// called with the step's OWN post-flip state at each of the three status
+/// transitions this loop performs (`Planned` -> `Running` at dispatch,
+/// `Running` -> `Complete`/`Error` at completion) — immediately after the
+/// matching `emit(step_lifecycle_record(...))` call, so a durable step
+/// file and its flow-record announcement land together. This closes the
+/// mid-run blind window a page opened between transitions used to see: the
+/// pre-#1397 pattern (every caller bulk-`save_step`ing only AFTER
+/// `run_step_graph` returns) left `graph.json` truthfully `planned` for
+/// the ENTIRE run and only jumped to the final state all at once when the
+/// caller's post-run loop ran. A no-op closure (`&mut |_| {}`) is a valid
+/// `persist` for callers with no durable Step storage (most scheduler unit
+/// tests) — the bulk end-of-run save loops every production caller already
+/// runs stay in place as a cheap idempotent reconcile, not the only write.
 #[allow(clippy::too_many_arguments)]
 pub fn run_step_graph(
     steps: &mut BTreeMap<String, Step>,
@@ -321,6 +338,7 @@ pub fn run_step_graph(
     remote_cap: usize,
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
     emit: &mut dyn FnMut(FlowRecord),
+    persist: &mut dyn FnMut(&Step),
 ) -> Result<SchedulerReport> {
     detect_cycles(tasks)?;
 
@@ -350,6 +368,7 @@ pub fn run_step_graph(
             step.status = NodeStatus::Running;
             step.started_ts = Some(now);
             emit(step_lifecycle_record(step, "step start"));
+            persist(step);
         }
         // Re-borrow immutably now that every ready step's status flip is
         // recorded — `gather_inputs` needs `&steps`/`&tasks` (completed
@@ -406,6 +425,7 @@ pub fn run_step_graph(
                     step.completed_ts = Some(finished_at);
                     step.output = Some(job_result.output);
                     emit(step_lifecycle_record(step, "step complete"));
+                    persist(step);
                     report.completed.push(id.clone());
                 }
                 Err(e) => {
@@ -413,6 +433,7 @@ pub fn run_step_graph(
                     step.completed_ts = Some(finished_at);
                     step.output = Some(format!("{e:#}"));
                     emit(step_lifecycle_record(step, "step error"));
+                    persist(step);
                     report.errored.push(id.clone());
                 }
             }
@@ -830,7 +851,18 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let mut emitted = Vec::new();
-        run_step_graph(steps, tasks, &kinds, &facts, &est, 8, &mock_host_factory, &mut |r| emitted.push(r)).unwrap()
+        run_step_graph(
+            steps,
+            tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |r| emitted.push(r),
+            &mut |_step| {},
+        )
+        .unwrap()
     }
 
     #[test]
@@ -929,8 +961,18 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let mut emitted = Vec::new();
-        let err = run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &mock_host_factory, &mut |r| emitted.push(r))
-            .unwrap_err();
+        let err = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |r| emitted.push(r),
+            &mut |_step| {},
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("cycle detected"));
         assert!(emitted.is_empty(), "no step-lifecycle records before the cycle check fires");
         for step in steps.values() {
@@ -946,11 +988,89 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let mut emitted: Vec<FlowRecord> = Vec::new();
-        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &mock_host_factory, &mut |r| emitted.push(r)).unwrap();
+        run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |r| emitted.push(r),
+            &mut |_step| {},
+        )
+        .unwrap();
 
         let actions: Vec<&str> = emitted.iter().map(|r| r.action.as_str()).collect();
         assert!(actions.contains(&"step start"));
         assert!(actions.contains(&"step complete"));
+    }
+
+    /// (#1397) The scheduler persists each step's OWN post-flip state at
+    /// transition time — `Running` at dispatch, `Complete`/`Error` at
+    /// completion — not just at the end of the whole run. A `persist`
+    /// closure that snapshots the step it's handed (cloned, since the
+    /// real step keeps mutating after each call) proves this: by the time
+    /// `run_step_graph` returns, the FIRST recorded snapshot for this
+    /// step must already show `Running` (not `Planned`), matching what a
+    /// mid-run page-open would have read from disk before the run
+    /// finished.
+    #[test]
+    fn run_step_graph_persists_running_before_the_step_completes() {
+        let (task_a, step_a) = task_and_step("a", &[]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut emitted: Vec<FlowRecord> = Vec::new();
+        let mut persisted: Vec<Step> = Vec::new();
+        run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |r| emitted.push(r),
+            &mut |step| persisted.push(step.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(persisted.len(), 2, "one persist call at Running, one at Complete: {persisted:?}");
+        assert_eq!(persisted[0].status, NodeStatus::Running, "first persisted snapshot must be Running, not Planned");
+        assert!(persisted[0].started_ts.is_some());
+        assert_eq!(persisted[1].status, NodeStatus::Complete);
+        assert!(persisted[1].completed_ts.is_some());
+    }
+
+    /// (#1397) An errored step is ALSO persisted at its transition — the
+    /// hook fires on every terminal status, not just the happy path.
+    #[test]
+    fn run_step_graph_persists_error_status_at_transition() {
+        let (task_fails, mut step_fails) = task_and_step("fails", &[]);
+        step_fails.kind = "procedural.shell".to_string();
+        step_fails.config = json!({"command": "exit 1"});
+        let (tasks, mut steps) = graph(vec![(task_fails, step_fails)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut emitted: Vec<FlowRecord> = Vec::new();
+        let mut persisted: Vec<Step> = Vec::new();
+        run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |r| emitted.push(r),
+            &mut |step| persisted.push(step.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(persisted.last().unwrap().status, NodeStatus::Error);
     }
 
     #[test]

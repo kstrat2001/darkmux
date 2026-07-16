@@ -384,6 +384,14 @@ pub fn launch(
         tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
     let facts = crew::step_kinds::Facts::default();
     let est = crew::step_kinds::FixedEstimator::default();
+    // (#1397) `persist` durably saves each step at ITS OWN transition
+    // (Running at dispatch, Complete/Error at completion), not just at the
+    // end of the whole run — see `run_step_graph`'s own doc. The phase id
+    // isn't on `Step` itself, so it's resolved per-call from the owning
+    // Task via `tasks_by_id` (borrowed here, alongside the scheduler's own
+    // immutable borrow of the same map — both read-only, no conflict). The
+    // bulk save loop right after this call stays in place as a cheap,
+    // idempotent final reconcile.
     crew::scheduler::run_step_graph(
         &mut steps,
         &tasks_by_id,
@@ -394,6 +402,18 @@ pub fn launch(
         &crew::concurrent_dispatch::lms_host_factory,
         &mut |record| {
             let _ = flow::record(record);
+        },
+        &mut |step| {
+            let phase_id = tasks_by_id
+                .get(&step.task_id)
+                .map(|t| t.phase_id.as_str())
+                .unwrap_or_default();
+            if let Err(e) = crew::lifecycle::save_step(&mission_id, phase_id, step) {
+                eprintln!(
+                    "{}",
+                    style::dim(&format!("mission launch: step persist warning (transition): {e:#}"))
+                );
+            }
         },
     )?;
 

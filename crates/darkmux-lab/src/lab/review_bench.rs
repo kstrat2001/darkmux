@@ -990,6 +990,9 @@ fn run_funnel_case(
     let staffing_snapshot =
         review::staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.crew.request_changes);
 
+    // (#1397) A bench run mints no real Mission — lab-vs-fleet boundary —
+    // so there is nothing to persist a Step to; `persist` is a no-op here,
+    // same as `run_review_graph`'s own tests.
     let (env, _steps) = review::run_review_graph(
         &step_ctx,
         &ctx.crew.name,
@@ -998,6 +1001,7 @@ fn run_funnel_case(
         staffing_snapshot,
         graph,
         emitter,
+        &mut |_step| {},
     )
     .with_context(|| format!("running review graph for case {}", c.id))?;
     let review = review_from_funnel(&env);

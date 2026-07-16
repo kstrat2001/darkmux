@@ -4916,6 +4916,23 @@ pub fn build_review_graph(
 /// caller can persist the final Step records — `darkmux mission status`/the
 /// graph lens must show what actually happened, never the pre-run
 /// `Planned` snapshot `build_review_graph` produced.
+/// `persist` (#1397 — "the review pipeline may not run through the crew
+/// scheduler; check how `run_review_graph` executes its steps" — it DOES,
+/// via the same `run_step_graph` call `mission_run.rs`/`mission_launch.rs`
+/// use, so it gets the identical transition-time persistence hook rather
+/// than a bespoke one) fires at every step's OWN status flip — `Running`
+/// at dispatch, `Complete`/`Error` at completion — mirroring
+/// `run_step_graph`'s own `persist` doc exactly, since this function is a
+/// thin pass-through to that call. This module deliberately has no
+/// `mission_id`/`darkmux_crew::lifecycle` dependency of its own (see the
+/// module doc's crate-boundary note) — `persist` is how the CALLER (
+/// `mission_launch_review::run_dispatch`, which owns the minted
+/// `mission_id`) gets durable per-transition Step saves without this
+/// driver knowing what a Mission is. A no-op closure (`&mut |_| {}`) is a
+/// valid `persist` for callers with no durable Step storage (every test in
+/// this module, and `darkmux lab review-bench`'s per-run-local bench path,
+/// which mints no real Mission — lab-vs-fleet boundary).
+#[allow(clippy::too_many_arguments)]
 pub fn run_review_graph(
     ctx: &ReviewStepContext,
     crew_name: &str,
@@ -4924,6 +4941,7 @@ pub fn run_review_graph(
     staffing: CrewStaffingSnapshot,
     graph: BuiltReviewGraph,
     emitter: &mut dyn ReviewEmitter,
+    persist: &mut dyn FnMut(&Step),
 ) -> Result<(ReviewEnvelope, std::collections::BTreeMap<String, Step>)> {
     let BuiltReviewGraph {
         tasks,
@@ -4990,6 +5008,7 @@ pub fn run_review_graph(
             }
             emitter.emit(record);
         },
+        persist,
     );
 
     // Merge the probe stage's NOW-populated accumulators (every probe step
@@ -7451,6 +7470,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             staffing_snap,
             graph,
             emitter,
+            &mut |_step| {},
         )?;
         Ok(env)
     }
@@ -7614,9 +7634,17 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), false);
 
         let mut emitter = RecordingEmitter::new();
-        let (env, steps) =
-            run_review_graph(&ctx, "test-crew", ExecMode::Sequential, fingerprint_val, staffing_snap, graph, &mut emitter)
-                .expect("graph run completes even with zero bundles");
+        let (env, steps) = run_review_graph(
+            &ctx,
+            "test-crew",
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            &mut emitter,
+            &mut |_step| {},
+        )
+        .expect("graph run completes even with zero bundles");
 
         assert_eq!(env.bundles, 0);
         assert_eq!(env.deduped_flags, 0);
@@ -7655,6 +7683,63 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             "run_review_graph must not emit its own task-level bookend: {:?}",
             emitter.records.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    /// (#1397) The review pipeline runs through the SAME `run_step_graph`
+    /// call `mission_run.rs`/`mission_launch.rs` use, so it gets the
+    /// identical transition-time persistence hook — proven here the same
+    /// way the crew scheduler's own `run_step_graph_persists_running_
+    /// before_the_step_completes` test proves it: a `persist` closure that
+    /// snapshots (clones) every step it's handed shows the FIRST recorded
+    /// snapshot per step is already `Running` (not the pre-run `Planned`),
+    /// and the LAST is terminal. This is what makes a `mission launch
+    /// review` dispatch's mid-run graph page truthful instead of blind
+    /// until the whole run finishes (composes with #1399 — the flow-record
+    /// half of the same fix).
+    #[test]
+    fn run_review_graph_persists_running_before_terminal_for_every_step() {
+        let crew = valid_crew();
+        let seats = validate_review_crew(&crew).expect("valid crew");
+        let judge = seats.judge.clone();
+        let verify = seats.verify.cloned();
+        let probes: Vec<_> = seats.probes.clone();
+        let ctx = step_ctx(&crew, vec![]);
+
+        let graph = build_review_graph(ctx.clone(), judge.clone(), verify.clone(), &probes, "investigate", "adjudicate", "report", 1)
+            .expect("built-in review config builds cleanly");
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), false);
+
+        let mut emitter = RecordingEmitter::new();
+        let mut persisted: Vec<Step> = Vec::new();
+        let (_env, steps) = run_review_graph(
+            &ctx,
+            "test-crew",
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            &mut emitter,
+            &mut |step| persisted.push(step.clone()),
+        )
+        .expect("graph run completes even with zero bundles");
+
+        assert_eq!(
+            persisted.len(),
+            steps.len() * 2,
+            "one Running persist + one terminal persist per step: {persisted:?}"
+        );
+        for step_id in steps.keys() {
+            let mut snapshots = persisted.iter().filter(|s| &s.id == step_id);
+            let first = snapshots.next().expect("at least one persisted snapshot per step");
+            assert_eq!(first.status, NodeStatus::Running, "step `{step_id}`'s first persisted snapshot must be Running");
+            let last = snapshots.next_back().unwrap_or(first);
+            assert!(
+                matches!(last.status, NodeStatus::Complete | NodeStatus::Error),
+                "step `{step_id}`'s last persisted snapshot must be terminal, got {:?}",
+                last.status
+            );
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════

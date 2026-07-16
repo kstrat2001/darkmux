@@ -878,10 +878,17 @@ fn run_dispatch(
         let fingerprint_val = fingerprint(&judge_identifier, &ctx.judge_system);
         let staffing = staffing_snapshot(&probes, &judge, verify.as_ref(), request_changes);
         let phase_id_of_step = graph.phase_id_of_step.clone();
+        // (#1397) A second clone for the transition-time `persist` closure
+        // below — the post-run loop's own clone stays as the cheap,
+        // idempotent final reconcile every other `run_step_graph` caller
+        // also keeps.
+        let phase_id_of_step_for_persist = graph.phase_id_of_step.clone();
         let mission_id_for_status = mission_id.clone();
         let mission_id_for_steps = mission_id.clone();
+        let mission_id_for_persist = mission_id.clone();
         let crew_name_for_closure = crew_name_for_bookends.clone();
         let report_phase_id_for_closure = report_phase_id.clone();
+        let report_phase_id_for_persist = report_phase_id.clone();
 
         let result = with_dispatch_bookends(
             &mut emitter,
@@ -890,18 +897,40 @@ fn run_dispatch(
             model_for_bookends.as_deref(),
             dispatch_start_extra,
             move |emitter| {
-                run_review_graph(&ctx, &crew_name_for_closure, mode, fingerprint_val, staffing, graph, emitter).map(
-                    |(env, steps)| {
-                        for (step_id, step) in &steps {
-                            let phase_id = phase_id_of_step
-                                .get(step_id)
-                                .map(String::as_str)
-                                .unwrap_or(&report_phase_id_for_closure);
-                            let _ = crew::lifecycle::save_step(&mission_id_for_steps, phase_id, step);
-                        }
-                        env
+                run_review_graph(
+                    &ctx,
+                    &crew_name_for_closure,
+                    mode,
+                    fingerprint_val,
+                    staffing,
+                    graph,
+                    emitter,
+                    // (#1397) Durably persist each step at ITS OWN
+                    // transition (Running at dispatch, Complete/Error at
+                    // completion) — the review pipeline runs through the
+                    // SAME `run_step_graph` call the crew scheduler's other
+                    // callers use, so it gets the identical mid-run
+                    // observability fix: a graph page opened while a probe
+                    // is still dispatching reads that step's real `Running`
+                    // status instead of the pre-run `Planned` snapshot.
+                    &mut |step| {
+                        let phase_id = phase_id_of_step_for_persist
+                            .get(&step.id)
+                            .map(String::as_str)
+                            .unwrap_or(&report_phase_id_for_persist);
+                        let _ = crew::lifecycle::save_step(&mission_id_for_persist, phase_id, step);
                     },
                 )
+                .map(|(env, steps)| {
+                    for (step_id, step) in &steps {
+                        let phase_id = phase_id_of_step
+                            .get(step_id)
+                            .map(String::as_str)
+                            .unwrap_or(&report_phase_id_for_closure);
+                        let _ = crew::lifecycle::save_step(&mission_id_for_steps, phase_id, step);
+                    }
+                    env
+                })
             },
         );
 
