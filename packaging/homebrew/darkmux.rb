@@ -139,7 +139,7 @@ class Darkmux < Formula
 
   test do
     assert_match "darkmux", shell_output("#{bin}/darkmux --version")
-    assert_match "fleet",   shell_output("#{bin}/darkmux fleet --help")
+    assert_match "machine", shell_output("#{bin}/darkmux machine --help")
     assert_match "doctor",  shell_output("#{bin}/darkmux --help")
     # Doctor should run end-to-end without panic; non-zero exit is fine
     # (it'll warn about most checks in a fresh install with no profile + no

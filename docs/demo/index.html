@@ -2195,7 +2195,7 @@ function renderCrumb(){
   const inMissions = state.level==="missions"||state.level==="mission";
   const inLab = state.level==="lab"||state.level==="lab-run";
   // (#1286) The machine memory lens — live probes (kernel counters + lms
-  // metadata via /machine/memory), a third source class distinct from run
+  // metadata via /machine/resources), a third source class distinct from run
   // artifacts (lab) and flow records (fleet/missions).
   const inMachineMem = state.level==="machinemem";
   const lf=$("lens-fleet"), lm=$("lens-missions"), ll=$("lens-lab"), lmm=$("lens-machine");
@@ -3646,14 +3646,14 @@ function renderLab(){
 // it by luck") / red, plus the unified-memory pressure rows.
 //
 // Data-source class (#1286 boundary hygiene): fed by THIS daemon's
-// /machine/memory — live probes (kernel counters + lms metadata), a third
+// /machine/resources — live probes (kernel counters + lms metadata), a third
 // source class distinct from run artifacts (lab lens) and the flow stream
 // (fleet lenses). Read-only; never flow records. The observer-effect
 // constraints hold structurally here: the daemon's gather costs zero model
 // dispatches and stamps its own cost (`gather_ms`, rendered below), and the
 // chart renders on THIS client — off the measured machine when the operator
 // watches from a phone over the tailnet, which is the designed posture.
-let MACHINE_MEM=null;        // last /machine/memory payload
+let MACHINE_MEM=null;        // last /machine/resources payload
 let MACHINE_MEM_ERR=false;   // daemon unreachable / non-200
 let MACHINE_MEM_SIG=null;    // structural signature — the re-render gate
 let MACHINE_MEM_POLLING=false;
@@ -3672,7 +3672,7 @@ async function pollMachineMem(){
   if(state.level!=="machinemem"){ MACHINE_MEM_POLLING=false; return; }
   MACHINE_MEM_POLLING=true;
   try{
-    const r=await fetch("/machine/memory",{headers:{accept:"application/json"}});
+    const r=await fetch("/machine/resources",{headers:{accept:"application/json"}});
     if(r.ok){ MACHINE_MEM=await r.json(); MACHINE_MEM_ERR=false; }
     else MACHINE_MEM_ERR=true;
   }catch(_){ MACHINE_MEM_ERR=true; }
@@ -3738,10 +3738,10 @@ function renderMachineMemModel(m, scale, limit){
 }
 function renderMachineMem(){
   $("logscope").textContent="machine";
-  const hdr=`<div class="stagehdr">machine memory · potential vs current</div>`;
+  const hdr=`<div class="stagehdr">machine resources · potential vs current</div>`;
   const b=MACHINE_MEM;
   if(MACHINE_MEM_ERR&&!b){
-    $("stage").innerHTML=hdr+`<div class="none">daemon not reachable — the machine lens reads live probes via <code>/machine/memory</code> (CLI twin: <code>darkmux model ledger</code>).</div>`;
+    $("stage").innerHTML=hdr+`<div class="none">daemon not reachable — the machine lens reads live probes via <code>/machine/resources</code> (CLI twin: <code>darkmux machine resources</code>).</div>`;
     return;
   }
   if(!b){

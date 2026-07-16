@@ -1,6 +1,6 @@
 ---
 name: darkmux-bootstrap
-description: First-time darkmux setup walkthrough. Detects the operator's hardware tier, looks up the bake-off-validated recommendation, surfaces what needs downloading, helps confirm the profile registry + orchestrator declaration, and validates end state with `darkmux doctor`. Read + propose pattern — operator runs the commands; the skill confirms each step took effect. Run this once on a fresh machine, or any time `darkmux doctor` surfaces structural drift.
+description: First-time darkmux setup walkthrough. Detects the operator's hardware tier, helps author + confirm the profile registry and orchestrator declaration, and validates end state with `darkmux doctor`. Read + propose pattern — operator runs the commands; the skill confirms each step took effect. Run this once on a fresh machine, or any time `darkmux doctor` surfaces structural drift.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*),Bash(lms:*),Read"
 ---
@@ -27,59 +27,32 @@ If any of the three errors:
 
 **Report to operator**: which of the three are alive, which are missing. Don't continue past this step unless `darkmux doctor` returns at least a partial report.
 
-## Step 1 — Detect hardware tier + look up the bake-off recommendation
+## Step 1 — Detect hardware tier
 
 ```bash
-darkmux doctor 2>&1 | grep -E "platform|machine_id|recommendation drift"
+darkmux doctor 2>&1 | grep -E "platform|machine_id"
 ```
 
 Look for:
 - `platform` line names the operator's hardware tier (`m-series-128`, `m-series-64`, `m-series-32`, `generic`)
 - `machine_id` line names the operator's machine identifier
-- `recommendation drift` line names what darkmux thinks should be loaded for this tier
 
-Three outcomes:
+If doctor errors on the platform check, stop and surface the error. Otherwise report the tier, then help the operator get a profile in place for it. Model selection is theirs; they pick from what LMStudio offers. Two ways forward:
 
-**A. Tier has a validated recommendation** (currently `m-series-128`; check `darkmux recommendations show <tier>` for the live list). Pull the registry's pick and report to the operator:
-
-```bash
-darkmux recommendations show <tier>
-```
-
-Then report:
-> Your tier is `<tier>`. The recommendation registry has a validated pick for this hardware class — a primary model and a compactor model selected through a documented bake-off (head-to-head comparison with evaluation criteria recorded before the runs). I'll walk through making sure both are downloaded + profile-registered.
-
-**B. Tier has a `pending-bake-off` status** (currently `m-series-64` / `m-series-32` / `generic`). Tell the operator:
-> Your tier is `<tier>`. The recommendation registry hasn't validated this hardware class yet — no head-to-head comparison has been run on this RAM band ([#117](https://github.com/kstrat2001/darkmux/issues/117) tracks the gap). I'll help you set up *something* sensible, but the model selection is yours: you'll be picking from what LMStudio offers, not from a validated list.
->
-> Two ways forward:
-> - **Scan + suggest**: run `/darkmux-scan-and-suggest` (sibling skill) — it walks through your `lms ls` catalog and proposes profile shapes for each model you have.
-> - **Draft a profile manually**: pick a model from `lms ls`, then `darkmux profile draft <name> -m <model_key> -t mid` to generate a starter profile JSON. Copy the output into `~/.darkmux/profiles.json` and tune.
-
-**C. Doctor errors on the platform check.** Stop and surface the error.
+- **Scan + suggest**: run `/darkmux-scan-and-suggest` (sibling skill), which walks through the `lms ls` catalog and proposes profile shapes for each downloaded model.
+- **Draft a profile manually**: pick a model from `lms ls`, then run `darkmux profile draft <name> -m <model_key> -t mid` to generate a starter profile JSON. Copy the output into `~/.darkmux/profiles.json` and tune.
 
 Continue with the operator's tier.
 
-## Step 2 — Verify the recommended models are downloaded (validated tiers only)
+## Step 2 — Check what models are downloaded
 
-For validated tiers, check whether the registry's recommended models are on disk:
+See what's on disk so the operator can pick from real options when authoring a profile:
 
 ```bash
 lms ls | head -50
 ```
 
-If the recommended models are missing, propose the one-command fix. Read the model ids from the recommendation registry (`darkmux recommendations show <tier>` if you haven't already), then:
-> The recommendation registry says these models should be downloaded for your tier (primary + compactor). Want me to walk you through downloading them? The command is `darkmux model pull-recommended` — it skips already-downloaded models, so safe to run even if one is already present.
-
-**Wait for operator confirmation.** If they say yes, ask them to run:
-
-```bash
-darkmux model pull-recommended
-```
-
-This may take several minutes per model (multi-GB downloads). After it finishes, re-run `lms ls` to confirm the models appear.
-
-For non-validated tiers, skip this step; tell the operator to download whatever models they want via LMStudio.
+If the models the operator wants aren't present, they download them via the LMStudio UI (or `lms get <model>`). Re-run `lms ls` to confirm they appear.
 
 ## Step 3 — Profile registry
 
@@ -91,7 +64,7 @@ darkmux profile list 2>&1 | head -20
 
 Outcomes:
 
-**A. Profiles already exist.** Confirm with the operator that the profile their tier's recommendation expects (check `darkmux recommendations show <tier>` for the expected profile name — `balanced` for `m-series-128` today) is present. Move on.
+**A. Profiles already exist.** Confirm with the operator that a profile suited to their tier is present, then move on.
 
 **B. No profiles file.** The operator hasn't run `darkmux init` yet. Propose:
 > Your profile registry is empty. The default `darkmux init` would create a starter `~/.darkmux/profiles.json` with placeholder profiles. Want to run it?
@@ -100,26 +73,25 @@ Outcomes:
 > darkmux init
 > ```
 
-**C. Profiles file exists but doesn't include the recommended one.** Check `darkmux recommendations show <tier>` for the expected profile name + model id. Propose `darkmux profile draft <profile-name> -m <model-id>` and ask the operator to add it to `~/.darkmux/profiles.json`.
+**C. Profiles file exists but doesn't cover the model the operator wants.** Propose `darkmux profile draft <profile-name> -m <model-id>` (pick a model id from `lms ls`) and ask the operator to add it to `~/.darkmux/profiles.json`.
 
-## Step 4 — Validate the swap path
+## Step 4 — Validate the dispatch path
 
-Once profiles + models are in place, ask the operator to run:
+Once profiles + models are in place, confirm a dispatch can load them and run. A dispatch loads whatever models its profile declares, under the resident RAM budget:
 
 ```bash
-darkmux swap recommended --dry-run
+darkmux lab run quick-q
 ```
 
-This resolves the active hardware tier → validated profile → pre-flight-checks all models are downloaded → shows what the swap would do. **No actual model loads happen with `--dry-run`.**
+This runs a single-turn smoke prompt through the internal runtime, loading the active profile's models on the way.
 
 Three outcomes:
 
-**A. Dry-run succeeds.** The recommendation path is wired up. Ask if the operator wants to swap for real:
-> Looks clean. Drop the `--dry-run` flag to actually load the recommended models?
+**A. The run completes.** The dispatch path is wired up. Move on.
 
-**B. Dry-run errors with rationale.** A non-validated tier — surface the rationale verbatim, ask the operator to pick a profile manually with `darkmux swap <name>`.
+**B. It errors on a missing model.** Back to Step 2: download the model first.
 
-**C. Dry-run errors with missing models.** Back to Step 2.
+**C. It errors on RAM headroom.** Trim the profile's context length so the loadout fits the resident budget, then re-run.
 
 ## Step 5 — Optional: declare the orchestrator
 

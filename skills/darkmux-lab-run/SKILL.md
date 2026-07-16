@@ -19,7 +19,7 @@ If the user's prompt didn't name a workload, surface the list and ask which to r
 
 ## Step 2 — Optional pre-run state
 
-If the user wants to know what stack will be exercised, run `darkmux status` first.
+If the user wants to know what stack will be exercised, run `darkmux machine status` first.
 
 ## Step 3 — Dispatch
 
