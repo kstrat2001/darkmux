@@ -7367,6 +7367,28 @@ mod tests {
         }
     }
 
+    /// (F3, #1397/#1399 gate remediation) The MECHANICAL tie between the
+    /// emit-side vocabulary constant and the page-side consumer: iterates
+    /// `darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS` itself (not
+    /// re-typed literals) and asserts each string appears in the embedded
+    /// mission-graph asset. The test above pins the page against literals
+    /// (covering the phase/mission verbs too, which have no shared Rust
+    /// constant yet); this one guarantees that if the SCHEDULER's canonical
+    /// step vocabulary ever changes, this crate fails to build/pass until
+    /// the page's STATUS_ACTIONS map catches up — the two hand-maintained
+    /// lists (Rust constant, JS map) can no longer drift silently.
+    #[test]
+    fn mission_graph_page_contains_every_scheduler_step_lifecycle_action() {
+        for action in darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS {
+            assert!(
+                MISSION_GRAPH_HTML.contains(&format!("\"{action}\"")),
+                "mission-graph.html's STATUS_ACTIONS map is missing scheduler \
+                 STEP_LIFECYCLE_ACTIONS entry \"{action}\" — the graph lens would silently \
+                 stop animating that step transition"
+            );
+        }
+    }
+
     /// (item 7) Shape test against a REAL review-config-interpreted graph:
     /// loads the embedded `review` mission config, interprets it with a
     /// launcher supplying two probe seats (mirroring how `pr-review run`

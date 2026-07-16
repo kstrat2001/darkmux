@@ -98,6 +98,7 @@ use darkmux_profiles::crews::{resolve_crew, ResolvedCrew};
 use darkmux_profiles::profiles::load_registry;
 use darkmux_profiles::swap;
 use darkmux_types::dispatch_liveness::{liveness, liveness_case, liveness_detail};
+use darkmux_types::style;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -459,13 +460,6 @@ fn crew_detail(crew: &ResolvedCrew) -> String {
     hosts.dedup();
     let hosts_str = if hosts.is_empty() { "(local-only)".to_string() } else { hosts.join(",") };
     format!("crew={} seats={seat_count} remote_hosts={hosts_str}", crew.name)
-}
-
-fn load_phase_status(mission_id: &str, phase_id: &str) -> Result<crew::types::PhaseStatus> {
-    let text = std::fs::read_to_string(crew::lifecycle::phase_path(mission_id, phase_id))
-        .with_context(|| format!("reading phase JSON for `{phase_id}`"))?;
-    let phase: crew::types::Phase = serde_json::from_str(&text).context("parsing phase JSON")?;
-    Ok(phase.status)
 }
 
 /// (#1284 Packet 2) Map a review dispatch's `Result<ReviewEnvelope>` onto
@@ -862,26 +856,30 @@ fn run_dispatch(
             let _ = crew::lifecycle::save_task(&mission_id, task);
         }
 
-        // Flip each of the three phases Planned/Abandoned -> Running,
-        // mirroring `mission_launch::launch`'s own "flip each executing
-        // phase" loop — every review phase always has tasks (the graph
-        // shape is fixed), so all three always start here.
-        for real_id in [&investigate_phase_id, &adjudicate_phase_id, &report_phase_id] {
-            match load_phase_status(&mission_id, real_id) {
-                Ok(crew::types::PhaseStatus::Planned) | Ok(crew::types::PhaseStatus::Abandoned) => {
-                    let _ = crew::lifecycle::phase_start(real_id);
-                }
-                _ => {}
-            }
-        }
+        // (#1400) Phases no longer start eagerly here — `investigate`/
+        // `adjudicate`/`report` used to ALL flip Planned -> Running before
+        // any dispatch happened, so the graph lens showed all three
+        // pulsing "running" from second zero regardless of which one the
+        // pipeline had actually reached. Each phase now starts LAZILY,
+        // inside the `persist` closure below, the first time one of its
+        // OWN steps flips `Running` — see `mission_launch::
+        // lazy_start_phase_for_step`'s doc.
 
         let fingerprint_val = fingerprint(&judge_identifier, &ctx.judge_system);
         let staffing = staffing_snapshot(&probes, &judge, verify.as_ref(), request_changes);
         let phase_id_of_step = graph.phase_id_of_step.clone();
+        // (#1397/#1400) A second clone for the transition-time `persist`
+        // closure below — the post-run loop's own clone stays as the
+        // cheap, idempotent final reconcile every other `run_step_graph`
+        // caller also keeps.
+        let phase_id_of_step_for_persist = graph.phase_id_of_step.clone();
         let mission_id_for_status = mission_id.clone();
         let mission_id_for_steps = mission_id.clone();
+        let mission_id_for_persist = mission_id.clone();
         let crew_name_for_closure = crew_name_for_bookends.clone();
         let report_phase_id_for_closure = report_phase_id.clone();
+        let report_phase_id_for_persist = report_phase_id.clone();
+        let mut started_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let result = with_dispatch_bookends(
             &mut emitter,
@@ -890,18 +888,68 @@ fn run_dispatch(
             model_for_bookends.as_deref(),
             dispatch_start_extra,
             move |emitter| {
-                run_review_graph(&ctx, &crew_name_for_closure, mode, fingerprint_val, staffing, graph, emitter).map(
-                    |(env, steps)| {
-                        for (step_id, step) in &steps {
-                            let phase_id = phase_id_of_step
-                                .get(step_id)
-                                .map(String::as_str)
-                                .unwrap_or(&report_phase_id_for_closure);
-                            let _ = crew::lifecycle::save_step(&mission_id_for_steps, phase_id, step);
+                run_review_graph(
+                    &ctx,
+                    &crew_name_for_closure,
+                    mode,
+                    fingerprint_val,
+                    staffing,
+                    graph,
+                    emitter,
+                    // (#1397) Durably persist each step at ITS OWN
+                    // transition (Running at dispatch, Complete/Error at
+                    // completion) — the review pipeline runs through the
+                    // SAME `run_step_graph` call the crew scheduler's other
+                    // callers use, so it gets the identical mid-run
+                    // observability fix: a graph page opened while a probe
+                    // is still dispatching reads that step's real `Running`
+                    // status instead of the pre-run `Planned` snapshot.
+                    &mut |step| {
+                        let phase_id = phase_id_of_step_for_persist
+                            .get(&step.id)
+                            .map(String::as_str)
+                            .unwrap_or(&report_phase_id_for_persist);
+                        mission_launch::lazy_start_phase_for_step(
+                            &mission_id_for_persist,
+                            phase_id,
+                            step.status,
+                            &mut started_phases,
+                        );
+                        // (F2, gate remediation) Warn, never silently
+                        // swallow — same dim-warning parity as
+                        // `mission_launch.rs`/`mission_run.rs`'s persist
+                        // closures: a disk-full mid-review would otherwise
+                        // freeze the graph page with zero operator signal.
+                        if let Err(e) = crew::lifecycle::save_step(&mission_id_for_persist, phase_id, step) {
+                            eprintln!(
+                                "{}",
+                                style::dim(&format!(
+                                    "mission launch review: step persist warning (transition): {e:#}"
+                                ))
+                            );
                         }
-                        env
                     },
                 )
+                .map(|(env, steps)| {
+                    for (step_id, step) in &steps {
+                        let phase_id = phase_id_of_step
+                            .get(step_id)
+                            .map(String::as_str)
+                            .unwrap_or(&report_phase_id_for_closure);
+                        // (F2) Same dim-warning parity as the transition
+                        // persist above and `mission_launch.rs`'s own
+                        // post-run reconcile loop.
+                        if let Err(e) = crew::lifecycle::save_step(&mission_id_for_steps, phase_id, step) {
+                            eprintln!(
+                                "{}",
+                                style::dim(&format!(
+                                    "mission launch review: step persist warning: {e:#}"
+                                ))
+                            );
+                        }
+                    }
+                    env
+                })
             },
         );
 
@@ -1209,14 +1257,21 @@ mod tests {
             Some(&reopen_reasoning),
         )
         .unwrap();
-        // `ensure_mission_and_phases` mints phases Planned — `run_dispatch`'s
-        // real flow flips each to Running via `phase_start` right after
-        // minting (see its own "flip Planned/Abandoned -> Running" loop);
-        // replicate that here so this fixture matches the real pre-dispatch
-        // state these tests exercise. `let _ =` (not unwrap): on a REUSE of
-        // a previously-CLEAN instance a phase is already terminal Complete
-        // and `phase_start` correctly refuses — same silent skip the
-        // production loop's status match performs.
+        // `ensure_mission_and_phases` mints phases Planned. `run_dispatch`'s
+        // REAL flow no longer flips all three eagerly (#1400 — that was the
+        // bug: every phase pulsed "running" from second zero); each starts
+        // LAZILY instead, via `mission_launch::lazy_start_phase_for_step`
+        // fired from the `persist` closure as the graph actually reaches
+        // it (see `review_phases_start_lazily_not_all_at_mint`, right below
+        // this fixture, for a direct test of that). This fixture still
+        // starts every phase up front because the tests THAT USE IT
+        // (`finalize_review_mission_*`) are exercising *finalization*
+        // behavior, which needs "every phase already Running" as its
+        // precondition, not the start-timing #1400 is about. `let _ =`
+        // (not unwrap): on a REUSE of a previously-CLEAN instance a phase
+        // is already terminal Complete and `phase_start` correctly
+        // refuses — same silent skip the production lazy-start path
+        // performs.
         for real_id in real_phase_ids.values() {
             let _ = crew::lifecycle::phase_start(real_id);
         }
@@ -1228,6 +1283,81 @@ mod tests {
                 real_phase_ids["report"].clone(),
             ],
         )
+    }
+
+    /// (#1400) A fresh review mint leaves all three phases `Planned`, and
+    /// each starts ONLY when `mission_launch::lazy_start_phase_for_step`
+    /// is called for a step belonging to it — mirroring EXACTLY what
+    /// `run_dispatch`'s `persist` closure does as `run_review_graph`
+    /// actually reaches each phase's steps (bundle/probe/dedup under
+    /// `investigate`, judge under `adjudicate`, verify/synthesis under
+    /// `report`). This is the direct regression test for the live-observed
+    /// bug: "all three phases pulse running from second zero."
+    #[test]
+    #[serial_test::serial]
+    fn review_phases_start_lazily_not_all_at_mint() {
+        let _guard = CrewDirGuard::new();
+        let config = crew::mission_config::load("review").expect("review is embedded").config;
+        let case_id = "owner/repo@lazy1400";
+        let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
+        id_input.insert("case_id".to_string(), Value::String(case_id.to_string()));
+        let mission_id = mission_launch::derive_mission_id("review", &id_input).unwrap();
+        let (real_phase_ids, _reused) = mission_launch::ensure_mission_and_phases_with_provenance(
+            &mission_id,
+            &config,
+            Some("PR review test — lazy start"),
+            None,
+        )
+        .unwrap();
+
+        // Fresh mint: every phase starts Planned, none pulse Running.
+        for real_id in real_phase_ids.values() {
+            assert_eq!(phase_status(&mission_id, real_id), "planned");
+        }
+
+        // Simulate the real dispatch order — investigate's bundle step is
+        // always the graph's first ready step, adjudicate's judge step
+        // only becomes ready once investigate's dedup completes, report's
+        // verify step only once adjudicate's judge completes.
+        let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
+        mission_launch::lazy_start_phase_for_step(
+            &mission_id,
+            &real_phase_ids["investigate"],
+            crew::types::NodeStatus::Running,
+            &mut started,
+        );
+        assert_eq!(phase_status(&mission_id, &real_phase_ids["investigate"]), "running");
+        assert_eq!(
+            phase_status(&mission_id, &real_phase_ids["adjudicate"]),
+            "planned",
+            "adjudicate hasn't been reached yet — must not pulse alongside investigate"
+        );
+        assert_eq!(
+            phase_status(&mission_id, &real_phase_ids["report"]),
+            "planned",
+            "report hasn't been reached yet — must not pulse alongside investigate"
+        );
+
+        mission_launch::lazy_start_phase_for_step(
+            &mission_id,
+            &real_phase_ids["adjudicate"],
+            crew::types::NodeStatus::Running,
+            &mut started,
+        );
+        assert_eq!(phase_status(&mission_id, &real_phase_ids["adjudicate"]), "running");
+        assert_eq!(
+            phase_status(&mission_id, &real_phase_ids["report"]),
+            "planned",
+            "report still hasn't been reached"
+        );
+
+        mission_launch::lazy_start_phase_for_step(
+            &mission_id,
+            &real_phase_ids["report"],
+            crew::types::NodeStatus::Running,
+            &mut started,
+        );
+        assert_eq!(phase_status(&mission_id, &real_phase_ids["report"]), "running");
     }
 
     #[test]
