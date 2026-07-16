@@ -604,6 +604,18 @@ pub(crate) fn ensure_mission_and_phases(
     ensure_mission_and_phases_with_provenance(mission_id, config, None, None)
 }
 
+/// Pure, no-I/O derivation of the doc phase id → real (composed) phase id
+/// map (`<mission_id>-<doc_id>`). Extracted from
+/// [`ensure_mission_and_phases_with_provenance`] (#1417) so a caller can
+/// compute the SAME map — and validate/consume it — before minting the
+/// Mission the map would otherwise only be available after. Both this
+/// function and the mint below derive it identically from `mission_id` +
+/// `config.phases`, so precomputing here never drifts from what the mint
+/// itself would produce.
+pub(crate) fn derive_phase_ids(mission_id: &str, config: &MissionConfig) -> BTreeMap<String, String> {
+    config.phases.iter().map(|p| (p.id.clone(), format!("{mission_id}-{}", p.id))).collect()
+}
+
 /// [`ensure_mission_and_phases`] with per-launcher PROVENANCE overrides
 /// (#1284 Packet 4b review gate, must-fix 2). A dedicated launcher whose
 /// instances are per-case (the review launcher: N CI reviews of N PRs)
@@ -618,11 +630,7 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
     description: Option<&str>,
     reopen_reasoning: Option<&str>,
 ) -> Result<(BTreeMap<String, String>, bool)> {
-    let real_phase_ids: BTreeMap<String, String> = config
-        .phases
-        .iter()
-        .map(|p| (p.id.clone(), format!("{mission_id}-{}", p.id)))
-        .collect();
+    let real_phase_ids: BTreeMap<String, String> = derive_phase_ids(mission_id, config);
 
     let mission_path = crew::lifecycle::mission_path(mission_id);
     if mission_path.exists() {

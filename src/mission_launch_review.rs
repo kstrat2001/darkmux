@@ -784,46 +784,26 @@ fn run_dispatch(
             chat_override: None,
         });
 
-        // Mint (or idempotently reuse/reopen) the Mission + the SAME three
-        // phases review.json declares (investigate/adjudicate/report) — the
-        // GENERIC instance-minting primitive every config-launched mission
-        // uses, replacing the retired `build_mission_for_review`/
-        // `reopen_terminal_mission_for_rerun` bespoke pair (their reopen
-        // semantics are already implemented once, generically, here).
         let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
         id_input.insert("case_id".to_string(), Value::String(case_id_for_bookends.clone()));
         let mission_id = mission_launch::derive_mission_id("review", &id_input)?;
-        // (must-fix 2, #1284 Packet 4b review gate) Case-bearing provenance,
-        // matching the retired `build_mission_for_review`'s board-facing
-        // strings: a fresh mint's description names the case + crew (N CI
-        // reviews must be distinguishable on `mission status`/the viewer —
-        // the config's own description is an 800-char transcription
-        // paragraph, useless as a board row), and a reopen's reasoning
-        // names the case being re-run.
-        //
-        // (C4, same review gate) Mission bookkeeping on this path is
-        // HARD-FAIL (`?`) — a DELIBERATE reversal of the retired
-        // `build_mission_for_review`'s best-effort `let _ =` discipline
-        // ("a persistence hiccup must never block the review"). An
-        // unwritable crew dir would break the envelope/step saves later in
-        // this same run anyway, leaving a half-recorded review; failing
-        // loud here, before any token is spent, beats that quiet partial
-        // state.
-        let description =
-            format!("PR review — {case_id_for_bookends} (crew `{crew_name_for_bookends}`)");
-        let reopen_reasoning = format!("review re-run for case `{case_id_for_bookends}`");
-        let (real_phase_ids, _reused) = mission_launch::ensure_mission_and_phases_with_provenance(
-            &mission_id,
-            config,
-            Some(&description),
-            Some(&reopen_reasoning),
-        )?;
-        crew::lifecycle::save_config_snapshot(&mission_id, config)
-            .context("persisting config-snapshot.json")?;
 
+        // (#1417) Resolve the phase ids and build the review graph BEFORE
+        // minting the Mission — `derive_phase_ids` is a pure, no-I/O
+        // derivation of the same doc-id -> real-id map the mint below would
+        // otherwise produce, so computing it here first doesn't change what
+        // gets minted, only WHEN. This closes the strand where a config
+        // whose phases don't resolve to `investigate`/`adjudicate`/`report`,
+        // or that `build_review_graph` itself can't load/interpret (a
+        // malformed USER-tier review.json — see that function's own doc),
+        // used to mint a Mission (Active, 3 Planned phases) and then `?`
+        // out with no finalize, leaving it permanently Active. Now those
+        // failures happen before any Mission/Phase file exists, so there is
+        // nothing left stranded.
         let judge_concurrency = darkmux_types::config_access::review_judge_concurrency();
-        // (C3, same review gate) `.get()` + a named error, never a raw
-        // index panic: a USER-TIER review.json with renamed phase ids
+        let real_phase_ids = mission_launch::derive_phase_ids(&mission_id, config);
+        // (C3, #1284 Packet 4b review gate) `.get()` + a named error, never
+        // a raw index panic: a USER-TIER review.json with renamed phase ids
         // lands exactly here (contract 7 — loud validation at the
         // consumption point, never a hot-path panic).
         let real_phase = |doc_id: &str| -> Result<String> {
@@ -852,6 +832,47 @@ fn run_dispatch(
             &report_phase_id,
             judge_concurrency,
         )?;
+
+        // (#1417) Mint (or idempotently reuse/reopen) the Mission + the SAME
+        // three phases review.json declares (investigate/adjudicate/report)
+        // — the GENERIC instance-minting primitive every config-launched
+        // mission uses, replacing the retired `build_mission_for_review`/
+        // `reopen_terminal_mission_for_rerun` bespoke pair (their reopen
+        // semantics are already implemented once, generically, here). Moved
+        // to run AFTER `build_review_graph` succeeds (see the comment
+        // above) — everything the graph needed (the phase id strings) was
+        // already derived without touching the Mission, so nothing here
+        // needs to run earlier.
+        //
+        // (must-fix 2, #1284 Packet 4b review gate) Case-bearing provenance,
+        // matching the retired `build_mission_for_review`'s board-facing
+        // strings: a fresh mint's description names the case + crew (N CI
+        // reviews must be distinguishable on `mission status`/the viewer —
+        // the config's own description is an 800-char transcription
+        // paragraph, useless as a board row), and a reopen's reasoning
+        // names the case being re-run.
+        //
+        // (C4, same review gate) Mission bookkeeping on this path is
+        // HARD-FAIL (`?`) — a DELIBERATE reversal of the retired
+        // `build_mission_for_review`'s best-effort `let _ =` discipline
+        // ("a persistence hiccup must never block the review"). An
+        // unwritable crew dir would break the envelope/step saves later in
+        // this same run anyway, leaving a half-recorded review; failing
+        // loud here, still before any token is spent (the graph build above
+        // is pure interpretation, no dispatch), beats that quiet partial
+        // state.
+        let description =
+            format!("PR review — {case_id_for_bookends} (crew `{crew_name_for_bookends}`)");
+        let reopen_reasoning = format!("review re-run for case `{case_id_for_bookends}`");
+        let (_, _reused) = mission_launch::ensure_mission_and_phases_with_provenance(
+            &mission_id,
+            config,
+            Some(&description),
+            Some(&reopen_reasoning),
+        )?;
+        crew::lifecycle::save_config_snapshot(&mission_id, config)
+            .context("persisting config-snapshot.json")?;
+
         for task in &graph.tasks {
             let _ = crew::lifecycle::save_task(&mission_id, task);
         }
@@ -1445,6 +1466,92 @@ mod tests {
             v["description"].as_str().unwrap(),
             format!("PR review — {case} (crew `test-crew`)"),
             "fresh-mint description must be case-bearing"
+        );
+    }
+
+    /// (#1417) Direct regression test for the mint-then-strand bug: a
+    /// user-tier `review.json` whose declared phase ids don't include
+    /// `investigate`/`adjudicate`/`report` (the exact repro in the issue —
+    /// a renamed phase id still passes `MissionConfig::validate`, since
+    /// that only checks for empty/duplicate ids, never the review
+    /// launcher's specific phase vocabulary) must fail `run_dispatch`
+    /// WITHOUT ever minting the Mission. Before the fix,
+    /// `ensure_mission_and_phases_with_provenance` ran first and minted an
+    /// Active mission with 3 Planned phases, then `real_phase("investigate")`
+    /// errored and `run_dispatch` returned — leaving that mission
+    /// permanently Active (`darkmux mission status` never recovers it short
+    /// of the 14-day stale-active drift rule).
+    #[test]
+    #[serial_test::serial]
+    fn run_dispatch_with_a_renamed_phase_id_fails_before_minting_the_mission() {
+        let _guard = CrewDirGuard::new();
+
+        // A minimal profiles.json with a crew that satisfies
+        // `validate_review_crew` (>= 1 review-probe staffing, exactly 1
+        // review-judge staffing) — enough to get `run_dispatch` past crew
+        // resolution and bundle-building (an empty worktree + empty diff
+        // yields an empty, valid bundle set) and up to the phase-id
+        // validation this test targets. No model dispatch is ever reached.
+        let profiles_dir = tempfile::TempDir::new().unwrap();
+        let profiles_path = profiles_dir.path().join("profiles.json");
+        std::fs::write(
+            &profiles_path,
+            r#"{
+                "schema_version": "1.5",
+                "profiles": {
+                    "test-profile": { "models": [ { "id": "test-model", "n_ctx": 8000 } ] }
+                },
+                "default_profile": "test-profile",
+                "crews": {
+                    "test-crew": {
+                        "seats": {
+                            "review-probe": [ { "profile": "test-profile", "k": 1 } ],
+                            "review-judge": [ { "profile": "test-profile", "passes": 1 } ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let worktree_dir = tempfile::TempDir::new().unwrap();
+
+        // The embedded `review` config, with its first declared phase id
+        // renamed — the exact user-tier-typo repro from #1417.
+        let mut config = crew::mission_config::load("review").expect("review is embedded").config;
+        assert_eq!(
+            config.phases[0].id, "investigate",
+            "test assumes the embedded review.json's phase order"
+        );
+        config.phases[0].id = "investigate-renamed".to_string();
+
+        let case_id = "owner/repo@renamed1417";
+        let mut collected: BTreeMap<String, Value> = BTreeMap::new();
+        collected.insert("case_id".to_string(), Value::String(case_id.to_string()));
+        collected.insert("crew".to_string(), Value::String("test-crew".to_string()));
+        collected.insert("worktree".to_string(), Value::String(worktree_dir.path().display().to_string()));
+        collected.insert("profiles".to_string(), Value::String(profiles_path.display().to_string()));
+
+        let diff_file = worktree_dir.path().join("unused.diff");
+        let result = run_dispatch(&config, &collected, &diff_file, "", 60);
+
+        let err = result.expect_err("a renamed phase id must fail, not silently interpret");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not declare a phase with id `investigate`"),
+            "expected the phase-id validation error, got: {msg}"
+        );
+
+        // The regression: the Mission must NEVER have been minted. Before
+        // the #1417 fix, `ensure_mission_and_phases_with_provenance` ran
+        // BEFORE this validation and would have already written
+        // mission.json (Active, 3 Planned phases) to disk.
+        let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
+        id_input.insert("case_id".to_string(), Value::String(case_id.to_string()));
+        let mission_id = mission_launch::derive_mission_id("review", &id_input).unwrap();
+        assert!(
+            !crew::lifecycle::mission_path(&mission_id).exists(),
+            "mission.json must not exist — a failed pre-graph validation must never strand a minted mission"
         );
     }
 
