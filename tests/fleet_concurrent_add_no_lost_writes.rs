@@ -46,7 +46,7 @@ fn parallel_fleet_adds_keep_every_entry() {
         let handle = std::thread::spawn(move || {
             std::process::Command::new(&bin)
                 .args([
-                    "fleet", "add", &id,
+                    "machine", "add", &id,
                     "--address", &format!("127.0.0.1:{}", 10000 + i),
                 ])
                 .env("HOME", &home)

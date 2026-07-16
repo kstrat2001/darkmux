@@ -5,9 +5,10 @@
 //! `default_profile`). But the dispatch goes through LMStudio's
 //! OpenAI-compatible API by model id, so LMStudio answers with whatever
 //! is actually loaded — regardless of which profile the lab thinks it's
-//! using. If the operator did `darkmux swap balanced` and then
-//! `darkmux lab run medium-coding` (no `--profile`), the manifest says
-//! `profile=deep` while the real runtime envelope is `balanced`'s.
+//! using. If a prior dispatch (or a hand `lms load`) left `balanced`'s
+//! models resident and the operator then runs `darkmux lab run
+//! medium-coding` (no `--profile`), the manifest says `profile=deep`
+//! while the real runtime envelope is `balanced`'s.
 //!
 //! That silent provenance drift poisons reproducibility: a notebook
 //! entry citing "measured against profile deep" is wrong, and a future
@@ -68,8 +69,8 @@ pub(crate) fn envelope_warnings(
                         "requested profile `{profile_name}` declares default model `{}` (ctx {declared}) \
                          but it is not among the currently loaded models — the dispatch will use \
                          whatever LMStudio has loaded, so this run's `profile={profile_name}` tag \
-                         may not reflect the real runtime envelope. Run `darkmux swap {profile_name}` \
-                         or pass `--profile <loaded-profile>` to align them.",
+                         may not reflect the real runtime envelope. Pass `--profile <loaded-profile>` \
+                         to align them (a dispatch on `{profile_name}` loads its declared models).",
                         pm.id,
                     ));
                 }

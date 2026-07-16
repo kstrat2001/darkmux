@@ -195,9 +195,9 @@ fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
 /// the streams unchanged so the operator sees standard `lms get`
 /// progress reporting in their terminal.
 ///
-/// Used by `darkmux model pull-recommended` (#159) to batch-download
-/// the recommendation registry's prescribed models for the operator's
-/// hardware tier.
+/// Batch-downloads a model via `lms get` with progress reporting. (#1426
+/// retired the `darkmux model pull-recommended` verb that drove this; the
+/// wrapper stays for any future download path.)
 pub fn get(model_id: &str) -> Result<()> {
     let status = Command::new(lms_bin())
         .args(["get", model_id])

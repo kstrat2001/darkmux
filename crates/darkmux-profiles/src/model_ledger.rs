@@ -3,8 +3,8 @@
 //! CURRENT (the materialized: observed inference-worker footprint), color-
 //! stated per model and machine-total.
 //!
-//! ONE implementation feeds three surfaces: the `darkmux model ledger` CLI
-//! verb, the serve daemon's `GET /machine/memory`, and (through that
+//! ONE implementation feeds three surfaces: the `darkmux machine resources` CLI
+//! verb, the serve daemon's `GET /machine/resources`, and (through that
 //! endpoint) the viewer's `#lens=machine`. It lives in `darkmux-profiles`
 //! because this crate is the shared floor of that dependency graph — the
 //! binary and `darkmux-serve` both already depend on it, and the I/O
@@ -110,7 +110,7 @@ pub const MEMORY_FREE_PERCENT_RED: u64 = 15;
 /// than 4 K ctx stops being a usable dispatch config.
 const SHRINK_CTX_FLOOR: u64 = 4096;
 
-// ── payload types (ONE shape for --json and /machine/memory) ────────────
+// ── payload types (ONE shape for --json and /machine/resources) ────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -799,7 +799,7 @@ fn bounded_stdout(
 ) -> Option<String> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
-    // Warnings ride /machine/memory to remote viewers, so they carry the
+    // Warnings ride /machine/resources to remote viewers, so they carry the
     // binary's BASENAME, never a full configured path — a `DARKMUX_LMS_BIN`
     // under a home dir must not leak off-machine (#1286 observer/privacy).
     // The runner's own error text (which repeats the full path) is likewise
@@ -961,7 +961,7 @@ fn truncate_ident(s: &str, max: usize) -> String {
     }
 }
 
-/// The `darkmux model ledger` table + machine rows + gather-cost line.
+/// The `darkmux machine resources` table + machine rows + gather-cost line.
 pub fn render_human(ledger: &ModelLedger) -> String {
     let mut out = String::new();
     out.push_str("model ledger — potential vs current (#1286)\n\n");

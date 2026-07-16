@@ -26,7 +26,7 @@ pub use darkmux_eureka as eureka;
 // #515 — fleet extracted (deps crew/flow/types all crates now). Re-export
 // keeps crate::fleet::* resolving for serve/phase_cli/notebook/mission_propose.
 pub use darkmux_fleet as fleet;
-// `darkmux fleet` command handlers — split out of main.rs alongside cli/lab_cli.
+// `darkmux machine` roster-facing handlers — split out of main.rs alongside cli/lab_cli.
 mod fleet_cli;
 // #463 workspace split — flow extracted to the darkmux-flow crate. The
 // re-export keeps all existing `crate::flow::*` paths resolving unchanged.
@@ -1789,7 +1789,7 @@ fn profile_matches(profile: &types::Profile, loaded: &[types::LoadedModel]) -> b
     //
     // Pure-endpoint semantics: zero local models required ⇒ the profile
     // matches exactly when NOTHING is loaded locally. That's what a swap to
-    // it produces (everything darkmux-owned unloaded), so `darkmux status`
+    // it produces (everything darkmux-owned unloaded), so `darkmux machine status`
     // reports that state as the profile it is rather than "matches no
     // registered profile". Any local load means the state isn't this
     // profile's.

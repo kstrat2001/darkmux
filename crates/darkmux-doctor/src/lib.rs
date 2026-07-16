@@ -781,7 +781,7 @@ fn utility_binding_status(
                     status: Status::Warn,
                     message: format!("utility model `{id}` registered but NOT loaded"),
                     hint: Some(
-                        "Load it before dispatching — compaction summons the utility model mid-dispatch; if it isn't resident the compactor call fails. Run `lms load <id>`, or include it in the profile you `darkmux swap` to. (#590)".into(),
+                        "Load it before dispatching — compaction summons the utility model mid-dispatch; if it isn't resident the compactor call fails. Run `lms load <id>`, or register it as `internal.utility` so a dispatch loads it automatically. (#590)".into(),
                     ),
                 }
             }
@@ -911,20 +911,20 @@ fn classify_openai_base_url(base: Option<&str>, lms_url: &str) -> (Status, Strin
         ),
         Some(b) if normalize_openai_base(b) == normalize_openai_base(lms_url) => (
             Status::Pass,
-            format!("OPENAI_BASE_URL points at darkmux's LMStudio ({lms_url}) — swaps reach downstream agents"),
+            format!("OPENAI_BASE_URL points at darkmux's LMStudio ({lms_url}) — darkmux's loaded models reach downstream agents"),
             None,
         ),
         Some(b) => (
             Status::Warn,
             format!("OPENAI_BASE_URL={b} does not point at darkmux's LMStudio ({lms_url})"),
             Some(
-                "darkmux doesn't set or manage OPENAI_BASE_URL — `darkmux swap` loads models into the LMStudio at lmstudio_url. OpenAI-compatible agents reading this env var talk to the other endpoint, so a swap won't change the model they see. Point OPENAI_BASE_URL at darkmux's LMStudio (or unset it) if you want swaps to reach those agents. (If it's a reverse proxy fronting the SAME LMStudio, this warning is benign.) (#5)".into(),
+                "darkmux doesn't set or manage OPENAI_BASE_URL — darkmux loads models into the LMStudio at lmstudio_url. OpenAI-compatible agents reading this env var talk to the other endpoint, so they won't see the models darkmux loaded. Point OPENAI_BASE_URL at darkmux's LMStudio (or unset it) if you want those agents to reach darkmux's models. (If it's a reverse proxy fronting the SAME LMStudio, this warning is benign.) (#5)".into(),
             ),
         ),
     }
 }
 
-/// (#5) Warn when a shell-exported `OPENAI_BASE_URL` would defeat `darkmux swap`
+/// (#5) Warn when a shell-exported `OPENAI_BASE_URL` would defeat darkmux's model loading
 /// for downstream OpenAI-compatible agents (they read the env var, not darkmux).
 fn check_openai_base_url_conflict() -> Check {
     let base = std::env::var("OPENAI_BASE_URL").ok();
@@ -2001,8 +2001,9 @@ fn check_models_loaded() -> Check {
             status: Status::Warn,
             message: "no models loaded in LMStudio".into(),
             hint: Some(
-                "load a model via the LMStudio GUI or `lms load <id> --context-length <N>`, \
-                 or run `darkmux swap <profile>` to load a profile's models automatically"
+                "load a model via the LMStudio GUI or `lms load <id> --context-length <N>` — \
+                 or just dispatch: a `darkmux dispatch` / `mission launch` loads what its \
+                 staffing needs, under the resident budget"
                     .into(),
             ),
         },
@@ -2078,7 +2079,7 @@ fn check_profile_loaded_match() -> Check {
             message: "loaded models don't match any profile".into(),
             hint: Some(
                 "edit ~/.darkmux/profiles.json so a profile's primary model id matches what \
-                 LMStudio is serving (compare `darkmux status` and `darkmux profile list`)"
+                 LMStudio is serving (compare `darkmux machine status` and `darkmux profile list`)"
                     .into(),
             ),
         }

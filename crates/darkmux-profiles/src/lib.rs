@@ -8,7 +8,7 @@
 //! for the port traits — no cycle (gestalt depends only on darkmux-types).
 //! `model_ledger` (#1286) composes those adapters into the potential-vs-
 //! current memory ledger — ONE implementation consumed by both the
-//! `darkmux model ledger` CLI verb and the serve daemon's `/machine/memory`.
+//! `darkmux machine resources` CLI verb and the serve daemon's `/machine/resources`.
 //!
 //! (2.0, #1405: the `runtime` module — the legacy `openclaw` shell-out
 //! runtime's config-file patcher — was removed along with that runtime.)

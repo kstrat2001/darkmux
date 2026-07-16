@@ -71,7 +71,7 @@ pub struct Budget {
 
 /// Who is asking (#1243): auto-triggered paths (cycler/JIT/scheduler) never
 /// breach the budget — they evict, serialize, or refuse. Operator-explicit
-/// commands (e.g. `darkmux swap`) warn-and-proceed: operator intent wins,
+/// commands (e.g. `darkmux dispatch`) warn-and-proceed: operator intent wins,
 /// loudly (operator sovereignty, #44).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CallerIntent {

@@ -2322,7 +2322,7 @@ mod tests {
     // ─── #482: ratio-of-context default when only the window is known ─
 
     /// When the host passes only `context_window` (the common case —
-    /// `darkmux swap` always derives `n_ctx` from the profile's primary
+    /// darkmux always derives `n_ctx` from the profile's primary
     /// model) and the operator hasn't set an explicit
     /// `threshold_tokens` or `threshold_ratio`, the runtime should pick
     /// a default in proportion to the loaded window — not the

@@ -1206,8 +1206,8 @@ pub trait ModelCycler {
 
 /// Production [`ModelCycler`] (#1230 Packet 1 cutover): every residency
 /// decision now routes through `darkmux_gestalt::plan_acquire`/
-/// `plan_release` — the pure planner `darkmux swap` and the dispatch
-/// preflight are converging on — executed via the real `LmsHost`/`MacProbe`
+/// `plan_release` — the pure planner the dispatch preflight routes
+/// through — executed via the real `LmsHost`/`MacProbe`
 /// port adapters (`darkmux_profiles::gestalt_host`). Those adapters existed
 /// fully built and unit-tested but had ZERO production callers before this
 /// cutover; this is their first one.
