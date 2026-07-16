@@ -506,7 +506,7 @@ fn cmd_scan(config: Option<&str>) -> Result<i32> {
     println!(
         "{}",
         darkmux_types::style::header(&format!(
-            "darkmux scan — {} model(s) in LMStudio, {} not yet in any profile",
+            "darkmux profile scan — {} model(s) in LMStudio, {} not yet in any profile",
             llms.len(),
             uncovered.len()
         ))
@@ -1520,7 +1520,7 @@ fn cmd_swap_recommended(config: Option<&str>, dry_run: bool, quiet: bool) -> Res
 
     if rec.status != recommendations::RecommendationStatus::Validated {
         eprintln!(
-            "darkmux: no validated recommendation for tier `{}`.\n\nRationale:\n  {}\n\nOptions:\n  - Pick a profile manually: `darkmux profiles` then `darkmux swap <name>`\n  - Contribute a bake-off for this tier — see kstrat2001/darkmux#117",
+            "darkmux: no validated recommendation for tier `{}`.\n\nRationale:\n  {}\n\nOptions:\n  - Pick a profile manually: `darkmux profile list` then `darkmux swap <name>`\n  - Contribute a bake-off for this tier — see kstrat2001/darkmux#117",
             rec.tier, rec.rationale
         );
         return Ok(2);

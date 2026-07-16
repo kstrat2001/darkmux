@@ -287,6 +287,22 @@ jobs:
             echo "$bad"
             exit 1
           fi
+          # (#1426 phase 1) Five verb spellings retired with NO compat alias:
+          # `darkmux profiles` -> `darkmux profile list`, `darkmux scan` ->
+          # `darkmux profile scan`, `darkmux notebook ...` -> `darkmux lab
+          # notebook ...`, `darkmux pr-review ...` -> `darkmux mission launch
+          # review`, `darkmux external ...` -> pipe into `mission propose`.
+          # The word boundary keeps the NEW spellings clean (`darkmux profile
+          # scan` does not contain `darkmux scan`). Historical release-notes
+          # lines (README's status block, one line per release naming its
+          # `**vX.Y.Z**`) legitimately quote old verbs — excluded by the -v
+          # filter; live prose never carries that bold-version marker.
+          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external)\b'
+          if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
+            echo "::error::Retired verb spelling in user-facing docs (#1426) — use profile list / profile scan / lab notebook / mission launch review / pipe into mission propose:"
+            echo "$bad"
+            exit 1
+          fi
           echo "docs drift guard passed: no retired terms"
       - name: Demo page is in sync with the canonical viewer
         run: |

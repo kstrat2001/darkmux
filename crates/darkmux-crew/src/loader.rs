@@ -24,7 +24,9 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     // (#1113) Agentic PR reviewer: repo checked out, read/exec tools, FREEFORM
     // marker-block output (deliberately no output_schema — a grammar lock
     // combined with tools makes the model skip tool-calling and fabricate).
-    // `darkmux pr-review render` parses the markers into inline comments.
+    // The marker parser survives in the lab's review-bench scoring
+    // (darkmux-lab review_bench.rs); the `pr-review render` CLI path that
+    // once turned markers into inline PR comments retired in #1426.
     ("pr-reviewer-agentic", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-agentic.json"))),
     // Sibling of pr-reviewer with the JSON grammar contract (output_schema)
     // dropped — free-form prose review, MUST FIX:/CONSIDER: marked. Exists to

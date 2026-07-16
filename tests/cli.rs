@@ -104,6 +104,28 @@ fn retired_top_level_scan_verb_is_unknown() {
 }
 
 #[test]
+fn retired_top_level_pr_review_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("pr-review")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand").or(
+            predicate::str::contains("unexpected argument"),
+        ));
+}
+
+#[test]
+fn retired_top_level_notebook_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("notebook")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand").or(
+            predicate::str::contains("unexpected argument"),
+        ));
+}
+
+#[test]
 fn swap_dry_run_succeeds_without_real_lms() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("profiles.json");
