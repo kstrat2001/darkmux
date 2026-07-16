@@ -1048,6 +1048,25 @@ pub fn run(
                     ));
                 }
 
+                // (#1391) Soft-trim OLD oversized tool-result bodies before the
+                // compaction trigger is evaluated. This is a zero-model-call,
+                // purely mechanical byte reclaim (head + tail kept, middle
+                // elided behind a marker) that shrinks the transcript and pushes
+                // the FIRST compaction out — on a tight window that can be one
+                // fewer compaction per dispatch. The recent thread is protected
+                // (see TOOL_RESULT_TRIM_PRESERVE_RECENT), so the model never
+                // loses context it is actively reasoning over. Runs every turn;
+                // idempotent on bodies already reclaimed.
+                let trim_stats =
+                    crate::tool_result_prune::soft_trim_old_tool_results(&mut messages);
+                if trim_stats.results_trimmed > 0 {
+                    eprintln!(
+                        "darkmux-runtime: soft-trimmed {} old tool result(s), reclaiming {} bytes \
+                         of transcript before the compaction check (#1391)",
+                        trim_stats.results_trimmed, trim_stats.bytes_reclaimed
+                    );
+                }
+
                 // (#854) When the endpoint's reported count is stale (frozen
                 // across turns while the thread grew), it can't gate compaction
                 // — it silently suppressed it into a degenerate cycle. Substitute
@@ -3542,7 +3561,16 @@ mod tests {
                 .path("/v1/chat/completions")
                 .body_contains("\"model\":\"test-compactor\"");
             then.status(200).json_body(chat_response_json(
-                Some("Summary: assistant read a file."),
+                // (#1389) >= MIN_SUMMARY_CHARS and delimiter-free, so the
+                // narrative floor + sanitizer accept it; the enlarged padding
+                // below keeps every compaction's middle comfortably larger than
+                // this summary, clearing the min-reduction guard.
+                Some(
+                    "Summary: the assistant repeatedly issued a read tool call against the \
+                     workspace file and inspected the returned contents. No decisions were \
+                     finalized and no files were modified. The next concrete action is to \
+                     continue reading and then act on what the file contains.",
+                ),
                 None,
                 "stop",
                 500,
@@ -3574,9 +3602,14 @@ mod tests {
         // condition for needs_compaction. Adding 5 extra user/assistant
         // pairs gets us there.
         let mut initial = vec![Message::system("test system"), Message::user("seed")];
+        // (#1389) Long padding so the FIRST compaction's middle (these 4
+        // messages) is comfortably larger than the mock summary, clearing the
+        // min-reduction guard. Later recompactions fold the prior summary plus
+        // two fresh turns, which stays larger than the summary on its own.
+        let pad = "context detail that occupies transcript space ".repeat(6);
         for i in 0..3 {
-            initial.push(Message::user(format!("padding user {i}")));
-            initial.push(Message::assistant(format!("padding assistant {i}")));
+            initial.push(Message::user(format!("padding user {i}: {pad}")));
+            initial.push(Message::assistant(format!("padding assistant {i}: {pad}")));
         }
         let tools = [Tool::Read];
 
@@ -3663,7 +3696,16 @@ mod tests {
         let compactor_mock = compactor_server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
-                Some("Summary: assistant read a file."),
+                // (#1389) >= MIN_SUMMARY_CHARS and delimiter-free, so the
+                // narrative floor + sanitizer accept it; the enlarged padding
+                // below keeps every compaction's middle comfortably larger than
+                // this summary, clearing the min-reduction guard.
+                Some(
+                    "Summary: the assistant repeatedly issued a read tool call against the \
+                     workspace file and inspected the returned contents. No decisions were \
+                     finalized and no files were modified. The next concrete action is to \
+                     continue reading and then act on what the file contains.",
+                ),
                 None,
                 "stop",
                 500,
@@ -3679,9 +3721,14 @@ mod tests {
         std::fs::create_dir_all(tmp.path()).unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let mut initial = vec![Message::system("test system"), Message::user("seed")];
+        // (#1389) Long padding so the FIRST compaction's middle (these 4
+        // messages) is comfortably larger than the mock summary, clearing the
+        // min-reduction guard. Later recompactions fold the prior summary plus
+        // two fresh turns, which stays larger than the summary on its own.
+        let pad = "context detail that occupies transcript space ".repeat(6);
         for i in 0..3 {
-            initial.push(Message::user(format!("padding user {i}")));
-            initial.push(Message::assistant(format!("padding assistant {i}")));
+            initial.push(Message::user(format!("padding user {i}: {pad}")));
+            initial.push(Message::assistant(format!("padding assistant {i}: {pad}")));
         }
         let tools = [Tool::Read];
 
@@ -3759,7 +3806,16 @@ mod tests {
                 .path("/v1/chat/completions")
                 .body_contains("\"model\":\"test-compactor\"");
             then.status(200).json_body(chat_response_json(
-                Some("Summary: assistant read a file."),
+                // (#1389) >= MIN_SUMMARY_CHARS and delimiter-free, so the
+                // narrative floor + sanitizer accept it; the enlarged padding
+                // below keeps every compaction's middle comfortably larger than
+                // this summary, clearing the min-reduction guard.
+                Some(
+                    "Summary: the assistant repeatedly issued a read tool call against the \
+                     workspace file and inspected the returned contents. No decisions were \
+                     finalized and no files were modified. The next concrete action is to \
+                     continue reading and then act on what the file contains.",
+                ),
                 None,
                 "stop",
                 500,
@@ -3869,7 +3925,16 @@ mod tests {
                 .path("/v1/chat/completions")
                 .body_contains("\"model\":\"test-compactor\"");
             then.status(200).json_body(chat_response_json(
-                Some("Summary: assistant read a file."),
+                // (#1389) >= MIN_SUMMARY_CHARS and delimiter-free, so the
+                // narrative floor + sanitizer accept it; the enlarged padding
+                // below keeps every compaction's middle comfortably larger than
+                // this summary, clearing the min-reduction guard.
+                Some(
+                    "Summary: the assistant repeatedly issued a read tool call against the \
+                     workspace file and inspected the returned contents. No decisions were \
+                     finalized and no files were modified. The next concrete action is to \
+                     continue reading and then act on what the file contains.",
+                ),
                 None,
                 "stop",
                 500,
@@ -3882,9 +3947,14 @@ mod tests {
         std::fs::create_dir_all(tmp.path()).unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let mut initial = vec![Message::system("test system"), Message::user("seed")];
+        // (#1389) Long padding so the FIRST compaction's middle (these 4
+        // messages) is comfortably larger than the mock summary, clearing the
+        // min-reduction guard. Later recompactions fold the prior summary plus
+        // two fresh turns, which stays larger than the summary on its own.
+        let pad = "context detail that occupies transcript space ".repeat(6);
         for i in 0..3 {
-            initial.push(Message::user(format!("padding user {i}")));
-            initial.push(Message::assistant(format!("padding assistant {i}")));
+            initial.push(Message::user(format!("padding user {i}: {pad}")));
+            initial.push(Message::assistant(format!("padding assistant {i}: {pad}")));
         }
         let tools = [Tool::Read];
 
@@ -3955,7 +4025,16 @@ mod tests {
                 .path("/v1/chat/completions")
                 .body_contains("\"model\":\"test-compactor\"");
             then.status(200).json_body(chat_response_json(
-                Some("Summary: assistant read a file."),
+                // (#1389) >= MIN_SUMMARY_CHARS and delimiter-free, so the
+                // narrative floor + sanitizer accept it; the enlarged padding
+                // below keeps every compaction's middle comfortably larger than
+                // this summary, clearing the min-reduction guard.
+                Some(
+                    "Summary: the assistant repeatedly issued a read tool call against the \
+                     workspace file and inspected the returned contents. No decisions were \
+                     finalized and no files were modified. The next concrete action is to \
+                     continue reading and then act on what the file contains.",
+                ),
                 None,
                 "stop",
                 500,
@@ -3968,9 +4047,14 @@ mod tests {
         std::fs::create_dir_all(tmp.path()).unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let mut initial = vec![Message::system("test system"), Message::user("seed")];
+        // (#1389) Long padding so the FIRST compaction's middle (these 4
+        // messages) is comfortably larger than the mock summary, clearing the
+        // min-reduction guard. Later recompactions fold the prior summary plus
+        // two fresh turns, which stays larger than the summary on its own.
+        let pad = "context detail that occupies transcript space ".repeat(6);
         for i in 0..3 {
-            initial.push(Message::user(format!("padding user {i}")));
-            initial.push(Message::assistant(format!("padding assistant {i}")));
+            initial.push(Message::user(format!("padding user {i}: {pad}")));
+            initial.push(Message::assistant(format!("padding assistant {i}: {pad}")));
         }
         let tools = [Tool::Read];
 
