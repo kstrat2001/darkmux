@@ -102,10 +102,10 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
 
 /// The model-facing elision marker inserted between the kept head and
 /// tail. Per the repo's model-facing conventions (CLAUDE.md): directive
-/// + literal, with a self-identifying `[darkmux-runtime: ...]` prefix as
-/// provenance. It states exactly how many bytes were removed and how to
-/// recover them, so a fresh-context model reads it as an instruction, not
-/// as prose to imitate. (#1391)
+/// and literal, with a self-identifying `[darkmux-runtime: ...]` prefix
+/// as provenance. It states exactly how many bytes were removed and how
+/// to recover them, so a fresh-context model reads it as an instruction,
+/// not as prose to imitate. (#1391)
 fn elision_marker(elided_bytes: usize, head_bytes: usize, tail_bytes: usize) -> String {
     format!(
         "\n[darkmux-runtime: elided {elided_bytes} bytes from the middle of this tool result; \
