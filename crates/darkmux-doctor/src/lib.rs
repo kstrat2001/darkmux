@@ -2787,36 +2787,6 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
 
-// ─── --fix path: auto-apply known-safe fixes ────────────────────────────
-
-/// Outcome of attempting an auto-fix for one rule. A non-skip
-/// `applied=false` means the handler ran but found nothing to change.
-#[derive(Debug, Clone)]
-pub struct FixOutcome {
-    pub rule_id: String,
-    pub applied: bool,
-    pub message: String,
-}
-
-/// Attempt to auto-apply known-safe fixes for failing checks in a doctor
-/// report. Only rules with a registered handler are touched; everything
-/// else is left for the operator. Each handler is responsible for its own
-/// idempotency — running `--fix` when nothing's broken is a no-op.
-///
-/// Returns the list of outcomes (one per fix attempt). Empty when no
-/// failing check had a registered handler.
-///
-/// No handlers are registered as of #1405 (the previous sole handler,
-/// `ctx-window-mismatch`, patched the removed openclaw runtime's config
-/// file). A future fix handler dispatches on `check.name.strip_prefix("eureka: ")`
-/// (the rule-id, so a typo or rename can't silently break the handler);
-/// keep additions narrow and documented in the issue tracker so operators
-/// can audit what `--fix` will and won't touch.
-#[allow(clippy::unnecessary_wraps)]
-pub fn try_fix(_report: &DoctorReport) -> Result<Vec<FixOutcome>> {
-    Ok(Vec::new())
-}
-
 // ─── Result rendering ───────────────────────────────────────────────────
 
 /// Print one check line + its hint lines. Shared by the verbose and

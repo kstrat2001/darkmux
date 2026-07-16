@@ -28,7 +28,7 @@ mod flow_cli;
 // crate::hardware::* resolving for heuristics/eureka/recommendations/doctor/etc.
 pub use darkmux_hardware as hardware;
 // #515 Tier B — per-tier heuristics extracted. Re-export keeps
-// crate::heuristics::* resolving for recommendations/optimize/doctor.
+// crate::heuristics::* resolving for recommendations/doctor.
 pub use darkmux_heuristics as heuristics;
 mod init;
 // #515 — lab harness extracted (lab + workloads + providers). Re-exports keep
@@ -43,7 +43,6 @@ mod mission_run;
 mod mission_launch;
 mod mission_launch_review;
 mod notebook;
-mod optimize;
 mod pr_review;
 pub use darkmux_lab::providers;
 // #515 — recommendation registry extracted (deps hardware/heuristics/types,
@@ -150,12 +149,6 @@ enum Cmd {
     /// registry, LMStudio, models, runtime, RAM, power) and reports
     /// pass/warn/fail with actionable hints. Exit 0 if no failures, else 1.
     Doctor {
-        /// Attempt to auto-apply known-safe fixes for failing or warning
-        /// checks where a handler is registered. No handlers are registered
-        /// today (#1405 removed the sole handler, which patched the legacy
-        /// openclaw runtime's config file); reserved for future fixes.
-        #[arg(long)]
-        fix: bool,
         /// (#1130) Print every check. Default output is issues-only — the
         /// build identity line + any warnings/failures, with the passing
         /// checks collapsed to a count. Use `-v` to see the full list.
@@ -290,10 +283,6 @@ enum Cmd {
         #[arg(long = "lab-dir")]
         lab_dir: Option<std::path::PathBuf>,
     },
-    /// Optimize for your workload — guided wizard (Phase 1 scaffold).
-    /// Composes scan, lab characterize/tune, heuristics, and eureka rules
-    /// into an opinionated optimization loop.
-    Optimize,
     /// One-command setup: install skills, optionally add session-start hook
     /// and CLAUDE.md integration so Claude Code knows about darkmux.
     Init {
@@ -1499,7 +1488,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Lab { sub } => cmd_lab(sub),
         Cmd::Skills { sub } => cmd_skills(sub),
         Cmd::Notebook { sub } => cmd_notebook(sub),
-        Cmd::Doctor { fix, verbose, probe } => cmd_doctor(fix, verbose, probe),
+        Cmd::Doctor { verbose, probe } => cmd_doctor(verbose, probe),
         Cmd::Scan { profiles } => cmd_scan(profiles.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
@@ -1541,7 +1530,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             serve::run(port, bind, flows_dir, lab_dir)?;
             Ok(0)
         }
-        Cmd::Optimize => optimize::run(),
     }
 }
 
@@ -1832,53 +1820,20 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
     }
 }
 
-fn cmd_doctor(fix: bool, verbose: bool, probe: bool) -> Result<i32> {
+fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
     let mut report = doctor::run();
     // (#1177) Opt-in live endpoint probes append to the same report so they
     // share the verdict/exit-code path — a failed probe exits 1 like any
-    // failed check. Probed ONCE per invocation: the --fix re-evaluation
-    // below reuses these results rather than re-billing a paid endpoint
-    // (no auto-fix can change a credential anyway).
+    // failed check.
     let probe_checks = if probe {
         doctor::probe_remote_endpoints()
     } else {
         Vec::new()
     };
-    report.checks.extend(probe_checks.iter().cloned());
+    report.checks.extend(probe_checks);
     doctor::print_report(&report, verbose)?;
 
-    // --fix path: attempt known-safe auto-fixes for failing/warning rules,
-    // then re-run the full check set so the operator sees the post-fix
-    // state. Without --fix, doctor is read-only — exits based on `report`.
-    let final_report = if fix {
-        let outcomes = doctor::try_fix(&report)?;
-        if outcomes.is_empty() {
-            println!();
-            println!("--fix: no auto-fix available for any failing or warning check.");
-            report
-        } else {
-            println!();
-            println!("--fix: applied {} auto-fix(es):", outcomes.len());
-            for o in &outcomes {
-                let marker = if o.applied { "✓" } else { "·" };
-                println!("  {marker} {} — {}", o.rule_id, o.message);
-            }
-            println!();
-            println!("Re-running doctor…");
-            println!();
-            let mut report2 = doctor::run();
-            // Carry the ORIGINAL probe results into the re-evaluated report —
-            // not re-probed (cost), but a probe failure must still fail the
-            // final exit code.
-            report2.checks.extend(probe_checks);
-            doctor::print_report(&report2, verbose)?;
-            report2
-        }
-    } else {
-        report
-    };
-
-    Ok(match final_report.worst_status() {
+    Ok(match report.worst_status() {
         doctor::Status::Fail => 1,
         _ => 0,
     })

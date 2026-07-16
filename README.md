@@ -189,7 +189,6 @@ darkmux swap fast                 # swap to the "fast" profile (loads model into
 darkmux lab characterize          # one-command "QA my Mac": dispatch a smoke workload, get a verdict
 darkmux lab run quick-q           # the smoke workload directly
 darkmux lab runs --limit 5        # see your recent runs
-darkmux optimize                 # guided "optimize for my workload" wizard (Phase 1 scaffold)
 darkmux lab inspect <run-id>      # full per-run breakdown
 darkmux notebook draft <run-id>   # ask the active role to author a lab-style notebook entry
 darkmux mission propose --from-stdin   # AI-built-in: vague intent → a structured mission config
@@ -371,7 +370,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 - ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
 - ✅ `darkmux flow status` + `darkmux flow integrity-check` diagnostic verbs
 - ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers
-- ✅ Doctor: 30+ pre-flight checks with auto-fix path (`--fix`) for known-safe drift, plus a legacy-extras warning that flags profiles still carrying pre-#380 compaction keys (`mode`, `maxHistoryShare`, …)
+- ✅ Doctor: 30+ pre-flight checks with actionable hints, plus a legacy-extras warning that flags profiles still carrying pre-#380 compaction keys (`mode`, `maxHistoryShare`, …)
 
 **On the roadmap (active):**
 
