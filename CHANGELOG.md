@@ -11,6 +11,9 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+### Removed (breaking, 2.0-track)
+- **`GET /diff/:session_id`** and the viewer's live-diff panel (#1387, part of the #1386 2.0 sweep). This was the daemon's only workspace-content route: it shipped a mission-run worktree's unified diff TEXT over HTTP behind its own always-on token gate (even on loopback), plus a 256KB server-side cap and a 4,000-line client cap. Replaced by `GET /worktree-summary/:session_id`, a numbers-only endpoint (`files`/`adds`/`dels`/`base`/`path`, derived from `git diff --numstat`, never diff content) that rides the general remote-read gate like every other route. The session view now renders a "what changed" totals line plus the worktree path with a copy-to-clipboard button and a `zed://file/<path>` anchor (inert, by design, on machines without Zed; no editor detection, no config matrix). No shim, both the route and the panel are gone.
+
 ## [1.18.5] - 2026-07-12
 
 Two fixes surfaced by a real production 37-flag funnel run on a private repo, plus a provenance gap found on the very first Azure review.

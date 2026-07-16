@@ -421,17 +421,15 @@
   .nrow{border-bottom:1px solid var(--line);padding:9px 0}.nrow:last-child{border-bottom:none}
   .nts{font:10px 'JetBrains Mono',monospace;color:var(--amber-dim)}
   .ntext{font:12px/1.5 'JetBrains Mono',monospace;color:var(--text);margin-top:3px;white-space:pre-wrap}
-  /* (#756) live diff panel — watch the code form during a mission-run dispatch */
-  .fchips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 8px}
-  .fchip{font:10px/1.7 'JetBrains Mono',monospace;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:1px 7px;color:var(--text)}
-  .fchip .fa{color:var(--good)}.fchip .fd{color:var(--bad)}
-  .diffwrap{max-height:380px;overflow:auto;background:#0a0f17;border:1px solid var(--line);border-radius:6px;padding:8px 10px;font:11px/1.5 'JetBrains Mono',ui-monospace,monospace}
-  .dl{white-space:pre-wrap;word-break:break-all}
-  .dl.add{color:var(--good);background:rgba(90,240,163,.05)}
-  .dl.del{color:var(--bad);background:rgba(255,107,133,.05)}
-  .dl.hunk{color:var(--amber);margin-top:4px}
-  .dl.fhd{color:var(--text);font-weight:700;margin-top:10px}
-  .dl.mt{color:var(--muted)}
+  /* (#1387) what-changed summary + worktree handoff — replaces the retired
+     live-diff panel (#756). The daemon never ships diff content over HTTP
+     any more; this renders totals + a copy/zed handoff to the worktree path. */
+  .wtpath{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}
+  .wtpath code{font:11px/1.5 'JetBrains Mono',ui-monospace,monospace;color:var(--text);background:#0a0f17;border:1px solid var(--line);border-radius:6px;padding:6px 10px;overflow-wrap:anywhere}
+  .wtcopy{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);border-radius:4px;padding:4px 10px;cursor:pointer;font:600 11px 'JetBrains Mono',monospace}
+  .wtcopy:hover{border-color:var(--amber)}
+  .wtzed{color:var(--amber);font:11px 'JetBrains Mono',monospace;text-decoration:none}
+  .wtzed:hover{text-decoration:underline}
   /* (#783) savings hero — tokens kept off the meter. The "bang-up" on the fleet view. */
   /* (#803 layout) Horizontal hero: the big number leads on the left, the
      token-class stat blocks fill the width to its right (the breakdown now
@@ -1980,9 +1978,6 @@ function runRegions(){
 // every other live tick, so the prompt's scroll + open survive.
 function renderSubsystem(){
   const r=runRegions();
-  // (#756) Capture the diff scroll before the full-stage wipe; paintDiff
-  // restores it into the stable #difftrack mount.
-  const _dw=document.querySelector('.diffwrap'); if(_dw)DIFF._scroll=_dw.scrollTop;
   $("stage").innerHTML=`<div class="sub">${r.header}
     ${r.brief}
     <div id="sub-met">${r.met}</div>
@@ -1990,66 +1985,90 @@ function renderSubsystem(){
     <div id="sub-cpu">${r.cpu}</div>
     <div id="sub-ctx">${r.ctxChart}</div>
     <div id="sub-det">${r.detections}</div>
-    <div id="difftrack"></div></div>`;
-  paintDiff(r.sid);
+    <div id="wtsumtrack"></div></div>`;
+  paintWtSum(r.sid);
 }
 
 // (#1148) Per-tick volatile refresh: update only the metric / model / cpu / ctx
 // / detection regions IN PLACE. The header + brief (and the prompt's scroll +
 // open inside it) are never touched — killing the ~1/sec state loss as a class
-// and giving each volatile value a stable DOM node to animate later. The diff
-// is repainted into its own stable #difftrack mount.
+// and giving each volatile value a stable DOM node to animate later. The
+// what-changed summary is repainted into its own stable #wtsumtrack mount.
 function refreshSubsystem(){
   const r=runRegions();
   const set=(id,html)=>{const e=$(id); if(e&&e.innerHTML!==html)e.innerHTML=html;};
   set("sub-met",r.met); set("sub-model",r.modelTrack); set("sub-cpu",r.cpu);
   set("sub-ctx",r.ctxChart); set("sub-det",r.detections);
-  paintDiff(r.sid);
+  paintWtSum(r.sid);
 }
-// (#756) Live-diff panel for the session view — the agent's code changes
-// forming in real time. Renders only in live mode (the static demo and
-// playback have no daemon to ask) and only when the daemon reports the
-// session's worktree diff as available; everything record-derived passes
-// through esc() at the template edge (the viewer's output-encoding
-// invariant — diff content is model-authored text, treat it as hostile).
-function diffPanel(sid){
+// (#1387) What-changed summary + worktree handoff for the session view —
+// replaces the retired live-diff panel (#756: a read-only, poll-based diff
+// pane that shipped source code over HTTP behind its own always-on auth
+// gate). The daemon's GET /worktree-summary/:session_id resolves the
+// session's worktree and returns file/adds/dels TOTALS plus the worktree
+// path only — no diff content ever leaves the server. Renders only in live
+// mode (the static demo and playback have no daemon to ask) and only when
+// the daemon reports the summary as available. The path renders with a
+// copy-to-clipboard button (universal) and a `zed://file/<path>` anchor —
+// a plain link, no editor detection: it's a no-op convenience on machines
+// without Zed, rendered unconditionally by design (#1387 operator decision).
+function wtSumPanel(sid){
   if(!document.body.classList.contains('live-mode'))return "";
-  const d=DIFF.sid===sid?DIFF.data:null;
+  const d=WTSUM.sid===sid?WTSUM.data:null;
   if(!d||!d.available)return "";
-  const files=d.files||[], untracked=d.untracked||[];
-  if(!files.length&&!untracked.length)
-    return `<div class="track"><div class="lbl">live diff vs ${esc(d.base)}</div><div class="hint">no changes yet — the worktree matches ${esc(d.base)}</div></div>`;
-  const adds=files.reduce((a,f)=>a+(f.additions||0),0), dels=files.reduce((a,f)=>a+(f.deletions||0),0);
-  const chips=files.map(f=>`<span class="fchip">${esc(f.path)} <b class="fa">+${f.additions==null?'·':esc(f.additions)}</b> <b class="fd">−${f.deletions==null?'·':esc(f.deletions)}</b></span>`).join("")
-    +untracked.map(p=>`<span class="fchip">${esc(p)} <b class="fa">new</b></span>`).join("");
-  // Client-side line cap for DOM sanity on huge diffs; the server already
-  // byte-bounds the text and flags `truncated`.
-  const MAXL=4000, lines=(d.diff||"").split("\n");
-  const body=lines.slice(0,MAXL).map(l=>{
-    const c=l.startsWith("+++")||l.startsWith("---")?"mt":l.startsWith("diff --git")?"fhd":l.startsWith("@@")?"hunk":l.startsWith("+")?"add":l.startsWith("-")?"del":"";
-    return `<div class="dl ${c}">${esc(l)||" "}</div>`;
-  }).join("");
-  const more=lines.length>MAXL?`<div class="dl mt">… ${lines.length-MAXL} more lines (capped for display)</div>`:"";
-  const trunc=d.truncated?' · <span class="fd">truncated</span>':'';
-  return `<div class="track"><div class="lbl">live diff vs ${esc(d.base)} — ${files.length} file${files.length===1?'':'s'} · <span class="fa" style="color:var(--good)">+${adds}</span> <span class="fd" style="color:var(--bad)">−${dels}</span>${trunc}</div>
-    <div class="fchips">${chips}</div>
-    <div class="diffwrap">${body}${more}</div></div>`;
+  const files=d.files||0, adds=d.adds||0, dels=d.dels||0, path=d.path||"";
+  const changed=files
+    ? `${files} file${files===1?'':'s'} changed · <span style="color:var(--good)">+${esc(adds)}</span> <span style="color:var(--bad)">−${esc(dels)}</span> vs ${esc(d.base)}`
+    : `no changes yet — the worktree matches ${esc(d.base)}`;
+  const handoff=path
+    ? `<div class="wtpath"><code>${esc(path)}</code>
+      <button type="button" class="wtcopy" data-act="copywt" data-arg="${esc(path)}">copy path</button>
+      <a class="wtzed" href="zed://file/${esc(encodeURI(path))}" title="open in Zed — inert if Zed isn't installed on this machine">open in zed</a>
+    </div>`
+    : "";
+  return `<div class="track"><div class="lbl">what changed</div><div class="hint">${changed}</div>${handoff}</div>`;
 }
-// (#756 flicker fix) Paint the diff into its stable #difftrack mount,
-// independent of the full-stage render. Repaints only when the content
-// changed OR the mount was just rebuilt empty by render() — and restores the
-// captured scroll, so a per-turn re-render neither flashes the diff nor jumps
-// it. Live-gated via diffPanel() (returns "" off-live), and starts the poll.
-function paintDiff(sid){
-  const mount=document.getElementById('difftrack');
+// Paint the what-changed summary into its stable #wtsumtrack mount,
+// independent of the full-stage render — repaints only when the content
+// changed OR the mount was just rebuilt empty by render(). Live-gated via
+// wtSumPanel() (returns "" off-live), and starts the poll.
+function paintWtSum(sid){
+  const mount=document.getElementById('wtsumtrack');
   if(!mount)return;
-  if(document.body.classList.contains('live-mode'))ensureDiffPoll(sid);
-  const html=diffPanel(sid);
-  if(html!==DIFF._painted||(html!==""&&mount.childElementCount===0)){
-    mount.innerHTML=html; DIFF._painted=html;
+  if(document.body.classList.contains('live-mode'))ensureWtSumPoll(sid);
+  const html=wtSumPanel(sid);
+  if(html!==WTSUM._painted||(html!==""&&mount.childElementCount===0)){
+    mount.innerHTML=html; WTSUM._painted=html;
   }
-  const w=mount.querySelector('.diffwrap');
-  if(w&&DIFF._scroll)w.scrollTop=DIFF._scroll;
+}
+// (#1387) Copy the worktree path to the clipboard. Tries the async Clipboard
+// API first; falls back to a hidden-textarea + execCommand('copy') because
+// the Clipboard API requires a secure context (https or localhost) and the
+// phone-over-tailnet case is plain http. Feedback lands on the button that's
+// currently rendered in #wtsumtrack (there's only ever one at a time).
+function copyWtPath(path){
+  const mark=ok=>{
+    const el=document.querySelector('#wtsumtrack .wtcopy');
+    if(!el)return;
+    const orig=el.textContent;
+    el.textContent=ok?"copied":"copy failed";
+    setTimeout(()=>{ if(el.isConnected)el.textContent=orig; },1400);
+  };
+  const fallback=()=>{
+    try{
+      const ta=document.createElement("textarea");
+      ta.value=path; ta.style.position="fixed"; ta.style.opacity="0";
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      const ok=document.execCommand("copy");
+      document.body.removeChild(ta);
+      mark(ok);
+    }catch(_){ mark(false); }
+  };
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(path).then(()=>mark(true)).catch(fallback);
+  }else{
+    fallback();
+  }
 }
 function pretty(r){
   const o={};Object.keys(r).filter(k=>!k.startsWith("_")).forEach(k=>o[k]=r[k]);
@@ -2591,6 +2610,8 @@ const ACTIONS={
   labrun:a=>drillLabRun(a),
   // (#1286) The machine memory lens.
   machinemem:()=>goMachineMem(),
+  // (#1387) Copy the worktree path from the what-changed summary.
+  copywt:a=>copyWtPath(a),
 };
 // (#1090) Shared dispatch for the delegated drill-nav — invoked by BOTH the
 // click handler and the keyboard handler below, so cards are mouse- AND
@@ -3092,42 +3113,42 @@ function startLiveTail(date){
 // (#638) Poll the live-session set on the heartbeat cadence (~5s, matching
 // the emitter's refresh + 15s TTL). Best-effort: a fetch error just leaves
 // the set unchanged rather than flapping sessions offline. Only started in
-// (#756) Live diff of a session's mission-run worktree. The daemon's
-// GET /diff/:session_id resolves the session's worktree from its
-// mission.run.start record and returns the running `git diff` vs the base
-// (read-only, size-bounded, path-contained server-side). Polled ONLY while
-// the operator is on that session's view in LIVE mode — playback and the
-// static demo never fetch (no daemon there; the catch keeps a 404 silent,
-// so this also degrades cleanly against a pre-#756 daemon). One timer max;
-// it self-stops when the view changes. Worktrees outlive dispatch complete
-// (until ship/abort), so the panel keeps working at the review gate —
-// where reading the diff matters most.
-const DIFF={sid:null,data:null,timer:null,_scroll:0,_painted:""};
-function stopDiffPoll(){ if(DIFF.timer)clearInterval(DIFF.timer); DIFF.timer=null; DIFF.sid=null; DIFF.data=null; DIFF._painted=""; DIFF._scroll=0; }
-async function pollDiff(){
-  const sid=DIFF.sid;
+// (#1387) What-changed summary of a session's mission-run worktree. The
+// daemon's GET /worktree-summary/:session_id resolves the session's
+// worktree from its mission.run.start record and returns file/adds/dels
+// totals + the worktree path (numbers + path only — no file content ever
+// leaves the server; replaces the retired #756 live-diff poll). Polled
+// ONLY while the operator is on that session's view in LIVE mode —
+// playback and the static demo never fetch (no daemon there; the catch
+// keeps a 404 silent, so this also degrades cleanly against an older
+// daemon). One timer max; it self-stops when the view changes. Worktrees
+// outlive dispatch complete (until ship/abort), so the panel keeps working
+// at the review gate — where the handoff matters most.
+const WTSUM={sid:null,data:null,timer:null,_painted:""};
+function stopWtSumPoll(){ if(WTSUM.timer)clearInterval(WTSUM.timer); WTSUM.timer=null; WTSUM.sid=null; WTSUM.data=null; WTSUM._painted=""; }
+async function pollWtSum(){
+  const sid=WTSUM.sid;
   if(!sid)return;
   try{
-    const r=await fetch("/diff/"+encodeURIComponent(sid),{headers:{accept:"application/json"}});
+    const r=await fetch("/worktree-summary/"+encodeURIComponent(sid),{headers:{accept:"application/json"}});
     if(!r.ok)return;
     const d=await r.json();
-    const changed=JSON.stringify(d)!==JSON.stringify(DIFF.data);
-    DIFF.data=d;
-    // (#756 flicker fix) Repaint ONLY the diff mount on a content change —
-    // not a full render(). The rest of the subsystem updates on its own
-    // cadence via applyLive; the diff has no business triggering a stage
-    // rebuild (that was half the flicker).
-    if(changed&&state.level==="subsystem"&&state.session===sid)paintDiff(sid);
+    const changed=JSON.stringify(d)!==JSON.stringify(WTSUM.data);
+    WTSUM.data=d;
+    // Repaint ONLY the summary mount on a content change — not a full
+    // render(). The rest of the subsystem updates on its own cadence via
+    // applyLive; the summary has no business triggering a stage rebuild.
+    if(changed&&state.level==="subsystem"&&state.session===sid)paintWtSum(sid);
   }catch(_){/* best-effort — no daemon / endpoint absent / transient */}
 }
-function ensureDiffPoll(sid){
-  if(DIFF.sid===sid&&DIFF.timer)return;
-  stopDiffPoll();
-  DIFF.sid=sid;
-  pollDiff();
-  DIFF.timer=setInterval(()=>{
-    if(state.level!=="subsystem"||state.session!==sid){stopDiffPoll();return;}
-    pollDiff();
+function ensureWtSumPoll(sid){
+  if(WTSUM.sid===sid&&WTSUM.timer)return;
+  stopWtSumPoll();
+  WTSUM.sid=sid;
+  pollWtSum();
+  WTSUM.timer=setInterval(()=>{
+    if(state.level!=="subsystem"||state.session!==sid){stopWtSumPoll();return;}
+    pollWtSum();
   },3000);
 }
 // live mode; playback keeps LIVE_SESSIONS empty so nothing reads "running".
