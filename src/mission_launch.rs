@@ -338,35 +338,20 @@ pub fn launch(
         None
     };
 
-    // Flip each executing phase Planned → Running, mirroring `mission
-    // run`'s own status-aware start (it only calls `phase_start` on a
-    // Planned phase). A phase already Running (a relaunch of a gated run
-    // that stopped at the sign-off gate) is left alone silently; a
-    // terminal-Complete phase (a relaunch of a gate-less finalized graph)
-    // gets the loud dim note since its subsequent finalize transitions
-    // will bail against the terminal state.
+    // (#1400) Preflight, READ-ONLY pass: name any phase that's already
+    // terminal-Complete from a prior finalized run — informational only,
+    // no `phase_start` call here. Phases don't start eagerly at mint
+    // anymore (that was the bug — every phase pulsed "running" from second
+    // zero regardless of whether the scheduler had reached it); each
+    // phase's OWN `phase_start` fires lazily, inside the `persist` closure
+    // below, the FIRST time one of its steps actually flips `Running`.
     for phase in &config.phases {
         let real_id = &real_phase_ids[&phase.id];
         if !tasks.iter().any(|t| &t.phase_id == real_id) {
             continue;
         }
-        let status = load_phase_for_brief(&mission_id, real_id)
-            .map(|p| p.status)
-            .unwrap_or(PhaseStatus::Planned);
-        match status {
-            PhaseStatus::Planned | PhaseStatus::Abandoned => {
-                if let Err(e) = crew::lifecycle::phase_start(real_id) {
-                    eprintln!(
-                        "{}",
-                        style::dim(&format!(
-                            "mission launch: phase_start({real_id}) failed: {e:#} — continuing; \
-                             state can be reconciled with `darkmux phase` verbs."
-                        ))
-                    );
-                }
-            }
-            PhaseStatus::Running => {}
-            PhaseStatus::Complete => {
+        if let Ok(p) = load_phase_for_brief(&mission_id, real_id) {
+            if p.status == PhaseStatus::Complete {
                 eprintln!(
                     "{}",
                     style::dim(&format!(
@@ -384,6 +369,9 @@ pub fn launch(
         tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
     let facts = crew::step_kinds::Facts::default();
     let est = crew::step_kinds::FixedEstimator::default();
+    // (#1400) Tracks which phases this dispatch has already lazy-started —
+    // see `lazy_start_phase_for_step`'s doc.
+    let mut started_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
     // (#1397) `persist` durably saves each step at ITS OWN transition
     // (Running at dispatch, Complete/Error at completion), not just at the
     // end of the whole run — see `run_step_graph`'s own doc. The phase id
@@ -408,6 +396,7 @@ pub fn launch(
                 .get(&step.task_id)
                 .map(|t| t.phase_id.as_str())
                 .unwrap_or_default();
+            lazy_start_phase_for_step(&mission_id, phase_id, step.status, &mut started_phases);
             if let Err(e) = crew::lifecycle::save_step(&mission_id, phase_id, step) {
                 eprintln!(
                     "{}",
@@ -649,13 +638,18 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
             let real_id = &real_phase_ids[&phase.id];
             let phase_path = crew::lifecycle::phase_path(mission_id, real_id);
             if phase_path.is_file() {
-                if let Ok(text) = std::fs::read_to_string(&phase_path) {
-                    if let Ok(existing) = serde_json::from_str::<Phase>(&text) {
-                        if existing.status == PhaseStatus::Abandoned {
-                            let _ = crew::lifecycle::phase_start(real_id);
-                        }
-                    }
-                }
+                // (#1400) An `Abandoned` phase on reuse is NOT restarted
+                // here anymore — that used to eagerly flip it (and, on a
+                // multi-phase config, every OTHER abandoned phase) straight
+                // to `Running` before the scheduler dispatched anything.
+                // `lazy_start_phase_for_step` already treats `Abandoned`
+                // as startable (mirrors `phase_start`'s own state machine —
+                // `Abandoned -> Running` clears `abandoned_ts`, same as a
+                // fresh restart), so the SAME persist-hook path that starts
+                // a `Planned` phase on reach also restarts an `Abandoned`
+                // one — preserving #1372's "restarts only what reruns"
+                // semantics while fixing the "all phases pulse at once"
+                // symptom for the reopen path too.
             } else {
                 // (consider 5) The config declares a phase the old instance
                 // doesn't have — mint it before executing, and register it
@@ -1139,10 +1133,69 @@ fn load_mission_for_brief(mission_id: &str) -> Result<Mission> {
     serde_json::from_str(&text).context("parsing mission.json")
 }
 
-fn load_phase_for_brief(mission_id: &str, phase_id: &str) -> Result<Phase> {
+// `pub(crate)` — `mission_launch_review.rs` reuses this (and
+// `lazy_start_phase_for_step` below) rather than re-deriving the same
+// read.
+pub(crate) fn load_phase_for_brief(mission_id: &str, phase_id: &str) -> Result<Phase> {
     let text = std::fs::read_to_string(crew::lifecycle::phase_path(mission_id, phase_id))
         .with_context(|| format!("reading phase JSON for `{phase_id}`"))?;
     serde_json::from_str(&text).context("parsing phase JSON")
+}
+
+/// (#1400) Called from a `run_step_graph`/`run_review_graph` `persist`
+/// closure on EVERY step transition this dispatch performs — starts
+/// `phase_id` the FIRST time one of ITS OWN steps flips to `Running`, and
+/// is a no-op for every other call: a terminal (`Complete`/`Error`)
+/// transition never starts anything, and a SECOND step in an
+/// already-started phase is skipped via `started` (a phase whose `Running`
+/// flip already fired would otherwise hit `phase_start`'s "already
+/// Running" error on every subsequent step in the same phase — the state
+/// machine only allows the transition once).
+///
+/// This is the mechanism that makes phases start LAZILY instead of every
+/// phase pulsing "running" from second zero at mint: a downstream phase
+/// (e.g. review's `adjudicate`/`report`) whose steps the scheduler hasn't
+/// reached yet never gets a `persist` call with `Running` for one of its
+/// own steps, so it stays `Planned` until the graph actually reaches it —
+/// the pipeline-progressing-left-to-right story the graph lens is meant to
+/// tell.
+///
+/// Reads a fresh phase status per FIRST-encountered phase (never trusts a
+/// caller-precomputed status, which could be stale by the time the
+/// scheduler reaches this phase in a long-running dispatch) — `Planned`/
+/// `Abandoned` starts it; `Running` (a relaunch of a gated run mid-flight)
+/// and `Complete` (a relaunch past a terminal phase — logged separately by
+/// the caller's own preflight pass) are left alone. Failure to start is a
+/// loud dim warning, never a hard error — the same "continue, state can be
+/// reconciled with `darkmux phase` verbs" posture the pre-#1400 eager loop
+/// used.
+pub(crate) fn lazy_start_phase_for_step(
+    mission_id: &str,
+    phase_id: &str,
+    step_status: crew::types::NodeStatus,
+    started: &mut std::collections::HashSet<String>,
+) {
+    use crew::types::NodeStatus;
+    if step_status != NodeStatus::Running {
+        return;
+    }
+    if phase_id.is_empty() || !started.insert(phase_id.to_string()) {
+        return;
+    }
+    let status = load_phase_for_brief(mission_id, phase_id)
+        .map(|p| p.status)
+        .unwrap_or(PhaseStatus::Planned);
+    if matches!(status, PhaseStatus::Planned | PhaseStatus::Abandoned) {
+        if let Err(e) = crew::lifecycle::phase_start(phase_id) {
+            eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "mission launch: phase_start({phase_id}) failed: {e:#} — continuing; state \
+                     can be reconciled with `darkmux phase` verbs."
+                ))
+            );
+        }
+    }
 }
 
 /// Fold the interpreted graph's final step statuses into a
@@ -1806,5 +1859,137 @@ mod tests {
         let missing = missing_required_inputs(&cfg, &BTreeMap::new());
         let names: Vec<&str> = missing.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["workdir"], "mission_id (launcher-supplied) and image (optional) must not appear");
+    }
+
+    // ── #1400: lazy phase start ("phase 2 stays planned until reached") ──
+
+    #[test]
+    #[serial_test::serial]
+    fn lazy_start_phase_for_step_only_starts_the_phase_its_step_belongs_to() {
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        let mission_id = "lazy-start-test";
+        let (real_phase_ids, _reused) = ensure_mission_and_phases(mission_id, &config).unwrap();
+        let p1 = &real_phase_ids["p1"];
+        let p2 = &real_phase_ids["p2"];
+
+        // Both phases start life Planned — mint never eagerly starts
+        // anything (this is #1400's headline finding: a 3-phase mission
+        // used to show every phase Running from second zero).
+        assert_eq!(phase_status_on_disk(mission_id, p1), PhaseStatus::Planned);
+        assert_eq!(phase_status_on_disk(mission_id, p2), PhaseStatus::Planned);
+
+        let mut started = std::collections::HashSet::new();
+        // A step belonging to p1 flips Running — only p1 starts; p2 (which
+        // the scheduler hasn't reached yet) stays Planned.
+        lazy_start_phase_for_step(mission_id, p1, NodeStatus::Running, &mut started);
+        assert_eq!(phase_status_on_disk(mission_id, p1), PhaseStatus::Running, "p1 starts on its own first step");
+        assert_eq!(
+            phase_status_on_disk(mission_id, p2),
+            PhaseStatus::Planned,
+            "p2 must stay Planned until ITS OWN step starts — not pulsed at the same time as p1"
+        );
+
+        // A terminal transition for a p1 step is a no-op for phase-start
+        // purposes — only a `Running` call can ever start a phase.
+        lazy_start_phase_for_step(mission_id, p1, NodeStatus::Complete, &mut started);
+        assert_eq!(phase_status_on_disk(mission_id, p1), PhaseStatus::Running);
+        assert_eq!(phase_status_on_disk(mission_id, p2), PhaseStatus::Planned);
+
+        // p2 finally gets its own step start — it starts too, independently
+        // and later, matching the pipeline-progressing-left-to-right story
+        // the graph lens is meant to tell.
+        lazy_start_phase_for_step(mission_id, p2, NodeStatus::Running, &mut started);
+        assert_eq!(phase_status_on_disk(mission_id, p2), PhaseStatus::Running, "p2 starts on its own first step");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lazy_start_phase_for_step_is_idempotent_for_a_multi_step_phase() {
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        let mission_id = "lazy-start-idempotent";
+        let (real_phase_ids, _) = ensure_mission_and_phases(mission_id, &config).unwrap();
+        let p1 = &real_phase_ids["p1"];
+
+        let mut started = std::collections::HashSet::new();
+        // Two DIFFERENT steps in the SAME phase both flip Running (a
+        // multi-task phase) — the second call must not re-attempt
+        // `phase_start` (which errors against an already-Running phase);
+        // `started` is what prevents the re-attempt, never a second read
+        // of the live phase status racing the first call's write.
+        lazy_start_phase_for_step(mission_id, p1, NodeStatus::Running, &mut started);
+        lazy_start_phase_for_step(mission_id, p1, NodeStatus::Running, &mut started);
+        assert_eq!(phase_status_on_disk(mission_id, p1), PhaseStatus::Running);
+    }
+
+    /// (#1400 + #1372) The reopen-semantics regression test: a relaunch of
+    /// a Closed mission must restart ONLY what reruns. Simulates a prior
+    /// partial run — phase 1 finished cleanly (`Complete`), phase 2
+    /// errored and was abandoned (`Abandoned`) — then reopens the SAME
+    /// mission id and asserts the reopen itself touches NEITHER phase's
+    /// status (no eager restart of the abandoned phase — the pre-#1400
+    /// bug), while the lazy hook still restarts the abandoned one once its
+    /// own step actually begins, and the terminal phase stays untouched
+    /// throughout (nothing reruns for it, so nothing calls the hook for
+    /// it).
+    #[test]
+    #[serial_test::serial]
+    fn reopen_preserves_terminal_phase_status_and_restarts_only_abandoned_ones_lazily() {
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        let mission_id = "lazy-reopen-test";
+        let (real_phase_ids, _) = ensure_mission_and_phases(mission_id, &config).unwrap();
+        let p1 = &real_phase_ids["p1"];
+        let p2 = &real_phase_ids["p2"];
+
+        crew::lifecycle::phase_start(p1).unwrap();
+        crew::lifecycle::phase_complete(p1).unwrap();
+        crew::lifecycle::phase_start(p2).unwrap();
+        crew::lifecycle::phase_abandon(p2).unwrap();
+        crew::lifecycle::mission_close_with_reasoning(mission_id, Some("test close")).unwrap();
+        assert_eq!(mission_status_on_disk(mission_id), MissionStatus::Closed);
+
+        // Relaunch (reopen) the SAME mission id.
+        let (real_phase_ids2, reused) = ensure_mission_and_phases(mission_id, &config).unwrap();
+        assert!(reused);
+        assert_eq!(real_phase_ids2, real_phase_ids);
+        assert_eq!(mission_status_on_disk(mission_id), MissionStatus::Active, "reopen reactivates the mission");
+
+        // (#1400) Preserved #1372 semantics: reopen restarts only what
+        // reruns. p1 (terminal Complete) is untouched; p2 (Abandoned) is
+        // ALSO untouched AT REOPEN TIME — not eagerly flipped to Running —
+        // only the scheduler's own lazy hook, once it actually reaches
+        // p2's first step, does that.
+        assert_eq!(
+            phase_status_on_disk(mission_id, p1),
+            PhaseStatus::Complete,
+            "a terminal phase is never touched by reopen"
+        );
+        assert_eq!(
+            phase_status_on_disk(mission_id, p2),
+            PhaseStatus::Abandoned,
+            "reopen must NOT eagerly restart an abandoned phase — that was the #1400 bug"
+        );
+
+        // The lazy hook restarts p2 once its own step actually begins; p1
+        // is never called (its graph doesn't rerun), proving the restart
+        // stays scoped to "only what reruns."
+        let mut started = std::collections::HashSet::new();
+        lazy_start_phase_for_step(mission_id, p2, NodeStatus::Running, &mut started);
+        assert_eq!(
+            phase_status_on_disk(mission_id, p2),
+            PhaseStatus::Running,
+            "the lazy hook restarts an Abandoned phase on reach"
+        );
+        assert!(
+            load_phase_for_brief(mission_id, p2).unwrap().abandoned_ts.is_none(),
+            "restart clears abandoned_ts, matching phase_start's own convention"
+        );
+        assert_eq!(
+            phase_status_on_disk(mission_id, p1),
+            PhaseStatus::Complete,
+            "p1 stays untouched since nothing reruns for it"
+        );
     }
 }
