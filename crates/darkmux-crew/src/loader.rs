@@ -179,8 +179,8 @@ const BUILTIN_PHASES: &[(&str, &str)] = &[];
 ///
 /// **Deprecated direction (Beat 33):** prefer the per-subdir helpers
 /// `roles_dir()`, `missions_dir()`, `phases_dir()`, `crews_dir()`,
-/// `skills_dir()`, and `role_pins_path()` for new code. They
-/// resolve the post-flatten `<root>/<subdir>/` layout with a backward-
+/// and `skills_dir()` for new code. They resolve the post-flatten
+/// `<root>/<subdir>/` layout with a backward-
 /// compatibility fallback to the legacy `<root>/crew/<subdir>/` layout.
 /// `crew_root()` is retained for callers that need the parent directory
 /// itself (e.g., daemon banner messages).
@@ -279,22 +279,6 @@ pub(crate) fn skills_dir() -> PathBuf {
 /// baggage pre-1.0" doctrine — nothing to be compatible WITH here).
 pub fn mission_configs_dir() -> PathBuf {
     user_state_root().join("mission-configs")
-}
-
-/// User-side role-model-pins.json path. Post-Beat-33:
-/// `<root>/role-model-pins.json`. Falls back to
-/// `<root>/crew/role-model-pins.json` for legacy.
-pub(crate) fn role_pins_path() -> PathBuf {
-    let root = user_state_root();
-    let canonical = root.join("role-model-pins.json");
-    if canonical.is_file() {
-        return canonical;
-    }
-    let legacy = root.join("crew").join("role-model-pins.json");
-    if legacy.is_file() {
-        return legacy;
-    }
-    canonical
 }
 
 /// Resolve a role's system-prompt text. Search order:
@@ -1592,30 +1576,6 @@ mod load_per_mission_tests {
         assert!(!canonical.exists());
         assert!(!guard.path().join("crew").join("phases").exists());
         assert_eq!(phases_dir(), canonical);
-    }
-
-    #[serial]
-    #[test]
-    fn role_pins_path_resolves_canonical_first_then_legacy_then_canonical() {
-        // Pins is a file (not a dir) so it has its own resolution. Mirror
-        // the same four-case table.
-        let guard = TestCrewRoot::new();
-        let canonical = guard.path().join("role-model-pins.json");
-        let legacy = guard.path().join("crew").join("role-model-pins.json");
-
-        // Neither: canonical
-        assert!(!canonical.is_file());
-        assert!(!legacy.is_file());
-        assert_eq!(role_pins_path(), canonical);
-
-        // Legacy only: legacy
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, "{}").unwrap();
-        assert_eq!(role_pins_path(), legacy);
-
-        // Both: canonical wins
-        std::fs::write(&canonical, "{}").unwrap();
-        assert_eq!(role_pins_path(), canonical);
     }
 
     #[serial]

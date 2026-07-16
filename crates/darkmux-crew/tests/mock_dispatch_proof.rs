@@ -196,11 +196,9 @@ fn run_mock_dispatch(
         timeout_seconds: 120,
         skip_preflight: true,
         json: true,
-        watch_paths: vec![],
         workdir: None,
         phase_id: None,
         runtime: Runtime::Internal,
-        runtime_cmd: "openclaw".to_string(), // ignored on the internal runtime
         machine: None,
         wait: true,
         compaction: CompactionDispatchArgs::default(),

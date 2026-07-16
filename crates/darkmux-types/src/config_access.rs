@@ -476,20 +476,9 @@ pub fn fleet_file() -> std::path::PathBuf {
     )
 }
 
-// The next four are **override-only** (`env > config.dirs.X`, else `None`):
-// each caller keeps its own no-HOME default/error handling (some return
-// `Option`, some `Result`, some `~/.darkmux/...` vs `~/.openclaw/...`), so the
-// accessor yields just the override and the caller applies its default.
-
-/// openclaw config-file override (`env(DARKMUX_OPENCLAW_CONFIG) >
-/// config.dirs.openclaw_config`). Callers default to `~/.openclaw/openclaw.json`
-/// (the swap patcher → `None` on no HOME; the dispatch path → `./.openclaw/...`).
-pub fn openclaw_config_override() -> Option<std::path::PathBuf> {
-    pick_dir_override(
-        env_str("DARKMUX_OPENCLAW_CONFIG"),
-        config().dirs.as_ref().and_then(|d| d.openclaw_config.as_deref()),
-    )
-}
+// The next two are **override-only** (`env > config.dirs.X`, else `None`):
+// each caller keeps its own no-HOME default/error handling, so the accessor
+// yields just the override and the caller applies its default.
 
 /// Operator-identity file override (`env(DARKMUX_IDENTITY_PATH) >
 /// config.dirs.identity`). Caller defaults to `~/.darkmux/identity.md`.
@@ -506,17 +495,6 @@ pub fn ack_dir_override() -> Option<std::path::PathBuf> {
     pick_dir_override(
         env_str("DARKMUX_ACK_DIR"),
         config().dirs.as_ref().and_then(|d| d.ack.as_deref()),
-    )
-}
-
-/// Agent-runtime trajectories dir override (`env(DARKMUX_RUNTIME_AGENTS_DIR) >
-/// config.dirs.runtime_agents`). Caller defaults to `~/.openclaw/agents`. NOTE:
-/// the prior env read was not empty-filtered; routing through `env_str` makes
-/// an empty value fall through (a strict improvement — an empty path is bogus).
-pub fn runtime_agents_dir_override() -> Option<std::path::PathBuf> {
-    pick_dir_override(
-        env_str("DARKMUX_RUNTIME_AGENTS_DIR"),
-        config().dirs.as_ref().and_then(|d| d.runtime_agents.as_deref()),
     )
 }
 
@@ -813,10 +791,8 @@ mod tests {
     fn override_only_dir_accessors_env_then_none() {
         type Acc = fn() -> Option<std::path::PathBuf>;
         for (key, accessor) in [
-            ("DARKMUX_OPENCLAW_CONFIG", openclaw_config_override as Acc),
-            ("DARKMUX_IDENTITY_PATH", identity_path_override),
+            ("DARKMUX_IDENTITY_PATH", identity_path_override as Acc),
             ("DARKMUX_ACK_DIR", ack_dir_override),
-            ("DARKMUX_RUNTIME_AGENTS_DIR", runtime_agents_dir_override),
         ] {
             let prev = std::env::var(key).ok();
             unsafe { std::env::set_var(key, "/custom/x"); }

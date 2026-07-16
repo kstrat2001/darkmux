@@ -13,12 +13,9 @@
 //!   0 — all checks passed (warnings allowed)
 //!   1 — at least one check failed
 //!
-//! Checks are intentionally scoped to what darkmux can verify natively. Some
-//! agent-runtime-specific checks (gateway port, openclaw config sanity) belong
-//! to the runtime, not to darkmux.
+//! Checks are intentionally scoped to what darkmux can verify natively.
 
 use anyhow::Result;
-use darkmux_agent_roles as agent_roles;
 use darkmux_eureka as eureka;
 use darkmux_hardware as hardware;
 use darkmux_heuristics as heuristics;
@@ -113,8 +110,8 @@ fn check_build_info() -> Check {
     }
 }
 
-pub fn run(include_openclaw: bool) -> DoctorReport {
-    let mut checks = vec![
+pub fn run() -> DoctorReport {
+    let checks = vec![
         check_build_info(),
         check_profile_registry(),
         check_crew_validation(),
@@ -150,13 +147,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_legacy_mission_layout(),
         check_legacy_compaction_extras(),
     ];
-    if include_openclaw {
-        checks.push(check_role_model_pin_drift());
-        checks.push(check_runtime_command());
-        checks.push(check_runtime_version());
-        checks.push(check_agent_role_definitions());
-    }
-    checks.extend(eureka_checks(include_openclaw));
+    let checks = [checks, eureka_checks()].concat();
     DoctorReport { checks }
 }
 
@@ -433,163 +424,6 @@ fn check_role_tool_vocab_typos() -> Check {
             "Edit the offending role manifest(s) — likely typos. Known tokens: {}.",
             darkmux_crew::dispatch_internal::known_role_vocab_csv()
         )),
-    }
-}
-
-/// Warn when openclaw's `agents.list[].model` for each `darkmux/<role>`
-/// agent doesn't match the active pin table. Drift means `darkmux crew
-/// sync` hasn't been run since the pin table changed (or the operator
-/// hand-edited openclaw.json). Recovery is one command: `darkmux crew
-/// sync`. (#160)
-fn check_role_model_pin_drift() -> Check {
-    let pins = match darkmux_crew::pins::load_pins() {
-        Ok(t) => t,
-        Err(e) => {
-            return Check {
-                name: "role-model pin drift".into(),
-                status: Status::Warn,
-                message: format!("could not load pin table: {e:#}"),
-                hint: Some(
-                    "Check the user override at <crew_root>/role-model-pins.json parses, or remove it to fall back to the embedded default."
-                        .into(),
-                ),
-            };
-        }
-    };
-
-    // Resolve through dispatch::default_openclaw_config so the doctor
-    // reads the same path sync writes to — respects DARKMUX_OPENCLAW_CONFIG.
-    // Without this, an operator using the env override sees doctor
-    // pass-silently while sync is actually writing to a different file.
-    let openclaw_path = darkmux_crew::dispatch::default_openclaw_config();
-    if !openclaw_path.exists() {
-        return Check {
-            name: "role-model pin drift".into(),
-            status: Status::Pass,
-            message: format!(
-                "(no openclaw config at {} — skipping; run `darkmux crew sync` once openclaw is configured)",
-                openclaw_path.display()
-            ),
-            hint: None,
-        };
-    }
-    let raw = match std::fs::read_to_string(&openclaw_path) {
-        Ok(r) => r,
-        // (#906) TOCTOU: the file existed at the `exists()` check above but
-        // could be deleted before this read. A NotFound here is the same
-        // "no config" state as the early return — Pass, not a spurious Warn.
-        // Other IO errors (perms, etc.) are real problems → Warn.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Check {
-                name: "role-model pin drift".into(),
-                status: Status::Pass,
-                message: format!(
-                    "(no openclaw config at {} — skipping; run `darkmux crew sync` once openclaw is configured)",
-                    openclaw_path.display()
-                ),
-                hint: None,
-            };
-        }
-        Err(e) => {
-            return Check {
-                name: "role-model pin drift".into(),
-                status: Status::Warn,
-                message: format!("could not read {}: {e}", openclaw_path.display()),
-                hint: None,
-            };
-        }
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            return Check {
-                name: "role-model pin drift".into(),
-                status: Status::Warn,
-                message: "openclaw.json failed to parse — skipping".into(),
-                hint: None,
-            };
-        }
-    };
-
-    let Some(agents) = parsed
-        .get("agents")
-        .and_then(|a| a.get("list"))
-        .and_then(|l| l.as_array())
-    else {
-        return Check {
-            name: "role-model pin drift".into(),
-            status: Status::Pass,
-            message: "(no agents.list array in openclaw.json)".into(),
-            hint: None,
-        };
-    };
-
-    // Collect drift: (role_id, expected_pin, actual_value_or_None) per
-    // darkmux/-namespaced agent whose model field doesn't match the pin.
-    let mut drifts: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut checked: u32 = 0;
-    for agent in agents {
-        let id = agent.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let Some(role_id) = id.strip_prefix("darkmux/") else {
-            continue;
-        };
-        checked += 1;
-        let expected = pins.pin_for(role_id);
-        let actual = agent
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let matches = actual.as_deref() == Some(expected);
-        if !matches {
-            drifts.push((role_id.to_string(), expected.to_string(), actual));
-        }
-    }
-
-    if checked == 0 {
-        return Check {
-            name: "role-model pin drift".into(),
-            status: Status::Pass,
-            message:
-                "(no darkmux/* agents in openclaw.json — run `darkmux crew sync` to register them)"
-                    .into(),
-            hint: None,
-        };
-    }
-
-    if drifts.is_empty() {
-        Check {
-            name: "role-model pin drift".into(),
-            status: Status::Pass,
-            message: format!("{checked} darkmux/* agent(s) pinned correctly"),
-            hint: None,
-        }
-    } else {
-        let summary = drifts
-            .iter()
-            .take(3)
-            .map(|(role, expected, actual)| {
-                let actual_str = actual.as_deref().unwrap_or("(no model field)");
-                format!("`{role}` expected `{expected}` got `{actual_str}`")
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let more = if drifts.len() > 3 {
-            format!(" (+{} more)", drifts.len() - 3)
-        } else {
-            String::new()
-        };
-        Check {
-            name: "role-model pin drift".into(),
-            status: Status::Warn,
-            message: format!(
-                "{} of {checked} darkmux/* agent(s) drift from pin table: {summary}{more}",
-                drifts.len()
-            ),
-            hint: Some(
-                "Run `darkmux crew sync` to re-write the agent entries with their pinned models. The pin table lives at templates/builtin/role-model-pins.json (or <crew_root>/role-model-pins.json for operator overrides)."
-                    .into(),
-            ),
-        }
     }
 }
 
@@ -1595,34 +1429,13 @@ fn check_crew_role_prompt_coverage() -> Check {
     }
 }
 
-/// Minimum OpenClaw version darkmux has been validated against. Older
-/// versions may produce subtle feature regressions on agent config
-/// (`systemPromptOverride` in particular — observed during 2026-05-11
-/// cross-machine testing on an M1 Max Studio running OpenClaw 2026.3.13).
-///
-/// CalVer (YYYY, MM, DD). Bump this when:
-///   - You introduce a darkmux feature that depends on a newer OpenClaw
-///   - You confirm via cross-machine testing that an older OpenClaw breaks
-///     a current darkmux feature
-const MIN_OPENCLAW_VERSION: (u32, u32, u32) = (2026, 5, 4);
-
 /// Run the eureka rule set and map each verdict to a doctor `Check`.
 /// Each rule produces one check row so the user sees which specific
 /// patterns matched/didn't match their setup.
-fn eureka_checks(include_openclaw: bool) -> Vec<Check> {
+fn eureka_checks() -> Vec<Check> {
     let ctx = eureka::Context::collect();
     eureka::evaluate_all(&ctx)
         .into_iter()
-        // (#1010) Suppress OC-path eureka rules from default output unless
-        // `--include-openclaw`, keyed on each rule's DECLARED runtime
-        // (RuleKind::runtime), not by substring-matching "openclaw" in the
-        // human-facing message. The old substring filter leaked any OC rule that
-        // named the config by field path (e.g. `agents.defaults.compaction.model`)
-        // without the literal word "openclaw" — compactor-not-loaded,
-        // agents-default-model-resolves, n-ctx-exceeds-model-max all slipped
-        // through. Filtering here (before the Check map) keys on the rule, not its
-        // wording, per the schema-isolation doctrine.
-        .filter(|(def, _)| include_openclaw || def.kind.runtime() != eureka::RuleRuntime::OpenClaw)
         .map(|(def, verdict)| match verdict {
             eureka::Verdict::Pass => Check {
                 name: format!("eureka: {}", def.id),
@@ -2264,31 +2077,15 @@ fn check_profile_loaded_match() -> Check {
     }
 }
 
-/// Phase-G: openclaw-as-active gate.
-///
-/// Returns true when openclaw is configured on this machine — defined
-/// as: `~/.openclaw/openclaw.json` (or the path the dispatch resolver
-/// reports, honoring `DARKMUX_OPENCLAW_CONFIG`) exists on disk.
-///
-/// The gate is intentionally "config-on-disk" rather than "binary on
-/// PATH": post-Beat-36 openclaw is opt-in per dispatch, and the
-/// operator's choice to leave openclaw uninstalled / unconfigured IS
-/// the signal that they don't intend to use it. An operator who has
-/// `openclaw` on PATH but no config (fresh install, partial setup)
-/// gets a silent skip — when they configure openclaw, doctor surfaces
-/// the binary/version checks automatically.
-fn openclaw_active() -> bool {
-    darkmux_crew::dispatch::default_openclaw_config().exists()
-}
-
-/// (#680) The internal Docker-bounded runtime is the DEFAULT for `crew
-/// dispatch` and `lab run`, but nothing else in doctor surfaces it — a fresh
+/// (#680) The internal Docker-bounded runtime is the ONLY dispatch path for
+/// `crew dispatch` and `lab run` (#1405 removed the legacy `openclaw`
+/// shell-out runtime), but nothing else in doctor surfaces it — a fresh
 /// operator otherwise gets an all-green doctor and only learns the Docker
 /// requirement when their first dispatch bails at the dispatch-time preflight.
 /// Reuses that preflight's probe (`dispatch_internal::docker_runtime_status`)
-/// so the image tag + probe logic have one home. Warn (not Fail):
-/// `--runtime openclaw` users legitimately need no Docker, so this is a
-/// heads-up, not a hard error.
+/// so the image tag + probe logic have one home. Warn (not Fail) so a
+/// `swap`/`status`/`profiles`-only operator (no dispatching yet) isn't
+/// blocked by a doctor check for a capability they haven't used.
 fn check_docker_runtime() -> Check {
     docker_status_to_check(darkmux_crew::dispatch_internal::docker_runtime_status())
 }
@@ -2347,139 +2144,6 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
             message: format!("couldn't probe the Docker runtime image: {e}"),
             hint: None,
         },
-    }
-}
-
-fn check_runtime_command() -> Check {
-    // Phase-G: skip when no openclaw config on disk. The internal
-    // runtime is the default and needs no external binary; checking
-    // for `openclaw` on PATH only matters when the operator has
-    // declared OC is part of their setup (config file present).
-    if !openclaw_active() {
-        return Check {
-            name: "runtime command".into(),
-            status: Status::Pass,
-            message: format!(
-                "(skipped — no {} on disk; openclaw not configured on this machine)",
-                darkmux_crew::dispatch::default_openclaw_config().display()
-            ),
-            hint: None,
-        };
-    }
-    let cmd = "openclaw";
-    if which(cmd).is_some() {
-        Check {
-            name: "runtime command".into(),
-            status: Status::Pass,
-            message: format!("found `{cmd}` on PATH (used when `--runtime openclaw` opt-in fires)"),
-            hint: None,
-        }
-    } else {
-        Check {
-            name: "runtime command".into(),
-            status: Status::Warn,
-            message: format!("`{cmd}` not on PATH despite openclaw config being present"),
-            hint: Some(
-                "your openclaw config exists but the binary isn't on PATH. \
-                 Either install openclaw, or remove the config if you don't \
-                 intend to use openclaw (darkmux's internal runtime is the default \
-                 and needs no external binary)."
-                    .into(),
-            ),
-        }
-    }
-}
-
-/// Parse OpenClaw's `--version` output to a CalVer tuple. Accepts forms
-/// like `OpenClaw 2026.5.4 (325df3e)`; the leading word and trailing
-/// commit hash are tolerated. Returns `None` if the YYYY.MM.DD segment
-/// can't be located.
-fn parse_openclaw_version(raw: &str) -> Option<(u32, u32, u32)> {
-    // Scan tokens for the first one that splits into three numeric parts.
-    for token in raw.split_whitespace() {
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        let ymd: Result<Vec<u32>, _> = parts.iter().map(|p| p.parse::<u32>()).collect();
-        if let Ok(v) = ymd {
-            return Some((v[0], v[1], v[2]));
-        }
-    }
-    None
-}
-
-fn check_runtime_version() -> Check {
-    // Phase-G: skip when openclaw not configured on this machine (no
-    // config file on disk). Same gate as check_runtime_command — when
-    // OC isn't active, version-checking it is noise.
-    if !openclaw_active() {
-        return Check {
-            name: "runtime version".into(),
-            status: Status::Pass,
-            message: format!(
-                "(skipped — no {} on disk; openclaw not configured on this machine)",
-                darkmux_crew::dispatch::default_openclaw_config().display()
-            ),
-            hint: None,
-        };
-    }
-    let cmd = "openclaw";
-    let output = Command::new(cmd).arg("--version").output();
-    let raw = match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)
-        }
-        _ => {
-            return Check {
-                name: "runtime version".into(),
-                status: Status::Warn,
-                message: "could not run `openclaw --version`".into(),
-                hint: Some("ensure openclaw is on PATH and executable".into()),
-            };
-        }
-    };
-
-    let parsed = parse_openclaw_version(&raw);
-    let (y, m, d) = match parsed {
-        Some(v) => v,
-        None => {
-            return Check {
-                name: "runtime version".into(),
-                status: Status::Warn,
-                message: format!("could not parse version from: {}", first_line(&raw)),
-                hint: None,
-            };
-        }
-    };
-
-    let (min_y, min_m, min_d) = MIN_OPENCLAW_VERSION;
-    let installed = format!("{y}.{m}.{d}");
-    let minimum = format!("{min_y}.{min_m}.{min_d}");
-
-    if (y, m, d) >= (min_y, min_m, min_d) {
-        Check {
-            name: "runtime version".into(),
-            status: Status::Pass,
-            message: format!("OpenClaw {installed} (>= validated minimum {minimum})"),
-            hint: None,
-        }
-    } else {
-        Check {
-            name: "runtime version".into(),
-            status: Status::Warn,
-            message: format!(
-                "OpenClaw {installed} is older than darkmux's validated minimum ({minimum}). \
-                 `systemPromptOverride` and some compaction config may regress silently."
-            ),
-            hint: Some(
-                "upgrade OpenClaw to >= 2026.5.4. From your openclaw source checkout: \
-                 `git pull && <build/install steps per openclaw's own README>`. \
-                 If a feature appears not to work after this doctor warning, surface the \
-                 version mismatch loudly — don't silently roll back configs (see CLAUDE.md anti-patterns)."
-                    .into(),
-            ),
-        }
     }
 }
 
@@ -2895,129 +2559,6 @@ fn pick_active_profile<'a>(
     Some(matches[0])
 }
 
-/// Read openclaw.json and flag agents whose names match a shipped role
-/// template (qa, scribe, engineer) but don't have a systemPromptOverride.
-/// These are the cases where the user *probably* wants to adopt a darkmux
-/// scaffold — without one, the agent's behavior is driven by the
-/// runtime's default preamble, which may not fit a narrow role.
-///
-/// The check is deliberately silent when no agents match shipped role
-/// names. Custom-named agents (e.g. "my-app-bot") can have any shape;
-/// darkmux doesn't have an opinion about those.
-fn check_agent_role_definitions() -> Check {
-    // #332 — use the canonical openclaw-config resolver so the
-    // `DARKMUX_OPENCLAW_CONFIG` env var is honored consistently
-    // with every other OC-touching surface (dispatcher, swap's
-    // apply_runtime, Phase-G's openclaw-active gate). Pre-fix this
-    // check hardcoded `~/.openclaw/openclaw.json` and silently
-    // probed the wrong file when the operator pointed the env var
-    // somewhere else.
-    let openclaw_path = darkmux_crew::dispatch::default_openclaw_config();
-    if !openclaw_path.exists() {
-        return Check {
-            name: "agent role scaffolds".into(),
-            status: Status::Pass,
-            message: format!("(no {} on disk — skipping)", openclaw_path.display()),
-            hint: None,
-        };
-    }
-    let raw = match std::fs::read_to_string(&openclaw_path) {
-        Ok(r) => r,
-        // (#906) TOCTOU: deleted between `exists()` and this read → NotFound
-        // is the same "no config" state as the early return (Pass). Other IO
-        // errors are real problems → Warn.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Check {
-                name: "agent role scaffolds".into(),
-                status: Status::Pass,
-                message: format!("(no {} on disk — skipping)", openclaw_path.display()),
-                hint: None,
-            };
-        }
-        Err(e) => {
-            return Check {
-                name: "agent role scaffolds".into(),
-                status: Status::Warn,
-                message: format!("could not read {}: {e}", openclaw_path.display()),
-                hint: None,
-            };
-        }
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            return Check {
-                name: "agent role scaffolds".into(),
-                status: Status::Warn,
-                message: "openclaw.json failed to parse — skipping".into(),
-                hint: None,
-            };
-        }
-    };
-
-    let known_role_ids: Vec<&str> = agent_roles::list_role_ids();
-    let agents = parsed
-        .get("agents")
-        .and_then(|a| a.get("list"))
-        .and_then(|l| l.as_array());
-    let Some(agents) = agents else {
-        return Check {
-            name: "agent role scaffolds".into(),
-            status: Status::Pass,
-            message: "(no agents.list array in openclaw.json)".into(),
-            hint: None,
-        };
-    };
-
-    let mut missing_overrides: Vec<String> = Vec::new();
-    for agent in agents {
-        let id = agent.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if !known_role_ids.contains(&id) {
-            continue;
-        }
-        let has_override = agent
-            .get("systemPromptOverride")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-        if !has_override {
-            missing_overrides.push(id.to_string());
-        }
-    }
-
-    if missing_overrides.is_empty() {
-        Check {
-            name: "agent role scaffolds".into(),
-            status: Status::Pass,
-            message: "no agent role-definition gaps detected".into(),
-            hint: None,
-        }
-    } else {
-        let suggestions = missing_overrides
-            .iter()
-            .map(|id| format!("`oc-scaffold.sh template {id}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Check {
-            name: "agent role scaffolds".into(),
-            status: Status::Warn,
-            message: format!(
-                "agent(s) {} have no systemPromptOverride — relying on runtime defaults",
-                missing_overrides
-                    .iter()
-                    .map(|s| format!("`{s}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            hint: Some(format!(
-                "darkmux ships validated scaffolds for these roles. From your darkmux \
-                 source checkout, run `integrations/openclaw/oc-scaffold.sh template <role>` \
-                 (e.g. {suggestions}) and paste the snippet into openclaw.json."
-            )),
-        }
-    }
-}
-
 fn check_platform_and_provider() -> Check {
     let hw = hardware::detect();
     let provider = heuristics::active_provider(&hw);
@@ -3248,9 +2789,7 @@ fn first_line(s: &str) -> &str {
 
 // ─── --fix path: auto-apply known-safe fixes ────────────────────────────
 
-/// Outcome of attempting an auto-fix for one rule. `applied=false` with a
-/// message starting "skipped:" means the handler reached a known-safe
-/// no-op (e.g., no openclaw config path resolvable); a non-skip
+/// Outcome of attempting an auto-fix for one rule. A non-skip
 /// `applied=false` means the handler ran but found nothing to change.
 #[derive(Debug, Clone)]
 pub struct FixOutcome {
@@ -3266,73 +2805,16 @@ pub struct FixOutcome {
 ///
 /// Returns the list of outcomes (one per fix attempt). Empty when no
 /// failing check had a registered handler.
-pub fn try_fix(report: &DoctorReport) -> Result<Vec<FixOutcome>> {
-    let mut outcomes = Vec::new();
-    for check in &report.checks {
-        if !matches!(check.status, Status::Fail | Status::Warn) {
-            continue;
-        }
-        // Eureka check names follow the convention `eureka: <rule-id>` —
-        // strip the prefix and dispatch by rule-id constant from the rules
-        // engine so a typo or rename can't silently break the handler.
-        if let Some(rule_id) = check.name.strip_prefix("eureka: ") {
-            if rule_id == eureka::RULE_ID_CTX_WINDOW_MISMATCH {
-                outcomes.push(fix_ctx_window_mismatch()?);
-            }
-            // Future fix handlers slot in here; keep additions narrow and
-            // documented in the issue tracker so operators can audit what
-            // `--fix` will and won't touch.
-        }
-    }
-    Ok(outcomes)
-}
-
-fn fix_ctx_window_mismatch() -> Result<FixOutcome> {
-    let Some(path) = darkmux_profiles::runtime::resolve_openclaw_config_path(None) else {
-        return Ok(FixOutcome {
-            rule_id: "ctx-window-mismatch".into(),
-            applied: false,
-            message: "skipped: no openclaw config path resolvable (set \
-                      DARKMUX_OPENCLAW_CONFIG or use a profile with \
-                      runtime.config_path)"
-                .into(),
-        });
-    };
-    let loaded = match lms::list_loaded() {
-        Ok(l) => l,
-        Err(e) => {
-            return Ok(FixOutcome {
-                rule_id: "ctx-window-mismatch".into(),
-                applied: false,
-                message: format!(
-                    "skipped: could not query lms ps — {}",
-                    first_line(&e.to_string())
-                ),
-            });
-        }
-    };
-    let changes = darkmux_profiles::runtime::fix_ctx_window_to_loaded(&path, &loaded)?;
-    if changes.is_empty() {
-        Ok(FixOutcome {
-            rule_id: "ctx-window-mismatch".into(),
-            applied: false,
-            message: "no contextWindow entries needed adjustment".into(),
-        })
-    } else {
-        let summary = changes
-            .iter()
-            .map(|c| format!("{}: {} → {}", c.model_id, c.from, c.to))
-            .collect::<Vec<_>>()
-            .join("; ");
-        Ok(FixOutcome {
-            rule_id: "ctx-window-mismatch".into(),
-            applied: true,
-            message: format!(
-                "aligned {} contextWindow entry/entries — {summary}",
-                changes.len()
-            ),
-        })
-    }
+///
+/// No handlers are registered as of #1405 (the previous sole handler,
+/// `ctx-window-mismatch`, patched the removed openclaw runtime's config
+/// file). A future fix handler dispatches on `check.name.strip_prefix("eureka: ")`
+/// (the rule-id, so a typo or rename can't silently break the handler);
+/// keep additions narrow and documented in the issue tracker so operators
+/// can audit what `--fix` will and won't touch.
+#[allow(clippy::unnecessary_wraps)]
+pub fn try_fix(_report: &DoctorReport) -> Result<Vec<FixOutcome>> {
+    Ok(Vec::new())
 }
 
 // ─── Result rendering ───────────────────────────────────────────────────
@@ -3502,7 +2984,8 @@ mod tests {
 
     #[test]
     fn docker_status_binary_missing_warns_not_fails() {
-        // Warn, never Fail — openclaw-only operators legitimately have no Docker.
+        // Warn, never Fail — swap-only operators (profile multiplexing, no
+        // crew dispatches) legitimately have no Docker.
         use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
         let c = docker_status_to_check(DockerRuntimeStatus::BinaryMissing);
         assert_eq!(c.status, Status::Warn);
@@ -3536,33 +3019,6 @@ mod tests {
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("boom"), "{}", c.message);
         assert!(c.hint.is_none());
-    }
-
-    #[test]
-    fn docker_checks_never_mention_openclaw() {
-        // #393 schema-isolation: doctor's default-mode checks must not surface
-        // openclaw (enforced by `doctor_default_skips_openclaw_checks`). The
-        // docker-runtime check runs in default mode, so NONE of its outputs —
-        // across every probe result — may mention openclaw in name/message/hint.
-        // This guards it directly, without needing a Docker-absent host.
-        use darkmux_crew::dispatch_internal::DockerRuntimeStatus as S;
-        for status in [
-            S::Ready,
-            S::BinaryMissing,
-            S::DaemonUnreachable("x".into()),
-            S::ImageMissing,
-            S::ProbeError("x".into()),
-        ] {
-            let c = docker_status_to_check(status);
-            let blob = format!(
-                "{} {} {}",
-                c.name,
-                c.message,
-                c.hint.unwrap_or_default()
-            )
-            .to_lowercase();
-            assert!(!blob.contains("openclaw"), "docker check leaked openclaw: {blob}");
-        }
     }
 
     // ─── classify_ram_headroom ─────────────────────────────────────────
@@ -3750,24 +3206,25 @@ mod tests {
 
     #[test]
     fn run_returns_static_plus_eureka_checks() {
-        let r = run(true);
-        // 32 static checks via run(true) (28 always-on + 4 openclaw), incl.
-        // build-identity [#1129] + docker-runtime [#680] + runtime version + load projection +
-        // daemon reachable + darkmux-version-vs-latest-release [#13] +
+        let r = run();
+        // 34 static checks via run() (#1405 removed the 4 openclaw-gated
+        // checks), incl. build-identity [#1129] + docker-runtime [#680] +
+        // load projection + daemon reachable +
+        // darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
         // machine_id + orchestrator [#167] + openai-base-url-conflict [#5] +
         // audit-integrity [#163] + recommendation-drift +
         // recommended-profile-not-shadowed [#159] + utility-model-binding
-        // [#590] + role-model-pin-drift [#160] + legacy-mission-layout [#148]
-        // + beat-33-crew-dir [Beat 33 directory flatten] + role-tool-vocab
-        // [#340] + legacy-compaction-extras [#380] + redis-config [#661] +
-        // remote-endpoint-credentials [#85/#91] + docker-runtime [#680] +
-        // audit-write-drops [#877] + serve-daemon-auth [#881] + fleet.mode
-        // [#933] + env-masks-config [#934] + binary-split-brain [#934] +
-        // crew-validation [#1269] + mission-config-registry [#1284]) + one
-        // per active eureka rule. Every check should appear regardless of
-        // environment — even if the underlying probe couldn't read state.
-        let expected = 38 + darkmux_eureka::all_rules().len();
+        // [#590] + legacy-mission-layout [#148] + beat-33-crew-dir [Beat 33
+        // directory flatten] + role-tool-vocab [#340] +
+        // legacy-compaction-extras [#380] + redis-config [#661] +
+        // remote-endpoint-credentials [#85/#91] + audit-write-drops [#877] +
+        // serve-daemon-auth [#881] + fleet.mode [#933] + env-masks-config
+        // [#934] + binary-split-brain [#934] + crew-validation [#1269] +
+        // mission-config-registry [#1284]) + one per active eureka rule.
+        // Every check should appear regardless of environment — even if the
+        // underlying probe couldn't read state.
+        let expected = 34 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -3972,41 +3429,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_openclaw_version_handles_canonical_form() {
-        assert_eq!(
-            parse_openclaw_version("OpenClaw 2026.5.4 (325df3e)"),
-            Some((2026, 5, 4))
-        );
-        assert_eq!(
-            parse_openclaw_version("OpenClaw 2026.3.13 (61d171a)"),
-            Some((2026, 3, 13))
-        );
-    }
-
-    #[test]
-    fn parse_openclaw_version_handles_bare_version() {
-        // Edge case: just the version string with no leading word
-        assert_eq!(parse_openclaw_version("2026.5.4"), Some((2026, 5, 4)));
-    }
-
-    #[test]
-    fn parse_openclaw_version_rejects_garbage() {
-        assert_eq!(parse_openclaw_version("not a version"), None);
-        assert_eq!(parse_openclaw_version(""), None);
-        // Two-segment versions are not CalVer YYYY.MM.DD shaped
-        assert_eq!(parse_openclaw_version("OpenClaw 2026.5"), None);
-    }
-
-    #[test]
     fn platform_check_always_present() {
-        let r = run(true);
+        let r = run();
         assert!(r.checks.iter().any(|c| c.name.contains("platform")));
-    }
-
-    #[test]
-    fn agent_role_check_always_present() {
-        let r = run(true);
-        assert!(r.checks.iter().any(|c| c.name.contains("agent role")));
     }
 
     // ─── check_daemon_reachable tests ──────────────────────────────────────
@@ -4193,81 +3618,6 @@ mod tests {
         assert!(
             !hint.contains("operator-private-stuff"),
             "mv script must not propose moving operator-authored subdirs"
-        );
-    }
-
-    // ─── Phase-G: OC-active gate on doctor runtime checks ──
-
-    /// Helper that points `DARKMUX_OPENCLAW_CONFIG` at a non-existent
-    /// path for the test's duration so `default_openclaw_config()`
-    /// resolves to a missing file (the "openclaw not configured"
-    /// signal Phase-G keys on).
-    struct OpenclawConfigGuard {
-        prev: Option<String>,
-        _tmp: tempfile::TempDir,
-    }
-
-    impl OpenclawConfigGuard {
-        fn missing() -> Self {
-            let tmp = tempfile::TempDir::new().expect("tempdir");
-            let bogus = tmp.path().join("does-not-exist.json");
-            let prev = std::env::var("DARKMUX_OPENCLAW_CONFIG").ok();
-            // SAFETY: tests using this guard MUST be #[serial].
-            unsafe {
-                std::env::set_var("DARKMUX_OPENCLAW_CONFIG", &bogus);
-            }
-            Self { prev, _tmp: tmp }
-        }
-    }
-
-    impl Drop for OpenclawConfigGuard {
-        fn drop(&mut self) {
-            // SAFETY: tests using this guard MUST be #[serial].
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_OPENCLAW_CONFIG", v),
-                    None => std::env::remove_var("DARKMUX_OPENCLAW_CONFIG"),
-                }
-            }
-        }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_runtime_command_skips_when_openclaw_not_configured() {
-        let _guard = OpenclawConfigGuard::missing();
-        let check = check_runtime_command();
-        assert_eq!(
-            check.status,
-            Status::Pass,
-            "no openclaw config → check must pass-with-skip, not warn"
-        );
-        assert!(
-            check.message.contains("skipped"),
-            "expected `skipped` in message; got: {}",
-            check.message
-        );
-        assert!(
-            check.message.contains("openclaw not configured"),
-            "expected `openclaw not configured` framing; got: {}",
-            check.message
-        );
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_runtime_version_skips_when_openclaw_not_configured() {
-        let _guard = OpenclawConfigGuard::missing();
-        let check = check_runtime_version();
-        assert_eq!(
-            check.status,
-            Status::Pass,
-            "no openclaw config → version check must pass-with-skip"
-        );
-        assert!(
-            check.message.contains("skipped"),
-            "expected `skipped` in message; got: {}",
-            check.message
         );
     }
 
@@ -4974,194 +4324,4 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1, "exactly one billed call");
     }
 
-    // ─── #332: doctor OC-config probe normalization ─────────────────
-
-    /// Helper that points `DARKMUX_OPENCLAW_CONFIG` at a path the
-    /// caller chooses (so the test can ALSO supply contents for the
-    /// resolver to read). Distinct from `OpenclawConfigGuard::missing`
-    /// which points at a known-missing path.
-    struct OpenclawConfigPointGuard {
-        prev: Option<String>,
-        _tmp: tempfile::TempDir,
-    }
-
-    impl OpenclawConfigPointGuard {
-        /// Point env var at a file under a freshly-created tempdir.
-        /// Returns the guard + the full path the env var was set to.
-        fn at_tempfile(filename: &str) -> (Self, std::path::PathBuf) {
-            let tmp = tempfile::TempDir::new().expect("tempdir");
-            let path = tmp.path().join(filename);
-            let prev = std::env::var("DARKMUX_OPENCLAW_CONFIG").ok();
-            // SAFETY: tests using this guard MUST be #[serial].
-            unsafe {
-                std::env::set_var("DARKMUX_OPENCLAW_CONFIG", &path);
-            }
-            (Self { prev, _tmp: tmp }, path)
-        }
-    }
-
-    impl Drop for OpenclawConfigPointGuard {
-        fn drop(&mut self) {
-            // SAFETY: tests using this guard MUST be #[serial].
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_OPENCLAW_CONFIG", v),
-                    None => std::env::remove_var("DARKMUX_OPENCLAW_CONFIG"),
-                }
-            }
-        }
-    }
-
-    /// #332 — `check_agent_role_definitions` must honor
-    /// `DARKMUX_OPENCLAW_CONFIG`. Pre-fix it hardcoded
-    /// `~/.openclaw/openclaw.json` and silently probed the wrong
-    /// file when the env var was set elsewhere.
-    ///
-    /// Test: point env var at a custom path that doesn't exist on
-    /// disk. The check must report the env-var-resolved path in its
-    /// "skipping" message (proving the resolver was consulted), NOT
-    /// the hardcoded `~/.openclaw/openclaw.json`.
-    #[serial_test::serial]
-    #[test]
-    fn check_agent_role_definitions_honors_openclaw_config_env_var() {
-        let (_guard, env_path) = OpenclawConfigPointGuard::at_tempfile("custom-oc.json");
-        // env_path does NOT exist on disk — the missing-config skip
-        // path fires. Its message names the resolved path.
-        let check = check_agent_role_definitions();
-        assert_eq!(
-            check.status,
-            Status::Pass,
-            "missing custom OC config → pass-with-skip"
-        );
-        let expected_fragment = env_path.display().to_string();
-        assert!(
-            check.message.contains(&expected_fragment),
-            "check message must name the env-var-resolved path `{expected_fragment}` \
-             (pre-fix it hardcoded `~/.openclaw/openclaw.json`); got: {}",
-            check.message
-        );
-        // Defensive: ensure the message does NOT mention the
-        // hardcoded default path — that would be the pre-fix bug.
-        // (Skip this assertion if HOME happens to contain the same
-        // tempdir prefix, which can't happen here.)
-        let hardcoded = format!(
-            "{}/.openclaw/openclaw.json",
-            dirs::home_dir().unwrap().display()
-        );
-        assert!(
-            !check.message.contains(&hardcoded),
-            "check message must not leak the hardcoded default path; got: {}",
-            check.message
-        );
-    }
-
-    /// Sibling: with the env var pointing at a REAL openclaw.json,
-    /// the check reads it (success path). Verifies the resolver isn't
-    /// just used for the skip path — the actual file read also goes
-    /// through the env-var-resolved location.
-    #[serial_test::serial]
-    #[test]
-    fn check_agent_role_definitions_reads_env_var_path_when_file_exists() {
-        let (_guard, env_path) = OpenclawConfigPointGuard::at_tempfile("custom-oc.json");
-        // Write a minimal valid openclaw.json (no agents.list means
-        // the check returns its "no darkmux/* agents" pass message,
-        // not an error).
-        std::fs::write(&env_path, r#"{"agents":{"list":[]}}"#).unwrap();
-        let check = check_agent_role_definitions();
-        // Either Pass with "no darkmux/* agents" message, or some
-        // other non-error outcome. The important assertion: the
-        // check didn't bail with the missing-config skip message,
-        // which would prove it read the env-var path.
-        assert!(
-            !check.message.contains("on disk — skipping"),
-            "with a real file at the env-var path, the missing-config skip path \
-             must NOT fire; got: {}",
-            check.message
-        );
-    }
-
-    // ─── #387: --include-openclaw flag gate tests ─────────────
-
-    /// Default `run(false)` must NOT include any OC-specific checks.
-    /// The four gated checks are: role-model pin drift, runtime command,
-    /// runtime version, agent role scaffolds.
-    #[test]
-    fn doctor_default_skips_openclaw_checks() {
-        let report = run(false);
-
-        // Collect names of checks that match OC-specific patterns.
-        let oc_names: Vec<&str> = report
-            .checks
-            .iter()
-            .filter(|c| {
-                let n = c.name.to_lowercase();
-                n.contains("runtime command")
-                    || n.contains("runtime version")
-                    || n.contains("role-model pin drift")
-                    || n.contains("agent role scaffolds")
-            })
-            .map(|c| c.name.as_str())
-            .collect();
-
-        assert!(
-            oc_names.is_empty(),
-            "default doctor (include_openclaw=false) must not run OC checks; \
-             found: {:?}",
-            oc_names
-        );
-
-        // (#393) The schema-isolation success criterion also requires that
-        // OC-reading eureka rules (ctx-window-mismatch, n-ctx-exceeds-max,
-        // etc.) don't emit their "no ~/.openclaw/openclaw.json — skipping"
-        // messages in default mode. The eureka_checks filter strips these
-        // Skipped("openclaw...") verdicts when include_openclaw=false.
-        let openclaw_mentions: Vec<&str> = report
-            .checks
-            .iter()
-            .filter(|c| {
-                c.message.to_lowercase().contains("openclaw")
-                    || c.name.to_lowercase().contains("openclaw")
-                    || c.hint
-                        .as_deref()
-                        .map(|h| h.to_lowercase().contains("openclaw"))
-                        .unwrap_or(false)
-            })
-            .map(|c| c.name.as_str())
-            .collect();
-
-        assert!(
-            openclaw_mentions.is_empty(),
-            "default doctor must not surface any check that mentions openclaw \
-             (schema-isolation success criterion); found: {:?}",
-            openclaw_mentions
-        );
-    }
-
-    /// `run(true)` must include all four OC-specific checks.
-    #[test]
-    fn doctor_with_include_openclaw_runs_them() {
-        let report = run(true);
-
-        // Collect names of checks that match OC-specific patterns.
-        let oc_names: Vec<&str> = report
-            .checks
-            .iter()
-            .filter(|c| {
-                let n = c.name.to_lowercase();
-                n.contains("runtime command")
-                    || n.contains("runtime version")
-                    || n.contains("role-model pin drift")
-                    || n.contains("agent role scaffolds")
-            })
-            .map(|c| c.name.as_str())
-            .collect();
-
-        assert!(
-            oc_names.len() == 4,
-            "doctor with include_openclaw=true must run all 4 OC checks; \
-             found {} (expected 4): {:?}",
-            oc_names.len(),
-            oc_names
-        );
-    }
 }

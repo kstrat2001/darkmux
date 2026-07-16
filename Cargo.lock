@@ -362,15 +362,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "darkmux-agent-roles"
-version = "1.18.5"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "darkmux-crew"
 version = "1.18.5"
 dependencies = [
@@ -392,7 +383,6 @@ name = "darkmux-doctor"
 version = "1.18.5"
 dependencies = [
  "anyhow",
- "darkmux-agent-roles",
  "darkmux-crew",
  "darkmux-eureka",
  "darkmux-flow",

@@ -1,8 +1,8 @@
 # darkmux-runtime
 
-In-house container-bounded agent runtime for darkmux. Replaces the openclaw shell-out path for `darkmux crew dispatch` with a lean Alpine container that darkmux owns end-to-end.
+In-house container-bounded agent runtime for darkmux. Replaced the legacy openclaw shell-out path for `darkmux crew dispatch` with a lean Alpine container that darkmux owns end-to-end.
 
-**The default for `darkmux crew dispatch`** (it has been the default across the 1.x line). Operators with an existing openclaw setup can opt back into the legacy path via `darkmux crew dispatch --runtime openclaw <role>`.
+**The only dispatch path for `darkmux crew dispatch`** (it was the default across the 1.x line; the openclaw shell-out alternative was removed on the 2.0 track — see [#1405](https://github.com/kstrat2001/darkmux/issues/1405)).
 
 ## Why this exists
 
@@ -81,7 +81,7 @@ darkmux does **not** ship a catalog of per-language images. Instead it **injects
 
 **Build cache:** `~/.darkmux/cache` is bind-mounted into every dispatch at `/darkmux-cache`, with `CARGO_HOME` / `npm_config_cache` / `PIP_CACHE_DIR` redirected into it — so the inner verify loop reuses downloaded deps across dispatches. The registry/download caches are concurrency-safe; each dispatch's `target/` stays in its own workspace, so concurrent dispatches don't contend on build artifacts.
 
-`--image` is local-dispatch only today — ignored on `--runtime openclaw` and on cross-machine `--machine` dispatch (the remote runner uses its own image; carrying the image through the fleet queue is a follow-on).
+`--image` is local-dispatch only today — ignored on cross-machine `--machine` dispatch (the remote runner uses its own image; carrying the image through the fleet queue is a follow-on).
 
 ## Environment variables
 
@@ -115,10 +115,9 @@ cargo test --release
 - Multi-agent parallelism inside one container (single agent loop per invocation today; nothing precludes extending to multiple `--agent` flags + parallel loops sharing the workspace)
 - Audit-chain wiring at the volume-mount boundary
 
-## Known gaps post-flip
+## Known gaps
 
-The internal runtime is the default for `darkmux crew dispatch`, but a few rough edges remain:
+The internal runtime is the only dispatch path for `darkmux crew dispatch`, but a few rough edges remain:
 
-- Variance vs openclaw across a larger sample set — current data: 5-sample distribution of converged config showed median 2-3× faster than openclaw, with 8.5× wall variance, so single-run rankings are noisy
-- Migration of crew role definitions (`templates/builtin/roles/*.md`) — several roles still reference openclaw's tool palette (`exec`, `update_plan`, `process`) which don't exist here; the internal runtime ignores them gracefully but the manifests would be cleaner without
+- Migration of crew role definitions (`templates/builtin/roles/*.md`) — several roles still reference the legacy openclaw tool palette (`exec`, `update_plan`, `process`) which don't exist here; the internal runtime ignores them gracefully but the manifests would be cleaner without
 - `darkmux init` integration: today's pre-flight is at dispatch time (Docker reachable + image present); a separate setup pass during `darkmux init` would catch the prerequisite earlier

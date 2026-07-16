@@ -408,8 +408,8 @@ fn parse_trajectory(trajectory: &Path) -> Result<(DetectorCounts, u32)> {
 }
 
 /// Read turns + compactions from the runtime's `metrics.json`. Both default
-/// to 0 when the file is absent or unparseable (openclaw path, or a run that
-/// died before finalizing metrics).
+/// to 0 when the file is absent or unparseable (a run that predates the
+/// internal runtime, or one that died before finalizing metrics).
 fn read_metrics(metrics: &Path) -> (u32, u32) {
     let Ok(raw) = fs::read_to_string(metrics) else {
         return (0, 0);

@@ -1047,13 +1047,9 @@ pub fn run(
         timeout_seconds,
         skip_preflight: false,
         json: true,
-        // mission run drives its own surfacing; don't watch the role's
-        // default openclaw workspace dir (library-caller convention).
-        watch_paths: Vec::new(),
         workdir: Some(wt_path.clone()),
         phase_id: Some(phase.id.clone()),
         runtime: crew::dispatch::Runtime::Internal,
-        runtime_cmd: "openclaw".to_string(),
         // `--machine` is not a `mission run` flag — always local. See
         // `MissionCoderStepKind`'s doc for why that means calling
         // `dispatch::dispatch` directly is behavior-identical to the old

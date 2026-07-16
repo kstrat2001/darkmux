@@ -6,9 +6,9 @@
 /// (a) Run/build droppings: excluded from BOTH the COW clone AND the
 /// content hash. The in-sandbox tests never need these.
 /// NOTE: `.darkmux-agent` is DEFENSIVE — no darkmux code writes it (verified
-/// by tree-wide grep); it's a foreign-runtime (openclaw/aider/cline via
-/// --runtime-cmd) or pre-#487 dropping. Excluding a never-present name is a
-/// no-op, so it's safe to list.
+/// by tree-wide grep); it's a leftover from the removed external-runtime
+/// shell-out path (#1405) or a pre-#487 dropping. Excluding a never-present
+/// name is a no-op, so it's safe to list.
 pub(crate) const RUN_ARTIFACT_DIRS: &[&str] = &[
     ".darkmux-runtime",
     ".darkmux-agent",

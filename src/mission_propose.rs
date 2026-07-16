@@ -204,21 +204,15 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // mission-compiler parses its compiled output from the dispatch's
         // human-readable stdout — no JSON envelope needed.
         json: false,
-        watch_paths: Vec::new(),
         // mission-compiler reads stdin-piped intent; no scope override.
         workdir: None,
         // mission-compiler runs BEFORE any mission/phases exist on disk —
         // there's nothing to bind to and no parent context to inject.
         phase_id: None,
         // Mission propose is a system-level utility dispatch; runs
-        // through the internal Docker-bounded runtime — same default
-        // as `darkmux crew dispatch` (#309). Beat 36 directional
-        // principle: openclaw is a downstream translation target, not
-        // a hardcoded utility-dispatch dependency.
+        // through the internal Docker-bounded runtime — the only
+        // dispatch path (#309, #1405).
         runtime: crate::crew::dispatch::Runtime::Internal,
-        // mission-compiler pins Runtime::Internal; runtime_cmd is unused
-        // by the internal path. Default "openclaw" for codebase parity.
-        runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
         // Mission-compile dispatch uses runtime-default compaction;
@@ -296,13 +290,8 @@ fn build_compiler_message(input: &str, hint: Option<&str>) -> String {
 /// response. The utility agent's role prompt requires exactly one such
 /// block; we strip everything outside it and parse the inner.
 ///
-/// First unwraps the openclaw envelope (if response is wrapped); the
-/// fall-through path uses the response as-is so non-envelope inputs
-/// (other runtimes, future format changes, tests with clean fenced
-/// blocks) still work.
 fn parse_proposal(response: &str) -> Result<Proposal> {
-    let unwrapped = unwrap_openclaw_envelope(response).unwrap_or_else(|| response.to_string());
-    let json_str = extract_json_block(&unwrapped)?;
+    let json_str = extract_json_block(response)?;
     serde_json::from_str(&json_str).with_context(|| format!("parsing proposal JSON:\n{json_str}"))
 }
 
@@ -373,44 +362,6 @@ fn validate_proposal_invariants(p: &Proposal) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Best-effort unwrap of an openclaw CLI envelope. Openclaw's
-/// `agent` invocation prints a structured JSON envelope to stdout:
-///
-/// ```json
-/// {
-///   "payloads": [{"text": "<agent reply, may include ```json fence>",
-///                 "mediaUrl": null}, ...],
-///   "meta": {...}
-/// }
-/// ```
-///
-/// The agent's actual `\`\`\`json` fenced block lives INSIDE
-/// `payloads[].text` with `\n` as escape sequences, not real newlines.
-/// If `extract_json_block` ran on the raw envelope, `.lines()` would
-/// iterate the envelope's outer JSON lines and never see a fence —
-/// returns "no fenced json block found" even though the agent emitted
-/// one perfectly. Returns `None` if `response` doesn't parse as an
-/// envelope (defensive fall-through for non-openclaw runtimes or
-/// format changes); callers should then use `response` as-is.
-///
-/// Surfaced 2026-05-14 during the Japan-trip-planning dogfood — the
-/// first real-engagement `mission propose` run. The unit tests for
-/// `parse_proposal` used clean fenced blocks (the agent-reply shape)
-/// and passed; the integration with openclaw's envelope wasn't
-/// exercised until live dispatch.
-fn unwrap_openclaw_envelope(response: &str) -> Option<String> {
-    let envelope: serde_json::Value = serde_json::from_str(response.trim()).ok()?;
-    let payloads = envelope.get("payloads")?.as_array()?;
-    let texts: Vec<&str> = payloads
-        .iter()
-        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-        .collect();
-    if texts.is_empty() {
-        return None;
-    }
-    Some(texts.join("\n\n"))
 }
 
 /// Find the JSON fenced block and return its inner content. Prefers a
@@ -978,73 +929,6 @@ some epilogue"#;
             err.to_string().contains("invalid char"),
             "expected an identifier-charset rejection at the persist boundary, got: {err}"
         );
-    }
-
-    #[test]
-    fn unwrap_openclaw_envelope_returns_text_payload() {
-        // Real openclaw envelope shape captured during the 2026-05-14
-        // Japan-trip dogfood that surfaced this bug. The fenced ```json
-        // block in `payloads[0].text` uses `\n` escape sequences inside
-        // the JSON string, not real newlines. Without unwrap, the parser
-        // would scan the envelope's outer JSON and never see a fence line.
-        let envelope = r#"{
-          "payloads": [
-            {"text": "```json\n{\"k\": 1}\n```", "mediaUrl": null}
-          ],
-          "meta": {}
-        }"#;
-        let unwrapped = unwrap_openclaw_envelope(envelope).expect("envelope should unwrap");
-        assert!(unwrapped.contains("```json"));
-        assert!(unwrapped.contains("\"k\": 1"));
-        assert!(unwrapped.contains("```"));
-    }
-
-    #[test]
-    fn unwrap_openclaw_envelope_concatenates_multiple_payloads() {
-        // Coder dispatches emit several payloads (intermediate thinking +
-        // final SIGNOFF). Concat with blank-line separator so a
-        // downstream fence search isn't fooled by adjacency.
-        let envelope = r#"{
-          "payloads": [
-            {"text": "step 1", "mediaUrl": null},
-            {"text": "step 2", "mediaUrl": null}
-          ]
-        }"#;
-        let unwrapped = unwrap_openclaw_envelope(envelope).expect("multi-payload should unwrap");
-        assert!(unwrapped.contains("step 1"));
-        assert!(unwrapped.contains("step 2"));
-        assert!(unwrapped.contains("\n\n"));
-    }
-
-    #[test]
-    fn unwrap_openclaw_envelope_returns_none_on_non_envelope() {
-        // Non-envelope input should return None so callers fall through to
-        // using the response as-is. Covers: raw agent reply (legacy test
-        // shape), unrelated JSON, and prose.
-        assert!(unwrap_openclaw_envelope("just plain prose").is_none());
-        assert!(unwrap_openclaw_envelope(r#"{"unrelated": "json"}"#).is_none());
-        assert!(unwrap_openclaw_envelope("").is_none());
-        assert!(unwrap_openclaw_envelope(r#"{"payloads": []}"#).is_none());
-    }
-
-    #[test]
-    fn parse_proposal_handles_openclaw_envelope() {
-        // Integration regression: end-to-end parse from envelope -> proposal.
-        // Without the unwrap step, this would fail with "no fenced ```json
-        // block found in response."
-        let envelope = r#"{
-          "payloads": [
-            {
-              "text": "```json\n{\n  \"mission\": {\n    \"id\": \"env-test\",\n    \"description\": \"envelope-wrapped\",\n    \"status\": \"active\",\n    \"phase_ids\": [\"env-s1\"],\n    \"created_ts\": 0\n  },\n  \"phases\": [\n    {\n      \"id\": \"env-s1\",\n      \"mission_id\": \"env-test\",\n      \"description\": \"first phase\",\n      \"status\": \"planned\",\n      \"depends_on\": [],\n      \"created_ts\": 0\n    }\n  ]\n}\n```",
-              "mediaUrl": null
-            }
-          ],
-          "meta": {"durationMs": 1000}
-        }"#;
-        let p = parse_proposal(envelope).expect("envelope-wrapped proposal should parse");
-        assert_eq!(p.mission.id, "env-test");
-        assert_eq!(p.phases.len(), 1);
-        assert_eq!(p.phases[0].id, "env-s1");
     }
 
     #[test]

@@ -230,21 +230,16 @@ pub(crate) trait WorkloadProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn setup(&self, loaded: &LoadedWorkload, run_dir: &Path, sandbox_dir: &Path) -> Result<()>;
-    /// Run the workload through the operator-selected runtime.
-    /// `runtime` selects between darkmux's in-house container-bounded
-    /// runtime (default; Beat 36 — no openclaw install required) and
-    /// the legacy openclaw shell-out path (opt-in via `--runtime
-    /// openclaw` on `darkmux lab run`).
-    ///
-    /// `runtime_cmd` is the executable path for the openclaw shell-out
-    /// (default `"openclaw"`, override via `--runtime-cmd <path>`).
-    /// Ignored when `runtime == Runtime::Internal`. Phase-E replacement
-    /// for the removed `DARKMUX_RUNTIME_CMD` env var.
+    /// Run the workload through darkmux's in-house container-bounded
+    /// runtime. `runtime` is a single-variant type post-#1405 (the legacy
+    /// `openclaw` shell-out runtime was removed) — kept in the signature
+    /// for the provenance it threads through, not because implementers
+    /// branch on it.
     ///
     /// Argument count exceeds clippy's default threshold (8 vs 7); the
-    /// trait shape mirrors the dispatch contract closely (profile,
-    /// runtime, runtime_cmd are inherent to a dispatch). A `RunContext`
-    /// struct is a candidate cleanup but out of Phase-E's scope.
+    /// trait shape mirrors the dispatch contract closely (profile and
+    /// runtime are inherent to a dispatch). A `RunContext` struct is a
+    /// candidate cleanup but out of scope here.
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
@@ -254,7 +249,6 @@ pub(crate) trait WorkloadProvider: Send + Sync {
         profile: &Profile,
         profile_name: &str,
         runtime: darkmux_crew::dispatch::Runtime,
-        runtime_cmd: &str,
         // (#984) The `--profiles-file` the dispatch's model + context-window
         // resolution must load from, so a lab `--profiles-file` actually
         // reaches the dispatch (not just lab run's own profile lookup).

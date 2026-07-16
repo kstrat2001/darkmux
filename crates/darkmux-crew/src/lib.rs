@@ -34,7 +34,6 @@ pub mod loader;
 // which those two functions (`darkmux-lab::lab::review`, `src/mission_run.rs`)
 // now call as thin launchers — the configs ARE the executable graphs.
 pub mod mission_config;
-pub mod pins;
 pub mod select;
 // (#1230 Packet 2) Generic dependency-graph scheduler over `Step`/`Phase`
 // — see the module doc for the DependencyNode/is_ready/reachable/

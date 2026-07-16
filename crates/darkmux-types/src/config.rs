@@ -102,11 +102,9 @@ pub struct DirsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub skills: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub crew: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub templates: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub runtime_agents: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub ack: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub fleet_file: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub openclaw_config: Option<String>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 

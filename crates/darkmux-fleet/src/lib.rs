@@ -343,7 +343,7 @@ mod tests {
             None,
             Some("/tmp/workspace".to_string()),
             None,
-            darkmux_crew::dispatch::Runtime::Openclaw,
+            darkmux_crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4)
             600,
             Some("studio".to_string()),
@@ -369,7 +369,7 @@ mod tests {
             None, // deliver None
             None, // workdir None
             None, // phase_id None
-            darkmux_crew::dispatch::Runtime::Openclaw,
+            darkmux_crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4)
             300,
             None, // published_by_machine None
@@ -402,11 +402,9 @@ mod tests {
         );
     }
 
-    /// Default runtime is `Internal` as of the runtime-default flip
-    /// (in-house container-bounded Rust runtime is darkmux's default;
-    /// openclaw shell-out stays as `--runtime openclaw` opt-in).
-    /// A WorkJob with no `runtime` field serializes/deserializes
-    /// against the Runtime enum's `#[default]` annotation.
+    /// `Internal` is the only `Runtime` variant (#1405 removed the legacy
+    /// openclaw shell-out runtime). A WorkJob with no `runtime` field
+    /// deserializes against the Runtime enum's `#[default]` annotation.
     #[test]
     fn work_job_default_runtime_is_internal() {
         let json = r#"{
@@ -447,19 +445,14 @@ mod tests {
         );
     }
 
-    /// Round-trip parity: Runtime::Openclaw serializes as "openclaw"
-    /// (lowercase) and Runtime::Internal as "internal", matching the
-    /// CLI-flag plumbing and the pre-enum String values so older
+    /// Round-trip parity: Runtime::Internal serializes as "internal"
+    /// (lowercase), matching the pre-enum String values so older
     /// JSON-on-disk records keep loading.
     #[test]
     fn runtime_enum_serdes_as_lowercase_string() {
         use darkmux_crew::dispatch::Runtime;
-        let oc = serde_json::to_string(&Runtime::Openclaw).unwrap();
-        assert_eq!(oc, "\"openclaw\"");
         let ic = serde_json::to_string(&Runtime::Internal).unwrap();
         assert_eq!(ic, "\"internal\"");
-        let oc_back: Runtime = serde_json::from_str("\"openclaw\"").unwrap();
-        assert_eq!(oc_back, Runtime::Openclaw);
         let ic_back: Runtime = serde_json::from_str("\"internal\"").unwrap();
         assert_eq!(ic_back, Runtime::Internal);
     }
@@ -491,7 +484,7 @@ mod tests {
             None,
             None,
             None,
-            darkmux_crew::dispatch::Runtime::Openclaw,
+            darkmux_crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4)
             600,
             None,
@@ -571,6 +564,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_xreadgroup_malformed_on_retired_openclaw_runtime() {
+        use redis::Value as V;
+        // (#1405) Wire-compat pin: a fleet peer on a pre-2.0 release can
+        // still publish a WorkJob with the retired `"runtime": "openclaw"`.
+        // The record is otherwise fully valid, but the variant no longer
+        // exists — the claim boundary must route it to Malformed (work_id
+        // surfaced so the runner XACKs it), never Err or a panic. Pins the
+        // lenient old-peer boundary the openclaw removal created.
+        let record = br#"{
+            "role_id": "coder",
+            "message": "hi",
+            "session_id": "s-1",
+            "runtime": "openclaw",
+            "timeout_seconds": 300,
+            "published_at_unix_ms": 0,
+            "attempt": 1
+        }"#;
+        let response = V::Array(vec![V::Array(vec![
+            V::BulkString(b"darkmux:work".to_vec()),
+            V::Array(vec![V::Array(vec![
+                V::BulkString(b"1716192000000-8".to_vec()),
+                V::Array(vec![
+                    V::BulkString(b"record".to_vec()),
+                    V::BulkString(record.to_vec()),
+                ]),
+            ])]),
+        ])]);
+        let ClaimOutcome::Malformed { work_id, reason } =
+            parse_xreadgroup_response(&response).unwrap()
+        else {
+            panic!("expected ClaimOutcome::Malformed for a retired-runtime job");
+        };
+        assert_eq!(work_id, "1716192000000-8");
+        assert!(reason.contains("invalid WorkJob JSON"), "{reason}");
+        assert!(reason.contains("openclaw"), "reason should name the offending variant: {reason}");
+    }
+
+    #[test]
     fn parse_xreadgroup_malformed_on_non_array_fields() {
         use redis::Value as V;
         // (#903) A valid entry-id but a non-array fields slot — the work_id is
@@ -631,7 +662,7 @@ mod tests {
             None,
             None,
             None,
-            darkmux_crew::dispatch::Runtime::Openclaw,
+            darkmux_crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4)
             600,
             None,
@@ -882,7 +913,7 @@ mod tests {
             "role_id": "coder",
             "message": "hi",
             "session_id": "s-1",
-            "runtime": "openclaw",
+            "runtime": "internal",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
             "attempt": 1,
@@ -908,7 +939,7 @@ mod tests {
             "role_id": "coder",
             "message": "hi",
             "session_id": "s-1",
-            "runtime": "openclaw",
+            "runtime": "internal",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
             "attempt": 1
@@ -932,7 +963,7 @@ mod tests {
             "role_id": "coder",
             "message": "hi",
             "session_id": "s-1",
-            "runtime": "openclaw",
+            "runtime": "internal",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
             "attempt": 1

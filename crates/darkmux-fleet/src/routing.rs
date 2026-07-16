@@ -161,8 +161,8 @@ pub(crate) fn scan_flow_entries_for_completion(
 ///
 /// Canonical action shape is `"dispatch complete"` (space, NOT dot) —
 /// that's what every production emit site uses today
-/// (`crew::dispatch::dispatch` openclaw path + `dispatch_internal::dispatch`
-/// internal-runtime path). The dotted form `"dispatch.complete"` is
+/// (`dispatch_internal::dispatch`, the internal-runtime path). The
+/// dotted form `"dispatch.complete"` is
 /// accepted as forward-compat in case a future cleanup migrates the
 /// emitters to match the dotted-per-action-type convention of
 /// `dispatch.turn` / `dispatch.tool` / etc. (PR-C.3 review HIGH-2)
@@ -408,7 +408,6 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
             stdout: format!("published; not waiting (session_id={session_id})\n"),
             stderr: String::new(),
             session_id,
-            watched_state: Vec::new(),
             // Remote/queue path: the runtime's bookkeeping lands on the
             // runner, not on this dispatching host.
             out_dir: None,
@@ -464,7 +463,6 @@ pub(crate) fn completion_to_dispatch_result(c: CompletionResult) -> DispatchResu
         stdout,
         stderr: String::new(),
         session_id: c.session_id,
-        watched_state: Vec::new(),
         // Remote/queue path: the runtime's bookkeeping lands on the
         // runner, not on this dispatching host.
         out_dir: None,
@@ -628,7 +626,7 @@ mod tests {
         let r = completion_to_dispatch_result(c);
         assert_eq!(r.exit_code, 137, "payload exit_code wins");
         assert!(r.stdout.contains("result_class=error") && r.stdout.contains("session=s-1"));
-        assert!(r.watched_state.is_empty() && r.out_dir.is_none(), "remote path: no local bookkeeping");
+        assert!(r.out_dir.is_none(), "remote path: no local bookkeeping");
 
         // No payload exit_code → derived from result_class (ok→0, else→1).
         let ok = CompletionResult {

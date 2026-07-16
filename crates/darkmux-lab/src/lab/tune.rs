@@ -60,9 +60,6 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
         // tune() runs the workload through the default runtime
         // (internal, post-Phase-D).
         runtime: darkmux_crew::dispatch::Runtime::Internal,
-        // runtime_cmd is unused by the internal path; "openclaw" for
-        // codebase parity (Phase-E).
-        runtime_cmd: "openclaw".to_string(),
         // tune() varies model behavior across N runs, not loop config (#986).
         loop_override: None,
         inject_context: None, // tune() never injects engagement-context (#1004)

@@ -14,8 +14,8 @@ use std::time::Duration;
 // local CLI invocation OR queue claim, it lands at the same entry point.
 //
 // **Why a dedicated thread, not a tokio task:** the redis crate (sync)
-// + `crew::dispatch::dispatch` (shells out to docker / openclaw, blocks
-// 5+ minutes) would saturate the tokio executor. The thread runs
+// + `crew::dispatch::dispatch` (spawns a Docker container, blocks 5+
+// minutes) would saturate the tokio executor. The thread runs
 // independently of the axum server's runtime.
 
 /// Consumer group name used by all darkmux runners. Combined with the
@@ -52,7 +52,7 @@ pub fn spawn_runner_thread() -> std::thread::JoinHandle<()> {
 
 /// Run one claimed-job handler with panic isolation.
 ///
-/// The dispatch path (`dispatch()` → docker / openclaw shell-out + downstream
+/// The dispatch path (`dispatch()` → Docker container spawn + downstream
 /// libs) can PANIC, not just return `Err`. Without a guard the panic unwinds
 /// this spawned thread and kills it: the daemon keeps serving every endpoint
 /// (and the presence heartbeat keeps emitting, so it looks healthy) while the
@@ -157,12 +157,16 @@ fn runner_main() {
                 // unparseable, so it can NEVER be dispatched. ACK it to drop it
                 // from the pending-entries list — otherwise it sits pending
                 // forever (the `>` cursor never redelivers it). Log loudly: a
-                // malformed entry means a buggy or hostile peer published it.
+                // malformed entry means a buggy or hostile peer published it —
+                // or, more likely, plain version skew (#1405: a pre-2.0 peer
+                // publishing the retired openclaw runtime lands here).
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
-                        "darkmux-runner: dropping unparseable work entry {work_id} ({reason}); \
-                         XACK to clear it from the pending-entries list"
+                        "darkmux-runner: dropping work entry {work_id} ({reason}) — malformed \
+                         or from an incompatible darkmux version (e.g. a pre-2.0 peer \
+                         publishing a retired runtime); XACK to clear it from the \
+                         pending-entries list"
                     ))
                 );
                 let _ = ack_job(&client, RUNNER_CONSUMER_GROUP, &work_id);
@@ -314,20 +318,9 @@ impl WorkJob {
             // (When cross-machine plumbing eventually carries the flag
             // through WorkJob, this can read self.json.)
             json: false,
-            watch_paths: vec![],
             workdir: self.workdir.map(PathBuf::from),
             phase_id: self.phase_id,
             runtime: self.runtime,
-            // Runner-side runtime_cmd hardcoded to "openclaw" —
-            // intentionally NOT threaded from the publisher's WorkJob.
-            // A publisher-local binary path (`/opt/aider/aider` on the
-            // dispatcher) doesn't translate to a remote runner's
-            // filesystem; when cross-machine openclaw becomes a
-            // first-class use case the field belongs to the RUNNER's
-            // local config (read at claim-time), not to the WorkJob
-            // serialized off the publisher. Internal-runtime jobs
-            // ignore the field entirely.
-            runtime_cmd: "openclaw".to_string(),
             // Runner-side opts: never recurse into the queue (would
             // ping-pong jobs back to redis); always run local synchronous.
             machine: None,

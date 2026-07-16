@@ -15,7 +15,7 @@ Built for operators who need to see what their AI fleet did, when, and why.
 **AI-first local-AI orchestrator.** darkmux uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, utility-agent dispatch verbs (like `mission propose`), and a mission/phase lifecycle, on top of LMStudio. Developed on Apple Silicon. **Assumes a frontier orchestrator** (Claude Code): the engagement work happens in the frontier session.
 
 > **Heads up: read before running.**
-> darkmux orchestrates AI tools that execute on your machine. It sends commands to your local LMStudio server, can modify your local config files (`~/.openclaw/openclaw.json`, only on the opt-in `--runtime openclaw` / `crew sync` path), and in lab mode runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
+> darkmux orchestrates AI tools that execute on your machine. It sends commands to your local LMStudio server and, in lab mode, runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
 
 ## What darkmux is for
 
@@ -43,16 +43,11 @@ Hobbyists building local-AI workflows on their own Macs. Individual engineers wh
 
 Not *designed* as team tooling or a multi-tenant platform. The technical surface (no auth on `DARKMUX_REDIS_URL` beyond what your mesh VPN already provides, operator-asserted provenance fields, cross-machine state on a shared substrate) assumes everyone reachable on the substrate is you. If team scope is interesting to you, the substrate is a reasonable starting point: fork it, layer in auth where you need it, and the project's design will likely benefit from the lessons. Bigger orgs have their own infrastructure for the multi-tenant problem, and darkmux stays focused on the one-operator-many-Macs case; that's not a fence, it's a focus.
 
-## Two ways to run darkmux
+## How darkmux runs
 
-Pick whichever matches your setup; it's switchable per dispatch, not a one-time install decision:
+With just Docker + LMStudio, darkmux dispatches through its own built-in, container-bounded runtime — no external agent runtime to install or configure. This is the only dispatch path: `darkmux crew dispatch`, `darkmux lab run`, and the mission/phase lifecycle all run through it. (Earlier versions offered an opt-in shell-out to a separately-installed agent runtime; that path was removed pre-1.0 to keep the build and test surface small — see [#1405](https://github.com/kstrat2001/darkmux/issues/1405).)
 
-- **Standalone** (default): with just Docker + LMStudio, darkmux dispatches through its built-in internal runtime. No external agent runtime to install or configure. The out-of-box path for `darkmux crew dispatch`, `darkmux lab run`, and the mission/phase lifecycle.
-- **With your existing openclaw**: if openclaw is already in your stack, `darkmux crew dispatch --runtime openclaw` (or `darkmux lab run --runtime openclaw`) routes through it. Your existing sessions, channel routing, custom agents, and openclaw-specific tools (`update_plan`, `process`) keep working as-is. `darkmux crew sync` aligns openclaw's `agents.list[]` with darkmux's role manifests so the two stay in step.
-
-**darkmux is not a replacement for openclaw.** The standalone path exists so fresh operators don't need to install a second tool to get started. The openclaw path exists so operators with openclaw already wired in keep their workflow without translation. Both are first-class; the choice is per-dispatch.
-
-See [DESIGN.md → "Relationship to openclaw"](DESIGN.md#relationship-to-openclaw) for the side-by-side comparison (install footprint, isolation model, session model, tool surface) and the scope filter for what gets added to each path.
+See [DESIGN.md](DESIGN.md) for the implementation reasoning.
 
 ## Many machines become one
 
@@ -97,7 +92,6 @@ The third one is opt-in (the daemon binds localhost by default for safety). To e
 
 | Optional | When you'd want it |
 |---|---|
-| **[OpenClaw](https://github.com/openclaw/openclaw)** (or Aider / Cline) | If you're already running openclaw and want darkmux to dispatch through it instead of (or alongside) the internal runtime, pass `--runtime openclaw` per dispatch. `darkmux crew sync` aligns openclaw's agent registry with darkmux's role manifests. See [the dual-mode framing](#two-ways-to-run-darkmux) above. `swap`/`status`/`profiles` work without any external runtime. Override the openclaw binary path per dispatch with `--runtime-cmd <path>`.<br>**Version:** no hard OpenClaw version is required, because darkmux only writes to `openclaw.json` on the opt-in OC path (`crew sync`, `--runtime openclaw`, or `swap --runtime openclaw`). darkmux is developed and tested against OpenClaw **2026.5.4**; much older OpenClaw (pre-`2026.3.x`) had a `systemPromptOverride` regression in the config darkmux writes there. `darkmux doctor --include-openclaw` warns (non-blocking) if yours predates the tested version; upgrade via your openclaw checkout (`git pull` + openclaw's own build steps) if it bites. |
 | **[Claude Code](https://claude.com/claude-code)** | The recommended way to drive darkmux. A frontier orchestrator (Claude Code, Cursor, Gemini, Antigravity, Codex, Copilot) operates the CLI verbs and the `/darkmux-*` skills; standalone CLI use works for scripting and cron, but orchestrator-driven dispatch is the design. |
 
 darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.
@@ -251,13 +245,13 @@ darkmux is a CLI binary, not an HTTP proxy. Your frontier session (Claude Code) 
 
 1. **Profile multiplexing.** `darkmux swap <profile>` unloads + loads models in LMStudio according to a named profile in `~/.darkmux/profiles.json`. `darkmux swap recommended` resolves the active hardware tier to the bake-off-validated profile + pre-flight-checks the required models are downloaded. `~10s` wall to swap.
 
-2. **Crew + mission + phase lifecycle.** `darkmux crew dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the in-house container-bounded runtime by default (or openclaw via `--runtime openclaw`). `darkmux mission propose` + `darkmux phase estimate` are utility-AI verbs that turn vague intent into a structured mission config without the operator authoring it by hand; `darkmux mission launch <id>` mints the running mission instance from that config. Each dispatch emits a flow record carrying provenance: `machine_id`, `orchestrator`, role, model, mission, phase.
+2. **Crew + mission + phase lifecycle.** `darkmux crew dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the in-house container-bounded runtime. `darkmux mission propose` + `darkmux phase estimate` are utility-AI verbs that turn vague intent into a structured mission config without the operator authoring it by hand; `darkmux mission launch <id>` mints the running mission instance from that config. Each dispatch emits a flow record carrying provenance: `machine_id`, `orchestrator`, role, model, mission, phase.
 
 3. **Flow substrate.** Every dispatch, decision, and review is recorded as a structured JSONL event. `LocalFileSink` (always-on) writes to `~/.darkmux/flows/`. `AuditFileSink` (opt-in via `DARKMUX_AUDIT_DIR`) adds a BLAKE3 hash chain whose edits `flow integrity-check` detects (un-anchored: detects edits absent a full re-chain). `RedisSink` (opt-in via `DARKMUX_REDIS_URL`) adds a cross-machine coordination stream. `darkmux flow status` introspects the substrate; `darkmux flow integrity-check` walks the audit chain.
 
 4. **Observability daemon.** `darkmux serve` is a local HTTP daemon (default bind `127.0.0.1:8765`) that serves flow records + mission/phase state + the new `/flow-status` endpoint to the `/flow` + `/lab` viewers. Endpoints: `/health`, `/flow/<date>(.jsonl)`, `/flow/<date>/stream` (SSE tail), `/model/status`, `/missions`, `/phases`, `/flow-status`. Foreground process: run in a separate terminal tab. `darkmux doctor` includes a `daemon: reachable` check; dispatches print a one-line stderr nudge when the daemon isn't reachable.
 
-Both `crew dispatch` and `lab run` use the internal Docker-bounded runtime by default; pass `--runtime openclaw` to opt into the openclaw shell-out path. Override the openclaw binary path per dispatch with `--runtime-cmd <path>` (e.g. for Aider, Cline, or any tool exposing the `<cmd> agent --message` surface). The frontier session (Claude Code) orchestrates the whole thing: see the `/darkmux-bootstrap` skill for a guided walkthrough.
+Both `crew dispatch` and `lab run` use the internal Docker-bounded runtime. The frontier session (Claude Code) orchestrates the whole thing: see the `/darkmux-bootstrap` skill for a guided walkthrough.
 
 ## Why "darkmux"
 
@@ -298,21 +292,9 @@ The `m-series-128` provider's rules are empirically validated against lab measur
 docker build -t darkmux-runtime:latest runtime/
 ```
 
-Opt into openclaw per-dispatch if you already have it installed:
+The `lab` subcommand mirrors `crew dispatch`'s contract — the internal runtime, no external agent runtime to install or configure. The `swap` / `status` / `profiles` subcommands don't depend on any runtime at all. They orchestrate LMStudio directly.
 
-```bash
-darkmux crew dispatch coder --runtime openclaw --message "..."
-```
-
-The `lab` subcommand mirrors `crew dispatch`'s contract: internal runtime by default, `--runtime openclaw --runtime-cmd <path>` to opt into any tool exposing a `<cmd> agent --message <text> --json` surface (Aider, Cline, your own wrapper). The `swap` / `status` / `profiles` subcommands don't depend on any runtime at all. They orchestrate LMStudio directly.
-
-On the explicit `--runtime openclaw` path (and via `darkmux crew sync`), `darkmux swap --runtime openclaw` and `darkmux doctor --fix` patch the openclaw config file in place. Path resolution: any profile's `runtime.config_path` wins; otherwise darkmux honors the `DARKMUX_OPENCLAW_CONFIG` env var; otherwise it falls back to `~/.openclaw/openclaw.json`. Set the env var if your openclaw lives somewhere non-standard:
-
-```bash
-export DARKMUX_OPENCLAW_CONFIG="$HOME/work/openclaw-staging/openclaw.json"
-```
-
-This means: **darkmux's profile-multiplexing is runtime-agnostic** today; `crew dispatch` ships with a self-contained internal runtime so new users don't need an openclaw install to get going; the lab harness is *runtime-pluggable* via the env var. The empirical findings in the article series were measured against OpenClaw; the routing thesis itself is independent.
+This means **darkmux's profile-multiplexing needs nothing beyond Docker + LMStudio**: `crew dispatch` ships with a self-contained internal runtime, so a new user never installs a second agent-runtime tool to get going. The empirical findings in the article series were measured against this runtime.
 
 ### Internal-runtime safety net + model-facing telemetry
 
@@ -389,7 +371,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 - ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
 - ✅ `darkmux flow status` + `darkmux flow integrity-check` diagnostic verbs
 - ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers
-- ✅ Doctor: 20+ pre-flight checks with auto-fix path (`--fix`) for known-safe drift; `--include-openclaw` gates openclaw-specific checks so internal-runtime operators get a clean report, plus a legacy-extras warning that flags profiles still carrying openclaw-shape compaction keys (`mode`, `maxHistoryShare`, …)
+- ✅ Doctor: 30+ pre-flight checks with auto-fix path (`--fix`) for known-safe drift, plus a legacy-extras warning that flags profiles still carrying pre-#380 compaction keys (`mode`, `maxHistoryShare`, …)
 
 **On the roadmap (active):**
 

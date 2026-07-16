@@ -7,7 +7,7 @@ This file is for any AI agent (Antigravity, Claude Code, Cursor, etc.) that's he
 A pre-1.0 Rust CLI that does two things for users running local LLMs (LMStudio + Ollama + llama.cpp):
 
 1. **Profile multiplexer** — `darkmux swap <name>` switches the loaded model + context length + (optional) compaction settings to a named profile defined in `~/.darkmux/profiles.json`.
-2. **Lab harness** — `darkmux lab run <workload>` dispatches a workload against an agent runtime (default: the internal Docker-bounded runtime; pass `--runtime openclaw` to opt into the openclaw shell-out path) and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
+2. **Lab harness** — `darkmux lab run <workload>` dispatches a workload against the internal Docker-bounded runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
 
 The CLI is the *engine*; the empirical findings in the Genesis series on Darkly Energized (<https://darklyenergized.substack.com>) are what it backs. The reproducibility story is the product story — users should be able to rerun a workload and get numbers comparable to the published claims.
 
@@ -129,9 +129,8 @@ Refer to the "Common tasks for an agent" section in `CLAUDE.md` for CLI command 
 ## Anti-patterns
 
 - **Don't assume models — read the profile registry first.** Models live in `~/.darkmux/profiles.json`. If an agent role needs a model and one isn't declared, **ask the user**; do NOT pick a model from the LMStudio catalog at random.
-- **Don't silently roll back on regression.** If a feature appears to regress on an unfamiliar OpenClaw / LMStudio version, **surface the finding to the user** with the version numbers you observed. Don't quietly revert config overrides "to make things work".
+- **Don't silently roll back on regression.** If a feature appears to regress on an unfamiliar LMStudio version, **surface the finding to the user** with the version numbers you observed. Don't quietly revert config overrides "to make things work".
 - **Check existing issues before filing.** Before creating new issues, use search and comment on existing ones where possible.
-- **Cross-machine version awareness.** darkmux assumes a recent OpenClaw. Check versions and prerequisites before applying new agent configs.
 
 ## Operator sovereignty (architectural principle)
 
@@ -142,8 +141,6 @@ Compressed to one rule: **the operator never has to wonder where a decision came
 ## Namespace convention (darkmux state in shared systems)
 
 - LMStudio loaded identifier (visible in `lms ps`): `darkmux:<model-id>` (e.g. `darkmux:qwen3.6-35b-a3b`)
-- OpenClaw agent ids (`agents.list[].id`): `darkmux/<role>` (e.g. `darkmux/coder`)
-- OpenClaw channel routing: `darkmux/<key>` (e.g. `darkmux/<channel-id>`)
 
 ## Model-facing prompt construction (AI-convention defaults + term provenance)
 

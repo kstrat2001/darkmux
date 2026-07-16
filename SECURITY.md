@@ -70,14 +70,11 @@ frame:
 
 ### What darkmux does NOT defend (by design)
 
-- **AI-generated code is not sandboxed for security.** The default internal
-  runtime runs each dispatch in a per-invocation Docker container with
-  kernel-enforced *workspace* isolation — better than a bare directory, but
-  Docker on macOS is a VM boundary, not a guarantee against a determined
-  adversary. The opt-in `--runtime openclaw` / `--runtime-cmd` path has **no
-  container at all**: the working directory is a regular directory and an agent
-  that runs `rm -rf ~` is not stopped by darkmux. Run only on a machine where
-  that risk is acceptable. (See [DISCLAIMER.md](./DISCLAIMER.md).)
+- **AI-generated code is not sandboxed for security.** The internal runtime
+  runs each dispatch in a per-invocation Docker container with kernel-enforced
+  *workspace* isolation — better than a bare directory, but Docker on macOS is
+  a VM boundary, not a guarantee against a determined adversary. Run only on a
+  machine where that risk is acceptable. (See [DISCLAIMER.md](./DISCLAIMER.md).)
 - **The daemon has no authentication.** Anyone who can reach the bind address
   can read your flow records and drive the viewer. Keep it on loopback, or put
   it behind your own authenticated reverse proxy / a private network
@@ -125,5 +122,5 @@ These are accepted, documented gaps — not undisclosed vulnerabilities:
 
 In scope: the darkmux binary, the `darkmux serve` daemon and viewer, the
 internal runtime, and the dispatch path. Out of scope: vulnerabilities in
-third-party software darkmux orchestrates or depends on (LMStudio, OpenClaw,
-Docker, the models you load) — report those to their respective projects.
+third-party software darkmux orchestrates or depends on (LMStudio, Docker,
+the models you load) — report those to their respective projects.

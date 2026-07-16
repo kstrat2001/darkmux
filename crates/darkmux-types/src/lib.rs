@@ -266,10 +266,11 @@ pub enum EndpointAuthType {
     Bearer,
 }
 
+/// Runtime block of a profile. (A `config_path` field — the removed
+/// openclaw-config patch target — was deleted with the openclaw path in
+/// #1405; serde tolerates the stale key in an old `profiles.json`.)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileRuntime {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

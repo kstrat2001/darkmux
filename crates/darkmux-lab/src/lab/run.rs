@@ -18,18 +18,10 @@ pub struct RunOpts {
     pub runs: u32,
     pub config_path: Option<String>,
     pub quiet: bool,
-    /// Which agent runtime to dispatch the workload through.
-    /// `Runtime::Internal` (default) uses darkmux's container-bounded
-    /// runtime; `Runtime::Openclaw` shells out to the openclaw CLI
-    /// (legacy path).
+    /// Which agent runtime to dispatch the workload through. The
+    /// in-house container-bounded runtime (`Runtime::Internal`) is the
+    /// only value (#1405 removed the legacy `openclaw` shell-out runtime).
     pub runtime: darkmux_crew::dispatch::Runtime,
-    /// Executable path for the openclaw shell-out (Phase-E
-    /// replacement for the removed `DARKMUX_RUNTIME_CMD` env var).
-    /// Defaults to `"openclaw"`; override via `--runtime-cmd <path>`
-    /// to point at Aider / Cline / any tool exposing the
-    /// `<cmd> agent --message` calling convention. Ignored when
-    /// `runtime == Runtime::Internal`.
-    pub runtime_cmd: String,
     /// (#986) Loop lab: per-run compaction overrides applied on top of the
     /// resolved profile's compaction config. `None` (the `lab run` /
     /// `characterize` / `tune` paths) leaves the profile intact, so those
@@ -256,7 +248,6 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
 
         let provider_id = loaded_workload.manifest.workload.provider.clone();
         let runtime = opts.runtime;
-        let runtime_cmd = opts.runtime_cmd.as_str();
         // (#488) Phase 1 — provider operates against the per-run
         // sandbox, not the source. Provider has no awareness of the
         // COW step; it just gets a sandbox dir and works against it.
@@ -269,7 +260,6 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 profile,
                 &profile_name,
                 runtime,
-                runtime_cmd,
                 opts.config_path.as_deref(),
                 opts.loop_override.as_ref(),
             )
@@ -992,7 +982,6 @@ mod tests {
             config_path: Some(cfg.to_str().unwrap().into()),
             quiet: true,
             runtime: darkmux_crew::dispatch::Runtime::Internal,
-            runtime_cmd: "openclaw".to_string(),
             loop_override: None,
             inject_context: None,
         })

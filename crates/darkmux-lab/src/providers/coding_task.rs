@@ -219,7 +219,6 @@ impl WorkloadProvider for CodingTaskProvider {
         profile: &Profile,
         profile_name: &str,
         runtime: darkmux_crew::dispatch::Runtime,
-        runtime_cmd: &str,
         config_path: Option<&str>,
         loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
     ) -> Result<RunResult> {
@@ -228,21 +227,12 @@ impl WorkloadProvider for CodingTaskProvider {
         // a superset of the old primary-only check here), so it isn't
         // repeated per provider — a coding-task run warns once, not twice.
 
-        // Per-runtime sandbox-path substitution:
-        //   - Openclaw runs on host → agent sees the host sandbox path.
-        //   - Internal runtime mounts sandbox_dir at /workspace in the
-        //     container → agent sees /workspace. Substituting the host
-        //     path here would point the agent at a path invisible
-        //     inside Docker (#337 root cause).
+        // `Runtime` has a single variant post-#1405 — the internal runtime
+        // mounts sandbox_dir at /workspace in the container, so the prompt
+        // substitutes the container-side path.
+        let darkmux_crew::dispatch::Runtime::Internal = runtime;
         let raw_prompt = resolve_prompt(loaded)?;
-        let prompt = match runtime {
-            darkmux_crew::dispatch::Runtime::Internal => {
-                expand_placeholders_with(&raw_prompt, "/workspace")
-            }
-            darkmux_crew::dispatch::Runtime::Openclaw => {
-                expand_placeholders(&raw_prompt, sandbox_dir)
-            }
-        };
+        let prompt = expand_placeholders_with(&raw_prompt, "/workspace");
         let role = pick_role(loaded);
         let session_id = format!(
             "darkmux-coding-{}-{}",
@@ -270,49 +260,31 @@ impl WorkloadProvider for CodingTaskProvider {
         };
 
         let started = std::time::Instant::now();
-        // `dispatch_out_dir` is the host path where the internal runtime
-        // wrote its `.darkmux-runtime/` bookkeeping. `None` for the
-        // openclaw path (and pre-image-rebuild internal dispatches) ⇒ the
-        // copy site falls back to the legacy sandbox_dir location.
-        let mut dispatch_out_dir: Option<PathBuf> = None;
-        let (stdout, stderr, ok) = match runtime {
-            darkmux_crew::dispatch::Runtime::Internal => {
-                // (#368) Derive compaction config from the active
-                // profile so the runtime honors operator's
-                // profile.runtime.compaction.* without env-var
-                // gymnastics. Profile is the operator's tuning
-                // source-of-truth; this is the host-side bridge.
-                // (#377) Per-role override applied inside
-                // dispatch_via_internal where the role manifest is
-                // already loaded — single lookup point.
-                let mut compaction =
-                    darkmux_crew::dispatch::CompactionDispatchArgs::from_profile(profile);
-                // (#986) Loop lab: overlay the per-run compaction overrides on
-                // top of the profile-derived args. `lab run` passes `None`
-                // here, so its behavior is byte-identical to before.
-                if let Some(ov) = loop_override {
-                    ov.apply(&mut compaction);
-                }
-                // Pass sandbox_dir as --workdir so the runtime mounts
-                // it at /workspace, matching the placeholder
-                // substitution above (#337 fix).
-                let (stdout, stderr, ok, out_dir) = dispatch_via_internal(
-                    &role,
-                    &prompt,
-                    &session_id,
-                    Some(sandbox_dir.to_path_buf()),
-                    compaction,
-                    profile_name,
-                    loaded.manifest.workload.image.as_deref(),
-                    config_path,
-                )?;
-                dispatch_out_dir = out_dir;
-                (stdout, stderr, ok)
-            }
-            darkmux_crew::dispatch::Runtime::Openclaw => {
-                dispatch_via_openclaw(runtime_cmd, &role, &prompt, &session_id)?
-            }
-        };
+        // (#368) Derive compaction config from the active profile so the
+        // runtime honors operator's profile.runtime.compaction.* without
+        // env-var gymnastics. Profile is the operator's tuning
+        // source-of-truth; this is the host-side bridge. (#377) Per-role
+        // override applied inside dispatch_via_internal where the role
+        // manifest is already loaded — single lookup point.
+        let mut compaction = darkmux_crew::dispatch::CompactionDispatchArgs::from_profile(profile);
+        // (#986) Loop lab: overlay the per-run compaction overrides on top
+        // of the profile-derived args. `lab run` passes `None` here, so
+        // its behavior is byte-identical to before.
+        if let Some(ov) = loop_override {
+            ov.apply(&mut compaction);
+        }
+        // Pass sandbox_dir as --workdir so the runtime mounts it at
+        // /workspace, matching the placeholder substitution above (#337 fix).
+        let (stdout, stderr, ok, dispatch_out_dir) = dispatch_via_internal(
+            &role,
+            &prompt,
+            &session_id,
+            Some(sandbox_dir.to_path_buf()),
+            compaction,
+            profile_name,
+            loaded.manifest.workload.image.as_deref(),
+            config_path,
+        )?;
         let duration_ms = started.elapsed().as_millis();
 
         fs::write(run_dir.join("qa-reply.json"), &stdout)?;
@@ -330,52 +302,37 @@ impl WorkloadProvider for CodingTaskProvider {
         // analysis was reading the latest dispatch's data for every
         // historical run.
         let mut trajectory_path: Option<PathBuf> = None;
-        match runtime {
-            darkmux_crew::dispatch::Runtime::Internal => {
-                // Read from the dispatch's out-dir. For the internal path
-                // `out_dir` is ALWAYS `Some` (the host allocates + mounts it),
-                // so the `unwrap_or(sandbox_dir)` fallback only catches the
-                // openclaw/remote cases that legitimately have no out-dir.
-                // There is NO safe pre-rebuild gap for the internal path: an
-                // un-rebuilt image still writes the trajectory into /workspace,
-                // which the new tailer never reads, so the #457 watchdog would
-                // hard-kill productive dispatches. The host-code change and the
-                // darkmux-runtime image rebuild must land atomically.
-                let runtime_dir = dispatch_out_dir
-                    .as_deref()
-                    .unwrap_or(sandbox_dir)
-                    .join(".darkmux-runtime");
-                // `src.exists()` gate is intentional: a #363-timeout
-                // dispatch may have written partial trajectory but no
-                // metrics.json. Copying what's there preserves forensic
-                // data; missing files just don't copy. Don't "fix" this
-                // by aborting when either is absent.
-                for (name, dst_name) in [
-                    ("trajectory.jsonl", "trajectory.jsonl"),
-                    ("metrics.json", "metrics.json"),
-                ] {
-                    let src = runtime_dir.join(name);
-                    if src.exists() {
-                        let dst = run_dir.join(dst_name);
-                        if let Err(e) = fs::copy(&src, &dst) {
-                            eprintln!(
-                                "darkmux: warn — failed copying runtime {name} into run dir: {e}"
-                            );
-                        } else if name == "trajectory.jsonl" {
-                            trajectory_path = Some(dst);
-                        }
-                    }
-                }
-            }
-            darkmux_crew::dispatch::Runtime::Openclaw => {
-                // Openclaw writes per-session trajectory under
-                // `~/.openclaw/agents/<agent>/sessions/<session-id>.trajectory.jsonl`.
-                // Best-effort lookup via guess_trajectory_path.
-                if let Some(t) = guess_trajectory_path(&session_id) {
-                    let dst = run_dir.join("trajectory.jsonl");
-                    if let Err(e) = fs::copy(&t, &dst) {
-                        eprintln!("darkmux: warn — failed copying trajectory: {e}");
-                    } else {
+        {
+            // Read from the dispatch's out-dir. `out_dir` is ALWAYS `Some`
+            // for a local internal-runtime dispatch (the host allocates +
+            // mounts it); `unwrap_or(sandbox_dir)` only catches the remote
+            // path, which legitimately has no out-dir. There is no safe
+            // pre-rebuild gap: an un-rebuilt image still writes the
+            // trajectory into /workspace, which the new tailer never reads,
+            // so the #457 watchdog would hard-kill productive dispatches.
+            // The host-code change and the darkmux-runtime image rebuild
+            // must land atomically.
+            let runtime_dir = dispatch_out_dir
+                .as_deref()
+                .unwrap_or(sandbox_dir)
+                .join(".darkmux-runtime");
+            // `src.exists()` gate is intentional: a #363-timeout
+            // dispatch may have written partial trajectory but no
+            // metrics.json. Copying what's there preserves forensic
+            // data; missing files just don't copy. Don't "fix" this
+            // by aborting when either is absent.
+            for (name, dst_name) in [
+                ("trajectory.jsonl", "trajectory.jsonl"),
+                ("metrics.json", "metrics.json"),
+            ] {
+                let src = runtime_dir.join(name);
+                if src.exists() {
+                    let dst = run_dir.join(dst_name);
+                    if let Err(e) = fs::copy(&src, &dst) {
+                        eprintln!(
+                            "darkmux: warn — failed copying runtime {name} into run dir: {e}"
+                        );
+                    } else if name == "trajectory.jsonl" {
                         trajectory_path = Some(dst);
                     }
                 }
@@ -670,8 +627,8 @@ fn expand_placeholders(input: &str, sandbox_dir: &Path) -> String {
 
 /// Lower-level helper: substitute `${SANDBOX_DIR}` / `${SANDBOX}` with
 /// an explicit view-path string. Used to swap between host paths
-/// (openclaw / verify command) and container-internal paths (internal
-/// runtime agent prompts) at the call site.
+/// (verify commands) and container-internal paths (internal runtime
+/// agent prompts) at the call site.
 fn expand_placeholders_with(input: &str, view_path: &str) -> String {
     input
         .replace("${SANDBOX_DIR}", view_path)
@@ -834,11 +791,9 @@ fn dispatch_via_internal(
         timeout_seconds: 3600,
         skip_preflight: false,
         json: true,
-        watch_paths: Vec::new(),
         workdir,
         phase_id: None,
         runtime: Runtime::Internal,
-        runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
         compaction,
@@ -868,65 +823,6 @@ fn dispatch_via_internal(
         result.exit_code == 0,
         result.out_dir,
     ))
-}
-
-/// Dispatch via the legacy openclaw shell-out path. Shells out with the
-/// `<cmd> agent --agent <role> --json ...` calling convention.
-/// `runtime_cmd` is the operator-supplied binary path (Phase-E:
-/// `--runtime-cmd <path>` flag; defaults to `"openclaw"`).
-fn dispatch_via_openclaw(
-    runtime_cmd: &str,
-    role: &str,
-    prompt: &str,
-    session_id: &str,
-) -> Result<(String, String, bool)> {
-    let output = Command::new(runtime_cmd)
-        .args([
-            "agent",
-            "--agent",
-            role,
-            "--session-id",
-            session_id,
-            "--json",
-            "--timeout",
-            "3600",
-            "--message",
-            prompt,
-        ])
-        .output()
-        .with_context(|| format!("running `{runtime_cmd} agent ...`"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok((stdout, stderr, output.status.success()))
-}
-
-/// Best-effort trajectory lookup for the active runtime.
-///
-/// darkmux doesn't know where every agent runtime stores trajectories, so we
-/// look in the location the OpenClaw runtime uses by default. Override with
-/// `DARKMUX_RUNTIME_AGENTS_DIR` for any other runtime that stores per-agent
-/// session files in a parallel layout: `<dir>/<agent>/sessions/<session-id>.trajectory.jsonl`.
-fn guess_trajectory_path(session_id: &str) -> Option<PathBuf> {
-    // env(DARKMUX_RUNTIME_AGENTS_DIR) > config.dirs.runtime_agents >
-    // ~/.openclaw/agents (None if no HOME and no override) (#661 Slice 3).
-    let agents_dir = match darkmux_types::config_access::runtime_agents_dir_override() {
-        Some(p) => p,
-        None => dirs::home_dir()?.join(".openclaw").join("agents"),
-    };
-    if !agents_dir.exists() {
-        return None;
-    }
-    let entries = fs::read_dir(&agents_dir).ok()?;
-    for entry in entries.flatten() {
-        let candidate = entry
-            .path()
-            .join("sessions")
-            .join(format!("{session_id}.trajectory.jsonl"));
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 /// (#420) Result of comparing the agent's final-message claim against
@@ -1270,11 +1166,11 @@ struct InternalRuntimeMetrics {
 }
 
 /// Read a runtime-emitted `metrics.json` from a specific path.
-/// Returns `None` if the file doesn't exist (openclaw shell-out
-/// dispatches won't have one; some run dirs don't yet have the
-/// per-run copy from #364) or if it can't be parsed (older runtime
-/// versions may emit a different shape). The fallback in the caller
-/// is to derive counts from the trajectory (#359).
+/// Returns `None` if the file doesn't exist (some run dirs don't yet
+/// have the per-run copy from #364, or predate the internal runtime)
+/// or if it can't be parsed (older runtime versions may emit a
+/// different shape). The fallback in the caller is to derive counts
+/// from the trajectory (#359).
 ///
 /// Caller-chooses the path so the preference chain (per-run copy
 /// first, sandbox-live fallback) lives at the consumer, not split
@@ -1938,11 +1834,10 @@ not-valid-json
         );
     }
 
-    /// QA reviewer's recommendation: pin the per-runtime substitution
+    /// QA reviewer's recommendation: pin the per-caller substitution
     /// contract. `${SANDBOX_DIR}` resolves to the operator-supplied
-    /// view_path; verify substitution + the dispatch-side branching
-    /// produce different paths for openclaw (host) vs internal
-    /// (`/workspace`).
+    /// view_path; verify commands substitute the host path, dispatched
+    /// prompts substitute the container path (`/workspace`).
     #[test]
     fn expand_placeholders_with_substitutes_view_path() {
         let host = "/Users/kain/.darkmux/sandboxes/quick-coding";
@@ -1950,7 +1845,7 @@ not-valid-json
         let prompt = "Fix the bug in ${SANDBOX_DIR}/bug.py — run python3 ${SANDBOX}/test.py";
 
         let host_view = expand_placeholders_with(prompt, host);
-        assert!(host_view.contains(host), "openclaw path should be substituted");
+        assert!(host_view.contains(host), "host path should be substituted");
         assert!(!host_view.contains("/workspace"));
 
         let container_view = expand_placeholders_with(prompt, inside_container);
