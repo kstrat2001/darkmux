@@ -94,13 +94,6 @@ pub(crate) enum Cmd {
         #[command(flatten)]
         json: JsonFlag,
     },
-    /// List profiles in the registry.
-    Profiles {
-        #[command(flatten)]
-        profiles: ProfilesFileArg,
-        #[command(flatten)]
-        json: JsonFlag,
-    },
     /// Lab subcommands.
     Lab {
         #[command(subcommand)]
@@ -110,11 +103,6 @@ pub(crate) enum Cmd {
     Skills {
         #[command(subcommand)]
         sub: SkillsCmd,
-    },
-    /// Notebook commands — agent-as-scribe for lab notebook entries.
-    Notebook {
-        #[command(subcommand)]
-        sub: NotebookCmd,
     },
     /// Run pre-flight diagnostic checks. Verifies the local setup (profile
     /// registry, LMStudio, models, runtime, RAM, power) and reports
@@ -135,15 +123,11 @@ pub(crate) enum Cmd {
         #[arg(long)]
         probe: bool,
     },
-    /// Scan the LMStudio model catalog for downloaded models that aren't yet
-    /// covered by any profile. For each uncovered model, suggests a task class
-    /// and rough memory impact. Run after downloading a new model in LMStudio
-    /// to see whether you'd want to define a profile for it.
-    Scan {
-        #[command(flatten)]
-        profiles: ProfilesFileArg,
-    },
-    /// Profile management subcommands.
+    /// Profile registry — the declaration surface for named model stacks.
+    /// `profile list` shows the configured profiles; `profile scan` finds
+    /// downloaded LMStudio models not yet in any profile; `profile draft`
+    /// emits a starter profile JSON (#1426 — top-level `profiles` and `scan`
+    /// merged into this family).
     Profile {
         #[command(subcommand)]
         sub: ProfileCmd,
@@ -170,16 +154,6 @@ pub(crate) enum Cmd {
     Crew {
         #[command(subcommand)]
         sub: CrewCmd,
-    },
-    /// Render a darkmux pr-reviewer dispatch into a GitHub PR-review payload
-    /// (#1060). Reads the dispatch `--json` envelope + the PR diff and emits
-    /// `{mode, review, comment}`. The binary-owned replacement for the per-repo
-    /// `pr-review-post.py` copy — the schema-coupled render lives here, versioned
-    /// with the `pr-reviewer` role; the thin workflow YAML keeps the model/
-    /// profile/trigger and the `gh` post.
-    PrReview {
-        #[command(subcommand)]
-        sub: PrReviewCmd,
     },
     /// Engagement-context lessons — operator-authored conventions,
     /// constraints, and decisions (with the reasoning behind them) that surface
@@ -274,38 +248,6 @@ pub(crate) enum Cmd {
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
-    /// External-source plugins: pull text/markdown from a single artifact
-    /// out to stdout. Composes with `darkmux mission propose` and other
-    /// downstream commands via shell pipes. Each invocation hits exactly
-    /// one plugin (mutually exclusive flags).
-    External {
-        #[command(subcommand)]
-        sub: ExternalCmd,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum ExternalCmd {
-    /// Pull text/markdown from an external source to stdout. Plugin
-    /// contract: produce text/markdown (any reasonable shape) to
-    /// stdout; downstream verbs read it as input. Exactly one source
-    /// flag must be provided.
-    #[command(group(clap::ArgGroup::new("source").required(true).multiple(false).args(["gh", "url", "stdin"])))]
-    Pull {
-        /// Pull from a GitHub issue or PR URL (wraps `gh issue view`
-        /// or `gh pr view`). Requires `gh` on PATH.
-        #[arg(long, group = "source")]
-        gh: Option<String>,
-        /// Pull from any URL (HTTP GET via `curl -s -L --max-time 30`).
-        /// Output is whatever the URL responds with — HTML is
-        /// passed through unchanged for now.
-        #[arg(long, group = "source")]
-        url: Option<String>,
-        /// Read from stdin and echo to stdout (passthrough). Useful
-        /// for `pbpaste | darkmux external pull --stdin | ...`.
-        #[arg(long, group = "source")]
-        stdin: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -321,37 +263,6 @@ pub(crate) enum RecommendationsCmd {
         tier: Option<String>,
         #[command(flatten)]
         json: JsonFlag,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum PrReviewCmd {
-    /// Render a dispatch envelope + diff into a GitHub PR-review payload:
-    /// resolve each finding's quoted `anchor` to a new-side line, build the
-    /// inline comments + summary, and emit `{mode, review, comment}` JSON to
-    /// stdout (or to `--emit <path>`). The thin workflow YAML posts it.
-    ///
-    /// The review-FUNNEL dispatch (bundle -> probe -> dedup -> judge ->
-    /// synthesis) that used to live at `pr-review run` retired in #1284
-    /// Packet 4b — it's now `darkmux mission launch review` (see that
-    /// verb's `--param` inputs, one-to-one with the old flags, documented
-    /// in `src/mission_launch_review.rs`'s module doc).
-    Render {
-        /// Path to the darkmux `--json` dispatch envelope.
-        #[arg(long)]
-        envelope: std::path::PathBuf,
-        /// Path to the PR unified diff.
-        #[arg(long)]
-        diff: std::path::PathBuf,
-        /// Write the payload JSON to this file instead of stdout.
-        #[arg(long)]
-        emit: Option<std::path::PathBuf>,
-        /// (#1113) Attribution text for the posted footer. The default claims
-        /// "running on a local model (no cloud API)" — pass the truthful line
-        /// when the dispatch routed elsewhere (e.g. a remote paid endpoint).
-        /// The workflow knows where the model ran; darkmux doesn't guess.
-        #[arg(long)]
-        attribution: Option<String>,
     },
 }
 
@@ -633,6 +544,14 @@ pub(crate) enum MissionCmd {
     /// text itself (where the frontier orchestrator can thread it
     /// natively); the mission-compiler structures whatever's in the
     /// input without needing to interpret engagement.
+    ///
+    /// The input is any text on stdin — the pipe IS the interface, so the
+    /// tools that already exist (gh, curl, cat) are the source adapters
+    /// (#1426 — this retired the bespoke `darkmux external pull` wrapper):
+    ///
+    ///   gh issue view 42 | darkmux mission propose --from-stdin
+    ///   curl -s <url>    | darkmux mission propose --from-stdin
+    ///   cat notes.md     | darkmux mission propose --from-stdin
     #[command(group(
         clap::ArgGroup::new("input_source").required(true).multiple(false)
     ))]
@@ -984,6 +903,23 @@ pub(crate) enum FleetCmd {
 
 #[derive(Subcommand)]
 pub(crate) enum ProfileCmd {
+    /// List profiles in the registry. (#1426 — the retired top-level
+    /// `darkmux profiles` verb; now `darkmux profile list`.)
+    List {
+        #[command(flatten)]
+        profiles: ProfilesFileArg,
+        #[command(flatten)]
+        json: JsonFlag,
+    },
+    /// Scan the LMStudio model catalog for downloaded models that aren't yet
+    /// covered by any profile. For each uncovered model, suggests a task class
+    /// and rough memory impact. Run after downloading a new model in LMStudio
+    /// to see whether you'd want to define a profile for it. (#1426 — the
+    /// retired top-level `darkmux scan` verb; now `darkmux profile scan`.)
+    Scan {
+        #[command(flatten)]
+        profiles: ProfilesFileArg,
+    },
     /// Generate a starter profile JSON for a model + task class. Output is
     /// printed to stdout — copy-paste into your `~/.darkmux/profiles.json`
     /// (or pipe into a file) and tune from there.
@@ -1416,4 +1352,12 @@ pub(crate) enum LabCmd {
     /// no dispatches, no network. Doctor is the discoverability layer
     /// for the lab subsystem.
     Doctor,
+    /// Notebook — agent-as-scribe for lab notebook entries. A lab HAS a
+    /// notebook: `lab notebook draft <run-id>` authors an entry from a run's
+    /// artifacts, `lab notebook list` enumerates recorded entries. (#1426 —
+    /// the retired top-level `darkmux notebook` verb; now under `lab`.)
+    Notebook {
+        #[command(subcommand)]
+        sub: NotebookCmd,
+    },
 }

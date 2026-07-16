@@ -267,6 +267,10 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             );
             Ok(if report.has_warnings() { 1 } else { 0 })
         }
+        // (#1426) `lab notebook draft|list` — the notebook family folded into
+        // `lab` (the retired top-level `notebook` verb). The handler stays in
+        // `main.rs` beside the other agent-as-scribe plumbing.
+        LabCmd::Notebook { sub } => crate::cmd_notebook(sub),
     }
 }
 
