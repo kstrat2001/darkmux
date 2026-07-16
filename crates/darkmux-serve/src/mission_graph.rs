@@ -100,6 +100,16 @@ pub struct StepRow {
     /// Resolved via [`resolve_step_label`] — StepKind display name → kind
     /// id → step id → `"unknown"` (#1402).
     pub label: String,
+    /// (#1403) The RAW step kind id (`"dispatch.internal"`, `"review.probe"`,
+    /// `"mission.coder"`, `"procedural.shell"`, …) — distinct from the
+    /// human `label`. The page gates the live token/turn meter on this: an
+    /// AI-DISPATCHING kind (`dispatch.*`, `review.probe/judge/verify`,
+    /// `mission.coder/verify`) shows a meter; a procedural kind
+    /// (`procedural.*`, `review.bundle/dedup`, `mission.worktree`) shows
+    /// none. Empty string when the kind is genuinely unknown (a synthesized
+    /// step with no config-snapshot recovery — see `build_mission_graph`);
+    /// the page then falls back to showing a meter only if metrics arrive.
+    pub kind: String,
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_ts: Option<u64>,
@@ -680,6 +690,7 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
                     Some(step) => StepRow {
                         id: step.id.clone(),
                         label: resolve_step_label(&step.kind, &step.id),
+                        kind: step.kind.clone(),
                         status: node_status_str(step.status),
                         started_ts: step.started_ts,
                         completed_ts: step.completed_ts,
@@ -690,6 +701,7 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
                         StepRow {
                             id: step_id.clone(),
                             label: resolve_step_label(&kind, step_id),
+                            kind,
                             status: node_status_str(NodeStatus::Planned),
                             started_ts: None,
                             completed_ts: None,
