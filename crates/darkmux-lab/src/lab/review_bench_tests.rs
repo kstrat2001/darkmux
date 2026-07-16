@@ -659,6 +659,64 @@
         assert!(rows.iter().all(|r| r.artifact.model == "m-x" && r.source == "native"));
     }
 
+    /// (#1210) A degenerate case whose dispatch served ZERO tokens is an INFRA
+    /// failure (rate-limited / unreachable endpoint / dead dispatch) — routed
+    /// to `Outcome::InfraFail` and EXCLUDED from the capability denominators,
+    /// never a `CapabilityFail` zero against the model. A degenerate case that
+    /// served tokens (model ran, output unparseable) stays a capability fail.
+    #[test]
+    fn build_score_rows_zero_token_degenerate_is_infra_not_capability() {
+        use crate::lab::scores::{ArtifactKey, Outcome};
+        let mk_case = |id: &str, kind: &str| Case {
+            id: id.into(),
+            label: Label {
+                kind: kind.into(),
+                intent_title: "t".into(),
+                intent_body: String::new(),
+                expect_verdict: String::new(),
+                bug_class: None,
+                anchor_contains: None,
+                expected: vec![],
+                notes: None,
+            },
+            diff: String::new(),
+        };
+        let clean_ok = mk_case("c1", "clean");
+        let clean_429 = mk_case("c2", "clean");
+        let clean_ran = mk_case("c3", "clean");
+        let pass = CaseScore { correct: true, verdict: "pass".into(), ..Default::default() };
+        let degen = CaseScore { degenerate: true, ..Default::default() };
+        let scored: Vec<(&Case, CaseScore)> = vec![
+            (&clean_ok, CaseScore { correct: true, verdict: "pass".into(), ..Default::default() }),
+            (&clean_429, CaseScore { degenerate: true, ..Default::default() }),
+            (&clean_ran, CaseScore { degenerate: true, ..Default::default() }),
+        ];
+        let _ = (&pass, &degen);
+        let meta = vec![
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(500) }, // ran + passed
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(0) },   // 429: zero served
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(200) }, // ran, unparseable
+        ];
+        let artifact = ArtifactKey { model: "m-x".into(), ..Default::default() };
+        let rows = build_score_rows(&scored, &meta, &artifact);
+
+        let case_rows: Vec<_> = rows.iter().filter(|r| r.axis == "case").collect();
+        assert_eq!(case_rows.len(), 3);
+        assert_eq!(case_rows[0].outcome, Outcome::Pass);
+        // Zero tokens served → infra, not capability.
+        assert_eq!(case_rows[1].outcome, Outcome::InfraFail);
+        // Ran but produced unparseable output → still a capability failure.
+        assert_eq!(case_rows[2].outcome, Outcome::CapabilityFail);
+
+        // clean_pass_rate denominator EXCLUDES the infra case (c2): 1 pass of
+        // the 2 clean cases that actually ran (c1 passed, c3 ran + degenerate),
+        // never 1 of 3.
+        let agg = rows.iter().find(|r| r.axis == "clean_pass_rate").unwrap();
+        assert_eq!(agg.value, Some(0.5));
+        let detail = &agg.detail;
+        assert_eq!(detail["clean_cases"].as_u64(), Some(2));
+    }
+
     #[test]
     fn build_score_rows_emits_multi_schema_aggregates() {
         use crate::lab::scores::ArtifactKey;
