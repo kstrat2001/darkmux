@@ -25,6 +25,25 @@
 //!   to `target/release/darkmux`); helper `build_darkmux_release()` is
 //!   a one-shot per test-run idempotent build.
 //!
+//! ### Build-once across the six e2e test BINARIES (#1291)
+//!
+//! This file is `#[path]`-included into six separate `tests/e2e_*.rs`
+//! integration-test binaries, each its own OS process. A per-process
+//! `OnceLock` (as this module used to rely on alone) memoizes the build
+//! within one binary but can't stop the other five binaries from each
+//! running their own `cargo build --release`: up to six redundant
+//! invocations per `cargo test`, most of them no-ops but each still
+//! paying cargo's lock+fingerprint walk, and contending on cargo's own
+//! target-dir lock under `--jobs`-parallel test-binary execution.
+//! `build_darkmux_release()` now wraps the actual build in a
+//! cross-process `flock(2)` (POSIX; same `FlockGuard` pattern as
+//! `darkmux-lab`'s registry lock and `darkmux-flow`'s audit sink) on a
+//! lock file under `target/`, so the six binaries serialize into at
+//! most one real compile plus five fast blocked-then-no-op waits
+//! instead of racing. Set `DARKMUX_E2E_BIN=<path>` to point at an
+//! already-built binary and skip the build step entirely (e.g. a CI
+//! job that built the release binary in an earlier step).
+//!
 //! ## Out of scope (v1)
 //!
 //! - Auth-protected Redis (open instance on loopback; production uses
@@ -48,8 +67,12 @@ const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const REDIS_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build `target/release/darkmux` once per `cargo test` invocation.
-/// Subsequent calls are no-ops. Used by `FleetHarness::boot` so tests
-/// don't have to remember to do this manually.
+/// Subsequent calls in THIS process are no-ops (per-process `OnceLock`
+/// memoization); the actual build is additionally serialized ACROSS
+/// the six e2e test binaries via a cross-process `flock(2)`; see the
+/// module doc's "Build-once across the six e2e test BINARIES" section.
+/// Used by `FleetHarness::boot` so tests don't have to remember to do
+/// this manually.
 fn build_darkmux_release() -> Result<(), String> {
     static BUILD_RESULT: OnceLock<Mutex<Option<Result<(), String>>>> = OnceLock::new();
     let cell = BUILD_RESULT.get_or_init(|| Mutex::new(None));
@@ -57,21 +80,93 @@ fn build_darkmux_release() -> Result<(), String> {
     if let Some(r) = guard.as_ref() {
         return r.clone();
     }
+    let result = build_darkmux_release_uncached();
+    *guard = Some(result.clone());
+    result
+}
+
+/// The actual build step behind `build_darkmux_release`'s per-process
+/// memoization. A `DARKMUX_E2E_BIN` override skips building entirely
+/// (the caller, typically CI, has already produced a binary);
+/// otherwise the build runs under a cross-process lock on POSIX so the
+/// six sibling e2e binaries don't race `cargo build --release` against
+/// each other.
+fn build_darkmux_release_uncached() -> Result<(), String> {
+    if std::env::var_os("DARKMUX_E2E_BIN").is_some() {
+        return Ok(()); // caller-provided binary; nothing to build.
+    }
+    #[cfg(unix)]
+    {
+        run_release_build_locked()
+    }
+    #[cfg(not(unix))]
+    {
+        run_cargo_build_release()
+    }
+}
+
+/// POSIX-only: acquire an exclusive `flock(2)` on a lock file under
+/// `target/` before running the build, so the six e2e binaries
+/// (each its own process; see module doc) serialize into at most one
+/// real compile instead of contending on cargo's own target-dir lock.
+/// Same `FlockGuard` shape as `darkmux-lab`'s registry lock
+/// (`crates/darkmux-lab/src/lab/registry.rs`) and `darkmux-flow`'s
+/// audit sink (`crates/darkmux-flow/src/integrity.rs`).
+#[cfg(unix)]
+fn run_release_build_locked() -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let lock_path = PathBuf::from(manifest).join("target/.e2e-release-build.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("opening e2e build lock {}: {e}", lock_path.display()))?;
+
+    let fd = lock_file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "flock(LOCK_EX) failed on e2e build lock {}: {}",
+            lock_path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    struct FlockGuard(std::os::unix::io::RawFd);
+    impl Drop for FlockGuard {
+        fn drop(&mut self) {
+            unsafe { libc::flock(self.0, libc::LOCK_UN) };
+        }
+    }
+    let _guard = FlockGuard(fd);
+
+    // Under the lock: whichever binary gets here first pays the real
+    // compile; the other five block on flock, then run a fast no-op
+    // `cargo build` (fingerprint check only) instead of racing a full
+    // build against each other.
+    run_cargo_build_release()
+}
+
+fn run_cargo_build_release() -> Result<(), String> {
     let out = Command::new("cargo")
         .args(["build", "--release", "--bin", "darkmux"])
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .output();
-    let result = match out {
+    match out {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(format!(
             "cargo build --release failed: exit={:?}",
             o.status.code()
         )),
         Err(e) => Err(format!("cargo build --release spawn failed: {e}")),
-    };
-    *guard = Some(result.clone());
-    result
+    }
 }
 
 /// One node in the test fleet. Wraps the spawned `darkmux serve`
@@ -206,6 +301,9 @@ impl Drop for FleetHarness {
 }
 
 fn darkmux_release_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("DARKMUX_E2E_BIN") {
+        return PathBuf::from(path);
+    }
     let manifest = env!("CARGO_MANIFEST_DIR");
     PathBuf::from(manifest).join("target/release/darkmux")
 }
