@@ -2,6 +2,14 @@
 //!
 //! Installs skills + (optional) SessionStart hook + (optional) CLAUDE.md
 //! merge so Claude Code knows about darkmux without further configuration.
+//!
+//! Safe to re-run; refreshes the bundled skills after a darkmux upgrade. The
+//! skill-install step passes `refresh_darkmux: true` (#1426), so a re-run
+//! overwrites the installed `darkmux-*` skills with this binary's embedded
+//! copies — never touching the operator's own non-darkmux skills. This is what
+//! the doctor freshness check's fix_hint (`run darkmux init to refresh`) relies
+//! on. The profile registry and config file keep their never-overwrite
+//! discipline; only the darkmux-owned skills refresh.
 
 use crate::skills;
 use anyhow::{Context, Result, anyhow};
@@ -83,11 +91,15 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     report.config_path = Some(config_path);
     report.config_created = config_created;
 
-    // 3) Skills install
+    // 3) Skills install. `refresh_darkmux: true` (#1426) makes a re-run after a
+    //    binary upgrade refresh the installed darkmux-* skills (idempotent
+    //    refresh); the installer only ever writes darkmux-* names, so the
+    //    operator's own skills are never touched.
     let skills_report = skills::install_skills(&skills::InstallOptions {
         target: None,
         force: opts.force,
         dry_run: opts.dry_run,
+        refresh_darkmux: true,
     })?;
     report.skills_targets = skills_report.targets;
     report.skills_installed = skills_report.installed;
