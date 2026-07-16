@@ -3,9 +3,10 @@
 //! Deterministic Rust function: parse a workload spec, compute predicted
 //! token consumption across the planned turn count, pick the smallest
 //! adequate profile, emit structured JSON. Optional `--narrate` flag
-//! POSTs the computed report to the already-loaded 4B compactor
-//! (`darkmux:qwen3-4b-instruct-2507`) for an operator-facing one-sentence
-//! recommendation wrap.
+//! POSTs the computed report to the machine's registered utility model
+//! (falling back to the `darkmux:qwen3-4b-instruct-2507` compactor when
+//! none is configured, see `resolve_narrate_model_id`, #1413) for an
+//! operator-facing one-sentence recommendation wrap.
 //!
 //! # Design (from estimator audition, 2026-05-13)
 //!
@@ -80,10 +81,42 @@ pub(crate) fn build_review_record(
     }
 }
 
-/// Namespaced 4B compactor — same model used for compaction, now extended
-/// as the small-task specialist for narrative wraps. See fixture-06's
+/// Namespaced 4B compactor, same model used for compaction, extended as
+/// the small-task specialist for narrative wraps. See fixture-06's
 /// concurrent probe for the operational justification.
+///
+/// (#1413) This is now the LAST-RESORT fallback only. `narrate_via_4b`
+/// prefers the machine's own registered utility-model binding
+/// (`internal.utility`, #590, the same binding `resolve_utility_model_internal`
+/// in `darkmux-crew::dispatch_internal` resolves for the compactor overlay)
+/// and only falls back to this literal when no binding is configured or the
+/// registry can't be loaded.
 const NARRATE_MODEL_ID: &str = "darkmux:qwen3-4b-instruct-2507";
+
+/// Bounded wait for the narrate completion call. This is a raw one-shot
+/// curl POST, not a crew dispatch through `DispatchOpts::timeout_seconds`,
+/// so there is no natural existing timeout source to share. 120s is a
+/// generous fixed ceiling for a call this small (`max_tokens: 200`), so a
+/// hung or unresponsive LMStudio degrades to the deterministic output
+/// instead of hanging `phase estimate --narrate` indefinitely (#1413).
+const NARRATE_TIMEOUT_SECONDS: u64 = 120;
+
+/// Resolve the model id `narrate_via_4b` dispatches to: the machine's
+/// registered utility model (`internal.utility`, #590) when one is
+/// configured, else the hardcoded [`NARRATE_MODEL_ID`] fallback.
+/// Best-effort, mirroring the loud-but-soft posture of
+/// `resolve_utility_model_internal` in `darkmux-crew::dispatch_internal`
+/// (that function is crate-private; the root crate already depends on
+/// `darkmux_profiles` directly, so this calls the same public
+/// `load_registry` + `utility_model_id` path rather than duplicating a
+/// private helper across a crate boundary). A missing or unloadable
+/// registry is not an error, just an absent overlay (#1413).
+fn resolve_narrate_model_id() -> String {
+    crate::profiles::load_registry(None)
+        .ok()
+        .and_then(|l| l.registry.utility_model_id().map(str::to_string))
+        .unwrap_or_else(|| NARRATE_MODEL_ID.to_string())
+}
 
 /// Safe budget fraction — recommend a larger profile when max cumulative
 /// input exceeds this fraction of the profile's primary context window.
@@ -390,13 +423,44 @@ fn lmstudio_chat_url() -> String {
     format!("{}/v1/chat/completions", darkmux_types::config_access::lmstudio_url())
 }
 
-/// Call the 4B compactor at LMStudio for the operator-facing narrative
-/// wrap. Returns the parsed JSON object from the model's response, or an
-/// error if the call/parse fails.
+/// Build the curl argv `narrate_via_4b` invokes. Pulled out as a pure
+/// function (rather than inlined into the `Command::new("curl")` call) so
+/// a test can assert the argv shape, in particular that `-m
+/// NARRATE_TIMEOUT_SECONDS` is present, without shelling out to a real
+/// `curl` (#1413).
+fn narrate_curl_args(url: &str, payload_str: &str) -> Vec<String> {
+    vec![
+        "-s".to_string(),
+        "--fail".to_string(),
+        "-m".to_string(),
+        NARRATE_TIMEOUT_SECONDS.to_string(),
+        url.to_string(),
+        "-H".to_string(),
+        "Content-Type: application/json".to_string(),
+        "-d".to_string(),
+        payload_str.to_string(),
+    ]
+}
+
+/// Call the machine's utility model at LMStudio for the operator-facing
+/// narrative wrap. Returns the parsed JSON object from the model's
+/// response, or an error if the call/parse fails.
+///
+/// (#1413) This call used to emit NO flow records at all (invisible to
+/// every liveness surface) and had no timeout on the curl argv. It now
+/// bookend-guards a `dispatch start`/`dispatch complete`/`dispatch error`
+/// pair (the same vocabulary `crew dispatch` uses, contract 2 in
+/// CLAUDE.md) so the call is liveness-visible and every exit path
+/// (success, a `curl`/parse failure, or a panic) fires a matching
+/// terminal record; the curl argv now carries `-m NARRATE_TIMEOUT_SECONDS`
+/// so a hung server can't hang this call indefinitely. The caller
+/// (`run_estimate`) still treats any `Err` here as non-fatal: the
+/// deterministic estimate output ships regardless.
 fn narrate_via_4b(output_so_far: &EstimateOutput) -> Result<Value> {
+    let model_id = resolve_narrate_model_id();
     let report_str = serde_json::to_string_pretty(output_so_far)?;
     let payload = serde_json::json!({
-        "model": NARRATE_MODEL_ID,
+        "model": model_id,
         "messages": [
             {
                 "role": "system",
@@ -411,39 +475,117 @@ fn narrate_via_4b(output_so_far: &EstimateOutput) -> Result<Value> {
         "max_tokens": 200
     });
     let payload_str = serde_json::to_string(&payload)?;
-
     let url = lmstudio_chat_url();
-    let output = Command::new("curl")
-        .args([
-            "-s",
-            "--fail",
-            &url,
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            &payload_str,
-        ])
-        .output()
-        .context("running curl to LMStudio")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "curl to LMStudio failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+
+    let session_id = format!(
+        "phase-estimate-narrate-{}",
+        std::time::UNIX_EPOCH
+            .elapsed()
+            .unwrap_or_default()
+            .as_micros()
+    );
+
+    let mut sink = |r: crate::flow::FlowRecord| {
+        let _ = crate::flow::record(r);
+    };
+    let model_for_abort = model_id.clone();
+    let session_id_for_abort = session_id.clone();
+    let on_abort = move |_id: &str, _kind: &str| {
+        crate::crew::dispatch::build_dispatch_record_with_payload(
+            crate::flow::Level::Error,
+            "dispatch error",
+            "phase-estimate-narrate",
+            &session_id_for_abort,
+            Some(&model_for_abort),
+            None,
+            None,
+            Some(serde_json::json!({
+                "runtime": "narrate",
+                "result_class": "error",
+                "error": "narrate call terminated before completion (early return or panic)",
+            })),
+        )
+    };
+    let mut bookend = crate::flow::BookendGuard::new(&mut sink, on_abort);
+    bookend.open(
+        "narrate",
+        "narrate",
+        crate::crew::dispatch::build_dispatch_record_with_payload(
+            crate::flow::Level::Info,
+            "dispatch start",
+            "phase-estimate-narrate",
+            &session_id,
+            Some(&model_id),
+            None,
+            None,
+            Some(serde_json::json!({ "runtime": "narrate" })),
+        ),
+    );
+
+    // Inner closure so every fallible step below shares one terminal-record
+    // close, regardless of which step fails. Mirrors the cleanup-closure
+    // pattern already used for the hosted-dispatch curl config file.
+    let call = || -> Result<Value> {
+        let output = Command::new("curl")
+            .args(narrate_curl_args(&url, &payload_str))
+            .output()
+            .context("running curl to LMStudio")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "curl to LMStudio failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let resp: Value = serde_json::from_slice(&output.stdout)
+            .context("parsing LMStudio response as JSON")?;
+        if let Some(err) = resp.get("error") {
+            anyhow::bail!("LMStudio returned an error: {err}");
+        }
+        let content = resp
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .context("LMStudio response missing /choices/0/message/content")?;
+        let narrative: Value =
+            serde_json::from_str(content).context("4B's narrative response is not valid JSON")?;
+        Ok(narrative)
+    };
+
+    let result = call();
+    match &result {
+        Ok(_) => bookend.close(
+            "narrate",
+            crate::crew::dispatch::build_dispatch_record_with_payload(
+                crate::flow::Level::Info,
+                "dispatch complete",
+                "phase-estimate-narrate",
+                &session_id,
+                Some(&model_id),
+                None,
+                None,
+                Some(serde_json::json!({ "runtime": "narrate", "result_class": "ok" })),
+            ),
+        ),
+        Err(e) => bookend.close(
+            "narrate",
+            crate::crew::dispatch::build_dispatch_record_with_payload(
+                crate::flow::Level::Error,
+                "dispatch error",
+                "phase-estimate-narrate",
+                &session_id,
+                Some(&model_id),
+                None,
+                None,
+                Some(serde_json::json!({
+                    "runtime": "narrate",
+                    "result_class": "error",
+                    "error": truncate(&format!("{e}"), 200),
+                })),
+            ),
+        ),
     }
 
-    let resp: Value =
-        serde_json::from_slice(&output.stdout).context("parsing LMStudio response as JSON")?;
-    if let Some(err) = resp.get("error") {
-        anyhow::bail!("LMStudio returned an error: {err}");
-    }
-    let content = resp
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .context("LMStudio response missing /choices/0/message/content")?;
-    let narrative: Value =
-        serde_json::from_str(content).context("4B's narrative response is not valid JSON")?;
-    Ok(narrative)
+    result
 }
 
 /// Core estimate logic — pure function over (spec, registry, narrate).
@@ -726,6 +868,29 @@ fn count_files_changed(path: &Path, base: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Builds the record fired by `phase_review_output_at`'s bookend guard on
+/// `Drop` when the guarded region exits without reaching one of its own
+/// named terminal emits (`verdict: clean`, `dispatch failed`, or
+/// `verdict: <verdict>`): a panic, or an early `?`-return from something
+/// like the `git diff` call that has no terminal record of its own today.
+/// Named separately so a test can drive the abort shape directly (#1413).
+fn phase_review_abort_record(
+    branch: &str,
+    session_id: &str,
+    phase_id: Option<&str>,
+) -> crate::flow::FlowRecord {
+    build_review_record(
+        crate::flow::Level::Error,
+        crate::flow::Category::Review,
+        crate::flow::Tier::Frontier,
+        crate::flow::Stage::Review,
+        "phase review aborted".to_string(),
+        branch.to_string(),
+        session_id,
+        phase_id,
+    )
+}
+
 /// Internal entry for `phase review` taking an explicit repo path.
 /// Core of `phase review`: run the reviewer dispatch against `path`'s diff
 /// vs `base` and return the structured [`PhaseReviewOutput`] (verdict +
@@ -760,17 +925,36 @@ pub(crate) fn phase_review_output_at(
             .as_secs()
     );
 
+    // (#1413) `phase review begin` / `verdict: ...` used to be plain paired
+    // writes: a panic (or an early `?`-return with no terminal of its
+    // own, e.g. the `git diff` call below) orphaned the begin record.
+    // Bookend-guard the pair so every exit path fires a matching terminal.
+    let mut sink = |r: crate::flow::FlowRecord| {
+        let _ = crate::flow::record(r);
+    };
+    let abort_branch = branch.clone();
+    let abort_session_id = session_id.clone();
+    let abort_phase_id = phase_id.map(String::from);
+    let on_abort = move |_id: &str, _kind: &str| {
+        phase_review_abort_record(&abort_branch, &abort_session_id, abort_phase_id.as_deref())
+    };
+    let mut bookend = crate::flow::BookendGuard::new(&mut sink, on_abort);
+
     // Emit review-start flow record.
-    let _ = crate::flow::record(build_review_record(
-        crate::flow::Level::Info,
-        crate::flow::Category::Review,
-        crate::flow::Tier::Frontier,
-        crate::flow::Stage::Review,
-        "phase review begin".to_string(),
-        branch.clone(),
-        &session_id,
-        phase_id,
-    ));
+    bookend.open(
+        "phase-review",
+        "phase-review",
+        build_review_record(
+            crate::flow::Level::Info,
+            crate::flow::Category::Review,
+            crate::flow::Tier::Frontier,
+            crate::flow::Stage::Review,
+            "phase review begin".to_string(),
+            branch.clone(),
+            &session_id,
+            phase_id,
+        ),
+    );
 
     // Run `git diff <base>` (working-tree-inclusive). NOT `<base>..HEAD` —
     // that would only see committed changes, missing the pre-PR review case
@@ -801,17 +985,21 @@ pub(crate) fn phase_review_output_at(
             findings: vec![],
             verdict: "clean".to_string(),
         };
-        // Emit verdict flow record.
-        let _ = crate::flow::record(build_review_record(
-            crate::flow::Level::Info,
-            crate::flow::Category::Review,
-            crate::flow::Tier::Frontier,
-            crate::flow::Stage::Review,
-            "verdict: clean".to_string(),
-            "0B / 0F / 0N".to_string(),
-            &session_id,
-            phase_id,
-        ));
+        // Emit verdict flow record. `close()` disarms the guard so this
+        // named terminal is the only record for this exit path.
+        bookend.close(
+            "phase-review",
+            build_review_record(
+                crate::flow::Level::Info,
+                crate::flow::Category::Review,
+                crate::flow::Tier::Frontier,
+                crate::flow::Stage::Review,
+                "verdict: clean".to_string(),
+                "0B / 0F / 0N".to_string(),
+                &session_id,
+                phase_id,
+            ),
+        );
         return Ok(output);
     }
 
@@ -887,8 +1075,9 @@ pub(crate) fn phase_review_output_at(
         model_base_url_override: None,
     };
 
-    // Emit dispatch flow record.
-    let _ = crate::flow::record(build_review_record(
+    // Emit dispatch flow record. This is a mid-point progress emit, not a
+    // terminal, so it goes through `emit_now` (the open unit stays armed).
+    bookend.emit_now(build_review_record(
         crate::flow::Level::Info,
         crate::flow::Category::Machinery,
         crate::flow::Tier::Local,
@@ -902,16 +1091,21 @@ pub(crate) fn phase_review_output_at(
     let dispatch_result = match crate::fleet::dispatch_routed(dispatch_opts) {
         Ok(r) => r,
         Err(e) => {
-            let _ = crate::flow::record(build_review_record(
-                crate::flow::Level::Error,
-                crate::flow::Category::Machinery,
-                crate::flow::Tier::Local,
-                crate::flow::Stage::Review,
-                "dispatch failed".to_string(),
-                truncate(&format!("{e}"), 200),
-                &session_id,
-                phase_id,
-            ));
+            // `close()` disarms the guard. This named terminal is the
+            // only record for the dispatch-failure exit path.
+            bookend.close(
+                "phase-review",
+                build_review_record(
+                    crate::flow::Level::Error,
+                    crate::flow::Category::Machinery,
+                    crate::flow::Tier::Local,
+                    crate::flow::Stage::Review,
+                    "dispatch failed".to_string(),
+                    truncate(&format!("{e}"), 200),
+                    &session_id,
+                    phase_id,
+                ),
+            );
             eprintln!("warning: crew dispatch failed ({e}); emitting empty review");
             return Err(anyhow::anyhow!("crew dispatch failed: {e}"));
         }
@@ -942,16 +1136,19 @@ pub(crate) fn phase_review_output_at(
     };
 
     // Emit verdict flow record.
-    let _ = crate::flow::record(build_review_record(
-        crate::flow::Level::Info,
-        crate::flow::Category::Review,
-        crate::flow::Tier::Frontier,
-        crate::flow::Stage::Review,
-        format!("verdict: {}", signoff.verdict.clone()),
-        format!("{}B / {}F / {}N", signoff.block, signoff.flag, signoff.nit),
-        &session_id,
-        phase_id,
-    ));
+    bookend.close(
+        "phase-review",
+        build_review_record(
+            crate::flow::Level::Info,
+            crate::flow::Category::Review,
+            crate::flow::Tier::Frontier,
+            crate::flow::Stage::Review,
+            format!("verdict: {}", signoff.verdict.clone()),
+            format!("{}B / {}F / {}N", signoff.block, signoff.flag, signoff.nit),
+            &session_id,
+            phase_id,
+        ),
+    );
 
     Ok(output)
 }
@@ -1772,5 +1969,135 @@ mod tests {
             })
             .filter(|l| !l.contains("\"_type\":\"schema\""))
             .collect()
+    }
+
+    // ---- #1413: liveness-guard regression tests ----
+
+    /// The narrate curl argv carries a `-m <NARRATE_TIMEOUT_SECONDS>`
+    /// timeout: a hung LMStudio must not be able to hang `phase estimate
+    /// --narrate` indefinitely. Pinning the whole shape (not just `-m`'s
+    /// presence) so a future edit can't silently drop `--fail` or the
+    /// payload while keeping the timeout flag.
+    #[test]
+    fn narrate_curl_args_carries_timeout_flag() {
+        let args = narrate_curl_args("http://localhost:1234/v1/chat/completions", "{}");
+        assert_eq!(
+            args,
+            vec![
+                "-s".to_string(),
+                "--fail".to_string(),
+                "-m".to_string(),
+                NARRATE_TIMEOUT_SECONDS.to_string(),
+                "http://localhost:1234/v1/chat/completions".to_string(),
+                "-H".to_string(),
+                "Content-Type: application/json".to_string(),
+                "-d".to_string(),
+                "{}".to_string(),
+            ]
+        );
+    }
+
+    /// `phase_review_output_at`'s begin/verdict pair used to be plain
+    /// paired writes (#1413): a panic between them orphaned the begin
+    /// record. Drives the same `BookendGuard` + `on_abort` shape the
+    /// production code wires up and confirms a panic mid-guarded-region
+    /// still fires the abort record on Drop (mirrors
+    /// `darkmux-flow::bookend`'s own `panic_while_armed_still_fires_the_abort_record`).
+    #[test]
+    fn phase_review_bookend_fires_abort_record_on_panic() {
+        let mut actions: Vec<String> = Vec::new();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut sink = |r: crate::flow::FlowRecord| actions.push(r.action);
+            let on_abort =
+                move |_id: &str, _kind: &str| phase_review_abort_record("main", "sess-1", Some("66"));
+            let mut guard = crate::flow::BookendGuard::new(&mut sink, on_abort);
+            guard.open(
+                "phase-review",
+                "phase-review",
+                build_review_record(
+                    crate::flow::Level::Info,
+                    crate::flow::Category::Review,
+                    crate::flow::Tier::Frontier,
+                    crate::flow::Stage::Review,
+                    "phase review begin".to_string(),
+                    "main".to_string(),
+                    "sess-1",
+                    Some("66"),
+                ),
+            );
+            panic!("simulated mid-review panic");
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err());
+        assert_eq!(actions, vec!["phase review begin", "phase review aborted"]);
+    }
+
+    /// `dispatch_compiler`'s `mission.compile.start`/`.error` pair used to
+    /// be plain paired writes (#1413): a panic between them orphaned the
+    /// start record. Drives the same guard shape mission_propose.rs wires
+    /// up and confirms a panic mid-guarded-region still fires the abort
+    /// record on Drop.
+    #[test]
+    fn mission_compile_bookend_fires_abort_record_on_panic() {
+        let mut actions: Vec<String> = Vec::new();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut sink = |r: crate::flow::FlowRecord| actions.push(r.action);
+            let on_abort =
+                move |_id: &str, _kind: &str| crate::mission_propose::mission_compile_abort_record("mission-compile-1");
+            let mut guard = crate::flow::BookendGuard::new(&mut sink, on_abort);
+            guard.open(
+                "mission.compile",
+                "mission.compile",
+                crate::crew::dispatch::build_dispatch_record_with_payload(
+                    crate::flow::Level::Info,
+                    "mission.compile.start",
+                    "mission-compiler",
+                    "mission-compile-1",
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            );
+            panic!("simulated mid-compile panic");
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err());
+        assert_eq!(
+            actions,
+            vec!["mission.compile.start", "mission.compile.error"]
+        );
+    }
+
+    /// Happy-path action-name pin: the empty-diff `phase review` path
+    /// still emits exactly `"phase review begin"` then `"verdict: clean"`.
+    /// The bookend-guard refactor (#1413) must not rename the vocabulary
+    /// downstream liveness/viewer consumers key on.
+    #[serial_test::serial]
+    #[test]
+    fn phase_review_happy_path_action_names_unchanged() {
+        let guard = FlowsDirGuard::new();
+
+        let repo = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo.path())
+            .output()
+            .ok();
+
+        crate::phase_cli::phase_review_at(repo.path(), None, false, Some("66")).unwrap();
+
+        let records = collect_records(guard.path());
+        assert_eq!(records.len(), 2, "expected begin + verdict records only");
+
+        let start: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
+        assert_eq!(start["action"], "phase review begin");
+
+        let verdict: serde_json::Value = serde_json::from_str(&records[1]).unwrap();
+        assert_eq!(verdict["action"], "verdict: clean");
     }
 }

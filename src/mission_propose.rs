@@ -172,6 +172,29 @@ fn read_input(from_stdin: bool, from_file: Option<&std::path::Path>) -> Result<S
     }
 }
 
+/// Builds the `mission.compile.error` record fired by
+/// `dispatch_compiler`'s bookend guard on `Drop` when the guarded region
+/// exits without reaching its own terminal emit (a panic, or a future
+/// early return added between `open` and `close`). Named separately so a
+/// test can drive the abort shape directly, without a real dispatch
+/// (#1413). `pub(crate)` so `phase_cli`'s test module can exercise the
+/// same guard shape mission_propose.rs wires up in production.
+pub(crate) fn mission_compile_abort_record(session_id: &str) -> crate::flow::FlowRecord {
+    crate::crew::dispatch::build_dispatch_record_with_payload(
+        crate::flow::Level::Error,
+        "mission.compile.error",
+        "mission-compiler",
+        session_id,
+        None,
+        None,
+        None,
+        Some(serde_json::json!({
+            "result_class": "error",
+            "error": "mission compile terminated before completion (early return or panic)",
+        })),
+    )
+}
+
 fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
     let message = build_compiler_message(input, hint);
 
@@ -186,20 +209,38 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
             .unwrap_or(0)
     );
     let input_chars = input.chars().count();
+
+    // (#1413) `mission.compile.start`/`.complete`/`.error` used to be plain
+    // paired writes: a panic between them (or a future early return added
+    // to this function) orphaned the start record. Bookend-guard the pair
+    // so every start gets a matching terminal on every exit path, same
+    // contract the INNER `dispatch_routed` call already honors for its own
+    // `dispatch.start`/`dispatch.complete`.
+    let mut sink = |r: crate::flow::FlowRecord| {
+        let _ = crate::flow::record(r);
+    };
+    let abort_session_id = synth_session_id.clone();
+    let on_abort = move |_id: &str, _kind: &str| mission_compile_abort_record(&abort_session_id);
+    let mut bookend = crate::flow::BookendGuard::new(&mut sink, on_abort);
+
     let compile_start_payload = serde_json::json!({
         "input_chars": input_chars,
         "has_hint": hint.is_some(),
     });
-    let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
-        crate::flow::Level::Info,
-        "mission.compile.start",
-        "mission-compiler",
-        &synth_session_id,
-        None,
-        None,
-        None,
-        Some(compile_start_payload),
-    ));
+    bookend.open(
+        "mission.compile",
+        "mission.compile",
+        crate::crew::dispatch::build_dispatch_record_with_payload(
+            crate::flow::Level::Info,
+            "mission.compile.start",
+            "mission-compiler",
+            &synth_session_id,
+            None,
+            None,
+            None,
+            Some(compile_start_payload),
+        ),
+    );
     let compile_start_instant = std::time::Instant::now();
 
     let opts = crate::crew::dispatch::DispatchOpts {
@@ -256,16 +297,22 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
     } else {
         ("mission.compile.error", crate::flow::Level::Error)
     };
-    let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
-        level,
-        action,
-        "mission-compiler",
-        &synth_session_id,
-        None,
-        None,
-        None,
-        Some(compile_complete_payload),
-    ));
+    // `close()` emits the terminal record and disarms the guard, so the
+    // `?`-propagation below (the pre-existing error path) never re-fires
+    // the Drop-time abort record on top of this one.
+    bookend.close(
+        "mission.compile",
+        crate::crew::dispatch::build_dispatch_record_with_payload(
+            level,
+            action,
+            "mission-compiler",
+            &synth_session_id,
+            None,
+            None,
+            None,
+            Some(compile_complete_payload),
+        ),
+    );
 
     let result = dispatch_result.context("dispatch to mission-compiler failed")?;
     Ok(result.stdout)
