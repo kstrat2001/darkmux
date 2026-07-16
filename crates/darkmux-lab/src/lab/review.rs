@@ -4607,6 +4607,14 @@ impl StepKind for ReviewSynthesisStepKind {
         // `ReviewEnvelope::degenerate`'s own doc comment promises ("never a
         // silent pass") — confirmed as a real, live regression via the
         // review-bench migration's degenerate-fixture test.
+        // (#1418) This step runs INSIDE `run_step_graph`, before
+        // `run_review_graph`'s post-run merge populates `env.members` from
+        // the probe accumulators (still empty here, see that merge's own
+        // doc), so synthesis can catch THAT draws were zero
+        // (`deduped_flags == 0`) but not WHY. `run_review_graph` replaces
+        // this generic reason with a more specific "no seat matched any
+        // bundle" one, once `env.members` is accurate, when that's the
+        // actual cause; see the doc there.
         if env.degenerate.is_none() {
             if env.bundles == 0 {
                 env.degenerate = Some("no bundles produced from the diff".to_string());
@@ -4809,7 +4817,14 @@ pub fn build_review_graph(
         expansions,
     };
 
-    let (tasks, steps) = interpret(&loaded.config, &params).with_context(|| {
+    // (#1418) `interpret_warnings` currently covers exactly one case: an
+    // `expand.over` key absent from `expansions` above (e.g. a user-tier
+    // `review.json` typo'ing the probe-seat expansion's collection name),
+    // threaded into `shared_env.warnings` below so a launch that silently
+    // expanded to zero probe tasks is named in the posted review, not just
+    // caught by the (separate) zero-draws honesty gate in
+    // `run_review_graph`'s post-run merge.
+    let (tasks, steps, interpret_warnings) = interpret(&loaded.config, &params).with_context(|| {
         format!(
             "interpreting mission config \"review\" (resolved from the {} tier at {})",
             loaded.source,
@@ -4834,6 +4849,7 @@ pub fn build_review_graph(
     let shared_env: SharedReviewEnvelope = Arc::new(StdMutex::new(ReviewEnvelope {
         case_id: ctx.case_id.clone(),
         bundles: ctx.bundles.len(),
+        warnings: interpret_warnings,
         ..Default::default()
     }));
 
@@ -5126,6 +5142,34 @@ pub fn run_review_graph(
         env.members = shared.members.clone();
         env.warnings = shared.warnings.clone();
         env.remote_budgets = shared.remote_budgets.clone();
+        drop(shared);
+
+        // (#1418) `ReviewSynthesisStepKind::run` already catches a
+        // `deduped_flags == 0` run via its own "zero flags from all probe
+        // draws" gate, but synthesis runs INSIDE `run_step_graph`, before
+        // `env.members` is merged in (just above), so it can't tell WHY
+        // draws were zero. Now that `env.members` is accurate, name the
+        // SPECIFIC "no seat matched any bundle" cause when that's what
+        // actually happened (a selector/config problem, distinct from a
+        // probe that genuinely dispatched and came back with nothing),
+        // replacing synthesis's generic reason with a more actionable one.
+        // Two routes land here: every probe seat's selector matching zero
+        // of the diff's bundles, and a silently-zero-expanded probe
+        // template (`mission_config::interpret`'s absent-`expand.over`-key
+        // case, which also surfaces its own `env.warnings` entry). Either
+        // way, `env.bundles > 0` (the diff produced real bundles) but not
+        // one seat ever placed a call: a review that examined nothing
+        // must never read as Clean.
+        let total_draws: u32 = env.members.iter().map(|m| m.draws).sum();
+        if env.bundles > 0 && total_draws == 0 {
+            env.degenerate = Some(
+                "no probe seat matched any bundle: zero draws across every staffed seat \
+                 (check each seat's selector against the diff's bundles, and that the \
+                 crew's probe expansion actually staffed a seat); a review that examined \
+                 nothing is never a clean pass"
+                    .to_string(),
+            );
+        }
         env
     } else {
         let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();

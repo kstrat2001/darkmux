@@ -255,8 +255,15 @@ pub fn launch(
         .context("persisting config-snapshot.json")?;
 
     let params = build_launch_params(config, &real_phase_ids, &collected);
-    let (tasks, mut steps) =
+    let (tasks, mut steps, interpret_warnings) =
         mission_config::interpret(config, &params).context("interpreting mission config graph")?;
+    // (#1418) An absent `expand.over` key (typo'd collection name in a
+    // user-tier config override, most likely) used to expand silently to
+    // zero real copies; now named here so the operator sees it instead of
+    // a mission that mints with fewer tasks than the config implies.
+    for w in &interpret_warnings {
+        eprintln!("{}", style::dim(&format!("mission launch: {w}")));
+    }
 
     for task in &tasks {
         if let Err(e) = crew::lifecycle::save_task(&mission_id, task) {

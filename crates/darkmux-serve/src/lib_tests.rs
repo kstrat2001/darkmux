@@ -3916,7 +3916,7 @@
             step_config_overrides: std::collections::BTreeMap::new(),
             expansions,
         };
-        let (tasks, steps) = darkmux_crew::mission_config::interpret(&loaded.config, &params)
+        let (tasks, steps, _warnings) = darkmux_crew::mission_config::interpret(&loaded.config, &params)
             .expect("interpret succeeds against the embedded review config");
 
         let mission_id = "review-shape-mission";
