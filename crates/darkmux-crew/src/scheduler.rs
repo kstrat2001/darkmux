@@ -491,6 +491,22 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// The complete, canonical step-lifecycle `FlowRecord.action` vocabulary
+/// (#1399 — contract 2 territory, "dispatch/lifecycle liveness must be
+/// uniform across producers"). `run_step_graph` is ONE producer; the graph
+/// lens's SSE matcher (`crates/darkmux-serve/assets/mission-graph.html`'s
+/// `STATUS_ACTIONS`) is the consumer every producer must stay aligned
+/// with. ANY execution path that runs a `Task`/`Step` graph — the generic
+/// scheduler here, or a Tier-3 driver with its own runner (e.g.
+/// `darkmux-lab`'s review pipeline) — emits ONLY these three strings for
+/// step transitions, never a competing vocabulary, so the graph lens
+/// animates identically regardless of which driver produced the run.
+/// Referenced directly by this module's own conformance test AND by
+/// `darkmux-lab::lab::review`'s cross-path conformance test, so the two
+/// test suites assert against the SAME source of truth and cannot drift
+/// apart silently.
+pub const STEP_LIFECYCLE_ACTIONS: [&str; 3] = ["step start", "step complete", "step error"];
+
 /// One `FlowRecord` for a step-lifecycle transition (`"step start"` /
 /// `"step complete"` / `"step error"`). Mirrors `lifecycle.rs`'s
 /// `emit_phase_transition_record` shape (`Category::Work`,
@@ -1004,6 +1020,16 @@ mod tests {
         let actions: Vec<&str> = emitted.iter().map(|r| r.action.as_str()).collect();
         assert!(actions.contains(&"step start"));
         assert!(actions.contains(&"step complete"));
+        // (#1399) Every emitted step-lifecycle action must be drawn from
+        // the canonical vocabulary — the SAME constant `darkmux-lab`'s
+        // review-path conformance test asserts against, so the two
+        // producers cannot drift onto competing vocabularies.
+        for action in &actions {
+            assert!(
+                STEP_LIFECYCLE_ACTIONS.contains(action),
+                "scheduler emitted an action outside the canonical step-lifecycle vocabulary: {action}"
+            );
+        }
     }
 
     /// (#1397) The scheduler persists each step's OWN post-flip state at

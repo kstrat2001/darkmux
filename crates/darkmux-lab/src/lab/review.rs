@@ -5095,6 +5095,7 @@ mod tests {
     // `NodeStatus` is used only by this test module as of #1284 Packet 3
     // (`build_review_graph` stopped constructing `Step` literals directly
     // once it became a thin `mission_config::interpret` launcher).
+    use darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS;
     use darkmux_crew::types::NodeStatus;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -7671,6 +7672,29 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // every step (free observability — see the module doc).
         let starts = emitter.records.iter().filter(|r| r.action == "step start").count();
         assert_eq!(starts, steps.len(), "every declared step got a lifecycle start record");
+        // (#1399) The terminal bookend (complete OR error) fired for every
+        // step too — zero step start/complete records was the exact bug
+        // #1399 found live: the review path's own `step result` records
+        // are a SUPPLEMENT to this vocabulary, never a replacement for it.
+        let terminals = emitter
+            .records
+            .iter()
+            .filter(|r| r.action == "step complete" || r.action == "step error")
+            .count();
+        assert_eq!(terminals, steps.len(), "every declared step got a terminal lifecycle record");
+        // (#1399) Every step-lifecycle action this path emits is drawn from
+        // the SAME canonical vocabulary constant the crew scheduler's own
+        // conformance test asserts against — the two execution paths
+        // (generic scheduler, review's Tier-3 driver) cannot silently grow
+        // a competing vocabulary.
+        for record in emitter.records.iter().filter(|r| r.action.starts_with("step ")) {
+            assert!(
+                STEP_LIFECYCLE_ACTIONS.contains(&record.action.as_str()) || record.action == "step result",
+                "review path emitted a step-scoped action outside the canonical lifecycle \
+                 vocabulary or the documented `step result` companion: {}",
+                record.action
+            );
+        }
         // (#1349) `run_review_graph` itself must emit NO task-level bookend
         // at all — that liveness edge belongs entirely to the caller's
         // `with_dispatch_bookends` wrap (`src/pr_review.rs`), which brackets
