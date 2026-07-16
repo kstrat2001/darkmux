@@ -116,7 +116,7 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
     };
 
     // Compose the entry path: <date>-<slug>.md
-    let date = chrono_like_today();
+    let date = darkmux_flow::day_utc_now();
     let slug = opts.slug.clone().unwrap_or_else(|| {
         slugify(&format!(
             "{}-{}",
@@ -405,40 +405,6 @@ fn machine_fingerprint() -> String {
     }
 }
 
-fn chrono_like_today() -> String {
-    use std::time::Duration;
-    // Avoid pulling in chrono just for this; format YYYY-MM-DD from the
-    // system clock using SystemTime.
-    let now = SystemTime::now();
-    let secs = now
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs() as i64;
-    let (y, m, d) = epoch_secs_to_ymd(secs);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-/// Convert unix epoch seconds to (year, month, day) in UTC. Civil calendar
-/// algorithm from Howard Hinnant ("date-time"), public-domain.
-fn epoch_secs_to_ymd(secs: i64) -> (i32, u32, u32) {
-    let days = secs.div_euclid(86_400);
-    let z = days + 719_468;
-    let era = if z >= 0 {
-        z / 146_097
-    } else {
-        (z - 146_096) / 146_097
-    };
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i32 + era as i32 * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
 /// A single notebook entry parsed from file-header metadata.
 pub struct NotebookEntry {
     pub date: String,
@@ -562,27 +528,6 @@ mod tests {
     fn shortid_truncates_to_12() {
         assert_eq!(shortid("abcdefghijklmnopqrstuvwxyz"), "abcdefghijkl");
         assert_eq!(shortid("short"), "short");
-    }
-
-    #[test]
-    fn epoch_to_ymd_known_dates() {
-        // Unix epoch start
-        assert_eq!(epoch_secs_to_ymd(0), (1970, 1, 1));
-        // 2000-02-29 leap day
-        assert_eq!(epoch_secs_to_ymd(951_782_400), (2000, 2, 29));
-        // 2024-02-29 leap day
-        assert_eq!(epoch_secs_to_ymd(1_709_164_800), (2024, 2, 29));
-        // 2024-03-01 (non-leap day after leap)
-        assert_eq!(epoch_secs_to_ymd(1_709_251_200), (2024, 3, 1));
-        // Round-trip a fresh epoch — value should be in current decade
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let (y, m, d) = epoch_secs_to_ymd(now);
-        assert!((2024..=2030).contains(&y), "year {y} not in expected range");
-        assert!((1..=12).contains(&m));
-        assert!((1..=31).contains(&d));
     }
 
     #[test]

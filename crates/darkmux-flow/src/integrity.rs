@@ -50,39 +50,19 @@ pub(crate) fn audit_seed_hash(header_line: &str) -> String {
 /// file with no chain seed visible.
 #[cfg(unix)]
 pub(crate) fn audit_record_at(record: &FlowRecord, path: &Path) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating audit dir {}", parent.display()))?;
-    }
+    darkmux_types::flock::with_locked_file(path, |file| {
+        audit_record_at_locked(record, path, file)
+    })
+}
 
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .with_context(|| format!("opening audit log {}", path.display()))?;
-
-    // Acquire exclusive cross-process lock; auto-released on file drop.
-    let fd = file.as_raw_fd();
-    let lock_ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
-    if lock_ret != 0 {
-        return Err(anyhow::anyhow!(
-            "flock(LOCK_EX) failed on audit log {}: errno {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    // RAII guard so the lock is released even if the function bails.
-    struct FlockGuard(std::os::unix::io::RawFd);
-    impl Drop for FlockGuard {
-        fn drop(&mut self) {
-            unsafe { libc::flock(self.0, libc::LOCK_UN) };
-        }
-    }
-    let _guard = FlockGuard(fd);
-
+/// The locked transaction body of [`audit_record_at`] — reads the chain's
+/// current tail hash from `file` (the SAME file `flock`'s held on, opened
+/// by the shared `darkmux_types::flock::with_locked_file` helper) and
+/// appends the new record. Split out so the lock acquisition (now shared
+/// with `darkmux-lab`'s registry lock and `darkmux-fleet`'s roster lock)
+/// stays separate from this crate's own read/parse/append logic.
+#[cfg(unix)]
+fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::File) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write as _};
     let mut contents = String::new();
     file.seek(SeekFrom::Start(0))

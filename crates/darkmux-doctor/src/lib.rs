@@ -2322,7 +2322,7 @@ fn check_ram_headroom() -> Check {
         .map(|models| {
             models
                 .iter()
-                .filter_map(|m| eureka::parse_size_gb(&m.size))
+                .filter_map(|m| darkmux_types::size::parse_size_gb(&m.size))
                 .sum::<f64>()
         })
         .unwrap_or(0.0);

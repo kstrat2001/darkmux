@@ -102,17 +102,6 @@ pub(crate) fn emit_step_result(
     ));
 }
 
-/// Resolve the base directory holding per-phase worktrees:
-/// `~/.darkmux/worktrees` (HOME-less fallback `/tmp/darkmux/worktrees`).
-/// Outside the main working tree by design — git refuses a worktree nested
-/// inside another, and a stable, discoverable location lets `mission ship`
-/// recompute the path without recording it in mission state.
-fn worktrees_base() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".darkmux").join("worktrees"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/worktrees"))
-}
-
 /// The MAIN working tree of the current repository, resolved identically
 /// whether invoked from the main checkout or from inside a linked worktree.
 ///
@@ -257,13 +246,19 @@ fn pr_merge_state(dir: &Path, pr_url: &str) -> MergeState {
 }
 
 /// Deterministic worktree path for a phase: `<base>/<repo-name>/<phase-id>`.
-/// Recomputable by `mission ship` from the same (repo, phase) inputs.
+/// Recomputable by `mission ship` from the same (repo, phase) inputs. The
+/// base (`darkmux_types::workdir::worktrees_base_dir`) is outside the main
+/// working tree by design — git refuses a worktree nested inside another,
+/// and a stable, discoverable location lets `mission ship` recompute the
+/// path without recording it in mission state.
 fn worktree_path(repo_root: &Path, phase_id: &str) -> PathBuf {
     let repo_name = repo_root
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
-    worktrees_base().join(repo_name).join(phase_id)
+    darkmux_types::workdir::worktrees_base_dir()
+        .join(repo_name)
+        .join(phase_id)
 }
 
 /// Branch name for a phase's worktree. The phase id is already charset-

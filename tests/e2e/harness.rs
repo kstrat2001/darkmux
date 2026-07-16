@@ -109,48 +109,22 @@ fn build_darkmux_release_uncached() -> Result<(), String> {
 /// `target/` before running the build, so the six e2e binaries
 /// (each its own process; see module doc) serialize into at most one
 /// real compile instead of contending on cargo's own target-dir lock.
-/// Same `FlockGuard` shape as `darkmux-lab`'s registry lock
-/// (`crates/darkmux-lab/src/lab/registry.rs`) and `darkmux-flow`'s
-/// audit sink (`crates/darkmux-flow/src/integrity.rs`).
+/// Uses the shared `FlockGuard` (`darkmux_types::flock`) — the same type
+/// `darkmux-lab`'s registry lock (`crates/darkmux-lab/src/lab/registry.rs`)
+/// and `darkmux-flow`'s audit sink (`crates/darkmux-flow/src/integrity.rs`)
+/// use, rather than a fifth hand-rolled copy.
 #[cfg(unix)]
 fn run_release_build_locked() -> Result<(), String> {
-    use std::os::unix::io::AsRawFd;
-
     let manifest = env!("CARGO_MANIFEST_DIR");
     let lock_path = PathBuf::from(manifest).join("target/.e2e-release-build.lock");
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
-    }
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| format!("opening e2e build lock {}: {e}", lock_path.display()))?;
-
-    let fd = lock_file.as_raw_fd();
-    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-        return Err(format!(
-            "flock(LOCK_EX) failed on e2e build lock {}: {}",
-            lock_path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    struct FlockGuard(std::os::unix::io::RawFd);
-    impl Drop for FlockGuard {
-        fn drop(&mut self) {
-            unsafe { libc::flock(self.0, libc::LOCK_UN) };
-        }
-    }
-    let _guard = FlockGuard(fd);
-
-    // Under the lock: whichever binary gets here first pays the real
-    // compile; the other five block on flock, then run a fast no-op
-    // `cargo build` (fingerprint check only) instead of racing a full
-    // build against each other.
-    run_cargo_build_release()
+    darkmux_types::flock::with_locked_file(&lock_path, |_file| {
+        // Under the lock: whichever binary gets here first pays the real
+        // compile; the other five block on flock, then run a fast no-op
+        // `cargo build` (fingerprint check only) instead of racing a full
+        // build against each other.
+        run_cargo_build_release().map_err(anyhow::Error::msg)
+    })
+    .map_err(|e| e.to_string())
 }
 
 fn run_cargo_build_release() -> Result<(), String> {
