@@ -3070,6 +3070,43 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         );
     }
 
+    /// (#1418 route a) Every staffed probe seat's `selector` matches zero
+    /// of the diff's bundles (e.g. a language-scoped crew reviewing a
+    /// docs-only diff): `select_bundles_for_staffing` comes back empty for
+    /// every seat, so zero draws happen anywhere in the run. Before #1418,
+    /// this read as an authoritative Clean "no findings" review having
+    /// examined nothing; the fix names it degenerate with a reason
+    /// distinguishing the selector-starvation cause from generic
+    /// zero-flags degeneracy.
+    #[test]
+    fn graph_degenerate_zero_draws_when_no_seat_matches_any_bundle() {
+        let crew = crew_with(vec![
+            (
+                "review-probe",
+                vec![ResolvedSeatStaffing {
+                    name: "fast".to_string(),
+                    pm: graph_pm("probe-model"),
+                    k: 2,
+                    passes: 2,
+                    max_tokens: None,
+                    selector: Some(BundleSelector {
+                        fact_families: vec!["nonexistent-family".to_string()],
+                        max_bundles: None,
+                        ..Default::default()
+                    }),
+                }],
+            ),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), |_call: &ChatCall| Ok(reply("unused")));
+        let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
+        assert!(env.bundles > 0, "the diff DID produce bundles; this isn't the zero-bundle gate");
+        assert!(env.members.is_empty(), "no seat ever placed a call");
+        assert_eq!(env.confirmed, 0);
+        let note = env.degenerate.expect("zero draws across every seat must never read as Clean");
+        assert!(note.contains("no probe seat matched any bundle"), "{note}");
+    }
+
     // ── remote seats: routing + provenance (#1260/#1177/#1355) ─────────
 
     /// Was `remote_seats_skip_cycler_route_endpoint_and_stamp_host_only_

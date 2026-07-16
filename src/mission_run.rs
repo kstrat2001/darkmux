@@ -537,13 +537,21 @@ fn default_phase_graph(
         expansions: std::collections::BTreeMap::new(),
     };
 
-    interpret(&loaded.config, &params).with_context(|| {
+    // (#1418) `coder-phase.json` declares no `expand` tasks today, so
+    // `warnings` is always empty here; printed anyway (never silently
+    // dropped) in case a future edit to the built-in or a user-tier
+    // override adds one.
+    let (tasks, steps, warnings) = interpret(&loaded.config, &params).with_context(|| {
         format!(
             "interpreting mission config \"coder-phase\" (resolved from the {} tier at {})",
             loaded.source,
             loaded.manifest_path.display()
         )
-    })
+    })?;
+    for w in &warnings {
+        eprintln!("{}", style::dim(&format!("mission run: {w}")));
+    }
+    Ok((tasks, steps))
 }
 
 /// Wraps the worktree-creation half of the old hand-written sequence

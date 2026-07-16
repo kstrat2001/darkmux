@@ -88,18 +88,36 @@ pub struct LaunchParams {
     /// missing from this map interprets as an EMPTY expansion (zero real
     /// copies) — the same "reduced coverage, not a hard error" posture a
     /// zero-seat crew already takes elsewhere in the review pipeline.
+    ///
+    /// (#1418) That leniency is for a genuinely EMPTY collection under a
+    /// KEY THE LAUNCHER DOES SUPPLY (e.g. a zero-seat crew still inserts
+    /// `"probe_seats" -> []`). A key ABSENT from this map entirely
+    /// (nothing under that name at all) is a different, likelier-a-typo
+    /// shape: [`interpret`] treats both as zero real copies (leniency is
+    /// unchanged), but names the absent case in its returned warnings so
+    /// the launcher can surface it instead of the run silently examining
+    /// nothing.
     pub expansions: BTreeMap<String, Vec<String>>,
 }
 
-/// See the module doc. Returns the real `Vec<Task>` (document order,
+/// What [`interpret`] returns: the real `Vec<Task>` (document order,
 /// expanded tasks appearing in place of their template) + `BTreeMap<String,
 /// Step>` a `StepKindRegistry`-equipped caller hands to
-/// `scheduler::run_step_graph`.
-pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<Task>, BTreeMap<String, Step>)> {
+/// `scheduler::run_step_graph`, + (#1418) any non-fatal warnings worth the
+/// caller printing, currently just the absent-`expand.over`-key case (see
+/// [`LaunchParams::expansions`]'s doc). Warnings are empty on a normal
+/// interpretation; `interpret` has no printing/logging channel of its own,
+/// so returning them is the smallest honest mechanism for a caller to
+/// surface them.
+pub type InterpretedGraph = (Vec<Task>, BTreeMap<String, Step>, Vec<String>);
+
+/// See the module doc and [`InterpretedGraph`].
+pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<InterpretedGraph> {
     check_params_reference_the_document(config, params)?;
 
     let mut tasks: Vec<Task> = Vec::new();
     let mut steps: BTreeMap<String, Step> = BTreeMap::new();
+    let mut warnings: Vec<String> = Vec::new();
     // Document-level TaskConfig.id -> the real Task id(s) it produced (len
     // 1 for a non-expanding task, len N for an expanding one). Drives BOTH
     // the depends_on rewrite pass below AND is how a dependent task's
@@ -133,7 +151,31 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<T
                             task_cfg.id
                         )
                     })?;
-                    let items = params.expansions.get(&spec.over).cloned().unwrap_or_default();
+                    // (#1418) Absent vs empty: a key genuinely present with
+                    // an empty Vec (a zero-seat crew, e.g.) stays silent;
+                    // that leniency is deliberate and pinned by
+                    // `zero_items_in_the_expansion_collection_produces_zero_
+                    // real_copies_and_an_empty_dependency` below. A key with
+                    // NO entry at all in `params.expansions` is a likelier
+                    // config typo (the launcher meant to supply a collection
+                    // under this exact name and didn't): same lenient
+                    // zero-copy behavior, but named in `warnings` so the
+                    // caller can print it instead of the run silently
+                    // examining nothing.
+                    let items = match params.expansions.get(&spec.over) {
+                        Some(items) => items.clone(),
+                        None => {
+                            warnings.push(format!(
+                                "task `{}` declares `expand.over: \"{}\"`, which has no \
+                                 matching entry in the launcher's supplied expansions; \
+                                 treated as zero real copies (leniency preserved), but an \
+                                 absent key usually means a typo; a genuinely empty \
+                                 collection is supplied as an explicit empty list",
+                                task_cfg.id, spec.over
+                            ));
+                            Vec::new()
+                        }
+                    };
                     let mut real_ids = Vec::with_capacity(items.len());
                     for (index, name) in items.iter().enumerate() {
                         let real_task_id = render(&spec.task_id_pattern, index, name);
@@ -241,7 +283,7 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<T
         }
     }
 
-    Ok((tasks, steps))
+    Ok((tasks, steps, warnings))
 }
 
 /// (#1284 review round 2, consider 4) Every launcher-supplied key must
@@ -489,7 +531,7 @@ mod tests {
         phase_ids.insert("investigate".to_string(), "pr-review-123-investigate".to_string());
         let params = LaunchParams { phase_ids, ..Default::default() };
 
-        let (tasks, steps) = interpret(&cfg, &params).unwrap();
+        let (tasks, steps, _warnings) = interpret(&cfg, &params).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "review-bundle-task", "fixed ids stay verbatim");
         assert_eq!(tasks[0].phase_id, "pr-review-123-investigate", "Task.phase_id is still the REAL phase id");
@@ -508,7 +550,7 @@ mod tests {
         phase_ids.insert("build".to_string(), "s1".to_string());
         let params = LaunchParams { phase_ids, ..Default::default() };
 
-        let (tasks, steps) = interpret(&cfg, &params).unwrap();
+        let (tasks, steps, _warnings) = interpret(&cfg, &params).unwrap();
         assert_eq!(tasks[0].id, "s1-coder");
         assert_eq!(tasks[0].phase_id, "s1");
         assert!(steps.contains_key("s1-coder-step"));
@@ -535,7 +577,7 @@ mod tests {
         );
         let params = LaunchParams { phase_ids, task_overrides, ..Default::default() };
 
-        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        let (tasks, _steps, _warnings) = interpret(&cfg, &params).unwrap();
         assert_eq!(tasks[0].role_id.as_deref(), Some("reviewer-bot"));
         assert_eq!(tasks[0].workdir, Some(PathBuf::from("/tmp/wt")));
         assert_eq!(tasks[0].image.as_deref(), Some("rust:slim"));
@@ -553,7 +595,7 @@ mod tests {
         phase_ids.insert("build".to_string(), "s1".to_string());
         let params = LaunchParams { phase_ids, ..Default::default() };
 
-        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        let (tasks, _steps, _warnings) = interpret(&cfg, &params).unwrap();
         let verify = tasks.iter().find(|t| t.id == "s1-verify").unwrap();
         assert_eq!(verify.role_id.as_deref(), Some("code-reviewer"));
     }
@@ -569,7 +611,7 @@ mod tests {
         phase_ids.insert("build".to_string(), "s1".to_string());
         let params = LaunchParams { phase_ids, ..Default::default() };
 
-        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        let (tasks, _steps, _warnings) = interpret(&cfg, &params).unwrap();
         assert_eq!(tasks[0].display_name.as_deref(), Some("Build"));
     }
 
@@ -583,7 +625,7 @@ mod tests {
         phase_ids.insert("build".to_string(), "s1".to_string());
         let params = LaunchParams { phase_ids, ..Default::default() };
 
-        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        let (tasks, _steps, _warnings) = interpret(&cfg, &params).unwrap();
         assert_eq!(tasks[0].display_name, None, "no display_name in the doc -> None, renderers fall back to id");
     }
 
@@ -601,7 +643,7 @@ mod tests {
         );
         let params = LaunchParams { phase_ids, task_overrides, ..Default::default() };
 
-        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        let (tasks, _steps, _warnings) = interpret(&cfg, &params).unwrap();
         assert_eq!(tasks[0].display_name.as_deref(), Some("Ship it"));
     }
 
@@ -620,7 +662,7 @@ mod tests {
         step_config_overrides.insert("review-judge-step".to_string(), serde_json::json!({"concurrency": 5}));
         let params = LaunchParams { step_config_overrides, ..Default::default() };
 
-        let (_tasks, steps) = interpret(&cfg, &params).unwrap();
+        let (_tasks, steps, _warnings) = interpret(&cfg, &params).unwrap();
         assert_eq!(steps["review-judge-step"].config, serde_json::json!({"concurrency": 5}));
     }
 
@@ -637,7 +679,7 @@ mod tests {
         )]);
         let params = LaunchParams::default();
 
-        let (_tasks, steps) = interpret(&cfg, &params).unwrap();
+        let (_tasks, steps, _warnings) = interpret(&cfg, &params).unwrap();
         assert_eq!(steps["review-judge-step"].config, serde_json::json!({"concurrency": 1}));
     }
 
@@ -683,7 +725,7 @@ mod tests {
         expansions.insert("probe_seats".to_string(), vec!["alpha".to_string(), "bravo".to_string()]);
         let params = LaunchParams { phase_ids, expansions, ..Default::default() };
 
-        let (tasks, steps) = interpret(&cfg, &params).unwrap();
+        let (tasks, steps, _warnings) = interpret(&cfg, &params).unwrap();
 
         // bundle + 2 expanded probes + dedup = 4 real tasks.
         assert_eq!(tasks.len(), 4);
@@ -742,13 +784,92 @@ mod tests {
                 ),
             ],
         )]);
-        // NO "probe_seats" entry in expansions at all -- zero staffed seats.
+        // NO "probe_seats" entry in expansions at all -- an ABSENT key,
+        // which (#1418) is exactly the case `interpret` now also names in
+        // its returned `warnings` (see the sibling test right below). The
+        // ZERO-COPY behavior pinned here is unchanged, only the silence is
+        // gone.
         let params = LaunchParams::default();
 
-        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        let (tasks, _steps, _warnings) = interpret(&cfg, &params).unwrap();
         let by_id: BTreeMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         assert!(!by_id.contains_key("review-probe-0-task"), "zero seats -> zero expanded copies");
         assert!(by_id["review-dedup-task"].depends_on.is_empty(), "an empty expansion resolves to an empty dependency, not a dangling reference");
+    }
+
+    /// (#1418) The sibling of the pinned test above: an ABSENT
+    /// `expand.over` key (nothing under that name in `params.expansions`
+    /// at all) surfaces a warning naming the task and the missing key,
+    /// while keeping the SAME lenient zero-real-copies behavior. Leniency
+    /// stays, silence goes.
+    #[test]
+    fn absent_expand_over_key_surfaces_a_warning_but_stays_lenient() {
+        let cfg = doc(vec![phase(
+            "investigate",
+            vec![TaskConfig {
+                id: "review-probe-template-task".to_string(),
+                description: None,
+                display_name: None,
+                depends_on: vec![],
+                role_id: None,
+                steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
+                expand: Some(ExpansionSpec {
+                    over: "probe_seats".to_string(),
+                    task_id_pattern: "review-probe-{index}-task".to_string(),
+                    step_id_pattern: "review-probe-{index}-step".to_string(),
+                    kind_pattern: "{kind}:{name}".to_string(),
+                    description_pattern: None,
+                    display_name_pattern: None,
+                    extras: Map::new(),
+                }),
+                extras: Map::new(),
+            }],
+        )]);
+        // NO "probe_seats" entry at all -- the ABSENT-key path.
+        let params = LaunchParams::default();
+
+        let (tasks, _steps, warnings) = interpret(&cfg, &params).unwrap();
+        assert!(tasks.is_empty(), "an absent key still produces zero real copies (leniency preserved)");
+        assert_eq!(warnings.len(), 1, "the absent key names exactly one warning: {warnings:?}");
+        assert!(warnings[0].contains("review-probe-template-task"), "{}", warnings[0]);
+        assert!(warnings[0].contains("probe_seats"), "{}", warnings[0]);
+    }
+
+    /// (#1418) The other half of the distinction: a key that IS present,
+    /// mapped to a genuinely empty `Vec` (e.g. a real zero-seat crew),
+    /// produces the SAME zero-real-copies result but NO warning. The
+    /// leniency for a truly empty collection stays silent, only an absent
+    /// key is named.
+    #[test]
+    fn present_but_empty_expansion_key_stays_silent() {
+        let cfg = doc(vec![phase(
+            "investigate",
+            vec![TaskConfig {
+                id: "review-probe-template-task".to_string(),
+                description: None,
+                display_name: None,
+                depends_on: vec![],
+                role_id: None,
+                steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
+                expand: Some(ExpansionSpec {
+                    over: "probe_seats".to_string(),
+                    task_id_pattern: "review-probe-{index}-task".to_string(),
+                    step_id_pattern: "review-probe-{index}-step".to_string(),
+                    kind_pattern: "{kind}:{name}".to_string(),
+                    description_pattern: None,
+                    display_name_pattern: None,
+                    extras: Map::new(),
+                }),
+                extras: Map::new(),
+            }],
+        )]);
+        let mut expansions = Map::new();
+        expansions.insert("probe_seats".to_string(), Vec::new());
+        let params = LaunchParams { expansions, ..Default::default() };
+
+        let (tasks, _steps, warnings) = interpret(&cfg, &params).unwrap();
+        assert!(tasks.is_empty(), "a present-but-empty key still produces zero real copies");
+        assert!(warnings.is_empty(), "a genuinely empty collection under a present key stays silent: {warnings:?}");
     }
 
     #[test]
@@ -773,7 +894,7 @@ mod tests {
                 ],
             ),
         ]);
-        let (tasks, _steps) = interpret(&cfg, &LaunchParams::default()).unwrap();
+        let (tasks, _steps, _warnings) = interpret(&cfg, &LaunchParams::default()).unwrap();
         let by_id: BTreeMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         assert_eq!(
             by_id["review-synthesis-task"].depends_on,
@@ -797,7 +918,7 @@ mod tests {
             "p1",
             vec![task("t1", &[], None, vec![step("s1", "dispatch.internal", serde_json::Value::Null)])],
         )]);
-        let (_tasks, steps) = interpret(&cfg, &LaunchParams::default()).unwrap();
+        let (_tasks, steps, _warnings) = interpret(&cfg, &LaunchParams::default()).unwrap();
         let s = &steps["s1"];
         assert_eq!(s.status, NodeStatus::Planned);
         assert!(s.started_ts.is_none());
