@@ -133,12 +133,22 @@ pub const MIN_REDUCTION_RATIO: f32 = 0.20;
 /// delimiter's first byte. The text reads identically to a human; the
 /// literal token no longer matches a fence / marker / tool-call scan.
 ///
-/// Idempotent: after one pass each delimiter carries the ZWSP and no longer
-/// matches, so a second pass is a no-op. UTF-8 safe: every delimiter starts
-/// with an ASCII byte, so the `[..1]` split is always on a char boundary,
-/// and `str::replace` preserves the (possibly multibyte) surrounding text.
-/// Handles unclosed / malformed / out-of-order tags — each open marker is
-/// neutralized independently, no balanced-tag assumption.
+/// Idempotent: sanitized output contains no live delimiter, so a second
+/// pass is a no-op. UTF-8 safe: every delimiter starts with an ASCII byte,
+/// so the `[..1]` split is always on a char boundary, and `str::replace`
+/// preserves the (possibly multibyte) surrounding text. Handles unclosed /
+/// malformed / out-of-order tags — each open marker is neutralized
+/// independently, no balanced-tag assumption.
+///
+/// Each delimiter is replaced in a LOOP until no live occurrence remains.
+/// A single non-overlapping `str::replace` is not enough for the
+/// self-overlapping ``` case: in a 4-backtick run the first 3 are replaced,
+/// and the leftover 4th backtick joins the neutralized text's trailing 2 to
+/// reform a LIVE contiguous ``` — exactly the repeated-token degenerate
+/// output class #1389 targets. The loop terminates: each pass inserts a
+/// ZWSP into every remaining occurrence, strictly shortening the longest
+/// live run; the non-self-overlapping markers clear in one pass and the
+/// loop is harmless for them.
 pub fn sanitize_compactor_summary(summary: &str) -> String {
     let mut out = summary.to_string();
     for delim in SUMMARY_STRUCTURAL_DELIMITERS {
@@ -150,7 +160,9 @@ pub fn sanitize_compactor_summary(summary: &str) -> String {
         neutralized.push_str(&delim[..1]);
         neutralized.push(NEUTRALIZE_ZWSP);
         neutralized.push_str(&delim[1..]);
-        out = out.replace(delim, &neutralized);
+        while out.contains(delim) {
+            out = out.replace(delim, &neutralized);
+        }
     }
     out
 }
@@ -623,9 +635,13 @@ pub fn compact(
             .next()
             .and_then(|c| c.message.content)
             .ok_or_else(|| anyhow!("compactor model returned no content"))?;
-        // (#1389 mechanism 1) Neutralize any structural delimiter the summary
-        // echoed BEFORE the floor check + install, so a delimiter-heavy
-        // degenerate output can't sneak past the floor on raw length either.
+        // (#1389 mechanism 1) Sanitize BEFORE the floor check so the floor
+        // measures the exact text that would be installed, and so no code
+        // path can splice unsanitized text into the rebuilt context. Note
+        // the ordering is NOT a floor-strictness play: sanitizing ADDS ZWSP
+        // chars (which `trim` keeps), marginally inflating the char count
+        // TOWARD passing the floor — an accepted, negligible bias (a summary
+        // within a few ZWSPs of the floor is degenerate either way).
         let cleaned = sanitize_compactor_summary(&raw);
         if is_degenerate_summary(&cleaned) {
             if attempt < MAX_NARRATIVE_ATTEMPTS {
@@ -3225,6 +3241,26 @@ mod tests {
         let once = sanitize_compactor_summary(s);
         let twice = sanitize_compactor_summary(&once);
         assert_eq!(once, twice, "second pass must be a no-op");
+
+        // Self-overlapping runs of 4+ backticks: a single non-overlapping
+        // replace leaves a LIVE contiguous ``` reassembled from the leftover
+        // backtick plus the neutralized text's trailing pair (gate-proven on
+        // the 4-run). The replacement loop must fully neutralize any run
+        // length AND stay idempotent.
+        for run in ["````", "``````", "text ```` mid `````` end"] {
+            let cleaned = sanitize_compactor_summary(run);
+            assert!(
+                !cleaned.contains("```"),
+                "sanitized output of {run:?} must contain NO live ``` substring; got {cleaned:?}"
+            );
+            assert_eq!(
+                sanitize_compactor_summary(&cleaned),
+                cleaned,
+                "re-sanitizing the output of {run:?} must be a no-op"
+            );
+            // Nothing is deleted — stripping the ZWSPs recovers the input.
+            assert_eq!(cleaned.replace(ZWSP, ""), run);
+        }
     }
 
     #[test]
