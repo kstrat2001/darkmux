@@ -98,6 +98,7 @@ use darkmux_profiles::crews::{resolve_crew, ResolvedCrew};
 use darkmux_profiles::profiles::load_registry;
 use darkmux_profiles::swap;
 use darkmux_types::dispatch_liveness::{liveness, liveness_case, liveness_detail};
+use darkmux_types::style;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -914,7 +915,19 @@ fn run_dispatch(
                             step.status,
                             &mut started_phases,
                         );
-                        let _ = crew::lifecycle::save_step(&mission_id_for_persist, phase_id, step);
+                        // (F2, gate remediation) Warn, never silently
+                        // swallow — same dim-warning parity as
+                        // `mission_launch.rs`/`mission_run.rs`'s persist
+                        // closures: a disk-full mid-review would otherwise
+                        // freeze the graph page with zero operator signal.
+                        if let Err(e) = crew::lifecycle::save_step(&mission_id_for_persist, phase_id, step) {
+                            eprintln!(
+                                "{}",
+                                style::dim(&format!(
+                                    "mission launch review: step persist warning (transition): {e:#}"
+                                ))
+                            );
+                        }
                     },
                 )
                 .map(|(env, steps)| {
@@ -923,7 +936,17 @@ fn run_dispatch(
                             .get(step_id)
                             .map(String::as_str)
                             .unwrap_or(&report_phase_id_for_closure);
-                        let _ = crew::lifecycle::save_step(&mission_id_for_steps, phase_id, step);
+                        // (F2) Same dim-warning parity as the transition
+                        // persist above and `mission_launch.rs`'s own
+                        // post-run reconcile loop.
+                        if let Err(e) = crew::lifecycle::save_step(&mission_id_for_steps, phase_id, step) {
+                            eprintln!(
+                                "{}",
+                                style::dim(&format!(
+                                    "mission launch review: step persist warning: {e:#}"
+                                ))
+                            );
+                        }
                     }
                     env
                 })
