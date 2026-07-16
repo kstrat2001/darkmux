@@ -7,8 +7,24 @@
 <meta name="darkmux-missions-src" content="./demo-missions.json">
 <meta name="darkmux-phases-src" content="./demo-phases.json">
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>darkmux · observability viewer</title>
+<!-- (#1403) Standalone-app shell. The operator runs the viewer as a chromeless
+     home-screen shortcut on mobile, so these make the shortcut behave like an
+     app: manifest (display:standalone), apple-mobile-web-app metas, a
+     same-origin app icon, and a theme color matching the dark chrome. Every
+     asset is served same-origin by the daemon (routes in src/lib.rs) — the
+     strict inline-only CSP forbids any external fetch. On the static demo
+     (GitHub Pages) these paths 404 harmlessly; the demo is not a standalone
+     app. -->
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="darkmux">
+<meta name="theme-color" content="#0a0a0b">
 <!--
   The canonical darkmux observability viewer. ONE file, served three ways:
 
@@ -2198,7 +2214,9 @@ function renderCrumb(){
   // (#827) Light the active lens. The missions lens covers the index + a
   // mission detail; the lab lens (#1247 Part 3) covers the run list + a run
   // detail; everything else is the fleet lens.
-  const inMissions = state.level==="missions"||state.level==="mission";
+  // (#1403) The missions lens is now just the index — the mission detail is the
+  // graph page (a separate document), no longer an in-viewer `mission` level.
+  const inMissions = state.level==="missions";
   const inLab = state.level==="lab"||state.level==="lab-run";
   // (#1286) The machine memory lens — live probes (kernel counters + lms
   // metadata via /machine/memory), a third source class distinct from run
@@ -2228,11 +2246,9 @@ function renderCrumb(){
     if(state.level==="lab-run") lc+=`<span class="sep">›</span>${esc(state.labRunDir||"—")}`;
     $("crumb").innerHTML=lc; return;
   }
-  // Missions-lens crumb: index → mission detail.
+  // Missions-lens crumb: the index (mission detail lives on the graph page — #1403).
   if(inMissions){
-    let mc=`<a data-act="missions">missions</a>`;
-    if(state.level==="mission") mc+=`<span class="sep">›</span>◆ ${esc(state.missionId||primaryMission()||"—")}`;
-    $("crumb").innerHTML=mc; return;
+    $("crumb").innerHTML=`<a data-act="missions">missions</a>`; return;
   }
   const pm=primaryMission();
   const hasMission=pm!=null;
@@ -2269,7 +2285,7 @@ function render(){
     renderMachineMem();
     return;
   }
-  if(state.level==="missions")renderMissionsIndex(); else if(state.level==="mission")renderMission(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
+  if(state.level==="missions")renderMissionsIndex(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
   syncTransport();
@@ -2283,10 +2299,17 @@ window.toggleRecentAll=()=>{state.recentAll=!state.recentAll;render();};
 window.setActivityWindow=min=>{state.activityWindowMin=min;render();};
 window.drillSession=s=>{state.level="subsystem";state.session=s;state.follow=true;render();};
 window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;state.follow=true;render();};
-window.goMission=()=>{ if(!missions.length)return goFleet(); state.level="mission";state.machine=null;state.session=null;state.missionId=primaryMission();state.follow=true;render();};
-// (#827 Slice A) The missions lens: index (all missions) + drill to one mission.
+// (#1403) The mission view IS the graph page now — clicking a mission (from the
+// index, the headline, or the crumb) navigates straight to /mission/<id>/graph,
+// one hop. The old flat drill-down (renderMission/renderMissionFromFlow) retired
+// with this change; the graph page absorbs the header/status/meters and degrades
+// to phases-only for pre-registry missions. Full-page nav (not an in-page level)
+// because the graph page is a separate document with its own React Flow shell.
+window.goMissionGraph=id=>{ if(!id)return goMissions(); location.href="/mission/"+encodeURIComponent(id)+"/graph"; };
+window.goMission=()=>{ const id=primaryMission(); if(!id)return goFleet(); goMissionGraph(id); };
+// (#827 Slice A) The missions lens: the index of all missions. Clicking a row
+// leaves for that mission's graph page (#1403).
 window.goMissions=()=>{ state.level="missions";state.machine=null;state.session=null;state.missionId=null;state.follow=true;render();};
-window.drillMission=id=>{ state.level="mission";state.machine=null;state.session=null;state.missionId=id;state.follow=true;render();};
 // (#827 Slice A) Fetch the durable mission + phase structure. Best-effort:
 // any failure leaves the caches empty and the index falls back to flow-derived
 // mission_ids. Async, awaited once at boot (Slice A doesn't live-poll it).
@@ -2417,96 +2440,12 @@ function cycleStage(mid, phaseId){
 // per-phase status + cycle, instead of "0 dispatches" when its runs are
 // outside the loaded window. Falls back to the old flow-dispatch grouping for
 // missions with no durable phases (demo / ad-hoc dispatches).
-function renderMission(){
-  const mid=state.missionId||primaryMission()||"—";
-  state.stageScope=r=>r.mission_id===mid; $("logscope").textContent="mission";
-  const mObj=MISSIONS.find(m=>m&&m.id===mid)||null;
-  const mstat=mObj?(mObj.status||"active"):null;
-  const phases=PHASES.filter(s=>s&&s.mission_id===mid)
-    .sort((a,b)=>(a.created_ts||0)-(b.created_ts||0)||String(a.id).localeCompare(b.id));
+// (#1403) renderMission + renderMissionFromFlow (the flat in-viewer mission
+// drill-down) retired here — the mission view is the graph page now
+// (/mission/<id>/graph), reached in one hop from the missions index. The
+// graph page carries the header/status/meters and degrades to phases-only for
+// pre-registry missions, so nothing the drill-down showed is lost.
 
-  if(!phases.length) return renderMissionFromFlow(mid, mstat);
-
-  const done=phases.filter(s=>s.status==="complete").length;
-  const total=phases.length, pct=total?Math.round(done/total*100):0;
-  const pill=(on,label)=>`<span class="cyc ${on?'on':''}">${label}</span>`;
-  const rows=phases.map(s=>{
-    const cyc=cycleStage(mid, s.id);
-    const sid=runSid(mid, s.id);
-    const hasRun=DATA.some(r=>r.session_id===sid&&T(r.ts)<=state.t);
-    // Run summary from the window when present; else point at history.
-    let runInfo;
-    if(hasRun){
-      const st=dispatch(sid,"start");
-      const mach=st?nameOf(uidOf(st)):"";
-      const toks=DATA.filter(r=>r.session_id===sid&&r.category==="telemetry"&&r.source==="tokens"&&T(r.ts)<=state.t)
-                     .reduce((a,r)=>a+((r.payload&&r.payload.total_tokens)||0),0);
-      runInfo=`<a class="splink" data-act="session" data-arg="${esc(sid)}">open run →</a>`
-        +`<span class="spa">${mach?esc(mach):''}${toks?' · '+fmtC(toks)+' tok':''}</span>`;
-    } else {
-      runInfo=`<span class="spe">${cyc?'':'runs in history — open that day in playback'}</span>`;
-    }
-    // Cycle strip: lit by mission.run.* when present, else implied by the
-    // durable phase status (complete ⇒ the whole cycle ran).
-    const impliedComplete=s.status==="complete";
-    const c=cyc||{};
-    // "blocked" is a CURRENT-state signal — suppress it once the phase
-    // shipped/completed, so a once-blocked-then-done phase doesn't show all
-    // stages lit AND a red blocked tag (QA: contradictory dual signal).
-    const showBlocked=c.blocked&&!c.ship&&!c.merged&&!impliedComplete;
-    const strip=c.aborted
-      ? `<span class="cyc abort">aborted</span>`
-      : pill(c.run||impliedComplete,"run")+pill(c.gate||impliedComplete,"qa")
-        +pill(c.gate||impliedComplete,"gate")+pill(c.ship||c.merged||impliedComplete,"ship")
-        +(showBlocked?`<span class="cyc block">blocked</span>`:'');
-    // (#1398) display_name -> id, never description (description is
-    // deliberately long — for coder-phase it's the coder's dispatch brief
-    // verbatim; showing it here would crowd the row). title carries the
-    // full description as a hover tooltip when present.
-    return `<div class="sprow" title="${esc(s.description||'')}"><span class="sps ${clsSafe(s.status)}">${esc(s.status)}</span>`
-      +`<span class="spt">${esc(s.display_name||s.id)}</span>`
-      +`<span class="cycstrip">${strip}</span>`
-      +`<span class="sprun">${runInfo}</span></div>`;
-  }).join("");
-
-  const closedWarn = mstat==="closed" && phases.some(s=>s.status!=="complete"&&s.status!=="abandoned")
-    ? `<div class="burnlbl"><span class="wallerr">⚠ mission Closed but a phase isn't terminal — see <code>darkmux mission status</code></span></div>` : '';
-  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)} ${missionBadge(mstat)} <a class="splink" href="${"/mission/"+encodeURIComponent(mid)+"/graph"}" target="_blank" rel="noopener">graph →</a></h2>
-    <div class="mgoal">${total} phase${total===1?'':'s'} · ${done} complete</div>
-    <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} phases complete · ${pct}%</div>${closedWarn}</div>
-    <div class="track"><div class="lbl">phases · run › qa › gate › ship</div>${rows}</div></div>`;
-}
-// Legacy flow-derived view — kept for missions with no durable phase plan
-// (the static demo's flow-only "demo" mission, ad-hoc dispatches).
-function renderMissionFromFlow(mid, mstat){
-  const starts={};
-  DATA.filter(r=>r.mission_id===mid&&typeof r.action==="string"&&r.action.indexOf("dispatch")===0&&r.action.indexOf("start")>-1)
-      .forEach(r=>{ if(r.session_id&&!starts[r.session_id])starts[r.session_id]=r; });
-  const sessions=Object.keys(starts).map(sid=>{
-    const st=starts[sid], cp=dispatchEnd(sid), close=sessionCloseEdge(sid);
-    const started=T(st.ts)<=state.t, ended=close&&T(close.ts)<=state.t;
-    // (#857) "in flight" routes through the shared sessionRunning() (live=presence,
-    // playback=close-edge), so an orphaned dispatch no longer inflates the
-    // "+N in flight" count. A live session that aged out of presence with no
-    // close-edge reads "abandoned" — never a phantom "active" or "complete".
-    let status;
-    if(!started) status="backlog";
-    else if(sessionRunning(sid)) status="active";
-    else if(ended) status=dispatchErrored(cp)?"errored":"complete";
-    else status="abandoned";
-    return {sid,role:(st.handle||"").replace(/^darkmux\//,""), machine:nameOf(uidOf(st)),
-            model:st.model||"?", status, ts:T(st.ts)};
-  }).sort((a,b)=>a.ts-b.ts);
-  const total=sessions.length, done=sessions.filter(s=>s.status==="complete").length, active=sessions.filter(s=>s.status==="active").length;
-  const errored=sessions.filter(s=>s.status==="errored").length;
-  const pct=total?Math.round(done/total*100):0;
-  const machs=[...new Set(sessions.map(s=>s.machine))];
-  const rows=sessions.map(s=>`<div class="sprow" data-act="session" data-arg="${esc(s.sid)}"><span class="sps ${s.status}">${s.status}</span><span class="spt">${esc(s.role)} · ${esc(s.machine)}</span><span class="spa">${esc(s.model)}</span></div>`).join("")||`<div class="none">no dispatches at this point in the timeline</div>`;
-  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)} ${missionBadge(mstat)} <a class="splink" href="${"/mission/"+encodeURIComponent(mid)+"/graph"}" target="_blank" rel="noopener">graph →</a></h2>
-    <div class="mgoal">${total} dispatch${total===1?'':'es'} across ${machs.length} machine${machs.length===1?'':'s'}${machs.length?' · '+esc(machs.join(', ')):''}</div>
-    <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} dispatches complete · ${pct}%${active?' · '+active+' in flight':''}${errored?` · <span class="wallerr">${errored} errored</span>`:''}</div></div>
-    <div class="track"><div class="lbl">dispatches</div>${rows}</div></div>`;
-}
 // Re-engage auto-tracking AND snap the playhead to the live tail. Used by the
 // follow-latest toggle and play-from-end so "follow latest" actually jumps to
 // latest; render()'s follow branch then selects the newest visible record.
@@ -2592,7 +2531,7 @@ const ACTIONS={
   rec:a=>selectRec(Number(a)),
   fleet:()=>goFleet(),
   missions:()=>goMissions(),
-  missiondrill:a=>drillMission(a),
+  missiondrill:a=>goMissionGraph(a),
   mission:()=>goMission(),
   recentall:()=>toggleRecentAll(),
   actwin:a=>setActivityWindow(Number(a)),
@@ -2607,7 +2546,7 @@ const ACTIONS={
   catalog:()=>toggleCatalog(),
   goday:d=>{ location.href="/play/"+encodeURIComponent(d); },
   golive:()=>{ location.href="/"; },
-  gomission:id=>{ location.href="/?mission="+encodeURIComponent(id); },
+  gomission:id=>{ location.href="/mission/"+encodeURIComponent(id)+"/graph"; },
   gosession:id=>{ location.href="/?session="+encodeURIComponent(id); },
   // (#1247 Part 3) The lab observer lens.
   lab:()=>goLab(),
@@ -3364,8 +3303,11 @@ async function boot(){
   state.t=tMax;
   state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),act:new Set(FACTS),q:""};
   absorbNewFilterValues();
-  // (#691) A mission query scopes the view to that mission (reuses the drill).
-  if(cq&&cq.kind==="mission"&&RAW.length){ state.level="mission"; state.machine=null; state.session=null; state.missionId=cq.id; state.follow=true; }
+  // (#1403) A ?mission= deep link now lands on that mission's graph page — the
+  // mission view IS the graph page. Only redirect in a live/playback context
+  // (RAW.length guards against the empty static demo, where there's no daemon
+  // to serve /mission/<id>/graph).
+  if(cq&&cq.kind==="mission"&&RAW.length){ location.href="/mission/"+encodeURIComponent(cq.id)+"/graph"; return; }
   render();
   if(mode==="live"){ startLiveTail(date); startLivePoll(); }
   // (#1247 deep-link) Boot straight into the lab lens AFTER the normal
