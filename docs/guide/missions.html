@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Missions, phases, and crew dispatch: darkmux user guide</title>
+<title>Missions, phases, and dispatch: darkmux user guide</title>
 <meta name="description" content="Structured agentic work in darkmux: dispatch local-AI roles, track multi-step plans as missions and phases, drive QA via phase review.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -27,7 +27,7 @@
 <header class="page-head">
   <div class="wrap">
     <div class="label">04 <span class="dot">·</span> advanced</div>
-    <h1>Missions, phases, and crew dispatch</h1>
+    <h1>Missions, phases, and dispatch</h1>
     <p class="lede">The advanced agentic surface. Use darkmux's <em>crew</em> abstraction to dispatch local-AI roles (coder, code-reviewer, scribe), track multi-step work as <em>missions</em> made of <em>phases</em>, and run structured QA via <code>phase review</code>. Optional: everything in earlier sections works without these concepts.</p>
   </div>
 </header>
@@ -63,7 +63,7 @@
 darkmux role show coder          <span class="comment"># full details for one role</span></code></pre>
 
     <h3>Dispatch a role</h3>
-    <pre><code>darkmux crew dispatch coder --message "Add tests for the new helper in src/foo.rs"</code></pre>
+    <pre><code>darkmux dispatch coder "Add tests for the new helper in src/foo.rs"</code></pre>
     <p>What happens (default runtime, internal):</p>
     <ol>
       <li>darkmux loads the role manifest + the <code>.md</code> system prompt.</li>
@@ -132,7 +132,7 @@ next: <code>darkmux mission launch draft-blog-post</code> to begin (or pass <cod
       <tr><th>Pattern</th><th>Shape</th><th>When</th></tr>
       <tr>
         <td>Skip</td>
-        <td>No mission. Just <code>darkmux crew dispatch coder --message "..."</code> ad-hoc.</td>
+        <td>No mission. Just <code>darkmux dispatch coder "..."</code> ad-hoc.</td>
         <td>Single-shot work, no follow-up expected. The dispatch record itself is the only artifact you need.</td>
       </tr>
       <tr>
@@ -166,7 +166,7 @@ next: <code>darkmux mission launch draft-blog-post</code> to begin (or pass <cod
     }
   ]
 }</code></pre>
-    <p>A phase with no <code>tasks</code> array (as both phases above) is a valid, common shape: a <strong>freeform/manual phase</strong> whose work happens by hand, or via ad-hoc <code>darkmux crew dispatch</code> calls, rather than an automated Task/Step graph. Phase order is the list position; there's no separate dependency field to set.</p>
+    <p>A phase with no <code>tasks</code> array (as both phases above) is a valid, common shape: a <strong>freeform/manual phase</strong> whose work happens by hand, or via ad-hoc <code>darkmux dispatch</code> calls, rather than an automated Task/Step graph. Phase order is the list position; there's no separate dependency field to set.</p>
 
     <h3>Launching a config: <code>mission launch</code></h3>
     <pre><code>darkmux mission launch draft-blog-post</code></pre>
@@ -229,7 +229,7 @@ next: <code>darkmux mission launch draft-blog-post</code> to begin (or pass <cod
     <pre><code>darkmux phase start draft-blog-post-s1-outline
 <span class="comment"># phase `draft-blog-post-s1-outline` → Running</span>
 
-<span class="comment"># …do the work, by hand or via `darkmux crew dispatch scribe ...`…</span>
+<span class="comment"># …do the work, by hand or via `darkmux dispatch scribe ...`…</span>
 
 darkmux phase complete draft-blog-post-s1-outline
 darkmux mission close draft-blog-post
@@ -351,7 +351,7 @@ darkmux mission ship deploy-rewrite --merge                <span class="comment"
       <li>Write a mission JSON describing what you're trying to do, with phase ids planned.</li>
       <li>Write the first phase JSON.</li>
       <li><code>darkmux mission start &lt;m&gt;</code> + <code>darkmux phase start &lt;s1&gt;</code>: operator/cyan records land in the viewer.</li>
-      <li>Dispatch the work: <code>darkmux crew dispatch coder --message "&lt;phase task&gt;"</code>: local/green records (start + complete) with the model field stamped.</li>
+      <li>Dispatch the work: <code>darkmux dispatch coder "&lt;phase task&gt;"</code>: local/green records (start + complete) with the model field stamped.</li>
       <li><code>darkmux phase complete &lt;s1&gt;</code>: duration arc visible in the wall-clock graphic.</li>
       <li><code>darkmux phase review --phase-id &lt;s1&gt;</code>: QA pass; verdict emits to the viewer. Address findings.</li>
       <li>Open a PR. If the verdict was clean (or flags-only with nothing material), merge.</li>

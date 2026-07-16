@@ -13,7 +13,7 @@ This skill picks up where a local-tier dispatch left off when it hit an operator
 
 You're looking at one of:
 
-- A `darkmux lab run` or `darkmux crew dispatch` that ended with `result: "escalation_compaction_limit_reached"`, `result: "escalation_cumulative_tokens_exceeded"`, or `result: "escalation_intra_turn_stall_exhausted"`. All escalation results share the `escalation_*` prefix; future variants will too.
+- A `darkmux lab run` or `darkmux dispatch` that ended with `result: "escalation_compaction_limit_reached"`, `result: "escalation_cumulative_tokens_exceeded"`, or `result: "escalation_intra_turn_stall_exhausted"`. All escalation results share the `escalation_*` prefix; future variants will too.
 - A run manifest under `~/.darkmux/runs/<run-id>/manifest.json` whose `ok: false` carries an escalation-shaped error string.
 - A flow record on the topology viewer with `terminal_reason: EscalationTriggered`.
 

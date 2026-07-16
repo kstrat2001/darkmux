@@ -4,7 +4,7 @@
 //! ## What this is for
 //!
 //! darkmux's real dispatch machinery (`crates/darkmux-crew`'s
-//! `dispatch_internal::dispatch`, used by `darkmux crew dispatch` /
+//! `dispatch_internal::dispatch`, used by `darkmux dispatch` /
 //! `darkmux mission run` / `darkmux phase review`, and eventually the
 //! review pipeline) talks to "the model" over one narrow seam: an
 //! OpenAI/LMStudio-compatible `POST /v1/chat/completions` call from inside

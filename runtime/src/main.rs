@@ -555,7 +555,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
 
     // System prompt: a default that names the runtime + names the
     // available tools. Real dispatches override this via --system with
-    // the role's .md prompt (see darkmux's crew dispatch path).
+    // the role's .md prompt (see darkmux's dispatch path).
     let system_prompt = system.unwrap_or_else(|| {
         "You are running inside the darkmux-runtime container. \
          You have access to six tools:\n\
@@ -647,7 +647,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // an explicit absolute threshold is known — pre-#482 the runtime
     // silently fell through to a hardcoded const, which made every
     // compaction decision downstream uncorrelated with the actual
-    // model envelope. The standard host path (`darkmux crew dispatch`,
+    // model envelope. The standard host path (`darkmux dispatch`,
     // `darkmux lab run`) always supplies `--context-window` from the
     // primary model's `n_ctx`; this check catches direct callers that
     // bypass the host (or profiles missing a Primary model).

@@ -1,8 +1,8 @@
 # darkmux-runtime
 
-In-house container-bounded agent runtime for darkmux. Replaced the legacy openclaw shell-out path for `darkmux crew dispatch` with a lean Alpine container that darkmux owns end-to-end.
+In-house container-bounded agent runtime for darkmux. Replaced the legacy openclaw shell-out path for `darkmux dispatch` with a lean Alpine container that darkmux owns end-to-end.
 
-**The only dispatch path for `darkmux crew dispatch`** (it was the default across the 1.x line; the openclaw shell-out alternative was removed on the 2.0 track — see [#1405](https://github.com/kstrat2001/darkmux/issues/1405)).
+**The only dispatch path for `darkmux dispatch`** (it was the default across the 1.x line; the openclaw shell-out alternative was removed on the 2.0 track — see [#1405](https://github.com/kstrat2001/darkmux/issues/1405)).
 
 ## Why this exists
 
@@ -65,14 +65,14 @@ docker run --rm -v "$(pwd):/workspace" darkmux-runtime run \
   --prompt "your task here"
 ```
 
-For routine use, the wrapper is `darkmux crew dispatch <role-id> -m "<message>"` (default runtime — handles role loading, workspace allocation, model probe, and Docker pre-flight).
+For routine use, the wrapper is `darkmux dispatch <role-id> "<message>"` (default runtime — handles role loading, workspace allocation, model probe, and Docker pre-flight).
 
 ## Dispatching into your own environment (`--image`, #703)
 
 By default a dispatch runs in `darkmux-runtime:latest` (slim — python + node, no compiled-language toolchain). To let the agent **compile/test in-sandbox** (the inner verify loop), point it at an image that has your project's toolchain:
 
 ```
-darkmux crew dispatch coder --workdir <repo> --image rust:slim -m "..."
+darkmux dispatch coder --workdir <repo> --image rust:slim "..."
 ```
 
 darkmux does **not** ship a catalog of per-language images. Instead it **injects** its agent into the image you name: the static `darkmux-runtime` binary (musl, runs in any Linux image) is extracted once to `~/.darkmux/runtime/` and bind-mounted into your image with the entrypoint overridden. So `--image` accepts *anything* — `rust:slim`, `node:20-bookworm`, **your project's own CI image**, or whatever your `Dockerfile` builds. The model of it: darkmux brings the agent; you bring the environment (the CI-runner / devcontainer pattern).
@@ -117,7 +117,7 @@ cargo test --release
 
 ## Known gaps
 
-The internal runtime is the only dispatch path for `darkmux crew dispatch`, but a few rough edges remain:
+The internal runtime is the only dispatch path for `darkmux dispatch`, but a few rough edges remain:
 
 - Migration of crew role definitions (`templates/builtin/roles/*.md`) — several roles still reference the legacy openclaw tool palette (`exec`, `update_plan`, `process`) which don't exist here; the internal runtime ignores them gracefully but the manifests would be cleaner without
 - `darkmux init` integration: today's pre-flight is at dispatch time (Docker reachable + image present); a separate setup pass during `darkmux init` would catch the prerequisite earlier

@@ -68,7 +68,7 @@
     <p>Run something that emits records and watch them land:</p>
     <pre><code>darkmux mission start &lt;your-mission-id&gt;    <span class="comment"># cyan: mission start record</span>
 darkmux phase start &lt;your-phase-id&gt;      <span class="comment"># cyan: phase start record</span>
-darkmux crew dispatch coder --message "..."<span class="comment"># green: dispatch start + (later) dispatch complete</span>
+darkmux dispatch coder "..."<span class="comment"># green: dispatch start + (later) dispatch complete</span>
 darkmux phase complete &lt;your-phase-id&gt;   <span class="comment"># cyan: phase complete + duration arc</span></code></pre>
 
     <p>With the viewer open as you run those commands, the records appear in order: two cyan operator-tier records bracketing a green local-tier dispatch pair (with the model pill visible on each green card), followed by the cyan phase-complete with its duration arc.</p>
@@ -124,7 +124,7 @@ darkmux serve --port 9000 --bind 127.0.0.1   <span class="comment"># override th
 <section>
   <div class="wrap">
     <h2>The pre-dispatch nudge</h2>
-    <p>When you run <code>darkmux crew dispatch</code> or <code>darkmux phase review</code> while the daemon is off, darkmux prints a one-line stderr nudge: the daemon isn't reachable, your flow records still write to disk, and you won't see them live until you start it (<code>brew services start darkmux</code> on Homebrew, or <code>darkmux serve</code> from source).</p>
+    <p>When you run <code>darkmux dispatch</code> or <code>darkmux phase review</code> while the daemon is off, darkmux prints a one-line stderr nudge: the daemon isn't reachable, your flow records still write to disk, and you won't see them live until you start it (<code>brew services start darkmux</code> on Homebrew, or <code>darkmux serve</code> from source).</p>
     <p>The dispatch proceeds either way: this is situational awareness, not consent-gating. You won't commit to a multi-minute dispatch only to realize the viewer would have been empty.</p>
     <p>If you started the daemon mid-dispatch, the records that landed before you started it are still visible. The viewer fetches the whole day's file first, then opens an SSE stream for new records. No data lost.</p>
   </div>

@@ -237,7 +237,7 @@
   <div class="wrap">
     <div class="brand">darkly energized<span class="dot">·</span>open source</div>
     <h1>darkmux<span class="cursor">_</span></h1>
-    <p class="tag"><strong>Own your AI workforce.</strong> The capable local models your <span class="accent">Apple Silicon</span> already runs, directed by your frontier, no API bill, on your hardware. When a job needs a bigger brain, the same crew dispatches to the cloud endpoint you choose.</p>
+    <p class="tag"><strong>Own your AI workforce.</strong> The capable local models your <span class="accent">Apple Silicon</span> already runs, directed by your frontier, no API bill, on your hardware. When a job needs a bigger brain, the same dispatches to the cloud endpoint you choose.</p>
     <div class="install">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew tap kstrat2001/darkmux</span><button class="copy-btn" data-copy="brew tap kstrat2001/darkmux" aria-label="Copy command">Copy</button></div>
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install darkmux</span><button class="copy-btn" data-copy="brew install darkmux" aria-label="Copy command">Copy</button></div>
@@ -295,7 +295,7 @@
       <li><code>darkmux serve</code> — start the daemon in a separate terminal tab</li>
       <li><code>darkmux doctor</code> — pre-flight checks including <code>daemon: reachable</code></li>
       <li><a href="demo/">darkmux.com/demo/</a> — interactive demo, sample fleet data (no install required)</li>
-      <li><code>darkmux crew dispatch</code> / <code>phase review</code> — emit flow records as they run</li>
+      <li><code>darkmux dispatch</code> / <code>phase review</code> — emit flow records as they run</li>
     </ul>
     <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/observability.html">observability section of the user guide</a>.</p>
   </div>
@@ -323,7 +323,7 @@
     <h3>Structured agentic work, for operators using darkmux as the local-AI tier of an orchestrator workflow.</h3>
     <p>Beyond the swap/lab CLI surface, darkmux ships a <em>crew</em> abstraction: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts, plus a <em>mission/phase</em> lifecycle that tracks multi-step plans as JSON files the operator owns. Optional: none of this is required to use darkmux as a CLI.</p>
     <ul class="plain">
-      <li><code>darkmux crew dispatch coder --message "..."</code> — invoke a named role; emits flow records</li>
+      <li><code>darkmux dispatch coder "..."</code> — invoke a named role; emits flow records</li>
       <li><code>darkmux mission run</code> / <code>ship</code> — the automated dispatch-to-PR loop: worktree, coder, QA review, operator sign-off gate, PR</li>
       <li><code>darkmux phase review</code> — QA pass against the current branch's diff; dispatches code-reviewer, parses the SIGNOFF block</li>
       <li><code>darkmux mission start/close/pause/resume</code> + <code>phase start/complete/abandon</code> — drive lifecycle state</li>
