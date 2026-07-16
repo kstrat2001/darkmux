@@ -55,9 +55,6 @@ mod mission_launch_review;
 mod notebook;
 mod pr_review;
 pub use darkmux_lab::providers;
-// #515 — recommendation registry extracted (deps hardware/heuristics/types,
-// all crates). Re-export keeps crate::recommendations::* resolving for doctor.
-pub use darkmux_recommendations as recommendations;
 mod role_cli;
 // #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
 // flow/profiles all crates). Re-export keeps crate::serve::* resolving for
@@ -90,17 +87,6 @@ fn main() -> Result<()> {
 
 fn run(cmd: Cmd) -> Result<i32> {
     match cmd {
-        Cmd::Swap {
-            profile,
-            profiles: cli::ProfilesFileArg { profiles },
-            dry_run,
-            quiet,
-            recommended,
-        } => cmd_swap(profile.as_deref(), profiles.as_deref(), dry_run, quiet, recommended),
-        Cmd::Status {
-            profiles: cli::ProfilesFileArg { profiles },
-            json: cli::JsonFlag { json },
-        } => cmd_status(profiles.as_deref(), json),
         Cmd::Lab { sub } => lab_cli::cmd_lab(sub),
         // (#1426) `dispatch` promoted to a top-level verb — the task-grain
         // execution entry. Relocated out of the `crew` family (`dispatch`
@@ -140,14 +126,14 @@ fn run(cmd: Cmd) -> Result<i32> {
         }),
         Cmd::Doctor { verbose, probe } => cmd_doctor(verbose, probe),
         Cmd::Profile { sub } => cmd_profile(sub),
-        Cmd::Model { sub } => cmd_model(sub),
-        Cmd::Fleet { sub } => fleet_cli::cmd_fleet(sub),
+        // (#1426) Bare `machine` routes to `machine status` (no id) — one
+        // code path, no separate overview render.
+        Cmd::Machine { sub } => cmd_machine(sub),
         Cmd::Crew { sub } => cmd_crew(sub),
         Cmd::Lessons { sub } => cmd_lessons(sub),
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Phase { sub } => cmd_phase(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
-        Cmd::Recommendations { sub } => cmd_recommendations(sub),
         Cmd::Flow { sub } => {
             flow_cli::run(sub)?;
             Ok(0)
@@ -1257,65 +1243,6 @@ pub fn speedup_verdict(
     }
 }
 
-/// Print a per-tier recommendation entry in operator-readable form.
-/// Wraps `recommendations::for_tier` / `for_active_hardware` so the
-/// `/darkmux-bootstrap` skill (and ad-hoc operator use) has a single
-/// way to ask "what does darkmux recommend for my hardware?".
-fn cmd_recommendations(sub: RecommendationsCmd) -> Result<i32> {
-    match sub {
-        RecommendationsCmd::Show {
-            tier,
-            json: cli::JsonFlag { json },
-        } => {
-            let rec = match tier.as_deref() {
-                Some(t) => recommendations::for_tier(t)?,
-                None => recommendations::for_active_hardware()?,
-            };
-            if json {
-                // (#907) Serialize the Recommendation directly — the full
-                // entry (tier, status, primary/compactor, rationale, etc.).
-                println!("{}", serde_json::to_string_pretty(&rec)?);
-                return Ok(0);
-            }
-            println!("Tier:     {}", rec.tier);
-            println!("Status:   {:?}", rec.status);
-            if let Some(name) = &rec.profile_name {
-                println!("Profile:  {name}");
-            }
-            if let Some(p) = &rec.primary {
-                println!(
-                    "Primary:  {} (n_ctx={}, role={})",
-                    p.model_id, p.n_ctx, p.role
-                );
-            }
-            if let Some(c) = &rec.compactor {
-                println!(
-                    "Compactor: {} (n_ctx={}, role={})",
-                    c.model_id, c.n_ctx, c.role
-                );
-            }
-            if !rec.validated_against.is_empty() {
-                println!("Validated against: {}", rec.validated_against.join(", "));
-            }
-            if !rec.not_validated_against.is_empty() {
-                println!(
-                    "NOT validated against: {}",
-                    rec.not_validated_against.join(", ")
-                );
-            }
-            if let Some(url) = &rec.bake_off_url {
-                println!("Bake-off:  {url}");
-            }
-            println!();
-            println!("Rationale:");
-            for line in rec.rationale.lines() {
-                println!("  {line}");
-            }
-            Ok(0)
-        }
-    }
-}
-
 fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
         CrewCmd::List => crew::cli::crew_list(),
@@ -1473,22 +1400,52 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     Ok(result.exit_code)
 }
 
-fn cmd_model(sub: ModelCmd) -> Result<i32> {
+/// (#1426) The `machine` family — this host's AI state. Bare `machine` (and
+/// `machine status`) route here; reads may target a roster peer over its
+/// serve daemon, but mutations (`machine eject`) stay local by construction.
+fn cmd_machine(sub: Option<MachineCmd>) -> Result<i32> {
     match sub {
-        ModelCmd::Status {
+        // Bare `darkmux machine` — the at-a-glance health view IS status.
+        None => cmd_machine_status(None, None, false),
+        Some(MachineCmd::Status {
+            id,
+            profiles: cli::ProfilesFileArg { profiles },
             json: cli::JsonFlag { json },
-        } => cmd_model_status(json),
-        ModelCmd::Eject { dry_run } => cmd_model_eject(dry_run),
-        ModelCmd::PullRecommended => cmd_model_pull_recommended(),
-        ModelCmd::Ledger { json } => cmd_model_ledger(json),
+        }) => cmd_machine_status(id.as_deref(), profiles.as_deref(), json),
+        Some(MachineCmd::Resources { id, json }) => cmd_machine_resources(id.as_deref(), json),
+        Some(MachineCmd::Eject { dry_run }) => cmd_model_eject(dry_run),
+        Some(MachineCmd::List { json, deep }) => fleet_cli::cmd_machine_list(json, deep),
+        Some(MachineCmd::Add {
+            id,
+            address,
+            description,
+        }) => fleet_cli::cmd_machine_add(&id, &address, description.as_deref()),
+        Some(MachineCmd::Remove { id }) => fleet_cli::cmd_machine_remove(&id),
     }
 }
 
-/// `darkmux model ledger` (#1286) — the no-viewer twin of the machine lens:
-/// one bounded gather (lms metadata + kernel counters, zero model
-/// dispatches), rendered as a table or emitted as the same JSON shape the
-/// serve daemon's /machine/memory returns.
-fn cmd_model_ledger(json: bool) -> Result<i32> {
+/// `darkmux machine resources` (#1286, renamed from `model ledger` in #1426)
+/// — the no-viewer twin of the machine lens: one bounded gather (lms metadata
+/// + kernel counters, zero model dispatches), rendered as a table or emitted
+/// as the same JSON shape the serve daemon's /machine/resources returns. With
+/// a roster `id`, reads that peer's resources over its serve daemon.
+fn cmd_machine_resources(id: Option<&str>, json: bool) -> Result<i32> {
+    if let Some(id) = id {
+        // Remote read — fetch the peer's live /machine/resources payload.
+        let value = fleet_cli::fetch_peer_json(id, "/machine/resources")?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(0);
+        }
+        // Deserialize into the same ledger shape and render it, so a remote
+        // read reads like a local one. Fall back to raw JSON if the peer's
+        // shape doesn't parse (older/newer daemon).
+        match serde_json::from_value::<darkmux_profiles::model_ledger::ModelLedger>(value.clone()) {
+            Ok(ledger) => print!("{}", darkmux_profiles::model_ledger::render_human(&ledger)),
+            Err(_) => println!("{}", serde_json::to_string_pretty(&value)?),
+        }
+        return Ok(0);
+    }
     let ledger = darkmux_profiles::model_ledger::gather();
     if json {
         println!("{}", serde_json::to_string_pretty(&ledger)?);
@@ -1498,23 +1455,77 @@ fn cmd_model_ledger(json: bool) -> Result<i32> {
     Ok(0)
 }
 
-fn cmd_model_status(json: bool) -> Result<i32> {
+/// `darkmux machine status [id]` (#1426) — residents grouped by ownership
+/// PLUS which registered profile(s) the loaded set matches (absorbs the
+/// retired top-level `status` verb's unique dimension). With a roster `id`,
+/// fetches THAT peer's residents over its serve daemon; the profile-match
+/// column is local-only (it reads this host's registry), so it is omitted for
+/// a remote read.
+fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Result<i32> {
+    if let Some(id) = id {
+        // Remote read: the peer's /model/status returns a flat resident list;
+        // partition by ownership here so a remote read renders like a local
+        // one. No profile-match — that reads this host's registry.
+        let value = fleet_cli::fetch_peer_json(id, "/model/status")?;
+        let models: Vec<types::LoadedModel> = value
+            .get("models")
+            .and_then(|m| serde_json::from_value(m.clone()).ok())
+            .unwrap_or_default();
+        return render_residents(&models, None, json, Some(id));
+    }
     let loaded = lms::list_loaded()?;
+    // Which registered profile(s) does the loaded set match? (The retired
+    // top-level `status` verb's one unique dimension.)
+    let matches: Option<Vec<String>> = match profiles::load_registry(config) {
+        Ok(loaded_reg) => Some(
+            loaded_reg
+                .registry
+                .profiles
+                .iter()
+                .filter(|(_, p)| profile_matches(p, &loaded))
+                .map(|(k, _)| k.clone())
+                .collect(),
+        ),
+        // No registry (fresh machine / bad path) — still show residents, just
+        // without the profile-match line rather than failing the read.
+        Err(_) => None,
+    };
+    render_residents(&loaded, matches.as_deref(), json, None)
+}
+
+/// Shared renderer for `machine status` (local + remote): residents grouped
+/// by ownership, and — for a local read — the matching-profile line. (#1426)
+fn render_residents(
+    loaded: &[types::LoadedModel],
+    matches: Option<&[String]>,
+    json: bool,
+    remote_id: Option<&str>,
+) -> Result<i32> {
     let (managed, user): (Vec<_>, Vec<_>) = loaded
         .iter()
         .partition(|m| swap::is_darkmux_owned(&m.identifier));
     if json {
         // (#907) machine-readable parity, grouped by ownership.
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "managed": managed,
             "user_state": user,
         });
+        if let Some(m) = matches {
+            out["matching_profiles"] = serde_json::json!(m);
+        }
+        if let Some(id) = remote_id {
+            out["machine_id"] = serde_json::json!(id);
+        }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(0);
     }
+    if let Some(id) = remote_id {
+        println!("{}", darkmux_types::style::header(&format!("machine `{id}` (remote):")));
+        println!();
+    }
     println!("{}", darkmux_types::style::header(&format!("darkmux-managed ({}):", managed.len())));
     if managed.is_empty() {
-        println!("  (none — `darkmux swap <profile>` to load)");
+        println!("  (none — a dispatch loads what its staffing needs)");
     } else {
         for m in &managed {
             println!("  {} ctx={:<8} {}", darkmux_types::style::accent(&format!("{:<46}", m.identifier)), m.context, m.size);
@@ -1531,6 +1542,18 @@ fn cmd_model_status(json: bool) -> Result<i32> {
         println!();
         println!("note: darkmux will never unload entries under `user state` — they're");
         println!("      yours. Use `lms unload <identifier>` to remove them manually.");
+    }
+    // The matching-profile line (absorbed from the retired `status` verb).
+    // Local reads only — a remote peer's residents can't be matched against
+    // this host's registry.
+    if let Some(matches) = matches {
+        println!();
+        if matches.is_empty() {
+            println!("matches no registered profile");
+        } else {
+            let listed: Vec<&str> = matches.iter().map(|s| s.as_str()).collect();
+            println!("matches profile(s): {}", listed.join(", "));
+        }
     }
     Ok(0)
 }
@@ -1570,114 +1593,6 @@ fn cmd_model_eject(dry_run: bool) -> Result<i32> {
     }
     println!("{summary}");
     Ok(0)
-}
-
-/// `darkmux model pull-recommended` — batch-download the bake-off-validated
-/// models for the active hardware tier. Skips already-downloaded models;
-/// reports per-model progress; errors with the tier's rationale when the
-/// recommendation isn't validated. (#159)
-fn cmd_model_pull_recommended() -> Result<i32> {
-    let rec = recommendations::for_active_hardware()?;
-    if rec.status != recommendations::RecommendationStatus::Validated {
-        eprintln!(
-            "darkmux: no validated recommendation for tier `{}` (status: {:?}).\n\nRationale:\n  {}",
-            rec.tier, rec.status, rec.rationale
-        );
-        return Ok(2);
-    }
-    let required = rec.required_model_ids();
-    if required.is_empty() {
-        eprintln!(
-            "darkmux: recommendation for tier `{}` is validated but lists no required models — registry bug.",
-            rec.tier
-        );
-        return Ok(2);
-    }
-
-    let available = lms::list_available()?;
-    let downloaded_keys: std::collections::HashSet<&str> =
-        available.iter().map(|m| m.model_key.as_str()).collect();
-
-    let mut downloaded_now = 0u32;
-    let mut already_present = 0u32;
-    for model_id in &required {
-        if downloaded_keys.contains(model_id.as_str()) {
-            println!("✓ {model_id} (already downloaded)");
-            already_present += 1;
-            continue;
-        }
-        println!("⤓ {model_id} (downloading via `lms get`)");
-        lms::get(model_id)
-            .with_context(|| format!("downloading recommended model `{model_id}`"))?;
-        downloaded_now += 1;
-    }
-
-    println!(
-        "darkmux: tier `{}` — {downloaded_now} downloaded, {already_present} already present, {} total required",
-        rec.tier,
-        required.len()
-    );
-    Ok(0)
-}
-
-/// `darkmux swap --recommended` — resolve the active hardware tier to its
-/// bake-off-validated profile and swap to it. Errors loudly when the
-/// recommendation status isn't `Validated`, or when the prescribed
-/// models aren't downloaded (with a one-command-fix pointer to
-/// `darkmux model pull-recommended`). (#159)
-fn cmd_swap_recommended(config: Option<&str>, dry_run: bool, quiet: bool) -> Result<i32> {
-    let rec = recommendations::for_active_hardware()?;
-    if !quiet {
-        println!(
-            "darkmux: matching tier `{}` → status `{:?}`",
-            rec.tier, rec.status
-        );
-    }
-
-    if rec.status != recommendations::RecommendationStatus::Validated {
-        eprintln!(
-            "darkmux: no validated recommendation for tier `{}`.\n\nRationale:\n  {}\n\nOptions:\n  - Pick a profile manually: `darkmux profile list` then `darkmux swap <name>`\n  - Contribute a bake-off for this tier — see kstrat2001/darkmux#117",
-            rec.tier, rec.rationale
-        );
-        return Ok(2);
-    }
-
-    let profile_name = rec.profile_name.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "validated recommendation for tier `{}` lacks `profile_name` — registry bug",
-            rec.tier
-        )
-    })?;
-
-    // Check the prescribed models are actually downloaded before kicking
-    // off the swap. The swap itself would also fail if models are missing,
-    // but a pre-flight check gives the operator a cleaner error + fix-it
-    // pointer than discovering it mid-swap.
-    let required = rec.required_model_ids();
-    let available = lms::list_available()?;
-    let downloaded_keys: std::collections::HashSet<&str> =
-        available.iter().map(|m| m.model_key.as_str()).collect();
-    let missing: Vec<&String> = required
-        .iter()
-        .filter(|id| !downloaded_keys.contains(id.as_str()))
-        .collect();
-    if !missing.is_empty() {
-        eprintln!("darkmux: required model(s) not downloaded for recommended swap:");
-        for id in &missing {
-            eprintln!("  - {id}");
-        }
-        eprintln!("\nFix: `darkmux model pull-recommended`, then re-try.");
-        return Ok(2);
-    }
-
-    if !quiet {
-        println!(
-            "darkmux: tier `{}` → profile `{profile_name}` (bake-off: {})",
-            rec.tier,
-            rec.bake_off_url.as_deref().unwrap_or("no url"),
-        );
-    }
-    cmd_swap(Some(profile_name), config, dry_run, quiet, false)
 }
 
 fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
@@ -1862,82 +1777,6 @@ fn cmd_init(
             println!("  2. Run `darkmux doctor` to verify your setup");
             println!("  3. Run `darkmux lab characterize` to smoke-test your machine");
         }
-    }
-    Ok(0)
-}
-
-fn cmd_swap(
-    profile_name: Option<&str>,
-    config: Option<&str>,
-    dry_run: bool,
-    quiet: bool,
-    recommended: bool,
-) -> Result<i32> {
-    // `swap --recommended` — short-circuit to the recommendation-
-    // registry-driven dispatcher rather than looking up a profile.
-    if recommended {
-        return cmd_swap_recommended(config, dry_run, quiet);
-    }
-    let Some(profile_name) = profile_name else {
-        eprintln!("darkmux: specify a profile name to swap to, or pass --recommended");
-        return Ok(2);
-    };
-    let loaded = profiles::load_registry(config)?;
-    let profile = profiles::get_profile(&loaded.registry, profile_name)?;
-    if !quiet {
-        println!(
-            "darkmux: swapping to \"{profile_name}\" (registry: {})",
-            loaded.path.display()
-        );
-    }
-    let result = swap::swap(profile, &loaded.registry, swap::SwapOpts { quiet, dry_run })?;
-    if !quiet {
-        let mut bits = vec![
-            format!("done in {}ms", result.walltime_ms),
-            format!("unloaded {}", result.unloaded.len()),
-            format!("loaded {}", result.loaded.len()),
-        ];
-        if result.hooks_ran > 0 {
-            bits.push(format!("{} hook(s)", result.hooks_ran));
-        }
-        if dry_run {
-            bits.push("[DRY RUN]".to_string());
-        }
-        println!("{}", bits.join(" — "));
-    }
-    Ok(0)
-}
-
-fn cmd_status(config: Option<&str>, json: bool) -> Result<i32> {
-    let loaded = profiles::load_registry(config)?;
-    let models = lms::list_loaded()?;
-    let matches: Vec<&String> = loaded
-        .registry
-        .profiles
-        .iter()
-        .filter(|(_, p)| profile_matches(p, &models))
-        .map(|(k, _)| k)
-        .collect();
-    if json {
-        // (#907) machine-readable parity for the frontier orchestrator.
-        let out = serde_json::json!({
-            "registry": loaded.path.display().to_string(),
-            "loaded_models": models,
-            "matching_profiles": matches,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(0);
-    }
-    println!("registry: {}", loaded.path.display());
-    println!("loaded models ({}):", models.len());
-    for m in &models {
-        println!("  {:<40} ctx={:<8} {}", m.identifier, m.context, m.status);
-    }
-    if matches.is_empty() {
-        println!("matches no registered profile");
-    } else {
-        let listed: Vec<&str> = matches.iter().map(|s| s.as_str()).collect();
-        println!("matches profile(s): {}", listed.join(", "));
     }
     Ok(0)
 }

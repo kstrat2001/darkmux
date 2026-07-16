@@ -1,34 +1,23 @@
-//! `darkmux fleet` command handlers — extracted from `main.rs` (mechanical,
-//! zero behavior change) alongside the `lab_cli`/`cli` split. `FleetCmd`
-//! itself (the arg surface) lives in `cli.rs`; this module owns the
-//! dispatch logic `cli::run` calls into.
+//! `darkmux machine` roster-facing command handlers (#1426 — the retired
+//! `fleet add`/`remove`/`status` folded into the machine family: `machine
+//! add`/`machine remove`/`machine list`). The `MachineCmd` arg surface lives
+//! in `cli.rs`; `cmd_machine` in `main.rs` routes the roster sub-verbs here.
+//! The "fleet" concept survives (roster, `fleet.mode`, flow records) — only
+//! the CLI family moved under `machine`.
 
 use anyhow::Result;
 
-use crate::cli::FleetCmd;
 use crate::fleet;
 use crate::flow;
 
-pub(crate) fn cmd_fleet(sub: FleetCmd) -> Result<i32> {
-    match sub {
-        FleetCmd::Add {
-            id,
-            address,
-            description,
-        } => cmd_fleet_add(&id, &address, description.as_deref()),
-        FleetCmd::Remove { id } => cmd_fleet_remove(&id),
-        FleetCmd::Status { json, deep } => cmd_fleet_status(json, deep),
-    }
-}
-
-fn cmd_fleet_add(id: &str, address: &str, description: Option<&str>) -> Result<i32> {
+pub(crate) fn cmd_machine_add(id: &str, address: &str, description: Option<&str>) -> Result<i32> {
     let was_present = fleet::mutate_roster(|roster| {
         let was_present = roster.machines.contains_key(id);
         fleet::add_machine(roster, id, address, description)?;
         Ok(was_present)
     })?;
     let verb = if was_present { "updated" } else { "added" };
-    println!("fleet: {verb} {id} (address={address})");
+    println!("machine: {verb} {id} (address={address})");
     if let Some(d) = description {
         println!("  description: {d}");
     }
@@ -36,22 +25,74 @@ fn cmd_fleet_add(id: &str, address: &str, description: Option<&str>) -> Result<i
     Ok(0)
 }
 
-fn cmd_fleet_remove(id: &str) -> Result<i32> {
+pub(crate) fn cmd_machine_remove(id: &str) -> Result<i32> {
     let removed = fleet::mutate_roster(|roster| Ok(fleet::remove_machine(roster, id)))?;
     match removed {
         Some(entry) => {
-            println!("fleet: removed {id} (address was {})", entry.address);
+            println!("machine: removed {id} (address was {})", entry.address);
             println!("  roster: {}", fleet::roster_path().display());
             Ok(0)
         }
         None => {
-            eprintln!("fleet: no machine `{id}` in roster — nothing to remove");
+            eprintln!("machine: no machine `{id}` in roster — nothing to remove");
             Ok(2)
         }
     }
 }
 
-fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
+/// Resolve a roster `id` to its normalized daemon base URL, then GET `path`
+/// with the shared fleet bearer token (#1426, #881). Used by `machine status
+/// [id]` / `machine resources [id]` to read a peer over its serve daemon —
+/// the same shared-token mechanism `machine list --deep` uses. Reads only;
+/// mutations never target a peer.
+pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value> {
+    let roster = fleet::load_roster()?;
+    let entry = roster.machines.get(id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no machine `{id}` in roster — add it with `darkmux machine add {id} --address <addr>`, \
+             or omit the id to read this host"
+        )
+    })?;
+    let base = normalize_daemon_base(&entry.address);
+    let url = format!("{base}{path}");
+    let token = darkmux_flow::serve_token();
+    let token_str = token.as_ref().map(|t| t.expose_for_compare());
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_millis(2000))
+        .build();
+    let mut req = agent.get(&url);
+    if let Some(tok) = token_str {
+        req = req.set("Authorization", &format!("Bearer {tok}"));
+    }
+    match req.call() {
+        Ok(resp) => {
+            let body = resp
+                .into_string()
+                .map_err(|e| anyhow::anyhow!("reading response from `{id}` ({url}): {e}"))?;
+            serde_json::from_str(&body)
+                .map_err(|e| anyhow::anyhow!("parsing JSON from `{id}` ({url}): {e}"))
+        }
+        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => anyhow::bail!(
+            "peer `{id}` requires a bearer token this machine isn't sending. Set DARKMUX_SERVE_TOKEN \
+             (or the darkmux-serve-token Keychain item) to the shared fleet token."
+        ),
+        Err(e) => anyhow::bail!("could not reach `{id}` ({url}): {e}"),
+    }
+}
+
+/// Normalize a roster address into an `http://host:port` daemon base URL,
+/// mirroring `fetch_machine_specs`' normalization (IPv6 / port-less forms).
+fn normalize_daemon_base(address: &str) -> String {
+    if address.contains("://") {
+        address.trim_end_matches('/').to_string()
+    } else if address.contains(':') {
+        format!("http://{address}")
+    } else {
+        format!("http://{address}:{}", crate::serve::DEFAULT_DAEMON_PORT)
+    }
+}
+
+pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
     let roster = fleet::load_roster()?;
 
     // Probe each machine's reachability (TCP connect to its daemon port).
@@ -136,7 +177,7 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
 
     // Human-readable table.
     use darkmux_types::style;
-    println!("{}", style::header("darkmux fleet status"));
+    println!("{}", style::header("darkmux machine list"));
     println!(
         "  roster:           {}",
         style::dim(&fleet::roster_path().display().to_string())
@@ -149,7 +190,7 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
     if probes.is_empty() {
         println!("(no peers in roster — single-machine fleet)");
         println!();
-        println!("Add a peer: darkmux fleet add <id> --address <tailnet-addr>");
+        println!("Add a peer: darkmux machine add <id> --address <tailnet-addr>");
         return Ok(0);
     }
     // Column-header row dimmed as secondary structure. Styling wraps the
