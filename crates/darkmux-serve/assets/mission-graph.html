@@ -7,8 +7,9 @@
 <!-- (#1403) Standalone-app shell — same as viewer.html. The operator reaches
      this page as a chromeless home-screen shortcut, so browser back can never
      be assumed; the manifest + app metas make an installed shortcut behave
-     like an app, and every asset is served same-origin by the daemon (strict
-     inline-only CSP forbids external fetches). -->
+     like an app, and every asset is served same-origin by the daemon (the
+     page is self-contained by convention — no external fetches anywhere;
+     there is no CSP header). -->
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="icon" type="image/png" href="/icon-192.png">
@@ -606,6 +607,12 @@ function hhmmss(ts){
   return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
 }
 var EVENTS_CAP = 250;
+// (#1404) The renderer breakpoint, kept `<= 700` to MATCH the CSS
+// `@media (max-width:700px)` (inclusive at exactly 700px) — a `< 700` here
+// would show the mobile header chrome with the desktop canvas at 700px even.
+function isNarrowViewport(){
+  return typeof window !== "undefined" && window.innerWidth <= 700;
+}
 
 // ─── (#1404) Mobile vertical-timeline renderer (plain DOM, no React Flow) ──
 // Same merged graph state as the canvas, different presentation: phases stack
@@ -726,11 +733,11 @@ function App(){
   var metrics = _m[0], setMetrics = _m[1];
   var _e = React.useState([]);
   var events = _e[0], setEvents = _e[1];
-  var _mob = React.useState(typeof window !== "undefined" && window.innerWidth < 700);
+  var _mob = React.useState(isNarrowViewport());
   var isMobile = _mob[0], setIsMobile = _mob[1];
   var _vm = React.useState("auto");            // "auto" | "canvas" | "timeline"
   var viewMode = _vm[0], setViewMode = _vm[1];
-  var _ev = React.useState(!(typeof window !== "undefined" && window.innerWidth < 700));
+  var _ev = React.useState(!isNarrowViewport());
   var evOpen = _ev[0], setEvOpen = _ev[1];
   var _exp = React.useState({});
   var expanded = _exp[0], setExpanded = _exp[1];
@@ -773,7 +780,7 @@ function App(){
   // (#1404) Track the viewport-width breakpoint so the renderer switches
   // between the React Flow canvas (wide) and the vertical timeline (narrow).
   React.useEffect(function(){
-    var onResize = function(){ setIsMobile(window.innerWidth < 700); };
+    var onResize = function(){ setIsMobile(isNarrowViewport()); };
     window.addEventListener("resize", onResize);
     return function(){ window.removeEventListener("resize", onResize); };
   }, []);
@@ -807,12 +814,23 @@ function App(){
       var newStatus = statusFromRecord(rec);
       var handle = rec.handle;
       if (!newStatus || !handle) return;
+      // (#1403 gate remediation) SSE flips are rank-guarded with the SAME
+      // monotone rule the reconcile poll's mergeGraphs applies: a delta may
+      // never regress a status to a lower rank (a stale or replayed record
+      // arriving after a terminal state stays a no-op). Equal rank still
+      // applies — a NEWER delta wins between two same-rank states (e.g. two
+      // terminal states disagreeing), matching mergeGraphs's "the more recent
+      // source wins on equal rank" reasoning. The invariant is now enforced
+      // at BOTH ingest points instead of relying on record ordering.
+      var advance = function(oldStatus){
+        return statusRank(newStatus) >= statusRank(oldStatus) ? newStatus : oldStatus;
+      };
       if (idx.nodeIds.has(handle)) {
         // A phase (or task) node id directly — flip that node's own status.
         setState(function(prev){
           if (!prev.graph) return prev;
           var nodes = prev.graph.nodes.map(function(n){
-            return n.id === handle ? Object.assign({}, n, {status: newStatus}) : n;
+            return n.id === handle ? Object.assign({}, n, {status: advance(n.status)}) : n;
           });
           return Object.assign({}, prev, {graph: Object.assign({}, prev.graph, {nodes: nodes})});
         });
@@ -828,7 +846,7 @@ function App(){
         var nodes = prev.graph.nodes.map(function(n){
           if (n.id !== taskId || !n.steps) return n;
           var steps = n.steps.map(function(s){
-            return s.id === handle ? Object.assign({}, s, {status: newStatus}) : s;
+            return s.id === handle ? Object.assign({}, s, {status: advance(s.status)}) : s;
           });
           return Object.assign({}, n, {steps: steps});
         });

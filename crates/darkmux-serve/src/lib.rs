@@ -124,10 +124,12 @@ const VENDOR_REACTFLOW_CSS: &str = include_str!("../assets/vendor/reactflow-bund
 
 /// (#1403) Standalone-app shell assets — the operator runs the viewer as a
 /// chromeless home-screen shortcut on mobile, so the app icon + web manifest
-/// must be served same-origin (the strict inline-only CSP forbids any external
-/// fetch). A dark cyan-diamond monogram. `apple-touch-icon.png` is the iOS
-/// home-screen icon (iOS ignores the manifest's `icons`); the 192/512 PNGs
-/// feed the manifest for other standalone-capable browsers.
+/// are served same-origin, matching the viewer's self-contained-by-convention
+/// posture (no external fetches anywhere; there is no CSP header — XSS
+/// defense is output-encoding plus the e2e gate). A dark cyan-diamond
+/// monogram. `apple-touch-icon.png` is the iOS home-screen icon (iOS ignores
+/// the manifest's `icons`); the 192/512 PNGs feed the manifest for other
+/// standalone-capable browsers.
 const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../assets/apple-touch-icon.png");
 const ICON_192_PNG: &[u8] = include_bytes!("../assets/icon-192.png");
 const ICON_512_PNG: &[u8] = include_bytes!("../assets/icon-512.png");
