@@ -860,7 +860,9 @@ impl ProfileRegistry {
 
 // `Serialize` so `darkmux serve`'s `/model/status` endpoint (#87) can
 // return loaded-model state as JSON for the flow viewer's toolbar pill.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+// `Deserialize` (#1426) so `darkmux machine status <id>` can read a roster
+// peer's residents back out of that same endpoint's JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadedModel {
     pub identifier: String,
     pub model: String,

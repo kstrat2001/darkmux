@@ -600,9 +600,9 @@
         assert!(json["loaded_models"].is_array());
     }
 
-    // ─── #1286: /machine/memory endpoint (the memory-ledger lens feed) ───
+    // ─── #1286: /machine/resources endpoint (the memory-ledger lens feed) ───
 
-    /// GET /machine/memory returns the memory ledger with the fields the
+    /// GET /machine/resources returns the memory ledger with the fields the
     /// machine lens reads, plus the recorded cadence knob (`cache_ttl_ms`)
     /// and the observer-cost stamp (`gather_ms`) — the #1286 observer-effect
     /// constraints made visible in the payload. `lms` is pointed at a
@@ -620,7 +620,7 @@
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/machine/memory")
+                    .uri("/machine/resources")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -632,7 +632,7 @@
                 None => std::env::remove_var("DARKMUX_LMS_BIN"),
             }
         }
-        assert_eq!(response.status(), StatusCode::OK, "expected 200 from /machine/memory");
+        assert_eq!(response.status(), StatusCode::OK, "expected 200 from /machine/resources");
         let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
         for key in [
@@ -652,7 +652,7 @@
         ] {
             assert!(
                 json.get(key).is_some(),
-                "/machine/memory response missing key `{key}`: {json}"
+                "/machine/resources response missing key `{key}`: {json}"
             );
         }
         assert!(json["models"].is_array());

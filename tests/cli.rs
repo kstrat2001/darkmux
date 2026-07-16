@@ -46,8 +46,7 @@ fn help_lists_subcommands() {
     cmd.arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("swap"))
-        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("machine"))
         .stdout(predicate::str::contains("profile"))
         .stdout(predicate::str::contains("lab"));
 }
@@ -155,59 +154,80 @@ fn retired_crew_dispatch_subverb_is_unknown() {
         ));
 }
 
+// (#1426 phase 3) `swap`, `status`, `model`, `fleet`, and `recommendations`
+// all retired as top-level verbs with NO compat alias (pre-2.0 clean removal).
+// `swap` (the second residency writer) is gone entirely; `status`/`model`/
+// `fleet` folded into the `machine` family.
 #[test]
-fn swap_dry_run_succeeds_without_real_lms() {
-    let tmp = TempDir::new().unwrap();
-    let p = tmp.path().join("profiles.json");
-    fs::write(&p, fixture_json()).unwrap();
+fn retired_top_level_swap_verb_is_unknown() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    // Force a non-functional `lms` binary. list_loaded falls back to text
-    // parsing on JSON failure and treats an empty result as "no models loaded."
-    // dry-run skips the actual unload/load calls, so the swap completes cleanly.
-    cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
-    cmd.args([
-        "swap",
-        "fast",
-        "--profiles-file",
-        p.to_str().unwrap(),
-        "--dry-run",
-        "--quiet",
-    ])
-    .assert()
-    .success();
+    cmd.arg("swap").assert().failure().stderr(
+        predicate::str::contains("unrecognized subcommand")
+            .or(predicate::str::contains("unexpected argument")),
+    );
 }
 
 #[test]
-fn swap_unknown_profile_errors() {
-    let tmp = TempDir::new().unwrap();
-    let p = tmp.path().join("profiles.json");
-    fs::write(&p, fixture_json()).unwrap();
+fn retired_top_level_status_verb_is_unknown() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
-    cmd.args([
-        "swap",
-        "nonexistent-profile",
-        "--profiles-file",
-        p.to_str().unwrap(),
-        "--dry-run",
-        "--quiet",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains("not found"));
+    cmd.arg("status").assert().failure().stderr(
+        predicate::str::contains("unrecognized subcommand")
+            .or(predicate::str::contains("unexpected argument")),
+    );
 }
 
 #[test]
-fn status_runs_with_explicit_profiles() {
+fn retired_top_level_model_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("model").assert().failure().stderr(
+        predicate::str::contains("unrecognized subcommand")
+            .or(predicate::str::contains("unexpected argument")),
+    );
+}
+
+#[test]
+fn retired_top_level_fleet_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("fleet").assert().failure().stderr(
+        predicate::str::contains("unrecognized subcommand")
+            .or(predicate::str::contains("unexpected argument")),
+    );
+}
+
+#[test]
+fn retired_top_level_recommendations_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("recommendations").assert().failure().stderr(
+        predicate::str::contains("unrecognized subcommand")
+            .or(predicate::str::contains("unexpected argument")),
+    );
+}
+
+// (#1426) The `machine` family is present. `machine status` (absorbs the
+// retired `status`) shows the matching-profile line; bare `machine` routes to
+// `machine status` (one code path, no separate overview render).
+#[test]
+fn machine_status_runs_with_explicit_profiles() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("profiles.json");
     fs::write(&p, fixture_json()).unwrap();
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
-    cmd.args(["status", "--profiles-file", p.to_str().unwrap()])
+    cmd.args(["machine", "status", "--profiles-file", p.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("registry:"));
+        .stdout(predicate::str::contains("darkmux-managed"))
+        .stdout(predicate::str::contains("matches"));
+}
+
+#[test]
+fn bare_machine_routes_to_status() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
+    cmd.arg("machine")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("darkmux-managed"));
 }
 
 #[test]
@@ -579,37 +599,6 @@ fn mission_migrate_apply_is_idempotent() {
         .success()
         .stdout(predicate::str::contains("nothing to do"));
 }
-
-/// Phase-F: `darkmux recommendations show <tier>` prints the registry
-/// entry for a known tier. This verb is referenced by the bootstrap
-/// skill to read the live primary + compactor model ids; if the verb
-/// regresses the skill breaks for every new operator.
-#[test]
-fn recommendations_show_known_tier_prints_validated_entry() {
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .args(["recommendations", "show", "m-series-128"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Tier:     m-series-128"))
-        .stdout(predicate::str::contains("Status:"))
-        .stdout(predicate::str::contains("Primary:"))
-        .stdout(predicate::str::contains("Compactor:"))
-        .stdout(predicate::str::contains("Rationale:"));
-}
-
-/// Phase-F: `recommendations show <unknown-tier>` errors clearly.
-/// The bootstrap skill's tier-resolution path depends on the verb
-/// bailing loud rather than silently returning an empty placeholder.
-#[test]
-fn recommendations_show_unknown_tier_errors() {
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .args(["recommendations", "show", "no-such-tier"])
-        .assert()
-        .failure();
-}
-
 
 /// Phase-H: `notebook draft --role <id>` is the new flag (renamed
 /// from `--agent` per Beat 36). The old `--agent` flag must NOT be

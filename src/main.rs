@@ -1426,7 +1426,7 @@ fn cmd_machine(sub: Option<MachineCmd>) -> Result<i32> {
 
 /// `darkmux machine resources` (#1286, renamed from `model ledger` in #1426)
 /// — the no-viewer twin of the machine lens: one bounded gather (lms metadata
-/// + kernel counters, zero model dispatches), rendered as a table or emitted
+/// and kernel counters, zero model dispatches), rendered as a table or emitted
 /// as the same JSON shape the serve daemon's /machine/resources returns. With
 /// a roster `id`, reads that peer's resources over its serve daemon.
 fn cmd_machine_resources(id: Option<&str>, json: bool) -> Result<i32> {
