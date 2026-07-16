@@ -48,17 +48,18 @@ fn help_lists_subcommands() {
         .success()
         .stdout(predicate::str::contains("swap"))
         .stdout(predicate::str::contains("status"))
-        .stdout(predicate::str::contains("profiles"))
+        .stdout(predicate::str::contains("profile"))
         .stdout(predicate::str::contains("lab"));
 }
 
+// (#1426) The top-level `profiles` verb retired into `profile list`.
 #[test]
-fn profiles_lists_from_explicit_config() {
+fn profile_list_lists_from_explicit_config() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("profiles.json");
     fs::write(&p, fixture_json()).unwrap();
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["profiles", "--profiles-file", p.to_str().unwrap()])
+    cmd.args(["profile", "list", "--profiles-file", p.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("fast"))
@@ -67,15 +68,39 @@ fn profiles_lists_from_explicit_config() {
 }
 
 #[test]
-fn profiles_errors_when_config_missing() {
+fn profile_list_errors_when_config_missing() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["profiles", "--profiles-file", "/no/such/path.json"])
+    cmd.args(["profile", "list", "--profiles-file", "/no/such/path.json"])
         .assert()
         .failure()
         .stderr(
             predicate::str::contains("registry not found")
                 .or(predicate::str::contains("no profile registry")),
         );
+}
+
+// (#1426) The retired top-level spellings now fail with an unknown-subcommand
+// error (no compat alias — pre-2.0 clean removal).
+#[test]
+fn retired_top_level_profiles_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("profiles")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand").or(
+            predicate::str::contains("unexpected argument"),
+        ));
+}
+
+#[test]
+fn retired_top_level_scan_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("scan")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand").or(
+            predicate::str::contains("unexpected argument"),
+        ));
 }
 
 #[test]
@@ -289,6 +314,7 @@ fn notebook_list_shows_entries() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     // Set notebook dir via env var.
     cmd.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
+        .arg("lab")
         .arg("notebook")
         .arg("list")
         .assert()
@@ -321,6 +347,7 @@ fn notebook_list_machine_filter() {
     // Filter to m5-home.
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
+        .arg("lab")
         .arg("notebook")
         .arg("list")
         .arg("--machine")
@@ -337,6 +364,7 @@ fn notebook_list_machine_filter() {
     // Filter to nonexistent machine → no output.
     let mut cmd2 = Command::cargo_bin("darkmux").unwrap();
     cmd2.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
+        .arg("lab")
         .arg("notebook")
         .arg("list")
         .arg("--machine")
@@ -346,12 +374,14 @@ fn notebook_list_machine_filter() {
         .stdout(predicate::str::contains("no notebook entries found"));
 }
 
-/// (#895) `notebook list` with an absent notebook dir exits 0 — "nothing to
-/// list" is success (fresh user / `notebook list && …` chaining), not an error.
+/// (#895) `lab notebook list` with an absent notebook dir exits 0 — "nothing
+/// to list" is success (fresh user / chaining), not an error. (#1426 — the
+/// notebook family folded into `lab`.)
 #[test]
 fn notebook_list_no_dir() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.arg("notebook")
+    cmd.arg("lab")
+        .arg("notebook")
         .arg("list")
         .env("DARKMUX_NOTEBOOK_DIR", "/no/such/path/xyz")
         .assert()
@@ -359,46 +389,20 @@ fn notebook_list_no_dir() {
         .stdout(predicate::str::contains("no notebook directory yet"));
 }
 
-/// `external pull --stdin` echoes stdin to stdout. The other two plugins
-/// (`--gh`, `--url`) shell out to `gh`/`curl` and aren't reliable to
-/// exercise in CI; their dispatch routing is covered by unit tests in
-/// `src/external/mod.rs`.
+/// (#1426) `external` retired entirely — the pipe is the interface (any text
+/// on stdin into `mission propose`). The old top-level verb now fails with an
+/// unknown-subcommand error (no compat alias — pre-2.0 clean removal).
 #[test]
-fn external_pull_stdin_passes_through() {
+fn retired_top_level_external_verb_is_unknown() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.arg("external")
         .arg("pull")
         .arg("--stdin")
-        .write_stdin("hello from #113")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("hello from #113"));
-}
-
-/// `external pull` with no source flag fails with a clap-level error.
-#[test]
-fn external_pull_requires_a_source() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.arg("external")
-        .arg("pull")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("required"));
-}
-
-/// `external pull --gh ... --stdin` fails because the flags are
-/// mutually exclusive (clap enforces this via the `source` ArgGroup).
-#[test]
-fn external_pull_rejects_multiple_sources() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.arg("external")
-        .arg("pull")
-        .arg("--gh")
-        .arg("https://example.invalid/issues/1")
-        .arg("--stdin")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
+        .stderr(predicate::str::contains("unrecognized subcommand").or(
+            predicate::str::contains("unexpected argument"),
+        ));
 }
 
 // ── mission migrate integration tests (#148 Task 8) ───────────────────────
@@ -567,6 +571,7 @@ fn notebook_draft_rejects_old_agent_flag() {
     cmd.current_dir(tmp.path());
     let output = cmd
         .args([
+            "lab",
             "notebook",
             "draft",
             "nonexistent",
@@ -610,6 +615,7 @@ fn notebook_draft_accepts_role_flag_under_dry_run() {
     cmd.current_dir(tmp.path());
     cmd.env("DARKMUX_NOTEBOOK_DIR", darkmux.join("notebook").to_str().unwrap());
     cmd.args([
+        "lab",
         "notebook",
         "draft",
         "test-run-h",
