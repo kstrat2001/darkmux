@@ -938,7 +938,15 @@ fn single_shot_body(
 /// (#1187 — a tool-granting role on an endpoint profile, multi-call loop) is
 /// NOT metered in 1.18.0; only this single-shot path and the review pipeline's
 /// seats are — see the module scope note / issue #1260 follow-up.
-fn admit_remote_execution(budget: u64) -> Result<()> {
+///
+/// `pub(crate)` (#1412): `step_kinds::builtins::DispatchSingleShotStepKind`'s
+/// hosted arm reuses this exact gate rather than inventing a second zero-
+/// allowance check — same minimum regime, one definition of "budget 0
+/// refuses." The full per-stage `RemoteBucket` regime (`darkmux-lab`'s
+/// review funnel) stays out of `darkmux-crew` on purpose (dependency
+/// direction: `darkmux-lab` depends on `darkmux-crew`, not the reverse) —
+/// consolidating the two regimes is #1414's job, not this one's.
+pub(crate) fn admit_remote_execution(budget: u64) -> Result<()> {
     if budget == 0 {
         bail!(
             "remote token budget exhausted: the per-execution allowance \
