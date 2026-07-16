@@ -61,6 +61,14 @@ struct ProposedPhase {
     id: String,
     mission_id: String,
     description: String,
+    /// (#1398) A short operator-facing label, alongside the (deliberately
+    /// long) `description` — see `PhaseConfig::display_name`'s doc for why
+    /// the two are separate fields. `mission-compiler.md`'s schema asks
+    /// the model to draft one for every phase; absent (an older-schema
+    /// response, or a model that skipped it) is tolerated — the graph lens
+    /// falls back to `id`, never a hard error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
     #[serde(default = "default_planned")]
     status: String,
     #[serde(default)]
@@ -529,6 +537,7 @@ fn build_mission_config(
         .map(|s| PhaseConfig {
             id: s.id.clone(),
             description: Some(s.description.clone()),
+            display_name: s.display_name.clone(),
             tasks: Vec::new(),
             extras: BTreeMap::new(),
         })
@@ -691,6 +700,7 @@ mod tests {
                     id: sid.to_string(),
                     mission_id: mission_id.to_string(),
                     description: format!("phase {sid}"),
+                    display_name: None,
                     status: "planned".to_string(),
                     depends_on: Vec::new(),
                     created_ts: 0,
@@ -864,6 +874,26 @@ some epilogue"#;
         assert_eq!(cfg.extras.get("ticket"), Some(&serde_json::json!("SYS-1")));
         // (contract 7) The document must itself validate cleanly.
         assert!(cfg.is_valid(&[]));
+    }
+
+    /// (#1398) `ProposedPhase::display_name` threads through
+    /// `build_mission_config` onto the persisted `PhaseConfig::display_name`
+    /// — absent when the compiler didn't set one (lenient-on-read: an
+    /// older-schema response still persists cleanly).
+    #[serial_test::serial]
+    #[test]
+    fn persist_threads_display_name_onto_the_mission_config() {
+        let _guard = CrewDirGuard::new(TempDir::new().unwrap());
+        let mut proposal = sample_proposal("test-display-name", &["s1", "s2"]);
+        proposal.phases[0].display_name = Some("Investigate".to_string());
+        // s2 deliberately left without a display_name.
+        persist(&proposal, "test input", None).expect("persist should succeed");
+
+        let path = crate::crew::loader::mission_configs_dir().join("test-display-name.json");
+        let cfg: darkmux_crew::mission_config::MissionConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.phases[0].display_name.as_deref(), Some("Investigate"));
+        assert_eq!(cfg.phases[1].display_name, None);
     }
 
     #[test]

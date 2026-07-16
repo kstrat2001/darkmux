@@ -2,7 +2,7 @@
   "id": "coder-phase",
   "name": "Coder Phase",
   "description": "Transcribed as data (#1284 Packet 1) from default_phase_graph (src/mission_run.rs), the 3-Task/3-Step graph `darkmux mission run` builds for one phase: prepare a git worktree, dispatch a specialist role into it, run mechanical verify (code-reviewer). A strict linear chain (worktree -> coder -> verify, each depends_on the last). As of Packet 3, this document is the EXECUTABLE source of truth -- default_phase_graph is a thin launcher that loads this config, resolves role/workdir/image as task_overrides, and calls mission_config::interpret. ID SCHEME (placeholder-prefix rule): every task/step id below carries the literal `build-` prefix standing in for the launcher's real composed phase id -- mission_config::interpret substitutes it at launch (`{phase_id}-worktree`, `{phase_id}-coder`, `{phase_id}-verify`; steps append `-step`), so persisted ids match what the Rust builder produced by hand before Packet 3, byte for byte.",
-  "schema_version": "1.1",
+  "schema_version": "1.2",
   "inputs": [
     {
       "name": "workdir",
@@ -38,6 +38,7 @@
   "phases": [
     {
       "id": "build",
+      "display_name": "Build",
       "description": "prepare the phase worktree, dispatch a specialist role into it, run mechanical verify",
       "tasks": [
         {

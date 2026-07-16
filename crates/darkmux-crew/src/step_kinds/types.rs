@@ -52,6 +52,22 @@ pub trait StepKind: Send + Sync {
     fn id(&self) -> &'static str;
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome>;
 
+    /// (#1402) A short, human-facing name for this kind — the graph lens,
+    /// the viewer's mission drill-down, and `mission status` all render
+    /// THIS instead of the raw registry id (`"dispatch.internal"` reads as
+    /// "Dispatch"). Registered once beside each kind's constructor, right
+    /// next to `id()`.
+    ///
+    /// Defaults to `id()` — a kind that hasn't been given a nicer label yet
+    /// still renders something legible rather than a hole in the fallback
+    /// chain (StepKind display name → kind id → step id → `"unknown"`, see
+    /// `darkmux-serve`'s `mission_graph` module doc). Every Tier 1 builtin
+    /// and every Tier 3 kind shipped with darkmux overrides this; the
+    /// default exists for third-party/future kinds that haven't yet.
+    fn display_name(&self) -> &'static str {
+        self.id()
+    }
+
     /// (#1230 Packet 3) Which local model, if any, this step needs
     /// resident before it can run — feeds `run_step_graph`'s per-step
     /// `Residency::Local(Placement)` vs `Residency::Remote` classification

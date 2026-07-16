@@ -2459,8 +2459,12 @@ function renderMission(){
       : pill(c.run||impliedComplete,"run")+pill(c.gate||impliedComplete,"qa")
         +pill(c.gate||impliedComplete,"gate")+pill(c.ship||c.merged||impliedComplete,"ship")
         +(showBlocked?`<span class="cyc block">blocked</span>`:'');
-    return `<div class="sprow"><span class="sps ${clsSafe(s.status)}">${esc(s.status)}</span>`
-      +`<span class="spt">${esc(s.id)}</span>`
+    // (#1398) display_name -> id, never description (description is
+    // deliberately long — for coder-phase it's the coder's dispatch brief
+    // verbatim; showing it here would crowd the row). title carries the
+    // full description as a hover tooltip when present.
+    return `<div class="sprow" title="${esc(s.description||'')}"><span class="sps ${clsSafe(s.status)}">${esc(s.status)}</span>`
+      +`<span class="spt">${esc(s.display_name||s.id)}</span>`
       +`<span class="cycstrip">${strip}</span>`
       +`<span class="sprun">${runInfo}</span></div>`;
   }).join("");

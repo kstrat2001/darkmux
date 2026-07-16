@@ -3735,6 +3735,10 @@ impl StepKind for ReviewBundleStepKind {
         "review.bundle"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Bundle"
+    }
+
     fn run(&self, step: &Step, _task: &Task, _input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
         let output = serde_json::to_string(&self.ctx.bundles).context("serializing bundles")?;
         emit_review_step_result(
@@ -3819,6 +3823,14 @@ impl ReviewProbeStepKind {
 impl StepKind for ReviewProbeStepKind {
     fn id(&self) -> &'static str {
         self.kind_id
+    }
+
+    fn display_name(&self) -> &'static str {
+        // (#1402) Deliberately the BASE label, not per-seat — every probe
+        // seat renders "Probe" regardless of `self.kind_id`'s
+        // `"review.probe:<seat-name>"` suffix (the seat name is dispatch
+        // routing detail, not a distinct kind for display purposes).
+        "Probe"
     }
 
     fn run(&self, step: &Step, _task: &Task, _input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
@@ -3971,6 +3983,10 @@ impl StepKind for ReviewDedupStepKind {
         "review.dedup"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Dedup"
+    }
+
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
         let t0 = Instant::now();
         let mut raw: Vec<ProbeFlag> = Vec::new();
@@ -4063,6 +4079,10 @@ struct JudgeChunkResult {
 impl StepKind for ReviewJudgeStepKind {
     fn id(&self) -> &'static str {
         "review.judge"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Judge"
     }
 
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
@@ -4333,6 +4353,10 @@ impl StepKind for ReviewVerifyStepKind {
         "review.verify"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Verify"
+    }
+
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
         let judge_output = input.values().next().cloned().unwrap_or_default();
         let mut judged: Vec<JudgedFlag> = if judge_output.is_empty() {
@@ -4538,6 +4562,10 @@ impl StepKind for ReviewSynthesisStepKind {
         "review.synthesis"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Synthesis"
+    }
+
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
         let t0 = Instant::now();
         let dedup_output = input.get(&self.dedup_task_id).cloned().unwrap_or_default();
@@ -4661,6 +4689,41 @@ pub struct BuiltReviewGraph {
     probe_members: Arc<StdMutex<Vec<MemberRecord>>>,
     probe_warnings: Arc<StdMutex<Vec<String>>>,
     probe_bucket: Arc<StdMutex<RemoteBucket>>,
+}
+
+/// (#1402) Pure kind-id → display-name lookup for review's six Tier 3
+/// kinds, usable WITHOUT constructing a live `StepKind` instance (which
+/// needs a `ReviewStepContext`/staffing that only exist during a real
+/// dispatch). `darkmux-serve`'s `mission_graph` module — a pure read path
+/// over persisted JSON, never a live dispatch — calls this directly (the
+/// crate already depends on `darkmux-lab`, so no new cross-crate edge).
+///
+/// Prefix-matches `"review.probe:<seat-name>"` (the only per-instance-
+/// suffixed kind here — see `ReviewProbeStepKind::id`'s doc) to the SAME
+/// base label its own `display_name()` returns; every other kind matches
+/// exactly. `review_step_kind_display_names_match_the_live_impls` (below)
+/// pins this literal table against the real `StepKind::display_name()`
+/// implementations so the two can't silently drift apart.
+pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
+    if kind == "review.bundle" {
+        return Some("Bundle");
+    }
+    if kind == "review.probe" || kind.starts_with("review.probe:") {
+        return Some("Probe");
+    }
+    if kind == "review.dedup" {
+        return Some("Dedup");
+    }
+    if kind == "review.judge" {
+        return Some("Judge");
+    }
+    if kind == "review.verify" {
+        return Some("Verify");
+    }
+    if kind == "review.synthesis" {
+        return Some("Synthesis");
+    }
+    None
 }
 
 /// Build the review's complete Task/Step graph across three Phases
@@ -7554,6 +7617,44 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // ONE call is the whole point: no separate driver loop needed to
         // reach every step — `depends_on` alone determines readiness.
         assert_eq!(graph.steps.len(), 7, "bundle + 2 probe + dedup + judge + verify + synthesis");
+    }
+
+    /// (#1402) Pins `review_step_kind_display_name` (the pure lookup
+    /// `darkmux-serve`'s `mission_graph` module calls, since it can't
+    /// construct a live `StepKind` instance from a persisted Step alone)
+    /// against the REAL `StepKind::display_name()` every registered kind
+    /// returns — the "conformance test in a crate that sees both" #1352's
+    /// tiering doctrine asks for instead of unguarded duplication.
+    #[test]
+    fn review_step_kind_display_names_match_the_live_impls() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model-a", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+        ]);
+        let seats = validate_review_crew(&crew).expect("valid crew");
+        let ctx = step_ctx(&crew, vec![]);
+        let graph = build_review_graph(
+            ctx,
+            seats.judge.clone(),
+            seats.verify.cloned(),
+            seats.probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("built-in review config builds cleanly");
+
+        for step in graph.steps.values() {
+            let live = graph.registry.get(&step.kind).expect("every step kind resolves");
+            let pure = review_step_kind_display_name(&step.kind);
+            assert_eq!(
+                pure,
+                Some(live.display_name()),
+                "review_step_kind_display_name(\"{}\") must match the live impl's display_name()",
+                step.kind
+            );
+        }
     }
 
     /// (#1284 Packet 3, review round 2 MUST FIX 2) LAUNCHER-LEVEL

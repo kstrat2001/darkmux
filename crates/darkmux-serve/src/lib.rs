@@ -25,8 +25,13 @@ use std::time::Duration;
 /// (`GraphNode`/`GraphEdge`/`MissionGraph`) plus a unit-tested pure layering
 /// function — see that module's doc for the schema-deviation note
 /// (post-#1341, dependency edges are derived from `Task::depends_on`, not a
-/// `Step::depends_on` that no longer exists).
-mod mission_graph;
+/// `Step::depends_on` that no longer exists). `pub` (#1402) so the root
+/// `darkmux` binary crate can pin `mission_step_kind_display_name`'s static
+/// `mission.*` table against `src/mission_run.rs`'s live `StepKind::
+/// display_name()` impls — see that constant's own doc for why the table
+/// can't be verified from THIS crate (the dependency edge runs the other
+/// way).
+pub mod mission_graph;
 
 /// (#925) Per-route request timeout for the NON-streaming routes. Bounds a
 /// slow/hung request; the long-lived `/flow/:date/stream` SSE route is
@@ -6743,6 +6748,7 @@ mod tests {
             id: id.to_string(),
             mission_id: mission_id.to_string(),
             description: format!("phase {id}"),
+            display_name: None,
             status: darkmux_crew::types::PhaseStatus::Running,
             created_ts: now_unix(),
             started_ts: Some(now_unix()),
@@ -6935,11 +6941,12 @@ mod tests {
     }
 
     /// Full shape test: a hand-built mission with a fan-in (two upstream
-    /// tasks feeding one downstream task) exercises phase→task containment,
-    /// task→step containment, AND the derived step-level `depends_on` edges
-    /// (module doc: an upstream task's LAST step feeds a downstream task's
-    /// FIRST step) — the "N converging edges into one step" legibility
-    /// requirement.
+    /// tasks feeding one downstream task) exercises phase→task containment
+    /// AND task-level `depends_on` edges (#1401: steps render as ROWS
+    /// inside their owning task node, not separate nodes — the derived
+    /// step-granularity fan-in edges retired along with the step nodes
+    /// they connected; the fan-in now shows as two edges converging
+    /// directly on the downstream TASK).
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_fan_in_shape() {
@@ -6953,6 +6960,7 @@ mod tests {
             id: "task-a".to_string(),
             phase_id: "p1".to_string(),
             description: "task a".to_string(),
+            display_name: None,
             step_ids: vec!["task-a-step".to_string()],
             depends_on: vec![],
             role_id: None,
@@ -6964,6 +6972,7 @@ mod tests {
             id: "task-b".to_string(),
             phase_id: "p1".to_string(),
             description: "task b".to_string(),
+            display_name: None,
             step_ids: vec!["task-b-step".to_string()],
             depends_on: vec![],
             role_id: None,
@@ -6975,6 +6984,7 @@ mod tests {
             id: "task-c".to_string(),
             phase_id: "p1".to_string(),
             description: "task c (dedup-like)".to_string(),
+            display_name: Some("Dedup".to_string()),
             step_ids: vec!["task-c-step".to_string()],
             depends_on: vec!["task-a".to_string(), "task-b".to_string()],
             role_id: None,
@@ -7035,14 +7045,30 @@ mod tests {
         assert_eq!(json["legacy"], false);
 
         let nodes = json["nodes"].as_array().unwrap();
-        // 1 phase + 3 tasks + 3 steps.
-        assert_eq!(nodes.len(), 7, "{nodes:?}");
+        // (#1401) 1 phase + 3 tasks — NO separate step nodes anymore.
+        assert_eq!(nodes.len(), 4, "{nodes:?}");
         let node = |id: &str| nodes.iter().find(|n| n["id"] == id).unwrap_or_else(|| panic!("missing node {id}: {nodes:?}"));
         assert_eq!(node("task-a")["status"], "complete");
         assert_eq!(node("task-b")["status"], "running");
         assert_eq!(node("task-c")["status"], "planned");
-        assert_eq!(node("task-a-step")["status"], "complete");
-        assert_eq!(node("task-b-step")["status"], "running");
+
+        // (#1398) label falls back to `id` when no display_name is set;
+        // task-c's explicit display_name wins over its id.
+        assert_eq!(node("task-a")["label"], "task-a");
+        assert_eq!(node("task-c")["label"], "Dedup");
+
+        // (#1401) The steps a task carries render as an array of rows on
+        // ITS OWN node — kind display name resolved via `resolve_step_label`
+        // ("procedural.noop" -> "No-op").
+        let task_a_steps = node("task-a")["steps"].as_array().unwrap();
+        assert_eq!(task_a_steps.len(), 1, "{task_a_steps:?}");
+        assert_eq!(task_a_steps[0]["id"], "task-a-step");
+        assert_eq!(task_a_steps[0]["label"], "No-op");
+        assert_eq!(task_a_steps[0]["status"], "complete");
+        assert_eq!(task_a_steps[0]["startedTs"], 1);
+        assert_eq!(task_a_steps[0]["completedTs"], 2);
+        let task_b_steps = node("task-b")["steps"].as_array().unwrap();
+        assert_eq!(task_b_steps[0]["status"], "running");
 
         // ── Wire-casing CONTRACT (review-gate MF1). The page's JS reads
         // `n.parentId` in computeLayout — the first cut serialized
@@ -7054,16 +7080,13 @@ mod tests {
         // on either side fails here instead of silently flattening the
         // layout.
         assert_eq!(node("task-a")["parentId"], "p1");
-        assert_eq!(node("task-a-step")["parentId"], "task-a");
         assert!(
             node("task-a")["parent_id"].is_null(),
             "snake_case parent_id must NOT be on the wire (JS reads parentId)"
         );
-        assert_eq!(node("task-a-step")["startedTs"], 1);
-        assert_eq!(node("task-a-step")["completedTs"], 2);
         assert!(
-            node("task-a-step")["started_ts"].is_null(),
-            "snake_case started_ts must NOT be on the wire (camelCase contract)"
+            task_a_steps[0]["started_ts"].is_null(),
+            "snake_case started_ts must NOT be on a step row's wire form (camelCase contract)"
         );
         assert!(node("task-a")["depth"].is_number());
         assert!(json["mission_id"].is_string(), "envelope stays snake_case (JS reads g.mission_id)");
@@ -7076,10 +7099,12 @@ mod tests {
         assert!(has_edge("p1", "task-a", "contains"));
         assert!(has_edge("p1", "task-b", "contains"));
         assert!(has_edge("p1", "task-c", "contains"));
-        assert!(has_edge("task-a", "task-a-step", "contains"));
-        // The fan-in: BOTH upstream steps converge on the same downstream step.
-        assert!(has_edge("task-a-step", "task-c-step", "depends_on"));
-        assert!(has_edge("task-b-step", "task-c-step", "depends_on"));
+        // The fan-in: BOTH upstream TASKS converge directly on the
+        // downstream task — no step-level detour (#1401).
+        assert!(has_edge("task-a", "task-c", "depends_on"));
+        assert!(has_edge("task-b", "task-c", "depends_on"));
+        // No "contains" edges into step ids — steps aren't nodes anymore.
+        assert!(!edges.iter().any(|e| e["target"] == "task-a-step"));
 
         // (review-gate C7) No duplicate edge ids — React keys must be
         // unique; a duplicate depends_on entry on a Task must not emit
@@ -7094,12 +7119,15 @@ mod tests {
     /// (review-gate MF2a) The three production graph runners persist Step
     /// JSONs only AFTER `run_step_graph` returns — so a page opened DURING
     /// a run sees tasks whose `step_ids` name steps with no file on disk.
-    /// The builder must synthesize `planned` step nodes for those ids
-    /// (otherwise the SSE layer has no node to flip when the scheduler's
-    /// `step start` records arrive, and cross-task dependency edges point
-    /// at nodes that don't exist). This fixture is exactly that mid-run
-    /// shape: tasks persisted with `step_ids` + `depends_on`, ZERO step
-    /// files.
+    /// The builder must synthesize `planned` step ROWS for those ids
+    /// (#1401 — otherwise the SSE layer has nothing to flip when the
+    /// scheduler's `step start` records arrive). This fixture is exactly
+    /// that mid-run shape: tasks persisted with `step_ids` + `depends_on`,
+    /// ZERO step files, and NO config-snapshot.json (a hand-built test
+    /// fixture, not a config-launched mission) — so the kind-recovery path
+    /// (#1402) has nothing to recover from, and the row's label falls back
+    /// to the step id itself (the fallback chain's SECOND-to-last rung,
+    /// not the deep "unknown" — see `resolve_step_label`'s doc).
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_synthesizes_planned_steps_for_unpersisted_step_files() {
@@ -7112,6 +7140,7 @@ mod tests {
             id: "task-a".to_string(),
             phase_id: "p1".to_string(),
             description: "task a".to_string(),
+            display_name: None,
             step_ids: vec!["task-a-step".to_string()],
             depends_on: vec![],
             role_id: None,
@@ -7123,8 +7152,8 @@ mod tests {
             id: "task-b".to_string(),
             phase_id: "p1".to_string(),
             description: "task b".to_string(),
-            // Two steps — the intra-task sequence edge must also resolve
-            // between two synthesized nodes.
+            display_name: None,
+            // Two steps — both must synthesize a row, in order.
             step_ids: vec!["task-b-step-1".to_string(), "task-b-step-2".to_string()],
             depends_on: vec!["task-a".to_string()],
             role_id: None,
@@ -7153,26 +7182,37 @@ mod tests {
         assert_eq!(json["legacy"], false);
 
         let nodes = json["nodes"].as_array().unwrap();
-        // 1 phase + 2 tasks + 3 synthesized steps.
-        assert_eq!(nodes.len(), 6, "{nodes:?}");
+        // (#1401) 1 phase + 2 tasks — NO separate step nodes, synthesized
+        // or otherwise.
+        assert_eq!(nodes.len(), 3, "{nodes:?}");
         let node = |id: &str| {
             nodes
                 .iter()
                 .find(|n| n["id"] == id)
                 .unwrap_or_else(|| panic!("missing node {id}: {nodes:?}"))
         };
-        for step_id in ["task-a-step", "task-b-step-1", "task-b-step-2"] {
-            let n = node(step_id);
-            assert_eq!(n["kind"], "step");
-            assert_eq!(n["status"], "planned", "synthesized step must be planned: {n}");
-            assert_eq!(n["label"], "unknown", "synthesized step kind label: {n}");
-        }
         assert_eq!(node("task-a")["status"], "planned");
         assert_eq!(node("task-b")["status"], "planned");
 
-        // Every dependency edge's BOTH endpoints exist as nodes — the
-        // pre-fix builder emitted cross-task edges referencing step nodes
-        // it never created mid-run.
+        let task_a_steps = node("task-a")["steps"].as_array().unwrap();
+        assert_eq!(task_a_steps.len(), 1);
+        assert_eq!(task_a_steps[0]["id"], "task-a-step");
+        assert_eq!(task_a_steps[0]["status"], "planned", "synthesized step must be planned: {task_a_steps:?}");
+        assert_eq!(
+            task_a_steps[0]["label"], "task-a-step",
+            "no config-snapshot to recover a kind from -> label falls back to the step id \
+             itself, not the deep 'unknown' (#1402): {task_a_steps:?}"
+        );
+
+        let task_b_steps = node("task-b")["steps"].as_array().unwrap();
+        assert_eq!(task_b_steps.len(), 2, "both synthesized rows present, in step_ids order");
+        assert_eq!(task_b_steps[0]["id"], "task-b-step-1");
+        assert_eq!(task_b_steps[1]["id"], "task-b-step-2");
+        for row in task_b_steps {
+            assert_eq!(row["status"], "planned");
+        }
+
+        // Every dependency edge's BOTH endpoints exist as (task) nodes.
         let node_ids: std::collections::BTreeSet<&str> =
             nodes.iter().filter_map(|n| n["id"].as_str()).collect();
         let edges = json["edges"].as_array().unwrap();
@@ -7182,13 +7222,11 @@ mod tests {
                 assert!(node_ids.contains(id), "edge {e} references missing node {id}");
             }
         }
-        let has_edge = |source: &str, target: &str, kind: &str| {
-            edges.iter().any(|e| e["source"] == source && e["target"] == target && e["kind"] == kind)
-        };
-        // Cross-task dep edge between two synthesized steps.
-        assert!(has_edge("task-a-step", "task-b-step-1", "depends_on"));
-        // Intra-task sequence edge between two synthesized steps.
-        assert!(has_edge("task-b-step-1", "task-b-step-2", "depends_on"));
+        // Cross-task dep edge connects the TASKS directly (#1401) — no
+        // step-level detour, synthesized or otherwise.
+        assert!(edges
+            .iter()
+            .any(|e| e["source"] == "task-a" && e["target"] == "task-b" && e["kind"] == "depends_on"));
     }
 
     /// (review-gate C2) Pin the SSE action-string contract: the page's
@@ -7307,8 +7345,36 @@ mod tests {
         let count_kind = |kind: &str| nodes.iter().filter(|n| n["kind"] == kind).count();
         assert_eq!(count_kind("phase"), 3, "{nodes:?}");
         assert_eq!(count_kind("task"), 7, "expected bundle+2 probes+dedup+judge+verify+synthesis: {nodes:?}");
-        assert_eq!(count_kind("step"), 7, "every task in review.json is single-step: {nodes:?}");
+        // (#1401) No separate "step" node kind anymore — every task's
+        // steps render as rows on ITS OWN node instead. Sum the `steps`
+        // array lengths across every task node: still 7 (every task in
+        // review.json is single-step), just no longer a separate node per
+        // step.
+        assert_eq!(count_kind("step"), 0, "steps are rows now, not nodes (#1401): {nodes:?}");
+        let total_step_rows: usize = nodes
+            .iter()
+            .filter(|n| n["kind"] == "task")
+            .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
+            .sum();
+        assert_eq!(total_step_rows, 7, "every task in review.json is single-step: {nodes:?}");
         assert_eq!(tasks.len(), 7);
         assert_eq!(steps.len(), 7);
+
+        // (#1402) Every row's label resolves through the real StepKind
+        // display-name fallback chain — a probe row (rendered per-seat
+        // kind id "review.probe:seat-a") still reads "Probe", the base
+        // label, not the raw suffixed id.
+        let all_labels: Vec<String> = nodes
+            .iter()
+            .filter(|n| n["kind"] == "task")
+            .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
+            .filter_map(|row| row["label"].as_str().map(String::from))
+            .collect();
+        for expected in ["Bundle", "Probe", "Dedup", "Judge", "Verify", "Synthesis"] {
+            assert!(
+                all_labels.iter().any(|l| l == expected),
+                "expected a \"{expected}\" row label among {all_labels:?}"
+            );
+        }
     }
 }

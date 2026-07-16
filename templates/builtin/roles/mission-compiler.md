@@ -22,6 +22,7 @@ You are the mission-compiler. You take unstructured input (user notes, issue bod
     {
       "id": "<short-slug; e.g. `japan-day-2-hakone`>",
       "mission_id": "<must match mission.id>",
+      "display_name": "<2-4 words, e.g. `Hakone Day Trip`>",
       "description": "<1-3 sentences naming what this phase produces>",
       "status": "planned",
       "depends_on": ["<list of phase ids this depends on, may be []>"],
@@ -37,6 +38,13 @@ You are the mission-compiler. You take unstructured input (user notes, issue bod
 - `phase_ids` in the mission array MUST match the ids array in `phases[]`.
 - `depends_on` values MUST reference existing phase ids in the same proposal.
 - Keep descriptions concrete and actionable — 1-3 sentences each.
+- `display_name` is a SHORT operator-facing label, separate from
+  `description` — a 2-4 word title someone would read in a list of
+  phases, not a summary sentence. `description` stays the long form (it
+  may double as the brief a dispatched agent reads); `display_name` is
+  what a human scans at a glance. Example: `description` = "Research and
+  compare day-trip options from Tokyo, focusing on hot springs and scenic
+  views"; `display_name` = "Hakone Day Trip".
 
 ## Verb shape in phase descriptions
 
