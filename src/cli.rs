@@ -258,7 +258,9 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: FleetCmd,
     },
-    /// Crew subcommands — dispatch a role for a single turn.
+    /// Crew registry reads — list/show/index the crews declared in the
+    /// profiles registry. (#1426 relocated single-role dispatch to the
+    /// top-level `darkmux dispatch` verb.)
     Crew {
         #[command(subcommand)]
         sub: CrewCmd,
