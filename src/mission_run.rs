@@ -589,6 +589,10 @@ impl StepKind for MissionWorktreeStepKind {
         "mission.worktree"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Worktree"
+    }
+
     fn run(
         &self,
         step: &crew::types::Step,
@@ -682,6 +686,10 @@ pub(crate) struct MissionCoderStepKind {
 impl StepKind for MissionCoderStepKind {
     fn id(&self) -> &'static str {
         "mission.coder"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Coder"
     }
 
     fn run(
@@ -801,6 +809,10 @@ pub(crate) struct MissionVerifyStepKind {
 impl StepKind for MissionVerifyStepKind {
     fn id(&self) -> &'static str {
         "mission.verify"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Verify (QA)"
     }
 
     fn run(
@@ -3255,6 +3267,56 @@ mod tests {
     use super::*;
     use crew::types::{Phase, PhaseStatus};
 
+    /// (#1402) `darkmux-serve`'s `mission_graph::mission_step_kind_display_name`
+    /// is a STATIC literal table (that crate can't depend on this root
+    /// binary crate — see its own doc for why) for the three `mission.*`
+    /// Tier 3 kinds this module owns. This is the "conformance test in a
+    /// crate that sees both" #1352's tiering doctrine asks for instead of
+    /// unguarded duplication: THIS crate depends on `darkmux-serve` (to
+    /// embed the daemon) AND owns these kinds, so it's the one place that
+    /// can pin the static table against the REAL `StepKind::display_name()`
+    /// each kind returns.
+    #[test]
+    fn mission_step_kind_display_names_match_this_crates_static_table() {
+        let worktree = MissionWorktreeStepKind {
+            repo_root: std::path::PathBuf::new(),
+            wt_path: std::path::PathBuf::new(),
+            branch: String::new(),
+            base: String::new(),
+            mission_id: String::new(),
+            phase_id: String::new(),
+            session_id: String::new(),
+            role: String::new(),
+        };
+        let coder = MissionCoderStepKind {
+            opts: Mutex::new(None),
+            wt_path: std::path::PathBuf::new(),
+            mission_id: String::new(),
+            phase_id: String::new(),
+            session_id: String::new(),
+            role_id: String::new(),
+            result_slot: Arc::new(Mutex::new(None)),
+        };
+        let verify = MissionVerifyStepKind {
+            wt_path: std::path::PathBuf::new(),
+            base: String::new(),
+            phase_id: String::new(),
+            result_slot: Arc::new(Mutex::new(None)),
+        };
+        for (id, display) in [
+            (worktree.id(), worktree.display_name()),
+            (coder.id(), coder.display_name()),
+            (verify.id(), verify.display_name()),
+        ] {
+            assert_eq!(
+                darkmux_serve::mission_graph::mission_step_kind_display_name(id),
+                Some(display),
+                "darkmux-serve's static mission_step_kind_display_name(\"{id}\") table has \
+                 drifted from this crate's live StepKind::display_name()"
+            );
+        }
+    }
+
     /// (#816) conventions_branch: template + ticket → conventioned ref;
     /// ticketless mission or invalid expansion → darkmux default (soft
     /// fallback, never an error).
@@ -4021,6 +4083,7 @@ mod tests {
             id: id.to_string(),
             mission_id: mission.to_string(),
             description: format!("desc {id}"),
+            display_name: None,
             status,
             created_ts: 0,
             started_ts: None,
@@ -4043,6 +4106,7 @@ mod tests {
             id: id.to_string(),
             phase_id: "s1".to_string(),
             description: "test task".to_string(),
+            display_name: None,
             step_ids: vec![format!("{id}-step")],
             depends_on: Vec::new(),
             role_id: None,

@@ -330,6 +330,17 @@ pub struct Phase {
     pub id: String,
     pub mission_id: String,
     pub description: String,
+    /// (#1398) Operator-facing short label — `description` is deliberately
+    /// LONG (for `coder-phase` it doubles as the coder's dispatch brief;
+    /// for `review` it's multi-sentence transcription prose), so a single
+    /// overloaded field can't serve as both the model-facing brief AND a
+    /// clean node/row label. Threaded from `PhaseConfig::display_name`
+    /// through `mission_launch::new_planned_phase` at mint time. `None` on
+    /// a hand-authored or pre-#1398 phase — every renderer falls back to
+    /// `id` (never `description` — a truncated brief reads worse than a
+    /// clean id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub status: PhaseStatus,
     pub created_ts: u64,
@@ -442,6 +453,14 @@ pub struct Task {
     #[serde(alias = "sprint_id")]
     pub phase_id: String,
     pub description: String,
+    /// (#1398) Operator-facing short label — same overload split as
+    /// `Phase::display_name` (this doc's twin), one level down. Threaded
+    /// from `TaskConfig::display_name` through `mission_config::interpret`
+    /// at mint time. `None` falls back to `id` everywhere a Task renders
+    /// (never `description`) — a task card's title in the graph lens
+    /// (#1401) is the primary consumer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Ordered — step at index `i` depends on the step at index `i-1` (see
     /// `Step`'s doc). A Task with 0 or 1 steps has nothing to order.
     #[serde(default)]

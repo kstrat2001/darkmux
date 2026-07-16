@@ -190,6 +190,10 @@ impl StepKind for DispatchInternalStepKind {
         "dispatch.internal"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Dispatch"
+    }
+
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         use crate::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts, Runtime};
 
@@ -319,6 +323,10 @@ impl StepKind for DispatchSingleShotStepKind {
         "dispatch.single_shot"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Dispatch (single-shot)"
+    }
+
     fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         use crate::single_shot::{
             single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest,
@@ -394,6 +402,10 @@ impl StepKind for ProceduralShellStepKind {
         "procedural.shell"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Shell"
+    }
+
     fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let command = require_config_str(step, self.id(), "command")?;
         let cwd = config_str(step, "cwd");
@@ -446,6 +458,10 @@ impl StepKind for ProceduralNoopStepKind {
         "procedural.noop"
     }
 
+    fn display_name(&self) -> &'static str {
+        "No-op"
+    }
+
     fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let output = config_str(step, "output").unwrap_or(&step.id).to_string();
         Ok(StepOutcome {
@@ -483,6 +499,7 @@ mod tests {
             id: "t1".to_string(),
             phase_id: "p1".to_string(),
             description: "test task".to_string(),
+            display_name: None,
             step_ids: vec!["s1".to_string()],
             depends_on: Vec::new(),
             role_id: None,
@@ -599,5 +616,15 @@ mod tests {
         let s = step("s1", "procedural.noop", json!({"output": "custom"}));
         let out = ProceduralNoopStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
         assert_eq!(out.output, "custom");
+    }
+
+    // ── (#1402) Tier 1 display names ────────────────────────────────────
+
+    #[test]
+    fn tier1_display_names_match_the_spec() {
+        assert_eq!(DispatchInternalStepKind.display_name(), "Dispatch");
+        assert_eq!(DispatchSingleShotStepKind.display_name(), "Dispatch (single-shot)");
+        assert_eq!(ProceduralShellStepKind.display_name(), "Shell");
+        assert_eq!(ProceduralNoopStepKind.display_name(), "No-op");
     }
 }

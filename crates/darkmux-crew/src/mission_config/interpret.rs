@@ -56,6 +56,10 @@ pub struct TaskOverride {
     /// launcher's `dispatch \`{role}\` into the worktree`, where `{role}`
     /// is only known at launch).
     pub description: Option<String>,
+    /// (#1398) Overrides `TaskConfig::display_name` — parity with
+    /// `description`'s override above, for a launcher that wants to name a
+    /// task differently than its static document default at launch time.
+    pub display_name: Option<String>,
 }
 
 /// Everything a launcher supplies to [`interpret`] beyond the static
@@ -141,11 +145,22 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<T
                             .map(|p| render(p, index, name))
                             .or_else(|| task_cfg.description.clone())
                             .unwrap_or_default();
+                        // (#1398) Same optional-pattern-with-unrendered-fallback
+                        // shape as `description_pattern` above — an expanding
+                        // template usually doesn't need a per-copy label
+                        // (`display_name_pattern` absent falls back to the
+                        // template's own `display_name` verbatim, unrendered).
+                        let display_name = spec
+                            .display_name_pattern
+                            .as_deref()
+                            .map(|p| render(p, index, name))
+                            .or_else(|| task_cfg.display_name.clone());
                         push_task(
                             &mut tasks,
                             &real_task_id,
                             &real_phase_id,
                             description,
+                            display_name,
                             vec![real_step_id.clone()],
                             override_,
                             task_cfg.role_id.as_deref(),
@@ -182,6 +197,7 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<(Vec<T
                         &real_task_id,
                         &real_phase_id,
                         description,
+                        task_cfg.display_name.clone(),
                         step_ids,
                         override_,
                         task_cfg.role_id.as_deref(),
@@ -352,6 +368,7 @@ fn push_task(
     real_task_id: &str,
     real_phase_id: &str,
     description: String,
+    display_name: Option<String>,
     step_ids: Vec<String>,
     override_: Option<&TaskOverride>,
     doc_role_id: Option<&str>,
@@ -372,6 +389,7 @@ fn push_task(
         .and_then(|o| o.role_id.clone())
         .or_else(|| doc_role_id.map(String::from));
     let description = override_.and_then(|o| o.description.clone()).unwrap_or(description);
+    let display_name = override_.and_then(|o| o.display_name.clone()).or(display_name);
     let profile_name = override_.and_then(|o| o.profile_name.clone());
     let workdir = override_.and_then(|o| o.workdir.clone());
     let image = override_.and_then(|o| o.image.clone());
@@ -379,6 +397,7 @@ fn push_task(
         id: real_task_id.to_string(),
         phase_id: real_phase_id.to_string(),
         description,
+        display_name,
         step_ids,
         depends_on: Vec::new(),
         role_id,
@@ -432,6 +451,7 @@ mod tests {
         TaskConfig {
             id: id.to_string(),
             description: Some(format!("do {id}")),
+            display_name: None,
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             role_id: role_id.map(String::from),
             steps,
@@ -441,7 +461,7 @@ mod tests {
     }
 
     fn phase(id: &str, tasks: Vec<TaskConfig>) -> PhaseConfig {
-        PhaseConfig { id: id.to_string(), description: None, tasks, extras: Map::new() }
+        PhaseConfig { id: id.to_string(), description: None, display_name: None, tasks, extras: Map::new() }
     }
 
     fn doc(phases: Vec<PhaseConfig>) -> MissionConfig {
@@ -538,6 +558,53 @@ mod tests {
         assert_eq!(verify.role_id.as_deref(), Some("code-reviewer"));
     }
 
+    // ── (#1398) display_name threading ──────────────────────────────────
+
+    #[test]
+    fn task_display_name_survives_from_the_document_when_no_override_is_supplied() {
+        let mut t = task("build-coder", &[], Some("coder"), vec![step("build-coder-step", "mission.coder", serde_json::Value::Null)]);
+        t.display_name = Some("Build".to_string());
+        let cfg = doc(vec![phase("build", vec![t])]);
+        let mut phase_ids = Map::new();
+        phase_ids.insert("build".to_string(), "s1".to_string());
+        let params = LaunchParams { phase_ids, ..Default::default() };
+
+        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        assert_eq!(tasks[0].display_name.as_deref(), Some("Build"));
+    }
+
+    #[test]
+    fn task_display_name_is_none_when_the_document_does_not_set_one() {
+        let cfg = doc(vec![phase(
+            "build",
+            vec![task("build-coder", &[], Some("coder"), vec![step("build-coder-step", "mission.coder", serde_json::Value::Null)])],
+        )]);
+        let mut phase_ids = Map::new();
+        phase_ids.insert("build".to_string(), "s1".to_string());
+        let params = LaunchParams { phase_ids, ..Default::default() };
+
+        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        assert_eq!(tasks[0].display_name, None, "no display_name in the doc -> None, renderers fall back to id");
+    }
+
+    #[test]
+    fn task_override_display_name_wins_over_the_document_default() {
+        let mut t = task("build-coder", &[], Some("coder"), vec![step("build-coder-step", "mission.coder", serde_json::Value::Null)]);
+        t.display_name = Some("Build".to_string());
+        let cfg = doc(vec![phase("build", vec![t])]);
+        let mut phase_ids = Map::new();
+        phase_ids.insert("build".to_string(), "s1".to_string());
+        let mut task_overrides = Map::new();
+        task_overrides.insert(
+            "build-coder".to_string(),
+            TaskOverride { display_name: Some("Ship it".to_string()), ..Default::default() },
+        );
+        let params = LaunchParams { phase_ids, task_overrides, ..Default::default() };
+
+        let (tasks, _steps) = interpret(&cfg, &params).unwrap();
+        assert_eq!(tasks[0].display_name.as_deref(), Some("Ship it"));
+    }
+
     #[test]
     fn step_config_override_replaces_the_document_default() {
         let cfg = doc(vec![phase(
@@ -587,6 +654,7 @@ mod tests {
                 TaskConfig {
                     id: "review-probe-template-task".to_string(),
                     description: Some("PLACEHOLDER".to_string()),
+                    display_name: None,
                     depends_on: vec!["review-bundle-task".to_string()],
                     role_id: None,
                     steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
@@ -596,6 +664,7 @@ mod tests {
                         step_id_pattern: "review-probe-{index}-step".to_string(),
                         kind_pattern: "{kind}:{name}".to_string(),
                         description_pattern: Some("probe seat `{name}`".to_string()),
+                        display_name_pattern: Some("Probe `{name}`".to_string()),
                         extras: Map::new(),
                     }),
                     extras: Map::new(),
@@ -629,6 +698,11 @@ mod tests {
         assert_eq!(steps["review-probe-0-step"].kind, "review.probe:alpha");
         assert_eq!(steps["review-probe-1-step"].kind, "review.probe:bravo");
 
+        // (#1398) `display_name_pattern` renders per-copy, same as
+        // `description_pattern` does.
+        assert_eq!(by_id["review-probe-0-task"].display_name.as_deref(), Some("Probe `alpha`"));
+        assert_eq!(by_id["review-probe-1-task"].display_name.as_deref(), Some("Probe `bravo`"));
+
         // the dedup task's depends_on rewrote from the SINGLE template id
         // to BOTH real expanded probe task ids.
         assert_eq!(
@@ -645,6 +719,7 @@ mod tests {
                 TaskConfig {
                     id: "review-probe-template-task".to_string(),
                     description: None,
+                    display_name: None,
                     depends_on: vec![],
                     role_id: None,
                     steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
@@ -654,6 +729,7 @@ mod tests {
                         step_id_pattern: "review-probe-{index}-step".to_string(),
                         kind_pattern: "{kind}:{name}".to_string(),
                         description_pattern: None,
+                        display_name_pattern: None,
                         extras: Map::new(),
                     }),
                     extras: Map::new(),
@@ -784,6 +860,7 @@ mod tests {
         TaskConfig {
             id: "template".to_string(),
             description: None,
+            display_name: None,
             depends_on: vec![],
             role_id: None,
             steps,
@@ -793,6 +870,7 @@ mod tests {
                 step_id_pattern: step_id_pattern.to_string(),
                 kind_pattern: "{kind}:{name}".to_string(),
                 description_pattern: None,
+                display_name_pattern: None,
                 extras: Map::new(),
             }),
             extras: Map::new(),

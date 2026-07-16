@@ -2,7 +2,7 @@
   "id": "review",
   "name": "PR Review",
   "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired from `darkmux pr-review run` in Packet 4b): investigate (resolve bundles from the diff, probe every staffed seat, dedup the flags) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of Packet 3, this document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config, resolves crew_staffing into the probe-template task's `expand` collection, and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
-  "schema_version": "1.1",
+  "schema_version": "1.2",
   "inputs": [
     {
       "name": "diff_file",
@@ -103,6 +103,7 @@
   "phases": [
     {
       "id": "investigate",
+      "display_name": "Investigate",
       "description": "resolve review bundles from the diff, probe every staffed seat, dedup",
       "tasks": [
         {
@@ -156,6 +157,7 @@
     },
     {
       "id": "adjudicate",
+      "display_name": "Adjudicate",
       "description": "double-confirm judge over deduped flags",
       "tasks": [
         {
@@ -178,6 +180,7 @@
     },
     {
       "id": "report",
+      "display_name": "Report",
       "description": "verify confirmed findings, synthesize tier counts",
       "tasks": [
         {

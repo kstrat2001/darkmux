@@ -9,26 +9,40 @@
 //! snapshot only; the page's own SSE subscription (`/flow/:date/stream`)
 //! layers status deltas on top client-side by matching a step-lifecycle
 //! record's `handle` field against a node id already present in this
-//! snapshot (see `assets/mission-graph.html`'s `applyFlowRecord`). No
-//! flow-record read happens here.
+//! snapshot, and a row within that node's `steps` array (see
+//! `assets/mission-graph.html`'s `applyFlowRecord`). No flow-record read
+//! happens here.
 //!
-//! **Schema note (deviation from the original #1284 design comment):**
-//! post-#1341, `Step` carries no `depends_on` of its own — ALL real
-//! dependency/concurrency semantics live at `Task::depends_on` (see that
-//! field's doc in `darkmux_crew::types`). This module derives step-level
-//! `depends_on` EDGES for the diagram (so a fan-in like N probe steps
-//! feeding one dedup step stays visually legible) from the OWNING tasks'
-//! `depends_on`: an edge runs from an upstream task's LAST step to a
-//! downstream task's FIRST step, mirroring `Step::output`'s own doc
-//! ("an upstream Task's output reaches ONLY the downstream Task's FIRST
-//! step"). The edges are diagram-only — never fed back into the
-//! scheduler.
+//! **Steps render as ROWS inside their owning Task node, not separate
+//! nodes (#1401).** post-#1341, `Step` carries no `depends_on` of its own —
+//! ALL real dependency/concurrency semantics live at `Task::depends_on`
+//! (see that field's doc in `darkmux_crew::types`) — and the overwhelming
+//! majority of production Tasks carry exactly one Step, so a separate Step
+//! node doubled the node count without adding graph-shape information. A
+//! Task node now carries its full `steps: Vec<StepRow>` (kind display
+//! label + status, in `Task.step_ids` order); the derived step-to-step
+//! edge synthesis this module previously built (an upstream task's LAST
+//! step → a downstream task's FIRST step) retires along with the step
+//! nodes it connected — `depends_on` edges connect TASK nodes directly on
+//! the real `Task::depends_on`, one edge per dependency, no step-level
+//! detour needed.
+//!
+//! **Kind fallback chain for a step's label (#1402).** A step that hasn't
+//! dispatched yet may have no persisted Step file — only STATUS is
+//! legitimately unknown mid-run; the KIND is fixed at mint time and frozen
+//! into `config-snapshot.json` (see [`kind_from_config_snapshot`]). Once a
+//! kind (persisted or recovered) is known, [`resolve_step_label`] resolves
+//! its human label: registered `StepKind::display_name()` → the raw kind
+//! id itself → the step id → `"unknown"` (a genuinely unconstructible/
+//! foreign kind with no snapshot either — the deep fallback, not the
+//! common case).
 
 use darkmux_crew::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus, Step, Task};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// One node in the rendered graph — a Phase, a Task, or a Step.
+/// One node in the rendered graph — a Phase or a Task (steps render as
+/// rows inside a Task node, see the module doc — #1401).
 ///
 /// **Wire casing contract:** serialized `camelCase` (`parentId`,
 /// `startedTs`, `completedTs`) because the CONSUMER is JS
@@ -54,11 +68,43 @@ pub struct GraphNode {
     pub completed_ts: Option<u64>,
     /// Layering depth for layout (0 = a root with no known upstream
     /// dependency). Phase nodes use their position in
-    /// `Mission::phase_ids`; task/step nodes use the task-dependency
+    /// `Mission::phase_ids`; task nodes use the task-dependency
     /// longest-path depth computed by [`layer_tasks_by_depth`].
     /// Diagram-only, never scheduler-authoritative — see that function's
     /// doc for the cycle/dangling-reference fallback.
     pub depth: usize,
+    /// (#1398) The FULL phase/task description, for a tooltip/detail
+    /// affordance — `label` above is the short operator-facing name
+    /// (`display_name` → `id`, never `description`), so the long text
+    /// (which for `coder-phase` doubles as the coder's dispatch brief)
+    /// stays one hover away rather than truncating the node itself. `None`
+    /// when the phase/task has no description text at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// (#1401) One row per Step in `Task.step_ids` order — empty for a
+    /// phase node. The page renders each row as `label` + a status dot (a
+    /// `"running"` row pulses); `id` is what the page's SSE handler
+    /// matches an incoming step-lifecycle record's `handle` against to
+    /// flip a row's status in place, without needing a separate node to
+    /// look up.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepRow>,
+}
+
+/// One row inside a Task node's card (#1401). Same `camelCase` wire
+/// contract as [`GraphNode`].
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StepRow {
+    pub id: String,
+    /// Resolved via [`resolve_step_label`] — StepKind display name → kind
+    /// id → step id → `"unknown"` (#1402).
+    pub label: String,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_ts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_ts: Option<u64>,
 }
 
 /// One edge in the rendered graph. Same `camelCase` wire contract as
@@ -71,8 +117,9 @@ pub struct GraphEdge {
     pub id: String,
     pub source: String,
     pub target: String,
-    /// `"contains"` (phase→task, task→step) or `"depends_on"` (a real
-    /// scheduler dependency, derived to step granularity — see module doc).
+    /// `"contains"` (phase→task) or `"depends_on"` (a real `Task::depends_on`
+    /// dependency — #1401 retired the derived step-granularity edges this
+    /// used to carry; every dependency edge connects two TASK nodes now).
     pub kind: &'static str,
 }
 
@@ -125,6 +172,18 @@ fn node_status_str(s: NodeStatus) -> &'static str {
         NodeStatus::Complete => "complete",
         NodeStatus::Abandoned => "abandoned",
         NodeStatus::Error => "error",
+    }
+}
+
+/// Non-empty description text, or `None` — shared by phase/task node
+/// construction so an empty-string `description` (the zero value every
+/// `Phase`/`Task` literal defaults to) doesn't round-trip as a present but
+/// useless tooltip (#1398).
+fn description_or_none(text: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text.to_string())
     }
 }
 
@@ -277,6 +336,221 @@ fn current_millis() -> u64 {
         .unwrap_or(0)
 }
 
+// ─── Step kind display-name fallback chain (#1402) ─────────────────────
+
+/// (#1402) Static kind-id → display-name table for `src/mission_run.rs`'s
+/// three Tier 3 `mission.*` kinds — `darkmux-serve` structurally cannot
+/// depend on the root `darkmux` binary crate (that crate depends on
+/// `darkmux-serve` to embed the daemon; the reverse edge would be
+/// circular), so unlike `review.*` (visible via the already-present
+/// `darkmux-lab` dependency, see [`darkmux_lab::lab::review::review_step_kind_display_name`]),
+/// this table can't call into the real `StepKind::display_name()` impls
+/// directly. It's a literal duplication, guarded per #1352's "a
+/// conformance test in a crate that sees both is acceptable and preferred
+/// over duplication without a guard": the root crate (which depends on
+/// BOTH this crate and owns `mission_run.rs`) pins this table against the
+/// live impls in its own test suite
+/// (`mission_run::tests::mission_step_kind_display_names_match_this_table`).
+pub fn mission_step_kind_display_name(kind: &str) -> Option<&'static str> {
+    match kind {
+        "mission.worktree" => Some("Worktree"),
+        "mission.coder" => Some("Coder"),
+        "mission.verify" => Some("Verify (QA)"),
+        _ => None,
+    }
+}
+
+/// The full display-name resolution, trying every kind family this crate
+/// can see: Tier 1 builtins (via the real registry — `darkmux-serve`
+/// already depends on `darkmux-crew`), Tier 3 `review.*` (via
+/// `darkmux-lab`, already a dependency), then Tier 3 `mission.*` (the
+/// static table above, this crate's own literal). `None` when `kind`
+/// isn't recognized by any of them — the caller falls back further (see
+/// [`resolve_step_label`]).
+fn step_kind_display_name(kind: &str) -> Option<&'static str> {
+    if let Ok(k) = darkmux_crew::step_kinds::StepKindRegistry::with_builtins().get(kind) {
+        return Some(k.display_name());
+    }
+    if let Some(n) = darkmux_lab::lab::review::review_step_kind_display_name(kind) {
+        return Some(n);
+    }
+    mission_step_kind_display_name(kind)
+}
+
+/// (#1402) The full label fallback chain a step row renders:
+/// StepKind display name → the raw kind id itself → the step id →
+/// `"unknown"` (a deep fallback reserved for a genuinely unconstructible/
+/// foreign kind with an empty id AND no step id — which never happens in
+/// practice, since every node always has an id; kept for defensive
+/// completeness).
+pub fn resolve_step_label(kind: &str, step_id: &str) -> String {
+    if kind.is_empty() {
+        return if step_id.is_empty() { "unknown".to_string() } else { step_id.to_string() };
+    }
+    step_kind_display_name(kind).map(str::to_string).unwrap_or_else(|| kind.to_string())
+}
+
+// ─── config-snapshot kind recovery for synthesized steps (#1402) ───────
+
+/// (#1402 point 1) Recover a step's real `kind` from the mission's frozen
+/// `config-snapshot.json` when no Step file has been persisted for it yet
+/// (mid-run — see `build_mission_graph`'s doc). Only STATUS is legitimately
+/// unknown mid-run (`Planned` is the correct default); the KIND was fixed
+/// at mint time and the snapshot is its authority.
+///
+/// Returns the doc's raw (unrendered) `StepConfig.kind` — for an EXPANDING
+/// template task this is the BASE kind (e.g. `"review.probe"`, not the
+/// per-seat-rendered `"review.probe:alpha"`), since recovering the exact
+/// per-copy name would require re-deriving the launcher's dynamic
+/// expansion inputs (e.g. staffed seat names), which this read-only path
+/// doesn't have. The base kind is enough for [`resolve_step_label`]'s
+/// fallback chain (`review_step_kind_display_name` prefix-matches
+/// `"review.probe"` to the same "Probe" label its per-seat form resolves
+/// to) — see [`pattern_matches`]'s doc for the matching mechanics.
+///
+/// `None` when the mission has no config-snapshot at all (a hand-authored
+/// mission, or one that predates #1284 Packet 4a) or the given ids don't
+/// match anything in it — the caller's own `"unknown"`-deep-fallback path
+/// still applies in that case, unchanged from before this feature.
+fn kind_from_config_snapshot(mission_id: &str, real_task_id: &str, real_step_id: &str) -> Option<String> {
+    let config = darkmux_crew::lifecycle::load_config_snapshot(mission_id).ok().flatten()?;
+    for phase in &config.phases {
+        // Mirrors `mission_launch::ensure_mission_and_phases_with_provenance`'s
+        // deterministic composition rule (`format!("{mission_id}-{}", p.id)`)
+        // — every config-launched instance's real phase id follows this
+        // convention, so it's derivable here with no launch-time state.
+        let real_phase_id = format!("{mission_id}-{}", phase.id);
+        for task_cfg in &phase.tasks {
+            match &task_cfg.expand {
+                Some(spec) => {
+                    if !pattern_matches(&spec.task_id_pattern, real_task_id) {
+                        continue;
+                    }
+                    if let Some(step_cfg) = task_cfg.steps.first() {
+                        if pattern_matches(&spec.step_id_pattern, real_step_id) {
+                            return Some(step_cfg.kind.clone());
+                        }
+                    }
+                }
+                None => {
+                    let candidate_task_id = substitute_id_placeholder_prefix(&task_cfg.id, &phase.id, &real_phase_id);
+                    if candidate_task_id != real_task_id {
+                        continue;
+                    }
+                    for step_cfg in &task_cfg.steps {
+                        let candidate_step_id =
+                            substitute_id_placeholder_prefix(&step_cfg.id, &phase.id, &real_phase_id);
+                        if candidate_step_id == real_step_id {
+                            return Some(step_cfg.kind.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The placeholder-prefix rule (`darkmux_crew::mission_config::TaskConfig`'s
+/// doc — this is a local, read-only mirror of `mission_config::interpret`'s
+/// private `substitute_id`, duplicated rather than exported since it's 8
+/// lines and this crate has no other reason to depend on `interpret`'s
+/// internals): if `id` is literally prefixed by `"<doc_phase_id>-"`,
+/// replace that PREFIX with `"<real_phase_id>-"`, keeping everything after
+/// it unchanged. An id with no such prefix (the FIXED-id convention, e.g.
+/// review.json's `"review-bundle-task"`) passes through verbatim.
+fn substitute_id_placeholder_prefix(id: &str, doc_phase_id: &str, real_phase_id: &str) -> String {
+    if real_phase_id == doc_phase_id {
+        return id.to_string();
+    }
+    let prefix = format!("{doc_phase_id}-");
+    match id.strip_prefix(prefix.as_str()) {
+        Some(rest) => format!("{real_phase_id}-{rest}"),
+        None => id.to_string(),
+    }
+}
+
+/// Structural match of an expansion pattern (e.g. `"review-probe-{index}-task"`)
+/// against a candidate real id, treating `{index}`/`{name}` as wildcards —
+/// this read-only path doesn't have the launcher's actual index/name
+/// values (those are dynamic, resolved from crew staffing at launch time),
+/// so it can't RENDER the pattern and compare strings; instead it checks
+/// that `candidate` starts with the pattern's literal text before the
+/// placeholder and ends with the literal text after it (and, for a pattern
+/// with more than one placeholder, that every literal segment between them
+/// appears in order) — sufficient to recognize "this real id plausibly
+/// came from this template" without knowing which specific item it was.
+fn pattern_matches(pattern: &str, candidate: &str) -> bool {
+    let segments = split_on_placeholders(pattern);
+    let mut cur = candidate;
+    let last = segments.len().saturating_sub(1);
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        let is_first = i == 0;
+        let is_last = i == last;
+        if is_first && is_last {
+            // No placeholder in the pattern at all — a single literal
+            // segment requires an EXACT match, not just a prefix (a
+            // `starts_with`-only check here would let "fixed-task-2"
+            // falsely match the fixed id "fixed-task").
+            if cur != seg.as_str() {
+                return false;
+            }
+            cur = "";
+        } else if is_first {
+            let Some(rest) = cur.strip_prefix(seg.as_str()) else {
+                return false;
+            };
+            cur = rest;
+        } else if is_last {
+            if !cur.ends_with(seg.as_str()) {
+                return false;
+            }
+        } else {
+            match cur.find(seg.as_str()) {
+                Some(pos) => cur = &cur[pos + seg.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Split `pattern` into literal segments around every `{index}`/`{name}`
+/// placeholder occurrence, e.g. `"review-probe-{index}-task"` →
+/// `["review-probe-", "-task"]`. A pattern with no placeholder at all
+/// yields one segment (the whole literal string) — [`pattern_matches`]
+/// then requires an exact `starts_with`+`ends_with` on that single literal,
+/// which for a one-segment list means an exact substring match.
+fn split_on_placeholders(pattern: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut rest = pattern;
+    loop {
+        let next_index = rest.find("{index}");
+        let next_name = rest.find("{name}");
+        let next = match (next_index, next_name) {
+            (Some(i), Some(n)) => Some(i.min(n)),
+            (Some(i), None) => Some(i),
+            (None, Some(n)) => Some(n),
+            (None, None) => None,
+        };
+        match next {
+            None => {
+                segments.push(rest.to_string());
+                break;
+            }
+            Some(pos) => {
+                segments.push(rest[..pos].to_string());
+                let tok_len = if rest[pos..].starts_with("{index}") { 7 } else { 6 };
+                rest = &rest[pos + tok_len..];
+            }
+        }
+    }
+    segments
+}
+
 /// Build the full node-link graph for one mission. `Ok(None)` when no
 /// mission with this id exists (the route answers 404).
 ///
@@ -284,24 +558,24 @@ fn current_millis() -> u64 {
 /// filesystem read here is `unwrap_or_default`, but the underlying
 /// `lifecycle::load_tasks_for_phase`/`load_steps_for_phase` readers
 /// (`load_json_dir`) `?`-propagate on the FIRST unreadable/corrupt file —
-/// so one corrupt step JSON drops that phase's ENTIRE step set (the page
-/// then shows that phase's steps as synthesized `planned` placeholders,
-/// see below), it does not skip just the one bad file. Per-file leniency
-/// would need a change in `darkmux-crew`'s `load_json_dir`, deliberately
-/// not made from this read-only viewer feature — a possible future
-/// improvement if corrupt single files show up in practice.
+/// so one corrupt step JSON drops that phase's ENTIRE step set (that
+/// phase's steps then render as synthesized `planned` rows, see below), it
+/// does not skip just the one bad file. Per-file leniency would need a
+/// change in `darkmux-crew`'s `load_json_dir`, deliberately not made from
+/// this read-only viewer feature — a possible future improvement if
+/// corrupt single files show up in practice.
 ///
 /// **Mid-run step synthesis:** the three production graph runners persist
 /// Step JSONs only AFTER `run_step_graph` returns (`mission_run.rs`,
 /// `mission_launch.rs`, `review.rs`) — so a page opened DURING a run sees
-/// tasks whose `step_ids` name steps with no file on disk yet. Rather
-/// than omitting those nodes (which would leave the SSE layer with no
-/// node to animate — the scheduler's `step start`/`step complete` records
-/// key on step id — and would leave cross-task dependency edges pointing
-/// at nonexistent nodes), every `step_ids` entry with no persisted file
-/// gets a synthesized `planned` step node (kind label `"unknown"` until
-/// the file exists). Self-contained fix on the read side; the writers are
-/// deliberately untouched.
+/// tasks whose `step_ids` name steps with no file on disk yet. Rather than
+/// omitting those rows (which would leave the SSE layer with no row to
+/// animate — the scheduler's `step start`/`step complete` records key on
+/// step id), every `step_ids` entry with no persisted file gets a
+/// synthesized `planned` row whose KIND is recovered from
+/// `config-snapshot.json` when available (#1402 — see
+/// [`kind_from_config_snapshot`]), falling back to the deep `"unknown"`
+/// chain only when no snapshot exists either.
 pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGraph>> {
     let missions = darkmux_crew::loader::load_missions().unwrap_or_default();
     let Some(mission) = missions.into_iter().find(|m: &Mission| m.id == mission_id) else {
@@ -354,13 +628,15 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
         };
         nodes.push(GraphNode {
             id: phase.id.clone(),
-            label: phase.description.clone(),
+            label: phase.display_name.clone().unwrap_or_else(|| phase.id.clone()),
             kind: "phase",
             status: phase_status_str(phase.status),
             parent_id: None,
             started_ts: phase.started_ts,
             completed_ts: phase.completed_ts,
             depth: phase_index,
+            description: description_or_none(&phase.description),
+            steps: Vec::new(),
         });
 
         let tasks = tasks_by_phase.remove(phase_id).unwrap_or_default();
@@ -392,94 +668,64 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
             } else {
                 None
             };
+
+            // (#1401) Steps render as ROWS on the task node, in
+            // `Task.step_ids` order — a synthesized (not-yet-persisted)
+            // step's kind is recovered from config-snapshot.json when
+            // possible (#1402), never hardcoded "unknown".
+            let step_rows: Vec<StepRow> = task
+                .step_ids
+                .iter()
+                .map(|step_id| match steps.get(step_id) {
+                    Some(step) => StepRow {
+                        id: step.id.clone(),
+                        label: resolve_step_label(&step.kind, &step.id),
+                        status: node_status_str(step.status),
+                        started_ts: step.started_ts,
+                        completed_ts: step.completed_ts,
+                    },
+                    None => {
+                        let kind = kind_from_config_snapshot(mission_id, &task.id, step_id)
+                            .unwrap_or_default();
+                        StepRow {
+                            id: step_id.clone(),
+                            label: resolve_step_label(&kind, step_id),
+                            status: node_status_str(NodeStatus::Planned),
+                            started_ts: None,
+                            completed_ts: None,
+                        }
+                    }
+                })
+                .collect();
+
             nodes.push(GraphNode {
                 id: task.id.clone(),
-                label: task.description.clone(),
+                label: task.display_name.clone().unwrap_or_else(|| task.id.clone()),
                 kind: "task",
                 status: node_status_str(status),
                 parent_id: Some(phase.id.clone()),
                 started_ts,
                 completed_ts,
                 depth: *task_depth.get(&task.id).unwrap_or(&0),
+                description: description_or_none(&task.description),
+                steps: step_rows,
             });
 
-            // Intra-task step containment + sequence edges (step at index i
-            // depends on step at index i-1 — see `Step`'s doc; no
-            // `Step::depends_on` field exists post-#1341). Every step_ids
-            // entry produces a node — synthesized `planned` when the file
-            // isn't on disk yet (see the fn doc) — so the SSE layer always
-            // has a node to flip and the dependency edges below always have
-            // both endpoints.
-            for (i, step_id) in task.step_ids.iter().enumerate() {
-                let node = match steps.get(step_id) {
-                    Some(step) => GraphNode {
-                        id: step.id.clone(),
-                        label: step.kind.clone(),
-                        kind: "step",
-                        status: node_status_str(step.status),
-                        parent_id: Some(task.id.clone()),
-                        started_ts: step.started_ts,
-                        completed_ts: step.completed_ts,
-                        depth: *task_depth.get(&task.id).unwrap_or(&0),
-                    },
-                    None => GraphNode {
-                        id: step_id.clone(),
-                        label: "unknown".to_string(),
-                        kind: "step",
-                        status: node_status_str(NodeStatus::Planned),
-                        parent_id: Some(task.id.clone()),
-                        started_ts: None,
-                        completed_ts: None,
-                        depth: *task_depth.get(&task.id).unwrap_or(&0),
-                    },
-                };
-                nodes.push(node);
-                edges.push(GraphEdge {
-                    id: format!("contains:{}:{}", task.id, step_id),
-                    source: task.id.clone(),
-                    target: step_id.clone(),
-                    kind: "contains",
-                });
-                if i > 0 {
-                    let prev = &task.step_ids[i - 1];
-                    edges.push(GraphEdge {
-                        id: format!("depends_on:{}:{}", prev, step_id),
-                        source: prev.clone(),
-                        target: step_id.clone(),
-                        kind: "depends_on",
-                    });
-                }
-            }
-
-            // Cross-task dependency edges, at STEP granularity: an upstream
-            // task's LAST step feeds a downstream task's FIRST step — this
-            // is what keeps a fan-in (N probe steps -> one dedup step)
-            // visually legible instead of collapsing to a single task-level
-            // edge. Both endpoints are guaranteed to exist as nodes (real or
-            // synthesized — see above). A dependency naming a task with no
-            // steps at all, or an unknown task id, is skipped rather than
-            // guessed at. Duplicate `depends_on` entries on a Task are
-            // deduped here (`seen_dep_edges`) so React never receives two
-            // edges with the same key.
+            // (#1401) Cross-task dependency edges connect TASK nodes
+            // directly on the real `Task::depends_on` — the derived
+            // step-granularity fan-in edges this module used to synthesize
+            // (upstream task's last step → downstream task's first step)
+            // retired along with the step nodes they connected; a real
+            // Task dependency is now exactly one edge, no detour needed.
             for dep_task_id in &task.depends_on {
-                let Some(dep_last_step) = all_tasks
-                    .iter()
-                    .find(|t| &t.id == dep_task_id)
-                    .and_then(|t| t.step_ids.last())
-                else {
-                    continue;
-                };
-                let Some(first_step) = task.step_ids.first() else {
-                    continue;
-                };
-                let edge_id = format!("depends_on:{}:{}", dep_last_step, first_step);
+                let edge_id = format!("depends_on:{dep_task_id}:{}", task.id);
                 if !seen_dep_edges.insert(edge_id.clone()) {
                     continue;
                 }
                 edges.push(GraphEdge {
                     id: edge_id,
-                    source: dep_last_step.clone(),
-                    target: first_step.clone(),
+                    source: dep_task_id.clone(),
+                    target: task.id.clone(),
                     kind: "depends_on",
                 });
             }
@@ -522,6 +768,7 @@ mod tests {
             id: id.to_string(),
             phase_id: "p1".to_string(),
             description: format!("task {id}"),
+            display_name: None,
             step_ids: step_ids.iter().map(|s| s.to_string()).collect(),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             role_id: None,
@@ -622,5 +869,74 @@ mod tests {
             derive_task_status(&[NodeStatus::Complete, NodeStatus::Planned]),
             NodeStatus::Planned
         );
+    }
+
+    // ─── resolve_step_label (#1402) ─────────────────────────────────────
+
+    #[test]
+    fn resolve_step_label_tier1_kind_resolves_via_the_registry() {
+        assert_eq!(resolve_step_label("dispatch.internal", "s1"), "Dispatch");
+        assert_eq!(resolve_step_label("procedural.noop", "s1"), "No-op");
+    }
+
+    #[test]
+    fn resolve_step_label_review_kind_resolves_via_darkmux_lab() {
+        assert_eq!(resolve_step_label("review.bundle", "s1"), "Bundle");
+        assert_eq!(resolve_step_label("review.probe:alpha", "s1"), "Probe");
+    }
+
+    #[test]
+    fn resolve_step_label_mission_kind_resolves_via_the_static_table() {
+        assert_eq!(resolve_step_label("mission.coder", "s1"), "Coder");
+        assert_eq!(resolve_step_label("mission.verify", "s1"), "Verify (QA)");
+    }
+
+    #[test]
+    fn resolve_step_label_falls_back_to_the_raw_kind_id_when_unrecognized() {
+        assert_eq!(resolve_step_label("some.custom.kind", "s1"), "some.custom.kind");
+    }
+
+    #[test]
+    fn resolve_step_label_falls_back_to_the_step_id_when_kind_is_empty() {
+        assert_eq!(resolve_step_label("", "s1"), "s1");
+    }
+
+    #[test]
+    fn resolve_step_label_deep_fallback_is_unknown_only_when_both_are_empty() {
+        assert_eq!(resolve_step_label("", ""), "unknown");
+    }
+
+    // ─── pattern_matches / split_on_placeholders (#1402) ────────────────
+
+    #[test]
+    fn pattern_matches_single_index_placeholder() {
+        assert!(pattern_matches("review-probe-{index}-task", "review-probe-0-task"));
+        assert!(pattern_matches("review-probe-{index}-task", "review-probe-17-task"));
+        assert!(!pattern_matches("review-probe-{index}-task", "review-dedup-task"));
+    }
+
+    #[test]
+    fn pattern_matches_name_placeholder() {
+        assert!(pattern_matches("review-probe-{name}-task", "review-probe-alpha-task"));
+    }
+
+    #[test]
+    fn pattern_matches_no_placeholder_requires_exact_containment() {
+        assert!(pattern_matches("fixed-task", "fixed-task"));
+        assert!(!pattern_matches("fixed-task", "fixed-task-2"));
+    }
+
+    #[test]
+    fn pattern_matches_rejects_a_candidate_missing_the_suffix() {
+        assert!(!pattern_matches("review-probe-{index}-task", "review-probe-0"));
+    }
+
+    // ─── kind_from_config_snapshot (#1402) ──────────────────────────────
+
+    #[test]
+    fn kind_from_config_snapshot_none_when_no_snapshot_exists() {
+        // No mission dir at all under this id in the test's isolated
+        // DARKMUX_CREW_DIR — the function must return None, not error.
+        assert_eq!(kind_from_config_snapshot("no-such-mission-xyz", "t1", "s1"), None);
     }
 }

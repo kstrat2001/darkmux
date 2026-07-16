@@ -335,6 +335,7 @@ mod tests {
             id: phase_id.to_string(),
             mission_id: mission_id.to_string(),
             description: "test phase".to_string(),
+            display_name: None,
             status: PhaseStatus::Running,
             created_ts: 1_700_000_000,
             started_ts: Some(1_700_000_000),

@@ -287,6 +287,7 @@ fn synthesize_config_snapshot(mission_id: &str) -> Result<()> {
         phases.push(PhaseConfig {
             id: phase.id,
             description: Some(phase.description),
+            display_name: phase.display_name,
             tasks: Vec::new(),
             extras: BTreeMap::new(),
         });

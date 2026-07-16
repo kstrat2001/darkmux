@@ -371,6 +371,7 @@ mod tests {
             id: id.into(),
             mission_id: mid.into(),
             description: "d".into(),
+            display_name: None,
             status,
             created_ts: 0,
             started_ts: None,

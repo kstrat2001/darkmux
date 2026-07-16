@@ -62,14 +62,12 @@
   .msg{padding:40px;color:var(--muted);font:13px 'JetBrains Mono',monospace}
   /* React Flow node chrome — the base package supplies layout/interaction
      CSS (vendored); this styles OUR node content. */
-  .mnode{border-radius:7px;border:1px solid var(--line);background:var(--panel);padding:8px 10px;min-width:160px;max-width:240px;font-family:'Inter',sans-serif}
+  .mnode{border-radius:7px;border:1px solid var(--line);background:var(--panel);padding:8px 10px;min-width:170px;max-width:260px;font-family:'Inter',sans-serif}
   .mnode .mn-label{font:600 12px/1.3 'JetBrains Mono',monospace;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .mnode .mn-kind{font:10px/1 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:3px}
   .mnode.k-phase{background:var(--bg2);border-color:var(--amber-dim);min-width:200px}
   .mnode.k-phase .mn-label{font-size:13px}
   .mnode.k-task{border-style:solid}
-  .mnode.k-step{padding:6px 9px;min-width:120px}
-  .mnode.k-step .mn-label{font-size:11px}
   .mnode.s-planned{border-color:var(--line)}
   .mnode.s-running{border-color:var(--run);box-shadow:0 0 0 1px var(--run)}
   .mnode.s-running .mn-label{color:var(--run)}
@@ -80,6 +78,20 @@
   .mnode.s-error{border-color:var(--bad)}
   .mnode.s-error .mn-label{color:var(--bad)}
   .mnode.s-abandoned{border-color:var(--muted);opacity:.6}
+  /* (#1401) Step ROWS inside a task node's card — replaces the former
+     separate step-node styling above. Each row is kind label + a status
+     dot; a running row's dot pulses (same @keyframes lpulse the top-level
+     livepill/node-corner indicators already use). */
+  .mnode .mn-steps{margin-top:6px;padding-top:6px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:4px}
+  .mnode .mn-step-row{display:flex;align-items:center;gap:6px;font:11px/1.3 'JetBrains Mono',monospace;color:var(--muted)}
+  .mnode .mn-step-row .mn-step-dot{display:inline-block;flex:0 0 auto;width:6px;height:6px;border-radius:50%;background:var(--line)}
+  .mnode .mn-step-row .mn-step-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mnode .mn-step-row.s-running .mn-step-dot{background:var(--run);animation:lpulse 1.1s ease-in-out infinite}
+  .mnode .mn-step-row.s-running .mn-step-label{color:var(--run)}
+  .mnode .mn-step-row.s-complete .mn-step-dot{background:var(--good)}
+  .mnode .mn-step-row.s-error .mn-step-dot{background:var(--bad)}
+  .mnode .mn-step-row.s-error .mn-step-label{color:var(--bad)}
+  .mnode .mn-step-row.s-abandoned .mn-step-dot{background:var(--muted);opacity:.6}
   .react-flow__edge-path{stroke:var(--muted)}
   .react-flow__edge.edge-depends_on .react-flow__edge-path{stroke:var(--amber-dim);stroke-width:1.6}
   .react-flow__edge.edge-contains .react-flow__edge-path{stroke:var(--line);stroke-dasharray:3 3}
@@ -116,36 +128,31 @@ function missionIdFromPath(){
 
 // ─── layout (pure function — the JS-side counterpart to the Rust
 // `layer_tasks_by_depth`, which already stamped `depth` onto every task
-// and step node server-side). Positions nodes in bands: one band per
-// phase (stacked top-to-bottom), tasks within a band laid out left-to-
-// right by `depth` (so dependency order reads left-to-right and a
-// fan-in/fan-out stays legible), steps stacked immediately below/right
-// of their owning task. ─────────────────────────────────────────────────
-var COL_W = 260, TASK_MIN_PITCH = 92, TASK_HEADER_H = 56, STEP_ROW_H = 44,
-    TASK_GAP = 18, PHASE_LABEL_W = 40, BAND_GAP = 40, BAND_PAD = 56;
+// node server-side). Positions nodes in bands: one band per phase (stacked
+// top-to-bottom), tasks within a band laid out left-to-right by `depth`
+// (so dependency order reads left-to-right and a fan-in/fan-out stays
+// legible). (#1401) Steps no longer get their own position — they render
+// as rows INSIDE their owning task's card (see `MissionNode`), so the
+// per-task vertical pitch just needs to grow with the task's OWN step
+// count instead of laying out a separate node per step. ──────────────────
+var COL_W = 260, TASK_MIN_PITCH = 70, TASK_HEADER_H = 40, STEP_ROW_H = 20,
+    TASK_GAP = 16, PHASE_LABEL_W = 40, BAND_GAP = 40, BAND_PAD = 56;
 
-// Vertical space one task occupies INCLUDING its step stack — the per-task
-// pitch. A fixed pitch overlapped from the second step on (steps sat at
-// y+56+44*si while task rows advanced only 92), so the pitch now grows with
-// the task's step count (review-gate C3).
+// Vertical space one task's CARD occupies, header + its own row stack —
+// the per-task pitch, so cards in the same depth column don't overlap
+// (review-gate C3's original fixed-pitch bug, now keyed off the task's own
+// `steps` array length instead of a separately-positioned step node count).
 function taskPitch(stepCount){
   return Math.max(TASK_MIN_PITCH, TASK_HEADER_H + stepCount * STEP_ROW_H + TASK_GAP);
 }
 
 function computeLayout(nodes){
-  var byId = {};
-  nodes.forEach(function(n){ byId[n.id] = n; });
   var phases = nodes.filter(function(n){ return n.kind === "phase"; })
     .sort(function(a,b){ return a.depth - b.depth; });
   var tasksByPhase = {};
   nodes.filter(function(n){ return n.kind === "task"; }).forEach(function(n){
     var p = n.parentId || "__none__";
     (tasksByPhase[p] = tasksByPhase[p] || []).push(n);
-  });
-  var stepsByTask = {};
-  nodes.filter(function(n){ return n.kind === "step"; }).forEach(function(n){
-    var t = n.parentId || "__none__";
-    (stepsByTask[t] = stepsByTask[t] || []).push(n);
   });
 
   var positions = {};
@@ -166,12 +173,8 @@ function computeLayout(nodes){
       var x = PHASE_LABEL_W + COL_W + d * COL_W;
       var yCursor = bandTop + BAND_PAD;
       atDepth.forEach(function(t){
-        var steps = (stepsByTask[t.id] || []);
         positions[t.id] = {x: x, y: yCursor};
-        steps.forEach(function(s, si){
-          positions[s.id] = {x: x + 20, y: yCursor + TASK_HEADER_H + si * STEP_ROW_H};
-        });
-        yCursor += taskPitch(steps.length);
+        yCursor += taskPitch((t.steps || []).length);
       });
       maxColumnHeight = Math.max(maxColumnHeight, yCursor - (bandTop + BAND_PAD));
     }
@@ -185,12 +188,25 @@ function computeLayout(nodes){
 }
 
 // ─── node component ─────────────────────────────────────────────────────
+// (#1401) A task node renders its OWN steps as rows — kind display label
+// (server-resolved via the fallback chain — #1402) + a status dot; a
+// running row's dot pulses via the `.mn-step-row.s-running` CSS rule. A
+// phase node has no `steps` array (empty), so `mnSteps` is a no-op for it.
 function MissionNode(props){
   var d = props.data;
-  return h("div", {className: "mnode k-" + d.kind + " s-" + d.status},
+  var mnSteps = (d.steps && d.steps.length)
+    ? h("div", {className:"mn-steps"}, d.steps.map(function(s){
+        return h("div", {key: s.id, className: "mn-step-row s-" + s.status, title: s.label},
+          h("span", {className:"mn-step-dot"}),
+          h("span", {className:"mn-step-label"}, s.label)
+        );
+      }))
+    : null;
+  return h("div", {className: "mnode k-" + d.kind + " s-" + d.status, title: d.description || d.label},
     h(V.Handle, {type:"target", position: V.Position.Left, style:{opacity:0}}),
     h("div", {className:"mn-kind"}, d.kind),
-    h("div", {className:"mn-label", title: d.label}, d.label),
+    h("div", {className:"mn-label"}, d.label),
+    mnSteps,
     h(V.Handle, {type:"source", position: V.Position.Right, style:{opacity:0}})
   );
 }
@@ -204,7 +220,13 @@ function toRfNodes(graphNodes, positions){
       id: n.id,
       type: "missionNode",
       position: pos,
-      data: { label: n.label, kind: n.kind, status: n.status },
+      // (#1398) `description` carries the FULL phase/task description text
+      // (never the short `label`) into the node's `title` attribute — a
+      // hover tooltip, so the long text (which for coder-phase doubles as
+      // the coder's dispatch brief) stays available without crowding the
+      // card. (#1401) `steps` is the task's own row list; empty on a
+      // phase node.
+      data: { label: n.label, kind: n.kind, status: n.status, description: n.description, steps: n.steps || [] },
       draggable: true,
     };
   });
@@ -264,22 +286,57 @@ function statusRank(s){
 // mid-run the disk snapshot is all-planned; a replace would regress every
 // status the SSE stream had advanced (and the running pulse would flicker
 // off every 20 seconds).
+//
+// (#1401) The SAME monotone merge now also applies ONE LEVEL DOWN, per
+// STEP ROW inside a task's `steps` array — a step row is where SSE deltas
+// actually land (see `onMessage` below), so without this a reconcile tick
+// would regress a row's live "running"/"complete" status back to the
+// disk snapshot's stale "planned" the instant it lags the stream, exactly
+// the flicker this function already exists to prevent at the node level.
 function mergeGraphs(prevGraph, fresh){
   if (!prevGraph) return fresh;
   var prevStatus = {};
-  prevGraph.nodes.forEach(function(n){ prevStatus[n.id] = n.status; });
+  var prevStepStatus = {};
+  prevGraph.nodes.forEach(function(n){
+    prevStatus[n.id] = n.status;
+    (n.steps || []).forEach(function(s){ prevStepStatus[s.id] = s.status; });
+  });
   var nodes = fresh.nodes.map(function(n){
     var old = prevStatus[n.id];
     // Disk wins ONLY when strictly more advanced; on equal rank the page's
     // value stands (identical when the statuses match; when two terminal
     // states disagree, the SSE delta that set the page's is more recent
     // than the disk snapshot).
-    if (old !== undefined && statusRank(old) >= statusRank(n.status)) {
-      return Object.assign({}, n, {status: old});
+    var merged = (old !== undefined && statusRank(old) >= statusRank(n.status))
+      ? Object.assign({}, n, {status: old})
+      : n;
+    if (merged.steps && merged.steps.length) {
+      var steps = merged.steps.map(function(s){
+        var oldS = prevStepStatus[s.id];
+        return (oldS !== undefined && statusRank(oldS) >= statusRank(s.status))
+          ? Object.assign({}, s, {status: oldS})
+          : s;
+      });
+      merged = Object.assign({}, merged, {steps: steps});
     }
-    return n;
+    return merged;
   });
   return Object.assign({}, fresh, {nodes: nodes});
+}
+
+// (#1401) Index a freshly-fetched graph into the two lookup refs `App`
+// needs to route an incoming flow record: `nodeIds` (phase/task ids, for a
+// record whose `handle` names a node directly) and `stepToTask` (step id
+// -> owning task's node id, since a step-lifecycle record's `handle` is a
+// STEP id — `scheduler::step_lifecycle_record` — but a step is now a ROW
+// inside its task's card, not its own node — see `onMessage`).
+function indexGraph(g){
+  var nodeIds = new Set(g.nodes.map(function(n){ return n.id; }));
+  var stepToTask = {};
+  g.nodes.forEach(function(n){
+    (n.steps || []).forEach(function(s){ stepToTask[s.id] = n.id; });
+  });
+  return { nodeIds: nodeIds, stepToTask: stepToTask };
 }
 
 function App(){
@@ -288,7 +345,12 @@ function App(){
   var state = _s[0], setState = _s[1];
   var _live = React.useState(false);
   var live = _live[0], setLive = _live[1];
+  // (#1401) `nodeIdsRef` — phase/task ids a record's `handle` can name
+  // directly. `stepToTaskRef` — step id -> owning task's node id, since a
+  // step-lifecycle record's `handle` is a STEP id but a step renders as a
+  // ROW inside its task's card now, not its own node (see `indexGraph`).
   var nodeIdsRef = React.useRef(new Set());
+  var stepToTaskRef = React.useRef({});
   var esRef = React.useRef(null);
 
   function fetchGraph(){
@@ -305,7 +367,9 @@ function App(){
     var cancelled = false;
     fetchGraph().then(function(g){
       if (cancelled) return;
-      nodeIdsRef.current = new Set(g.nodes.map(function(n){ return n.id; }));
+      var idx = indexGraph(g);
+      nodeIdsRef.current = idx.nodeIds;
+      stepToTaskRef.current = idx.stepToTask;
       setState({loading:false, error:null, graph:g});
     }).catch(function(e){
       if (cancelled) return;
@@ -315,7 +379,8 @@ function App(){
   }, [missionId]);
 
   // SSE subscription — starts once the initial graph has loaded so the
-  // known-node-id set is populated before any delta needs matching.
+  // known-node-id / step-to-task index is populated before any delta needs
+  // matching.
   React.useEffect(function(){
     if (!state.graph || typeof EventSource === "undefined") return;
     var es = null;
@@ -324,12 +389,32 @@ function App(){
       var rec; try { rec = JSON.parse(ev.data); } catch(_e) { return; }
       if (!rec || typeof rec !== "object") return;
       var newStatus = statusFromRecord(rec);
-      if (!newStatus || !rec.handle) return;
-      if (!nodeIdsRef.current.has(rec.handle)) return;
+      var handle = rec.handle;
+      if (!newStatus || !handle) return;
+      if (nodeIdsRef.current.has(handle)) {
+        // A phase (or task) node id directly — flip that node's own status.
+        setState(function(prev){
+          if (!prev.graph) return prev;
+          var nodes = prev.graph.nodes.map(function(n){
+            return n.id === handle ? Object.assign({}, n, {status: newStatus}) : n;
+          });
+          return Object.assign({}, prev, {graph: Object.assign({}, prev.graph, {nodes: nodes})});
+        });
+        return;
+      }
+      // (#1401) A step id — find its owning task's node and flip ONLY that
+      // row's status, leaving every other row (and the task node's own
+      // aggregate status, refreshed by the reconcile poll below) alone.
+      var taskId = stepToTaskRef.current[handle];
+      if (!taskId) return;
       setState(function(prev){
         if (!prev.graph) return prev;
         var nodes = prev.graph.nodes.map(function(n){
-          return n.id === rec.handle ? Object.assign({}, n, {status: newStatus}) : n;
+          if (n.id !== taskId || !n.steps) return n;
+          var steps = n.steps.map(function(s){
+            return s.id === handle ? Object.assign({}, s, {status: newStatus}) : s;
+          });
+          return Object.assign({}, n, {steps: steps});
         });
         return Object.assign({}, prev, {graph: Object.assign({}, prev.graph, {nodes: nodes})});
       });
@@ -357,7 +442,9 @@ function App(){
     var reconcile = setInterval(function(){
       if (todayUtc() !== sseDate) openStream();
       fetchGraph().then(function(g){
-        nodeIdsRef.current = new Set(g.nodes.map(function(n){ return n.id; }));
+        var idx = indexGraph(g);
+        nodeIdsRef.current = idx.nodeIds;
+        stepToTaskRef.current = idx.stepToTask;
         setState(function(prev){
           if (!prev.graph) return prev;
           return Object.assign({}, prev, {graph: mergeGraphs(prev.graph, g)});

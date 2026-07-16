@@ -49,10 +49,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (#1284 Packet 1); bumped to "1.1" in Packet 3 — additive: [`TaskConfig`]
 /// gained the optional `expand` field ([`ExpansionSpec`]), replacing
 /// review.json's original `expands_per_staffed_seat` prose-`notes` bool
-/// placeholder with a typed, interpretable primitive. Bump discipline (see
+/// placeholder with a typed, interpretable primitive. Bumped to "1.2"
+/// (#1398) — additive: [`PhaseConfig`] and [`TaskConfig`] gained the
+/// optional `display_name` field (an operator-facing short label, split
+/// from `description` which is deliberately long — see each field's own
+/// doc), and [`ExpansionSpec`] gained the optional `display_name_pattern`
+/// twin of its existing `description_pattern`. Bump discipline (see
 /// `CLAUDE.md`'s "Versioning" — same rule, different data shape): additive
 /// field/section → minor; rename/retype/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "1.1";
+pub const MISSION_CONFIG_SCHEMA: &str = "1.2";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,6 +130,16 @@ pub struct PhaseConfig {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// (#1398) Operator-facing short label — `description` is deliberately
+    /// LONG (for `coder-phase` it's the coder's dispatch brief verbatim;
+    /// for `review` it's multi-sentence transcription prose), so a single
+    /// overloaded field can't serve both jobs. `None` on a config that
+    /// doesn't set one — every renderer falls back to `id` (never
+    /// `description`; see the graph lens / `interpret::TaskOverride`'s twin
+    /// doc). Threaded through [`interpret::interpret`]'s mint path onto the
+    /// persisted `crew::types::Phase::display_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub tasks: Vec<TaskConfig>,
     #[serde(flatten)]
@@ -164,6 +179,12 @@ pub struct TaskConfig {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// (#1398) Operator-facing short label — same overload split as
+    /// [`PhaseConfig::display_name`], one level down. `None` falls back to
+    /// `id` everywhere a Task renders. See [`ExpansionSpec::display_name_pattern`]
+    /// for the expanding-template-task variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     /// Default crew role this task dispatches, e.g. `"coder"`. Not
@@ -235,6 +256,14 @@ pub struct ExpansionSpec {
     /// a per-copy description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description_pattern: Option<String>,
+    /// (#1398) Display-name pattern for one expanded copy, e.g. `"probe
+    /// `{name}`"`. Same shape and same fallback as
+    /// [`description_pattern`](Self::description_pattern): falls back to
+    /// the template `TaskConfig.display_name` verbatim (unrendered) when
+    /// absent — adequate for a mission whose expanded copies don't need a
+    /// distinct per-copy label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name_pattern: Option<String>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
@@ -620,6 +649,7 @@ mod tests {
         TaskConfig {
             id: id.to_string(),
             description: None,
+            display_name: None,
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             role_id: None,
             steps,
@@ -632,6 +662,7 @@ mod tests {
         PhaseConfig {
             id: id.to_string(),
             description: None,
+            display_name: None,
             tasks,
             extras: BTreeMap::new(),
         }
@@ -767,6 +798,7 @@ mod tests {
         TaskConfig {
             id: "template".to_string(),
             description: None,
+            display_name: None,
             depends_on: vec![],
             role_id: None,
             steps,
@@ -776,6 +808,7 @@ mod tests {
                 step_id_pattern: step_pat.to_string(),
                 kind_pattern: "{kind}:{name}".to_string(),
                 description_pattern: None,
+                display_name_pattern: None,
                 extras: BTreeMap::new(),
             }),
             extras: BTreeMap::new(),
@@ -1061,5 +1094,40 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: MissionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    // ── (#1398) display_name schema field ───────────────────────────────
+
+    #[test]
+    fn phase_and_task_display_name_parse_and_round_trip() {
+        let json = r#"{
+            "id": "m", "name": "M",
+            "phases": [{
+                "id": "p1", "display_name": "Investigate",
+                "tasks": [{"id": "t1", "display_name": "Bundle"}]
+            }]
+        }"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.phases[0].display_name.as_deref(), Some("Investigate"));
+        assert_eq!(cfg.phases[0].tasks[0].display_name.as_deref(), Some("Bundle"));
+        let back = serde_json::to_string(&cfg).unwrap();
+        let cfg2: MissionConfig = serde_json::from_str(&back).unwrap();
+        assert_eq!(cfg, cfg2);
+    }
+
+    #[test]
+    fn display_name_absent_is_not_drift() {
+        // A pre-#1398 document with no `display_name` anywhere still
+        // parses cleanly and validates clean (lenient-on-read, contract 7).
+        let cfg = doc(vec![phase("p1", vec![task("t1", &[], vec![step("s1", "dispatch.internal")])])]);
+        assert!(cfg.phases[0].display_name.is_none());
+        assert!(cfg.phases[0].tasks[0].display_name.is_none());
+        assert!(cfg.validate(&["dispatch.internal"]).is_empty());
+    }
+
+    #[test]
+    fn schema_version_constant_is_1_2() {
+        // (#1398) Additive minor bump for the display_name field.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "1.2");
     }
 }

@@ -552,11 +552,21 @@ fn now_unix() -> u64 {
 
 /// One Phase JSON literal, shared by the fresh-mint loop and the
 /// reuse-path missing-phase backfill (#1284 review round 1, consider 5).
-fn new_planned_phase(mission_id: &str, real_id: &str, description: Option<&str>, now: u64) -> Phase {
+/// `display_name` (#1398) is `PhaseConfig::display_name` verbatim — `None`
+/// on a config that doesn't set one, which every renderer falls back to
+/// `id` for (never `description`).
+fn new_planned_phase(
+    mission_id: &str,
+    real_id: &str,
+    description: Option<&str>,
+    display_name: Option<&str>,
+    now: u64,
+) -> Phase {
     Phase {
         id: real_id.to_string(),
         mission_id: mission_id.to_string(),
         description: description.unwrap_or_default().to_string(),
+        display_name: display_name.map(String::from),
         status: PhaseStatus::Planned,
         created_ts: now,
         started_ts: None,
@@ -654,7 +664,13 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
                 // (consider 5) The config declares a phase the old instance
                 // doesn't have — mint it before executing, and register it
                 // in phase_ids so it isn't a dangling file.
-                let p = new_planned_phase(mission_id, real_id, phase.description.as_deref(), now);
+                let p = new_planned_phase(
+                    mission_id,
+                    real_id,
+                    phase.description.as_deref(),
+                    phase.display_name.as_deref(),
+                    now,
+                );
                 crew::lifecycle::save_phase(&p)
                     .with_context(|| format!("minting missing phase {real_id} on reuse"))?;
                 if let Some(m) = &mut mission_doc {
@@ -700,7 +716,13 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
 
     for phase in &config.phases {
         let real_id = &real_phase_ids[&phase.id];
-        let p = new_planned_phase(mission_id, real_id, phase.description.as_deref(), now);
+        let p = new_planned_phase(
+            mission_id,
+            real_id,
+            phase.description.as_deref(),
+            phase.display_name.as_deref(),
+            now,
+        );
         crew::lifecycle::save_phase(&p).with_context(|| format!("persisting phase {real_id}"))?;
     }
 
@@ -1604,7 +1626,7 @@ mod tests {
             ticket: None,
         };
         crew::lifecycle::save_mission(&mission).unwrap();
-        let mut phase = new_planned_phase(mission_id, phase_id, Some("gate phase"), now);
+        let mut phase = new_planned_phase(mission_id, phase_id, Some("gate phase"), None, now);
         phase.status = PhaseStatus::Running;
         phase.started_ts = Some(now);
         crew::lifecycle::save_phase(&phase).unwrap();
