@@ -306,6 +306,19 @@ impl StepKind for DispatchInternalStepKind {
     }
 }
 
+/// (#1412) Clamp a requested `max_tokens` down to the per-execution remote
+/// token allowance so one hosted call cannot request more completion
+/// tokens than the whole execution is allowed to spend. `budget == 0` is
+/// unreachable in practice (the hosted arm calls `admit_remote_execution`
+/// first, which already refuses a zero budget), but the clamp stays
+/// total/defensive rather than assuming its caller's ordering. A `budget`
+/// wider than `u32::MAX` (the allowance is `u64`, `max_tokens` on the wire
+/// is `u32`) saturates instead of wrapping.
+fn clamp_hosted_max_tokens(requested: u32, budget: u64) -> u32 {
+    let budget_u32 = u32::try_from(budget).unwrap_or(u32::MAX);
+    requested.min(budget_u32)
+}
+
 /// Wraps `single_shot::single_shot_chat` (local LMStudio) /
 /// `single_shot_chat_hosted` (a remote OpenAI-compatible endpoint) — one
 /// container-free chat-completions call, no agent loop. Required
@@ -316,6 +329,27 @@ impl StepKind for DispatchInternalStepKind {
 /// `timeout_seconds` (u32, default 120), `endpoint`
 /// (`darkmux_types::ModelEndpoint` JSON — presence selects the HOSTED
 /// dialect instead of local).
+///
+/// **Hosted-arm metering (#1412).** The LOCAL dialect (LMStudio) is
+/// unmetered by design — `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` governs
+/// REMOTE spend only. The HOSTED dialect now goes through the same minimum
+/// gate `dispatch_remote` uses (`dispatch_internal::admit_remote_execution`)
+/// before the call fires, so a `0` allowance refuses with a typed error
+/// instead of dispatching off the meter, plus a `max_tokens` clamp
+/// (`clamp_hosted_max_tokens`) so one call can't request more than the
+/// allowance in one shot. **Reading:** each `dispatch.single_shot` step is
+/// its own execution (one pipeline stage) — a graph with several
+/// endpoint-bearing single-shot steps draws the allowance once PER STEP,
+/// not once for the whole graph, matching how a bare `crew dispatch` (also
+/// gated by `admit_remote_execution`) counts as one execution. This is the
+/// minimum regime, not the full one: there is no cross-call bucket here
+/// (each step gets a fresh allowance check), unlike the review funnel's
+/// per-stage `RemoteBucket` (`darkmux-lab::lab::review`), which accumulates
+/// spend across many calls in one stage. `darkmux-lab` depends on
+/// `darkmux-crew`, not the reverse, so `RemoteBucket` cannot be reused here
+/// without moving it — that consolidation is #1414's job. This PR closes
+/// the silent-bypass gap (#1412); the shared-bucket regime is a deliberate
+/// follow-up, not a scope cut hiding in this diff.
 pub struct DispatchSingleShotStepKind;
 
 impl StepKind for DispatchSingleShotStepKind {
@@ -348,19 +382,73 @@ impl StepKind for DispatchSingleShotStepKind {
             .and_then(|v| v.as_u64())
             .unwrap_or(120) as u32;
 
+        let mut flow_records = Vec::new();
+
         let reply = if let Some(endpoint_val) = step.config.get("endpoint") {
             let endpoint: darkmux_types::ModelEndpoint = serde_json::from_value(endpoint_val.clone())
                 .with_context(|| format!("step `{}`: config.endpoint", step.id))?;
+
+            // (#1412) Admit gate FIRST — a budget of 0 refuses before any
+            // HTTP call is even constructed, mirroring `dispatch_remote`'s
+            // ordering (meter before the network, never after). No
+            // `.with_context` wrap here on purpose: `admit_remote_execution`
+            // already names the step-independent bucket reason in full, the
+            // same bare error `dispatch_remote` surfaces — wrapping it would
+            // just bury that message under a second "step `s1` ..." layer.
+            let budget = darkmux_types::config_access::remote_max_tokens_per_execution();
+            crate::dispatch_internal::admit_remote_execution(budget)?;
+
+            let clamped_max_tokens = clamp_hosted_max_tokens(max_tokens, budget);
             let req = HostedSingleShotRequest {
                 endpoint: &endpoint,
                 model,
                 system,
                 user: &user,
-                max_tokens,
+                max_tokens: clamped_max_tokens,
                 timeout_seconds,
             };
-            single_shot_chat_hosted(&req)
-                .with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id))?
+            let reply = single_shot_chat_hosted(&req)
+                .with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id))?;
+
+            // (#1412) Surface actual spend the same way `dispatch_remote`
+            // embeds totals in its `dispatch complete` record, so a hosted
+            // single-shot step's token usage is visible even without the
+            // full per-stage bucket regime.
+            flow_records.push(darkmux_flow::FlowRecord {
+                ts: darkmux_flow::ts_utc_now(),
+                level: darkmux_flow::Level::Info,
+                category: darkmux_flow::Category::Work,
+                tier: darkmux_flow::Tier::Local,
+                stage: darkmux_flow::Stage::Dispatch,
+                action: "step result".to_string(),
+                handle: step.id.clone(),
+                phase_id: None,
+                session_id: Some(format!("task:{}", step.task_id)),
+                source: Some("scheduler".to_string()),
+                model: Some(model.to_string()),
+                reasoning: None,
+                mission_id: None,
+                machine_id: None,
+                machine_uid: None,
+                orchestrator: None,
+                prev_hash: None,
+                hash: None,
+                payload: Some(serde_json::json!({
+                    "step_id": step.id,
+                    "kind": "dispatch.single_shot",
+                    "runtime": "direct",
+                    "remote_max_tokens_per_execution": budget,
+                    "max_tokens_requested": max_tokens,
+                    "max_tokens_sent": clamped_max_tokens,
+                    "prompt_tokens": reply.prompt_tokens,
+                    "completion_tokens": reply.completion_tokens,
+                    "total_tokens": reply.total_tokens,
+                })),
+                work_id: None,
+                attempt: None,
+            });
+
+            reply
         } else {
             let temperature = step
                 .config
@@ -382,7 +470,7 @@ impl StepKind for DispatchSingleShotStepKind {
 
         Ok(StepOutcome {
             output: reply.content,
-            flow_records: Vec::new(),
+            flow_records,
         })
     }
 }
@@ -626,5 +714,120 @@ mod tests {
         assert_eq!(DispatchSingleShotStepKind.display_name(), "Dispatch (single-shot)");
         assert_eq!(ProceduralShellStepKind.display_name(), "Shell");
         assert_eq!(ProceduralNoopStepKind.display_name(), "No-op");
+    }
+
+    // ── (#1412) dispatch.single_shot hosted-arm metering ────────────────
+
+    #[test]
+    fn clamp_hosted_max_tokens_never_exceeds_the_budget() {
+        assert_eq!(clamp_hosted_max_tokens(4096, 500_000), 4096, "well under budget: unchanged");
+        assert_eq!(clamp_hosted_max_tokens(4096, 1_000), 1_000, "clamped down to the budget");
+        assert_eq!(
+            clamp_hosted_max_tokens(4096, 0),
+            0,
+            "a zero budget clamps to zero (defensive — unreachable via the admit gate, \
+             which already refuses budget 0 before this runs)"
+        );
+        assert_eq!(
+            clamp_hosted_max_tokens(100, u64::MAX),
+            100,
+            "a budget wider than u32::MAX saturates rather than wrapping, and never inflates a small request"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_single_shot_hosted_arm_refuses_when_budget_is_zero_before_any_http_call() {
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "0");
+        }
+
+        // The endpoint URL is deliberately unroutable (port 1 refuses
+        // immediately) with a 1s timeout: if the admit gate did NOT fire
+        // first, this call would fail with a connection error instead of
+        // the budget-exhausted message asserted below. The DISTINCT error
+        // text is the proof that `single_shot_chat_hosted` (and therefore
+        // the HTTP call) was never reached.
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({
+                "model": "gpt-5.1",
+                "user": "hi",
+                "endpoint": { "url": "http://127.0.0.1:1" },
+                "timeout_seconds": 1,
+            }),
+        );
+        let err = DispatchSingleShotStepKind
+            .run(&s, &empty_task(), &BTreeMap::new())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remote token budget exhausted"),
+            "expected the admit-gate's typed refusal, got: {msg}"
+        );
+        assert!(
+            msg.contains("max_tokens_per_execution"),
+            "the error names the exhausted bucket: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("curl") && !msg.to_lowercase().contains("connect"),
+            "no sign of an attempted network call in the error: {msg}"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_single_shot_local_arm_is_unmetered_by_the_remote_budget() {
+        let budget_key = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev_budget = std::env::var(budget_key).ok();
+        let prev_url = std::env::var(url_key).ok();
+        unsafe {
+            // The hard opt-out. If the LOCAL dialect were (wrongly) gated
+            // by the remote budget, this would fail with the same
+            // "remote token budget exhausted" message the hosted-arm test
+            // above asserts on. It must not.
+            std::env::set_var(budget_key, "0");
+            std::env::set_var(url_key, "http://127.0.0.1:1");
+        }
+
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "some-local-model", "user": "hi", "timeout_seconds": 1 }),
+        );
+        let err = DispatchSingleShotStepKind
+            .run(&s, &empty_task(), &BTreeMap::new())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("remote token budget exhausted"),
+            "the LOCAL dialect must never be gated by DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION: {msg}"
+        );
+        assert!(
+            msg.contains("dispatch.single_shot (local)"),
+            "expected the local-arm error context, got: {msg}"
+        );
+
+        unsafe {
+            match prev_budget {
+                Some(v) => std::env::set_var(budget_key, v),
+                None => std::env::remove_var(budget_key),
+            }
+            match prev_url {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
     }
 }
