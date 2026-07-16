@@ -94,7 +94,7 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
 
     // Dispatch through darkmux's in-house Docker-bounded runtime via
     // `crew::dispatch::dispatch()`, mirroring the pattern used by
-    // `lab run` + `crew dispatch`.
+    // `lab run` + `dispatch`.
     let session_id = format!(
         "darkmux-notebook-{}-{}",
         opts.run_id,

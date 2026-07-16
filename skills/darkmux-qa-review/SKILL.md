@@ -1,13 +1,13 @@
 ---
 name: darkmux-qa-review
-description: Dispatch the darkmux `code-reviewer` role against the current branch's diff via `darkmux crew dispatch --json`. Uses the default internal runtime; findings return inline.
+description: Dispatch the darkmux `code-reviewer` role against the current branch's diff via `darkmux dispatch --json`. Uses the default internal runtime; findings return inline.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*),Bash(git:*),Bash(jq:*)"
 ---
 
 # Darkmux QA review
 
-Dispatches the **code-reviewer** role against the current branch's diff via `darkmux crew dispatch` (default internal runtime, container-bounded). The dispatch reads the role manifest at `templates/builtin/roles/code-reviewer.json` + the bundled `.md` system prompt, runs in a fresh per-dispatch Docker container, and returns a structured JSON envelope via `--json`.
+Dispatches the **code-reviewer** role against the current branch's diff via `darkmux dispatch` (default internal runtime, container-bounded). The dispatch reads the role manifest at `templates/builtin/roles/code-reviewer.json` + the bundled `.md` system prompt, runs in a fresh per-dispatch Docker container, and returns a structured JSON envelope via `--json`.
 
 ## Step 1 — Determine review scope
 
@@ -42,11 +42,11 @@ If empty, stop and report "no reviewable changes."
 DIFF=$(git diff "$MERGE_BASE" HEAD 2>/dev/null | head -300)
 RUN_ID="darkmux-qa-review-$(date +%s)-$$"
 
-OUTPUT=$(darkmux crew dispatch code-reviewer \
+OUTPUT=$(darkmux dispatch code-reviewer \
   --json \
   --session-id "$RUN_ID" \
   --timeout 600 \
-  --message "QA review request.
+  "QA review request.
 
 Repo: $REPO
 Branch: $BRANCH

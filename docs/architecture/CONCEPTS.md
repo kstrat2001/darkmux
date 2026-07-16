@@ -184,7 +184,7 @@ Both lifecycles are implemented (`src/main.rs:1321-1392` — phase verbs at
 
 ---
 
-## 4. Crew dispatch verbs
+## 4. Dispatch verbs
 
 The AI-built-in verbs compose CLI primitives with utility/specialist dispatches.
 All of the following are **shipped**:
@@ -195,7 +195,7 @@ All of the following are **shipped**:
 | `darkmux phase estimate` | Reads a `WorkloadSpec` → deterministic per-turn token math → recommends the smallest adequate profile → optional 4B narration. | `src/phase_cli.rs:233-310, 500-514`; `src/main.rs:459-471` |
 | `darkmux phase review` | Auto-detects base branch → computes the git diff → dispatches the **code-reviewer** role → parses the `QA-REVIEW-SIGNOFF` block (`BLOCK`/`FLAG`/`NIT`) → emits a verdict (`clean` / `flags-only` / `blockers`, or `indeterminate` when the reviewer output doesn't match the expected format). | `src/phase_cli.rs:683-970`; `src/main.rs:472-485` |
 | `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, fans out its ready phases (`depends_on == []`) as work jobs onto the single global fleet work queue (`darkmux:work`); waits or returns session ids. | `src/main.rs:642-662`, `1453-1721` |
-| `darkmux crew dispatch <role>` | Single-turn dispatch to a named role through the internal runtime. | see `CLAUDE.md` → operator-facing commands |
+| `darkmux dispatch <role>` | Single-turn dispatch to a named role through the internal runtime. | see `CLAUDE.md` → operator-facing commands |
 
 The **operator-approval gate on `mission propose`** is the sovereignty contract
 in action: the utility agent proposes structure; the operator approves before
@@ -205,7 +205,7 @@ anything is written.
 
 ## 5. The internal runtime + compaction
 
-`darkmux crew dispatch` and `darkmux lab run` use the **internal runtime**:
+`darkmux dispatch` and `darkmux lab run` use the **internal runtime**:
 a per-dispatch `darkmux-runtime` Docker container running an in-house Rust agent
 loop (`runtime/src/loop_runner.rs`).
 
@@ -371,7 +371,7 @@ optional fields are minor bumps that older viewers safely ignore (the
 
 ### Lab telemetry transport (today)
 
-Cross-layer telemetry is always-on (#557): the internal runtime and crew dispatch
+Cross-layer telemetry is always-on (#557): the internal runtime and dispatch
 emit it as `category=telemetry` flow records on the flow stream (sources: `lms`,
 `process`, `detector`, `runtime`, `context`, `compaction`). There is no sidecar
 file and no flag: the standalone `instruments.jsonl` sidecar and the `--instrument`

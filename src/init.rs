@@ -625,7 +625,7 @@ mod tests {
     /// at load time). A fresh `darkmux init` must never hand the operator a
     /// registry that fails that pass, AND its bundled `review-deep` crew
     /// must still resolve cleanly via `resolve_crew` — the example is meant
-    /// to be a working starting point for `crew dispatch` /
+    /// to be a working starting point for `dispatch` /
     /// `review-bench --funnel`, not just load-valid.
     ///
     /// Also drift-guards the example's stamped `schema_version` against

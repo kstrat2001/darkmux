@@ -205,7 +205,7 @@ pub struct DispatchOpts {
     pub machine: Option<String>,
     /// Whether to block on completion when the dispatch routes to a
     /// remote machine (#246 PR-C.3). `true` — the default for
-    /// `crew dispatch` — tails the local flow stream for the matching
+    /// `dispatch` — tails the local flow stream for the matching
     /// `session_id`'s `dispatch.complete` record and returns the
     /// outcome (preserves today's "spawn, block, see result" CLI
     /// ergonomics). `false` returns immediately with a synthetic
@@ -431,11 +431,15 @@ pub struct DispatchResult {
 /// wall-clock micros component collides (loops faster than the system clock).
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Generate a fresh, unique session id for an unscoped `crew dispatch` call.
+/// Generate a fresh, unique session id for an unscoped `dispatch` call.
 /// Shape: `crew-dispatch-<role>-<unix_micros>-<process_counter>`.
 ///
+/// The `crew-dispatch-` prefix is a FROZEN data-contract identifier —
+/// presence tests key on it. It predates the #1426 verb rename (`crew
+/// dispatch` -> `dispatch`); do NOT rename it in a spelling-cleanup sweep.
+///
 /// The micros component distinguishes calls across processes (different
-/// invocations of `darkmux crew dispatch` from a shell each get their own
+/// invocations of `darkmux dispatch` from a shell each get their own
 /// process start time). The counter component distinguishes calls within
 /// the same process (scripted callers or future server backends could call
 /// faster than microsecond resolution allows). Together they guarantee no
@@ -535,7 +539,7 @@ pub(crate) fn resolve_mission_for_phase(phase_id: Option<&str>) -> Option<String
         Ok(s) => Some(s.mission_id),
         Err(_) => {
             eprintln!(
-                "darkmux crew dispatch: phase `{phase_id}` not found; \
+                "darkmux dispatch: phase `{phase_id}` not found; \
                  flow records won't carry a mission_id."
             );
             None
@@ -714,6 +718,9 @@ pub fn build_dispatch_record_with_payload(
         handle: role_id.to_string(),
         phase_id: phase_id.map(String::from),
         session_id: Some(session_id.to_string()),
+        // FROZEN data-contract value: consumed by the viewer's source join and
+        // test-asserted. Predates the #1426 verb rename (`crew dispatch` ->
+        // `dispatch`); do NOT rename in a spelling-cleanup sweep.
         source: Some("crew_dispatch".to_string()),
         model: model.map(String::from),
         reasoning: None,

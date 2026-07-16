@@ -4,7 +4,7 @@
 //! Lives in `darkmux-flow` because the nudge is about live flow-record
 //! visibility: the `darkmux serve` daemon serves the flow stream over HTTP/
 //! SSE, and a dispatch run with the daemon down still writes flow records to
-//! disk but the operator can't watch them live. Both the crew dispatch path
+//! disk but the operator can't watch them live. Both the dispatch path
 //! and the serve daemon itself reference these, so the probe lives in the
 //! foundation flow crate that both depend on (#463 cycle-break — relocated
 //! here from `serve` so `crew` doesn't depend on `serve`).
@@ -57,7 +57,7 @@ fn is_addr_reachable(addr: std::net::SocketAddr, timeout: std::time::Duration) -
 /// last week doesn't lose visibility into a multi-minute dispatch
 /// before realizing it.
 ///
-/// `verb_hint` is the verb the operator just ran (e.g. "crew dispatch"
+/// `verb_hint` is the verb the operator just ran (e.g. "dispatch"
 /// or "phase review"); used in the nudge to make the message
 /// context-specific.
 pub fn nudge_if_daemon_unreachable(verb_hint: &str) {

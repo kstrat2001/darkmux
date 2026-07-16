@@ -218,13 +218,13 @@ pub struct FleetConfig {
 ///
 /// **What an "execution" is (operator decision, 2026-07-10 design chat):**
 /// one pipeline stage — the review pipeline's probe pass, each judge pass, the
-/// verify pass; a bare `crew dispatch` is one execution. Each stage's
+/// verify pass; a bare `dispatch` is one execution. Each stage's
 /// REMOTE calls draw from their own allowance, so a runaway stage is caught
 /// at the cap without starving later stages. Tokens only — never currency.
 ///
 /// **Which paths this meters (1.18.0 scope — be precise):** the review
 /// pipeline's remote seats (probe / judge-pass1 / judge-pass2 / verify) AND the
-/// tool-less single-shot remote `crew dispatch` path (`dispatch_remote`). The
+/// tool-less single-shot remote `dispatch` path (`dispatch_remote`). The
 /// AGENTIC-remote container path (#1187 — a tool-granting role on an endpoint
 /// profile, driven by the multi-call container loop) is NOT metered by this
 /// bucket in 1.18.0; metering that loop is tracked as a follow-up. A path

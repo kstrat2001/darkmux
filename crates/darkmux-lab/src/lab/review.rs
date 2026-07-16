@@ -403,7 +403,7 @@ const REVIEW_RULING_ACTION: &str = "review.ruling";
 /// RUN's identity, the role `session_id` plays for a single dispatch).
 /// `source = "review"` distinguishes these from `crew_dispatch`/
 /// `phase_review` records that may share the same sink. `category = Work`
-/// / `tier = Local` / `stage = Dispatch` mirror `crew dispatch`'s own
+/// / `tier = Local` / `stage = Dispatch` mirror `dispatch`'s own
 /// per-turn records (`dispatch.tool`, `dispatch.turn`) — the review is,
 /// mechanically, a multi-dispatch alternative shape of the same "produce a
 /// local review" job.
@@ -1206,7 +1206,7 @@ pub trait ModelCycler {
 
 /// Production [`ModelCycler`] (#1230 Packet 1 cutover): every residency
 /// decision now routes through `darkmux_gestalt::plan_acquire`/
-/// `plan_release` — the pure planner `darkmux swap` and the crew dispatch
+/// `plan_release` — the pure planner `darkmux swap` and the dispatch
 /// preflight are converging on — executed via the real `LmsHost`/`MacProbe`
 /// port adapters (`darkmux_profiles::gestalt_host`). Those adapters existed
 /// fully built and unit-tested but had ZERO production callers before this

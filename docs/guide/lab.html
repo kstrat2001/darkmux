@@ -49,7 +49,7 @@
 <section>
   <div class="wrap">
     <h2>Prerequisites for lab</h2>
-    <p><code>darkmux lab run</code> uses the same internal Docker-bounded runtime as <code>darkmux crew dispatch</code>. Workloads dispatch through a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code> from the darkmux repo root.</p>
+    <p><code>darkmux lab run</code> uses the same internal Docker-bounded runtime as <code>darkmux dispatch</code>. Workloads dispatch through a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code> from the darkmux repo root.</p>
     <p>If you don't have Docker, the <code>swap</code> / <code>status</code> / <code>profiles</code> / <code>doctor</code> verbs still work. You just can't run lab dispatches.</p>
   </div>
 </section>
@@ -73,7 +73,7 @@
     </ul>
 
     <h3>Cross-layer telemetry (always-on)</h3>
-    <p>Cross-layer telemetry is captured automatically (#557): no flag, no sidecar file. The internal runtime and crew dispatch emit it as <code>category=telemetry</code> flow records on the flow stream (sources: <code>lms</code>, <code>process</code>, <code>detector</code>, <code>runtime</code>, <code>context</code>, <code>compaction</code>), so you can see what LMStudio had loaded, where the runtime process sat across the run, detector signals, and compaction events. That's useful for diagnosing where wall-clock latency is concentrated.</p>
+    <p>Cross-layer telemetry is captured automatically (#557): no flag, no sidecar file. The internal runtime and dispatch emit it as <code>category=telemetry</code> flow records on the flow stream (sources: <code>lms</code>, <code>process</code>, <code>detector</code>, <code>runtime</code>, <code>context</code>, <code>compaction</code>), so you can see what LMStudio had loaded, where the runtime process sat across the run, detector signals, and compaction events. That's useful for diagnosing where wall-clock latency is concentrated.</p>
     <p>View it in the daemon's observability viewer: run <code>darkmux serve</code> and open <code>http://localhost:8765/</code>. The viewer reads live flow records straight from the daemon. A demo instance lives at <a href="../../demo/">darkmux.com/demo</a>.</p>
   </div>
 </section>
@@ -212,7 +212,7 @@ scripts/lab-init.sh --force  <span class="comment"># re-register, accepting upst
   </a>
   <a href="missions.html" class="next">
     <span class="dir">Next ›</span>
-    <span class="title">Missions, phases, and crew dispatch</span>
+    <span class="title">Missions, phases, and dispatch</span>
   </a>
 </nav>
 

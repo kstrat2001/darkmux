@@ -284,7 +284,7 @@ rm ~/Library/LaunchAgents/com.darkmux.serve.plist</code></pre>
     <h3>Hub-specific decisions</h3>
     <ul>
       <li><strong>Audit dir:</strong> <code>~/.darkmux/audit/</code> by default: same filesystem as the casual sink, simplest backup posture. Put it on a different volume if your backup policy needs that.</li>
-      <li><strong>Enable it in two scopes:</strong> set <code>DARKMUX_AUDIT_DIR</code> in the daemon's service environment (so the daemon's own writes are audited) AND in your interactive <code>~/.zshrc</code> (so <code>darkmux flow note</code>, <code>crew dispatch</code>, etc. from the hub's shell are too). Missing either yields a partial chain.</li>
+      <li><strong>Enable it in two scopes:</strong> set <code>DARKMUX_AUDIT_DIR</code> in the daemon's service environment (so the daemon's own writes are audited) AND in your interactive <code>~/.zshrc</code> (so <code>darkmux flow note</code>, <code>dispatch</code>, etc. from the hub's shell are too). Missing either yields a partial chain.</li>
       <li><strong>Restart the daemon after enabling</strong> (<code>brew services restart darkmux</code> or reload the plist); it reads the env at process-start.</li>
     </ul>
     <pre><code><span class="comment"># In ~/.zshrc:</span>

@@ -9,7 +9,7 @@
 //! matrix, reproducibly (the model axis is `--profile` / `--profiles-file`).
 //!
 //! Dispatch goes through `darkmux_crew::dispatch` (internal runtime, `--json`),
-//! same substrate as `darkmux crew dispatch pr-reviewer` — so a bench run and a
+//! same substrate as `darkmux dispatch pr-reviewer` — so a bench run and a
 //! real CI review exercise the identical path.
 
 use crate::providers::prompt::extract_reply_text;
@@ -722,7 +722,7 @@ fn parse_exec_mode(s: Option<&str>) -> Result<super::review::ExecMode> {
 
 /// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, resolve
 /// `--crew` against it (`darkmux_profiles::crews::resolve_crew` — the same
-/// validation `crew dispatch` would apply), validate it carries the
+/// validation `dispatch` would apply), validate it carries the
 /// funnel's own seat requirements (`review::validate_review_crew` — the
 /// SAME check `run_review` runs internally, called here too so a
 /// misconfigured crew fails at bench START, not at the first case's

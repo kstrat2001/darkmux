@@ -1,7 +1,7 @@
 //! Real end-to-end mock-dispatch proof (mock-model harness, v1, item 4).
 //!
 //! Runs `darkmux_crew::dispatch::dispatch(DispatchOpts { runtime:
-//! Runtime::Internal, .. })` — the SAME function `darkmux crew dispatch` /
+//! Runtime::Internal, .. })` — the SAME function `darkmux dispatch` /
 //! `darkmux mission run` / `darkmux phase review` call — for real:
 //!
 //!   - a REAL, genuinely separate OS process (`tools/darkmux-mock-model`)

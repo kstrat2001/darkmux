@@ -514,7 +514,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
 /// (typos like "exce" for "exec", future tokens not yet wired).
 ///
 /// Without this check, the only operator-visible signal of a typo
-/// was the `darkmux crew dispatch: tool_palette filtered to []`
+/// was the `darkmux dispatch: tool_palette filtered to []`
 /// line at dispatch time — easy to miss, and only surfaces AFTER
 /// the operator tried to use the role. Doctor walks every role
 /// manifest proactively. (#340)
@@ -1530,7 +1530,7 @@ fn check_flow_sink_health() -> Check {
 
 /// Verify every embedded crew-role manifest has a sibling `.md` prompt
 /// embedded too. The dispatcher errors at runtime when a manifest exists
-/// without a prompt (`crew dispatch <role>` fails with *"role X has no
+/// without a prompt (`dispatch <role>` fails with *"role X has no
 /// .md system prompt"*); this check surfaces the gap pre-dispatch so
 /// operators don't discover it by failing a dispatch.
 ///
@@ -1915,7 +1915,7 @@ fn check_crew_validation() -> Check {
             message: offending.join("; "),
             hint: Some(
                 "fix the named crew(s) in ~/.darkmux/profiles.json — the crew's OWN dispatch \
-                 (`crew dispatch`, review-bench `--crew`) will fail loud with the same error; \
+                 (`dispatch`, review-bench `--crew`) will fail loud with the same error; \
                  unaffected profiles and crews continue to work in the meantime."
                     .into(),
             ),
@@ -2225,7 +2225,7 @@ fn check_profile_loaded_match() -> Check {
 }
 
 /// (#680) The internal Docker-bounded runtime is the ONLY dispatch path for
-/// `crew dispatch` and `lab run` (#1405 removed the legacy `openclaw`
+/// `dispatch` and `lab run` (#1405 removed the legacy `openclaw`
 /// shell-out runtime), but nothing else in doctor surfaces it — a fresh
 /// operator otherwise gets an all-green doctor and only learns the Docker
 /// requirement when their first dispatch bails at the dispatch-time preflight.
@@ -3208,7 +3208,7 @@ mod tests {
     #[test]
     fn docker_status_binary_missing_warns_not_fails() {
         // Warn, never Fail — swap-only operators (profile multiplexing, no
-        // crew dispatches) legitimately have no Docker.
+        // dispatches) legitimately have no Docker.
         use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
         let c = docker_status_to_check(DockerRuntimeStatus::BinaryMissing);
         assert_eq!(c.status, Status::Warn);

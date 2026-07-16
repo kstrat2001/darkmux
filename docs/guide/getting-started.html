@@ -56,12 +56,12 @@
     <p class="muted">darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.</p>
 
     <h3>For the dispatch + lab path</h3>
-    <p class="muted">The <code>swap</code> / <code>status</code> / <code>profiles</code> core needs only LMStudio. Docker is required for <code>crew dispatch</code> / <code>lab run</code> (the only dispatch path).</p>
+    <p class="muted">The <code>swap</code> / <code>status</code> / <code>profiles</code> core needs only LMStudio. Docker is required for <code>dispatch</code> / <code>lab run</code> (the only dispatch path).</p>
     <table>
       <tr><th>Tool</th><th>When you need it</th></tr>
       <tr>
         <td><a href="https://www.docker.com/products/docker-desktop">Docker</a></td>
-        <td><strong>Required for <code>darkmux crew dispatch</code> / <code>lab run</code></strong>. The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; the image is pulled from GHCR on first use, so you just need Docker running.</td>
+        <td><strong>Required for <code>darkmux dispatch</code> / <code>lab run</code></strong>. The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; the image is pulled from GHCR on first use, so you just need Docker running.</td>
       </tr>
       <tr>
         <td><a href="https://claude.com/claude-code">Claude Code</a> (or any frontier orchestrator)</td>
@@ -213,7 +213,7 @@ darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at wh
     <ul>
       <li>For the deeper tour of the live viewer (reading the timeline, managing the daemon, the HTTP endpoints): <a href="observability.html">Observability: daemon + viewer</a>.</li>
       <li>If you want to benchmark / characterize your hardware against a workload: <a href="lab.html">The lab harness</a>.</li>
-      <li>If you're integrating with an orchestrator for agentic work: <a href="missions.html">Missions, phases, and crew dispatch</a>.</li>
+      <li>If you're integrating with an orchestrator for agentic work: <a href="missions.html">Missions, phases, and dispatch</a>.</li>
     </ul>
   </div>
 </section>

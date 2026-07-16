@@ -88,7 +88,7 @@ darkmux doctor</code></pre>
   <div class="wrap">
     <h2>Can I dispatch to this peer from another machine?</h2>
     <p>Short answer for Part 1: <strong>no, and it's worth understanding why before you reach for it.</strong></p>
-    <p>A <code>darkmux crew dispatch &lt;role&gt; --machine mini-1 …</code> from another machine publishes the job to the global work queue. But a job only <em>runs</em> when some machine's <strong>claiming worker</strong> picks it up, and that worker only exists inside a running <code>darkmux serve</code> daemon with Redis configured. In Part 1 the peer isn't running that daemon, so it never claims. And because <code>--machine</code> is an <em>advisory hint</em>, not a pin, the hub's own worker (which IS running) would claim your <code>--machine mini-1</code> job and run it <strong>on the hub</strong>.</p>
+    <p>A <code>darkmux dispatch &lt;role&gt; --machine mini-1 …</code> from another machine publishes the job to the global work queue. But a job only <em>runs</em> when some machine's <strong>claiming worker</strong> picks it up, and that worker only exists inside a running <code>darkmux serve</code> daemon with Redis configured. In Part 1 the peer isn't running that daemon, so it never claims. And because <code>--machine</code> is an <em>advisory hint</em>, not a pin, the hub's own worker (which IS running) would claim your <code>--machine mini-1</code> job and run it <strong>on the hub</strong>.</p>
     <p>So:</p>
     <ul>
       <li><strong>To run work on the peer in Part 1:</strong> run the dispatch <em>locally on the peer itself</em> (see below). No queue, no surprises about where it lands.</li>
@@ -98,7 +98,7 @@ darkmux doctor</code></pre>
     <h3>Run work on the peer (locally)</h3>
     <p>On the peer, dispatch with no <code>--machine</code>. It runs in the peer's own container, sized by you to fit the hardware:</p>
     <pre><code><span class="comment"># On the peer:</span>
-darkmux crew dispatch coder --message "implement the X feature"</code></pre>
+darkmux dispatch coder "implement the X feature"</code></pre>
     <p>This is the reliable way to use a small box: drive it directly (in person, or over SSH / its own Claude Code session), pick model profiles that fit its RAM, and let its activity stream to the hub for the fleet-wide view. The dispatch path is identical to the hub's (same container, same runtime loop, same flow records), just initiated on the machine that runs it.</p>
   </div>
 </section>

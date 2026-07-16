@@ -281,25 +281,35 @@ jobs:
         run: |
           # 'admin' role family was renamed to 'utility' with NO compat alias —
           # crates/darkmux-crew validate_role_family REJECTS 'admin' at load time.
+          # Scanned set: the user-facing doc surfaces PLUS packaging/ — the
+          # brew formula's caveats are printed to every installing user, and a
+          # retired-verb spelling slipped through there once precisely because
+          # packaging/ was outside this set (#1426 phase-2 gate finding).
           PAT='admin[- ]agent|admin</code>'
-          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ 2>/dev/null); then
+          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null); then
             echo "::error::Retired term in user-facing docs — use 'utility', not 'admin' (the role_family loader rejects 'admin'):"
             echo "$bad"
             exit 1
           fi
-          # (#1426 phase 1) Five verb spellings retired with NO compat alias:
-          # `darkmux profiles` -> `darkmux profile list`, `darkmux scan` ->
-          # `darkmux profile scan`, `darkmux notebook ...` -> `darkmux lab
-          # notebook ...`, `darkmux pr-review ...` -> `darkmux mission launch
-          # review`, `darkmux external ...` -> pipe into `mission propose`.
-          # The word boundary keeps the NEW spellings clean (`darkmux profile
-          # scan` does not contain `darkmux scan`). Historical release-notes
-          # lines (README's status block, one line per release naming its
-          # `**vX.Y.Z**`) legitimately quote old verbs — excluded by the -v
-          # filter; live prose never carries that bold-version marker.
-          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external)\b'
-          if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
-            echo "::error::Retired verb spelling in user-facing docs (#1426) — use profile list / profile scan / lab notebook / mission launch review / pipe into mission propose:"
+          # (#1426) Verb spellings retired with NO compat alias:
+          # phase 1 — `darkmux profiles` -> `darkmux profile list`,
+          # `darkmux scan` -> `darkmux profile scan`, `darkmux notebook ...` ->
+          # `darkmux lab notebook ...`, `darkmux pr-review ...` -> `darkmux
+          # mission launch review`, `darkmux external ...` -> pipe into
+          # `mission propose`. phase 2 — `darkmux crew dispatch <role>` ->
+          # `darkmux dispatch <role>` (dispatch promoted to a top-level verb),
+          # and `darkmux skills ...` -> `darkmux init` (init is the one
+          # setup/refresh verb; doctor flags stale darkmux-* skills). The word
+          # boundary keeps NEW spellings clean (`darkmux profile scan` does not
+          # contain `darkmux scan`), and the `crew dispatch` alternative anchors
+          # on the two-word spelling so the surviving `crew list`/`show`/`index`
+          # family does NOT trip. Historical release-notes lines (README's
+          # status block, one line per release naming its `**vX.Y.Z**`)
+          # legitimately quote old verbs — excluded by the -v filter; live prose
+          # never carries that bold-version marker.
+          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew dispatch)\b'
+          if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
+            echo "::error::Retired verb spelling in user-facing docs (#1426) — use profile list / profile scan / lab notebook / mission launch review / pipe into mission propose / dispatch (not crew dispatch) / init (not skills):"
             echo "$bad"
             exit 1
           fi

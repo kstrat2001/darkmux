@@ -99,207 +99,37 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: LabCmd,
     },
-    /// Manage agent-invokable skills bundled with darkmux.
-    Skills {
-        #[command(subcommand)]
-        sub: SkillsCmd,
-    },
-    /// Run pre-flight diagnostic checks. Verifies the local setup (profile
-    /// registry, LMStudio, models, runtime, RAM, power) and reports
-    /// pass/warn/fail with actionable hints. Exit 0 if no failures, else 1.
-    Doctor {
-        /// (#1130) Print every check. Default output is issues-only — the
-        /// build identity line + any warnings/failures, with the passing
-        /// checks collapsed to a count. Use `-v` to see the full list.
-        #[arg(long, short = 'v')]
-        verbose: bool,
-        /// (#1177) Live-probe each profile model's remote endpoint with ONE
-        /// minimal chat completion through the same URL/auth path a real
-        /// dispatch uses — verifies the credential actually WORKS (the
-        /// default doctor only checks the Keychain item exists). Opt-in
-        /// because each probe is a real API call: a paid endpoint bills a
-        /// few tokens per probe (the probe's own token cost is shown in
-        /// its result line).
-        #[arg(long)]
-        probe: bool,
-    },
-    /// Profile registry — the declaration surface for named model stacks.
-    /// `profile list` shows the configured profiles; `profile scan` finds
-    /// downloaded LMStudio models not yet in any profile; `profile draft`
-    /// emits a starter profile JSON (#1426 — top-level `profiles` and `scan`
-    /// merged into this family).
-    Profile {
-        #[command(subcommand)]
-        sub: ProfileCmd,
-    },
-    /// Model lifecycle subcommands — operate on the darkmux-managed model
-    /// group (anything in `lms ps` under the `darkmux:` namespace).
-    /// User-loaded models (non-namespaced identifiers) are off-limits to
-    /// these commands by design.
-    Model {
-        #[command(subcommand)]
-        sub: ModelCmd,
-    },
-    /// Fleet management — declare which machines compose your darkmux
-    /// fleet and probe their reachability. The substrate for tier-aware
-    /// dispatch routing (PR-C / #247) and the topology view's fleet
-    /// pane. Single-machine fleets work without any roster entries;
-    /// multi-machine fleets need `darkmux fleet add <id>` per peer.
-    /// (#246 / #248)
-    Fleet {
-        #[command(subcommand)]
-        sub: FleetCmd,
-    },
-    /// Crew subcommands — dispatch a role for a single turn.
-    Crew {
-        #[command(subcommand)]
-        sub: CrewCmd,
-    },
-    /// Engagement-context lessons — operator-authored conventions,
-    /// constraints, and decisions (with the reasoning behind them) that surface
-    /// to coder dispatches as a `<lessons>` block. Stored in a durable,
-    /// concurrent-safe SQLite `lessons.db`. Per-repo by default
-    /// (`<repo>/.darkmux/lessons.db`, engagement-scoped); `--global` targets
-    /// the cross-engagement `~/.darkmux/lessons.db`. (#994)
-    Lessons {
-        #[command(subcommand)]
-        sub: LessonsCmd,
-    },
-    /// Role management — list and show role details from the SQLite index.
-    Role {
-        #[command(subcommand)]
-        sub: RoleCmd,
-    },
-    /// Phase planning — pre-dispatch budget oracle.
-    /// `darkmux phase estimate <spec.json>` computes token consumption +
-    /// recommends a profile. `--narrate` adds a one-sentence operator-facing
-    /// wrap from the 4B compactor.
-    Phase {
-        #[command(subcommand)]
-        sub: PhaseCmd,
-    },
-    /// Mission lifecycle — transition missions through their state machine.
-    /// Mission status flows: Active ↔ Paused → Closed. All transitions are
-    /// operator-explicit; nothing auto-decides a mission is paused or done.
-    /// Wall-clock UI consumes mission timestamps via `darkmux serve`.
-    Mission {
-        #[command(subcommand)]
-        sub: MissionCmd,
-    },
-    /// Per-hardware-tier recommendations — primary + compactor model
-    /// picks validated via the project's bake-off methodology. Read-only;
-    /// surfaces the registry's pick for the active or a specified tier.
-    Recommendations {
-        #[command(subcommand)]
-        sub: RecommendationsCmd,
-    },
-    /// Flow observability — record operator-facing flow events.
-    Flow {
-        #[command(subcommand)]
-        sub: crate::flow_cli::FlowCmd,
-    },
-    /// Read/write `~/.darkmux/config.json` settings (#937). `set` validates the
-    /// key + coerces the value; secrets stay in the Keychain. Distinct from
-    /// `profile` (the swap-profiles registry).
-    Config {
-        #[command(subcommand)]
-        sub: crate::config_cmd::ConfigCmd,
-    },
-    /// Start an HTTP daemon for flow record retrieval.
-    Serve {
-        /// Port to listen on (default: 8765).
-        #[arg(long, default_value = "8765")]
-        port: u16,
-        /// Address to bind (default: 127.0.0.1).
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
-        /// Directory to serve flow records from (default: ~/.darkmux/flows/).
-        #[arg(long = "flows-dir")]
-        flows_dir: Option<std::path::PathBuf>,
-        /// (#1247 Part 3) Root directory the lab observer lens scans for run
-        /// clusters (any dir containing funnels.json / funnel-events.jsonl /
-        /// scores.json). Falls back to `DARKMUX_LAB_DIR` when unset; unset
-        /// entirely by default — no default scanning of arbitrary paths, the
-        /// lab lens stays "not configured" until named. Machine-local by
-        /// design: this daemon only ever reads ITS OWN machine's runs, never
-        /// a remote path.
-        #[arg(long = "lab-dir")]
-        lab_dir: Option<std::path::PathBuf>,
-    },
-    /// One-command setup: install skills, optionally add session-start hook
-    /// and CLAUDE.md integration so Claude Code knows about darkmux.
-    Init {
-        /// Add a SessionStart hook to ~/.claude/settings.json that runs
-        /// `darkmux status` so Claude sees the current stack at session start.
-        #[arg(long)]
-        with_hook: bool,
-        /// Append a darkmux integration section to the given CLAUDE.md.
-        /// Use `~/.claude/CLAUDE.md` for global, or a project-relative path.
-        #[arg(long)]
-        with_claude_md: Option<std::path::PathBuf>,
-        /// Append a darkmux integration section to the given AGENTS.md.
-        /// Use `./AGENTS.md` for a project-relative path, or any custom path.
-        #[arg(long)]
-        with_agents_md: Option<std::path::PathBuf>,
-        /// Overwrite existing skills / hook entries.
-        #[arg(long, short = 'f')]
-        force: bool,
-        /// Show what would be installed without writing.
-        #[arg(long, short = 'n')]
-        dry_run: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum RecommendationsCmd {
-    /// Show the recommendation registry entry for a hardware tier.
-    /// Defaults to the active tier (resolved via the same hardware
-    /// fingerprint `darkmux doctor` uses); pass `<tier>` to inspect a
-    /// non-active tier (`m-series-128`, `m-series-64`, `m-series-32`,
-    /// `generic`). Operator-readable output: status, profile name,
-    /// primary + compactor model ids, rationale.
-    Show {
-        /// Optional tier id; defaults to the active hardware tier.
-        tier: Option<String>,
-        #[command(flatten)]
-        json: JsonFlag,
-    },
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Subcommand)]
-pub(crate) enum CrewCmd {
-    /// List every crew in the index.
-    List,
-    /// Show full details for a single crew.
-    Show {
-        /// Crew id to show.
-        id: String,
-    },
-    /// Dispatch a single turn to the named role. Loads the role manifest +
-    /// `.md` system prompt and runs the role through the in-house container-
-    /// bounded runtime — a per-dispatch `darkmux-runtime` Docker container
-    /// with the assembled message.
+    /// Dispatch a single turn to the named role — the task-grain execution
+    /// entry point (#1426). Loads the role manifest + `.md` system prompt and
+    /// runs the role through the in-house container-bounded runtime (a
+    /// per-dispatch `darkmux-runtime` Docker container) with the assembled
+    /// message.
+    ///
+    /// The MESSAGE is positional. When it is omitted, darkmux reads the
+    /// message from stdin, so a diff pipes straight in:
+    /// `git diff | darkmux dispatch pr-reviewer`. For a message that begins
+    /// with `-`, use the standard `--` separator:
+    /// `darkmux dispatch coder -- --version bump`.
     Dispatch {
         /// Role id (e.g. `code-reviewer`). Must have a manifest at
         /// `templates/builtin/roles/<id>.json` (or under
         /// `~/.darkmux/roles/`) AND a sibling `.md` prompt file.
         role: String,
-        /// Message body for the dispatch. Mutually exclusive with
-        /// `--message-from-file`; exactly one of the two is required.
-        #[arg(
-            long,
-            short = 'm',
-            required_unless_present = "message_from_file",
-            conflicts_with = "message_from_file"
-        )]
+        /// Message body for the dispatch (positional). When omitted, the
+        /// message is read from stdin (`git diff | darkmux dispatch
+        /// pr-reviewer`); darkmux refuses to run if stdin is a terminal and
+        /// no message was given, rather than hang waiting for input, and an
+        /// empty or whitespace-only pipe (e.g. an empty `git diff`) is
+        /// refused loudly rather than dispatched as a blank brief. A
+        /// message that begins with `-` needs the standard `--` separator:
+        /// `darkmux dispatch coder -- -starts-with-dash`.
         message: Option<String>,
-        /// (#386) Read the message body from a file instead of the command
-        /// line — for substantial briefs that would exceed the shell's
-        /// ARG_MAX or clutter `ps`/shell history. Mutually exclusive with
-        /// `--message`. The brief is passed to the runtime via a bind-mounted
-        /// file, so it never lands on the `docker run` argv either.
-        #[arg(long = "message-from-file", value_name = "PATH")]
+        /// (#386) Read the message body from a file instead of the positional
+        /// argument or stdin — for substantial briefs that would exceed the
+        /// shell's ARG_MAX or clutter `ps`/shell history. The brief is passed
+        /// to the runtime via a bind-mounted file, so it never lands on the
+        /// `docker run` argv either. Conflicts with the positional MESSAGE.
+        #[arg(long = "message-from-file", value_name = "PATH", conflicts_with = "message")]
         message_from_file: Option<std::path::PathBuf>,
         /// (#1054) Select a named profile from the machine's registry for this
         /// dispatch's model + context-window resolution, instead of the
@@ -383,6 +213,181 @@ pub(crate) enum CrewCmd {
         /// No effect on container-path dispatches (local or agentic-remote).
         #[arg(long, value_name = "N")]
         max_completion_tokens: Option<u32>,
+    },
+    /// Run pre-flight diagnostic checks. Verifies the local setup (profile
+    /// registry, LMStudio, models, runtime, RAM, power) and reports
+    /// pass/warn/fail with actionable hints. Exit 0 if no failures, else 1.
+    Doctor {
+        /// (#1130) Print every check. Default output is issues-only — the
+        /// build identity line + any warnings/failures, with the passing
+        /// checks collapsed to a count. Use `-v` to see the full list.
+        #[arg(long, short = 'v')]
+        verbose: bool,
+        /// (#1177) Live-probe each profile model's remote endpoint with ONE
+        /// minimal chat completion through the same URL/auth path a real
+        /// dispatch uses — verifies the credential actually WORKS (the
+        /// default doctor only checks the Keychain item exists). Opt-in
+        /// because each probe is a real API call: a paid endpoint bills a
+        /// few tokens per probe (the probe's own token cost is shown in
+        /// its result line).
+        #[arg(long)]
+        probe: bool,
+    },
+    /// Profile registry — the declaration surface for named model stacks.
+    /// `profile list` shows the configured profiles; `profile scan` finds
+    /// downloaded LMStudio models not yet in any profile; `profile draft`
+    /// emits a starter profile JSON (#1426 — top-level `profiles` and `scan`
+    /// merged into this family).
+    Profile {
+        #[command(subcommand)]
+        sub: ProfileCmd,
+    },
+    /// Model lifecycle subcommands — operate on the darkmux-managed model
+    /// group (anything in `lms ps` under the `darkmux:` namespace).
+    /// User-loaded models (non-namespaced identifiers) are off-limits to
+    /// these commands by design.
+    Model {
+        #[command(subcommand)]
+        sub: ModelCmd,
+    },
+    /// Fleet management — declare which machines compose your darkmux
+    /// fleet and probe their reachability. The substrate for tier-aware
+    /// dispatch routing (PR-C / #247) and the topology view's fleet
+    /// pane. Single-machine fleets work without any roster entries;
+    /// multi-machine fleets need `darkmux fleet add <id>` per peer.
+    /// (#246 / #248)
+    Fleet {
+        #[command(subcommand)]
+        sub: FleetCmd,
+    },
+    /// Crew registry reads — list/show/index the crews declared in the
+    /// profiles registry. (#1426 relocated single-role dispatch to the
+    /// top-level `darkmux dispatch` verb.)
+    Crew {
+        #[command(subcommand)]
+        sub: CrewCmd,
+    },
+    /// Engagement-context lessons — operator-authored conventions,
+    /// constraints, and decisions (with the reasoning behind them) that surface
+    /// to coder dispatches as a `<lessons>` block. Stored in a durable,
+    /// concurrent-safe SQLite `lessons.db`. Per-repo by default
+    /// (`<repo>/.darkmux/lessons.db`, engagement-scoped); `--global` targets
+    /// the cross-engagement `~/.darkmux/lessons.db`. (#994)
+    Lessons {
+        #[command(subcommand)]
+        sub: LessonsCmd,
+    },
+    /// Role management — list and show role details from the SQLite index.
+    Role {
+        #[command(subcommand)]
+        sub: RoleCmd,
+    },
+    /// Phase planning — pre-dispatch budget oracle.
+    /// `darkmux phase estimate <spec.json>` computes token consumption +
+    /// recommends a profile. `--narrate` adds a one-sentence operator-facing
+    /// wrap from the 4B compactor.
+    Phase {
+        #[command(subcommand)]
+        sub: PhaseCmd,
+    },
+    /// Mission lifecycle — transition missions through their state machine.
+    /// Mission status flows: Active ↔ Paused → Closed. All transitions are
+    /// operator-explicit; nothing auto-decides a mission is paused or done.
+    /// Wall-clock UI consumes mission timestamps via `darkmux serve`.
+    Mission {
+        #[command(subcommand)]
+        sub: MissionCmd,
+    },
+    /// Per-hardware-tier recommendations — primary + compactor model
+    /// picks validated via the project's bake-off methodology. Read-only;
+    /// surfaces the registry's pick for the active or a specified tier.
+    Recommendations {
+        #[command(subcommand)]
+        sub: RecommendationsCmd,
+    },
+    /// Flow observability — record operator-facing flow events.
+    Flow {
+        #[command(subcommand)]
+        sub: crate::flow_cli::FlowCmd,
+    },
+    /// Read/write `~/.darkmux/config.json` settings (#937). `set` validates the
+    /// key + coerces the value; secrets stay in the Keychain. Distinct from
+    /// `profile` (the swap-profiles registry).
+    Config {
+        #[command(subcommand)]
+        sub: crate::config_cmd::ConfigCmd,
+    },
+    /// Start an HTTP daemon for flow record retrieval.
+    Serve {
+        /// Port to listen on (default: 8765).
+        #[arg(long, default_value = "8765")]
+        port: u16,
+        /// Address to bind (default: 127.0.0.1).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Directory to serve flow records from (default: ~/.darkmux/flows/).
+        #[arg(long = "flows-dir")]
+        flows_dir: Option<std::path::PathBuf>,
+        /// (#1247 Part 3) Root directory the lab observer lens scans for run
+        /// clusters (any dir containing funnels.json / funnel-events.jsonl /
+        /// scores.json). Falls back to `DARKMUX_LAB_DIR` when unset; unset
+        /// entirely by default — no default scanning of arbitrary paths, the
+        /// lab lens stays "not configured" until named. Machine-local by
+        /// design: this daemon only ever reads ITS OWN machine's runs, never
+        /// a remote path.
+        #[arg(long = "lab-dir")]
+        lab_dir: Option<std::path::PathBuf>,
+    },
+    /// One-command setup: install skills, optionally add session-start hook
+    /// and CLAUDE.md integration so Claude Code knows about darkmux. Safe to
+    /// re-run; refreshes the bundled skills after a darkmux upgrade (#1426 —
+    /// `darkmux doctor` flags stale darkmux-* skills and points here).
+    Init {
+        /// Add a SessionStart hook to ~/.claude/settings.json that runs
+        /// `darkmux status` so Claude sees the current stack at session start.
+        #[arg(long)]
+        with_hook: bool,
+        /// Append a darkmux integration section to the given CLAUDE.md.
+        /// Use `~/.claude/CLAUDE.md` for global, or a project-relative path.
+        #[arg(long)]
+        with_claude_md: Option<std::path::PathBuf>,
+        /// Append a darkmux integration section to the given AGENTS.md.
+        /// Use `./AGENTS.md` for a project-relative path, or any custom path.
+        #[arg(long)]
+        with_agents_md: Option<std::path::PathBuf>,
+        /// Overwrite existing skills / hook entries.
+        #[arg(long, short = 'f')]
+        force: bool,
+        /// Show what would be installed without writing.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RecommendationsCmd {
+    /// Show the recommendation registry entry for a hardware tier.
+    /// Defaults to the active tier (resolved via the same hardware
+    /// fingerprint `darkmux doctor` uses); pass `<tier>` to inspect a
+    /// non-active tier (`m-series-128`, `m-series-64`, `m-series-32`,
+    /// `generic`). Operator-readable output: status, profile name,
+    /// primary + compactor model ids, rationale.
+    Show {
+        /// Optional tier id; defaults to the active hardware tier.
+        tier: Option<String>,
+        #[command(flatten)]
+        json: JsonFlag,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CrewCmd {
+    /// List every crew in the index.
+    List,
+    /// Show full details for a single crew.
+    Show {
+        /// Crew id to show.
+        id: String,
     },
     /// SQLite-backed derived index over crew manifests (Phase B of #45).
     /// The index is derived state — JSON manifests under the crew root are
@@ -1068,27 +1073,6 @@ pub(crate) enum LessonsCmd {
         file: Option<String>,
         #[command(flatten)]
         json: JsonFlagPlain,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum SkillsCmd {
-    /// Copy bundled skills into a Claude Code (or compatible) skills dir.
-    Install {
-        /// Target dir (default: ~/.claude/skills/darkmux/).
-        #[arg(long)]
-        target: Option<std::path::PathBuf>,
-        /// Overwrite existing SKILL.md files.
-        #[arg(long, short = 'f')]
-        force: bool,
-        /// Show what would be installed without writing.
-        #[arg(long, short = 'n')]
-        dry_run: bool,
-    },
-    /// List currently-installed skills under the target dir.
-    List {
-        #[arg(long)]
-        target: Option<std::path::PathBuf>,
     },
 }
 

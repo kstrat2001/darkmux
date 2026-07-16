@@ -229,7 +229,7 @@ fn bundle_inputs_from_set(set: &BundleSet, source: &FileSource) -> Result<Vec<Bu
 
 /// (#1247 Part 1) Production wiring of `review::ReviewEmitter` — writes
 /// through the real darkmux-flow machinery, the same engagement-scoped
-/// stream `crew dispatch`/`phase review` write through. This is the FLEET
+/// stream `dispatch`/`phase review` write through. This is the FLEET
 /// sink: `mission launch review` drives ONE case per invocation (a real PR
 /// review), so its run/step/ruling records belong on the operator's real
 /// engagement stream — contrast `darkmux lab review-bench --funnel`'s
@@ -247,7 +247,7 @@ impl ReviewEmitter for FleetFlowEmitter {
 /// Every distinct model this crew's resolved seats will dispatch,
 /// darkmux-namespaced and deduped/sorted for a stable display string. A
 /// review run is inherently multi-model (>=1 probe seat plus the judge
-/// seat) — unlike a single-model `crew dispatch`, there's no one "the
+/// seat) — unlike a single-model `dispatch`, there's no one "the
 /// model" for the dispatch bookend's `model` field, so this is the closest
 /// honest equivalent: every model actually in play, comma-joined.
 fn crew_model_summary(crew: &ResolvedCrew) -> Option<String> {
@@ -273,7 +273,7 @@ fn crew_model_summary(crew: &ResolvedCrew) -> Option<String> {
 }
 
 /// One review-run dispatch bookend record. Same builder + field shape
-/// `crew dispatch` uses, with ONE deliberate difference: `source` is
+/// `dispatch` uses, with ONE deliberate difference: `source` is
 /// overridden from the builder's hardcoded `"crew_dispatch"` to `"review"`
 /// — the SAME provenance tag every sibling `review.task/step/ruling` record
 /// in this session carries.
@@ -325,7 +325,7 @@ impl ReviewEmitter for EmitterSink<'_> {
 
 /// Emit `dispatch start`, run `f`, then emit the matching terminal record —
 /// `dispatch complete` on `Ok`, `dispatch error` (carrying the real error
-/// text) on `Err`. Same shape `crew dispatch` emits around every dispatch,
+/// text) on `Err`. Same shape `dispatch` emits around every dispatch,
 /// so a production review dispatch opens/closes the SAME liveness edge the
 /// viewer's fleet/machine surfaces key on.
 fn with_dispatch_bookends(

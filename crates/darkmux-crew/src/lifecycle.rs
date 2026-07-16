@@ -476,7 +476,7 @@ fn fsync_dir(dir: &std::path::Path) -> Result<()> {
 /// Currently every internal caller routes through `load_phase_by_id` (since
 /// the CLI verbs accept a bare phase id and discover the mission from the
 /// JSON itself). Kept as the primary public surface for code that *does*
-/// have both ids in scope (e.g., crew dispatch when `--mission` lands).
+/// have both ids in scope (e.g., dispatch when `--mission` lands).
 #[allow(dead_code)]
 pub(crate) fn load_phase(mission_id: &str, phase_id: &str) -> Result<Phase> {
     let path = phase_path(mission_id, phase_id);

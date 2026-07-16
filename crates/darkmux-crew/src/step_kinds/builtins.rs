@@ -340,7 +340,7 @@ fn clamp_hosted_max_tokens(requested: u32, budget: u64) -> u32 {
 /// allowance in one shot. **Reading:** each `dispatch.single_shot` step is
 /// its own execution (one pipeline stage) — a graph with several
 /// endpoint-bearing single-shot steps draws the allowance once PER STEP,
-/// not once for the whole graph, matching how a bare `crew dispatch` (also
+/// not once for the whole graph, matching how a bare `dispatch` (also
 /// gated by `admit_remote_execution`) counts as one execution. This is the
 /// minimum regime, not the full one: there is no cross-call bucket here
 /// (each step gets a fresh allowance check), unlike the review funnel's

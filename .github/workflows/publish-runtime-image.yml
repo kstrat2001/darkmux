@@ -2,7 +2,7 @@ name: Publish runtime image
 
 # Builds `runtime/` and pushes it to GHCR as
 # `ghcr.io/kstrat2001/darkmux-runtime:<darkmux-version>` (+ `:latest`) so a
-# `brew install` user can pull the runtime image on demand for `crew dispatch`
+# `brew install` user can pull the runtime image on demand for `dispatch`
 # / `lab run` instead of needing a source checkout + local `docker build`.
 # See https://github.com/kstrat2001/darkmux/issues/759.
 #

@@ -1022,7 +1022,7 @@ function missionLabel(){
   return ms.length>2 ? `${ms.slice(0,2).join(', ')} +${ms.length-2} more` : ms.join(', ');
 }
 // The live headline subject — what's RUNNING right now, tracked by live
-// SESSION (not just mission): an unscoped `crew dispatch` has a live session
+// SESSION (not just mission): an unscoped `dispatch` has a live session
 // but no mission_id and is still "running". Returns null when nothing is live
 // (→ idle status) or in playback (LIVE_SESSIONS empty). Prefers a mission-
 // scoped session as the primary subject; surfaces the rest behind "+N more".

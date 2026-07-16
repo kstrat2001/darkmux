@@ -85,13 +85,13 @@ class Darkmux < Formula
 
       Scope: this formula ships the `darkmux` CLI + `serve` daemon + the
       keychain wrapper + bundled skills. The `darkmux-runtime` Docker image
-      that `darkmux crew dispatch` and `darkmux lab run` use is not bundled,
+      that `darkmux dispatch` and `darkmux lab run` use is not bundled,
       but you don't build it by hand: on the first dispatch with no local
       image, darkmux pulls the version-pinned image from GHCR on demand
       (ghcr.io/kstrat2001/darkmux-runtime:<version>, #759) — you just need
       Docker running. (`docker build -t darkmux-runtime:latest runtime/` from
       a source checkout is the offline/dev alternative.) So brew is a complete
-      install end to end: `swap` / `status` / `profiles` / `fleet` / `flow` /
+      install end to end: `swap` / `status` / `profile` / `fleet` / `flow` /
       `serve` / `doctor`, the hub coordinator role, AND local dispatches.
 
       For a single-machine CLI install (no daemon needed):

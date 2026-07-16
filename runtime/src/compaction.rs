@@ -417,7 +417,7 @@ impl CompactionConfig {
 /// Loud-fail here surfaces the misconfiguration at startup rather than
 /// silently mistuning every compaction decision downstream.
 ///
-/// On the standard host path (`darkmux crew dispatch`,
+/// On the standard host path (`darkmux dispatch`,
 /// `darkmux lab run`) the host always supplies `--context-window` from
 /// the primary model's `n_ctx`, so this check never fires. It catches
 /// the runtime being invoked without the host (direct `docker run`,
@@ -451,7 +451,7 @@ pub fn validate_compaction_cli_inputs(
              - add --context-window N (loaded model's n_ctx), or\n  \
              - drop the ratio and use --compact-threshold-tokens N for an \
              absolute trigger.\n\n\
-             If you reached this via `darkmux crew dispatch` or `darkmux lab \
+             If you reached this via `darkmux dispatch` or `darkmux lab \
              run`, the host should be supplying --context-window — check that \
              the active profile has a Primary model with `n_ctx` set. See #482."
                 .to_string(),
@@ -466,7 +466,7 @@ pub fn validate_compaction_cli_inputs(
              path derives this from the active profile's primary model)\n  \
              - --compact-threshold-tokens N (operator's explicit absolute \
              trigger)\n\n\
-             If you reached this via `darkmux crew dispatch` or `darkmux lab \
+             If you reached this via `darkmux dispatch` or `darkmux lab \
              run`, the host should be supplying --context-window — check that \
              the active profile has a Primary model with `n_ctx` set. See \
              #482."

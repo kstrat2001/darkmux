@@ -125,6 +125,36 @@ fn retired_top_level_notebook_verb_is_unknown() {
         ));
 }
 
+/// (#1426 phase 2) The `skills` top-level verb retired — `init` is the one
+/// setup/refresh verb (it refreshes the bundled darkmux-* skills on re-run,
+/// and `darkmux doctor` flags stale ones). The spelling has NO compat alias,
+/// so clap rejects it as an unknown subcommand.
+#[test]
+fn retired_top_level_skills_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("skills")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand").or(
+            predicate::str::contains("unexpected argument"),
+        ));
+}
+
+/// (#1426 phase 2) `dispatch` promoted to a top-level verb, so `crew dispatch`
+/// retired from the crew family. `crew` survives (list/show/index), so the
+/// error is an unknown SUB-verb WITHIN the surviving family — not an unknown
+/// top-level verb.
+#[test]
+fn retired_crew_dispatch_subverb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.args(["crew", "dispatch", "code-reviewer"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand").or(
+            predicate::str::contains("unexpected argument"),
+        ));
+}
+
 #[test]
 fn swap_dry_run_succeeds_without_real_lms() {
     let tmp = TempDir::new().unwrap();
@@ -925,19 +955,20 @@ fn lab_doctor_passes_for_builtin_demo_tiny_py() {
         .stdout(predicate::str::contains("1 pass"));
 }
 
-/// (#386) `crew dispatch` accepts the message via `--message-from-file` and
-/// enforces the xor with `--message`. These fail before any container work, so
-/// they don't need docker / a model.
+/// (#1426 / #386) `darkmux dispatch <role> [MESSAGE]` sources the message
+/// from a positional argument, `--message-from-file`, or stdin. The positional
+/// and the file flag are mutually exclusive, and the file is resolved at the
+/// top of the handler — all before any container work, so these need no
+/// docker / model.
 #[test]
-fn crew_dispatch_message_from_file_flag_contract() {
-    // Mutual exclusion: --message AND --message-from-file → clap rejects.
+fn dispatch_message_source_contract() {
+    // Mutual exclusion: positional MESSAGE AND --message-from-file → clap
+    // rejects. (Proves the positional exists and conflicts with the file flag.)
     Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "crew",
             "dispatch",
             "code-reviewer",
-            "-m",
             "inline",
             "--message-from-file",
             "/tmp/whatever",
@@ -946,28 +977,16 @@ fn crew_dispatch_message_from_file_flag_contract() {
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
 
-    // Neither → clap requires one (the error names --message as the required arg).
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .args(["crew", "dispatch", "code-reviewer"])
-        .assert()
-        .failure()
-        .stderr(
-            predicate::str::contains("required arguments were not provided")
-                .and(predicate::str::contains("--message")),
-        );
-
-    // Missing file → resolved early, fails loud BEFORE any dispatch setup
-    // (the message is resolved at the top of the handler, ahead of out-dir
-    // creation / container spawn).
+    // Missing --message-from-file → resolved early, fails loud BEFORE any
+    // dispatch setup (the message is resolved at the top of the handler, ahead
+    // of out-dir creation / container spawn).
     Command::cargo_bin("darkmux")
         .unwrap()
         .args([
-            "crew",
             "dispatch",
             "code-reviewer",
             "--message-from-file",
-            "/nonexistent/darkmux-386/brief.md",
+            "/nonexistent/darkmux-1426/brief.md",
         ])
         .assert()
         .failure()
@@ -978,20 +997,137 @@ fn crew_dispatch_message_from_file_flag_contract() {
         );
 }
 
-/// (#1405 gate remediation) The licensed-adjacent ACK gate fires on the
-/// internal dispatch path BEFORE any Docker work. The gate was moved into
-/// `dispatch_internal::dispatch()` when the openclaw branch (its previous
-/// only caller) was removed; this pins the moved-but-unwired regression
-/// class structurally: a non-TTY dispatch of `health-research` with no
-/// prior ack must bail at the gate — no Docker preflight, no container
-/// spawn — so the test needs no Docker and is CI-safe.
+/// (#1426) The POSITIONAL message reaches the dispatch path. `health-research`
+/// is licensed-adjacent, so its ACK gate bails BEFORE any Docker work — a
+/// CI-safe way to prove the positional message was accepted and routed without
+/// a real model.
 #[test]
-fn crew_dispatch_licensed_adjacent_role_bails_at_ack_gate_before_docker() {
+fn dispatch_positional_message_reaches_ack_gate() {
     let ack_dir = TempDir::new().unwrap(); // empty — no prior ack on file
     Command::cargo_bin("darkmux")
         .unwrap()
         .env("DARKMUX_ACK_DIR", ack_dir.path())
-        .args(["crew", "dispatch", "health-research", "-m", "smoke"])
+        .args(["dispatch", "health-research", "smoke"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("requires operator acknowledgment")
+                // The positional was consumed — no "no message given" guard,
+                // no docker.
+                .and(predicate::str::contains("no message given").not())
+                .and(predicate::str::contains("runtime=internal").not())
+                .and(predicate::str::contains("docker").not()),
+        );
+}
+
+/// (#1426) When the positional MESSAGE is omitted, the message is read from
+/// stdin (pipe composition: `git diff | darkmux dispatch pr-reviewer`). Piping
+/// a message to `health-research` proves the stdin channel drives the message
+/// (no TTY-absent error fires) and the dispatch reaches the ACK gate, which
+/// bails before Docker. CI-safe: `write_stdin` makes stdin a non-TTY pipe, the
+/// path the byte-faithful `read_to_string` consumes.
+#[test]
+fn dispatch_stdin_message_reaches_ack_gate() {
+    let ack_dir = TempDir::new().unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_ACK_DIR", ack_dir.path())
+        .args(["dispatch", "health-research"])
+        .write_stdin("smoke from stdin")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("requires operator acknowledgment")
+                // The TTY-absent guard did NOT fire (stdin was a pipe with
+                // content), and no docker work happened.
+                .and(predicate::str::contains("no message given").not())
+                .and(predicate::str::contains("runtime=internal").not())
+                .and(predicate::str::contains("docker").not()),
+        );
+}
+
+/// (#1426) Empty piped stdin bails LOUDLY with its own error — distinct from
+/// the terminal-guard's "no message given" text — instead of dispatching a
+/// blank brief (an empty `git diff |` is the most common accident). The
+/// dispatch never starts: no ACK-gate text, no docker.
+#[test]
+fn dispatch_empty_stdin_bails_loudly() {
+    let ack_dir = TempDir::new().unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_ACK_DIR", ack_dir.path())
+        .args(["dispatch", "health-research"])
+        .write_stdin("") // empty pipe → loud bail, not a blank dispatch
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("stdin was empty")
+                // Distinct from the TTY-absent guard's error.
+                .and(predicate::str::contains("no message given").not())
+                // Bailed before any dispatch machinery.
+                .and(predicate::str::contains("requires operator acknowledgment").not())
+                .and(predicate::str::contains("docker").not()),
+        );
+}
+
+/// (#1426) A whitespace-only pipe (`echo |` produces a lone "\n" — the second
+/// most common accident) gets the same loud empty-stdin bail. The emptiness
+/// check trims for the CHECK only; a message with real content is still
+/// delivered byte-faithfully (covered by dispatch_stdin_message_reaches_ack_gate).
+#[test]
+fn dispatch_whitespace_only_stdin_bails_loudly() {
+    let ack_dir = TempDir::new().unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_ACK_DIR", ack_dir.path())
+        .args(["dispatch", "health-research"])
+        .write_stdin("\n")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("stdin was empty")
+                .and(predicate::str::contains("requires operator acknowledgment").not()),
+        );
+}
+
+/// (#1426) An empty (or whitespace-only) --message-from-file gets the same
+/// trim-empty bail for consistency, with a distinct error naming the file
+/// path — resolved at the top of the handler, before any dispatch setup.
+#[test]
+fn dispatch_empty_message_file_bails_loudly() {
+    let tmp = TempDir::new().unwrap();
+    let brief = tmp.path().join("blank-brief.md");
+    fs::write(&brief, "  \n\n").unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "dispatch",
+            "code-reviewer",
+            "--message-from-file",
+            brief.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("is empty")
+                .and(predicate::str::contains("blank-brief.md"))
+                .and(predicate::str::contains("docker").not()),
+        );
+}
+
+/// (#1405 gate remediation, relocated to top-level `dispatch` in #1426) The
+/// licensed-adjacent ACK gate fires on the internal dispatch path BEFORE any
+/// Docker work. This pins the moved-but-unwired regression class structurally:
+/// a non-TTY dispatch of `health-research` with no prior ack must bail at the
+/// gate — no Docker preflight, no container spawn — so the test needs no
+/// Docker and is CI-safe.
+#[test]
+fn dispatch_licensed_adjacent_role_bails_at_ack_gate_before_docker() {
+    let ack_dir = TempDir::new().unwrap(); // empty — no prior ack on file
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_ACK_DIR", ack_dir.path())
+        .args(["dispatch", "health-research", "smoke"])
         // assert_cmd pipes stdin (not a TTY), so the gate's non-interactive
         // arm bails rather than prompting for ACKNOWLEDGE.
         .assert()

@@ -1,5 +1,7 @@
-//! `darkmux skills install` — copy bundled agent-invokable skills into a
-//! Claude Code (or compatible) skills directory.
+//! Skill installer — copy bundled agent-invokable skills into a Claude Code
+//! (or compatible) skills directory. Driven by `darkmux init` (#1426 retired
+//! the standalone `skills` verb; init is the one setup/refresh verb, and
+//! `darkmux doctor` flags stale darkmux-* skills and points back at it).
 //!
 //! Source priority:
 //!   1. On-disk `skills/` dir (if found via the search path) — preserved for
@@ -8,8 +10,7 @@
 //!      default for users installing via `cargo install --path .` from
 //!      anywhere outside the source tree.
 //!
-//! Destination: `~/.claude/skills/<skill-name>/SKILL.md` by default,
-//! or whatever the user passes via `--target`.
+//! Destination: `~/.claude/skills/<skill-name>/SKILL.md` by default.
 
 use anyhow::{Context, Result};
 use std::env;
@@ -340,6 +341,12 @@ fn default_skills_targets() -> Result<Vec<PathBuf>> {
     Ok(targets)
 }
 
+// (#1426) The `skills list` CLI verb retired along with the whole `skills`
+// family (init is now the one setup/refresh verb). This enumerator survives —
+// its residual value is folding into the doctor freshness check's verbose
+// detail (round-8 spec), and its own tests still exercise it — but it has no
+// non-test caller in the binary today, so the bin-target build would flag it.
+#[allow(dead_code)]
 pub fn list_installed_skills(target: Option<&Path>) -> Result<Vec<String>> {
     let targets = match target {
         Some(p) => vec![p.to_path_buf()],

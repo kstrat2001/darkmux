@@ -324,7 +324,7 @@ pub struct FlowRecord {
     pub payload: Option<serde_json::Value>,
     /// Work-queue claim id when this record was produced by a job that
     /// flowed through the global `darkmux:work` stream. Absent on direct
-    /// local dispatches (the operator ran `darkmux crew dispatch <role>`
+    /// local dispatches (the operator ran `darkmux dispatch <role>`
     /// with no `--machine`). Populated by the dispatch path when it claims
     /// work from the queue. Schema 1.8 addition (#246).
     #[serde(skip_serializing_if = "Option::is_none")]

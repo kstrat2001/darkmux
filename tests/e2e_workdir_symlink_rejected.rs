@@ -16,7 +16,7 @@
 //! Test shape: spawn a single-node fleet (no Redis needed since we're
 //! exercising the LOCAL runtime-boundary validation here), create a
 //! tempdir + a symlink pointing to it, invoke
-//! `darkmux crew dispatch coder --workdir <symlink> --message hi`,
+//! `darkmux dispatch coder <symlink> hi` (message positional, #1426),
 //! assert non-zero exit + the symlink-reject error.
 
 #[path = "e2e/mod.rs"]
@@ -33,9 +33,9 @@ fn redis_available() -> bool {
 }
 
 #[test]
-fn crew_dispatch_rejects_symlink_workdir() {
+fn dispatch_rejects_symlink_workdir() {
     if !redis_available() {
-        eprintln!("skipping crew_dispatch_rejects_symlink_workdir: redis-server not on PATH");
+        eprintln!("skipping dispatch_rejects_symlink_workdir: redis-server not on PATH");
         return;
     }
 
@@ -49,26 +49,24 @@ fn crew_dispatch_rejects_symlink_workdir() {
     let sym = tmp.path().join("evil-symlink");
     std::os::unix::fs::symlink(&target, &sym).unwrap();
 
-    // Run `darkmux crew dispatch coder --workdir <sym>` from node-a's
-    // env. We use --skip-preflight to bypass the Docker preflight check
-    // (this test doesn't need a real container run — the workdir
-    // validation happens before `docker run` is ever invoked, so it
-    // fires regardless of Docker availability).
+    // Run `darkmux dispatch coder --workdir <sym> hi` from node-a's env
+    // (message is positional, #1426). We use --skip-preflight to bypass the
+    // Docker preflight check (this test doesn't need a real container run —
+    // the workdir validation happens before `docker run` is ever invoked, so
+    // it fires regardless of Docker availability).
     let node = harness.node("node-a").unwrap();
     let output = node
         .cmd()
         .args([
-            "crew",
             "dispatch",
             "coder",
             "--workdir",
             sym.to_str().unwrap(),
-            "--message",
             "hi",
             "--skip-preflight",
         ])
         .output()
-        .expect("running darkmux crew dispatch");
+        .expect("running darkmux dispatch");
 
     assert!(
         !output.status.success(),

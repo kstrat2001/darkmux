@@ -1,6 +1,6 @@
 //! Internal runtime dispatch path.
 //!
-//! Routes a `darkmux crew dispatch <role>` invocation to the
+//! Routes a `darkmux dispatch <role>` invocation to the
 //! `darkmux-runtime` docker container. Per-dispatch container, mounted
 //! workspace, structured output collected from stdout.
 //!
@@ -89,7 +89,7 @@ fn image_present_locally(tag: &str) -> bool {
 /// hang. Bails with an actionable message (auth / network / build-locally) on
 /// failure.
 fn pull_runtime_image(image: &str) -> Result<()> {
-    eprintln!("darkmux crew dispatch: no local runtime image — pulling `{image}` from GHCR (one-time, #759)…");
+    eprintln!("darkmux dispatch: no local runtime image — pulling `{image}` from GHCR (one-time, #759)…");
     let status = Command::new("docker")
         .args(["pull", image])
         .status()
@@ -296,7 +296,7 @@ fn ensure_runtime_binary_cached(source_image: &str) -> Result<PathBuf> {
         .with_context(|| format!("publishing runtime binary to {}", dest.display()))?;
 
     eprintln!(
-        "darkmux crew dispatch: cached runtime binary → {} (from {source_image}, for --image injection)",
+        "darkmux dispatch: cached runtime binary → {} (from {source_image}, for --image injection)",
         dest.display()
     );
     Ok(dest)
@@ -620,7 +620,7 @@ fn warn_if_unparseable_u32(var: &str) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() && trimmed.parse::<u32>().is_err() {
             eprintln!(
-                "darkmux crew dispatch: {var}=`{raw}` is not a positive integer; \
+                "darkmux dispatch: {var}=`{raw}` is not a positive integer; \
                  ignoring it (falling through to config / runtime default). (#457)"
             );
         }
@@ -926,8 +926,8 @@ fn single_shot_body(
     body
 }
 
-/// (#1260) Gate a bare remote `crew dispatch` against the per-EXECUTION
-/// remote token bucket. Per the operator's scope split, a bare crew dispatch
+/// (#1260) Gate a bare remote `dispatch` against the per-EXECUTION
+/// remote token bucket. Per the operator's scope split, a bare dispatch
 /// IS one execution (config doc: `RemoteConfig`), so its single hosted call
 /// draws from a fresh per-execution allowance. A single call only "exhausts"
 /// a fresh bucket when the operator has set the allowance to zero — a hard
@@ -951,7 +951,7 @@ pub(crate) fn admit_remote_execution(budget: u64) -> Result<()> {
         bail!(
             "remote token budget exhausted: the per-execution allowance \
              (config.remote.max_tokens_per_execution / \
-             DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) is 0 — this hosted crew dispatch is \
+             DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) is 0 — this hosted dispatch is \
              refused rather than run off the meter. Raise the allowance above 0 to dispatch \
              to a remote endpoint."
         );
@@ -1466,7 +1466,7 @@ fn dispatch_remote(
         .endpoint
         .as_ref()
         .expect("dispatch_remote requires a remote endpoint");
-    // (#1260) Meter this bare crew dispatch as one execution BEFORE any record
+    // (#1260) Meter this bare dispatch as one execution BEFORE any record
     // is emitted — a zero allowance refuses the call cleanly, without leaving
     // an orphaned in-flight session in the viewer.
     admit_remote_execution(darkmux_types::config_access::remote_max_tokens_per_execution())?;
@@ -1476,7 +1476,7 @@ fn dispatch_remote(
         .unwrap_or_else(|| crate::dispatch::fresh_session_id(&opts.role_id));
     let label = remote_endpoint_label(ep, &pm.id);
     eprintln!(
-        "darkmux crew dispatch: runtime=direct (hosted) — endpoint: {label} — model={}",
+        "darkmux dispatch: runtime=direct (hosted) — endpoint: {label} — model={}",
         pm.id
     );
 
@@ -1644,7 +1644,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    dispatch will still write flow records to disk, but they
     //    won't be observable in the viewer until the daemon comes up.
     //    Non-blocking; the dispatch proceeds either way (#104 S3).
-    darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("crew dispatch");
+    darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
 
     // 0.5. Licensed-adjacent ACK gate (#1405: moved here from the retired
     //      openclaw dispatch branch — this is the only dispatch path now).
@@ -1706,7 +1706,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // resolved (possibly just-pulled) darkmux image.
     let image = opts.image.clone().unwrap_or_else(|| darkmux_image.clone());
     eprintln!(
-        "darkmux crew dispatch: runtime=internal — image: {image}{}",
+        "darkmux dispatch: runtime=internal — image: {image}{}",
         if inject {
             " (darkmux-runtime binary injected)"
         } else {
@@ -1763,7 +1763,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let unknown_tokens = unknown_role_vocab_tokens(&role.tool_palette);
     if !unknown_tokens.is_empty() {
         eprintln!(
-            "darkmux crew dispatch: role `{}` declares unknown tool-vocab tokens: [{}] \
+            "darkmux dispatch: role `{}` declares unknown tool-vocab tokens: [{}] \
              — these will be silently dropped from the runtime catalog (likely typos). \
              Known tokens: {}",
             opts.role_id,
@@ -1841,7 +1841,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .as_ref()
         .and_then(|pm| pm.endpoint.as_ref().map(|ep| remote_endpoint_label(ep, &pm.id)));
     eprintln!(
-        "darkmux crew dispatch: model={model}{}",
+        "darkmux dispatch: model={model}{}",
         remote_endpoint_raw_label
             .as_deref()
             .map(|l| format!(" — brain: {l}"))
@@ -1908,7 +1908,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "fresh tempdir (no --workdir given)"
     };
     eprintln!(
-        "darkmux crew dispatch: workspace={} ({})",
+        "darkmux dispatch: workspace={} ({})",
         workspace.display(),
         workspace_source
     );
@@ -1941,7 +1941,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     fs::create_dir_all(&host_out)
         .with_context(|| format!("creating dispatch out-dir: {}", host_out.display()))?;
     eprintln!(
-        "darkmux crew dispatch: out-dir={} (runtime bookkeeping → /darkmux-out)",
+        "darkmux dispatch: out-dir={} (runtime bookkeeping → /darkmux-out)",
         host_out.display()
     );
 
@@ -3699,7 +3699,7 @@ fn resolve_dispatch_model_internal(
 
     let loaded = load_registry(config_path).map_err(|e| {
         anyhow!(
-            "darkmux crew dispatch: profile registry not loadable ({e}). \
+            "darkmux dispatch: profile registry not loadable ({e}). \
              Fix the registry file named above — this is a hard stop, not a \
              fallback to whatever LMStudio has loaded, since a broken config \
              can't tell us what you intended to dispatch to. (#1269)"
@@ -3730,7 +3730,7 @@ fn resolve_dispatch_model_internal(
             if let Some(req) = profile_override {
                 if req != pair.0 {
                     eprintln!(
-                        "darkmux crew dispatch: requested profile `{req}` is not defined \
+                        "darkmux dispatch: requested profile `{req}` is not defined \
                          on this machine; using default_profile `{}` instead. Define \
                          `{req}` in ~/.darkmux/profiles.json to select a profile-specific \
                          model. (#1054)",
@@ -3752,7 +3752,7 @@ fn resolve_dispatch_model_internal(
                 }
             }
             eprintln!(
-                "darkmux crew dispatch: no usable profile (no --profile match and no \
+                "darkmux dispatch: no usable profile (no --profile match and no \
                  default_profile set/defined); falling back to probe_loaded_model() — \
                  deprecated, set default_profile in ~/.darkmux/profiles.json. (#450 refactor 1b)"
             );
@@ -3811,7 +3811,7 @@ fn resolve_dispatch_model_internal(
                         // than a silent route to whatever LMStudio has
                         // loaded.
                         bail!(
-                            "darkmux crew dispatch: profile `{active_name}` selects \
+                            "darkmux dispatch: profile `{active_name}` selects \
                              `{id}`, but LMStudio has loaded [{loaded}] and \
                              DARKMUX_STRICT_SELECTION is set — refusing to dispatch \
                              against an unselected model. Fix: `darkmux swap \
@@ -3821,7 +3821,7 @@ fn resolve_dispatch_model_internal(
                         );
                     }
                     eprintln!(
-                        "darkmux crew dispatch: WARNING — profile `{active_name}` \
+                        "darkmux dispatch: WARNING — profile `{active_name}` \
                          selects `{id}`, but LMStudio has loaded [{loaded}]. \
                          `darkmux swap` does not update `default_profile` in the \
                          registry; if you swapped recently, your loaded model \
@@ -3835,13 +3835,13 @@ fn resolve_dispatch_model_internal(
                 }
             }
             eprintln!(
-                "darkmux crew dispatch: selected model `{id}` via profile `{active_name}`"
+                "darkmux dispatch: selected model `{id}` via profile `{active_name}`"
             );
             Ok(id)
         }
         Err(e) => {
             eprintln!(
-                "darkmux crew dispatch: select_model error ({e}); falling back \
+                "darkmux dispatch: select_model error ({e}); falling back \
                  to probe_loaded_model() — deprecated. Add a default \
                  model to profile `{active_name}` to migrate. (#450 refactor 1b)"
             );
@@ -3916,7 +3916,7 @@ pub fn resolve_context_window_internal(
 }
 
 /// (#632) Guard that the runtime always receives a context window. Some
-/// dispatch paths (bare `crew dispatch`, the lab `prompt` provider) build a
+/// dispatch paths (bare `dispatch`, the lab `prompt` provider) build a
 /// `default()` `CompactionDispatchArgs` with `context_window: None`, but the
 /// runtime has no built-in default and hard-errors without one. Fill it from
 /// the profile-derived `fallback`; a path that already set a window (e.g. the
@@ -3947,7 +3947,7 @@ fn utility_preflight_warning(
         None
     } else {
         Some(format!(
-            "darkmux crew dispatch: WARNING — utility model `{util_id}` \
+            "darkmux dispatch: WARNING — utility model `{util_id}` \
              (internal.utility) is NOT loaded; compaction summons it mid-dispatch \
              and will fail if it isn't resident. Load it now (`lms load {util_id}`, \
              or include it in the profile you `darkmux swap` to). (#590)"
@@ -4012,7 +4012,7 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
         Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
         Some(m) => {
             eprintln!(
-                "darkmux crew dispatch: `{}` is resident at context {} but the profile \
+                "darkmux dispatch: `{}` is resident at context {} but the profile \
                  declares n_ctx={}; reloading at {} so the dispatch gets the declared \
                  context. (#1135)",
                 pm.id, m.context, n_ctx, n_ctx
@@ -4023,7 +4023,7 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
         }
         None => {
             eprintln!(
-                "darkmux crew dispatch: loading `{}` at n_ctx={} (the profile's declared \
+                "darkmux dispatch: loading `{}` at n_ctx={} (the profile's declared \
                  context) before dispatch. (#1135)",
                 pm.id, n_ctx
             );
