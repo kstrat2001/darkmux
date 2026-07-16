@@ -122,6 +122,21 @@ const VENDOR_REACTFLOW_JS: &str = include_str!("../assets/vendor/reactflow-bundl
 /// Served at `GET /vendor/reactflow-bundle.min.css`.
 const VENDOR_REACTFLOW_CSS: &str = include_str!("../assets/vendor/reactflow-bundle.min.css");
 
+/// (#1403) Standalone-app shell assets — the operator runs the viewer as a
+/// chromeless home-screen shortcut on mobile, so the app icon + web manifest
+/// must be served same-origin (the strict inline-only CSP forbids any external
+/// fetch). A dark cyan-diamond monogram. `apple-touch-icon.png` is the iOS
+/// home-screen icon (iOS ignores the manifest's `icons`); the 192/512 PNGs
+/// feed the manifest for other standalone-capable browsers.
+const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../assets/apple-touch-icon.png");
+const ICON_192_PNG: &[u8] = include_bytes!("../assets/icon-192.png");
+const ICON_512_PNG: &[u8] = include_bytes!("../assets/icon-512.png");
+
+/// (#1403) The web app manifest — `display: standalone` so an installed
+/// shortcut opens chromeless. Served at `GET /manifest.webmanifest`. Static
+/// (no per-request templating); the icon paths are same-origin routes below.
+const WEB_MANIFEST: &str = include_str!("../assets/manifest.webmanifest");
+
 /// Inject a `<meta name="darkmux-mode">` tag right after `<head>` so the
 /// viewer's `boot()` can read it before any data-fetching logic runs.
 /// Optionally injects a `<meta name="darkmux-date">` to pin playback to a
@@ -282,6 +297,10 @@ pub(crate) fn build_router_full(
         .route("/mission/:id/graph.json", get(mission_graph_json_handler))
         .route("/vendor/reactflow-bundle.min.js", get(vendor_reactflow_js))
         .route("/vendor/reactflow-bundle.min.css", get(vendor_reactflow_css))
+        .route("/manifest.webmanifest", get(web_manifest_handler))
+        .route("/apple-touch-icon.png", get(apple_touch_icon_handler))
+        .route("/icon-192.png", get(icon_192_handler))
+        .route("/icon-512.png", get(icon_512_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .route("/fleet/machines/live", get(fleet_machines_live_handler))
         .route("/lab/runs", get(lab_runs_handler))
@@ -1321,6 +1340,49 @@ async fn vendor_reactflow_css() -> impl IntoResponse {
         [("content-type", "text/css; charset=utf-8")],
         VENDOR_REACTFLOW_CSS,
     )
+}
+
+/// (#1403) `GET /manifest.webmanifest` — the standalone-app manifest so a
+/// home-screen shortcut opens chromeless (`display: standalone`). Same
+/// self-contained, no-caching posture as the viewer HTML itself.
+async fn web_manifest_handler() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "application/manifest+json; charset=utf-8")],
+        WEB_MANIFEST,
+    )
+}
+
+/// (#1403) `GET /apple-touch-icon.png` — the iOS home-screen icon for the
+/// standalone shortcut (iOS reads this link, not the manifest's `icons`).
+async fn apple_touch_icon_handler() -> impl IntoResponse {
+    png_response(APPLE_TOUCH_ICON_PNG)
+}
+
+/// (#1403) `GET /icon-192.png` — manifest icon for non-iOS standalone browsers.
+async fn icon_192_handler() -> impl IntoResponse {
+    png_response(ICON_192_PNG)
+}
+
+/// (#1403) `GET /icon-512.png` — manifest icon (also the maskable source).
+async fn icon_512_handler() -> impl IntoResponse {
+    png_response(ICON_512_PNG)
+}
+
+/// Shared PNG response builder for the standalone-shell icons (#1403). A long
+/// `Cache-Control` is safe for the same reason the vendored bundle uses one —
+/// the icon is content-addressed by the daemon build, and a stale browser
+/// cache clears on a normal reload after upgrade.
+fn png_response(bytes: &'static [u8]) -> axum::response::Response {
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "image/png"),
+            ("cache-control", "public, max-age=86400"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 fn current_millis() -> u64 {
