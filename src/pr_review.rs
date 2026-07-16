@@ -1,7 +1,7 @@
-//! (#1060) Render a darkmux pr-reviewer dispatch into a GitHub PR-review payload.
+//! (#1060) Synthesize a darkmux review-funnel envelope into a GitHub
+//! PR-review payload.
 //!
-//! This is the binary-owned replacement for the per-repo `pr-review-post.py`
-//! copy. The `pr-reviewer` role emits findings that each quote the line they're
+//! The `pr-reviewer` role emits findings that each quote the line they're
 //! about (`anchor`) rather than a line *number* (#1053 quote-resolve — local
 //! models name the construct reliably but guess its coordinate badly). The
 //! coordinate half is deterministic, so it lives here, in the binary, versioned
@@ -9,102 +9,43 @@
 //! with it in one release, instead of every repo updating a copied script that
 //! silently degrades when it drifts.
 //!
-//! `darkmux pr-review render --envelope <e> --diff <d>` reads the dispatch
-//! `--json` envelope + the PR diff and emits one JSON object on stdout:
+//! The output is one JSON object:
 //! `{ "mode": "review"|"comment"|"degraded", "review": <gh-review-payload>|null,
 //!    "comment": <markdown>|null }`. The thin workflow YAML posts it (so the
-//! operator keeps control of the model/profile, trigger, and the `gh` call);
-//! `--emit <path>` writes the object to a file instead (the escape hatch).
-//! `mode: "degraded"` (#1113) means NO review signal was produced (missing
-//! envelope, empty reply, vacuous pass) — the workflow posts the comment AND
-//! marks its check failed/neutral, never green.
+//! operator keeps control of the model/profile, trigger, and the `gh` call).
+//! `mode: "degraded"` (#1113) means NO review signal was produced (a
+//! degenerate envelope) — the workflow posts the comment AND marks its check
+//! failed/neutral, never green.
 //!
-//! The review-FUNNEL dispatch (bundle -> probe(k draws) -> dedup ->
-//! double-confirm judge -> synthesis) that used to live at `pr-review run`
-//! retired from this module in #1284 Packet 4b — it's now `darkmux mission
-//! launch review` (`src/mission_launch_review.rs`), which drives the SAME
-//! `darkmux_lab::lab::review::{build_review_graph, run_review_graph,
-//! run_judge_only}` machinery this module used to own, and calls back into
-//! [`synthesize_review`]/[`emit_rendered`] here for its own render step —
-//! this module's synthesis logic (a `Tier::Confirmed` flag becomes an
-//! inline, merge-blocking comment or a general body item when its anchor
-//! can't be resolved to a diff line; a `Tier::NeedsCheck` flag becomes a
-//! non-blocking "worth a double check" note; a `Tier::Archived` flag never
-//! renders) is unchanged and shared by both entry points.
+//! Consumers: `darkmux mission launch review` (`src/mission_launch_review.rs`)
+//! drives the `darkmux_lab::lab::review::{build_review_graph, run_review_graph,
+//! run_judge_only}` machinery and calls back into
+//! [`synthesize_review`]/[`emit_rendered`] here for its own render step.
+//! This module's synthesis logic (a `Tier::Confirmed` flag becomes an inline,
+//! merge-blocking comment or a general body item when its anchor can't be
+//! resolved to a diff line; a `Tier::NeedsCheck` flag becomes a non-blocking
+//! "worth a double check" note; a `Tier::Archived` flag never renders) is the
+//! shared entry point.
+//!
+//! (#1426) The top-level `darkmux pr-review` CLI verb — and its
+//! single-envelope render path (`cmd_render` / `render_with_attribution`) —
+//! retired here: the base tool does not know domain workflows by name, and
+//! `mission launch review` already renders the `{mode, review, comment}`
+//! payload itself. The review-FUNNEL dispatch (bundle -> probe(k draws) ->
+//! dedup -> double-confirm judge -> synthesis) had earlier moved out of this
+//! module to `mission launch review` in #1284 Packet 4b.
 
 use anyhow::{Context, Result};
 use darkmux_lab::lab::review::{JudgeRecord, ReviewEnvelope, Tier, VerifyRecord, VerifyRuling};
-use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-
-// (#1298) The single-reviewer (`pr-review render`) default footer. The review
-// path never uses this — it derives its footer from the envelope's member
-// provenance (see `review_footer`). The stale "`pr-reviewer` role" wording is
-// gone from both paths; the "no cloud API" claim survives ONLY here because
-// this path has no envelope to derive from and the workflow that knows where
-// the model ran passes the truthful `--attribution` (the review does derive).
-const FOOTER: &str = "\n\n---\n<sub>Automated review — running on a \
-local model (no cloud API) via a self-hosted runner. Advisory, not a merge gate. \
-· [Powered by darkmux](https://darkmux.com)</sub>";
+use std::path::Path;
 
 /// (#1298/#1186) Default tagline for the review's posted footer — the
 /// operator-owned "why this comment exists" half. The operator overrides it
 /// via `--attribution`; the model / local-vs-cloud half is DERIVED from the
 /// run, never carried here (see [`dispatch_provenance`]).
 const REVIEW_TAGLINE: &str = "Advisory, not a merge gate.";
-
-/// Severity → label. Unknown severity renders as a plain note.
-fn sev_label(severity: Option<&str>) -> &'static str {
-    match severity.map(str::to_ascii_lowercase).as_deref() {
-        Some("high") => "🔴 **HIGH**",
-        Some("medium") => "🟡 **MEDIUM**",
-        Some("low") => "🔵 **LOW**",
-        _ => "**NOTE**",
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct Finding {
-    #[serde(default)]
-    path: Option<String>,
-    /// (#1053) Verbatim quote of the line this finding is about — `null` for a
-    /// file-level finding. We resolve it to a line; we never trust a model line
-    /// number (the old `line` field is gone).
-    #[serde(default)]
-    anchor: Option<String>,
-    #[serde(default)]
-    severity: Option<String>,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    detail: Option<String>,
-    #[serde(default)]
-    advice: Option<String>,
-    #[serde(default)]
-    suggestion: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReviewDoc {
-    #[serde(default)]
-    summary: Option<String>,
-    #[serde(default)]
-    verdict: Option<String>,
-    /// Tolerate `findings: null` (some local models emit it) and a missing key
-    /// by coercing to `[]`, matching the Python reference's `... or []`. The
-    /// no-`findings`-key → comment-fallback contract is enforced separately in
-    /// `extract_review` (it checks the key is present before deserializing).
-    #[serde(default, deserialize_with = "null_to_empty")]
-    findings: Vec<Finding>,
-}
-
-/// Deserialize `null` (or a present list) into a `Vec<Finding>`, mapping `null`
-/// to an empty vec instead of failing the whole parse.
-fn null_to_empty<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Finding>, D::Error> {
-    Ok(Option::<Vec<Finding>>::deserialize(d)?.unwrap_or_default())
-}
 
 /// What the verb emits: the posting mode + the payload for it.
 pub struct Rendered {
@@ -253,264 +194,6 @@ pub fn resolve_anchor(
     None
 }
 
-/// Pull the JSON review object out of the model's reply: prefer a fenced
-/// ```json block, else the outermost `{...}`. Returns the parsed doc, or `None`
-/// (unparseable / no `findings` key → caller posts a summary fallback).
-fn extract_review(reply: &str) -> Option<ReviewDoc> {
-    for cand in json_candidates(reply) {
-        if let Ok(v) = serde_json::from_str::<Value>(cand) {
-            if v.is_object() && v.get("findings").is_some() {
-                if let Ok(doc) = serde_json::from_value::<ReviewDoc>(v) {
-                    return Some(doc);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// (#1113) Freeform marker contract — the agentic reviewer's output shape.
-/// A tool-granting role cannot use an `output_schema` (a grammar-constrained
-/// output combined with tools makes the model skip tool-calling entirely and
-/// fabricate — verified 2026-07-04), so `pr-reviewer-agentic` writes marker
-/// blocks instead:
-///
-/// ```text
-/// One-to-two-sentence summary.
-///
-/// MUST FIX [app/services/billing.ts] `const end = start.plus({ days: 30 })`
-/// Body tracing the defect… (until the next marker or the verdict line)
-///
-/// VERDICT: flag
-/// ```
-///
-/// Tried AFTER the JSON contract (structured roles are unchanged) and only
-/// claims the reply when a marker or a verdict line is present — ordinary
-/// prose still falls through to the comment fallback. Severity maps
-/// MUST FIX → high, CONSIDER → medium; a missing verdict line derives from
-/// the findings the same way the structured contract defines it (flag iff
-/// any high).
-fn extract_freeform_review(reply: &str) -> Option<ReviewDoc> {
-    // Tolerate common model dressing on a marker line: list bullets,
-    // heading hashes, bold markers.
-    fn undress(line: &str) -> &str {
-        let mut s = line.trim();
-        for pre in ["- ", "* ", "• "] {
-            if let Some(rest) = s.strip_prefix(pre) {
-                s = rest.trim_start();
-            }
-        }
-        s = s.trim_start_matches('#').trim_start();
-        s.trim_start_matches("**").trim_start()
-    }
-    // A marker keyword must end at a word boundary — "CONSIDERED
-    // alternatives…" as a body line must not phantom-split a finding
-    // (review-QA finding on this PR).
-    fn strip_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
-        let rest = s.strip_prefix(kw)?;
-        match rest.chars().next() {
-            Some(c) if c.is_ascii_alphanumeric() => None,
-            _ => Some(rest),
-        }
-    }
-    fn marker_severity(line: &str) -> Option<(&'static str, &str)> {
-        let s = undress(line);
-        if let Some(rest) = strip_keyword(s, "MUST FIX") {
-            return Some(("high", rest));
-        }
-        if let Some(rest) = strip_keyword(s, "CONSIDER") {
-            return Some(("medium", rest));
-        }
-        None
-    }
-    fn verdict_of(line: &str) -> Option<String> {
-        let s = undress(line);
-        // Case-insensitive keyword ("Verdict: pass" is common English title
-        // case); the first 7 bytes are only sliced when they are ASCII.
-        let rest = match s.as_bytes().get(..7) {
-            Some(head) if head.eq_ignore_ascii_case(b"VERDICT") => &s[7..],
-            _ => return None,
-        };
-        let rest = rest.trim_start_matches("**");
-        let rest = rest.trim_start_matches(':').trim().to_ascii_lowercase();
-        if rest.starts_with("flag") {
-            Some("flag".into())
-        } else if rest.starts_with("pass") {
-            Some("pass".into())
-        } else {
-            None
-        }
-    }
-    // Marker-line remainder → ([path], `anchor`, leftover prose). The
-    // leftover seeds the finding body so an inline-colon style
-    // ("MUST FIX: reason on the same line") keeps its substance instead of
-    // discarding it (review-QA finding on this PR).
-    fn path_and_anchor(rest: &str) -> (Option<String>, Option<String>, String) {
-        let path = rest.find('[').and_then(|s| {
-            rest[s + 1..]
-                .find(']')
-                .map(|e| rest[s + 1..s + 1 + e].trim().to_string())
-        });
-        let (pre_bracket, after_bracket) = match (rest.find('['), rest.find(']')) {
-            (Some(s), Some(e)) if s < e => (&rest[..s], &rest[e + 1..]),
-            _ => ("", rest),
-        };
-        let (anchor, post_anchor) = match after_bracket.find('`') {
-            Some(s) => match after_bracket[s + 1..].find('`') {
-                Some(e) => (
-                    Some(after_bracket[s + 1..s + 1 + e].to_string()),
-                    format!("{}{}", &after_bracket[..s], &after_bracket[s + 2 + e..]),
-                ),
-                None => (None, after_bracket.to_string()),
-            },
-            None => (None, after_bracket.to_string()),
-        };
-        let leftover = format!("{pre_bracket}{post_anchor}")
-            .trim_matches([':', '—', '-', '*', ' '])
-            .to_string();
-        (
-            path.filter(|p| !p.is_empty()),
-            anchor.filter(|a| !a.trim().is_empty()),
-            leftover,
-        )
-    }
-
-    let mut findings: Vec<Finding> = Vec::new();
-    let mut summary_lines: Vec<&str> = Vec::new();
-    let mut verdict: Option<String> = None;
-    // (severity, path, anchor, body lines) of the block being accumulated.
-    type Block = (String, Option<String>, Option<String>, Vec<String>);
-    let mut current: Option<Block> = None;
-
-    fn flush(cur: &mut Option<Block>, out: &mut Vec<Finding>) {
-        if let Some((severity, path, anchor, body)) = cur.take() {
-            let body: Vec<&str> = body
-                .iter()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let title = body.first().map(|s| s.to_string());
-            let detail = (body.len() > 1).then(|| body[1..].join("\n"));
-            out.push(Finding {
-                path,
-                anchor,
-                severity: Some(severity),
-                title: title.or_else(|| Some("(finding)".into())),
-                detail,
-                advice: None,
-                suggestion: None,
-            });
-        }
-    }
-
-    for line in reply.lines() {
-        if let Some(v) = verdict_of(line) {
-            flush(&mut current, &mut findings);
-            verdict = Some(v);
-        } else if let Some((sev, rest)) = marker_severity(line) {
-            flush(&mut current, &mut findings);
-            let (path, anchor, leftover) = path_and_anchor(rest);
-            let mut body = Vec::new();
-            if !leftover.is_empty() {
-                body.push(leftover);
-            }
-            current = Some((sev.to_string(), path, anchor, body));
-        } else if let Some((_, _, _, body)) = current.as_mut() {
-            body.push(line.to_string());
-        } else if !line.trim().is_empty() {
-            summary_lines.push(line.trim());
-        }
-    }
-    flush(&mut current, &mut findings);
-
-    // Only claim the reply when the contract is actually present.
-    if verdict.is_none() && findings.is_empty() {
-        return None;
-    }
-    let derived = if findings.iter().any(|f| f.severity.as_deref() == Some("high")) {
-        "flag"
-    } else {
-        "pass"
-    };
-    let summary = summary_lines.join(" ").trim().to_string();
-    Some(ReviewDoc {
-        summary: (!summary.is_empty()).then_some(summary),
-        verdict: verdict.or_else(|| Some(derived.into())),
-        findings,
-    })
-}
-
-/// Candidate JSON slices to try, in order: a fenced ```json block, then the
-/// outermost brace span.
-fn json_candidates(text: &str) -> Vec<&str> {
-    let mut out = vec![];
-    if let Some(fence) = text.find("```") {
-        let after = &text[fence + 3..];
-        let after = after.strip_prefix("json").unwrap_or(after);
-        if let Some(end) = after.find("```") {
-            let inner = after[..end].trim();
-            if inner.starts_with('{') {
-                out.push(inner);
-            }
-        }
-    }
-    if let (Some(s), Some(e)) = (text.find('{'), text.rfind('}')) {
-        if e > s {
-            out.push(&text[s..=e]);
-        }
-    }
-    out
-}
-
-fn comment_body(f: &Finding) -> String {
-    let mut parts = vec![
-        format!("{} — {}", sev_label(f.severity.as_deref()), f.title.as_deref().unwrap_or("").trim()),
-        String::new(),
-        f.detail.as_deref().unwrap_or("").trim().to_string(),
-    ];
-    if let Some(a) = f.advice.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        parts.push(String::new());
-        parts.push(format!("**Fix:** {a}"));
-    }
-    // `suggestion` is the exact one-line replacement (or null) → a one-click
-    // GitHub suggestion block. `advice` above is the always-present prose fix.
-    if let Some(s) = f.suggestion.as_deref().filter(|s| !s.trim().is_empty()) {
-        parts.push(String::new());
-        parts.push("```suggestion".to_string());
-        parts.push(s.trim_end_matches('\n').to_string());
-        parts.push("```".to_string());
-    }
-    parts.join("\n").trim().to_string()
-}
-
-fn comment_fallback(reply: &str, attribution: Option<&str>) -> Rendered {
-    let text = reply.trim();
-    if text.is_empty() {
-        return degraded_fallback("The reviewer returned no output.", attribution);
-    }
-    Rendered {
-        mode: "comment",
-        review: None,
-        comment: Some(format!(
-            "### 🤖 PR review\n\n{text}{}",
-            footer_for(attribution)
-        )),
-    }
-}
-
-/// (#1113) NO review signal — distinct from both a clean pass and a prose
-/// comment. A hard-killed dispatch (exit 137, zero tokens) used to render the
-/// same way as "clean review, no findings": a green gate that proved nothing,
-/// on a repo whose main deploys to production. `mode: "degraded"` is the
-/// machine-readable half (the workflow marks its check failed/neutral instead
-/// of green); the posted comment is the human-readable half. Cases: missing/
-/// empty envelope, an empty reply, and a vacuous structured pass (verdict
-/// pass + zero findings + no summary — the contract mandates a summary, so
-/// its absence means nothing was actually reviewed).
-fn degraded_fallback(note: &str, attribution: Option<&str>) -> Rendered {
-    degraded_with_footer(note, &footer_for(attribution))
-}
-
 /// The degraded rendering with an explicit footer — so the review path can
 /// pass its envelope-derived footer (#1298) while the single-reviewer path
 /// keeps the static-default footer. Body text is identical either way.
@@ -524,123 +207,6 @@ fn degraded_with_footer(note: &str, footer: &str) -> Rendered {
              no usable review, so this pull request has had no automated \
              review. Human review (or a re-run) required.{footer}"
         )),
-    }
-}
-
-/// Core: dispatch envelope text + diff text → the posting payload, with an
-/// operator-supplied attribution line for the posted footer (#1113). The
-/// default footer claims "running on a local model (no cloud API)" — true
-/// for the original self-review workflow, FALSE for a dispatch routed to a
-/// remote paid endpoint. The workflow that knows where the model actually
-/// ran passes the truthful text; darkmux doesn't guess.
-pub fn render_with_attribution(
-    envelope: &str,
-    diff: &str,
-    attribution: Option<&str>,
-) -> Rendered {
-    let reply = serde_json::from_str::<Value>(envelope)
-        .ok()
-        .and_then(|e| e.get("final_assistant").and_then(Value::as_str).map(String::from))
-        .unwrap_or_default();
-    // JSON contract first (structured roles unchanged), then the freeform
-    // marker contract (#1113, the agentic reviewer), else the comment
-    // fallback posts the raw reply.
-    let doc = match extract_review(&reply).or_else(|| extract_freeform_review(&reply)) {
-        Some(d) => d,
-        None => return comment_fallback(&reply, attribution),
-    };
-
-    // (#1113) Vacuous pass: pass-shaped (or verdict-less) doc with zero
-    // findings AND no summary. The contract mandates a 1–2 sentence summary
-    // on every review, so a "pass" carrying neither findings nor summary
-    // proves nothing was reviewed — degrade loudly instead of rendering a
-    // green-looking clean pass. A flagging doc or any real finding is real
-    // signal and never degrades.
-    // Pass-ish = anything that is not the contract's explicit "flag" token
-    // (including absent and off-contract synonyms like "passed"/"lgtm") — a
-    // zero-content review only escapes the gate by deliberately flagging
-    // (review-QA finding on this PR: matching "pass" literally let a
-    // pass-synonym verdict read as a green review with no content).
-    let passish = doc
-        .verdict
-        .as_deref()
-        .map(|v| !v.trim().eq_ignore_ascii_case("flag"))
-        .unwrap_or(true);
-    // (MSRV 1.80: map_or, not the 1.82 is_none_or)
-    let no_summary = doc.summary.as_deref().map(str::trim).map_or(true, str::is_empty);
-    if doc.findings.is_empty() && passish && no_summary {
-        return degraded_fallback(
-            "The reviewer emitted an empty pass: no findings and no summary.",
-            attribution,
-        );
-    }
-
-    let index = new_side_index(diff);
-    let mut inline: Vec<Value> = vec![];
-    let mut deferred: Vec<&Finding> = vec![];
-    for f in &doc.findings {
-        match resolve_anchor(f.path.as_deref(), f.anchor.as_deref(), &index) {
-            Some(line) => inline.push(json!({
-                "path": f.path.as_deref().map(norm_path).unwrap_or(""),
-                "line": line,
-                "side": "RIGHT",
-                "body": comment_body(f),
-            })),
-            None => deferred.push(f),
-        }
-    }
-
-    let summary = doc.summary.as_deref().unwrap_or("").trim();
-    let verdict = doc.verdict.as_deref().unwrap_or("").trim().to_ascii_lowercase();
-    // Neutral header — where the model ran is the footer attribution's job
-    // (the old "(local model)" suffix here became false once a dispatch could
-    // route to a remote endpoint).
-    let mut body = vec!["### 🤖 PR review".to_string(), String::new()];
-    if !summary.is_empty() {
-        body.push(summary.to_string());
-        body.push(String::new());
-    }
-    body.push(format!(
-        "**Verdict: {}** · {} inline, {} general",
-        if verdict.is_empty() { "n/a" } else { &verdict },
-        inline.len(),
-        deferred.len()
-    ));
-    if !deferred.is_empty() {
-        body.push(String::new());
-        body.push("**Findings not anchored to a diff line:**".to_string());
-        for f in &deferred {
-            let mut line = format!(
-                "- {} `{}` — {}: {}",
-                sev_label(f.severity.as_deref()),
-                f.path.as_deref().map(norm_path).unwrap_or("?"),
-                f.title.as_deref().unwrap_or("").trim(),
-                f.detail.as_deref().unwrap_or("").trim()
-            );
-            if let Some(a) = f.advice.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                line.push_str(&format!(" _Fix: {a}_"));
-            }
-            body.push(line);
-        }
-    }
-
-    Rendered {
-        mode: "review",
-        review: Some(json!({
-            "event": "COMMENT",
-            "body": format!("{}{}", body.join("\n"), footer_for(attribution)),
-            "comments": inline,
-        })),
-        comment: None,
-    }
-}
-
-/// The posted footer: the operator's attribution text when given (wrapped in
-/// the standard rule + <sub> dressing), else the historical default.
-fn footer_for(attribution: Option<&str>) -> String {
-    match attribution.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(text) => format!("\n\n---\n<sub>{text}</sub>"),
-        None => FOOTER.to_string(),
     }
 }
 
@@ -713,31 +279,6 @@ fn unique_seat_models(env: &ReviewEnvelope, remote: bool) -> Vec<String> {
         }
     }
     out
-}
-
-/// `darkmux pr-review render` handler: read the envelope + diff, render, and
-/// emit the `{mode, review, comment}` object to stdout (or `--emit <path>`).
-pub fn cmd_render(
-    envelope: &PathBuf,
-    diff: &PathBuf,
-    emit: Option<&PathBuf>,
-    attribution: Option<&str>,
-) -> Result<i32> {
-    // A missing/empty envelope is the "dispatch produced nothing" case — emit a
-    // comment-mode payload rather than erroring, so the workflow still posts.
-    let envelope_text = std::fs::read_to_string(envelope).unwrap_or_default();
-    let diff_text = std::fs::read_to_string(diff).unwrap_or_default();
-    let rendered = if envelope_text.trim().is_empty() {
-        degraded_fallback("The review dispatch produced no envelope.", attribution)
-    } else {
-        render_with_attribution(&envelope_text, &diff_text, attribution)
-    };
-    let out = serde_json::to_string(&rendered.to_value())?;
-    match emit {
-        Some(path) => std::fs::write(path, &out).with_context(|| format!("writing {}", path.display()))?,
-        None => println!("{out}"),
-    }
-    Ok(0)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1141,42 +682,6 @@ mod tests {
         assert_eq!(resolve_anchor(Some("doc.md"), Some("+count"), &i), Some(2));
     }
 
-    #[test]
-    fn render_resolves_anchor_to_inline_comment() {
-        let envelope = json!({
-            "final_assistant": "{\"summary\":\"x\",\"verdict\":\"flag\",\"findings\":[{\"path\":\"src/x.ts\",\"anchor\":\"const b = 2;\",\"severity\":\"high\",\"title\":\"T\",\"detail\":\"D\",\"advice\":\"A\",\"suggestion\":null}]}"
-        })
-        .to_string();
-        let r = render(&envelope, DIFF);
-        assert_eq!(r.mode, "review");
-        let review = r.review.unwrap();
-        let comments = review["comments"].as_array().unwrap();
-        assert_eq!(comments.len(), 1);
-        assert_eq!(comments[0]["path"], "src/x.ts");
-        assert_eq!(comments[0]["line"], 2);
-    }
-
-    #[test]
-    fn render_file_level_anchor_defers_to_general() {
-        let envelope = json!({
-            "final_assistant": "```json\n{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[{\"path\":\"src/x.ts\",\"anchor\":null,\"severity\":\"medium\",\"title\":\"file-level\",\"detail\":\"D\",\"advice\":\"A\",\"suggestion\":null}]}\n```"
-        })
-        .to_string();
-        let r = render(&envelope, DIFF);
-        assert_eq!(r.mode, "review");
-        let review = r.review.unwrap();
-        assert_eq!(review["comments"].as_array().unwrap().len(), 0); // none inline
-        assert!(review["body"].as_str().unwrap().contains("Findings not anchored")); // listed general
-    }
-
-    #[test]
-    fn render_unparseable_falls_back_to_comment() {
-        let envelope = json!({ "final_assistant": "the model rambled with no json" }).to_string();
-        let r = render(&envelope, DIFF);
-        assert_eq!(r.mode, "comment");
-        assert!(r.comment.unwrap().contains("PR review"));
-    }
-
     // ── new_side_index: hunk + file structure edge cases ──────────────────
 
     #[test]
@@ -1293,349 +798,15 @@ mod tests {
 
     // ── extract/render: tolerant JSON extraction ──────────────────────────
 
-    fn env(reply: &str) -> String {
-        json!({ "final_assistant": reply }).to_string()
-    }
-
-    /// Test shorthand — the production entry point with the default footer.
-    fn render(envelope: &str, diff: &str) -> Rendered {
-        render_with_attribution(envelope, diff, None)
-    }
-
-    #[test]
-    fn render_raw_json_no_fence() {
-        assert_eq!(render(&env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}"), DIFF).mode, "review");
-    }
-
-    #[test]
-    fn render_fence_without_json_tag() {
-        assert_eq!(render(&env("```\n{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}\n```"), DIFF).mode, "review");
-    }
-
-    #[test]
-    fn render_prose_around_json() {
-        let r = render(&env("Here is my review:\n{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}\nThanks!"), DIFF);
-        assert_eq!(r.mode, "review");
-    }
-
-    #[test]
-    fn render_brace_inside_string_value_still_parses() {
-        let r = render(&env("{\"summary\":\"use {x} here\",\"verdict\":\"pass\",\"findings\":[]}"), DIFF);
-        assert_eq!(r.mode, "review");
-        assert!(r.review.unwrap()["body"].as_str().unwrap().contains("use {x} here"));
-    }
-
-    #[test]
-    fn render_no_findings_key_is_comment_fallback() {
-        assert_eq!(render(&env("{\"summary\":\"s\",\"verdict\":\"pass\"}"), DIFF).mode, "comment");
-    }
-
-    #[test]
-    fn render_empty_findings_is_pass_review() {
-        let rv = render(&env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}"), DIFF).review.unwrap();
-        assert_eq!(rv["comments"].as_array().unwrap().len(), 0);
-        assert!(rv["body"].as_str().unwrap().contains("0 inline, 0 general"));
-    }
-
     // ── render: payload shape ─────────────────────────────────────────────
-
-    #[test]
-    fn render_mixes_inline_and_deferred() {
-        let reply = "{\"verdict\":\"flag\",\"findings\":[\
-            {\"path\":\"src/x.ts\",\"anchor\":\"const b = 2;\",\"severity\":\"high\",\"title\":\"T1\",\"detail\":\"D1\",\"advice\":\"A1\",\"suggestion\":null},\
-            {\"path\":\"src/x.ts\",\"anchor\":null,\"severity\":\"low\",\"title\":\"T2\",\"detail\":\"D2\",\"advice\":\"A2\",\"suggestion\":null}]}";
-        let rv = render(&env(reply), DIFF).review.unwrap();
-        assert_eq!(rv["comments"].as_array().unwrap().len(), 1); // one anchored inline
-        let body = rv["body"].as_str().unwrap();
-        assert!(body.contains("1 inline, 1 general"));
-        assert!(body.contains("T2")); // the deferred one is listed in the summary
-    }
-
-    #[test]
-    fn render_suggestion_and_fix_render_in_inline_body() {
-        let reply = "{\"verdict\":\"flag\",\"findings\":[{\"path\":\"src/x.ts\",\"anchor\":\"const b = 2;\",\"severity\":\"high\",\"title\":\"T\",\"detail\":\"D\",\"advice\":\"A\",\"suggestion\":\"const b = 3;\"}]}";
-        let body = render(&env(reply), DIFF).review.unwrap()["comments"][0]["body"].as_str().unwrap().to_string();
-        assert!(body.contains("```suggestion"));
-        assert!(body.contains("const b = 3;"));
-        assert!(body.contains("**Fix:** A"));
-    }
-
-    #[test]
-    fn render_normalizes_posted_path() {
-        let reply = "{\"verdict\":\"flag\",\"findings\":[{\"path\":\"b/src/x.ts\",\"anchor\":\"const b = 2;\",\"severity\":\"high\",\"title\":\"T\",\"detail\":\"D\",\"advice\":\"A\",\"suggestion\":null}]}";
-        assert_eq!(render(&env(reply), DIFF).review.unwrap()["comments"][0]["path"], "src/x.ts");
-    }
-
-    #[test]
-    fn render_missing_verdict_is_na_and_has_footer() {
-        let body = render(&env("{\"summary\":\"s\",\"findings\":[]}"), DIFF).review.unwrap()["body"].as_str().unwrap().to_string();
-        assert!(body.contains("Verdict: n/a"));
-        assert!(body.contains("Advisory, not a merge gate")); // FOOTER
-    }
 
     // ── cmd_render handler ────────────────────────────────────────────────
 
-    #[test]
-    fn cmd_render_missing_envelope_emits_comment_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out.json");
-        let diff = dir.path().join("d.diff");
-        std::fs::write(&diff, DIFF).unwrap();
-        cmd_render(&dir.path().join("nope.json"), &diff, Some(&out), None).unwrap();
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-        // (#1113) A missing envelope is NO review signal — degraded, not a
-        // comment a workflow could mistake for benign.
-        assert_eq!(v["mode"], "degraded");
-        assert!(v["comment"].as_str().unwrap().contains("no envelope"));
-    }
-
-    #[test]
-    fn cmd_render_emits_review_payload_to_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out.json");
-        let envf = dir.path().join("env.json");
-        let difff = dir.path().join("d.diff");
-        std::fs::write(&envf, env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}")).unwrap();
-        std::fs::write(&difff, DIFF).unwrap();
-        cmd_render(&envf, &difff, Some(&out), None).unwrap();
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-        assert_eq!(v["mode"], "review");
-        assert_eq!(v["review"]["event"], "COMMENT");
-    }
-
-    #[test]
-    fn render_findings_null_coerces_to_empty_pass_review() {
-        // Some local models emit `findings: null`; coerce to [] (a clean
-        // review/pass), matching the Python reference — NOT a raw-JSON comment
-        // fallback. (Regression caught by the port differential QA.)
-        let r = render(&env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":null}"), DIFF);
-        assert_eq!(r.mode, "review");
-        let rv = r.review.unwrap();
-        assert_eq!(rv["comments"].as_array().unwrap().len(), 0);
-        assert!(rv["body"].as_str().unwrap().contains("0 inline, 0 general"));
-    }
-
-    #[test]
-    fn render_empty_reply_is_degraded_not_a_pass() {
-        // (#1113) An empty reply is NO review signal — it must not be
-        // indistinguishable from a clean review.
-        let r = render(&env(""), DIFF);
-        assert_eq!(r.mode, "degraded");
-        let c = r.comment.unwrap();
-        assert!(c.contains("no review signal"), "{c}");
-        assert!(c.contains("not a clean pass"), "{c}");
-    }
-
     // ─── #1113: vacuous-pass gate ──────────────────────────────────────
-
-    #[test]
-    fn vacuous_structured_pass_degrades() {
-        // pass + zero findings + no summary proves nothing was reviewed.
-        for reply in [
-            "{\"verdict\":\"pass\",\"findings\":[]}",
-            "{\"findings\":[]}",
-            "{\"summary\":\"  \",\"verdict\":\"pass\",\"findings\":[]}",
-            // Off-contract pass synonyms must not slip through the gate.
-            "{\"verdict\":\"passed\",\"findings\":[]}",
-            "{\"verdict\":\"LGTM\",\"findings\":[]}",
-        ] {
-            let r = render(&env(reply), DIFF);
-            assert_eq!(r.mode, "degraded", "must degrade: {reply}");
-            assert!(r.comment.unwrap().contains("empty pass"));
-        }
-    }
-
-    #[test]
-    fn clean_pass_with_summary_is_a_real_review() {
-        let r = render(
-            &env("{\"summary\":\"Change achieves its purpose.\",\"verdict\":\"pass\",\"findings\":[]}"),
-            DIFF,
-        );
-        assert_eq!(r.mode, "review", "a summarized clean pass is real signal");
-    }
-
-    #[test]
-    fn flag_with_findings_but_no_summary_never_degrades() {
-        // Real findings are real signal regardless of the missing summary.
-        let reply = "{\"verdict\":\"flag\",\"findings\":[{\"path\":\"src/x.ts\",\"anchor\":\"const b = 2;\",\"severity\":\"high\",\"title\":\"t\",\"detail\":\"d\",\"advice\":\"a\",\"suggestion\":null}]}";
-        let r = render(&env(reply), DIFF);
-        assert_eq!(r.mode, "review");
-        assert_eq!(r.review.unwrap()["comments"].as_array().unwrap().len(), 1);
-    }
 
     // ─── #1113: freeform marker contract (pr-reviewer-agentic) ────────
 
-    #[test]
-    fn freeform_markers_resolve_to_inline_comments() {
-        let reply = "The change looks mostly sound but has one real defect.\n\
-            \n\
-            MUST FIX [src/x.ts] `const b = 2;`\n\
-            This constant shadows the config default. Inputs passing through\n\
-            the fallback path get 2 instead of the configured value.\n\
-            Fix: read the default from config.\n\
-            \n\
-            CONSIDER [src/x.ts] `const d = 5;`\n\
-            Magic number; a named constant would document intent.\n\
-            \n\
-            VERDICT: flag\n";
-        let r = render(&env(reply), DIFF);
-        assert_eq!(r.mode, "review");
-        let rv = r.review.unwrap();
-        let comments = rv["comments"].as_array().unwrap();
-        assert_eq!(comments.len(), 2, "both anchored findings post inline");
-        assert_eq!(comments[0]["path"], "src/x.ts");
-        assert_eq!(comments[0]["line"], 2); // `const b = 2;` is new-side line 2
-        assert!(comments[0]["body"].as_str().unwrap().contains("HIGH"));
-        assert!(comments[0]["body"]
-            .as_str()
-            .unwrap()
-            .contains("shadows the config default"));
-        assert!(comments[1]["body"].as_str().unwrap().contains("MEDIUM"));
-        let body = rv["body"].as_str().unwrap();
-        assert!(body.contains("Verdict: flag"), "{body}");
-        assert!(body.contains("mostly sound"), "summary carried: {body}");
-    }
-
-    #[test]
-    fn freeform_clean_pass_needs_only_the_verdict_line() {
-        let reply = "The change achieves its stated purpose; no defects found.\n\
-            \n\
-            VERDICT: pass\n";
-        let r = render(&env(reply), DIFF);
-        assert_eq!(r.mode, "review", "a verdict line alone claims the reply");
-        let rv = r.review.unwrap();
-        assert_eq!(rv["comments"].as_array().unwrap().len(), 0);
-        assert!(rv["body"].as_str().unwrap().contains("Verdict: pass"));
-    }
-
-    #[test]
-    fn freeform_anchorless_marker_defers_to_general() {
-        let reply = "Summary line.\n\
-            \n\
-            MUST FIX [src/x.ts]\n\
-            The two halves of this change disagree about the default value —\n\
-            a cross-line relationship, so no single anchor line.\n\
-            \n\
-            VERDICT: flag\n";
-        let r = render(&env(reply), DIFF);
-        let rv = r.review.unwrap();
-        assert_eq!(rv["comments"].as_array().unwrap().len(), 0);
-        let body = rv["body"].as_str().unwrap();
-        assert!(body.contains("not anchored"), "{body}");
-        assert!(body.contains("disagree about the default"), "{body}");
-    }
-
-    #[test]
-    fn freeform_missing_verdict_derives_from_findings() {
-        let reply = "MUST FIX [src/x.ts] `const b = 2;`\nBad constant.\n";
-        let r = render(&env(reply), DIFF);
-        let rv = r.review.unwrap();
-        assert!(rv["body"].as_str().unwrap().contains("Verdict: flag"));
-        // CONSIDER-only derives pass (mirrors the structured contract:
-        // flag iff any high-severity finding).
-        let reply2 = "CONSIDER [src/x.ts] `const d = 5;`\nNit.\n";
-        let r2 = render(&env(reply2), DIFF);
-        assert!(r2.review.unwrap()["body"]
-            .as_str()
-            .unwrap()
-            .contains("Verdict: pass"));
-    }
-
-    #[test]
-    fn freeform_plain_prose_still_falls_back_to_comment() {
-        // No marker, no verdict line — the freeform layer must NOT claim it.
-        let reply = "I looked at the change and it seems fine to me overall.";
-        let r = render(&env(reply), DIFF);
-        assert_eq!(r.mode, "comment");
-    }
-
-    #[test]
-    fn freeform_json_contract_wins_over_markers() {
-        // A structured reply that HAPPENS to mention "MUST FIX" in a string
-        // must parse as JSON, not be re-parsed as freeform.
-        let reply = "{\"summary\":\"MUST FIX mentioned in prose\",\"verdict\":\"pass\",\"findings\":[]}";
-        let r = render(&env(reply), DIFF);
-        let rv = r.review.unwrap();
-        assert!(rv["body"].as_str().unwrap().contains("Verdict: pass"));
-        assert_eq!(rv["comments"].as_array().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn freeform_tolerates_bold_and_bullet_dressing() {
-        let reply = "- **MUST FIX** [src/x.ts] `const b = 2;`\nBad.\n\n**VERDICT: flag**\n";
-        let r = render(&env(reply), DIFF);
-        let rv = r.review.unwrap();
-        assert_eq!(rv["comments"].as_array().unwrap().len(), 1);
-        assert!(rv["body"].as_str().unwrap().contains("Verdict: flag"));
-    }
-
-    #[test]
-    fn freeform_inline_colon_marker_keeps_its_body() {
-        // "MARKER: reason on the same line" is a common natural style; the
-        // reason must survive as the finding body, not be discarded.
-        let reply = "MUST FIX: this shadows the config default on the fallback path\n\nVERDICT: flag\n";
-        let r = render(&env(reply), DIFF);
-        let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
-        assert!(
-            body.contains("shadows the config default"),
-            "inline reason must survive: {body}"
-        );
-    }
-
-    #[test]
-    fn freeform_verdict_is_case_insensitive() {
-        let r = render(&env("Looks good overall.\n\nVerdict: pass\n"), DIFF);
-        assert_eq!(r.mode, "review", "title-case Verdict must still claim the reply");
-        assert!(r.review.unwrap()["body"]
-            .as_str()
-            .unwrap()
-            .contains("Verdict: pass"));
-    }
-
-    #[test]
-    fn freeform_marker_keyword_needs_a_word_boundary() {
-        // A body line starting "CONSIDERED…" must not phantom-split the
-        // finding, and "MUST FIXES…" at line start is not a marker.
-        let reply = "MUST FIX [src/x.ts] `const b = 2;`\n\
-            CONSIDERED alternatives were rejected because the default is load-bearing.\n\
-            MUST FIXES of this class usually hide in the fallback path.\n\
-            \n\
-            VERDICT: flag\n";
-        let r = render(&env(reply), DIFF);
-        let rv = r.review.unwrap();
-        let comments = rv["comments"].as_array().unwrap();
-        assert_eq!(comments.len(), 1, "exactly one finding, not phantom-split");
-        let body = comments[0]["body"].as_str().unwrap();
-        assert!(body.contains("CONSIDERED alternatives"), "{body}");
-        assert!(body.contains("MUST FIXES of this class"), "{body}");
-    }
-
     // ─── #1113: footer attribution ─────────────────────────────────────
-
-    #[test]
-    fn attribution_replaces_default_footer_in_both_modes() {
-        let att = "Reviewed by gpt-5.1 via Azure OpenAI on the repo's runner.";
-        // Review mode.
-        let r = render_with_attribution(
-            &env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}"),
-            DIFF,
-            Some(att),
-        );
-        let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
-        assert!(body.contains(att), "{body}");
-        assert!(!body.contains("no cloud API"), "{body}");
-        // Comment-fallback mode.
-        let c = render_with_attribution(&env("just prose"), DIFF, Some(att));
-        let comment = c.comment.unwrap();
-        assert!(comment.contains(att));
-        assert!(!comment.contains("no cloud API"));
-        // Default unchanged when no attribution given.
-        let d = render(&env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}"), DIFF);
-        assert!(d.review.unwrap()["body"]
-            .as_str()
-            .unwrap()
-            .contains("no cloud API"));
-    }
 
     // ─── synthesize_review: three-tier synthesis (#1222 Phase B packet 5) ──
 
@@ -2115,9 +1286,7 @@ mod tests {
         // The `hits.len() == 1` discipline (`resolve_anchor`) must hold at
         // the synthesize_review level too: a confirmed flag whose anchor
         // matches TWO diff lines must never guess — it lands in the general
-        // body list, same as an unresolvable anchor. Mirrors
-        // `resolve_ambiguous_duplicate_is_general` (render()-level) one
-        // layer up.
+        // body list, same as an unresolvable anchor.
         let dup_diff = "diff --git a/y.ts b/y.ts\n+++ b/y.ts\n@@ -1,0 +1,2 @@\n+  return;\n+  return;\n";
         let j = confirmed_flag("fn@y.ts", Some("return;"), "ambiguous note", "ambiguous evidence");
         let env = healthy_envelope(vec![j]);

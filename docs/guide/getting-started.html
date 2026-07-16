@@ -137,14 +137,14 @@ darkmux init</code></pre>
     <p class="muted">This is the manual version of what the <a href="#orchestrator"><code>/darkmux-bootstrap</code></a> skill does for you. Follow it to understand the moving parts, or if you're running darkmux without an orchestrator.</p>
     <p>A profile is a named loadout: which model(s) to keep resident in LMStudio at which context length. Profiles live in <code>~/.darkmux/profiles.json</code> (created by <code>darkmux init</code>).</p>
     <h3>Inspect what's already there</h3>
-    <pre><code>darkmux profiles                  <span class="comment"># list configured profiles</span>
+    <pre><code>darkmux profile list              <span class="comment"># list configured profiles</span>
 cat ~/.darkmux/profiles.json      <span class="comment"># see the actual JSON</span></code></pre>
     <p>The bootstrap config ships with four reference profiles in increasing capacity: <code>fast</code> (32K), <code>balanced</code> (100K), <code>deep</code> (200K), and a <code>gpt-oss</code> preset (the 120B MXFP4 build for Apple Silicon, at 100K). <code>fast</code>/<code>balanced</code>/<code>deep</code> carry a placeholder worker id, <code>&lt;your-worker-model-id&gt;</code>, for you to fill in; <code>gpt-oss</code> ships a concrete id (<code>mlx-community/gpt-oss-120b-MXFP4-Q8</code>). The <strong>default profile is <code>balanced</code></strong>, not the 120B preset.</p>
 
     <h3>Swap a real model id in</h3>
-    <p>The quickest way: <code>darkmux scan</code> lists the models LMStudio has downloaded that aren't yet in any profile, with a suggestion for each, so you can see what's available to slot in without hand-matching ids.</p>
+    <p>The quickest way: <code>darkmux profile scan</code> lists the models LMStudio has downloaded that aren't yet in any profile, with a suggestion for each, so you can see what's available to slot in without hand-matching ids.</p>
     <pre><code><span class="comment"># Downloaded models not yet in a profile, with suggestions</span>
-darkmux scan</code></pre>
+darkmux profile scan</code></pre>
     <p>Then replace a placeholder in <code>profiles.json</code> with a real id (<code>lms ls</code> shows the raw list if you prefer). Pick one to start, whatever you've been using day-to-day:</p>
     <pre><code><span class="comment"># See what's available (raw)</span>
 lms ls
@@ -159,7 +159,7 @@ ${EDITOR:-vim} ~/.darkmux/profiles.json</code></pre>
     <p>Profile models are <strong>worker</strong> models; there's no per-model <code>role</code> field. The standing utility/compactor model is declared once for the machine in the top-level <code>internal.utility</code> binding, not per profile. If a profile lists more than one worker, an optional <code>default_model</code> names which one is the default.</p>
 
     <h3>Verify the edits</h3>
-    <pre><code>darkmux profiles                  <span class="comment"># the profile should now list your model</span>
+    <pre><code>darkmux profile list              <span class="comment"># the profile should now list your model</span>
 darkmux doctor                    <span class="comment"># confirm "profile match" is green or close</span></code></pre>
 
     <h3>The opinionated path: <code>swap recommended</code></h3>

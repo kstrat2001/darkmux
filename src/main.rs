@@ -23,7 +23,6 @@ pub use darkmux_doctor as doctor;
 // #515 Tier B — eureka rules engine extracted. Re-export keeps crate::eureka::*
 // resolving for doctor/serve/lab.
 pub use darkmux_eureka as eureka;
-mod external;
 // #515 — fleet extracted (deps crew/flow/types all crates now). Re-export
 // keeps crate::fleet::* resolving for serve/phase_cli/notebook/mission_propose.
 pub use darkmux_fleet as fleet;
@@ -91,12 +90,6 @@ fn main() -> Result<()> {
 
 fn run(cmd: Cmd) -> Result<i32> {
     match cmd {
-        Cmd::External { sub } => match sub {
-            ExternalCmd::Pull { gh, url, stdin } => {
-                external::pull(gh.as_deref(), url.as_deref(), stdin)?;
-                Ok(0)
-            }
-        },
         Cmd::Swap {
             profile,
             profiles: cli::ProfilesFileArg { profiles },
@@ -108,22 +101,13 @@ fn run(cmd: Cmd) -> Result<i32> {
             profiles: cli::ProfilesFileArg { profiles },
             json: cli::JsonFlag { json },
         } => cmd_status(profiles.as_deref(), json),
-        Cmd::Profiles {
-            profiles: cli::ProfilesFileArg { profiles },
-            json: cli::JsonFlag { json },
-        } => cmd_profiles(profiles.as_deref(), json),
         Cmd::Lab { sub } => lab_cli::cmd_lab(sub),
         Cmd::Skills { sub } => cmd_skills(sub),
-        Cmd::Notebook { sub } => cmd_notebook(sub),
         Cmd::Doctor { verbose, probe } => cmd_doctor(verbose, probe),
-        Cmd::Scan {
-            profiles: cli::ProfilesFileArg { profiles },
-        } => cmd_scan(profiles.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
         Cmd::Fleet { sub } => fleet_cli::cmd_fleet(sub),
         Cmd::Crew { sub } => cmd_crew(sub),
-        Cmd::PrReview { sub } => cmd_pr_review(sub),
         Cmd::Lessons { sub } => cmd_lessons(sub),
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Phase { sub } => cmd_phase(sub),
@@ -392,7 +376,10 @@ fn print_lessons_tier(label: &str, entries: &[darkmux_crew::lessons::Lesson]) {
     }
 }
 
-fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
+// (#1426) `pub(crate)` so `lab_cli::cmd_lab` can dispatch `lab notebook …`
+// — the notebook family folded into `lab` (the retired top-level `notebook`
+// verb).
+pub(crate) fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
     match sub {
         NotebookCmd::Draft {
             run_id,
@@ -539,7 +526,7 @@ fn cmd_scan(config: Option<&str>) -> Result<i32> {
     println!(
         "{}",
         darkmux_types::style::header(&format!(
-            "darkmux scan — {} model(s) in LMStudio, {} not yet in any profile",
+            "darkmux profile scan — {} model(s) in LMStudio, {} not yet in any profile",
             llms.len(),
             uncovered.len()
         ))
@@ -1294,14 +1281,6 @@ fn cmd_recommendations(sub: RecommendationsCmd) -> Result<i32> {
     }
 }
 
-fn cmd_pr_review(sub: PrReviewCmd) -> Result<i32> {
-    match sub {
-        PrReviewCmd::Render { envelope, diff, emit, attribution } => {
-            pr_review::cmd_render(&envelope, &diff, emit.as_ref(), attribution.as_deref())
-        }
-    }
-}
-
 fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
         CrewCmd::List => crew::cli::crew_list(),
@@ -1561,7 +1540,7 @@ fn cmd_swap_recommended(config: Option<&str>, dry_run: bool, quiet: bool) -> Res
 
     if rec.status != recommendations::RecommendationStatus::Validated {
         eprintln!(
-            "darkmux: no validated recommendation for tier `{}`.\n\nRationale:\n  {}\n\nOptions:\n  - Pick a profile manually: `darkmux profiles` then `darkmux swap <name>`\n  - Contribute a bake-off for this tier — see kstrat2001/darkmux#117",
+            "darkmux: no validated recommendation for tier `{}`.\n\nRationale:\n  {}\n\nOptions:\n  - Pick a profile manually: `darkmux profile list` then `darkmux swap <name>`\n  - Contribute a bake-off for this tier — see kstrat2001/darkmux#117",
             rec.tier, rec.rationale
         );
         return Ok(2);
@@ -1607,6 +1586,15 @@ fn cmd_swap_recommended(config: Option<&str>, dry_run: bool, quiet: bool) -> Res
 
 fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
     match sub {
+        // (#1426) `profile list` / `profile scan` — the retired top-level
+        // `profiles` / `scan` verbs folded into the profile family.
+        ProfileCmd::List {
+            profiles: cli::ProfilesFileArg { profiles },
+            json: cli::JsonFlag { json },
+        } => cmd_profiles(profiles.as_deref(), json),
+        ProfileCmd::Scan {
+            profiles: cli::ProfilesFileArg { profiles },
+        } => cmd_scan(profiles.as_deref()),
         ProfileCmd::Draft {
             name,
             model,

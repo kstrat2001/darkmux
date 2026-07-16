@@ -1,9 +1,11 @@
 //! `darkmux mission launch review` — the review-pipeline launcher (#1284
 //! Packet 4b, the clean verb break). Retires `darkmux pr-review run`
 //! (formerly `src/pr_review.rs::{cmd_run, run_dispatch, RunOpts, ...}`,
-//! deleted in this packet) as the review dispatch entry point;
-//! `darkmux pr-review render` survives unchanged (envelope -> PR payload,
-//! still `src/pr_review.rs`).
+//! deleted in this packet) as the review dispatch entry point. The
+//! top-level `pr-review` CLI verb itself (including `pr-review render`)
+//! retired in #1426; the render IMPLEMENTATION survives in
+//! `src/pr_review.rs` (`synthesize_review`/`emit_rendered`, envelope ->
+//! PR payload), consumed by this launcher's own emit path.
 //!
 //! **Why review gets its own launcher instead of falling through
 //! `mission_launch::launch`'s generic `mission_config::interpret` +

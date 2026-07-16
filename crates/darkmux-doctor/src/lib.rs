@@ -2210,7 +2210,7 @@ fn check_profile_loaded_match() -> Check {
             message: "loaded models don't match any profile".into(),
             hint: Some(
                 "edit ~/.darkmux/profiles.json so a profile's primary model id matches what \
-                 LMStudio is serving (compare `darkmux status` and `darkmux profiles`)"
+                 LMStudio is serving (compare `darkmux status` and `darkmux profile list`)"
                     .into(),
             ),
         }
