@@ -1,14 +1,14 @@
 //! Shared `--workdir` validation — symlink-escape guard + canonical-path
-//! resolution. Hoisted from `crew/dispatch_internal.rs` so the openclaw
-//! path (`crew/dispatch.rs::apply_workdir_override`) and the internal
-//! runtime path (`crew/dispatch_internal.rs`) share one implementation,
-//! and the runner side (`fleet.rs::handle_claimed_job`) can validate
-//! queued `WorkJob.workdir` values before invoking dispatch.
+//! resolution. Hoisted from `crew/dispatch_internal.rs` so the internal
+//! runtime path AND the runner side (`fleet.rs::handle_claimed_job`) share
+//! one implementation and can validate queued `WorkJob.workdir` values
+//! before invoking dispatch.
 //!
-//! Flagged in PR-C.1, PR-C.2, AND PR-C.3 security reviews — without
-//! this hoist, a remote publisher can target the (weaker) openclaw
-//! path's symlink-following surface via the work queue, bypassing the
-//! protection that's been in `dispatch_internal.rs` since #232.
+//! Flagged in PR-C.1, PR-C.2, AND PR-C.3 security reviews — without this
+//! hoist, a remote publisher could target a weaker symlink-following
+//! surface via the work queue, bypassing the protection that's been in
+//! `dispatch_internal.rs` since #232. (The legacy openclaw shell-out
+//! path this originally guarded against was removed in #1405.)
 //!
 //! ## Algorithm
 //!
@@ -76,12 +76,10 @@ pub fn is_macos_firmlink(p: &Path) -> bool {
 ///
 /// Returns the canonical `PathBuf` (always absolute, symlink-free).
 /// Callers should use the returned canonical path for any subsequent
-/// filesystem operation (docker volume mount, openclaw workspace
-/// symlink, etc.) so the actual target is the explicit one validated
-/// here.
+/// filesystem operation (docker volume mount, etc.) so the actual target
+/// is the explicit one validated here.
 ///
 /// Call sites:
-/// - `crew::dispatch::apply_workdir_override` (openclaw path)
 /// - `crew::dispatch_internal::dispatch` (internal runtime path)
 /// - `fleet::handle_claimed_job` (runner side; validates `WorkJob.workdir`
 ///   before invoking the dispatch path that consumes it)

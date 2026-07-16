@@ -7,7 +7,7 @@ This file is for any AI agent (Claude Code, Cursor, OpenClaw, etc.) that's helpi
 A pre-1.0 Rust CLI that does two things for users running local LLMs (LMStudio + Ollama + llama.cpp):
 
 1. **Profile multiplexer** — `darkmux swap <name>` switches the loaded model + context length + (optional) compaction settings to a named profile defined in `~/.darkmux/profiles.json`.
-2. **Lab harness** — `darkmux lab run <workload>` dispatches a workload against an agent runtime (default: the internal Docker-bounded runtime; pass `--runtime openclaw` to opt into the openclaw shell-out path) and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
+2. **Lab harness** — `darkmux lab run <workload>` dispatches a workload against the internal Docker-bounded runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
 
 The CLI is the *engine*; the empirical findings in the Genesis series on Darkly Energized (<https://darklyenergized.substack.com>) are what it backs. The reproducibility story is the product story — users should be able to rerun a workload and get numbers comparable to the published claims.
 
@@ -217,7 +217,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | `DARKMUX_HOME` (bootstrap pointer) | — (locates the config root; can't live in config) |
 | `DARKMUX_PROFILES` (profiles registry, **renamed from `DARKMUX_CONFIG`**) | — (a separate file, not `config.json`) |
 
-The previously-documented `DARKMUX_RUNTIME_CMD` env var was removed when the openclaw shell-out path became opt-in. Per-dispatch operators now pass `--runtime-cmd <path>` alongside `--runtime openclaw` on `darkmux crew dispatch` and `darkmux lab run` to point at Aider, Cline, or any tool exposing the `<cmd> agent --message` calling convention. The internal runtime is the default and needs no external binary.
+The internal runtime is the only dispatch path and needs no external binary. (Historical: a `DARKMUX_RUNTIME_CMD` env var, then a per-dispatch `--runtime-cmd <path>` flag, once let operators point `crew dispatch` / `lab run` at an external openclaw/Aider/Cline shell-out. That whole path — the flag, the openclaw runtime, and `darkmux crew sync` — was removed on the 2.0 track; see [#1405](https://github.com/kstrat2001/darkmux/issues/1405).)
 
 When working on darkmux from a Claude Code (or other frontier) session, export `DARKMUX_ORCHESTRATOR=<harness-name>` in the shell so flow records carry orchestrator provenance. This is part of the cultivation discipline tracked in [#130](https://github.com/kstrat2001/darkmux/issues/130).
 
@@ -229,7 +229,6 @@ src/
   types.rs                   Profile / ProfileRegistry / ProfileModel
   profiles.rs                Registry loader + lookup
   swap.rs / lms.rs           Stack swap orchestration + lms CLI wrapper
-  runtime.rs                 Runtime config patcher (e.g. openclaw.json)
   init.rs / skills.rs        `darkmux init` + skill installer
   notebook.rs                Notebook draft generator
   lab/
@@ -255,7 +254,7 @@ src/
     types.rs                 Role + Skill + Capability schema; capabilities() derivation; is_specialist()
     select.rs                select_model(role, profile) — dispatch model selection (phase-1 stub, E14)
     dispatch_internal.rs     Internal-runtime dispatch path (typed-config consumer)
-    dispatch.rs              OC shell-out dispatch path
+    dispatch.rs              Runtime-neutral dispatch plumbing (ack gate, phase context, flow-record builders, fleet routing)
 runtime/                      Internal-runtime crate (built into darkmux-runtime Docker image)
   src/loop_runner.rs          Agent loop; budget caps; inactivity deadline; detector + recovery wiring
   src/compaction.rs           Narrative + structured-slot compaction; JSON repair; escalation
@@ -273,10 +272,6 @@ templates/builtin/
   lab-fixtures/               Built-in lab fixtures (e.g. demo-tiny-py) registered via scripts/lab-init.sh
   recommendations/            Tier-aware recommendation registry
   AUTONOMOUS_DISPATCH_PREAMBLE.md  Injected ahead of specialist-role dispatches (#427)
-  role-model-pins.json        Default per-role model pins
-integrations/openclaw/
-  agent-scaffolds/            Openclaw-integration export scaffolds (NOT engine-internal)
-  oc-scaffold.sh              Standalone agents.list[] snippet emitter (NOT a CLI verb; replaced `darkmux agent template`, #538)
 scripts/lab-init.sh           Standalone fixture-registry bootstrapper (NOT a CLI verb; #487 phase 5)
 skills/darkmux-<name>/        Agent-invokable skill wrappers
 tests/cli.rs                  Integration tests (spawn the binary)
@@ -361,7 +356,6 @@ If a user asks you to:
 | "add a new provider" | Implement `WorkloadProvider` in `src/providers/<name>.rs`, register it in `src/workloads/registry.rs::register_builtins()`. |
 | "add a lab fixture" | Create a dir with a `.fixture.json` manifest (`name` required; `satisfies`, `verify_command`, `required_files` optional), then `darkmux lab register <path>`. A workload binds to it via `requires_fixture: "<name>@<version>"`. Built-ins live under `templates/builtin/lab-fixtures/` and register via `scripts/lab-init.sh`. |
 | "check fixtures are healthy" | `darkmux lab doctor` — offline check that registered paths exist, manifests load, required files are present, and content hashes haven't drifted. |
-| "emit an OpenClaw agent scaffold" | `integrations/openclaw/oc-scaffold.sh list` / `... template <role>` — standalone script (needs `jq`, NOT a CLI verb; #538). Emits a paste-ready `agents.list[]` snippet from `integrations/openclaw/agent-scaffolds/*.json`. Add a new scaffold by dropping a JSON there (and appending to `EMBEDDED_ROLES` in `crates/darkmux-agent-roles` so `darkmux doctor` recognizes it). |
 | "run the smoke test" | `cargo install --path . && darkmux lab run quick-q`. Should complete in ~6-10s if a model is loaded. |
 | "list notebook entries" | `darkmux notebook list` (optionally `--machine <id>` to filter). Enumerates `.md` files, parses headers. |
 | "draft a notebook entry" | `darkmux notebook draft <run-id>` (optionally `--machine <id>` to override). |
@@ -384,11 +378,9 @@ Live findings from cross-machine testing (M1 Max Studio fresh-Claude session, 20
 
 - **Don't assume models — read the profile registry first.** Models live in `~/.darkmux/profiles.json` (or wherever `darkmux profiles` reports). If an agent role needs a model and one isn't declared, **ask the user**; do NOT pick a model from the LMStudio catalog at random. Older gemma family in particular ("gemma-4-e4b", "Gemma 4 26b", etc.) is known to produce looping garbage that poisons sessions across model swaps — never default-assume gemma. If the user has saved a memory about model selection, that supersedes any inference you'd make from the catalog.
 
-- **Don't silently roll back on regression.** If a feature appears to regress on an unfamiliar OpenClaw / LMStudio version (e.g., `systemPromptOverride` doesn't behave as expected, compaction settings don't take effect), **surface the finding to the user** with the version numbers you observed. Don't quietly revert config overrides "to make things work" — loud beats quiet. The user is debugging an unfamiliar env and needs the signal; a silent rollback hides the real bug.
+- **Don't silently roll back on regression.** If a feature appears to regress on an unfamiliar LMStudio version, **surface the finding to the user** with the version numbers you observed. Don't quietly revert config overrides "to make things work" — loud beats quiet. The user is debugging an unfamiliar env and needs the signal; a silent rollback hides the real bug.
 
 - **Check existing issues before filing.** Before `gh issue create`, run `gh issue list --search "<keywords>"` (include closed issues with `--state all`) and skim. Duplicates clutter the project board and dilute the eureka-detection roadmap. Default to **commenting on an existing issue** over filing a new one. If you're not sure whether something is a dupe, **ask the user**; don't file-and-hope.
-
-- **Cross-machine version awareness.** darkmux assumes a recent OpenClaw. Before applying any agent config (especially `systemPromptOverride`, compaction settings, or sampler tweaks), check `openclaw --version` and consider whether the feature you're about to use exists on the user's installed version. If you can't verify, ask. The currently-documented minimum is captured in `doctor`'s `runtime version` check (see `MIN_OPENCLAW_VERSION` in `src/doctor.rs`) and in the README's Prerequisites.
 
 - **Empirical defaults are load-bearing, not decorative.** When choosing compaction modes, context windows, or compactor pairings, the shipped profile defaults (`default` mode beats `safeguard` for local; small dedicated compactor at ~68K cuts wall-clock substantially) reflect measured configurations, not arbitrary picks. Don't deviate from a profile's settings without acknowledging the empirical reason — the operator has chosen them deliberately.
 
@@ -410,8 +402,8 @@ Exemplars across darkmux's current surface:
 - **Confidence threshold per expertise** — operator self-rates per capability; system adjusts how often it asks vs decides
 - **Role + Crew (not Team)** — composition is operator's call per mission; no fixed membership
 - **JSON source-of-truth + SQLite derived index** — operator hand-edits any source file; system rebuilds derived state on demand; deleting the index is recoverable
-- **Don't mutate user state without confirmation** — `~/.darkmux/profiles.json`, `~/.openclaw/openclaw.json`, anything operator-owned. Read + propose; never write silently.
-- **Namespace everything darkmux brings up in shared state** — LMStudio loaded models, OpenClaw agent definitions, channel routing, anything else darkmux writes into a system other systems also use. Conventions: LMStudio identifiers under `darkmux:<model-id>` (e.g. `darkmux:qwen3.6-35b-a3b`); OpenClaw agent ids under `darkmux/<role>` (e.g. `darkmux/coder`). Then darkmux's own state-mutating operations only touch the namespaced subset — user state is off-limits by construction, not by careful coding. The namespace is the contract.
+- **Don't mutate user state without confirmation** — `~/.darkmux/profiles.json`, anything operator-owned. Read + propose; never write silently.
+- **Namespace everything darkmux brings up in shared state** — LMStudio loaded models, anything else darkmux writes into a system other systems also use. Convention: LMStudio identifiers under `darkmux:<model-id>` (e.g. `darkmux:qwen3.6-35b-a3b`). Then darkmux's own state-mutating operations only touch the namespaced subset — user state is off-limits by construction, not by careful coding. The namespace is the contract.
 - **Keyword vocabulary hybrid** — ship a starter; operator augments; system logs misses but never auto-mutates the vocabulary
 - **Operator-tunable preferences are numeric scales, not hidden enums** — discoverable via example values; supports continuous tuning; UI-ready
 
@@ -421,17 +413,15 @@ Tracked as #44.
 
 ## Namespace convention (darkmux state in shared systems)
 
-When darkmux maintains state in a system other consumers also use — LMStudio loaded instances, OpenClaw agent definitions, channel routing, anything operator-managed — **darkmux-owned entries are namespaced** so they can be recognized at a glance and so darkmux's own state-mutating operations can scope themselves to only the namespaced subset. User state is then off-limits by construction, not by careful coding.
+When darkmux maintains state in a system other consumers also use — LMStudio loaded instances, anything operator-managed — **darkmux-owned entries are namespaced** so they can be recognized at a glance and so darkmux's own state-mutating operations can scope themselves to only the namespaced subset. User state is then off-limits by construction, not by careful coding.
 
 ### Current namespaces
 
 | System | Form | Example |
 |---|---|---|
 | LMStudio loaded identifier (visible in `lms ps`) | `darkmux:<model-id>` | `darkmux:qwen3.6-35b-a3b` |
-| OpenClaw agent ids (`agents.list[].id`) | `darkmux/<role>` | `darkmux/coder` |
-| OpenClaw channel routing (`channels.modelByChannel.*`) — if darkmux ever manages it | `darkmux/<key>` | `darkmux/<channel-id>` |
 
-Different separators (`:` vs `/`) are deliberate — `:` reads naturally in LMStudio's ecosystem (which uses `:` to separate concepts like `mlx-community/foo:Q4_K_M`); `/` reads naturally in OpenClaw's config (which uses paths and ids that benefit from hierarchy). Both are clearly "this is darkmux's thing."
+(A previous namespace, `darkmux/<role>` for openclaw agent ids, was retired along with the openclaw shell-out path in #1405.)
 
 ### Why this matters
 
@@ -439,22 +429,23 @@ Without the namespace, darkmux's operations have to fall back on heuristics or p
 
 ### Transparency at dispatch time
 
-When darkmux loads a model under `darkmux:<id>`, the underlying LMStudio model key is unchanged — `lms ps` shows `identifier=darkmux:foo, modelKey=foo`. Dispatchers calling LMStudio's chat-completion API with the bare model id `foo` still resolve via the `modelKey` match (verified empirically 2026-05-12 against openclaw's lmstudio plugin). **The namespace is invisible at dispatch time** — only visible to darkmux and operators inspecting `lms ps`. Existing dispatcher configs continue to work without migration.
+When darkmux loads a model under `darkmux:<id>`, the underlying LMStudio model key is unchanged — `lms ps` shows `identifier=darkmux:foo, modelKey=foo`. Dispatchers calling LMStudio's chat-completion API with the bare model id `foo` still resolve via the `modelKey` match. **The namespace is invisible at dispatch time** — only visible to darkmux and operators inspecting `lms ps`. Existing dispatcher configs continue to work without migration.
 
 ### Conventions for new code
 
-When writing a new feature that mutates state in LMStudio or OpenClaw on the operator's behalf:
+When writing a new feature that mutates LMStudio state on the operator's behalf:
 
-1. **Generate the namespaced form** at the point of write. See `swap::namespaced_identifier` for the LMStudio case.
-2. **Filter on the namespace** at the point of read/cleanup. See `swap::is_darkmux_owned` for the LMStudio case.
+1. **Generate the namespaced form** at the point of write. See `swap::namespaced_identifier`.
+2. **Filter on the namespace** at the point of read/cleanup. See `swap::is_darkmux_owned`.
 3. **Pass-through explicit overrides** — if the operator sets an explicit identifier in their profile, don't override it. The namespace is the *default*; the operator can opt out.
 
 ### Operator-facing commands
 
 - `darkmux model status` — list `lms ps` results grouped by ownership (darkmux-managed vs user state). Read-only.
 - `darkmux model eject [--dry-run]` — unload everything in the `darkmux:` namespace; never touches user state. Use to release darkmux's RAM footprint without disturbing other tools.
-- `darkmux crew sync [--dry-run]` — reconcile openclaw's `agents.list[]` with the crew role manifests. For each role with both a JSON manifest and `.md` system prompt, ensures a `darkmux/<role-id>` openclaw agent exists with the manifest-derived shape (system prompt + tool palette). Idempotent.
-- `darkmux crew dispatch <role-id> --message <text> [--deliver <chan>:<target>]` — dispatch a single turn to the named role. Looks up the role manifest + `.md` system prompt, then runs the role through the **internal runtime** by default (per-dispatch `darkmux-runtime` Docker container, mounted workspace tempdir, in-house Rust agent loop with streamed flow records). Pass `--runtime openclaw` to opt into the openclaw shell-out path; that path pre-flight-verifies the `darkmux/<role-id>` openclaw agent matches the manifest (bails loud on drift with a `darkmux crew sync` repair pointer) before invoking `openclaw agent`. Pass `--image <tag>` (#703) to dispatch into a specific environment: the default `darkmux-runtime:latest` is slim (python + node), but naming ANY Linux image (e.g. `rust:slim`, the operator's own CI image) makes darkmux **inject** its static runtime binary into that image (bind-mount + entrypoint override) so the coder runs in that environment and can `cargo check`/`test` in-sandbox — the inner verify loop. darkmux ships NO per-language images (it brings the agent; you bring the environment). The image needs `bash` + coreutils (debian/ubuntu-family work as-is; bare-alpine needs them added). **For Rust in-sandbox lint** (`cargo clippy`), name an image that includes the clippy component — `rust:latest` ships it; bare `rust:slim` may not, and a missing clippy slips lint to the frontier gate. The coder role makes one bounded `rustup component add clippy` attempt when cargo is present but clippy isn't (the single exception to its no-toolchain-setup rule), but the reliable fix is the operator's image choice — BYO-environment, so bring clippy if you want in-sandbox lint. Local dispatch only today (ignored on `--runtime openclaw` and cross-machine `--machine`).
+- `darkmux crew dispatch <role-id> --message <text>` — dispatch a single turn to the named role. Looks up the role manifest + `.md` system prompt, then runs the role through the **internal runtime** (per-dispatch `darkmux-runtime` Docker container, mounted workspace tempdir, in-house Rust agent loop with streamed flow records). Pass `--image <tag>` (#703) to dispatch into a specific environment: the default `darkmux-runtime:latest` is slim (python + node), but naming ANY Linux image (e.g. `rust:slim`, the operator's own CI image) makes darkmux **inject** its static runtime binary into that image (bind-mount + entrypoint override) so the coder runs in that environment and can `cargo check`/`test` in-sandbox — the inner verify loop. darkmux ships NO per-language images (it brings the agent; you bring the environment). The image needs `bash` + coreutils (debian/ubuntu-family work as-is; bare-alpine needs them added). **For Rust in-sandbox lint** (`cargo clippy`), name an image that includes the clippy component — `rust:latest` ships it; bare `rust:slim` may not, and a missing clippy slips lint to the frontier gate. The coder role makes one bounded `rustup component add clippy` attempt when cargo is present but clippy isn't (the single exception to its no-toolchain-setup rule), but the reliable fix is the operator's image choice — BYO-environment, so bring clippy if you want in-sandbox lint. Local dispatch only today (ignored on cross-machine `--machine`).
+
+(A previous entry here, `darkmux crew sync` — reconciling an openclaw agent registry with the crew role manifests — was removed along with the openclaw shell-out path in #1405; the internal runtime reads role manifests directly, so there is no registry left to sync.)
 
 Tracked alongside operator sovereignty (#44) and issues [#52](https://github.com/kstrat2001/darkmux/issues/52) (LMStudio namespace), [#55](https://github.com/kstrat2001/darkmux/issues/55) (full pre-flight checklist — partial coverage in `crew dispatch` today), and the `qa-review` migration that brought these verbs into the dispatch path.
 
@@ -561,7 +552,7 @@ Two role families compose to make this work, and the distinction matters when pi
 
 CLI primitives stay small and composable; the AI-built-in verbs (`mission propose`, `phase estimate`, `notebook draft`) compose those primitives with utility-agent dispatches so the operator gets structured output without authoring JSON by hand. Both surfaces are part of the same project — the dual posture (small primitives + AI-built-in verbs) is deliberate.
 
-`darkmux crew dispatch` and `darkmux lab run` both default to the internal Docker-bounded runtime; pass `--runtime openclaw` to opt into the openclaw shell-out path for operators who already have it. The openclaw binary path defaults to `openclaw`-on-PATH; override per dispatch with `--runtime-cmd <path>` to point at Aider, Cline, or anything with a `<cmd> agent --message` interface.
+`darkmux crew dispatch` and `darkmux lab run` both use the internal Docker-bounded runtime — the only dispatch path (#1405 removed the legacy openclaw shell-out alternative).
 
 ## When in doubt
 

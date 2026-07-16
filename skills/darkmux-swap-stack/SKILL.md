@@ -27,7 +27,7 @@ If the requested profile matches the current loaded state, just report "already 
 darkmux swap "$ARGUMENTS"
 ```
 
-Wait for it to complete. The command prints lines like `unload <model>` then `load <model> @ ctx=N`. Bare `darkmux swap` loads the LMStudio stack and touches nothing else — it does NOT write openclaw config. Operator-authored pre/post-swap hooks (if any are defined in the profile registry) run on every swap. Only `darkmux swap <profile> --runtime openclaw` ALSO patches `~/.openclaw/openclaw.json` and prints `openclaw config patched`. Total wall ~10-30s depending on model load times.
+Wait for it to complete. The command prints lines like `unload <model>` then `load <model> @ ctx=N`. `darkmux swap` loads the LMStudio stack and touches nothing else — it writes no other config file. Operator-authored pre/post-swap hooks (if any are defined in the profile registry) run on every swap. Total wall ~10-30s depending on model load times.
 
 ## Step 4 — Verify
 
@@ -41,4 +41,4 @@ Confirm the output reads `matches profile(s): $ARGUMENTS`. If not, surface the d
 
 - `--dry-run` is available if you want to preview the swap without executing.
 - If the user hasn't created a profile registry yet (`darkmux: no profile registry found`), tell them to drop a `profiles.json` at `~/.darkmux/profiles.json` (see `profiles.example.json` in the darkmux repo).
-- Swapping is idempotent — if the requested ctx values already match what's loaded, darkmux skips the lms calls. Operator-authored pre/post-swap hooks still run. Bare swap never writes openclaw config; only `--runtime openclaw` patches `~/.openclaw/openclaw.json`.
+- Swapping is idempotent — if the requested ctx values already match what's loaded, darkmux skips the lms calls. Operator-authored pre/post-swap hooks still run. Swap never writes any config file other than LMStudio's loaded state.

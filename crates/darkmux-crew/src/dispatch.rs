@@ -1,28 +1,21 @@
 //! Dispatch a crew member (role) for a single turn.
 //!
 //! This is the operator-facing entry point that ties the crew schema
-//! (`templates/builtin/roles/<id>.{json,md}`) to the actual runtime
-//! (openclaw). Three responsibilities:
+//! (`templates/builtin/roles/<id>.{json,md}`) to the in-house container-
+//! bounded runtime (`dispatch_internal`). This module owns the pieces that
+//! are runtime-neutral: the licensed-adjacent acknowledgment gate, session
+//! id generation, cross-phase message/output threading, flow-record
+//! builders, and fleet routing decisions. The actual dispatch execution
+//! (Docker container spawn, agent loop, trajectory) lives in
+//! `dispatch_internal.rs`.
 //!
-//!   1. **Load the role** — manifest + `.md` system prompt
-//!   2. **Pre-flight check** — verify the corresponding openclaw agent
-//!      exists under the `darkmux/<role-id>` namespace and matches the
-//!      manifest's expectations (system prompt + tool palette)
-//!   3. **Dispatch** — invoke `openclaw agent darkmux/<role-id>` and return
-//!      the result
-//!
-//! `darkmux crew sync` is the operator-explicit way to make openclaw's
-//! `agents.list[]` reflect the manifests on disk — writes/updates the
-//! `darkmux/<role>` entries to match what the manifests + `.md` prompts say.
+//! (2.0: the `openclaw` shell-out runtime and `darkmux crew sync` were
+//! removed — see #1405. The in-house runtime is the only dispatch path.)
 
-use crate::loader::{load_missions, load_role_prompt, load_roles, load_phases};
-use crate::types::Role;
 use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Map, Value};
 use std::fs;
 use std::io::{BufRead, IsTerminal, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,47 +30,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// the operator can pre-create the file (`touch ~/.darkmux/acks/<role>.ack`)
 /// to skip the prompt in scripted contexts, or delete it to re-trigger.
 const LICENSED_ADJACENT_ROLES: &[&str] = &["health-research", "legal-research", "fitness-coach"];
-
-/// Default openclaw config path. `DARKMUX_OPENCLAW_CONFIG` env var overrides
-/// (e.g., for tests). Visible to other crates so the doctor pin-drift
-/// check (#160) reads from the same path sync writes to.
-pub fn default_openclaw_config() -> PathBuf {
-    // env(DARKMUX_OPENCLAW_CONFIG) > config.dirs.openclaw_config >
-    // ~/.openclaw/openclaw.json (with a `./.openclaw/...` no-HOME fallback) (#661).
-    darkmux_types::config_access::openclaw_config_override().unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".openclaw/openclaw.json")
-    })
-}
-
-/// The openclaw agent id darkmux uses for a given role. Per the
-/// CLAUDE.md namespace convention: `darkmux/<role-id>`.
-fn agent_id_for(role_id: &str) -> String {
-    format!("darkmux/{role_id}")
-}
-
-/// The role's openclaw workspace dir, derived from the standard
-/// `~/.openclaw/workspace-darkmux-<role-id>/` layout. Used as the default
-/// `--watch` target when the caller doesn't supply explicit paths (#89).
-pub fn default_workspace_for_role(role_id: &str) -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".openclaw")
-        .join(format!("workspace-darkmux-{role_id}"))
-}
-
-/// Slug for the agent's on-disk dirs. Translates the `darkmux/<role>` id
-/// to a filesystem-safe nested path (`agents/darkmux/<role>/agent`) and a
-/// flat workspace slug (`workspace-darkmux-<role>`).
-fn agent_dirs_for(role_id: &str, openclaw_root: &Path) -> (PathBuf, PathBuf) {
-    let agent_dir = openclaw_root
-        .join("agents")
-        .join("darkmux")
-        .join(role_id)
-        .join("agent");
-    let workspace = openclaw_root.join(format!("workspace-darkmux-{role_id}"));
-    (agent_dir, workspace)
-}
 
 /// Resolve the directory where licensed-adjacent acknowledgment files
 /// live. Defaults to `~/.darkmux/acks/`. The `DARKMUX_ACK_DIR` env var
@@ -131,7 +83,7 @@ fn print_licensed_adjacent_banner(role_id: &str) {
 /// the operator-facing instruction for how to pre-acknowledge.
 ///
 /// **No-op for non-licensed-adjacent roles.**
-fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
+pub(crate) fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
     if !LICENSED_ADJACENT_ROLES.contains(&role_id) {
         return Ok(());
     }
@@ -188,41 +140,19 @@ fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Which agent runtime services a dispatch. `Internal` is the default
-/// as of the runtime-default flip: darkmux's in-house container-
-/// bounded Rust runtime (see `runtime/` and `dispatch_internal.rs`).
-/// Kernel-enforced workspace isolation via Docker; no external runtime
-/// binary to install, no separate config to maintain.
-///
-/// `Openclaw` is the legacy shell-out path that's shipped since v0.1.
-/// Available via the explicit `--runtime openclaw` flag for operators
-/// who already use openclaw, want the runtime the article-series
-/// numbers were measured against, or need workspace-permissive
-/// behavior the container doesn't allow.
+/// Which agent runtime services a dispatch. As of 2.0 (#1405) the
+/// in-house container-bounded Rust runtime (see `runtime/` and
+/// `dispatch_internal.rs`) is the ONLY dispatch path — the legacy
+/// `openclaw` shell-out runtime and its `--runtime` opt-in flag were
+/// removed. The enum survives as a single-variant type because
+/// `DispatchOpts.runtime` and the fleet `WorkJob.runtime` field are
+/// serialized/round-tripped across the queue boundary; collapsing it
+/// further would touch that schema for no behavioral gain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Runtime {
     #[default]
     Internal,
-    Openclaw,
-}
-
-impl Runtime {
-    /// String parse for CLI-flag plumbing (`--runtime <name>`). The
-    /// queue boundary uses `serde::Deserialize` directly — a mistyped
-    /// runtime on a WorkJob is rejected at JSON parse time rather than
-    /// in `validate()`, which is what Wave-E.14 lifted into the type
-    /// (#255 / PR-C.1 code-reviewer MEDIUM).
-    pub fn parse(s: &str) -> Result<Self> {
-        match s {
-            "openclaw" => Ok(Runtime::Openclaw),
-            "internal" => Ok(Runtime::Internal),
-            other => bail!(
-                "unknown runtime: {other}. \
-                 Known: openclaw, internal"
-            ),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -230,69 +160,44 @@ pub struct DispatchOpts {
     pub role_id: String,
     pub message: String,
     /// Optional delivery target in `<channel>:<target>` form
-    /// (e.g. `discord:1500166601909993503`).
+    /// (e.g. `discord:1500166601909993503`). Not consumed by the
+    /// internal runtime today — reserved for a future delivery
+    /// integration.
     pub deliver: Option<String>,
     pub session_id: Option<String>,
     pub timeout_seconds: u32,
     /// Skip the pre-flight checks. Use only when explicitly debugging.
     pub skip_preflight: bool,
     /// When `true`, request the runtime emit a machine-parseable JSON
-    /// envelope on stdout instead of the human-readable format. Today
-    /// only the internal runtime honors this — it's plumbed through to
-    /// `--json` on the container's CLI. The openclaw path always
-    /// returns its own JSON envelope, so this flag is a no-op there.
+    /// envelope on stdout instead of the human-readable format —
+    /// plumbed through to `--json` on the container's CLI.
     pub json: bool,
-    /// Paths to capture post-dispatch filesystem state for (#89 —
-    /// SIGNOFF verification visibility). The dispatcher walks each
-    /// path (immediate children + one level deep into subdirs;
-    /// excludes openclaw state files) after the openclaw call returns
-    /// and emits a stderr summary so the operator can compare the
-    /// actual filesystem state against any "files written" claims in
-    /// the SIGNOFF block. Empty defaults to the role's openclaw
-    /// workspace dir.
-    pub watch_paths: Vec<PathBuf>,
     /// Explicit working-directory override for the dispatch (#143).
-    /// When `Some(path)`, the dispatcher sets up
-    /// `~/.openclaw/workspace-darkmux-<role>/repo` as a symlink to
-    /// the given path before invoking openclaw. The agent then sees
-    /// the operator-named scope as `repo/` inside its workspace.
-    /// When `None`, the dispatcher does NOT touch the workspace —
-    /// whatever symlink the operator has set up (or none at all)
-    /// is what the agent gets. Per the operator-sovereignty contract
-    /// in #143, darkmux doesn't auto-create or auto-remove scope
-    /// links; --workdir is the explicit operator opt-in.
+    /// When `Some(path)`, the internal runtime mounts the given path
+    /// into the container as the workspace. When `None`, a fresh
+    /// tempdir is allocated. Per the operator-sovereignty contract,
+    /// darkmux never auto-creates or auto-removes an operator-named
+    /// `--workdir` — see `dispatch_internal`'s workspace setup.
     pub workdir: Option<PathBuf>,
     /// Optional phase id binding this dispatch to a phase in a
     /// mission (#146 Stage 1). When set:
     ///
-    ///   1. The dispatcher loads the phase manifest and resolves
-    ///      `depends_on` parents. For each parent that has a recorded
-    ///      output file (`<phase-id>-output.txt`), the parent's
-    ///      output text is prepended to the dispatch message as a
-    ///      "Prior phase outputs" context block. One-hop only —
-    ///      transitive ancestors are NOT walked (Stage 1 scope).
+    ///   1. The dispatcher loads the phase manifest and resolves its
+    ///      predecessor. When the predecessor has a recorded output
+    ///      file (`<phase-id>-output.txt`), that text is prepended to
+    ///      the dispatch message as a "Prior phase outputs" context
+    ///      block. One-hop only — transitive ancestors are NOT walked.
     ///   2. After the dispatch returns, the agent's reply text is
     ///      persisted to `<phase-id>-output.txt` alongside the phase
-    ///      manifest, so downstream phases with this phase in their
-    ///      `depends_on` can read it on their own dispatch.
+    ///      manifest, so downstream phases with this phase as their
+    ///      predecessor can read it on their own dispatch.
     ///
     /// When `None`, the dispatcher behaves as before — no phase
     /// awareness, no output persistence. Backwards-compatible default.
     pub phase_id: Option<String>,
     /// Which agent runtime to dispatch through. See [`Runtime`].
-    /// Default: `Runtime::Internal` (the in-house container-bounded path).
+    /// The in-house container-bounded runtime is the only value.
     pub runtime: Runtime,
-    /// Executable path for the openclaw shell-out (Phase-E). Defaults
-    /// to `"openclaw"`; operators override via `--runtime-cmd <path>`
-    /// to point at Aider / Cline / any tool exposing the
-    /// `<cmd> agent --agent <id> --json ...` calling convention.
-    /// **Ignored when `runtime == Runtime::Internal`** — internal-runtime
-    /// dispatches use the in-house Rust loop and don't shell out.
-    ///
-    /// Replaces the pre-Phase-E global env var `DARKMUX_RUNTIME_CMD`.
-    /// Per-dispatch override (operator sovereignty); no implicit global
-    /// state to surprise the operator across sessions.
-    pub runtime_cmd: String,
     /// Target machine for the dispatch (#246 PR-C.3). When `Some(<id>)`
     /// and `<id>` differs from the local `DARKMUX_MACHINE_ID`, the
     /// dispatch is published to the single global `darkmux:work` stream
@@ -323,9 +228,6 @@ pub struct DispatchOpts {
     /// vars are NOT consulted by the runtime — the operator's tuning
     /// surface is the profile JSON, with these struct fields as the
     /// in-process plumbing layer between profile-read and CLI-emit.
-    ///
-    /// Ignored when `runtime == Runtime::Openclaw` (openclaw's
-    /// compaction config lives in its own `openclaw.json`).
     pub compaction: CompactionDispatchArgs,
     /// (#549) The resolved profile name the dispatch should use for
     /// model selection — the CLI `--profile` override when set, else
@@ -361,7 +263,7 @@ pub struct DispatchOpts {
     /// in that environment and can compile/test in-sandbox — the inner
     /// verify loop. No per-language darkmux images. The image needs `bash`
     /// and coreutils `timeout` (debian/ubuntu-family ship them; bare-alpine
-    /// images need them added — Slice 2). Ignored on the openclaw runtime.
+    /// images need them added — Slice 2).
     pub image: Option<String>,
     /// Mock-model harness: override the container's `--base-url` — the
     /// LMStudio-compatible chat-completions host the runtime dials for a
@@ -372,8 +274,7 @@ pub struct DispatchOpts {
     /// real container-based dispatch machinery — real `docker run`, real
     /// agent loop, real flow records — against a scripted/deterministic
     /// fake response instead of a real model, with zero LMStudio/GPU
-    /// involvement. Ignored on the openclaw runtime (which has no
-    /// equivalent flag). The mock server itself is the standalone
+    /// involvement. The mock server itself is the standalone
     /// `tools/darkmux-mock-model` binary — a genuinely separate process
     /// reached over a real socket, not a function-call fake — see its
     /// crate doc and `crates/darkmux-crew/tests/mock_dispatch_proof.rs`.
@@ -396,14 +297,12 @@ pub struct CompactionDispatchArgs {
     /// Absolute trigger. Set from `profile.runtime.compaction.threshold_tokens`
     /// (typed v0.1 field, #357).
     pub threshold_tokens: Option<u32>,
-    /// Compactor model override. Set from
-    /// `profile.runtime.compaction.extras["model"]` (openclaw-shape
-    /// passthrough; the typed schema in #357 didn't promote `model` to
-    /// a typed field since it's openclaw-flavored).
+    /// Compactor model override. `None` by default — the runtime falls
+    /// back to its hardcoded default compactor model (or the machine's
+    /// bound `internal.utility` model via `apply_utility_model` below).
     pub compactor_model: Option<String>,
     /// Adaptive-trigger fraction (0.1-0.9). Set from typed
-    /// `profile.runtime.compaction.threshold_ratio` (#368 clean
-    /// break — no openclaw-shape `maxHistoryShare` extras fallback).
+    /// `profile.runtime.compaction.threshold_ratio` (#368 T2-A).
     pub threshold_ratio: Option<f32>,
     /// Primary model's loaded context window. Set from
     /// `profile.models[primary].n_ctx`. Required for the formula
@@ -426,42 +325,30 @@ pub struct CompactionDispatchArgs {
     /// (#383) Operator-tunable text appended to the compactor's
     /// system prompt at compaction time. Set from typed
     /// `profile.runtime.compaction.custom_instructions`. Schema
-    /// isolation: reads ONLY the typed field — no extras fallback.
+    /// isolation: reads ONLY the typed field.
     pub custom_instructions: Option<String>,
 }
 
 impl CompactionDispatchArgs {
     /// Derive from a profile (operator's tuning source-of-truth).
-    /// Reads the typed `threshold_tokens` field plus the operator-
-    /// supplied openclaw-shape passthroughs (`maxHistoryShare`,
-    /// `model`) from the `extras` map. Picks the primary model's
-    /// `n_ctx` as the context_window (needed for formula trigger).
+    /// Reads the typed fields under `profile.runtime.compaction.*`.
+    /// Picks the primary model's `n_ctx` as the context_window (needed
+    /// for formula trigger).
     pub fn from_profile(profile: &darkmux_types::Profile) -> Self {
         let comp = profile.runtime.as_ref().and_then(|r| r.compaction.as_ref());
         let threshold_tokens = comp
             .and_then(|c| c.threshold_tokens)
             .and_then(|v| u32::try_from(v).ok());
-        // (#368 clean break) Compactor model is NOT read from
-        // openclaw-shape `extras["model"]`. Openclaw convention
-        // prefixes the id with `lmstudio/` (e.g.
-        // `lmstudio/qwen3-4b-instruct-2507`), which LMStudio's direct
-        // chat-completions API doesn't recognize — produces HTTP 400
-        // on the compactor call. Silently translating across that
-        // format boundary would mask operator intent. Until #368.x
-        // adds a typed `compaction.compactor_model` field, the runtime
-        // uses its hardcoded default `darkmux:qwen3-4b-instruct-2507`,
+        // (#368 clean break) Compactor model is a typed field only —
+        // no legacy-shape `extras["model"]` fallback. Until a typed
+        // `compaction.compactor_model` field exists, the runtime uses
+        // its hardcoded default `darkmux:qwen3-4b-instruct-2507`,
         // which matches what LMStudio has loaded in the standard
-        // `darkmux swap`-based workflow. Surfaced by Beat-39 smoke
-        // dispatch (2026-05-25): turn 4's compactor call failed with
-        // HTTP 400 when this read-from-extras was active.
+        // `darkmux swap`-based workflow.
         let compactor_model: Option<String> = None;
-        // (#368 clean break) Read from the typed schema field, NOT
-        // openclaw-shape extras. Operators wanting the adaptive
-        // trigger set `profile.runtime.compaction.threshold_ratio`
-        // directly. The openclaw-passthrough `maxHistoryShare` is a
-        // SEPARATE concept (their post-compaction history cap, not
-        // a pre-compaction trigger) and would be confusing to silently
-        // map across the semantic boundary.
+        // (#368 clean break) Read from the typed schema field.
+        // Operators wanting the adaptive trigger set
+        // `profile.runtime.compaction.threshold_ratio` directly.
         let threshold_ratio = comp.and_then(|c| c.threshold_ratio).map(|f| f as f32);
         // (#590) Context window for the compaction trigger comes from the
         // profile's default model (default_model, or first model). (#1282)
@@ -485,8 +372,6 @@ impl CompactionDispatchArgs {
             .and_then(|c| c.reserve.as_ref())
             .and_then(|r| r.bail_after_compactions);
         // (#383) Custom instructions — read from typed field only.
-        // Schema isolation: no extras fallback (DESIGN.md "Schema
-        // isolation: each runtime owns its own config").
         let custom_instructions = comp.and_then(|c| c.custom_instructions.clone());
         Self {
             threshold_tokens,
@@ -529,24 +414,6 @@ impl CompactionDispatchArgs {
     }
 }
 
-/// One file's state for the watched-paths summary (#89).
-#[derive(Debug, Clone)]
-pub struct WatchedFile {
-    pub path: PathBuf,
-    pub size: u64,
-}
-
-/// Post-dispatch state of one watched path.
-#[derive(Debug, Clone)]
-pub struct WatchedPathState {
-    pub root: PathBuf,
-    pub files: Vec<WatchedFile>,
-    /// True if `root` itself didn't exist or wasn't readable at snapshot
-    /// time. The dispatcher reports the gap rather than silently dropping
-    /// the path.
-    pub unreachable: bool,
-}
-
 #[derive(Debug)]
 pub struct DispatchResult {
     pub exit_code: i32,
@@ -555,17 +422,13 @@ pub struct DispatchResult {
     /// The session id actually used for this dispatch. Echoes back the
     /// caller-supplied `opts.session_id` when set, or the fresh one this
     /// dispatch generated when `opts.session_id` was `None` (closes #88 —
-    /// without an explicit `--session-id`, openclaw's per-agent session
-    /// reuse caused cross-task context pollution).
+    /// without an explicit `--session-id`, per-agent session reuse can
+    /// cause cross-task context pollution).
     pub session_id: String,
-    /// Post-dispatch state of each `opts.watch_paths` entry, in the same
-    /// order. Surfaces the actual filesystem so the operator can compare
-    /// against the SIGNOFF block's "files written" claims (#89).
-    pub watched_state: Vec<WatchedPathState>,
     /// Host path where the internal runtime's `.darkmux-runtime/`
     /// bookkeeping landed (the dir mounted into the container at
-    /// `/darkmux-out`). `None` for the openclaw runtime, which writes no
-    /// such out-of-band bookkeeping.
+    /// `/darkmux-out`). `None` when the dispatch path doesn't produce
+    /// out-of-band bookkeeping (e.g. the remote single-shot path).
     pub out_dir: Option<PathBuf>,
 }
 
@@ -593,107 +456,6 @@ pub fn fresh_session_id(role_id: &str) -> String {
     format!("crew-dispatch-{role_id}-{micros}-{counter}")
 }
 
-/// Bounded directory walk that's resilient to non-existent paths +
-/// permission errors. Returns the immediate-child + one-level-down
-/// regular files under `root`, excluding openclaw state files (which
-/// change on every dispatch and would drown out the operator's signal).
-///
-/// Symlinks are reported as files only when their target is a regular
-/// file. Symlinked directories are NOT followed (would unbounded-walk
-/// the live source tree the workspace symlinks into).
-///
-/// Cap: 200 files per `root`. The dispatcher's job is to surface the
-/// signal, not to dump entire repos.
-pub(crate) fn snapshot_watched_path(root: &Path) -> WatchedPathState {
-    const MAX_FILES_PER_ROOT: usize = 200;
-
-    if !root.exists() {
-        return WatchedPathState {
-            root: root.to_path_buf(),
-            files: Vec::new(),
-            unreachable: true,
-        };
-    }
-
-    let mut files: Vec<WatchedFile> = Vec::new();
-    walk_one_level(root, &mut files, MAX_FILES_PER_ROOT);
-
-    if files.len() >= MAX_FILES_PER_ROOT {
-        // Truncate; operator sees the cap was hit via the leading entries.
-        files.truncate(MAX_FILES_PER_ROOT);
-    }
-
-    // Sort by size descending so the operator sees the largest (often
-    // most-relevant — actual outputs vs scratch files) first.
-    files.sort_by_key(|f| std::cmp::Reverse(f.size));
-
-    WatchedPathState {
-        root: root.to_path_buf(),
-        files,
-        unreachable: false,
-    }
-}
-
-fn walk_one_level(dir: &Path, out: &mut Vec<WatchedFile>, cap: usize) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        if out.len() >= cap {
-            return;
-        }
-        let path = entry.path();
-        if is_openclaw_noise(&path) {
-            continue;
-        }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.is_file() {
-            out.push(WatchedFile {
-                path,
-                size: meta.len(),
-            });
-        } else if meta.is_dir() {
-            // One level only — don't recurse into subdirs of subdirs.
-            // (Distinguishes from symlinks via is_symlink check below.)
-            if path.is_symlink() {
-                continue;
-            }
-            // Walk the subdir flat (no further recursion).
-            let sub_entries = match fs::read_dir(&path) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            for sub in sub_entries.flatten() {
-                if out.len() >= cap {
-                    return;
-                }
-                let sub_path = sub.path();
-                if is_openclaw_noise(&sub_path) {
-                    continue;
-                }
-                let sub_meta = match sub.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if sub_meta.is_file() {
-                    out.push(WatchedFile {
-                        path: sub_path,
-                        size: sub_meta.len(),
-                    });
-                }
-            }
-        }
-    }
-}
-
-/// Files the dispatcher excludes from watched-state snapshots — openclaw's
-/// own session bookkeeping, trajectory files, and the workspace bootstrap
-/// markdowns. These change on every dispatch and would drown out the
-/// signal the operator is actually looking for.
 /// Resolve the path to the optional operator-identity file (#147).
 /// Defaults to `~/.darkmux/identity.md`. The `DARKMUX_IDENTITY_PATH`
 /// env var overrides — used by tests, also available for operators
@@ -738,10 +500,8 @@ fn load_operator_identity() -> Option<String> {
 /// honest surfacing of the missing context.
 ///
 /// When the identity file is present: appends an `## About the operator`
-/// section to the role prompt. Called at BOTH sync time (so the
-/// systemPromptOverride written to openclaw.json reflects the
-/// augmented form) AND preflight time (so drift detection compares
-/// like-for-like).
+/// section to the role prompt. Called from `dispatch_internal::dispatch`
+/// before the system prompt is sent to the runtime.
 pub(crate) fn augment_prompt_with_identity(role_prompt: &str) -> String {
     match load_operator_identity() {
         Some(identity) => format!(
@@ -750,53 +510,6 @@ pub(crate) fn augment_prompt_with_identity(role_prompt: &str) -> String {
         ),
         None => role_prompt.to_string(),
     }
-}
-
-/// Phase-output file path for a given phase id. Lives alongside the
-/// phase manifest at `<crew_root>/phases/<id>-output.txt`. Used by
-/// #146 Stage 1 (cross-phase context) to:
-///
-///   - Read parent phase outputs when dispatching a phase with
-///     `depends_on` (one-hop only)
-///   - Persist this phase's agent reply so downstream phases can
-///     read it on their own dispatch
-///
-/// Plain text, not JSON — the agent's reply IS prose. Storing it raw
-/// keeps the inject-back-into-message format friction-free.
-///
-/// Output file path for a phase's recorded agent reply.
-///
-/// New layout (#148): `<crew_root>/missions/<mission_id>/phases/<phase_id>-output.txt`
-/// co-located with the phase manifest under the per-mission directory.
-fn phase_output_path(mission_id: &str, phase_id: &str) -> PathBuf {
-    crate::lifecycle::phases_dir(mission_id).join(format!("{phase_id}-output.txt"))
-}
-
-/// (#146 residual) Default per-parent cap, in chars, on injected prior-phase
-/// output. A parent's recorded reply can be long; without a bound, a dependent
-/// dispatch's brief grows with every upstream hop and can crowd a small model's
-/// window. ~8000 chars ≈ 2000 tokens — generous for a phase summary. Operator-
-/// tunable per dispatch via `DARKMUX_PHASE_CONTEXT_MAX_CHARS`.
-const DEFAULT_PHASE_CONTEXT_MAX_CHARS: usize = 8000;
-
-/// The per-parent prior-phase-output cap: `env(DARKMUX_PHASE_CONTEXT_MAX_CHARS)`
-/// when set + parseable, else the default. `0` disables the cap (inject in full).
-fn phase_context_max_chars() -> usize {
-    std::env::var("DARKMUX_PHASE_CONTEXT_MAX_CHARS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_PHASE_CONTEXT_MAX_CHARS)
-}
-
-/// Truncate a parent's output to `max` chars (char-safe, never mid-UTF-8),
-/// appending a marker that names the full source so the agent knows it's seeing
-/// a head. `max == 0` means "no cap" (return as-is). Pure, for testability.
-fn cap_parent_output(content: &str, max: usize) -> String {
-    if max == 0 || content.chars().count() <= max {
-        return content.to_string();
-    }
-    let head: String = content.chars().take(max).collect();
-    format!("{head}\n\n[… output truncated at {max} chars; full text in the phase's output file]")
 }
 
 /// Max chars of stderr carried in the dispatch-error flow record (#1042).
@@ -818,164 +531,6 @@ pub(crate) fn tail_excerpt(content: &str, max: usize) -> String {
     format!("[… stderr truncated, showing last {max} of {n} chars]\n{tail}")
 }
 
-/// Resolve the dispatch message: when `phase_id` is `Some(id)`, look up
-/// the phase's PREDECESSOR — the phase immediately before it in its
-/// mission's `Mission.phase_ids` order (#1341: Phases are strictly linear,
-/// ordered purely by list position — "Phase.depends_on" no longer exists;
-/// see `types::Phase`'s doc) — and prepend its recorded output (capped per
-/// [`phase_context_max_chars`]) as a "Prior phase outputs" context block.
-/// Returns the augmented message (or the original message unchanged if
-/// this is the mission's first phase, there's no recorded output, or no
-/// phase_id at all).
-///
-/// One predecessor only — transitive ancestors are NOT walked (unchanged
-/// from the pre-#1341 "Stage 1, one-hop only" scope per #146; a phase now
-/// structurally has at most one immediate predecessor anyway).
-///
-/// A missing predecessor / missing output file is NOT fatal — the
-/// dispatch proceeds without it. The dispatcher logs to stderr when the
-/// predecessor's output wasn't found so the operator can see what context
-/// the agent received.
-fn augment_message_with_phase_context(
-    phase_id: Option<&str>,
-    original_message: &str,
-) -> Result<String> {
-    let Some(phase_id) = phase_id else {
-        return Ok(original_message.to_string());
-    };
-
-    // Load all phases (cheap — small number of JSONs on disk). Find
-    // the named phase; if not found, log + dispatch as-is.
-    let phases = match load_phases() {
-        Ok(s) => s,
-        Err(_) => {
-            // Loader failure shouldn't block dispatch — just log.
-            eprintln!(
-                "darkmux crew dispatch: phase loader unavailable; \
-                 dispatching `{phase_id}` without cross-phase context."
-            );
-            return Ok(original_message.to_string());
-        }
-    };
-    let phase = match phases.into_iter().find(|s| s.id == phase_id) {
-        Some(s) => s,
-        None => {
-            eprintln!(
-                "darkmux crew dispatch: phase `{phase_id}` not found in \
-                 crew root; dispatching without cross-phase context."
-            );
-            return Ok(original_message.to_string());
-        }
-    };
-
-    let missions = match load_missions() {
-        Ok(m) => m,
-        Err(_) => {
-            eprintln!(
-                "darkmux crew dispatch: mission loader unavailable; \
-                 dispatching `{phase_id}` without cross-phase context."
-            );
-            return Ok(original_message.to_string());
-        }
-    };
-    let Some(mission) = missions.into_iter().find(|m| m.id == phase.mission_id) else {
-        eprintln!(
-            "darkmux crew dispatch: mission `{}` not found for phase `{phase_id}`; \
-             dispatching without cross-phase context.",
-            phase.mission_id
-        );
-        return Ok(original_message.to_string());
-    };
-    let position = mission.phase_ids.iter().position(|id| id == phase_id);
-    let predecessor_id = match position {
-        Some(0) | None => None, // first phase (or not listed — defensive): no predecessor
-        Some(i) => Some(mission.phase_ids[i - 1].clone()),
-    };
-    let Some(predecessor_id) = predecessor_id else {
-        // First phase in the mission; nothing to inject.
-        return Ok(original_message.to_string());
-    };
-
-    // Look up the predecessor's recorded output. Missing output is
-    // accumulated in `missing_parents` so the operator sees the phase
-    // didn't get cross-phase context.
-    //
-    // Per-mission layout (#148): the predecessor phase lives in the same
-    // mission as this one. Output files are co-located with phase
-    // manifests under `missions/<mission_id>/phases/`.
-    let max_chars = phase_context_max_chars();
-    let mut parent_blocks: Vec<String> = Vec::new();
-    let mut missing_parents: Vec<String> = Vec::new();
-    let path = phase_output_path(&phase.mission_id, &predecessor_id);
-    match fs::read_to_string(&path) {
-        Ok(content) if !content.trim().is_empty() => {
-            // (#146 residual) Bound the predecessor's output so a long
-            // upstream reply can't blow the dependent dispatch's brief.
-            let capped = cap_parent_output(content.trim_end(), max_chars);
-            parent_blocks.push(format!("### {predecessor_id}\n\n{capped}\n"));
-        }
-        _ => {
-            missing_parents.push(predecessor_id.clone());
-        }
-    }
-
-    if parent_blocks.is_empty() {
-        if !missing_parents.is_empty() {
-            eprintln!(
-                "darkmux crew dispatch: phase `{}` depends on {} \
-                 (no recorded output for any parent yet — dispatching with \
-                 bare message).",
-                phase_id,
-                missing_parents.join(", ")
-            );
-        }
-        return Ok(original_message.to_string());
-    }
-
-    if !missing_parents.is_empty() {
-        eprintln!(
-            "darkmux crew dispatch: phase `{phase_id}` got context from {} \
-             parent(s); missing recorded output for: {}",
-            parent_blocks.len(),
-            missing_parents.join(", ")
-        );
-    } else {
-        eprintln!(
-            "darkmux crew dispatch: phase `{phase_id}` got context from {} \
-             parent(s).",
-            parent_blocks.len()
-        );
-    }
-
-    let context_block = format!(
-        "## Prior phase outputs\n\n\
-         The following phases in this mission have completed and produced \
-         output you can reference. Use them as context for your task below.\n\n\
-         {}\n\
-         ---\n\n\
-         ## Your task\n\n\
-         {original_message}",
-        parent_blocks.join("\n"),
-    );
-    Ok(context_block)
-}
-
-/// Persist the agent's reply text to the phase's output file after a
-/// dispatch completes (#146 Stage 1 / #148 layout). Operator-visible
-/// side effect: `<crew_root>/missions/<mission_id>/phases/<phase_id>-output.txt`
-/// is created or overwritten with the agent's text reply.
-///
-/// No-op when `phase_id` is `None` (dispatcher was called without
-/// phase context — typical for ad-hoc role dispatches).
-///
-/// The `mission_id` is resolved via `lifecycle::load_phase_by_id` at
-/// persist time. If the phase is not found (e.g. the loader is
-/// unavailable or the id is stale), persistence is skipped silently —
-/// the output is already on stdout.
-///
-/// Returns the path written when persistence happened, `None`
-/// otherwise. Errors are logged but don't fail the dispatch itself —
-/// best-effort for downstream phases.
 /// (#714) Resolve a phase's mission so every dispatch flow record can be
 /// stamped with `mission_id` and group under its mission in the observability
 /// view. `None` when there's no `--phase-id` or the phase manifest can't be
@@ -994,465 +549,18 @@ pub(crate) fn resolve_mission_for_phase(phase_id: Option<&str>) -> Option<String
     }
 }
 
-fn persist_phase_output(phase_id: Option<&str>, reply_text: &str) -> Option<PathBuf> {
-    let phase_id = phase_id?;
-    if reply_text.trim().is_empty() {
-        return None;
-    }
-    // Resolve mission_id via lifecycle so the output file lands in the
-    // per-mission directory next to the phase manifest (#148).
-    let mission_id = match crate::lifecycle::load_phase_by_id(phase_id) {
-        Ok(s) => s.mission_id,
-        Err(_) => {
-            eprintln!(
-                "darkmux crew dispatch: phase `{phase_id}` not found; \
-                 skipping output persistence."
-            );
-            return None;
-        }
-    };
-    let path = phase_output_path(&mission_id, phase_id);
-    if let Some(parent) = path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            eprintln!(
-                "darkmux crew dispatch: failed to create output dir {}: {e}",
-                parent.display()
-            );
-            return None;
-        }
-    }
-    match fs::write(&path, reply_text) {
-        Ok(()) => Some(path),
-        Err(e) => {
-            eprintln!(
-                "darkmux crew dispatch: failed to persist phase output to {}: {e}",
-                path.display()
-            );
-            None
-        }
-    }
-}
-
-/// Outcome of applying a `--workdir` override for a dispatch. Returned
-/// from `apply_workdir_override` so the caller can decide whether to
-/// emit any operator-facing notice.
-#[derive(Debug, PartialEq)]
-enum WorkdirOutcome {
-    /// `--workdir` not set; no change applied.
-    NoChange,
-    /// `repo` symlink created/replaced; previous state (if any) is
-    /// included so the operator can see what was overwritten.
-    Applied { previous_target: Option<PathBuf> },
-}
-
-/// Apply a `--workdir` override to the role's openclaw workspace. The
-/// override is a symlink at `<role-workspace>/repo` pointing at the
-/// operator-named path.
-///
-/// **Operator-sovereign contract** (#143):
-/// - When `workdir` is `None`, this function is a no-op. Whatever
-///   symlink already exists in the workspace (or none) is what the
-///   agent sees.
-/// - When `workdir` is `Some(path)`, the path MUST exist as a directory
-///   (or symlink to one) — we don't fabricate scope. The function
-///   replaces any existing `repo` symlink with one pointing at the
-///   operator's choice.
-/// - We do NOT remove the symlink after dispatch. The operator's
-///   explicit declaration persists until they `rm` it or pass a
-///   different `--workdir`. This avoids the crash-mid-dispatch
-///   restore-fragility class of bugs.
-fn apply_workdir_override(workdir: Option<&Path>, role_workspace: &Path) -> Result<WorkdirOutcome> {
-    let Some(target) = workdir else {
-        return Ok(WorkdirOutcome::NoChange);
-    };
-
-    // Symlink-escape guard + existence + is-dir check via the shared
-    // validator (#255 Wave-E.2). Closes the long-deferred parity gap
-    // where the openclaw path silently followed symlinks while
-    // dispatch_internal had the guard since #232. Validator returns
-    // the canonical (symlink-free) path — operations below use the
-    // operator-supplied `target` for messages but the canonical path
-    // for filesystem ops is captured at the link-create site below.
-    let _resolved = darkmux_types::workdir::validate_workdir(target)?;
-
-    fs::create_dir_all(role_workspace)
-        .with_context(|| format!("creating role workspace {}", role_workspace.display()))?;
-
-    let link_path = role_workspace.join("repo");
-
-    // Read previous state for the operator-facing notice.
-    let previous_target = if link_path.is_symlink() {
-        fs::read_link(&link_path).ok()
-    } else if link_path.exists() {
-        // Not a symlink but exists — refuse to clobber. This catches
-        // the case where an operator has a real `repo/` directory in
-        // the workspace.
-        bail!(
-            "{} exists but is not a symlink; refusing to clobber. \
-             Remove it manually if you want --workdir to manage scope, \
-             or omit --workdir to use the existing path.",
-            link_path.display()
-        );
-    } else {
-        None
-    };
-
-    // Remove the existing symlink (if any) and create a fresh one.
-    if link_path.is_symlink() {
-        fs::remove_file(&link_path)
-            .with_context(|| format!("removing existing symlink at {}", link_path.display()))?;
-    }
-
-    let absolute_target = target
-        .canonicalize()
-        .unwrap_or_else(|_| target.to_path_buf());
-    std::os::unix::fs::symlink(&absolute_target, &link_path).with_context(|| {
-        format!(
-            "creating symlink {} -> {}",
-            link_path.display(),
-            absolute_target.display()
-        )
-    })?;
-
-    Ok(WorkdirOutcome::Applied { previous_target })
-}
-
-fn is_openclaw_noise(path: &Path) -> bool {
-    let name = match path.file_name().and_then(|s| s.to_str()) {
-        Some(n) => n,
-        None => return false,
-    };
-    name.ends_with(".trajectory.jsonl")
-        || name.ends_with(".trajectory-path.json")
-        || name.ends_with(".checkpoint.jsonl")
-        || (name.ends_with(".jsonl") && name.contains("checkpoint"))
-        || matches!(
-            name,
-            "AGENTS.md"
-                | "BOOTSTRAP.md"
-                | "HEARTBEAT.md"
-                | "IDENTITY.md"
-                | "SOUL.md"
-                | "TOOLS.md"
-                | "USER.md"
-                | "sessions.json"
-        )
-}
-
 /// Run a single dispatch end-to-end.
+///
 /// Local dispatch entry point. Runs the role through the in-house
-/// container-bounded runtime (`--runtime internal`) or the openclaw
-/// shell-out path on THIS machine. Never routes across the fleet — the
-/// local-vs-remote routing decision lives in `fleet::dispatch_routed`
-/// (#463 cycle-break: moved up so `crew` doesn't depend on `fleet`).
-/// User-facing callers go through `fleet::dispatch_routed`; the fleet
-/// runner (already on the chosen machine) calls this directly.
+/// container-bounded runtime on THIS machine. Never routes across the
+/// fleet — the local-vs-remote routing decision lives in
+/// `fleet::dispatch_routed` (#463 cycle-break: moved up so `crew` doesn't
+/// depend on `fleet`). User-facing callers go through
+/// `fleet::dispatch_routed`; the fleet runner (already on the chosen
+/// machine) calls this directly.
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
-    // Route to the in-house container-bounded runtime when the operator
-    // explicitly opts in via `--runtime internal`. Default stays the
-    // openclaw path (everything below this branch).
-    if opts.runtime == Runtime::Internal {
-        return crate::dispatch_internal::dispatch(opts);
-    }
-
-    // (#703) `--image` only applies to the internal runtime (it names the
-    // container darkmux injects into). Warn loud rather than silently ignore
-    // it on the openclaw path — symmetric with the cross-machine warning, and
-    // matches the loud-beats-quiet operator-sovereignty bar.
-    if opts.image.is_some() {
-        eprintln!(
-            "darkmux: warning — `--image` is ignored on `--runtime openclaw`; \
-             it only selects the container for the internal runtime."
-        );
-    }
-
-    // 0. Pre-flight: nudge the operator if the daemon isn't up. The
-    //    dispatch will still write flow records to disk, but they
-    //    won't be observable in the viewer until the daemon comes up.
-    //    Non-blocking; the dispatch proceeds either way (#104 S3).
-    darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("crew dispatch");
-
-    // 1. Load the role + its .md prompt
-    let role = load_role_or_bail(&opts.role_id)?;
-    let bare_prompt = role_prompt_or_bail(&role)?;
-    // #147: augment with operator-identity from ~/.darkmux/identity.md
-    // if present. Pre-flight compares against the augmented form so
-    // drift detection matches what `darkmux crew sync` wrote.
-    let prompt = augment_prompt_with_identity(&bare_prompt);
-    let agent_id = agent_id_for(&opts.role_id);
-
-    // 1.5. Licensed-adjacent ACK gate. For roles whose prompts operate
-    //      in domains regulated by professional licensure (health, law,
-    //      fitness), require an operator acknowledgment on first dispatch.
-    //      The prompts encode the boundary at runtime; this gate makes the
-    //      same boundary visible to the operator at the CLI surface.
-    require_licensed_adjacent_ack(&opts.role_id)
-        .context("licensed-adjacent role dispatch requires acknowledgment")?;
-
-    // 2. Pre-flight against openclaw config. Run BEFORE --workdir
-    //    mutates state (per QA review on #143 Stage 1): cheap-and-
-    //    reversible checks come first so a pre-flight failure doesn't
-    //    leave the operator with a half-applied symlink. The
-    //    operator-never-has-to-wonder rule from CLAUDE.md says
-    //    silent-partial-state from a failed dispatch is exactly the
-    //    wondering this discipline prevents.
-    let role_workspace = default_workspace_for_role(&opts.role_id);
-    if !opts.skip_preflight {
-        let openclaw_path = default_openclaw_config();
-        let openclaw_config = read_openclaw_config(&openclaw_path)?;
-        preflight_check(&openclaw_config, &agent_id, &role, &prompt)
-            .with_context(|| {
-                format!(
-                    "pre-flight failed for `{agent_id}`. Run `darkmux crew sync` to update openclaw config from the manifests."
-                )
-            })?;
-    }
-
-    // 2.5. Apply --workdir override (#143 Stage 1). State mutation only
-    //      after pre-flight has cleared. When the operator passes an
-    //      explicit workdir, set up the role's workspace `repo` symlink
-    //      to point at it. When omitted, the workspace is left whatever
-    //      state it was in (no auto-mutation).
-    let workdir_outcome = apply_workdir_override(opts.workdir.as_deref(), &role_workspace)?;
-    if let WorkdirOutcome::Applied { previous_target } = &workdir_outcome {
-        let absolute_target = opts
-            .workdir
-            .as_deref()
-            .and_then(|p| p.canonicalize().ok())
-            .unwrap_or_else(|| opts.workdir.clone().unwrap_or_default());
-        match previous_target {
-            Some(prev) => eprintln!(
-                "darkmux crew dispatch: --workdir replaced `{}/repo` (was -> {}; now -> {})",
-                role_workspace.display(),
-                prev.display(),
-                absolute_target.display()
-            ),
-            None => eprintln!(
-                "darkmux crew dispatch: --workdir installed `{}/repo` (now -> {})",
-                role_workspace.display(),
-                absolute_target.display()
-            ),
-        }
-    }
-
-    // 2.75. Cross-phase context injection (#146 Stage 1). When a
-    //       --phase-id was passed, look up the phase's depends_on
-    //       parents and prepend each recorded output as a "Prior
-    //       phase outputs" context block. One-hop only — transitive
-    //       ancestors are NOT walked. Missing parent outputs are
-    //       logged and the dispatch proceeds with whatever's available.
-    let augmented_message =
-        augment_message_with_phase_context(opts.phase_id.as_deref(), &opts.message)?;
-
-    // 3. Resolve session id. Always pass `--session-id` to openclaw — when
-    //    the caller didn't supply one, generate a fresh `crew-dispatch-
-    //    <role>-<timestamp>`. Without this, openclaw silently reuses the
-    //    per-agent `agent:darkmux-<role>:main` session across dispatches,
-    //    leading to cross-task context pollution (#88).
-    let resolved_session_id = opts
-        .session_id
-        .clone()
-        .unwrap_or_else(|| fresh_session_id(&opts.role_id));
-
-    // Resolve the model openclaw will route to for this agent — stamped
-    // onto both the start and end flow records so the viewer can show
-    // "which model ran this dispatch" without cross-referencing the
-    // model-status pill (#106). Resolved once, reused for both records
-    // of the pair so they reference the same model even if the agent's
-    // config is edited mid-dispatch. Non-fatal: None on failure.
-    let resolved_model = resolve_dispatch_model(&agent_id);
-
-    // (#714) Resolve the phase → mission once so every flow record this
-    // dispatch emits carries `mission_id`/`phase_id` and groups under its
-    // mission in the observability view. Best-effort: None when not phase-bound.
-    let dispatch_mission_id = resolve_mission_for_phase(opts.phase_id.as_deref());
-    let dispatch_phase_id = opts.phase_id.as_deref();
-
-    // Flow emission: dispatch_start lands on disk before openclaw is
-    // even invoked, so the viewer sees the local-tier event the instant
-    // we begin. Pairs with the dispatch_complete / dispatch_error
-    // record below via session_id (the viewer's computeDispatchDurations
-    // does the start↔end pairing). Non-fatal: emission errors are
-    // ignored so a flows-dir write problem doesn't sink the dispatch.
-    //
-    // Schema 1.6 (#204) enriches the payload with runtime metadata so
-    // the viewer can render which runtime + prompt size handled the
-    // work without cross-referencing other state.
-    let dispatch_start_payload = serde_json::json!({
-        "runtime": "openclaw",
-        "prompt_chars": augmented_message.chars().count(),
-        // (#1127) The dispatch prompt text (capped) — run context the viewer
-        // renders collapsed. prompt_chars carries the full length.
-        "prompt": capped_prompt(&augmented_message),
-        "agent_id": agent_id,
-    });
-    let _ = darkmux_flow::record(build_dispatch_record_with_payload(
-        darkmux_flow::Level::Info,
-        "dispatch start",
-        &opts.role_id,
-        &resolved_session_id,
-        resolved_model.as_deref(),
-        dispatch_mission_id.as_deref(),
-        dispatch_phase_id,
-        Some(dispatch_start_payload),
-    ));
-
-    let dispatch_start_instant = std::time::Instant::now();
-
-    // 4. Invoke openclaw agent (or operator-supplied --runtime-cmd binary)
-    let mut cmd = Command::new(&opts.runtime_cmd);
-    cmd.args(["agent", "--local", "--agent", &agent_id, "--json"]);
-    cmd.args(["--session-id", &resolved_session_id]);
-    cmd.args(["--timeout", &opts.timeout_seconds.to_string()]);
-    if let Some(deliver) = &opts.deliver {
-        let (chan, target) = deliver
-            .split_once(':')
-            .ok_or_else(|| anyhow!("--deliver must be `<channel>:<target>`, got `{deliver}`"))?;
-        cmd.args(["--channel", chan, "--reply-to", target, "--deliver"]);
-    }
-    cmd.args(["--message", &augmented_message]);
-
-    let output_result = cmd
-        .output()
-        .with_context(|| format!("running `{} agent {agent_id}`", opts.runtime_cmd));
-
-    let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
-
-    // Emit the dispatch end record BEFORE propagating any error or
-    // returning Ok — emission must reflect both success and failure paths
-    // so the viewer never sees a dangling start with no terminal event.
-    let (action, level) = match &output_result {
-        Ok(o) if o.status.success() => ("dispatch complete", darkmux_flow::Level::Info),
-        _ => ("dispatch error", darkmux_flow::Level::Error),
-    };
-    // (#1042) On the error path, capture a bounded stderr excerpt at
-    // record-build time — the `stderr_text` below is computed only after the
-    // `?` on the success path, so the error record previously carried the char
-    // COUNT but never the text (you couldn't see WHY a dispatch failed).
-    let (stdout_chars, stderr_chars, exit_code, stderr_excerpt) = match &output_result {
-        Ok(o) => {
-            let excerpt = if o.status.success() {
-                None
-            } else {
-                Some(tail_excerpt(
-                    &String::from_utf8_lossy(&o.stderr),
-                    STDERR_EXCERPT_MAX,
-                ))
-            };
-            (o.stdout.len(), o.stderr.len(), o.status.code(), excerpt)
-        }
-        // A spawn failure has no process stderr; surface the spawn error itself
-        // so the record still explains why nothing ran.
-        Err(e) => (0, 0, None, Some(format!("dispatch failed to spawn: {e:#}"))),
-    };
-    let dispatch_complete_payload = serde_json::json!({
-        "runtime": "openclaw",
-        "wall_ms": wall_ms,
-        "stdout_chars": stdout_chars,
-        "stderr_chars": stderr_chars,
-        "exit_code": exit_code,
-        "result_class": if matches!(&output_result, Ok(o) if o.status.success()) {
-            "ok"
-        } else {
-            "error"
-        },
-        // (#1042) bounded stderr tail on the error path; null on success so
-        // clean records aren't bloated. Payload-additive — no FLOW_SCHEMA bump.
-        "stderr_excerpt": stderr_excerpt,
-    });
-    let _ = darkmux_flow::record(build_dispatch_record_with_payload(
-        level,
-        action,
-        &opts.role_id,
-        &resolved_session_id,
-        resolved_model.as_deref(),
-        dispatch_mission_id.as_deref(),
-        dispatch_phase_id,
-        Some(dispatch_complete_payload),
-    ));
-
-    let output = output_result?;
-
-    // 5. Post-dispatch: snapshot filesystem state at each caller-supplied
-    //    watch path. Surfaces ground-truth file presence + sizes so SIGNOFF
-    //    claims are verifiable (#89). Empty watch_paths => empty snapshot
-    //    vector; the CLI handler decides whether to default to the role's
-    //    workspace dir, so library callers (e.g. phase_cli's internal
-    //    dispatch) can opt out of the echo without ceremony.
-    let watched_state: Vec<WatchedPathState> = opts
-        .watch_paths
-        .iter()
-        .map(|p| snapshot_watched_path(p))
-        .collect();
-
-    let stdout_text = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
-
-    // 6. Persist phase output for downstream context injection (#146
-    //    Stage 1). Best-effort — failures logged to stderr but don't
-    //    fail the dispatch. The reply text comes from openclaw's JSON
-    //    envelope on stdout; we extract `payloads[0].text` if present
-    //    and fall back to the full stdout otherwise.
-    //
-    //    **Gated on dispatch success** (QA review on #157): a failed
-    //    dispatch (timeout, agent error, partial truncation) must NOT
-    //    clobber a previously-clean output. Operators re-running a
-    //    phase that already had a recorded parent output should not
-    //    have downstream phases silently start reading garbage.
-    //    Stderr already tells them what failed; they can decide whether
-    //    to hand-edit the output file or accept the prior recording.
-    if output.status.success() {
-        if let Some(phase_id) = opts.phase_id.as_deref() {
-            let reply_text =
-                extract_payload_text(&stdout_text).unwrap_or_else(|| stdout_text.clone());
-            if let Some(path) = persist_phase_output(Some(phase_id), &reply_text) {
-                eprintln!(
-                    "darkmux crew dispatch: phase `{phase_id}` output persisted to {}",
-                    path.display()
-                );
-            }
-        }
-    } else if opts.phase_id.is_some() {
-        eprintln!(
-            "darkmux crew dispatch: dispatch failed (exit {}); NOT persisting phase output. \
-             Any prior recorded output remains intact.",
-            output.status.code().unwrap_or(-1)
-        );
-    }
-
-    Ok(DispatchResult {
-        exit_code: output.status.code().unwrap_or(-1),
-        stdout: stdout_text,
-        stderr: stderr_text,
-        session_id: resolved_session_id,
-        watched_state,
-        // openclaw writes no out-of-band runtime bookkeeping dir.
-        out_dir: None,
-    })
+    crate::dispatch_internal::dispatch(opts)
 }
-
-/// Extract the `payloads[0].text` field from openclaw's JSON envelope.
-/// Returns `None` if the stdout isn't JSON or the field is missing.
-/// Used for phase-output persistence (#146 Stage 1) so the recorded
-/// file contains the agent's prose, not openclaw's outer envelope.
-///
-/// Trims leading/trailing whitespace before parsing — openclaw sometimes
-/// emits a trailing newline that would otherwise fail `serde_json::from_str`.
-///
-/// **First payload only** — if openclaw ever emits multi-payload replies
-/// (multiple `text` segments for a single turn), this returns the first.
-/// A future expansion that concats segments would be a Stage 2 concern.
-fn extract_payload_text(stdout: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-    value
-        .get("payloads")?
-        .as_array()?
-        .first()?
-        .get("text")?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
 
 /// Outcome of the `dispatch()` routing-decision branch. Extracted as a
 /// pure shape so the (Some(machine), local_machine_id) matrix is
@@ -1551,19 +659,17 @@ pub fn routing_decision(machine: Option<&str>, local_machine_id: Option<&str>) -
     }
 }
 
-
 /// Build a flow record for a dispatch lifecycle event (`dispatch start`,
 /// `dispatch complete`, `dispatch error`). All three share the same
 /// session_id so the viewer pairs start↔end into a single wall-clock
 /// arc per dispatch. `handle` is the role id (operator-readable label);
-/// `session_id` is the full openclaw session identifier; `model` is the
-/// resolved LMStudio model id (best-effort — `None` when the openclaw
-/// config can't be read or no model is pinned for this agent).
+/// `model` is the resolved LMStudio model id (best-effort — `None` on
+/// resolution failure).
 ///
 /// Legacy wrapper around `build_dispatch_record_with_payload` for the
-/// pre-#204 call shape. The two main openclaw-path emit sites now go
-/// through `_with_payload` directly to carry runtime metadata; this
-/// wrapper survives for tests + future callers that don't need payload.
+/// pre-#204 call shape. Emit sites now go through `_with_payload`
+/// directly to carry runtime metadata; this wrapper survives for tests
+/// + future callers that don't need payload.
 #[allow(dead_code)]
 pub fn build_dispatch_record(
     level: darkmux_flow::Level,
@@ -1672,381 +778,9 @@ pub fn build_telemetry_record(
     }
 }
 
-/// Best-effort resolve the LMStudio model id openclaw will route this
-/// agent's dispatches to. Tries `agents.list[<agent-id>].model` first,
-/// falls back to `agents.defaults.model.primary`. Returns `None` when:
-///   - The openclaw config can't be located or parsed.
-///   - Neither path resolves to a string.
-///
-/// Non-fatal everywhere — a missing model annotation degrades to no
-/// `model` field on the flow record, not a failed dispatch.
-///
-/// Deliberately silent on failure: surfacing "no model resolved" as
-/// stderr noise on every dispatch would conflict with the dispatcher's
-/// existing minimal output. The structural "is the model pinned?"
-/// check belongs to `darkmux doctor`'s `agents-default-model-resolves`
-/// rule (#91/#102), which runs at operator-explicit pre-flight time
-/// and is the right place for that signal. The flow record's absent
-/// `model` field is operator-visible enough on its own — it shows as
-/// missing in the viewer, which is the same signal in the right place.
-pub(crate) fn resolve_dispatch_model(agent_id: &str) -> Option<String> {
-    let path = default_openclaw_config();
-    let raw = fs::read_to_string(&path).ok()?;
-    let config: Value = serde_json::from_str(&raw).ok()?;
-
-    // Try per-agent override in agents.list[].
-    if let Some(agents) = config
-        .get("agents")
-        .and_then(|a| a.get("list"))
-        .and_then(|l| l.as_array())
-    {
-        if let Some(m) = agents
-            .iter()
-            .find(|a| a.get("id").and_then(|i| i.as_str()) == Some(agent_id))
-            .and_then(|a| a.get("model"))
-            .and_then(|m| m.as_str())
-        {
-            return Some(m.to_string());
-        }
-    }
-
-    // Fall back to defaults.model.primary.
-    config
-        .get("agents")
-        .and_then(|a| a.get("defaults"))
-        .and_then(|d| d.get("model"))
-        .and_then(|m| m.get("primary"))
-        .and_then(|p| p.as_str())
-        .map(String::from)
-}
-
-pub fn load_role_or_bail(role_id: &str) -> Result<Role> {
-    let roles = load_roles().context("loading crew role manifests")?;
-    roles
-        .into_iter()
-        .find(|r| r.id == role_id)
-        .ok_or_else(|| anyhow!("no role with id `{role_id}` found in crew manifests"))
-}
-
-fn role_prompt_or_bail(role: &Role) -> Result<String> {
-    load_role_prompt(&role.id).ok_or_else(|| {
-        anyhow!(
-            "role `{}` has no `.md` system prompt. Author one at \
-             `templates/builtin/roles/{}.md` (or override at \
-             `<crew_root>/roles/{}.md`).",
-            role.id,
-            role.id,
-            role.id
-        )
-    })
-}
-
-fn read_openclaw_config(path: &Path) -> Result<Value> {
-    if !path.exists() {
-        bail!(
-            "openclaw config not found at {}. \
-             Set DARKMUX_OPENCLAW_CONFIG to override.",
-            path.display()
-        );
-    }
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("reading openclaw config at {}", path.display()))?;
-    serde_json::from_str(&raw)
-        .with_context(|| format!("parsing openclaw config at {}", path.display()))
-}
-
-/// The three pre-flight checks from issue #55, scoped to what's verifiable
-/// pre-dispatch:
-///
-///   - inventory: the `darkmux/<role>` agent entry exists
-///   - field consistency: systemPromptOverride matches the manifest's `.md`
-///   - tool palette matches the manifest's `tool_palette`
-///   - **model pin (#182)**: `agents.list[].model` matches the active pin
-///     table's expectation for this role (closes the last silent-fallback
-///     hole — sync-time + doctor-time + dispatch-time enforcement chain)
-fn preflight_check(
-    config: &Value,
-    agent_id: &str,
-    role: &Role,
-    expected_prompt: &str,
-) -> Result<()> {
-    let agents_list = config
-        .get("agents")
-        .and_then(|a| a.get("list"))
-        .and_then(|l| l.as_array())
-        .ok_or_else(|| anyhow!("openclaw config has no `agents.list` array"))?;
-
-    let entry = agents_list
-        .iter()
-        .find(|a| a.get("id").and_then(|s| s.as_str()) == Some(agent_id))
-        .ok_or_else(|| {
-            anyhow!(
-                "agent `{agent_id}` not found in openclaw `agents.list[]`. \
-                 The crew dispatch expects darkmux-namespaced agents to exist; \
-                 run `darkmux crew sync` to create them from the manifests."
-            )
-        })?;
-
-    // System prompt match
-    let actual_prompt = entry
-        .get("systemPromptOverride")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| anyhow!("agent `{agent_id}` has no systemPromptOverride"))?;
-    if actual_prompt.trim() != expected_prompt.trim() {
-        // After #147 the effective expected prompt may include
-        // operator-identity injected from `~/.darkmux/identity.md`.
-        // Mention both sources in the error so operators who edited
-        // identity.md don't go debugging the role manifest by mistake.
-        let identity_note = if load_operator_identity().is_some() {
-            " (Effective prompt includes operator-identity from \
-             `~/.darkmux/identity.md`; if you edited that file, run \
-             sync to update.)"
-        } else {
-            ""
-        };
-        bail!(
-            "agent `{agent_id}` systemPromptOverride drifted from the role manifest's `.md`. \
-             Manifest expects {expected_chars} chars; openclaw has {actual_chars} chars. \
-             Run `darkmux crew sync` to reconcile.{identity_note}",
-            expected_chars = expected_prompt.len(),
-            actual_chars = actual_prompt.len(),
-        );
-    }
-
-    // Tool palette match (allow set)
-    let expected_allow: Vec<&str> = role.tool_palette.allow.iter().map(|s| s.as_str()).collect();
-    let actual_allow: Vec<&str> = entry
-        .get("tools")
-        .and_then(|t| t.get("allow"))
-        .and_then(|a| a.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-    let expected_sorted = {
-        let mut v = expected_allow.clone();
-        v.sort();
-        v
-    };
-    let actual_sorted = {
-        let mut v = actual_allow.clone();
-        v.sort();
-        v
-    };
-    if expected_sorted != actual_sorted {
-        bail!(
-            "agent `{agent_id}` tool palette (allow) drifted from manifest. \
-             Manifest expects {expected:?}; openclaw has {actual:?}. \
-             Run `darkmux crew sync` to reconcile.",
-            expected = expected_sorted,
-            actual = actual_sorted,
-        );
-    }
-
-    // Model pin match (#182). Sync-time enforcement (#160) writes the
-    // pinned model into `agents.list[].model`; doctor's drift check
-    // catches stale state on operator-explicit doctor run; this check
-    // is the dispatch-time enforcement that closes the last silent-
-    // fallback hole. An operator who edited <crew_root>/role-model-
-    // pins.json (or pulled a new release with updated pins) but didn't
-    // run `darkmux crew sync` would otherwise dispatch to the stale
-    // model with no signal — the whole point of #160's "loud beats
-    // quiet" principle is to make that scenario impossible.
-    //
-    // Pin-table load failures bail with the underlying error so the
-    // operator sees what went wrong with their pin file; we don't
-    // swallow that into a generic warning. Dispatch hot path = strict.
-    let pin_table = crate::pins::load_pins()
-        .context("loading pin table for dispatch-time preflight (#182)")?;
-    let expected_model = pin_table.pin_for(&role.id);
-    let actual_model = entry.get("model").and_then(|m| m.as_str());
-    if actual_model != Some(expected_model) {
-        let actual_display = actual_model.unwrap_or("(no model field)");
-        bail!(
-            "agent `{agent_id}` pinned model drifted from the pin table. \
-             Pin table expects `{expected_model}`; openclaw has `{actual_display}`. \
-             Run `darkmux crew sync` to reconcile, then re-try dispatch."
-        );
-    }
-
-    Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-//   sync
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Default)]
-pub struct SyncResult {
-    /// Agents added.
-    pub added: Vec<String>,
-    /// Agents updated (entry existed but drifted; reconciled to match manifest).
-    pub updated: Vec<String>,
-    /// Agents already in sync — no change.
-    pub unchanged: Vec<String>,
-    /// Roles skipped because they have no `.md` prompt (can't dispatch them).
-    pub skipped_no_prompt: Vec<String>,
-}
-
-#[derive(Debug)]
-pub struct SyncOpts {
-    pub dry_run: bool,
-}
-
-/// Reconcile openclaw's `agents.list[]` with the crew role manifests:
-/// for every role that has a `.md` system prompt, ensure a
-/// `darkmux/<role-id>` agent exists with the manifest-derived shape.
-pub fn sync(opts: SyncOpts) -> Result<SyncResult> {
-    let roles = load_roles().context("loading crew role manifests")?;
-    let openclaw_path = default_openclaw_config();
-    let mut config = read_openclaw_config(&openclaw_path)?;
-    let openclaw_root = openclaw_path
-        .parent()
-        .ok_or_else(|| {
-            anyhow!(
-                "openclaw config path has no parent: {}",
-                openclaw_path.display()
-            )
-        })?
-        .to_path_buf();
-
-    let mut result = SyncResult::default();
-    let mut config_modified = false;
-
-    // Ensure agents.list exists.
-    let agents = config
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("openclaw config root is not an object"))?
-        .entry("agents".to_string())
-        .or_insert_with(|| json!({}));
-    let agents_obj = agents
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("`agents` is not an object"))?;
-    let agents_list = agents_obj
-        .entry("list".to_string())
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .ok_or_else(|| anyhow!("`agents.list` is not an array"))?;
-
-    for role in &roles {
-        // Only sync roles that have an authored `.md` prompt — otherwise
-        // there's nothing to dispatch with. Checks user dir first, then
-        // bundled BUILTIN_ROLE_PROMPTS.
-        let bare_prompt = match load_role_prompt(&role.id) {
-            Some(p) => p,
-            None => {
-                result.skipped_no_prompt.push(role.id.clone());
-                continue;
-            }
-        };
-        // #147: inject operator-identity into the effective system prompt
-        // when ~/.darkmux/identity.md exists. No-op when absent.
-        let prompt = augment_prompt_with_identity(&bare_prompt);
-
-        let agent_id = agent_id_for(&role.id);
-        let (agent_dir, workspace_dir) = agent_dirs_for(&role.id, &openclaw_root);
-
-        let expected_entry = build_agent_entry(role, &prompt, &agent_dir, &workspace_dir);
-        let existing_pos = agents_list
-            .iter()
-            .position(|a| a.get("id").and_then(|s| s.as_str()) == Some(&agent_id));
-
-        match existing_pos {
-            None => {
-                if !opts.dry_run {
-                    agents_list.push(expected_entry);
-                    // Create the on-disk dirs the openclaw runtime will expect.
-                    fs::create_dir_all(&agent_dir)
-                        .with_context(|| format!("creating {}", agent_dir.display()))?;
-                    fs::create_dir_all(&workspace_dir)
-                        .with_context(|| format!("creating {}", workspace_dir.display()))?;
-                    config_modified = true;
-                }
-                result.added.push(agent_id);
-            }
-            Some(i) => {
-                if agents_list[i] != expected_entry {
-                    if !opts.dry_run {
-                        agents_list[i] = expected_entry;
-                        fs::create_dir_all(&agent_dir)
-                            .with_context(|| format!("creating {}", agent_dir.display()))?;
-                        fs::create_dir_all(&workspace_dir)
-                            .with_context(|| format!("creating {}", workspace_dir.display()))?;
-                        config_modified = true;
-                    }
-                    result.updated.push(agent_id);
-                } else {
-                    result.unchanged.push(agent_id);
-                }
-            }
-        }
-    }
-
-    if config_modified && !opts.dry_run {
-        let pretty = serde_json::to_string_pretty(&config)?;
-        fs::write(&openclaw_path, pretty + "\n")
-            .with_context(|| format!("writing {}", openclaw_path.display()))?;
-    }
-
-    Ok(result)
-}
-
-fn build_agent_entry(role: &Role, prompt: &str, agent_dir: &Path, workspace: &Path) -> Value {
-    let mut tools = Map::new();
-    tools.insert(
-        "allow".to_string(),
-        Value::Array(
-            role.tool_palette
-                .allow
-                .iter()
-                .cloned()
-                .map(Value::String)
-                .collect(),
-        ),
-    );
-    if !role.tool_palette.deny.is_empty() {
-        tools.insert(
-            "deny".to_string(),
-            Value::Array(
-                role.tool_palette
-                    .deny
-                    .iter()
-                    .cloned()
-                    .map(Value::String)
-                    .collect(),
-            ),
-        );
-    }
-
-    // Per-role model pin (#160). Reads the active pin table (user-dir
-    // override → embedded default) and emits `agents.list[].model` so
-    // openclaw routes the dispatch to the hired model regardless of
-    // what's ambient-loaded. Pin-table read failures degrade to NO
-    // model field — agent loses pin protection but the sync itself
-    // doesn't fail; doctor's pin-drift check surfaces the gap.
-    let pinned_model = crate::pins::load_pins()
-        .ok()
-        .map(|t| t.pin_for(&role.id).to_string());
-
-    let mut entry = json!({
-        "id": agent_id_for(&role.id),
-        "name": role.id,
-        "agentDir": agent_dir.display().to_string(),
-        "workspace": workspace.display().to_string(),
-        "systemPromptOverride": prompt,
-        "tools": Value::Object(tools),
-        "skills": []
-    });
-    if let Some(model) = pinned_model {
-        if let Value::Object(map) = &mut entry {
-            map.insert("model".to_string(), Value::String(model));
-        }
-    }
-    entry
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{EscalationContract, Role, ToolPalette};
     use tempfile::TempDir;
 
     // ─── #1042 stderr tail excerpt for the dispatch-error record ───────
@@ -2219,7 +953,6 @@ mod tests {
         assert_eq!(keys, vec!["decision", "target_machine"]);
     }
 
-
     // ─── routing_decision (Wave-E.7 #255) ─────────────────────────────
 
     #[test]
@@ -2271,31 +1004,6 @@ mod tests {
                 local_unknown: true,
             }
         );
-    }
-
-    fn sample_role() -> Role {
-        Role {
-            output_schema: None,
-            id: "code-reviewer".to_string(),
-            description: "test".to_string(),
-            skills: vec!["code-reviewing".to_string()],
-            tool_palette: ToolPalette {
-                allow: vec!["read".to_string(), "exec".to_string()],
-                deny: vec!["edit".to_string(), "write".to_string()],
-            },
-            escalation_contract: EscalationContract::BailWithExplanation,
-            prompt_path: None,
-            bail_after_compactions: None,
-            escalation_posture: None,
-            role_family: None,
-            feedback_templates: None,
-        }
-    }
-
-    #[test]
-    fn agent_id_uses_darkmux_namespace() {
-        assert_eq!(agent_id_for("code-reviewer"), "darkmux/code-reviewer");
-        assert_eq!(agent_id_for("analyst"), "darkmux/analyst");
     }
 
     #[test]
@@ -2426,62 +1134,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_payload_text_pulls_first_text_from_envelope() {
-        let stdout = r#"{"payloads":[{"text":"hello world","mediaUrl":null}],"meta":{}}"#;
-        assert_eq!(extract_payload_text(stdout).as_deref(), Some("hello world"));
-    }
-
-    #[test]
-    fn extract_payload_text_none_on_malformed_or_missing_fields() {
-        assert!(extract_payload_text("not json").is_none());
-        assert!(extract_payload_text("{}").is_none());
-        assert!(extract_payload_text(r#"{"payloads":[]}"#).is_none());
-        assert!(extract_payload_text(r#"{"payloads":[{"mediaUrl":null}]}"#).is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn augment_message_passes_through_when_no_phase_id() {
-        let result = augment_message_with_phase_context(None, "do the thing").unwrap();
-        assert_eq!(result, "do the thing");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn augment_message_passes_through_when_phase_is_first_in_mission() {
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-        }
-        // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
-        let mission_dir = tmp.path().join("missions").join("m");
-        let phases_dir = mission_dir.join("phases");
-        fs::create_dir_all(&phases_dir).unwrap();
-        // (#1341) Phases are strictly linear — ordered purely by
-        // `Mission.phase_ids` position. `solo-phase` is first (index 0),
-        // so it has no predecessor.
-        fs::write(
-            mission_dir.join("mission.json"),
-            r#"{"id":"m","description":"d","phase_ids":["solo-phase"],"created_ts":0}"#,
-        ).unwrap();
-        fs::write(
-            phases_dir.join("solo-phase.json"),
-            r#"{"id":"solo-phase","mission_id":"m","description":"d","status":"planned","created_ts":0}"#,
-        ).unwrap();
-
-        let result = augment_message_with_phase_context(Some("solo-phase"), "task body").unwrap();
-        assert_eq!(result, "task body");
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
-    }
-
-    #[test]
     #[serial_test::serial]
     fn resolve_mission_for_phase_returns_mission_for_known_phase() {
         // (#714) The resolution heart of the fix: a known phase id maps to
@@ -2536,355 +1188,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn augment_message_injects_predecessor_output_when_recorded() {
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-        }
-        // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
-        let mission_dir = tmp.path().join("missions").join("m");
-        let phases_dir = mission_dir.join("phases");
-        fs::create_dir_all(&phases_dir).unwrap();
-        // (#1341) `child`'s predecessor is derived from `Mission.phase_ids`
-        // order (`["parent", "child"]`), not a `depends_on` field.
-        fs::write(
-            mission_dir.join("mission.json"),
-            r#"{"id":"m","description":"d","phase_ids":["parent","child"],"created_ts":0}"#,
-        ).unwrap();
-        fs::write(
-            phases_dir.join("parent.json"),
-            r#"{"id":"parent","mission_id":"m","description":"d","status":"complete","created_ts":0}"#,
-        ).unwrap();
-        fs::write(
-            phases_dir.join("child.json"),
-            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","created_ts":0}"#,
-        ).unwrap();
-        // Parent's recorded output co-located with manifests.
-        fs::write(phases_dir.join("parent-output.txt"), "parent did X and Y").unwrap();
-
-        let result = augment_message_with_phase_context(Some("child"), "task body").unwrap();
-        assert!(result.contains("## Prior phase outputs"), "got: {result}");
-        assert!(result.contains("### parent"), "got: {result}");
-        assert!(result.contains("parent did X and Y"), "got: {result}");
-        assert!(result.contains("## Your task"), "got: {result}");
-        assert!(result.contains("task body"), "got: {result}");
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn augment_message_one_hop_only_skips_the_phase_before_the_predecessor() {
-        // (#1341) Phases are strictly linear now — `["grandparent", "parent",
-        // "child"]` — and the injection is still ONE-HOP: `child` gets
-        // `parent`'s output, never `grandparent`'s, even though
-        // `grandparent` also has recorded output.
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-        }
-        let mission_dir = tmp.path().join("missions").join("m");
-        let phases_dir = mission_dir.join("phases");
-        fs::create_dir_all(&phases_dir).unwrap();
-        fs::write(
-            mission_dir.join("mission.json"),
-            r#"{"id":"m","description":"d","phase_ids":["grandparent","parent","child"],"created_ts":0}"#,
-        ).unwrap();
-        for id in ["grandparent", "parent", "child"] {
-            fs::write(
-                phases_dir.join(format!("{id}.json")),
-                format!(r#"{{"id":"{id}","mission_id":"m","description":"d","status":"complete","created_ts":0}}"#),
-            ).unwrap();
-        }
-        fs::write(phases_dir.join("grandparent-output.txt"), "grandparent did A").unwrap();
-        fs::write(phases_dir.join("parent-output.txt"), "parent did B").unwrap();
-
-        let result = augment_message_with_phase_context(Some("child"), "child task").unwrap();
-        assert!(result.contains("### parent"), "got: {result}");
-        assert!(result.contains("parent did B"), "got: {result}");
-        assert!(!result.contains("grandparent did A"), "one-hop only: {result}");
-        assert!(result.contains("## Your task"), "got: {result}");
-        assert!(result.contains("child task"), "got: {result}");
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn augment_message_falls_back_to_bare_when_no_predecessor_output_recorded() {
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-        }
-        // Per-mission layout (#148): missions/<mission_id>/phases/<phase_id>.json
-        let mission_dir = tmp.path().join("missions").join("m");
-        let phases_dir = mission_dir.join("phases");
-        fs::create_dir_all(&phases_dir).unwrap();
-        fs::write(
-            mission_dir.join("mission.json"),
-            r#"{"id":"m","description":"d","phase_ids":["parent","child"],"created_ts":0}"#,
-        ).unwrap();
-        fs::write(
-            phases_dir.join("parent.json"),
-            r#"{"id":"parent","mission_id":"m","description":"d","status":"planned","created_ts":0}"#,
-        ).unwrap();
-        fs::write(
-            phases_dir.join("child.json"),
-            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","created_ts":0}"#,
-        ).unwrap();
-        // No parent-output.txt — dispatch proceeds with bare message.
-
-        let result = augment_message_with_phase_context(Some("child"), "task body").unwrap();
-        assert_eq!(result, "task body");
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
-    }
-
-    /// (#146 residual) `phase_context_max_chars` precedence: env (parseable) >
-    /// default; unparseable/absent → default; `0` honored (disables the cap).
-    #[test]
-    #[serial_test::serial]
-    fn phase_context_max_chars_env_precedence() {
-        let prev = std::env::var("DARKMUX_PHASE_CONTEXT_MAX_CHARS").ok();
-        unsafe { std::env::remove_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS") };
-        assert_eq!(phase_context_max_chars(), DEFAULT_PHASE_CONTEXT_MAX_CHARS, "absent → default");
-        unsafe { std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", " 1234 ") };
-        assert_eq!(phase_context_max_chars(), 1234, "env (trimmed) wins");
-        unsafe { std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", "0") };
-        assert_eq!(phase_context_max_chars(), 0, "0 honored (disables cap)");
-        unsafe { std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", "not-a-number") };
-        assert_eq!(phase_context_max_chars(), DEFAULT_PHASE_CONTEXT_MAX_CHARS, "unparseable → default");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", v),
-                None => std::env::remove_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS"),
-            }
-        }
-    }
-
-    /// (#146 residual) The per-parent output cap: under the cap → unchanged;
-    /// over → char-safe head + marker; `0` → no cap.
-    #[test]
-    fn cap_parent_output_truncates_and_marks() {
-        assert_eq!(cap_parent_output("short", 100), "short", "under cap → unchanged");
-        let long = "x".repeat(500);
-        let capped = cap_parent_output(&long, 100);
-        assert!(capped.starts_with(&"x".repeat(100)), "keeps the head");
-        assert!(capped.contains("truncated at 100 chars"), "marks the truncation: {capped}");
-        assert!(capped.chars().count() < 500, "actually shorter than the input");
-        assert_eq!(cap_parent_output(&long, 0), long, "0 disables the cap");
-        // Char-safe: a multi-byte boundary must not panic / corrupt.
-        let multi = "🦀".repeat(50);
-        let c = cap_parent_output(&multi, 10);
-        assert!(c.starts_with(&"🦀".repeat(10)) && !c.contains('\u{FFFD}'), "no mid-codepoint split");
-    }
-
-    /// (#146 residual) End-to-end: a long parent output is truncated in the
-    /// augmented brief, honoring `DARKMUX_PHASE_CONTEXT_MAX_CHARS`. `#[serial]`
-    /// — mutates DARKMUX_CREW_DIR + the cap env.
-    #[test]
-    #[serial_test::serial]
-    fn augment_message_caps_long_parent_output() {
-        let tmp = TempDir::new().unwrap();
-        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
-        let prev_cap = std::env::var("DARKMUX_PHASE_CONTEXT_MAX_CHARS").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-            std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", "50");
-        }
-        let mission_dir = tmp.path().join("missions").join("m");
-        let phases_dir = mission_dir.join("phases");
-        fs::create_dir_all(&phases_dir).unwrap();
-        fs::write(
-            mission_dir.join("mission.json"),
-            r#"{"id":"m","description":"d","phase_ids":["parent","child"],"created_ts":0}"#,
-        ).unwrap();
-        fs::write(
-            phases_dir.join("parent.json"),
-            r#"{"id":"parent","mission_id":"m","description":"d","status":"complete","created_ts":0}"#,
-        ).unwrap();
-        fs::write(
-            phases_dir.join("child.json"),
-            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","created_ts":0}"#,
-        ).unwrap();
-        let unique_tail = "TAIL_MARKER_THAT_MUST_NOT_SURVIVE";
-        fs::write(
-            phases_dir.join("parent-output.txt"),
-            format!("{}{unique_tail}", "h".repeat(200)),
-        )
-        .unwrap();
-
-        let result = augment_message_with_phase_context(Some("child"), "task body").unwrap();
-        assert!(result.contains("truncated at 50 chars"), "cap marker present: {result}");
-        assert!(!result.contains(unique_tail), "the over-cap tail must be dropped: {result}");
-        assert!(result.contains("task body"), "the task still rides along");
-
-        unsafe {
-            match prev_crew {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-            match prev_cap {
-                Some(v) => std::env::set_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS", v),
-                None => std::env::remove_var("DARKMUX_PHASE_CONTEXT_MAX_CHARS"),
-            }
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn persist_phase_output_writes_text_to_canonical_path() {
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-        }
-
-        // Seed phase manifest so load_phase_by_id can resolve mission_id (#148).
-        let phases_dir = tmp.path().join("missions").join("m").join("phases");
-        fs::create_dir_all(&phases_dir).unwrap();
-        fs::write(
-            phases_dir.join("my-phase.json"),
-            r#"{"id":"my-phase","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
-        ).unwrap();
-
-        let path = persist_phase_output(Some("my-phase"), "agent reply text").unwrap();
-        let content = fs::read_to_string(&path).unwrap();
-        assert_eq!(content, "agent reply text");
-        // New layout: missions/<mission_id>/phases/<phase_id>-output.txt
-        assert!(
-            path.ends_with("missions/m/phases/my-phase-output.txt"),
-            "got: {}",
-            path.display()
-        );
-
-        // No-op for None phase_id.
-        assert!(persist_phase_output(None, "ignored").is_none());
-        // No-op for empty reply.
-        assert!(persist_phase_output(Some("my-phase"), "").is_none());
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
-    }
-
-    #[test]
-    fn apply_workdir_override_noop_when_workdir_is_none() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace-darkmux-coder");
-        // No --workdir; function should be a no-op + workspace stays empty.
-        let outcome = apply_workdir_override(None, &workspace).unwrap();
-        assert_eq!(outcome, WorkdirOutcome::NoChange);
-        // Workspace was NOT auto-created either — no scope = no side effect.
-        assert!(!workspace.exists());
-    }
-
-    #[test]
-    fn apply_workdir_override_creates_symlink_to_existing_dir() {
-        let tmp = TempDir::new().unwrap();
-        let project = tmp.path().join("my-project");
-        fs::create_dir(&project).unwrap();
-        let workspace = tmp.path().join("workspace-darkmux-coder");
-
-        let outcome = apply_workdir_override(Some(&project), &workspace).unwrap();
-        assert!(matches!(
-            outcome,
-            WorkdirOutcome::Applied {
-                previous_target: None
-            }
-        ));
-
-        let link = workspace.join("repo");
-        assert!(link.is_symlink());
-        let target = fs::read_link(&link).unwrap();
-        // Symlink target is canonicalized to absolute.
-        assert_eq!(target, project.canonicalize().unwrap());
-    }
-
-    #[test]
-    fn apply_workdir_override_replaces_existing_symlink_and_reports_prev() {
-        let tmp = TempDir::new().unwrap();
-        let old_project = tmp.path().join("old-project");
-        let new_project = tmp.path().join("new-project");
-        fs::create_dir(&old_project).unwrap();
-        fs::create_dir(&new_project).unwrap();
-        let workspace = tmp.path().join("workspace-darkmux-coder");
-        fs::create_dir(&workspace).unwrap();
-        std::os::unix::fs::symlink(&old_project, workspace.join("repo")).unwrap();
-
-        let outcome = apply_workdir_override(Some(&new_project), &workspace).unwrap();
-        match outcome {
-            WorkdirOutcome::Applied { previous_target } => {
-                let prev = previous_target.expect("previous target should be captured");
-                assert!(prev.ends_with("old-project"));
-            }
-            other => panic!("unexpected outcome: {other:?}"),
-        }
-        let link_target = fs::read_link(workspace.join("repo")).unwrap();
-        assert_eq!(link_target, new_project.canonicalize().unwrap());
-    }
-
-    #[test]
-    fn apply_workdir_override_refuses_when_workdir_does_not_exist() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace-darkmux-coder");
-        let missing = tmp.path().join("does-not-exist");
-
-        let err = apply_workdir_override(Some(&missing), &workspace).unwrap_err();
-        let s = format!("{err:#}");
-        assert!(
-            s.contains("does not exist") || s.contains("not readable"),
-            "got: {s}"
-        );
-    }
-
-    #[test]
-    fn apply_workdir_override_refuses_when_repo_path_is_real_dir() {
-        // If the workspace already has a REAL `repo` dir (not a symlink),
-        // refuse to clobber. Operator-sovereign: don't trash files we
-        // didn't put there.
-        let tmp = TempDir::new().unwrap();
-        let project = tmp.path().join("my-project");
-        fs::create_dir(&project).unwrap();
-        let workspace = tmp.path().join("workspace-darkmux-coder");
-        fs::create_dir_all(&workspace).unwrap();
-        let real_repo = workspace.join("repo");
-        fs::create_dir(&real_repo).unwrap();
-        fs::write(real_repo.join("OPERATOR_FILE.txt"), "do not clobber").unwrap();
-
-        let err = apply_workdir_override(Some(&project), &workspace).unwrap_err();
-        let s = format!("{err:#}");
-        assert!(
-            s.contains("not a symlink") || s.contains("refusing to clobber"),
-            "got: {s}"
-        );
-        // And the operator file is intact.
-        assert!(real_repo.join("OPERATOR_FILE.txt").exists());
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn licensed_adjacent_ack_bails_when_no_tty_and_no_ack_file() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_ACK_DIR").ok();
@@ -2906,188 +1209,6 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_ACK_DIR"),
             }
         }
-    }
-
-    #[test]
-    fn agent_dirs_use_nested_namespace_for_agentdir() {
-        let root = Path::new("/tmp/.openclaw");
-        let (agent_dir, workspace) = agent_dirs_for("code-reviewer", root);
-        assert_eq!(
-            agent_dir,
-            Path::new("/tmp/.openclaw/agents/darkmux/code-reviewer/agent")
-        );
-        assert_eq!(
-            workspace,
-            Path::new("/tmp/.openclaw/workspace-darkmux-code-reviewer")
-        );
-    }
-
-    #[test]
-    fn build_agent_entry_includes_tools_and_prompt() {
-        let role = sample_role();
-        let agent_dir = PathBuf::from("/tmp/agent");
-        let workspace = PathBuf::from("/tmp/ws");
-        let entry = build_agent_entry(&role, "PROMPT", &agent_dir, &workspace);
-        assert_eq!(entry["id"], "darkmux/code-reviewer");
-        assert_eq!(entry["systemPromptOverride"], "PROMPT");
-        assert_eq!(entry["tools"]["allow"], json!(["read", "exec"]));
-        assert_eq!(entry["tools"]["deny"], json!(["edit", "write"]));
-        assert_eq!(entry["skills"], json!([]));
-    }
-
-    #[test]
-    fn build_agent_entry_omits_empty_deny() {
-        let mut role = sample_role();
-        role.tool_palette.deny.clear();
-        let entry = build_agent_entry(&role, "PROMPT", Path::new("/x"), Path::new("/y"));
-        // No "deny" key when the list is empty.
-        assert!(entry["tools"].get("deny").is_none());
-    }
-
-    #[test]
-    fn preflight_passes_when_config_matches() {
-        // sample_role's id is "code-reviewer" which the shipped pin
-        // table maps to `darkmux:qwen3.6-35b-a3b-turboquant-mlx` — the
-        // config below has to include that model field for the new
-        // dispatch-time pin check (#182) to pass.
-        let role = sample_role();
-        let config = json!({
-            "agents": {
-                "list": [
-                    {
-                        "id": "darkmux/code-reviewer",
-                        "systemPromptOverride": "EXPECTED",
-                        "model": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
-                        "tools": {"allow": ["read", "exec"], "deny": ["edit", "write"]}
-                    }
-                ]
-            }
-        });
-        assert!(preflight_check(&config, "darkmux/code-reviewer", &role, "EXPECTED").is_ok());
-    }
-
-    #[test]
-    fn preflight_fails_when_pinned_model_drifts() {
-        // sync-time + doctor-time + dispatch-time enforcement chain.
-        // Operator edits pin file, doesn't run sync, then dispatches —
-        // dispatch must bail loudly with the fix-it pointer rather
-        // than silently routing to the stale model. (#182)
-        let role = sample_role();
-        let config = json!({
-            "agents": {
-                "list": [
-                    {
-                        "id": "darkmux/code-reviewer",
-                        "systemPromptOverride": "EXPECTED",
-                        "model": "darkmux:something-stale",
-                        "tools": {"allow": ["read", "exec"], "deny": ["edit", "write"]}
-                    }
-                ]
-            }
-        });
-        let err = preflight_check(&config, "darkmux/code-reviewer", &role, "EXPECTED").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("pinned model drifted"), "got: {msg}");
-        assert!(msg.contains("darkmux:something-stale"), "got: {msg}");
-        assert!(msg.contains("darkmux crew sync"), "got: {msg}");
-    }
-
-    #[test]
-    fn preflight_fails_when_model_field_absent() {
-        // Pre-#160 openclaw.json files written by `darkmux crew sync`
-        // had no `model` field at all (the field was added in #160).
-        // An operator who upgraded darkmux but didn't re-sync would
-        // hit this case — should bail loudly with the same fix-it.
-        let role = sample_role();
-        let config = json!({
-            "agents": {
-                "list": [
-                    {
-                        "id": "darkmux/code-reviewer",
-                        "systemPromptOverride": "EXPECTED",
-                        "tools": {"allow": ["read", "exec"], "deny": ["edit", "write"]}
-                    }
-                ]
-            }
-        });
-        let err = preflight_check(&config, "darkmux/code-reviewer", &role, "EXPECTED").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("pinned model drifted"), "got: {msg}");
-        assert!(msg.contains("(no model field)"), "got: {msg}");
-        assert!(msg.contains("darkmux crew sync"), "got: {msg}");
-    }
-
-    #[test]
-    fn preflight_fails_when_agent_missing() {
-        let role = sample_role();
-        let config = json!({"agents": {"list": []}});
-        let err = preflight_check(&config, "darkmux/code-reviewer", &role, "EXPECTED").unwrap_err();
-        assert!(err.to_string().contains("not found in openclaw"));
-    }
-
-    #[test]
-    fn preflight_fails_when_prompt_drifts() {
-        let role = sample_role();
-        let config = json!({
-            "agents": {
-                "list": [
-                    {
-                        "id": "darkmux/code-reviewer",
-                        "systemPromptOverride": "STALE",
-                        "tools": {"allow": ["read", "exec"]}
-                    }
-                ]
-            }
-        });
-        let err = preflight_check(&config, "darkmux/code-reviewer", &role, "EXPECTED").unwrap_err();
-        assert!(err.to_string().contains("systemPromptOverride drifted"));
-    }
-
-    #[test]
-    fn preflight_fails_when_tool_palette_drifts() {
-        let role = sample_role();
-        let config = json!({
-            "agents": {
-                "list": [
-                    {
-                        "id": "darkmux/code-reviewer",
-                        "systemPromptOverride": "EXPECTED",
-                        "tools": {"allow": ["read", "edit"]}
-                    }
-                ]
-            }
-        });
-        let err = preflight_check(&config, "darkmux/code-reviewer", &role, "EXPECTED").unwrap_err();
-        assert!(err.to_string().contains("tool palette"));
-    }
-
-    #[test]
-    fn sync_adds_missing_agent_to_empty_config() {
-        let tmp = TempDir::new().unwrap();
-        let openclaw_path = tmp.path().join("openclaw.json");
-        fs::write(&openclaw_path, "{}").unwrap();
-
-        // Test the build_agent_entry logic directly — sync() itself depends
-        // on load_roles() which reads on-disk manifests; we test the
-        // single-role write path here, then exercise the integration path
-        // via a CLI test (in tests/cli.rs).
-        let role = sample_role();
-        let mut config: Value =
-            serde_json::from_str(&fs::read_to_string(&openclaw_path).unwrap()).unwrap();
-        let agents = config
-            .as_object_mut()
-            .unwrap()
-            .entry("agents".to_string())
-            .or_insert_with(|| json!({}));
-        let list = agents
-            .as_object_mut()
-            .unwrap()
-            .entry("list".to_string())
-            .or_insert_with(|| json!([]));
-        let entry = build_agent_entry(&role, "PROMPT", Path::new("/x"), Path::new("/y"));
-        list.as_array_mut().unwrap().push(entry);
-
-        assert_eq!(config["agents"]["list"][0]["id"], "darkmux/code-reviewer");
     }
 
     // ─── #88: fresh session id per dispatch ────────────────────────────────
@@ -3138,143 +1259,6 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.contains("-coder-"));
         assert!(b.contains("-scribe-"));
-    }
-
-    // ─── #89: watched-state snapshot ───────────────────────────────────────
-    // (std::io::Write is already imported at the top of the module.)
-
-    fn write_file(path: &Path, contents: &[u8]) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        let mut f = fs::File::create(path).unwrap();
-        f.write_all(contents).unwrap();
-    }
-
-    #[test]
-    fn snapshot_reports_unreachable_for_missing_path() {
-        let s = snapshot_watched_path(Path::new("/no/such/path/anywhere"));
-        assert!(s.unreachable);
-        assert!(s.files.is_empty());
-    }
-
-    #[test]
-    fn snapshot_walks_top_level_files() {
-        let tmp = TempDir::new().unwrap();
-        write_file(&tmp.path().join("a.txt"), b"AAAAA"); // 5 bytes
-        write_file(&tmp.path().join("b.txt"), b"BB"); // 2 bytes
-        write_file(&tmp.path().join("c.txt"), b"CCCCCCCCCC"); // 10 bytes
-
-        let s = snapshot_watched_path(tmp.path());
-        assert!(!s.unreachable);
-        assert_eq!(s.files.len(), 3);
-        // Sort order: largest first.
-        assert_eq!(s.files[0].size, 10);
-        assert_eq!(s.files[1].size, 5);
-        assert_eq!(s.files[2].size, 2);
-    }
-
-    #[test]
-    fn snapshot_walks_one_level_into_subdirs() {
-        let tmp = TempDir::new().unwrap();
-        write_file(&tmp.path().join("top.txt"), b"top");
-        write_file(&tmp.path().join("sub").join("nested.txt"), b"nested");
-        write_file(
-            &tmp.path().join("sub").join("deeper").join("deep.txt"),
-            b"too-deep",
-        );
-
-        let s = snapshot_watched_path(tmp.path());
-        let names: std::collections::HashSet<String> = s
-            .files
-            .iter()
-            .map(|f| f.path.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
-        assert!(names.contains("top.txt"));
-        assert!(names.contains("nested.txt"));
-        // Recursion stops at one level deep — `deep.txt` is two levels in.
-        assert!(
-            !names.contains("deep.txt"),
-            "should not recurse beyond one level"
-        );
-    }
-
-    #[test]
-    fn snapshot_excludes_openclaw_noise() {
-        let tmp = TempDir::new().unwrap();
-        // Real output file the operator cares about.
-        write_file(&tmp.path().join("output.md"), b"real content");
-        // Openclaw bookkeeping that changes every dispatch — should NOT
-        // appear in the operator-facing summary.
-        write_file(
-            &tmp.path().join("abc-123.trajectory.jsonl"),
-            b"{\"type\":\"event\"}",
-        );
-        write_file(&tmp.path().join("BOOTSTRAP.md"), b"workspace bootstrap");
-        write_file(&tmp.path().join("HEARTBEAT.md"), b"heartbeat");
-        write_file(&tmp.path().join("AGENTS.md"), b"agents list");
-
-        let s = snapshot_watched_path(tmp.path());
-        let names: Vec<String> = s
-            .files
-            .iter()
-            .map(|f| f.path.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
-        assert_eq!(names, vec!["output.md".to_string()]);
-    }
-
-    #[test]
-    fn snapshot_skips_symlinked_subdirs() {
-        let tmp = TempDir::new().unwrap();
-        let real = TempDir::new().unwrap();
-        // Real outside content — a symlinked subdir to it should NOT walk.
-        write_file(&real.path().join("should-not-appear.txt"), b"shadow");
-        // Symlink from `tmp/repo` -> `real.path()`. Skips into it would be
-        // unbounded across the operator's actual source tree.
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(real.path(), tmp.path().join("repo")).unwrap();
-        // A regular top-level file in tmp — should appear.
-        write_file(&tmp.path().join("plain.txt"), b"x");
-
-        let s = snapshot_watched_path(tmp.path());
-        let names: Vec<String> = s
-            .files
-            .iter()
-            .map(|f| f.path.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
-        assert!(names.contains(&"plain.txt".to_string()));
-        assert!(
-            !names.contains(&"should-not-appear.txt".to_string()),
-            "must not descend into symlinked subdir; got {names:?}"
-        );
-    }
-
-    #[test]
-    fn is_openclaw_noise_classifies_known_files() {
-        // Workspace bootstrap markdowns
-        assert!(is_openclaw_noise(Path::new("/x/AGENTS.md")));
-        assert!(is_openclaw_noise(Path::new("/x/BOOTSTRAP.md")));
-        assert!(is_openclaw_noise(Path::new("/x/HEARTBEAT.md")));
-        assert!(is_openclaw_noise(Path::new("/x/USER.md")));
-        // Session bookkeeping
-        assert!(is_openclaw_noise(Path::new("/x/abc-123.trajectory.jsonl")));
-        assert!(is_openclaw_noise(Path::new("/x/sessions.json")));
-        // Real operator content stays
-        assert!(!is_openclaw_noise(Path::new("/x/output.md")));
-        assert!(!is_openclaw_noise(Path::new("/x/decisions.md")));
-        assert!(!is_openclaw_noise(Path::new("/x/deck-revised.pptx")));
-        assert!(!is_openclaw_noise(Path::new("/x/2026-05-14.jsonl"))); // flow records aren't noise
-    }
-
-    #[test]
-    fn default_workspace_for_role_uses_namespace_convention() {
-        let p = default_workspace_for_role("code-reviewer");
-        // Path ends with the expected segment regardless of $HOME's shape.
-        let s = p.to_string_lossy();
-        assert!(
-            s.ends_with(".openclaw/workspace-darkmux-code-reviewer"),
-            "unexpected workspace path: {s}",
-        );
     }
 
     #[test]
@@ -3429,5 +1413,4 @@ mod tests {
         // too (an erroring dispatch still has a wall-clock arc).
         assert_eq!(ok.session_id, err.session_id);
     }
-
 }

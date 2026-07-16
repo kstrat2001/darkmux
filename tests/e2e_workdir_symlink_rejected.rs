@@ -2,11 +2,11 @@
 //! dispatches MUST reject operator-named symlink workdirs at the
 //! queue boundary AND the runtime boundary.
 //!
-//! Pre-fix (Wave-E.1 main): the openclaw path's `apply_workdir_override`
-//! followed symlinks silently — a `--workdir /tmp/sym-to-etc` would
-//! point the openclaw workspace at the symlink target. The
-//! internal-runtime path had the guard since #232 but they were
-//! duplicate implementations.
+//! Pre-fix (Wave-E.1 main): the (since-removed, #1405) openclaw shell-out
+//! path's `apply_workdir_override` followed symlinks silently — a
+//! `--workdir /tmp/sym-to-etc` would point the openclaw workspace at the
+//! symlink target. The internal-runtime path had the guard since #232 but
+//! they were duplicate implementations.
 //!
 //! Post-fix (this PR): shared `crate::workdir::validate_workdir`
 //! enforces the symlink check + canonicalize + is_dir uniformly
@@ -14,7 +14,7 @@
 //! validation in `handle_claimed_job`.
 //!
 //! Test shape: spawn a single-node fleet (no Redis needed since we're
-//! exercising the LOCAL openclaw-path validation here), create a
+//! exercising the LOCAL runtime-boundary validation here), create a
 //! tempdir + a symlink pointing to it, invoke
 //! `darkmux crew dispatch coder --workdir <symlink> --message hi`,
 //! assert non-zero exit + the symlink-reject error.
@@ -50,11 +50,10 @@ fn crew_dispatch_rejects_symlink_workdir() {
     std::os::unix::fs::symlink(&target, &sym).unwrap();
 
     // Run `darkmux crew dispatch coder --workdir <sym>` from node-a's
-    // env. We use --skip-preflight to bypass any other-state checks
-    // that the test env doesn't have set up (the openclaw config is a
-    // stub). The workdir validation runs in `apply_workdir_override`,
-    // which is BEFORE the openclaw subprocess spawns — so we hit our
-    // validation regardless of whether openclaw is installed.
+    // env. We use --skip-preflight to bypass the Docker preflight check
+    // (this test doesn't need a real container run — the workdir
+    // validation happens before `docker run` is ever invoked, so it
+    // fires regardless of Docker availability).
     let node = harness.node("node-a").unwrap();
     let output = node
         .cmd()

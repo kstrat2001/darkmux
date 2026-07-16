@@ -557,11 +557,13 @@ pub(crate) struct SignoffParse {
     findings: Vec<ReviewFinding>,
 }
 
-/// Unwrap the openclaw JSON envelope from `crew::dispatch` stdout to the
-/// inner assistant text. The envelope shape is
+/// Unwrap a legacy JSON envelope shape from `crew::dispatch` stdout to the
+/// inner assistant text, for reading historical run artifacts predating the
+/// internal runtime (#1405). The envelope shape is
 /// `{"payloads": [{"text": "..."}], ...}`; we concatenate every payload's
 /// `text` field with newlines. Falls back to the raw input when it doesn't
-/// parse as JSON (so unit tests passing literal SIGNOFF strings work).
+/// parse as JSON — the common case today, since the internal runtime's
+/// plain-text dispatch mode (what `phase review` uses) returns unwrapped text.
 pub fn unwrap_envelope_text(raw: &str) -> String {
     let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
         return raw.to_string();
@@ -860,23 +862,14 @@ pub(crate) fn phase_review_output_at(
         // Phase review doesn't ask the reviewer to write files — it
         // parses the SIGNOFF text from the dispatch's stdout. Skip the
         // watched-state echo to keep phase review output focused.
-        watch_paths: Vec::new(),
         // Phase review reads operator-supplied diffs; no scope override.
         workdir: None,
         // Phase review is a code-reviewer dispatch on the phase's diff,
         // not on the phase's own work. No cross-phase context needed.
         phase_id: None,
         // Phase review dispatches through the internal Docker-bounded
-        // runtime — same default as `darkmux crew dispatch` (#309).
-        // Operators who prefer openclaw can run the underlying
-        // `darkmux crew dispatch code-reviewer --runtime openclaw` by
-        // hand; phase review itself goes through DM's substrate so
-        // openclaw is genuinely optional (Beat 36).
+        // runtime — the only dispatch path (#309, #1405).
         runtime: crate::crew::dispatch::Runtime::Internal,
-        // Phase review pins Runtime::Internal; runtime_cmd is unused
-        // by the internal path. Default to "openclaw" for parity with
-        // the rest of the codebase post-Phase-E.
-        runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
         // Phase dispatch defaults to runtime's built-in compaction;
@@ -924,7 +917,8 @@ pub(crate) fn phase_review_output_at(
         }
     };
 
-    // Unwrap the openclaw JSON envelope FIRST — the SIGNOFF text lives inside
+    // Unwrap the legacy envelope shape FIRST (in case this is a historical
+    // dispatch reply) — the SIGNOFF text would otherwise live inside
     // .payloads[].text, escaped. Without unwrapping, parse_signoff sees JSON
     // keys instead of the actual newline-separated SIGNOFF lines and finds
     // zero matches. Recursive bug from phase A's own dogfood. See

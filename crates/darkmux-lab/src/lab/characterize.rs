@@ -35,9 +35,6 @@ pub fn characterize(opts: &CharacterizeOpts) -> Result<CharacterizeReport> {
         // characterize() is an internal utility operation — uses default
         // runtime (internal, post-Phase-D).
         runtime: darkmux_crew::dispatch::Runtime::Internal,
-        // runtime_cmd is unused by the internal path; "openclaw" for
-        // codebase parity (Phase-E).
-        runtime_cmd: "openclaw".to_string(),
         // characterize() is not a loop-variation surface (#986).
         loop_override: None,
         // characterize() never injects engagement-context (#1004).

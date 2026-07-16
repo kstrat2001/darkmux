@@ -100,11 +100,9 @@ const KEYS: &[(&str, Ty)] = &[
     ("dirs.skills", Ty::Str),
     ("dirs.crew", Ty::Str),
     ("dirs.templates", Ty::Str),
-    ("dirs.runtime_agents", Ty::Str),
     ("dirs.ack", Ty::Str),
     ("dirs.identity", Ty::Str),
     ("dirs.fleet_file", Ty::Str),
-    ("dirs.openclaw_config", Ty::Str),
 ];
 
 /// Keys that are deliberately NOT config — a secret that lives in the macOS

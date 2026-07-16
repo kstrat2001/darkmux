@@ -24,8 +24,7 @@
 //! answer (nonce match) + the trajectory JSONL (tool names, ok flags, cycle /
 //! promotion events — the trajectory records shape, not argument payloads, so
 //! argument quality is outcome-inferred). Rows land in scores.json (#1198).
-//! No runtime changes; internal runtime only (the openclaw shell-out path has
-//! no comparable trajectory contract).
+//! No runtime changes; internal runtime only.
 
 use crate::lab::review_bench::envelope_meta;
 use crate::lab::scores;
@@ -33,7 +32,7 @@ use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
 };
 use darkmux_types::Profile;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -698,17 +697,13 @@ impl WorkloadProvider for ToolBenchProvider {
         profile: &Profile,
         profile_name: &str,
         runtime: darkmux_crew::dispatch::Runtime,
-        _runtime_cmd: &str,
         config_path: Option<&str>,
         _loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
     ) -> Result<RunResult> {
-        if runtime != darkmux_crew::dispatch::Runtime::Internal {
-            bail!(
-                "tool-bench requires the internal runtime — its provenance scoring reads \
-                 the internal trajectory contract (tool.completed ok-flags, cycle events). \
-                 Drop `--runtime openclaw` for this workload."
-            );
-        }
+        // `Runtime` has a single variant post-#1405 (the legacy `openclaw`
+        // shell-out runtime, which tool-bench's provenance scoring never
+        // supported, was removed).
+        let darkmux_crew::dispatch::Runtime::Internal = runtime;
         let wl = &loaded.manifest.workload;
         let extras_u64 = |key: &str| wl.extras.get(key).and_then(|v| v.as_u64());
         let trials_per_task = extras_u64("trials").unwrap_or(1).clamp(1, 20) as u32;
@@ -1026,11 +1021,9 @@ fn dispatch_task(
         timeout_seconds: timeout,
         skip_preflight: false,
         json: true,
-        watch_paths: Vec::new(),
         workdir: Some(workdir),
         phase_id: None,
         runtime: Runtime::Internal,
-        runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
         compaction,

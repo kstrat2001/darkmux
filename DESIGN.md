@@ -44,7 +44,7 @@ Choosing which local model fills a role isn't preference, it's a [documented hea
 
 ### The internal runtime — owning the loop
 
-Early dispatch shelled out to an external agent runtime. darkmux now ships its **own** container-bounded runtime by default: a Rust agent loop in a per-dispatch Docker container. Owning the loop is what makes everything downstream possible: kernel-enforced workspace isolation, a trajectory format darkmux fully controls, and telemetry emitted straight into the flow stream rather than scraped back out of someone else's logs. The external path stays first-class (`--runtime openclaw`) for operators already wired into it (see [Relationship to openclaw](#relationship-to-openclaw)). The filter for what the internal runtime *adds* is [workflow-fit, not feature-parity](#scope-of-the-internal-runtime-workflow-fit-not-feature-parity).
+Early dispatch shelled out to an external agent runtime (openclaw). darkmux now ships its **own** container-bounded runtime: a Rust agent loop in a per-dispatch Docker container. Owning the loop is what makes everything downstream possible: kernel-enforced workspace isolation, a trajectory format darkmux fully controls, and telemetry emitted straight into the flow stream rather than scraped back out of someone else's logs. The openclaw shell-out path stayed first-class for a while as an opt-in alternative, but was removed on the 2.0 track ([#1405](https://github.com/kstrat2001/darkmux/issues/1405)) to keep the build and test surface small — the internal runtime is now the only dispatch path. The filter for what the internal runtime *adds* is [workflow-fit, not feature-parity](#scope-of-the-internal-runtime-workflow-fit-not-feature-parity) — a principle that outlived the comparison it was coined for.
 
 ### The dispatch-to-PR loop — the defining capability
 
@@ -105,31 +105,15 @@ Single-operator multi-machine is the design target. The operator owns a couple o
 - Not a prompt router across cloud providers (LiteLLM has that covered, and it's cloud-oriented).
 - Not *designed* for multi-tenant deployment. **darkmux is single-operator, multi-machine.** A hobbyist or individual engineer's "few Macs joined over a mesh VPN" is the natural deployment shape. The trust boundary is the operator-controlled tailnet, not enforcement in darkmux's code: `DARKMUX_REDIS_URL` carries no auth beyond what the underlying mesh + Redis ACLs already provide; `DARKMUX_ORCHESTRATOR` and `DARKMUX_MACHINE_ID` are operator-asserted provenance, not authenticated identity; cross-machine state on the shared substrate assumes all participants are the same operator. Fork-friendly if multi-tenant matters to you: the substrate is a reasonable starting point, and the missing pieces (auth, ACLs, fairness across distrusting users) are well-trodden elsewhere.
 
-## Relationship to openclaw
+## History: the openclaw shell-out path (removed in 2.0)
 
-**darkmux works two ways. Pick whichever matches your setup, switchable per-dispatch:**
+Through the 0.x line, darkmux ran dispatches through either its own internal container-bounded runtime (the default) or an opt-in shell-out to a separately-installed openclaw process (`--runtime openclaw`), with a `darkmux crew sync` verb keeping openclaw's `agents.list[]` aligned with darkmux's role manifests. The two paths were deliberately schema-isolated — darkmux never translated its profile fields into openclaw's config shape, and vice versa — so an upstream openclaw schema change had zero impact on darkmux.
 
-- **Standalone** (default): with just Docker + LMStudio, darkmux runs dispatches through its built-in internal runtime, an in-house Rust agent loop in a per-dispatch container. No external runtime to install or configure. This is what `darkmux crew dispatch` and `darkmux lab run` use out of the box.
-- **With your existing openclaw**: if openclaw is already in your stack, darkmux dispatches through it via `--runtime openclaw`. The agent runs as a host process under openclaw's normal session/agent model, with no translation layer and no "darkmux mode" inside openclaw. Pre-flight sync (`darkmux crew sync`) keeps openclaw's `agents.list[]` aligned with the darkmux role manifests; otherwise the integration is transparent.
+The openclaw path was removed on the 2.0 track ([#1405](https://github.com/kstrat2001/darkmux/issues/1405), operator decision on [#1386](https://github.com/kstrat2001/darkmux/issues/1386) theme 5) to keep the build and test surface small: the internal runtime is now the only dispatch path, and the schema-isolation doctrine below continues to apply to it on its own terms.
 
-**darkmux is not a replacement for openclaw.** The standalone path exists for fresh operators who shouldn't need to install a second tool to get started. The openclaw path exists so operators with openclaw already wired in keep their workflow: existing sessions, channel routing, custom agents, and the openclaw-specific tools the internal runtime doesn't ship. Both paths are first-class; the choice is per-dispatch, not a one-time install decision.
+### Scope of the internal runtime: workflow-fit, not feature creep
 
-The two runtimes overlap on the basic shape (model + system prompt + tools + chat loop → final reply + trajectory). They diverge on the surrounding concerns:
-
-| Aspect | Internal runtime | OpenClaw |
-|---|---|---|
-| Install footprint | Docker image (~150 MB) | openclaw binary + `~/.openclaw/openclaw.json` |
-| Workspace isolation | per-dispatch container (kernel-enforced) | host process + symlink fences |
-| Session model | per-dispatch tempdir; cross-dispatch state is file-mediated (phase-as-contract) | persistent sessions at `~/.openclaw/agents/<id>/sessions/` |
-| Agent registry | role manifests under `templates/builtin/roles/` (re-read every dispatch) | `agents.list[]` in `openclaw.json` (synced via `darkmux crew sync`) |
-| Tool surface | `read`, `edit`, `write`, `search`, `bash` | broader (adds `update_plan`, `process`, background lifecycle) |
-| Reach for it when | new install; out-of-box dispatching; phase-as-contract workflows | already openclaw-wired; want session persistence; need `update_plan` / `process` |
-
-The internal runtime has stricter isolation and a tighter feature surface scoped to darkmux's specific workflow needs. Openclaw has the broader feature surface and the mature ecosystem an existing operator may already depend on.
-
-### Scope of the internal runtime: workflow-fit, not feature-parity
-
-When deciding what to add to the internal runtime, the filter is **workflow-fit**, not feature-parity with openclaw. darkmux is shaped by three load-bearing decisions:
+When deciding what to add to the internal runtime, the filter is **workflow-fit** — does the feature serve darkmux's own workflow, not "does some other agent runtime have it." darkmux is shaped by three load-bearing decisions:
 
 - **Mission-as-contract.** A phase is a bounded unit of work with explicit inputs (prior phase outputs, scope file), explicit outputs (typed text file persisted to disk), and explicit verify criteria. Cross-phase memory is file-mediated by design, so the frontier orchestrator sees what state moves between phases. Hidden session-state that survives across dispatches breaks this contract.
 - **Utility/specialist split.** Utility agents (4B-class: compactor, scribe, estimator, mission-compiler) handle bounded structured work at high throughput. Specialist agents (35B+: coder, code-reviewer, analyst) handle judgment-dependent work at lower throughput. Features that push specialists toward utility work (mid-dispatch planning, todo tracking, autonomous replanning) collapse the layering that makes the split valuable, turning judgment-bearing work into hidden utility work.
@@ -137,21 +121,9 @@ When deciding what to add to the internal runtime, the filter is **workflow-fit*
 
 The filter for any proposed internal-runtime feature: **does this reinforce mission-as-contract, the utility/specialist split, and frontier-as-strategic-layer, or does it blur them?** Features that reinforce land cleanly even when they're small. Features that blur produce "works technically but feels wrong" outcomes that surface as bugs months later.
 
-Openclaw's broader surface is a strength for openclaw's own use cases. When operators need a feature openclaw has and the internal runtime doesn't, the answer is usually `--runtime openclaw`, not "let's add it to the internal runtime." Both paths stay viable on purpose.
+### Schema isolation: darkmux owns its own config
 
-### Schema isolation: each runtime owns its own config
-
-The internal runtime and openclaw dispatch are separate runtime paths with separate config schemas. **Neither runtime translates the other's config shape.** This separation enforces operator-sovereignty at the schema level: every field an operator sees in a darkmux profile maps to a darkmux-typed schema entry that the internal runtime consumes, with no decorative fields that look tunable but have no effect.
-
-The codebase distinguishes three code-path categories with distinct rules for what they may read:
-
-**1. Internal-runtime path** (`src/crew/dispatch_internal.rs`, `runtime/src/`): reads only darkmux-native typed fields from `profile.runtime.*`. darkmux owns these field names, their semantics, and their evolution. An untyped `extras` map exists for legacy back-compat parse only; nothing in the internal-runtime path reads from it (enforced by explicit "must not auto-populate" tests).
-
-**2. OC dispatch path** (`--runtime openclaw`, `src/crew/dispatch.rs`): shells out to `openclaw agent darkmux/<role-id>`. Openclaw reads its own `~/.openclaw/openclaw.json`. darkmux does not forward profile fields into openclaw's config, and openclaw never sees the darkmux profile. No schema bridging in either direction.
-
-**3. OC helper tooling** (`darkmux crew sync`, the OC config patcher in `src/runtime.rs`, eureka OC diagnostics): legitimate openclaw-aware code that operates ON `~/.openclaw/openclaw.json` directly. These are *helper verbs for openclaw users*, not part of the internal-runtime path. The patcher is reached only on the opt-in `--runtime openclaw` path; a default flagless `darkmux swap` writes zero bytes to `~/.openclaw/openclaw.json`. Openclaw-schema *emission* the engine doesn't itself consume (the `agents.list[]` scaffold snippets) lives one step further out, as the standalone `integrations/openclaw/oc-scaffold.sh` script, so the binary carries no openclaw-schema knowledge it doesn't use.
-
-**Maintenance risk this prevents.** When darkmux's profile schema is purely darkmux-typed, an upstream openclaw schema change has zero impact on darkmux: no darkmux code path consumes openclaw-shape fields on either runtime path. The only maintenance dependency lives in OC helper tooling, where it's explicit and scoped to verbs that exist to serve openclaw users. `darkmux doctor` defaults to internal-runtime-only output; OC-specific checks are opt-in via `--include-openclaw`.
+Every field an operator sees in a darkmux profile maps to a darkmux-typed schema entry the internal runtime consumes — no decorative fields that look tunable but have no effect. The internal-runtime path (`src/crew/dispatch_internal.rs`, `runtime/src/`) reads only darkmux-native typed fields from `profile.runtime.*`; darkmux owns these field names, their semantics, and their evolution. An untyped `extras` map exists for forward-compat parse only (so an older binary tolerates a newer config); nothing in the internal-runtime path reads from it (enforced by explicit "must not auto-populate" tests). This discipline predates and outlived the openclaw path — it started as "don't let openclaw's config shape leak into darkmux's," and now stands on its own as "the profile schema is purely darkmux-typed, full stop."
 
 ## Lab reproducibility: fixtures + content hashing
 

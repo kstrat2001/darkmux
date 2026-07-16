@@ -83,7 +83,6 @@ pub struct FleetNode {
     pub flows_dir: PathBuf,
     pub fleet_file: PathBuf,
     pub crew_root: PathBuf,
-    pub openclaw_config: PathBuf,
     pub redis_url: String,
     #[allow(dead_code)] // consumed by Wave-E.2+ scenarios
     pub lmstudio_base_url: String,
@@ -101,7 +100,6 @@ impl FleetNode {
             .env("DARKMUX_FLOWS_DIR", &self.flows_dir)
             .env("DARKMUX_FLEET_FILE", &self.fleet_file)
             .env("DARKMUX_CREW_DIR", &self.crew_root)
-            .env("DARKMUX_OPENCLAW_CONFIG", &self.openclaw_config)
             .env("DARKMUX_ORCHESTRATOR", "darkmux-e2e-test");
         cmd
     }
@@ -287,13 +285,6 @@ fn spawn_daemon(
     std::fs::create_dir_all(crew_root.join("roles"))
         .map_err(|e| format!("crew/roles dir: {e}"))?;
     let fleet_file = node_dir.join("fleet.json");
-    let openclaw_config = node_dir.join("openclaw.json");
-    // Minimal openclaw stub config so doctor checks don't bail.
-    std::fs::write(
-        &openclaw_config,
-        r#"{"agents":{"list":[],"defaults":{}}}"#,
-    )
-    .map_err(|e| format!("openclaw.json stub: {e}"))?;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("binding daemon port: {e}"))?;
@@ -311,9 +302,8 @@ fn spawn_daemon(
         .env("DARKMUX_FLOWS_DIR", &flows_dir)
         .env("DARKMUX_FLEET_FILE", &fleet_file)
         .env("DARKMUX_CREW_DIR", &crew_root)
-        .env("DARKMUX_OPENCLAW_CONFIG", &openclaw_config)
         .env("DARKMUX_ORCHESTRATOR", "darkmux-e2e-test")
-        // Point any runtime/openclaw paths at our mock LMStudio.
+        // Point the internal runtime at our mock LMStudio.
         .env("OPENAI_BASE_URL", lmstudio_base_url)
         .env("DARKMUX_LMSTUDIO_BASE_URL", lmstudio_base_url)
         .stdout(Stdio::null())
@@ -327,7 +317,6 @@ fn spawn_daemon(
         flows_dir,
         fleet_file,
         crew_root,
-        openclaw_config,
         redis_url: redis_url.to_string(),
         lmstudio_base_url: lmstudio_base_url.to_string(),
         daemon,

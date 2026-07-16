@@ -241,12 +241,11 @@ pub struct FlowRecord {
     /// LMStudio model id that handled this work, when known. Set on
     /// dispatch records (`tier=local, stage=dispatch`) so the viewer
     /// can render which model ran the work without cross-referencing
-    /// the model-status pill's timestamp. Resolved from openclaw config
-    /// at dispatch entry: first checks `agents.list[<agent-id>].model`,
-    /// then falls back to `agents.defaults.model.primary` when absent.
-    /// None for non-dispatch records (lifecycle transitions, phase
-    /// review verdicts) and for dispatches where the openclaw config
-    /// can't be resolved. Schema 1.2 addition (#106).
+    /// the model-status pill's timestamp. Resolved at dispatch entry
+    /// from the active profile (`crew::select::select_model`). None for
+    /// non-dispatch records (lifecycle transitions, phase review
+    /// verdicts) and for dispatches where the model can't be resolved.
+    /// Schema 1.2 addition (#106).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Operator-facing reasoning for this record. Used primarily by

@@ -6,10 +6,10 @@ It's a personal project with a small audience. As of v1.0.0 darkmux follows semv
 
 ## What darkmux does to your machine
 
-- **Reads and writes config files.** A default `darkmux swap` only transitions the LMStudio loadout and touches no agent-runtime config. darkmux writes `~/.openclaw/openclaw.json` *only* on the opt-in OpenClaw path — `darkmux swap --runtime openclaw`, `darkmux crew dispatch / lab run --runtime openclaw`, `darkmux crew sync`, or `darkmux doctor --fix` on that path. If darkmux has a bug, if your config has an unusual shape, or if a write is interrupted, your OpenClaw agent runtime can end up in a broken state. You are ultimately responsible for backing up anything you cannot afford to lose.
+- **Reads and writes config files.** `darkmux swap` transitions the LMStudio loadout; darkmux also reads/writes its own `~/.darkmux/` state (`config.json`, `profiles.json`, flow records). It does not write to any other agent runtime's config file. If darkmux has a bug, if your config has an unusual shape, or if a write is interrupted, your `~/.darkmux/` state can end up in a broken state. You are ultimately responsible for backing up anything you cannot afford to lose.
 - **Talks to your local LMStudio server.** darkmux sends HTTP requests to `http://localhost:1234/v1` to load and unload models. It does not talk to any remote service on your behalf. (No telemetry, no analytics, no update checks.) Your data stays on your disk.
 - **Uses Docker for the default dispatch + lab path.** `darkmux crew dispatch` and `darkmux lab run` default to darkmux's internal Rust runtime, which runs inside a per-invocation `darkmux-runtime` Docker container (image built from `runtime/`). Docker is therefore a runtime dependency for that path. darkmux builds and runs that image on your behalf.
-- **Runs AI-orchestrated workloads.** In lab mode and on crew dispatch, darkmux runs an agent loop and can execute shell commands the agent produces — for example, `npm test` against AI-generated code. On the **default internal runtime**, each dispatch runs in a per-invocation container with kernel-enforced workspace isolation — better than a bare directory, but still not a hardened sandbox (Docker on macOS is a VM boundary, not a security guarantee against a determined adversary). On the **opt-in `--runtime openclaw`** path (or any `--runtime-cmd` tool), there is no container: the working directory is **not a security boundary** — it is a regular directory on your filesystem, and an AI that decides to run `rm -rf ~` is not stopped by darkmux. Treat that path the way you would treat running any untrusted script: only on a machine where that risk is acceptable, ideally on a separate user account or VM.
+- **Runs AI-orchestrated workloads.** In lab mode and on crew dispatch, darkmux runs an agent loop and can execute shell commands the agent produces — for example, `npm test` against AI-generated code. Each dispatch runs in a per-invocation container with kernel-enforced workspace isolation — better than a bare directory, but still not a hardened sandbox (Docker on macOS is a VM boundary, not a security guarantee against a determined adversary). Treat any dispatch the way you would treat running any untrusted script: only on a machine where that risk is acceptable, ideally on a separate user account or VM.
 
 ## About AI behavior
 
@@ -48,11 +48,10 @@ Benchmarks, throughput claims, and "X tokens/sec" figures in this repository and
 darkmux is not affiliated with, endorsed by, or supported by:
 
 - **LMStudio** — a separate product with its own license and terms of service. You are responsible for complying with them, including any commercial-use restrictions.
-- **OpenClaw** — a separate open-source project. darkmux can integrate with it on the opt-in `--runtime openclaw` path but is not maintained by the OpenClaw authors.
-- **Docker** — a separate product with its own license and terms. The default dispatch path depends on a working Docker installation, which you provide and maintain.
+- **Docker** — a separate product with its own license and terms. The dispatch path depends on a working Docker installation, which you provide and maintain.
 - **Apple, Inc.** — "Apple Silicon" and "M5 Max" are Apple trademarks used here descriptively. No endorsement is implied.
 
-darkmux is tested against specific versions of LMStudio and OpenClaw. Future versions of either may break compatibility. When that happens, file an issue — but understand fixes ship on the author's schedule.
+darkmux is tested against specific versions of LMStudio. Future versions may break compatibility. When that happens, file an issue — but understand fixes ship on the author's schedule.
 
 ## Model licenses are your responsibility
 

@@ -195,7 +195,7 @@ All of the following are **shipped**:
 | `darkmux phase estimate` | Reads a `WorkloadSpec` → deterministic per-turn token math → recommends the smallest adequate profile → optional 4B narration. | `src/phase_cli.rs:233-310, 500-514`; `src/main.rs:459-471` |
 | `darkmux phase review` | Auto-detects base branch → computes the git diff → dispatches the **code-reviewer** role → parses the `QA-REVIEW-SIGNOFF` block (`BLOCK`/`FLAG`/`NIT`) → emits a verdict (`clean` / `flags-only` / `blockers`, or `indeterminate` when the reviewer output doesn't match the expected format). | `src/phase_cli.rs:683-970`; `src/main.rs:472-485` |
 | `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, fans out its ready phases (`depends_on == []`) as work jobs onto the single global fleet work queue (`darkmux:work`); waits or returns session ids. | `src/main.rs:642-662`, `1453-1721` |
-| `darkmux crew dispatch <role>` | Single-turn dispatch to a named role through the internal runtime (default) or `--runtime openclaw`. | see `CLAUDE.md` → operator-facing commands |
+| `darkmux crew dispatch <role>` | Single-turn dispatch to a named role through the internal runtime. | see `CLAUDE.md` → operator-facing commands |
 
 The **operator-approval gate on `mission propose`** is the sovereignty contract
 in action: the utility agent proposes structure; the operator approves before
@@ -205,10 +205,9 @@ anything is written.
 
 ## 5. The internal runtime + compaction
 
-`darkmux crew dispatch` and `darkmux lab run` default to the **internal runtime**:
+`darkmux crew dispatch` and `darkmux lab run` use the **internal runtime**:
 a per-dispatch `darkmux-runtime` Docker container running an in-house Rust agent
-loop (`runtime/src/loop_runner.rs`). `--runtime openclaw` opts into the openclaw
-shell-out path instead.
+loop (`runtime/src/loop_runner.rs`).
 
 ### Compaction is a runtime primitive, not a crew role
 
@@ -416,9 +415,9 @@ Two principles thread through every concept above; both are spelled out in full 
   provenance fields, and "read + propose, never write user state silently" are all
   instances.) Tracked as [#44](https://github.com/kstrat2001/darkmux/issues/44).
 - **Namespacing in shared state.** darkmux-owned entries in systems others also
-  use are namespaced (`darkmux:<model-id>` in LMStudio, `darkmux/<role>` in
-  openclaw) so darkmux's state-mutating operations touch only the namespaced
-  subset; user state is off-limits by construction.
+  use are namespaced (`darkmux:<model-id>` in LMStudio) so darkmux's
+  state-mutating operations touch only the namespaced subset; user state is
+  off-limits by construction.
 
 ---
 

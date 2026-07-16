@@ -94,8 +94,8 @@ Show the user the reply. Ask: "Want to address any of these findings, or move on
 
 ## Notes
 
-- **No Discord delivery by default.** Unlike the FH `qa-review` skill (which posts to `#finhero-qa`), the darkmux variant returns findings inline only. If you want Discord delivery, add `--deliver discord:<channel-id>` to the dispatch command.
+- **No Discord delivery.** Unlike the FH `qa-review` skill (which posts to `#finhero-qa`), the darkmux variant returns findings inline only.
 - **No multi-auditor dispatch.** For code review, darkmux ships the `code-reviewer` role (this skill dispatches it). Other engagement roles ship too — including `legal-research` for legal questions — but a dedicated multi-specialist *diff auditor* crew (e.g. a `devops` auditor; `devops` is genuinely not in the schema) isn't wired up yet. Those would be added when the team is staffed for those concerns.
-- **Out-of-the-box runtime is internal (Docker container).** This skill uses darkmux's in-house container-bounded runtime — no openclaw install needed. Operators who prefer openclaw can opt in via `--runtime openclaw`, but the parser below assumes the `--json` envelope shape that the internal runtime emits.
-- **No `crew sync` step needed.** The internal runtime reads role manifests directly each dispatch — no agent-registry reconciliation required.
-- **Why this skill instead of `qa-review`:** the FH skill is scoped to FinHero-era infrastructure (Discord channel, qa/devops/legal openclaw agents). This darkmux variant routes through the namespace-managed agent and respects the operator-sovereignty contract.
+- **The runtime is internal (Docker container) — the only dispatch path.** This skill uses darkmux's in-house container-bounded runtime; the parser below assumes the `--json` envelope shape it emits.
+- **No agent-registry sync step needed.** The internal runtime reads role manifests directly each dispatch — no separate registry to reconcile.
+- **Why this skill instead of `qa-review`:** the FH skill is scoped to FinHero-era infrastructure (Discord channel, qa/devops/legal agents). This darkmux variant routes through the namespace-managed agent and respects the operator-sovereignty contract.

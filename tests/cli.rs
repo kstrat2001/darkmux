@@ -152,15 +152,20 @@ fn lab_with_no_subcommand_reports() {
 /// approach — `cargo install --path .` produces a binary that doesn't need
 /// the source tree at runtime.
 ///
-/// Test passes `--runtime openclaw` because the default-internal runtime
-/// (post-Phase-D) requires Docker + LMStudio, which CI doesn't have. The
-/// openclaw shell-out path is mockable: we point `--runtime-cmd` at
-/// `/usr/bin/true` (Phase-E replacement for the removed
-/// `DARKMUX_RUNTIME_CMD` env var) so the dispatch always "succeeds"
-/// without actually hitting any backend. The test verifies that the
-/// surrounding plumbing (workload load → provider dispatch → manifest
-/// write → run dir creation) works end-to-end from a clean tempdir.
+/// **Requires Docker** (#1405 removed the legacy openclaw shell-out runtime,
+/// which this test previously mocked via `--runtime-cmd /usr/bin/true` to
+/// avoid needing a real backend in CI). The internal runtime is now the only
+/// dispatch path and it always spawns a real container, so this test needs
+/// `darkmux-runtime:latest` built locally — matches the
+/// `mock_dispatch_proof` test's "Docker required → `#[ignore]`d by default"
+/// convention so `cargo test --workspace` never requires Docker. Run
+/// explicitly with:
+///
+/// ```sh
+/// cargo test --test cli lab_run_quick_q_from_clean_cwd_uses_embedded_workload -- --ignored
+/// ```
 #[test]
+#[ignore]
 fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     let tmp = TempDir::new().unwrap();
     // Profile registry with `deep` as default.
@@ -198,15 +203,6 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
         "lab",
         "run",
         "quick-q",
-        // Force openclaw so the --runtime-cmd=/usr/bin/true mock applies.
-        // Internal-runtime path requires Docker + LMStudio, unavailable
-        // in CI. /usr/bin/true exits 0 with empty stdout — the prompt
-        // provider treats this as a successful (but empty-reply)
-        // dispatch under the openclaw shell-out path.
-        "--runtime",
-        "openclaw",
-        "--runtime-cmd",
-        "/usr/bin/true",
         "--profiles-file",
         cfg.to_str().unwrap(),
         "--quiet",
@@ -267,145 +263,6 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
         manifest["fixture"]["source_path"].is_null(),
         "expected null source_path for self-contained workload, got: {}",
         manifest["fixture"]["source_path"]
-    );
-}
-
-/// Phase-E: `--runtime-cmd <path>` overrides the openclaw binary used
-/// by the shell-out path, replacing the pre-Phase-E `DARKMUX_RUNTIME_CMD`
-/// env var.
-///
-/// The test points `--runtime-cmd` at a binary that DOES NOT EXIST and
-/// confirms the dispatch fails with an error mentioning that exact path
-/// — proving the flag is reaching the Command::new() call rather than
-/// silently falling through to the default `openclaw`. Inverse signal:
-/// if the flag weren't plumbed through, we'd either get a clap parse
-/// error or a "no such binary `openclaw`" message depending on whether
-/// openclaw is on PATH in the test env.
-#[test]
-fn lab_run_runtime_cmd_flag_overrides_openclaw_binary() {
-    let tmp = TempDir::new().unwrap();
-    let cfg = tmp.path().join("profiles.json");
-    fs::write(
-        &cfg,
-        r#"{
-            "profiles": {
-                "deep": {
-                    "description": "test deep stack",
-                    "models": [
-                        {"id": "model-a", "n_ctx": 100000, "role": "primary"}
-                    ]
-                }
-            },
-            "default_profile": "deep"
-        }"#,
-    )
-    .unwrap();
-    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
-
-    let bogus_path = "/this/binary/definitely/does/not/exist/darkmux-phase-e";
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.env(
-        "DARKMUX_TEMPLATES_DIR",
-        tmp.path().join("nope").to_str().unwrap(),
-    );
-    cmd.current_dir(tmp.path());
-    let output = cmd
-        .args([
-            "lab",
-            "run",
-            "quick-q",
-            "--runtime",
-            "openclaw",
-            "--runtime-cmd",
-            bogus_path,
-            "--profiles-file",
-            cfg.to_str().unwrap(),
-            "--quiet",
-        ])
-        .output()
-        .unwrap();
-
-    // Dispatch should NOT succeed (the binary doesn't exist).
-    assert!(
-        !output.status.success(),
-        "expected non-zero exit when --runtime-cmd points at a non-existent binary, got stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // Error should mention the bogus path — proves the flag reached the
-    // Command::new call.
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains(bogus_path),
-        "expected error to mention `{bogus_path}` (proving --runtime-cmd plumbed through); got: {combined}"
-    );
-}
-
-/// Phase-E QA: passing `--runtime-cmd` without `--runtime openclaw` is
-/// an operator-intent conflict (the flag is only consulted under
-/// openclaw shell-out). The CLI must bail loudly rather than silently
-/// ignoring the flag — Beat 36 doctrine: "no implicit state, operator-
-/// explicit intent only."
-///
-/// `--runtime internal` (the default) + `--runtime-cmd /some/path` →
-/// must NOT succeed; error must reference `--runtime openclaw`.
-#[test]
-fn lab_run_runtime_cmd_without_openclaw_bails_loud() {
-    let tmp = TempDir::new().unwrap();
-    let cfg = tmp.path().join("profiles.json");
-    fs::write(
-        &cfg,
-        r#"{
-            "profiles": {
-                "deep": {
-                    "description": "test",
-                    "models": [
-                        {"id": "model-a", "n_ctx": 100000, "role": "primary"}
-                    ]
-                }
-            },
-            "default_profile": "deep"
-        }"#,
-    )
-    .unwrap();
-    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
-
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.env(
-        "DARKMUX_TEMPLATES_DIR",
-        tmp.path().join("nope").to_str().unwrap(),
-    );
-    cmd.current_dir(tmp.path());
-    let output = cmd
-        .args([
-            "lab",
-            "run",
-            "quick-q",
-            // --runtime defaults to "internal" — explicit here for
-            // clarity that the test exercises the conflict path.
-            "--runtime",
-            "internal",
-            "--runtime-cmd",
-            "/opt/aider/aider",
-            "--profiles-file",
-            cfg.to_str().unwrap(),
-            "--quiet",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(
-        !output.status.success(),
-        "expected non-zero exit when --runtime-cmd set without --runtime openclaw"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--runtime openclaw"),
-        "expected stderr to point operator at `--runtime openclaw`; got: {stderr}"
     );
 }
 
@@ -767,46 +624,6 @@ fn notebook_draft_accepts_role_flag_under_dry_run() {
     .stdout(predicate::str::contains("phase-h-test"));
 }
 
-/// Phase-H + Phase-E loud-bail gate: notebook draft also enforces
-/// "--runtime-cmd is only valid under --runtime openclaw."
-#[test]
-fn notebook_draft_runtime_cmd_without_openclaw_bails_loud() {
-    let tmp = TempDir::new().unwrap();
-    let darkmux = tmp.path().join(".darkmux");
-    let runs_dir = darkmux.join("runs/test-run-h2");
-    fs::create_dir_all(&runs_dir).unwrap();
-    fs::write(
-        runs_dir.join("manifest.json"),
-        r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","session_id":"s","duration_ms":5000,"ok":true}"#,
-    )
-    .unwrap();
-
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.current_dir(tmp.path());
-    let output = cmd
-        .args([
-            "notebook",
-            "draft",
-            "test-run-h2",
-            "--runtime",
-            "internal",
-            "--runtime-cmd",
-            "/opt/aider/aider",
-            "--dry-run",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        !output.status.success(),
-        "expected non-zero exit when --runtime-cmd set without --runtime openclaw"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--runtime openclaw"),
-        "expected stderr to point operator at `--runtime openclaw`; got: {stderr}"
-    );
-}
-
 // ─── (#491) Phase 4 lab CLI verbs: register / unregister / fixtures / doctor ──
 
 /// Operator runs `dm lab register <path>` against a fixture dir with
@@ -1078,60 +895,6 @@ fn lab_doctor_passes_for_builtin_demo_tiny_py() {
         .success()
         .stdout(predicate::str::contains("demo-tiny-py"))
         .stdout(predicate::str::contains("1 pass"));
-}
-
-/// (#893) `crew sync` mutates operator-owned openclaw.json — a bare run
-/// (no `--yes`) must PREVIEW and bail without writing; `--yes` applies.
-#[test]
-fn crew_sync_refuses_to_write_without_yes() {
-    let tmp = TempDir::new().unwrap();
-    let oc = tmp.path().join("openclaw.json");
-    fs::write(&oc, r#"{"agents":{"list":[]}}"#).unwrap();
-    let crew_dir = tmp.path().join("crew"); // empty → builtin roles only
-    fs::create_dir_all(&crew_dir).unwrap();
-
-    // Bare `crew sync`: builtin roles are pending → bail + leave the file alone.
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .env("DARKMUX_OPENCLAW_CONFIG", &oc)
-        .env("DARKMUX_CREW_DIR", &crew_dir)
-        .args(["crew", "sync"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("re-run").and(predicate::str::contains("--yes")));
-    assert!(
-        !fs::read_to_string(&oc).unwrap().contains("darkmux/"),
-        "no agent should be written without --yes"
-    );
-
-    // `--yes` applies.
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .env("DARKMUX_OPENCLAW_CONFIG", &oc)
-        .env("DARKMUX_CREW_DIR", &crew_dir)
-        .args(["crew", "sync", "--yes"])
-        .assert()
-        .success();
-    assert!(
-        fs::read_to_string(&oc).unwrap().contains("darkmux/"),
-        "--yes should have written agents to openclaw.json"
-    );
-
-    // `--dry-run` previews and exits 0 without writing (even with pending).
-    let oc2 = tmp.path().join("openclaw2.json");
-    fs::write(&oc2, r#"{"agents":{"list":[]}}"#).unwrap();
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .env("DARKMUX_OPENCLAW_CONFIG", &oc2)
-        .env("DARKMUX_CREW_DIR", &crew_dir)
-        .args(["crew", "sync", "--dry-run"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("[DRY RUN]"));
-    assert!(
-        !fs::read_to_string(&oc2).unwrap().contains("darkmux/"),
-        "--dry-run must not write"
-    );
 }
 
 /// (#386) `crew dispatch` accepts the message via `--message-from-file` and

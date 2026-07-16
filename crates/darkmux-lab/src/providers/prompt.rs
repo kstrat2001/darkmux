@@ -1,9 +1,7 @@
 //! Trivial workload provider: "just answer this prompt."
 //! No sandbox; optional must_contain / must_not_contain keyword checks.
 //!
-//! Dispatches via the active runtime: the in-house internal runtime by
-//! default, or the `openclaw agent` shell-out when `--runtime openclaw`
-//! is opted into.
+//! Dispatches via darkmux's in-house internal runtime.
 
 use darkmux_types::Profile;
 use crate::workloads::types::{
@@ -14,7 +12,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) struct PromptProvider;
@@ -43,7 +40,6 @@ impl WorkloadProvider for PromptProvider {
         profile: &Profile,
         profile_name: &str,
         runtime: darkmux_crew::dispatch::Runtime,
-        runtime_cmd: &str,
         config_path: Option<&str>,
         // (#986) The prompt provider runs trivial single-prompt workloads with
         // no compaction config to override — the loop lab targets coding-task
@@ -61,22 +57,18 @@ impl WorkloadProvider for PromptProvider {
                 .unwrap_or(0)
         );
 
+        // `Runtime` has a single variant post-#1405 (the legacy `openclaw`
+        // shell-out runtime was removed).
+        let darkmux_crew::dispatch::Runtime::Internal = runtime;
         let started = std::time::Instant::now();
-        let (stdout, stderr, ok) = match runtime {
-            darkmux_crew::dispatch::Runtime::Internal => {
-                dispatch_via_internal(
-                    &role,
-                    &prompt,
-                    &session_id,
-                    loaded.manifest.workload.image.as_deref(),
-                    config_path,
-                    profile_name,
-                )?
-            }
-            darkmux_crew::dispatch::Runtime::Openclaw => {
-                dispatch_via_openclaw(runtime_cmd, &role, &prompt, &session_id)?
-            }
-        };
+        let (stdout, stderr, ok) = dispatch_via_internal(
+            &role,
+            &prompt,
+            &session_id,
+            loaded.manifest.workload.image.as_deref(),
+            config_path,
+            profile_name,
+        )?;
         let duration_ms = started.elapsed().as_millis();
 
         fs::write(run_dir.join("qa-reply.json"), &stdout)?;
@@ -173,8 +165,7 @@ impl WorkloadProvider for PromptProvider {
 /// Dispatch via darkmux's internal Docker-bounded runtime through the
 /// crew::dispatch substrate. The runtime emits a JSON envelope per
 /// `runtime/src/main.rs::build_json_envelope` which becomes the
-/// provider's stdout artifact — same as openclaw's JSON envelope, just
-/// from DM's substrate. Beat 36: no openclaw install required.
+/// provider's stdout artifact.
 fn dispatch_via_internal(
     role_id: &str,
     prompt: &str,
@@ -192,11 +183,9 @@ fn dispatch_via_internal(
         timeout_seconds: 3600,
         skip_preflight: false,
         json: true,
-        watch_paths: Vec::new(),
         workdir: None,
         phase_id: None,
         runtime: Runtime::Internal,
-        runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
         // Prompt-only workloads don't accumulate context across turns
@@ -221,37 +210,6 @@ fn dispatch_via_internal(
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     Ok((result.stdout, result.stderr, result.exit_code == 0))
-}
-
-/// Dispatch via the legacy openclaw shell-out path. Shells out with the
-/// `<cmd> agent --agent <role> --json ...` calling convention.
-/// `runtime_cmd` is the operator-supplied binary path (Phase-E:
-/// `--runtime-cmd <path>` flag; defaults to `"openclaw"`). Kept for
-/// operators who explicitly opt in via `--runtime openclaw`.
-fn dispatch_via_openclaw(
-    runtime_cmd: &str,
-    role: &str,
-    prompt: &str,
-    session_id: &str,
-) -> Result<(String, String, bool)> {
-    let output = Command::new(runtime_cmd)
-        .args([
-            "agent",
-            "--agent",
-            role,
-            "--session-id",
-            session_id,
-            "--json",
-            "--timeout",
-            "3600",
-            "--message",
-            prompt,
-        ])
-        .output()
-        .with_context(|| format!("running `{runtime_cmd} agent ...`"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok((stdout, stderr, output.status.success()))
 }
 
 fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
@@ -297,7 +255,8 @@ pub(crate) fn extract_reply_text(stdout: &str) -> String {
     if let Some(final_assistant) = parsed.get("final_assistant").and_then(|v| v.as_str()) {
         return final_assistant.to_string();
     }
-    // openclaw --json envelope (legacy path; `--runtime openclaw`):
+    // Legacy openclaw-shaped envelope — kept for reading historical run
+    // artifacts from before the openclaw runtime was removed (#1405):
     // `{"result": {"payloads": [{"text": "..."}], ...}}`.
     if let Some(payloads) = parsed
         .get("result")

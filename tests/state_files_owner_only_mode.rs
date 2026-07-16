@@ -149,10 +149,10 @@ fn lifecycle_save_json_is_owner_only_mode() {
             .output()
             .expect("running `darkmux mission start`");
         // We don't insist on success — mission start may bail on
-        // openclaw config absence in this isolated env. What we care
-        // about is whether save_json fired AND set the mode. If the
-        // file mode is still pre_mode, save_json didn't run; that's
-        // a setup miss, not the bug we're testing for.
+        // missing state in this isolated env. What we care about is
+        // whether save_json fired AND set the mode. If the file mode
+        // is still pre_mode, save_json didn't run; that's a setup
+        // miss, not the bug we're testing for.
         if !out.status.success() {
             eprintln!(
                 "mission start failed (expected in isolated env); stdout={} stderr={}",

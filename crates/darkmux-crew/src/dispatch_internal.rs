@@ -4,19 +4,15 @@
 //! `darkmux-runtime` docker container. Per-dispatch container, mounted
 //! workspace, structured output collected from stdout.
 //!
-//! Default runtime as of the runtime-default flip. Openclaw remains
-//! available via the explicit `--runtime openclaw` flag for operators
-//! who already have it installed and configured.
+//! The ONLY dispatch path as of 2.0 (#1405 removed the legacy `openclaw`
+//! shell-out runtime and its `--runtime` opt-in flag).
 //!
-//! Deliberately simpler than the openclaw path:
-//!
-//! - No openclaw pre-flight (it's not involved)
-//! - No `--workdir` symlink injection (workspace is a fresh tempdir
-//!   per dispatch; the gallery-incident class of bug is structurally
-//!   impossible because there's nowhere persistent to leak into)
-//! - No phase-output persistence (later iteration)
-//! - No watched-path post-dispatch echo (same)
-//! - No model pin enforcement (probes whatever LMStudio currently has loaded)
+//! No `--workdir` symlink injection (workspace is a fresh tempdir per
+//! dispatch); no watched-path post-dispatch echo (`DispatchResult.watched_state`
+//! is always empty — the workspace is ephemeral, not a fixed path to
+//! snapshot); no model pin enforcement (probes whatever LMStudio currently
+//! has loaded via `crew::select`, a different mechanism than the retired
+//! `role-model-pins.json` table).
 //!
 //! See `runtime/` for the container image this dispatches to.
 
@@ -106,8 +102,7 @@ fn pull_runtime_image(image: &str) -> Result<()> {
              Options:\n  \
              - Check network / `docker login ghcr.io` if the package is private, OR\n  \
              - Build it locally from a darkmux source checkout:\n      \
-             docker build -t {RUNTIME_IMAGE} runtime/\n  \
-             - Or use `--runtime openclaw` if you have openclaw installed."
+             docker build -t {RUNTIME_IMAGE} runtime/"
         );
     }
     Ok(())
@@ -1625,12 +1620,25 @@ fn dispatch_remote(
         stdout,
         stderr: String::new(),
         session_id,
-        watched_state: Vec::new(),
         out_dir: None,
     })
 }
 
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
+    // 0. Pre-flight: nudge the operator if the daemon isn't up. The
+    //    dispatch will still write flow records to disk, but they
+    //    won't be observable in the viewer until the daemon comes up.
+    //    Non-blocking; the dispatch proceeds either way (#104 S3).
+    darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("crew dispatch");
+
+    // 0.5. Licensed-adjacent ACK gate (#1405: moved here from the retired
+    //      openclaw dispatch branch — this is the only dispatch path now).
+    //      For roles whose prompts operate in domains regulated by
+    //      professional licensure (health, law, fitness), require an
+    //      operator acknowledgment on first dispatch.
+    crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
+        .context("licensed-adjacent role dispatch requires acknowledgment")?;
+
     // (#1177 / #1187) A resolved model naming a remote OpenAI-compatible
     // endpoint forks two ways, decided by whether the ROLE grants any tools:
     //
@@ -1691,10 +1699,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         }
     );
 
-    // 1. Load the role manifest + .md prompt. The internal runtime uses
-    //    the SAME on-disk role definition as the openclaw path so the
-    //    prompts stay identical across runtimes — load-bearing for the
-    //    runtime-vs-openclaw comparison.
+    // 1. Load the role manifest + .md prompt.
     let roles = load_roles().context("loading crew roles for internal dispatch")?;
     let role = roles
         .iter()
@@ -1722,6 +1727,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     } else {
         role_prompt
     };
+    // (#147, #1405) Augment with operator-identity from
+    // ~/.darkmux/identity.md if present. No-op when absent.
+    let system_prompt = crate::dispatch::augment_prompt_with_identity(&system_prompt);
     // #340 — surface unknown role-vocab tokens loudly. Unknown tokens
     // (typos like "exce" for "exec", future tokens not yet wired)
     // get silently dropped by `role_to_runtime`; without this warning
@@ -1815,9 +1823,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .unwrap_or_default()
     );
 
-    // 3. Resolve session id — same shape as the openclaw path so
-    //    callers that compare sessions across runtimes have a stable
-    //    handle.
+    // 3. Resolve session id.
     let unix_micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros())
@@ -1852,9 +1858,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //
     //    NEITHER path auto-cleans the workspace dir — the operator
     //    can inspect trajectory.jsonl + any files the agent wrote
-    //    after the container exits. That's half the point of replacing
-    //    the openclaw workspace model (operator visibility into what
-    //    the dispatch did).
+    //    after the container exits. That's half the point of the
+    //    workspace model (operator visibility into what the dispatch
+    //    did).
     let workspace = match validated_workdir {
         // Already validated above (#510) — reuse the canonical path.
         // Symlink-escape guard via the shared validator (#255 Wave-E.2);
@@ -1942,15 +1948,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let remote_needs_auth = remote_auth.is_some();
 
     // 5. Emit dispatch.start flow record with runtime metadata in payload
-    //    (#204). Pairs with dispatch.complete below via session_id, same
-    //    as the openclaw path does.
+    //    (#204). Pairs with dispatch.complete below via session_id.
     let mut dispatch_start_payload = serde_json::json!({
         "runtime": "internal",
         // (#1126) The resolved runtime image (operator `--image` or the default
         // darkmux image, line ~711) — the environment the coder ran in. The
         // viewer's run brief + recent-runs rail read `payload.image`; it was a
-        // dead reference until now (no path emitted it). openclaw dispatches
-        // have no container image, so that path omits the field honestly.
+        // dead reference until now (no path emitted it).
         "image": image.clone(),
         "prompt_chars": opts.message.chars().count(),
         // (#1127) The dispatch prompt text (capped) — run context the viewer
@@ -2417,8 +2421,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // path previously emitted only the char count — you couldn't see WHY
         // it failed without shelling into the runner). null on success so
         // clean records aren't bloated. Payload-additive — no FLOW_SCHEMA bump.
-        // (The openclaw path already does this; this brings the DEFAULT path
-        // to parity.)
         "stderr_excerpt": if exit_code == 0 {
             None
         } else {
@@ -2495,7 +2497,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         stdout,
         stderr,
         session_id,
-        watched_state: Vec::new(),
         // Host path where the runtime's `.darkmux-runtime/` bookkeeping
         // landed (mounted at `/darkmux-out` in the container). Threaded
         // to coding_task so it reads the trajectory from here rather than
@@ -3593,26 +3594,19 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
     match status {
         DockerRuntimeStatus::Ready => Ok(()),
         DockerRuntimeStatus::DaemonUnreachable(stderr) => bail!(
-            "darkmux's default runtime (`--runtime internal`) requires Docker, \
-             but `docker version` failed:\n  {}\n\
-             Options:\n  \
-             - Start Docker Desktop, OR\n  \
-             - Re-run with `--runtime openclaw` if you have openclaw installed",
+            "darkmux's runtime requires Docker, but `docker version` failed:\n  {}\n\
+             Start Docker Desktop and retry.",
             stderr
         ),
         DockerRuntimeStatus::BinaryMissing => bail!(
-            "darkmux's default runtime (`--runtime internal`) requires Docker, \
-             but the `docker` binary isn't on PATH.\n\
-             Options:\n  \
-             - Install Docker Desktop (https://www.docker.com/products/docker-desktop), OR\n  \
-             - Re-run with `--runtime openclaw` if you have openclaw installed"
+            "darkmux's runtime requires Docker, but the `docker` binary isn't on PATH.\n\
+             Install Docker Desktop (https://www.docker.com/products/docker-desktop) and retry."
         ),
         DockerRuntimeStatus::ImageMissing => bail!(
             "no darkmux runtime image found locally. darkmux pulls the \
              version-pinned image `{}` from GHCR on demand; if that pull \
              can't run, build it once from a darkmux source checkout:\n  \
-             docker build -t {RUNTIME_IMAGE} runtime/\n\
-             (Or use `--runtime openclaw` if you have openclaw installed.)",
+             docker build -t {RUNTIME_IMAGE} runtime/",
             ghcr_runtime_image()
         ),
         DockerRuntimeStatus::ProbeError(e) => {

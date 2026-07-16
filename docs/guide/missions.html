@@ -70,22 +70,14 @@ darkmux role show coder          <span class="comment"># full details for one ro
       <li><strong>Pre-flight</strong>: verifies Docker is reachable and the <code>darkmux-runtime:latest</code> image is present locally. Bails loud with build instructions if either is missing.</li>
       <li>Spins up a fresh <code>darkmux-runtime</code> container per dispatch with a mounted workspace tempdir: kernel-enforced isolation, no cross-task context leak by construction.</li>
       <li>Streams the model's reasoning and tool calls via the in-house Rust loop; emits <code>dispatch.turn</code>, <code>dispatch.tool</code>, and <code>dispatch.reasoning</code> flow records as they happen.</li>
-      <li>Emits a final <code>dispatch complete</code> or <code>dispatch error</code> record; optionally snapshots <code>--watch</code> paths to verify the role's SIGNOFF claims.</li>
+      <li>Emits a final <code>dispatch complete</code> or <code>dispatch error</code> record.</li>
     </ol>
     <div class="callout">
       <strong>Verification boundary.</strong>
       <p style="margin: 8px 0 0;">The dispatch container is intentionally minimal: no project toolchains. The <code>coder</code>, <code>code-reviewer</code>, and <code>test-designer</code> roles are instructed <em>not</em> to install toolchains or run build/test/lint inside the container: their job ends at "the edit is in place + the tests are written," and they name the verification commands the frontier should run on the host afterward. So a role's report won't claim "tests passed" for commands it never ran. Verification is the frontier orchestrator's step, by design.</p>
     </div>
 
-    <h4>Opting into openclaw</h4>
-    <p>If you already have openclaw installed and prefer its dispatch path:</p>
-    <pre><code>darkmux crew dispatch coder --runtime openclaw --message "..."</code></pre>
-    <p>The openclaw path uses <code>darkmux/&lt;role-id&gt;</code> agents in openclaw's config; run <code>darkmux crew sync</code> first if you've edited a role manifest since the last sync.</p>
-
-    <h3>Sync the role registry (openclaw only)</h3>
-    <p>Only needed if you use <code>--runtime openclaw</code>. The internal runtime reads role manifests directly each dispatch: no registry to reconcile.</p>
-    <pre><code>darkmux crew sync                <span class="comment"># reconcile openclaw agents.list[] with manifests</span>
-darkmux crew sync --dry-run      <span class="comment"># preview without writing</span></code></pre>
+    <p>The internal runtime reads role manifests directly from disk each dispatch — no separate registry to sync.</p>
   </div>
 </section>
 

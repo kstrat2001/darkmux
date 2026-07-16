@@ -26,6 +26,6 @@ dirs = "5.0"
 tempfile = "3.10"
 serial_test = "3.1"
 # (#811) Empty the config tier by construction in this crate's TEST build so
-# tests never read the operator's real ~/.darkmux/config.json (e.g. lms_bin /
-# openclaw-config resolution). Dev-dep only; off in the release binary.
+# tests never read the operator's real ~/.darkmux/config.json (e.g. lms_bin
+# resolution). Dev-dep only; off in the release binary.
 darkmux-types = { path = "../darkmux-types", features = ["test-support"] }

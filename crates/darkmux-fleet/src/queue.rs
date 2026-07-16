@@ -45,8 +45,8 @@ pub struct WorkJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_machine: Option<String>,
 
-    /// Role to dispatch against — `darkmux/<role-id>` resolves to the
-    /// openclaw agent on the runner side.
+    /// Role to dispatch against — resolved to a role manifest under
+    /// `templates/builtin/roles/<role-id>.{json,md}` on the runner side.
     pub role_id: String,
 
     /// The operator's dispatch message — handed verbatim to the runtime.
@@ -71,11 +71,12 @@ pub struct WorkJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase_id: Option<String>,
 
-    /// Which runtime the runner should use — `Openclaw` (default) or
-    /// `Internal`. Wave-E.14 lifted this from `String` to the
-    /// `Runtime` enum: a mistyped runtime is rejected at JSON-parse
-    /// time by serde rather than at `validate()`, eliminating a class
-    /// of "publisher snuck through validate, runner crashed" bugs.
+    /// Which runtime the runner should use. `Internal` is the only
+    /// variant (#1405 removed the legacy openclaw shell-out runtime).
+    /// Wave-E.14 lifted this from `String` to the `Runtime` enum: a
+    /// mistyped runtime is rejected at JSON-parse time by serde rather
+    /// than at `validate()`, eliminating a class of "publisher snuck
+    /// through validate, runner crashed" bugs.
     #[serde(default)]
     pub runtime: darkmux_crew::dispatch::Runtime,
 

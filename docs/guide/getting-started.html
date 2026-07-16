@@ -56,16 +56,12 @@
     <p class="muted">darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.</p>
 
     <h3>For the dispatch + lab path</h3>
-    <p class="muted">The <code>swap</code> / <code>status</code> / <code>profiles</code> core needs only LMStudio. Docker is required for <code>crew dispatch</code> / <code>lab run</code> (the default internal runtime); an external agent runtime is an optional alternative to it.</p>
+    <p class="muted">The <code>swap</code> / <code>status</code> / <code>profiles</code> core needs only LMStudio. Docker is required for <code>crew dispatch</code> / <code>lab run</code> (the only dispatch path).</p>
     <table>
       <tr><th>Tool</th><th>When you need it</th></tr>
       <tr>
         <td><a href="https://www.docker.com/products/docker-desktop">Docker</a></td>
-        <td><strong>Required for <code>darkmux crew dispatch</code> / <code>lab run</code></strong> (the default internal runtime). The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; the image is pulled from GHCR on first use, so you just need Docker running. Skip only if you opt out via <code>--runtime openclaw</code>.</td>
-      </tr>
-      <tr>
-        <td>An agent runtime (e.g. <a href="https://github.com/openclaw/openclaw">OpenClaw</a>, Aider, Cline)</td>
-        <td>Only when you opt into <code>--runtime openclaw</code> on <code>darkmux crew dispatch</code> or <code>darkmux lab run</code> (both default to the internal Docker-bounded runtime). Override the openclaw binary path per dispatch with <code>--runtime-cmd &lt;path&gt;</code> (e.g. for Aider / Cline). Pure <code>swap</code>/<code>status</code>/<code>profiles</code> work without any runtime.</td>
+        <td><strong>Required for <code>darkmux crew dispatch</code> / <code>lab run</code></strong>. The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; the image is pulled from GHCR on first use, so you just need Docker running.</td>
       </tr>
       <tr>
         <td><a href="https://claude.com/claude-code">Claude Code</a> (or any frontier orchestrator)</td>
@@ -178,14 +174,14 @@ darkmux swap recommended              <span class="comment"># load them for real
 <section>
   <div class="wrap">
     <h2>Your first swap</h2>
-    <p><code>darkmux swap &lt;profile&gt;</code> transitions LMStudio's loaded model set to match the named profile: it unloads anything that doesn't belong and loads what does. By default it writes nothing outside LMStudio. The internal runtime reads the loaded model directly. If you dispatch through openclaw, add <code>--runtime openclaw</code> and swap will also patch <code>~/.openclaw/openclaw.json</code> to reference the now-loaded identifier; without that flag, no config file is touched.</p>
+    <p><code>darkmux swap &lt;profile&gt;</code> transitions LMStudio's loaded model set to match the named profile: it unloads anything that doesn't belong and loads what does. It writes nothing outside LMStudio. The internal runtime reads the loaded model directly.</p>
     <pre><code>darkmux status                    <span class="comment"># what's loaded right now; which profile (if any) matches</span>
 darkmux swap fast                 <span class="comment"># load the "fast" profile</span>
 darkmux status                    <span class="comment"># confirm: should show "fast" as the active profile</span></code></pre>
 
     <div class="callout good">
       <strong>What just happened.</strong>
-      <p style="margin: 6px 0 0;">darkmux issued <code>lms load</code> for your profile's primary model with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), set the context length, and reported success. Nothing outside LMStudio was modified. The internal runtime resolves the loaded model directly. (Had you run <code>darkmux swap fast --runtime openclaw</code>, swap would additionally patch <code>~/.openclaw/openclaw.json</code> so an openclaw dispatch routes to the loaded identifier.)</p>
+      <p style="margin: 6px 0 0;">darkmux issued <code>lms load</code> for your profile's primary model with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), set the context length, and reported success. Nothing outside LMStudio was modified. The internal runtime resolves the loaded model directly.</p>
     </div>
 
     <p>If swap reports a warning about RAM headroom or a model not found in <code>lms ls</code>, that's doctor-style feedback at swap time, usually fixable by either trimming context length or downloading the model first via the LMStudio UI.</p>
@@ -193,7 +189,7 @@ darkmux status                    <span class="comment"># confirm: should show "
     <h3>The smoke test</h3>
     <pre><code>darkmux lab run quick-q           <span class="comment"># single-turn smoke prompt against the active profile</span>
 darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at what happened</span></code></pre>
-    <p>This runs through darkmux's default internal Docker-bounded runtime. The runtime image is pulled from GHCR on first use, so you just need Docker running. To dispatch through openclaw instead, pass <code>--runtime openclaw</code>. No Docker yet? Skip this step and come back after the <a href="lab.html">lab</a> section.</p>
+    <p>This runs through darkmux's internal Docker-bounded runtime. The runtime image is pulled from GHCR on first use, so you just need Docker running. No Docker yet? Skip this step and come back after the <a href="lab.html">lab</a> section.</p>
   </div>
 </section>
 

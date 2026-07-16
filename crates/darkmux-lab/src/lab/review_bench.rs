@@ -666,13 +666,11 @@ fn dispatch_case(
         timeout_seconds: opts.timeout_seconds,
         skip_preflight: false,
         json: true,
-        watch_paths: Vec::new(),
         // Agentic mode mounts the case's repo tree at /workspace; diff-only
         // modes dispatch with no workdir (a fresh tempdir).
         workdir,
         phase_id: None,
         runtime: Runtime::Internal,
-        runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
         // pr-review is single-turn; no compaction to override.

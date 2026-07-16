@@ -56,12 +56,12 @@ mod role_cli;
 pub use darkmux_serve as serve;
 mod skills;
 mod phase_cli;
-// #463 workspace split (PR2) — profiles/swap/lms/runtime extracted to the
+// #463 workspace split (PR2) — profiles/swap/lms extracted to the
 // darkmux-profiles crate. These re-exports keep every existing
-// crate::{profiles,swap,lms,runtime}::* path resolving unchanged.
+// crate::{profiles,swap,lms}::* path resolving unchanged. (2.0, #1405: the
+// `runtime` module — the legacy openclaw config-file patcher — was removed.)
 pub use darkmux_profiles::lms;
 pub use darkmux_profiles::profiles;
-pub use darkmux_profiles::runtime;
 pub use darkmux_profiles::swap;
 // #463 workspace split — types extracted to the darkmux-types crate. The
 // re-export keeps all existing `crate::types::*` paths resolving unchanged.
@@ -92,9 +92,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Swap the LMStudio stack to a profile. With `--runtime openclaw`, ALSO
-    /// patches openclaw's config to match; the default leaves
-    /// `~/.openclaw/openclaw.json` untouched.
+    /// Swap the LMStudio stack to a profile. Touches ONLY LMStudio — no
+    /// other config file is read or written.
     Swap {
         /// Name of the profile to swap to (from profiles.json).
         #[arg(required = false)]
@@ -111,14 +110,6 @@ enum Cmd {
         dry_run: bool,
         #[arg(long, short = 'q')]
         quiet: bool,
-        /// Dispatch runtime this profile targets. `internal` (default) — swap
-        /// loads LMStudio and touches NOTHING else. `openclaw` — ALSO patch
-        /// `~/.openclaw/openclaw.json` to match the profile (model pins,
-        /// contextWindow sync, namespaced registry entries). Openclaw config
-        /// is patched on explicit opt-in only, never via passive file-presence
-        /// — mirrors `crew dispatch` / `lab run` (#590 openclaw independence).
-        #[arg(long, default_value = "internal")]
-        runtime: String,
     },
     /// Show what's loaded and which profile (if any) it matches.
     Status {
@@ -158,28 +149,13 @@ enum Cmd {
     /// Run pre-flight diagnostic checks. Verifies the local setup (profile
     /// registry, LMStudio, models, runtime, RAM, power) and reports
     /// pass/warn/fail with actionable hints. Exit 0 if no failures, else 1.
-    ///
-    /// By default only runs internal-runtime-relevant checks. Pass
-    /// `--include-openclaw` to also run checks against
-    /// ~/.openclaw/openclaw.json (model pin drift, runtime binary
-    /// discovery, version, agent definitions). See DESIGN.md "Schema
-    /// isolation: each runtime owns its own config".
     Doctor {
         /// Attempt to auto-apply known-safe fixes for failing or warning
-        /// checks where a handler is registered (currently:
-        /// `eureka: ctx-window-mismatch` realigns openclaw.json
-        /// `contextWindow` values to match what `lms ps` reports). After
-        /// the fixes run, doctor re-evaluates and prints the updated report.
+        /// checks where a handler is registered. No handlers are registered
+        /// today (#1405 removed the sole handler, which patched the legacy
+        /// openclaw runtime's config file); reserved for future fixes.
         #[arg(long)]
         fix: bool,
-        /// (#393) Include openclaw-specific checks.
-        /// Default: doctor output is internal-runtime-only. With this
-        /// flag, also runs checks against ~/.openclaw/openclaw.json
-        /// (model pin drift, runtime binary discovery, version, agent
-        /// definitions). See DESIGN.md "Schema isolation: each runtime
-        /// owns its own config".
-        #[arg(long)]
-        include_openclaw: bool,
         /// (#1130) Print every check. Default output is issues-only — the
         /// build identity line + any warnings/failures, with the passing
         /// checks collapsed to a count. Use `-v` to see the full list.
@@ -228,8 +204,7 @@ enum Cmd {
         #[command(subcommand)]
         sub: FleetCmd,
     },
-    /// Crew subcommands — dispatch a role for a single turn, or reconcile
-    /// the openclaw agent registry with the on-disk crew manifests.
+    /// Crew subcommands — dispatch a role for a single turn.
     Crew {
         #[command(subcommand)]
         sub: CrewCmd,
@@ -434,11 +409,9 @@ enum CrewCmd {
         id: String,
     },
     /// Dispatch a single turn to the named role. Loads the role manifest +
-    /// `.md` system prompt and runs the role through the **internal runtime**
-    /// by default — a per-dispatch `darkmux-runtime` Docker container with the
-    /// assembled message. Pass `--runtime openclaw` to opt into the openclaw
-    /// shell-out path instead (which pre-flight-verifies the `darkmux/<role-id>`
-    /// openclaw agent matches the manifest, then invokes `openclaw agent`).
+    /// `.md` system prompt and runs the role through the in-house container-
+    /// bounded runtime — a per-dispatch `darkmux-runtime` Docker container
+    /// with the assembled message.
     Dispatch {
         /// Role id (e.g. `code-reviewer`). Must have a manifest at
         /// `templates/builtin/roles/<id>.json` (or under
@@ -470,50 +443,30 @@ enum CrewCmd {
         #[arg(long)]
         profile: Option<String>,
         /// Optional delivery target in `<channel>:<target>` form
-        /// (e.g. `discord:1500166601909993503`). When set, openclaw's
-        /// reply is delivered to that channel in addition to being
-        /// returned on stdout.
+        /// (e.g. `discord:1500166601909993503`). Reserved for a future
+        /// delivery integration — not consumed by the internal runtime today.
         #[arg(long)]
         deliver: Option<String>,
         /// Override the dispatch session id. Default: a fresh
         /// `crew-dispatch-<role>-<unix-micros>-<process-counter>` is
         /// generated per call, so consecutive dispatches don't share
-        /// openclaw session state (which would otherwise pollute one
-        /// task with another's context).
+        /// session state (which would otherwise pollute one task with
+        /// another's context).
         #[arg(long)]
         session_id: Option<String>,
         /// Timeout in seconds (default: 600).
         #[arg(long, default_value = "600")]
         timeout: u32,
-        /// Path to snapshot for the post-dispatch state echo (#89 — SIGNOFF
-        /// verification visibility). Repeatable: pass `--watch` multiple
-        /// times to capture multiple directories. If omitted, defaults to
-        /// the role's openclaw workspace dir (~/.openclaw/workspace-darkmux-<role>/).
-        /// After the dispatch returns, the dispatcher walks each path
-        /// (top-level + one level deep) and emits a stderr summary of
-        /// regular files + sizes so the operator can compare the actual
-        /// state on disk against the SIGNOFF block's "files written" claims.
-        #[arg(long = "watch", value_name = "PATH")]
-        watch: Vec<std::path::PathBuf>,
         /// Explicit working directory override (#143). When set, the
-        /// dispatcher creates/replaces a `repo` symlink in the role's
-        /// openclaw workspace pointing at this path, so the agent
-        /// operates against the operator-named scope. When omitted, the
-        /// dispatcher does NOT touch the workspace — whatever symlink
-        /// already exists (or none at all) is what the agent sees. Per
-        /// the operator-sovereignty contract: darkmux doesn't auto-
-        /// fabricate scope, but it also doesn't auto-strip scope the
-        /// operator has set up manually.
+        /// internal runtime mounts this path into the container as the
+        /// workspace, so the agent operates against the operator-named
+        /// scope. When omitted, a fresh ephemeral tempdir is used.
         #[arg(long = "workdir", value_name = "PATH")]
         workdir: Option<std::path::PathBuf>,
-        /// Phase id binding this dispatch to a phase in a mission
-        /// (#146 Stage 1). When set, the dispatcher reads the phase's
-        /// `depends_on` parents and prepends each recorded output as a
-        /// "Prior phase outputs" context block on the message. After
-        /// the dispatch returns, the agent's reply text is persisted to
-        /// `<crew_root>/phases/<phase-id>-output.txt` so downstream
-        /// phases can read it on their own dispatch. One-hop only —
-        /// transitive ancestors are not walked (Stage 1 scope).
+        /// Phase id binding this dispatch to a phase in a mission (#714).
+        /// When set, every flow record this dispatch emits carries
+        /// `mission_id`/`phase_id` so the observability view groups it
+        /// under its mission.
         #[arg(long = "phase-id", value_name = "ID")]
         phase_id: Option<String>,
         /// Skip the pre-flight checks. Use only for debugging.
@@ -522,28 +475,8 @@ enum CrewCmd {
         /// Emit the runtime's response as a machine-parseable JSON
         /// envelope on stdout, with status lines routed to stderr.
         /// Schema: `{ result, final_assistant, metrics, trajectory_path }`.
-        /// Today only the internal runtime honors this flag; the
-        /// openclaw path emits its own JSON envelope regardless.
         #[arg(long)]
         json: bool,
-        /// Which agent runtime to dispatch through. The default
-        /// `internal` path is darkmux's in-house container-bounded
-        /// Rust runtime at `runtime/` (Alpine docker container with
-        /// kernel-enforced workspace path isolation). `openclaw`
-        /// opts into the legacy shell-out path — available for
-        /// operators who already use openclaw or want the runtime
-        /// the article-series numbers were measured against. See
-        /// `runtime/README.md` for the internal runtime's scope.
-        #[arg(long, default_value = "internal")]
-        runtime: String,
-        /// Executable to invoke for the openclaw shell-out (Phase-E
-        /// replacement for the removed `DARKMUX_RUNTIME_CMD` env var).
-        /// Defaults to `openclaw`; override to point at Aider, Cline,
-        /// or any tool exposing the `<cmd> agent --agent <id> --json
-        /// ...` calling convention. **Only consulted when `--runtime
-        /// openclaw`** — the internal runtime ignores this flag.
-        #[arg(long = "runtime-cmd", value_name = "PATH", default_value = "openclaw")]
-        runtime_cmd: String,
         /// Advisory target machine for the dispatch (#246 PR-C.3). When
         /// set to an id that's NOT the local `DARKMUX_MACHINE_ID`, the
         /// dispatch is published to the single global fleet work queue
@@ -573,7 +506,7 @@ enum CrewCmd {
         /// inner verify loop. No per-language darkmux images. The image needs
         /// `bash` + coreutils (debian/ubuntu-family have them; bare-alpine
         /// needs them added). Local dispatch only: ignored on
-        /// `--runtime openclaw` and on cross-machine `--machine` dispatch.
+        /// cross-machine `--machine` dispatch.
         #[arg(long, value_name = "TAG")]
         image: Option<String>,
         /// (#1199) Cap the completion tokens of a single-shot hosted dispatch
@@ -582,18 +515,6 @@ enum CrewCmd {
         /// No effect on container-path dispatches (local or agentic-remote).
         #[arg(long, value_name = "N")]
         max_completion_tokens: Option<u32>,
-    },
-    /// Reconcile openclaw's `agents.list[]` with the crew role manifests.
-    /// For every role with both a JSON manifest and a `.md` prompt, ensures
-    /// a `darkmux/<role-id>` openclaw agent exists with the manifest's
-    /// system prompt + tool palette. Idempotent.
-    Sync {
-        /// Skip the diff preview and write directly.
-        #[arg(long, short = 'y')]
-        yes: bool,
-        /// Show what would change without writing.
-        #[arg(long, short = 'n')]
-        dry_run: bool,
     },
     /// SQLite-backed derived index over crew manifests (Phase B of #45).
     /// The index is derived state — JSON manifests under the crew root are
@@ -1140,12 +1061,9 @@ enum NotebookCmd {
     /// Draft a notebook entry from a recorded run via the active role.
     Draft {
         run_id: String,
-        /// DM role id to dispatch the drafting prompt through (Phase-H
-        /// rename from `--agent`; Beat 36 — DM concepts primary on
-        /// DM-side surfaces). Resolves through
-        /// `templates/builtin/roles/<role>.{json,md}` under the
-        /// internal runtime; under `--runtime openclaw` it's passed
-        /// verbatim to openclaw's `--agent <id>` flag.
+        /// DM role id to dispatch the drafting prompt through. Resolves
+        /// through `templates/builtin/roles/<role>.{json,md}` under the
+        /// in-house container-bounded runtime.
         #[arg(long, default_value = "scribe")]
         role: String,
         /// Override the entry's filename slug (default derived from workload + run id).
@@ -1157,16 +1075,6 @@ enum NotebookCmd {
         /// Override the machine id (overrides DARKMUX_MACHINE_ID env var).
         #[arg(long)]
         machine: Option<String>,
-        /// Which agent runtime to dispatch through. Default `internal`
-        /// is darkmux's in-house container-bounded runtime (Phase-H
-        /// — Beat 36 finish); `openclaw` opts into the legacy
-        /// shell-out path.
-        #[arg(long, default_value = "internal")]
-        runtime: String,
-        /// Executable to invoke for the openclaw shell-out (Phase-E
-        /// pattern). Only consulted when `--runtime openclaw`.
-        #[arg(long = "runtime-cmd", value_name = "PATH", default_value = "openclaw")]
-        runtime_cmd: String,
     },
     /// List notebook entries (parsed from entry headers).
     ///
@@ -1313,21 +1221,6 @@ enum LabCmd {
         profiles: Option<String>,
         #[arg(long, short = 'q')]
         quiet: bool,
-        /// Which agent runtime to dispatch through. Default `internal`
-        /// is darkmux's in-house container-bounded Rust runtime.
-        /// `openclaw` opts into the legacy shell-out path. Beat 36
-        /// directional principle: openclaw is a downstream translation
-        /// target the operator opts into per dispatch.
-        #[arg(long, default_value = "internal")]
-        runtime: String,
-        /// Executable to invoke for the openclaw shell-out (Phase-E
-        /// replacement for the removed `DARKMUX_RUNTIME_CMD` env var).
-        /// Defaults to `openclaw`; override to point at Aider, Cline,
-        /// or any tool exposing the `<cmd> agent --message` calling
-        /// convention. **Only consulted when `--runtime openclaw`** —
-        /// the internal runtime ignores this flag.
-        #[arg(long = "runtime-cmd", value_name = "PATH", default_value = "openclaw")]
-        runtime_cmd: String,
     },
     /// PR-reviewer eval (#1119) — run the `pr-reviewer` role over a labeled
     /// diff corpus and score precision / recall / verdict / anchor against the
@@ -1599,17 +1492,14 @@ fn run(cmd: Cmd) -> Result<i32> {
             profiles,
             dry_run,
             quiet,
-            runtime,
             recommended,
-        } => cmd_swap(profile.as_deref(), profiles.as_deref(), dry_run, quiet, &runtime, recommended),
+        } => cmd_swap(profile.as_deref(), profiles.as_deref(), dry_run, quiet, recommended),
         Cmd::Status { profiles, json } => cmd_status(profiles.as_deref(), json),
         Cmd::Profiles { profiles, json } => cmd_profiles(profiles.as_deref(), json),
         Cmd::Lab { sub } => cmd_lab(sub),
         Cmd::Skills { sub } => cmd_skills(sub),
         Cmd::Notebook { sub } => cmd_notebook(sub),
-        Cmd::Doctor { fix, include_openclaw, verbose, probe } => {
-            cmd_doctor(fix, include_openclaw, verbose, probe)
-        }
+        Cmd::Doctor { fix, verbose, probe } => cmd_doctor(fix, verbose, probe),
         Cmd::Scan { profiles } => cmd_scan(profiles.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
@@ -1887,27 +1777,14 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
             slug,
             dry_run,
             machine,
-            runtime,
-            runtime_cmd,
         } => {
-            let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
-            // Phase-E loud-bail gate: --runtime-cmd is only valid under
-            // --runtime openclaw. Silent ignore would re-introduce the
-            // implicit-state pattern Phase-E removed.
-            if runtime_flag != crew::dispatch::Runtime::Openclaw && runtime_cmd != "openclaw" {
-                anyhow::bail!(
-                    "--runtime-cmd `{runtime_cmd}` is only valid with --runtime openclaw \
-                     (got --runtime {runtime}). Either drop --runtime-cmd, or add --runtime openclaw."
-                );
-            }
             let report = notebook::draft_entry(&notebook::DraftOptions {
                 run_id,
                 role,
                 slug,
                 dry_run,
                 machine_override: machine,
-                runtime: runtime_flag,
-                runtime_cmd,
+                runtime: crew::dispatch::Runtime::Internal,
             })?;
             println!("source run: {}", report.run_dir.display());
             println!("entry path: {}", report.entry_path.display());
@@ -1955,8 +1832,8 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
     }
 }
 
-fn cmd_doctor(fix: bool, include_openclaw: bool, verbose: bool, probe: bool) -> Result<i32> {
-    let mut report = doctor::run(include_openclaw);
+fn cmd_doctor(fix: bool, verbose: bool, probe: bool) -> Result<i32> {
+    let mut report = doctor::run();
     // (#1177) Opt-in live endpoint probes append to the same report so they
     // share the verdict/exit-code path — a failed probe exits 1 like any
     // failed check. Probed ONCE per invocation: the --fix re-evaluation
@@ -1989,7 +1866,7 @@ fn cmd_doctor(fix: bool, include_openclaw: bool, verbose: bool, probe: bool) -> 
             println!();
             println!("Re-running doctor…");
             println!();
-            let mut report2 = doctor::run(include_openclaw);
+            let mut report2 = doctor::run();
             // Carry the ORIGINAL probe results into the re-evaluated report —
             // not re-probed (cost), but a probe failure must still fail the
             // final exit code.
@@ -2533,9 +2410,8 @@ fn cmd_mission_dispatch(
             Some(phase.id.clone()),
             // Mission dispatch publishes work jobs to peers; the runner
             // on the receiving machine runs the role through the
-            // internal Docker-bounded runtime (same default as local
-            // dispatch — Beat 36 directional principle, openclaw
-            // optional everywhere).
+            // internal Docker-bounded runtime — the only dispatch path
+            // (#1405).
             crate::crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4) — mission dispatch uses the runner's default
             timeout_seconds,
@@ -3125,13 +3001,10 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             deliver,
             session_id,
             timeout,
-            watch,
             workdir,
             phase_id,
             skip_preflight,
             json,
-            runtime,
-            runtime_cmd,
             machine,
             no_wait,
             image,
@@ -3151,30 +3024,6 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                     anyhow::bail!("a message is required: pass --message or --message-from-file");
                 }
             };
-            // CLI default: if the operator didn't supply --watch, watch the
-            // role's openclaw workspace dir. Library callers (e.g.
-            // phase_cli) pass an empty Vec directly to opt out.
-            let watch_paths = if watch.is_empty() {
-                vec![crew::dispatch::default_workspace_for_role(&role)]
-            } else {
-                watch
-            };
-            // Parse --runtime <openclaw|internal>; default internal.
-            // `internal` routes to the in-house container-bounded
-            // runtime (see `runtime/`); `openclaw` is the opt-in
-            // shell-out path.
-            let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
-            // Phase-E QA: bail loud when --runtime-cmd is set without
-            // --runtime openclaw. The flag is only consulted by the
-            // openclaw shell-out; silently ignoring it under Internal
-            // would re-introduce the "implicit state surprising the
-            // operator" pattern Phase-E removed.
-            if runtime_flag != crew::dispatch::Runtime::Openclaw && runtime_cmd != "openclaw" {
-                anyhow::bail!(
-                    "--runtime-cmd `{runtime_cmd}` is only valid with --runtime openclaw \
-                     (got --runtime {runtime}). Either drop --runtime-cmd, or add --runtime openclaw."
-                );
-            }
             let opts = crew::dispatch::DispatchOpts {
                 role_id: role,
                 message,
@@ -3183,11 +3032,9 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 timeout_seconds: timeout,
                 skip_preflight,
                 json,
-                watch_paths,
                 workdir,
                 phase_id,
-                runtime: runtime_flag,
-                runtime_cmd,
+                runtime: crew::dispatch::Runtime::Internal,
                 machine,
                 wait: !no_wait,
                 // Bare `crew dispatch` carries no profile-derived compaction
@@ -3220,108 +3067,21 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 model_base_url_override: None,
             };
             let result = fleet::dispatch_routed(opts)?;
-            // Announce the resolved session id on stderr so operators see
-            // which session openclaw was pointed at — without polluting
-            // the --json envelope on stdout that orchestrators parse.
+            // Announce the resolved session id on stderr so operators can
+            // correlate this dispatch with the flow stream — without
+            // polluting the --json envelope on stdout that orchestrators
+            // parse.
             eprintln!("darkmux crew dispatch: session id `{}`", result.session_id);
-            // Stream both stdout (openclaw's --json envelope) and stderr to
-            // the caller — the orchestrator parses one or the other.
             print!("{}", result.stdout);
             if !result.stderr.is_empty() {
                 eprint!("{}", result.stderr);
             }
-            // Surface the post-dispatch filesystem state at watched paths
-            // (#89). Ground-truth signal next to the SIGNOFF block's
-            // "files written" claims; operator/orchestrator compares.
-            print_watched_state(&result.watched_state);
             Ok(result.exit_code)
         }
         CrewCmd::Index { sub } => match sub {
             CrewIndexCmd::Rebuild => crew::index::rebuild().map(|_| 0),
             CrewIndexCmd::Status => crew::index::status().map(|_| 0),
         },
-        CrewCmd::Sync { yes, dry_run } => {
-            // (#893) `crew sync` mutates operator-owned ~/.openclaw/openclaw.json,
-            // so it must not write without explicit confirmation. Default
-            // (no flags) = preview the diff + bail with a re-run hint;
-            // `--dry-run` = explicit preview (exit 0); `--yes` = apply.
-            // Follows `mission migrate`'s preview-then-confirm pattern, with a
-            // non-zero exit when changes are pending so the unwritten state is
-            // unmissable in scripts.
-            let write = yes && !dry_run;
-            let opts = crew::dispatch::SyncOpts { dry_run: !write };
-            let result = crew::dispatch::sync(opts)?;
-            let pending = result.added.len() + result.updated.len();
-            let (add_v, upd_v) = if write {
-                ("added", "updated")
-            } else {
-                ("would add", "would update")
-            };
-            let trail = if write {
-                ""
-            } else if dry_run {
-                " [DRY RUN]"
-            } else {
-                " [PREVIEW]"
-            };
-            println!(
-                "crew sync{trail}: {add_v} {a}, {upd_v} {u}, unchanged {un}, skipped (no .md prompt) {sn}",
-                a = result.added.len(),
-                u = result.updated.len(),
-                un = result.unchanged.len(),
-                sn = result.skipped_no_prompt.len(),
-            );
-            for id in &result.added {
-                println!("  + {id}");
-            }
-            for id in &result.updated {
-                println!("  ~ {id}");
-            }
-            for id in &result.skipped_no_prompt {
-                println!("  · {id} (no .md prompt)");
-            }
-            // Default (no --yes, no --dry-run) with pending changes: refuse to
-            // write, point at --yes. A bare `--dry-run` is an explicit preview
-            // and exits 0 even with pending changes.
-            if !write && !dry_run && pending > 0 {
-                anyhow::bail!(
-                    "crew sync: {pending} pending change(s) NOT applied to openclaw.json — \
-                     re-run `darkmux crew sync --yes` to write them (or `--dry-run` to just preview)"
-                );
-            }
-            Ok(0)
-        }
-    }
-}
-
-/// Render the post-dispatch watched-state summary to stderr. The output's
-/// purpose is to give the operator/orchestrator a ground-truth view of
-/// the filesystem at the watched paths so they can compare against any
-/// "files written" claims in the SIGNOFF block (#89).
-fn print_watched_state(states: &[crew::dispatch::WatchedPathState]) {
-    if states.is_empty() {
-        return;
-    }
-    eprintln!("darkmux crew dispatch: post-dispatch state at watched paths:");
-    for s in states {
-        if s.unreachable {
-            eprintln!("  {} (unreachable — path does not exist)", s.root.display());
-            continue;
-        }
-        if s.files.is_empty() {
-            eprintln!("  {}: (no files)", s.root.display());
-            continue;
-        }
-        eprintln!("  {}:", s.root.display());
-        for f in &s.files {
-            let rel = f.path.strip_prefix(&s.root).unwrap_or(&f.path);
-            eprintln!("    {:>10}  {}", f.size, rel.display());
-        }
-        eprintln!(
-            "    ({} file{})",
-            s.files.len(),
-            if s.files.len() == 1 { "" } else { "s" }
-        );
     }
 }
 
@@ -3475,12 +3235,7 @@ fn cmd_model_pull_recommended() -> Result<i32> {
 /// recommendation status isn't `Validated`, or when the prescribed
 /// models aren't downloaded (with a one-command-fix pointer to
 /// `darkmux model pull-recommended`). (#159)
-fn cmd_swap_recommended(
-    config: Option<&str>,
-    dry_run: bool,
-    quiet: bool,
-    runtime: &str,
-) -> Result<i32> {
+fn cmd_swap_recommended(config: Option<&str>, dry_run: bool, quiet: bool) -> Result<i32> {
     let rec = recommendations::for_active_hardware()?;
     if !quiet {
         println!(
@@ -3532,7 +3287,7 @@ fn cmd_swap_recommended(
             rec.bake_off_url.as_deref().unwrap_or("no url"),
         );
     }
-    cmd_swap(Some(profile_name), config, dry_run, quiet, runtime, false)
+    cmd_swap(Some(profile_name), config, dry_run, quiet, false)
 }
 
 fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
@@ -3717,13 +3472,12 @@ fn cmd_swap(
     config: Option<&str>,
     dry_run: bool,
     quiet: bool,
-    runtime: &str,
     recommended: bool,
 ) -> Result<i32> {
     // `swap --recommended` — short-circuit to the recommendation-
     // registry-driven dispatcher rather than looking up a profile.
     if recommended {
-        return cmd_swap_recommended(config, dry_run, quiet, runtime);
+        return cmd_swap_recommended(config, dry_run, quiet);
     }
     let Some(profile_name) = profile_name else {
         eprintln!("darkmux: specify a profile name to swap to, or pass --recommended");
@@ -3737,29 +3491,13 @@ fn cmd_swap(
             loaded.path.display()
         );
     }
-    // (#590) Openclaw config is patched only when the operator explicitly
-    // names openclaw (`--runtime openclaw`). The default (`internal`) leaves
-    // ~/.openclaw/openclaw.json untouched — file-presence is not opt-in.
-    let patch_openclaw =
-        crew::dispatch::Runtime::parse(runtime)? == crew::dispatch::Runtime::Openclaw;
-    let result = swap::swap(
-        profile,
-        &loaded.registry,
-        swap::SwapOpts {
-            quiet,
-            dry_run,
-            patch_openclaw,
-        },
-    )?;
+    let result = swap::swap(profile, &loaded.registry, swap::SwapOpts { quiet, dry_run })?;
     if !quiet {
         let mut bits = vec![
             format!("done in {}ms", result.walltime_ms),
             format!("unloaded {}", result.unloaded.len()),
             format!("loaded {}", result.loaded.len()),
         ];
-        if result.runtime_modified {
-            bits.push("runtime patched".to_string());
-        }
         if result.hooks_ran > 0 {
             bits.push(format!("{} hook(s)", result.hooks_ran));
         }
@@ -3962,28 +3700,14 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             runs,
             profiles,
             quiet,
-            runtime,
-            runtime_cmd,
         } => {
-            let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
-            // Phase-E QA: bail loud when --runtime-cmd is set without
-            // --runtime openclaw — see CrewCmd::Dispatch for the same
-            // gate; doctrine is "no implicit state, operator-explicit
-            // intent only" (Beat 36).
-            if runtime_flag != crew::dispatch::Runtime::Openclaw && runtime_cmd != "openclaw" {
-                anyhow::bail!(
-                    "--runtime-cmd `{runtime_cmd}` is only valid with --runtime openclaw \
-                     (got --runtime {runtime}). Either drop --runtime-cmd, or add --runtime openclaw."
-                );
-            }
             let outcomes = lab::run::lab_run(lab::run::RunOpts {
                 workload_id: workload,
                 profile_name: profile,
                 runs,
                 config_path: profiles,
                 quiet,
-                runtime: runtime_flag,
-                runtime_cmd,
+                runtime: crew::dispatch::Runtime::Internal,
                 loop_override: None,
                 inject_context: None,
             })?;
@@ -4346,7 +4070,6 @@ fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
             config_path: args.profiles.clone(),
             quiet: args.json,
             runtime: crew::dispatch::Runtime::Internal,
-            runtime_cmd: "openclaw".to_string(),
             // When no compaction flag was set, pass `None` so the dispatch takes
             // the exact `lab run` compaction path (caps still apply via env).
             loop_override: if loop_override.is_empty() {
