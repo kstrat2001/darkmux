@@ -102,7 +102,42 @@ fn run(cmd: Cmd) -> Result<i32> {
             json: cli::JsonFlag { json },
         } => cmd_status(profiles.as_deref(), json),
         Cmd::Lab { sub } => lab_cli::cmd_lab(sub),
-        Cmd::Skills { sub } => cmd_skills(sub),
+        // (#1426) `dispatch` promoted to a top-level verb — the task-grain
+        // execution entry. Relocated out of the `crew` family (`crew dispatch`
+        // retired) with the message reshaped to a positional + stdin source.
+        Cmd::Dispatch {
+            role,
+            message,
+            message_from_file,
+            profile,
+            deliver,
+            session_id,
+            timeout,
+            workdir,
+            phase_id,
+            skip_preflight,
+            json,
+            machine,
+            no_wait,
+            image,
+            max_completion_tokens,
+        } => cmd_dispatch(DispatchInvocation {
+            role,
+            message,
+            message_from_file,
+            profile,
+            deliver,
+            session_id,
+            timeout,
+            workdir,
+            phase_id,
+            skip_preflight,
+            json,
+            machine,
+            no_wait,
+            image,
+            max_completion_tokens,
+        }),
         Cmd::Doctor { verbose, probe } => cmd_doctor(verbose, probe),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
@@ -1285,96 +1320,135 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
         CrewCmd::List => crew::cli::crew_list(),
         CrewCmd::Show { id } => crew::cli::crew_show(&id),
-        CrewCmd::Dispatch {
-            role,
-            message,
-            message_from_file,
-            profile,
-            deliver,
-            session_id,
-            timeout,
-            workdir,
-            phase_id,
-            skip_preflight,
-            json,
-            machine,
-            no_wait,
-            image,
-            max_completion_tokens,
-        } => {
-            // (#386) Resolve the message: exactly one of --message /
-            // --message-from-file is present (clap enforces the xor). Read the
-            // file when given so a substantial brief never has to fit on the
-            // command line.
-            let message = match (message, message_from_file) {
-                (Some(m), _) => m,
-                (None, Some(path)) => std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading --message-from-file {}", path.display()))?,
-                (None, None) => {
-                    // Unreachable in practice (clap's required_unless_present),
-                    // but fail loud rather than dispatch an empty brief.
-                    anyhow::bail!("a message is required: pass --message or --message-from-file");
-                }
-            };
-            let opts = crew::dispatch::DispatchOpts {
-                role_id: role,
-                message,
-                deliver,
-                session_id,
-                timeout_seconds: timeout,
-                skip_preflight,
-                json,
-                workdir,
-                phase_id,
-                runtime: crew::dispatch::Runtime::Internal,
-                machine,
-                wait: !no_wait,
-                // Bare `crew dispatch` carries no profile-derived compaction
-                // config here; the internal dispatch fills the runtime-
-                // required context window from the resolved `default_profile`
-                // (#632 — the runtime has no built-in context-window default),
-                // so a `default()` is safe. Lab + phase paths derive the
-                // full compaction config from the profile up front.
-                compaction: crew::dispatch::CompactionDispatchArgs::default(),
-                // (#1054) `--profile <name>` selects a named profile from the
-                // machine's registry; when omitted (None) or undefined on this
-                // machine, model + context-window resolution fall back to the
-                // registry's `default_profile`. The lab path passes its own
-                // resolved name.
-                profile_name: profile,
-                // (#984) No --profiles-file here; dispatch resolves env > default.
-                config_path: None,
-                // (#1199) force_container stays programmatic (bench-only);
-                // the completion cap is operator-facing for long single-shot
-                // outputs (e.g. many-finding hosted reviews).
-                force_container: false,
-                max_completion_tokens,
-                // (#703) operator-selected dispatch image; darkmux injects
-                // its runtime binary into it when it's not the default.
-                image,
-                // Mock-model harness (v1): no CLI surface yet (deliberately —
-                // see darkmux's CLAUDE.md doctrine on shipping the underlying
-                // mechanism before the CLI verb). `None` on every operator-
-                // facing dispatch.
-                model_base_url_override: None,
-            };
-            let result = fleet::dispatch_routed(opts)?;
-            // Announce the resolved session id on stderr so operators can
-            // correlate this dispatch with the flow stream — without
-            // polluting the --json envelope on stdout that orchestrators
-            // parse.
-            eprintln!("darkmux crew dispatch: session id `{}`", result.session_id);
-            print!("{}", result.stdout);
-            if !result.stderr.is_empty() {
-                eprint!("{}", result.stderr);
-            }
-            Ok(result.exit_code)
-        }
         CrewCmd::Index { sub } => match sub {
             CrewIndexCmd::Rebuild => crew::index::rebuild().map(|_| 0),
             CrewIndexCmd::Status => crew::index::status().map(|_| 0),
         },
     }
+}
+
+/// (#1426) Owned fields of the top-level `dispatch` verb — a plain carrier so
+/// the handler takes ONE argument (clippy `too_many_arguments`) rather than
+/// the fifteen the clap variant unpacks into.
+struct DispatchInvocation {
+    role: String,
+    message: Option<String>,
+    message_from_file: Option<std::path::PathBuf>,
+    profile: Option<String>,
+    deliver: Option<String>,
+    session_id: Option<String>,
+    timeout: u32,
+    workdir: Option<std::path::PathBuf>,
+    phase_id: Option<String>,
+    skip_preflight: bool,
+    json: bool,
+    machine: Option<String>,
+    no_wait: bool,
+    image: Option<String>,
+    max_completion_tokens: Option<u32>,
+}
+
+/// (#1426) `darkmux dispatch <role> [MESSAGE]` — the task-grain execution
+/// entry, promoted from the retired `crew dispatch`. The plumbing is unchanged
+/// (`fleet::dispatch_routed`); only the message source is reshaped: the message
+/// is a positional argument, falls back to stdin when omitted, and can still be
+/// read from a file via `--message-from-file`.
+fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
+    let DispatchInvocation {
+        role,
+        message,
+        message_from_file,
+        profile,
+        deliver,
+        session_id,
+        timeout,
+        workdir,
+        phase_id,
+        skip_preflight,
+        json,
+        machine,
+        no_wait,
+        image,
+        max_completion_tokens,
+    } = inv;
+    // (#1426) Resolve the message in precedence order: positional MESSAGE >
+    // `--message-from-file` > stdin. clap makes the positional and the file
+    // flag mutually exclusive, so at most one of the first two is present.
+    // When neither is given, read stdin to EOF byte-faithfully (no trim) so
+    // pipe composition works: `git diff | darkmux dispatch pr-reviewer`. A
+    // terminal stdin with no piped input would block forever waiting for EOF,
+    // so refuse loudly with usage guidance instead of hanging.
+    let message = match (message, message_from_file) {
+        (Some(m), _) => m,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .with_context(|| format!("reading --message-from-file {}", path.display()))?,
+        (None, None) => {
+            use std::io::{IsTerminal, Read};
+            if std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "no message given. Pass it as the positional MESSAGE argument \
+                     (`darkmux dispatch {role} \"<message>\"`), pipe it on stdin \
+                     (`git diff | darkmux dispatch {role}`), or use \
+                     `--message-from-file <path>`. For a message that begins with \
+                     `-`, use the `--` separator: `darkmux dispatch {role} -- <message>`."
+                );
+            }
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading the dispatch message from stdin")?;
+            buf
+        }
+    };
+    let opts = crew::dispatch::DispatchOpts {
+        role_id: role,
+        message,
+        deliver,
+        session_id,
+        timeout_seconds: timeout,
+        skip_preflight,
+        json,
+        workdir,
+        phase_id,
+        runtime: crew::dispatch::Runtime::Internal,
+        machine,
+        wait: !no_wait,
+        // A bare `dispatch` carries no profile-derived compaction config here;
+        // the internal dispatch fills the runtime-required context window from
+        // the resolved `default_profile` (#632 — the runtime has no built-in
+        // context-window default), so a `default()` is safe. Lab + phase paths
+        // derive the full compaction config from the profile up front.
+        compaction: crew::dispatch::CompactionDispatchArgs::default(),
+        // (#1054) `--profile <name>` selects a named profile from the machine's
+        // registry; when omitted (None) or undefined on this machine, model +
+        // context-window resolution fall back to the registry's
+        // `default_profile`. The lab path passes its own resolved name.
+        profile_name: profile,
+        // (#984) No --profiles-file here; dispatch resolves env > default.
+        config_path: None,
+        // (#1199) force_container stays programmatic (bench-only); the
+        // completion cap is operator-facing for long single-shot outputs
+        // (e.g. many-finding hosted reviews).
+        force_container: false,
+        max_completion_tokens,
+        // (#703) operator-selected dispatch image; darkmux injects its runtime
+        // binary into it when it's not the default.
+        image,
+        // Mock-model harness (v1): no CLI surface yet (deliberately — see
+        // darkmux's CLAUDE.md doctrine on shipping the underlying mechanism
+        // before the CLI verb). `None` on every operator-facing dispatch.
+        model_base_url_override: None,
+    };
+    let result = fleet::dispatch_routed(opts)?;
+    // Announce the resolved session id on stderr so operators can correlate
+    // this dispatch with the flow stream — without polluting the --json
+    // envelope on stdout that orchestrators parse.
+    eprintln!("darkmux dispatch: session id `{}`", result.session_id);
+    print!("{}", result.stdout);
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr);
+    }
+    Ok(result.exit_code)
 }
 
 fn cmd_model(sub: ModelCmd) -> Result<i32> {
@@ -1920,72 +1994,6 @@ fn cmd_profiles(config: Option<&str>, json: bool) -> Result<i32> {
         }
     }
     Ok(0)
-}
-
-fn cmd_skills(sub: SkillsCmd) -> Result<i32> {
-    match sub {
-        SkillsCmd::Install {
-            target,
-            force,
-            dry_run,
-        } => {
-            let report = skills::install_skills(&skills::InstallOptions {
-                target,
-                force,
-                dry_run,
-                // (#1426) The standalone `skills install` verb keeps its
-                // force-gated overwrite behavior; only `darkmux init` opts into
-                // the darkmux-* refresh.
-                refresh_darkmux: false,
-            })?;
-            println!("source: {}", report.source.display());
-            println!(
-                "targets: {}",
-                report
-                    .targets
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            if !report.installed.is_empty() {
-                println!(
-                    "installed ({}): {}",
-                    report.installed.len(),
-                    report.installed.join(", ")
-                );
-            }
-            if !report.overwritten.is_empty() {
-                println!(
-                    "overwritten ({}): {}",
-                    report.overwritten.len(),
-                    report.overwritten.join(", ")
-                );
-            }
-            if !report.skipped.is_empty() {
-                println!(
-                    "skipped (already exists, use --force to overwrite) ({}): {}",
-                    report.skipped.len(),
-                    report.skipped.join(", ")
-                );
-            }
-            if dry_run {
-                println!("[DRY RUN — nothing was written]");
-            }
-            Ok(0)
-        }
-        SkillsCmd::List { target } => {
-            let listed = skills::list_installed_skills(target.as_deref())?;
-            if listed.is_empty() {
-                println!("(no skills installed)");
-            } else {
-                for n in listed {
-                    println!("{n}");
-                }
-            }
-            Ok(0)
-        }
-    }
 }
 
 #[cfg(test)]

@@ -99,10 +99,118 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: LabCmd,
     },
-    /// Manage agent-invokable skills bundled with darkmux.
-    Skills {
-        #[command(subcommand)]
-        sub: SkillsCmd,
+    /// Dispatch a single turn to the named role — the task-grain execution
+    /// entry point (#1426). Loads the role manifest + `.md` system prompt and
+    /// runs the role through the in-house container-bounded runtime (a
+    /// per-dispatch `darkmux-runtime` Docker container) with the assembled
+    /// message.
+    ///
+    /// The MESSAGE is positional. When it is omitted, darkmux reads the
+    /// message from stdin, so a diff pipes straight in:
+    /// `git diff | darkmux dispatch pr-reviewer`. For a message that begins
+    /// with `-`, use the standard `--` separator:
+    /// `darkmux dispatch coder -- --version bump`.
+    Dispatch {
+        /// Role id (e.g. `code-reviewer`). Must have a manifest at
+        /// `templates/builtin/roles/<id>.json` (or under
+        /// `~/.darkmux/roles/`) AND a sibling `.md` prompt file.
+        role: String,
+        /// Message body for the dispatch (positional). When omitted, the
+        /// message is read from stdin (`git diff | darkmux dispatch
+        /// pr-reviewer`); darkmux refuses to run if stdin is a terminal and
+        /// no message was given, rather than hang waiting for input. A
+        /// message that begins with `-` needs the standard `--` separator:
+        /// `darkmux dispatch coder -- -starts-with-dash`.
+        message: Option<String>,
+        /// (#386) Read the message body from a file instead of the positional
+        /// argument or stdin — for substantial briefs that would exceed the
+        /// shell's ARG_MAX or clutter `ps`/shell history. The brief is passed
+        /// to the runtime via a bind-mounted file, so it never lands on the
+        /// `docker run` argv either. Conflicts with the positional MESSAGE.
+        #[arg(long = "message-from-file", value_name = "PATH", conflicts_with = "message")]
+        message_from_file: Option<std::path::PathBuf>,
+        /// (#1054) Select a named profile from the machine's registry for this
+        /// dispatch's model + context-window resolution, instead of the
+        /// registry's `default_profile`. When the named profile isn't defined
+        /// on this machine, the dispatch falls back to `default_profile` (with
+        /// a note). Lets a machine-agnostic caller (e.g. the self-review CI
+        /// workflow) NAME the profile it wants while each machine owns which
+        /// lab-validated model that profile maps to.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Optional delivery target in `<channel>:<target>` form
+        /// (e.g. `discord:1500166601909993503`). Reserved for a future
+        /// delivery integration — not consumed by the internal runtime today.
+        #[arg(long)]
+        deliver: Option<String>,
+        /// Override the dispatch session id. Default: a fresh
+        /// `crew-dispatch-<role>-<unix-micros>-<process-counter>` is
+        /// generated per call, so consecutive dispatches don't share
+        /// session state (which would otherwise pollute one task with
+        /// another's context).
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Timeout in seconds (default: 600).
+        #[arg(long, default_value = "600")]
+        timeout: u32,
+        /// Explicit working directory override (#143). When set, the
+        /// internal runtime mounts this path into the container as the
+        /// workspace, so the agent operates against the operator-named
+        /// scope. When omitted, a fresh ephemeral tempdir is used.
+        #[arg(long = "workdir", value_name = "PATH")]
+        workdir: Option<std::path::PathBuf>,
+        /// Phase id binding this dispatch to a phase in a mission (#714).
+        /// When set, every flow record this dispatch emits carries
+        /// `mission_id`/`phase_id` so the observability view groups it
+        /// under its mission.
+        #[arg(long = "phase-id", value_name = "ID")]
+        phase_id: Option<String>,
+        /// Skip the pre-flight checks. Use only for debugging.
+        #[arg(long, hide = true)]
+        skip_preflight: bool,
+        /// Emit the runtime's response as a machine-parseable JSON
+        /// envelope on stdout, with status lines routed to stderr.
+        /// Schema: `{ result, final_assistant, metrics, trajectory_path }`.
+        #[arg(long)]
+        json: bool,
+        /// Advisory target machine for the dispatch (#246 PR-C.3). When
+        /// set to an id that's NOT the local `DARKMUX_MACHINE_ID`, the
+        /// dispatch is published to the single global fleet work queue
+        /// (`darkmux:work`) and the first available runner picks it up.
+        /// The id is an advisory hint (#590): any runner may claim it;
+        /// a non-target runner logs a soft warning and proceeds. When
+        /// omitted, the dispatch runs locally. Requires
+        /// `DARKMUX_REDIS_URL` set on the dispatching machine +
+        /// `darkmux serve` running on the runner.
+        #[arg(long, value_name = "ID")]
+        machine: Option<String>,
+        /// Return immediately after publishing to the queue instead of
+        /// blocking on the runner's `dispatch.complete` (#246 PR-C.3).
+        /// Default is `--wait` (block) so today's "spawn, see result"
+        /// ergonomics are preserved. With `--no-wait`, the CLI prints
+        /// the `session_id` and exits 0; the operator polls completion
+        /// via `darkmux flow tail --session <id>` (or `darkmux mission
+        /// dispatch` for fan-out — PR-D). Ignored for local
+        /// dispatches (those are always synchronous).
+        #[arg(long)]
+        no_wait: bool,
+        /// (#703) Dispatch into a specific Docker image. Default:
+        /// `darkmux-runtime:latest` (slim — python + node). Pass ANY Linux
+        /// image (e.g. `rust:slim`, your project's own CI image) and darkmux
+        /// injects its static runtime binary into it, so the coder runs in
+        /// that environment and can `cargo check`/`test` in-sandbox — the
+        /// inner verify loop. No per-language darkmux images. The image needs
+        /// `bash` + coreutils (debian/ubuntu-family have them; bare-alpine
+        /// needs them added). Local dispatch only: ignored on
+        /// cross-machine `--machine` dispatch.
+        #[arg(long, value_name = "TAG")]
+        image: Option<String>,
+        /// (#1199) Cap the completion tokens of a single-shot hosted dispatch
+        /// (a tool-less role on a remote endpoint). Default 4096. Raise it
+        /// when a long output (e.g. a many-finding review) would truncate.
+        /// No effect on container-path dispatches (local or agentic-remote).
+        #[arg(long, value_name = "N")]
+        max_completion_tokens: Option<u32>,
     },
     /// Run pre-flight diagnostic checks. Verifies the local setup (profile
     /// registry, LMStudio, models, runtime, RAM, power) and reports
@@ -227,7 +335,9 @@ pub(crate) enum Cmd {
         lab_dir: Option<std::path::PathBuf>,
     },
     /// One-command setup: install skills, optionally add session-start hook
-    /// and CLAUDE.md integration so Claude Code knows about darkmux.
+    /// and CLAUDE.md integration so Claude Code knows about darkmux. Safe to
+    /// re-run; refreshes the bundled skills after a darkmux upgrade (#1426 —
+    /// `darkmux doctor` flags stale darkmux-* skills and points here).
     Init {
         /// Add a SessionStart hook to ~/.claude/settings.json that runs
         /// `darkmux status` so Claude sees the current stack at session start.
@@ -266,7 +376,6 @@ pub(crate) enum RecommendationsCmd {
     },
 }
 
-#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub(crate) enum CrewCmd {
     /// List every crew in the index.
@@ -275,114 +384,6 @@ pub(crate) enum CrewCmd {
     Show {
         /// Crew id to show.
         id: String,
-    },
-    /// Dispatch a single turn to the named role. Loads the role manifest +
-    /// `.md` system prompt and runs the role through the in-house container-
-    /// bounded runtime — a per-dispatch `darkmux-runtime` Docker container
-    /// with the assembled message.
-    Dispatch {
-        /// Role id (e.g. `code-reviewer`). Must have a manifest at
-        /// `templates/builtin/roles/<id>.json` (or under
-        /// `~/.darkmux/roles/`) AND a sibling `.md` prompt file.
-        role: String,
-        /// Message body for the dispatch. Mutually exclusive with
-        /// `--message-from-file`; exactly one of the two is required.
-        #[arg(
-            long,
-            short = 'm',
-            required_unless_present = "message_from_file",
-            conflicts_with = "message_from_file"
-        )]
-        message: Option<String>,
-        /// (#386) Read the message body from a file instead of the command
-        /// line — for substantial briefs that would exceed the shell's
-        /// ARG_MAX or clutter `ps`/shell history. Mutually exclusive with
-        /// `--message`. The brief is passed to the runtime via a bind-mounted
-        /// file, so it never lands on the `docker run` argv either.
-        #[arg(long = "message-from-file", value_name = "PATH")]
-        message_from_file: Option<std::path::PathBuf>,
-        /// (#1054) Select a named profile from the machine's registry for this
-        /// dispatch's model + context-window resolution, instead of the
-        /// registry's `default_profile`. When the named profile isn't defined
-        /// on this machine, the dispatch falls back to `default_profile` (with
-        /// a note). Lets a machine-agnostic caller (e.g. the self-review CI
-        /// workflow) NAME the profile it wants while each machine owns which
-        /// lab-validated model that profile maps to.
-        #[arg(long)]
-        profile: Option<String>,
-        /// Optional delivery target in `<channel>:<target>` form
-        /// (e.g. `discord:1500166601909993503`). Reserved for a future
-        /// delivery integration — not consumed by the internal runtime today.
-        #[arg(long)]
-        deliver: Option<String>,
-        /// Override the dispatch session id. Default: a fresh
-        /// `crew-dispatch-<role>-<unix-micros>-<process-counter>` is
-        /// generated per call, so consecutive dispatches don't share
-        /// session state (which would otherwise pollute one task with
-        /// another's context).
-        #[arg(long)]
-        session_id: Option<String>,
-        /// Timeout in seconds (default: 600).
-        #[arg(long, default_value = "600")]
-        timeout: u32,
-        /// Explicit working directory override (#143). When set, the
-        /// internal runtime mounts this path into the container as the
-        /// workspace, so the agent operates against the operator-named
-        /// scope. When omitted, a fresh ephemeral tempdir is used.
-        #[arg(long = "workdir", value_name = "PATH")]
-        workdir: Option<std::path::PathBuf>,
-        /// Phase id binding this dispatch to a phase in a mission (#714).
-        /// When set, every flow record this dispatch emits carries
-        /// `mission_id`/`phase_id` so the observability view groups it
-        /// under its mission.
-        #[arg(long = "phase-id", value_name = "ID")]
-        phase_id: Option<String>,
-        /// Skip the pre-flight checks. Use only for debugging.
-        #[arg(long, hide = true)]
-        skip_preflight: bool,
-        /// Emit the runtime's response as a machine-parseable JSON
-        /// envelope on stdout, with status lines routed to stderr.
-        /// Schema: `{ result, final_assistant, metrics, trajectory_path }`.
-        #[arg(long)]
-        json: bool,
-        /// Advisory target machine for the dispatch (#246 PR-C.3). When
-        /// set to an id that's NOT the local `DARKMUX_MACHINE_ID`, the
-        /// dispatch is published to the single global fleet work queue
-        /// (`darkmux:work`) and the first available runner picks it up.
-        /// The id is an advisory hint (#590): any runner may claim it;
-        /// a non-target runner logs a soft warning and proceeds. When
-        /// omitted, the dispatch runs locally. Requires
-        /// `DARKMUX_REDIS_URL` set on the dispatching machine +
-        /// `darkmux serve` running on the runner.
-        #[arg(long, value_name = "ID")]
-        machine: Option<String>,
-        /// Return immediately after publishing to the queue instead of
-        /// blocking on the runner's `dispatch.complete` (#246 PR-C.3).
-        /// Default is `--wait` (block) so today's "spawn, see result"
-        /// ergonomics are preserved. With `--no-wait`, the CLI prints
-        /// the `session_id` and exits 0; the operator polls completion
-        /// via `darkmux flow tail --session <id>` (or `darkmux mission
-        /// dispatch` for fan-out — PR-D). Ignored for local
-        /// dispatches (those are always synchronous).
-        #[arg(long)]
-        no_wait: bool,
-        /// (#703) Dispatch into a specific Docker image. Default:
-        /// `darkmux-runtime:latest` (slim — python + node). Pass ANY Linux
-        /// image (e.g. `rust:slim`, your project's own CI image) and darkmux
-        /// injects its static runtime binary into it, so the coder runs in
-        /// that environment and can `cargo check`/`test` in-sandbox — the
-        /// inner verify loop. No per-language darkmux images. The image needs
-        /// `bash` + coreutils (debian/ubuntu-family have them; bare-alpine
-        /// needs them added). Local dispatch only: ignored on
-        /// cross-machine `--machine` dispatch.
-        #[arg(long, value_name = "TAG")]
-        image: Option<String>,
-        /// (#1199) Cap the completion tokens of a single-shot hosted dispatch
-        /// (a tool-less role on a remote endpoint). Default 4096. Raise it
-        /// when a long output (e.g. a many-finding review) would truncate.
-        /// No effect on container-path dispatches (local or agentic-remote).
-        #[arg(long, value_name = "N")]
-        max_completion_tokens: Option<u32>,
     },
     /// SQLite-backed derived index over crew manifests (Phase B of #45).
     /// The index is derived state — JSON manifests under the crew root are
@@ -1068,27 +1069,6 @@ pub(crate) enum LessonsCmd {
         file: Option<String>,
         #[command(flatten)]
         json: JsonFlagPlain,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum SkillsCmd {
-    /// Copy bundled skills into a Claude Code (or compatible) skills dir.
-    Install {
-        /// Target dir (default: ~/.claude/skills/darkmux/).
-        #[arg(long)]
-        target: Option<std::path::PathBuf>,
-        /// Overwrite existing SKILL.md files.
-        #[arg(long, short = 'f')]
-        force: bool,
-        /// Show what would be installed without writing.
-        #[arg(long, short = 'n')]
-        dry_run: bool,
-    },
-    /// List currently-installed skills under the target dir.
-    List {
-        #[arg(long)]
-        target: Option<std::path::PathBuf>,
     },
 }
 
