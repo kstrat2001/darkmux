@@ -416,8 +416,8 @@ pub fn launch(
     // (#1406, F4) A scheduler-level `Err` mid-run would otherwise `?`-return
     // here with NO finalize, stranding the mission Active with `Running`
     // phases + steps forever. Reconcile the stranded steps and drive the
-    // mission to a terminal Error status BEFORE propagating the failure —
-    // the failure is still surfaced to the caller (loud, non-zero exit), the
+    // mission to a terminal Error status BEFORE propagating the failure.
+    // The failure is still surfaced to the caller (loud, non-zero exit); the
     // mission board just no longer lies about a dead run being active.
     if let Err(e) = graph_result {
         reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e);
@@ -1258,7 +1258,7 @@ pub(crate) fn lazy_start_phase_for_step(
 /// - any step left non-terminal (`Running`/`Planned`) → Abandoned
 ///
 /// A phase is `Complete` ONLY when it genuinely finished. Everything else is
-/// honestly Abandoned — `PhaseOutcomeKind` has no `Error` variant, so an
+/// honestly Abandoned; `PhaseOutcomeKind` has no `Error` variant, so an
 /// errored phase abandons, matching the existing terminal status vocabulary.
 /// Only phases that actually had tasks in this run are named (a phase with no
 /// tasks is a freeform/manual phase this launcher doesn't drive).
@@ -1280,7 +1280,7 @@ fn derive_phase_outcomes(
                 .flat_map(|t| t.step_ids.iter().map(String::as_str))
                 .collect();
             if phase_step_ids.is_empty() {
-                // Not an executed phase (no tasks/steps) — nothing to finalize.
+                // Not an executed phase (no tasks/steps), so nothing to finalize.
                 return None;
             }
             let phase_steps: Vec<&crew::types::Step> =
@@ -1291,8 +1291,8 @@ fn derive_phase_outcomes(
         .collect()
 }
 
-/// (#1406) The per-phase outcome + provenance for one phase's step slice —
-/// see [`derive_phase_outcomes`] for the rules.
+/// (#1406) The per-phase outcome + provenance for one phase's step slice.
+/// See [`derive_phase_outcomes`] for the rules.
 fn phase_finalization(phase_steps: &[&crew::types::Step]) -> (crew::envelope::PhaseOutcomeKind, Option<String>) {
     use crew::envelope::PhaseOutcomeKind;
     let errored = phase_steps.iter().filter(|s| s.status == NodeStatus::Error).count();
@@ -1314,7 +1314,7 @@ fn phase_finalization(phase_steps: &[&crew::types::Step]) -> (crew::envelope::Ph
 /// agnostic) status decision: every step Complete → Clean; some Complete
 /// and some Error → Degraded (real output produced, but part of the run was
 /// constrained); every relevant step Error (nothing completed) → Error.
-/// Per-phase finalization outcomes come from [`derive_phase_outcomes`] — the
+/// Per-phase finalization outcomes come from [`derive_phase_outcomes`]; the
 /// run-level `status` is NOT stamped uniformly onto every phase (#1406). See
 /// `envelope.rs`'s own module doc for the phase/mission-outcome mapping.
 fn build_envelope(
@@ -1360,7 +1360,7 @@ fn build_envelope(
         )
     };
 
-    // (#1406) Per-phase outcomes derived from each phase's OWN steps — NOT
+    // (#1406) Per-phase outcomes derived from each phase's OWN steps, NOT
     // the run-level `status` stamped uniformly (which marked a never-started
     // phase Complete on a Degraded run). `new(.., &[])` seeds the schema
     // version + defaults; the honest phases override the (empty) default.
@@ -1381,20 +1381,20 @@ fn build_envelope(
 /// kind lookup failure, a `run_bounded` failure) propagates through
 /// `run_step_graph`'s `?` BEFORE the normal finalize runs, leaving steps
 /// persisted as `Running` and the mission Active with `Running` phases
-/// forever — the same stranded-Active drift class an operator hit at scale
+/// forever: the same stranded-Active drift class an operator hit at scale
 /// (10 Active missions whose phases were stranded `running` with no process
 /// behind them, mobile report 2026-07-16). This brings the failed run to an
 /// honest terminal state, exactly as the review launcher already does by
 /// always finalizing off its captured `Result` (never `?`-propagating past
 /// the finalize): flip every still-`Running` step to `Error` (persisting it),
 /// then finalize the mission with an Error-status envelope whose PER-PHASE
-/// outcomes come from each phase's own steps ([`derive_phase_outcomes`]) — a
+/// outcomes come from each phase's own steps ([`derive_phase_outcomes`]), so a
 /// phase that fully completed before the failure still reads `Complete`;
 /// everything the failure interrupted or never reached abandons.
 ///
 /// Best-effort throughout, matching [`crew::envelope::finalize_mission`]'s
 /// own discipline: the caller still propagates the original `Err`, so the
-/// failure is never swallowed — a persistence hiccup here degrades only the
+/// failure is never swallowed; a persistence hiccup here degrades only the
 /// mission-board VIEW.
 fn reconcile_and_finalize_on_error(
     mission_id: &str,
@@ -2173,10 +2173,10 @@ mod tests {
         );
     }
 
-    // ── (#1406) Honest finalize — per-phase outcomes from step statuses ──
+    // ── (#1406) Honest finalize: per-phase outcomes from step statuses ──
 
     /// A single-step `Task` bound to `phase_real_id`, whose one step is
-    /// `step_id` — the minimal shape [`derive_phase_outcomes`] /
+    /// `step_id`: the minimal shape [`derive_phase_outcomes`] /
     /// [`build_envelope`] read.
     fn task_with_step(phase_real_id: &str, step_id: &str) -> crew::types::Task {
         crew::types::Task {
@@ -2194,7 +2194,7 @@ mod tests {
     }
 
     /// Seed an Active mission on disk with the named phases at the given
-    /// statuses — so a finalize/reconcile test can assert the on-disk end
+    /// statuses, so a finalize/reconcile test can assert the on-disk end
     /// state agrees with the envelope.
     fn seed_mission_with_phases(mission_id: &str, phases: &[(&str, PhaseStatus)]) {
         let now = 1_700_000_000u64;
@@ -2257,7 +2257,7 @@ mod tests {
     #[serial_test::serial]
     fn build_envelope_clean_run_completes_every_phase_unchanged() {
         // (#1406) A Clean run is unaffected by the per-phase derivation:
-        // every phase's steps all completed, so every phase reads Complete —
+        // every phase's steps all completed, so every phase reads Complete,
         // identical to the retired uniform mapping's result for a clean run.
         let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
         let mid = "gen3clean";
@@ -2282,7 +2282,7 @@ mod tests {
         // (#1406) End to end: build the honest envelope for the issue's
         // scenario and finalize it against seeded disk state, asserting the
         // mission Closes with p1 Complete, p2 terminal-not-complete, p3
-        // Abandoned — no phase left Planned inside a Closed mission — and the
+        // Abandoned (no phase left Planned inside a Closed mission), and the
         // persisted envelope.json agrees with the phase files.
         let _guard = LaunchTestGuard::new();
         let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
@@ -2312,7 +2312,7 @@ mod tests {
         assert_ne!(
             phase_status_on_disk(mid, &rp3),
             PhaseStatus::Planned,
-            "p3 must NEVER be left Planned inside a Closed mission — the #1406 bug"
+            "p3 must NEVER be left Planned inside a Closed mission (the #1406 bug)"
         );
         assert_eq!(phase_status_on_disk(mid, &rp3), PhaseStatus::Abandoned);
         assert_eq!(mission_status_on_disk(mid), MissionStatus::Closed);
@@ -2355,13 +2355,13 @@ mod tests {
         let err = anyhow::anyhow!("step kind `mission.bogus` is not registered");
         reconcile_and_finalize_on_error(mid, &config, &real, &tasks, &mut steps, &err);
 
-        // The mid-run Running step flipped to Error, in memory AND on disk —
+        // The mid-run Running step flipped to Error, in memory AND on disk;
         // no step is stranded Running.
         assert_eq!(steps["p2-step"].status, NodeStatus::Error, "the Running step flips to Error in memory");
         assert_eq!(
             crew::lifecycle::load_step(mid, &rp2, "p2-step").unwrap().status,
             NodeStatus::Error,
-            "the flip is persisted — no Running step survives the failure path"
+            "the flip is persisted; no Running step survives the failure path"
         );
 
         // The mission reaches a terminal status with honest per-phase

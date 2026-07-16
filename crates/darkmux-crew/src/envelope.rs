@@ -226,15 +226,15 @@ impl MissionEnvelope {
 ///
 /// (#1406) A refused phase transition is NO LONGER silently swallowed
 /// (`let _`). The underlying `lifecycle` verbs are idempotent-safe via their
-/// own state-machine guards, so a BENIGN no-op — the phase is already in the
-/// terminal state the declared outcome asks for (e.g. a reopen re-finalizing
-/// a phase a prior run already completed) — stays quiet. But a GENUINE drift
-/// refusal — the phase is in a state the declared outcome can't reach (e.g. a
-/// `Planned` phase asked to `Complete`, the exact #1406 bug the honest
-/// per-phase derivation upstream is meant to prevent) — is surfaced as a loud
-/// warning naming the phase, the intended outcome, and the refusal, instead
-/// of leaving a Closed mission whose envelope disagrees with disk with no
-/// signal. This function still applies the declared outcome and lets
+/// own state-machine guards, so a BENIGN no-op (the phase is already in the
+/// terminal state the declared outcome asks for, e.g. a reopen re-finalizing
+/// a phase a prior run already completed) stays quiet. But a GENUINE drift
+/// refusal, where the phase is in a state the declared outcome can't reach
+/// (e.g. a `Planned` phase asked to `Complete`, the exact #1406 bug the
+/// honest per-phase derivation upstream is meant to prevent), is surfaced as
+/// a loud warning naming the phase, the intended outcome, and the refusal,
+/// instead of leaving a Closed mission whose envelope disagrees with disk
+/// with no signal. This function still applies the declared outcome and lets
 /// `lifecycle` do the legality check; it only inspects current state to
 /// classify a refusal, never to gate the transition.
 ///
@@ -264,8 +264,8 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
             );
             if !already_terminal {
                 eprintln!(
-                    "warning: mission `{}` finalize could not drive phase `{}` to {:?}: {e:#} \
-                     — phase left as-is; reconcile with `darkmux phase` verbs (#1406)",
+                    "warning: mission `{}` finalize could not drive phase `{}` to {:?}: {e:#}; \
+                     phase left as-is, reconcile with `darkmux phase` verbs (#1406)",
                     envelope.mission_id, phase.phase_id, phase.outcome
                 );
             }
