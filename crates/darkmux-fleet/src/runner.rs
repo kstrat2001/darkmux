@@ -156,17 +156,18 @@ fn runner_main() {
                 // (#903) A poison entry: claimed into this consumer's PEL but
                 // unparseable, so it can NEVER be dispatched. ACK it to drop it
                 // from the pending-entries list — otherwise it sits pending
-                // forever (the `>` cursor never redelivers it). Log loudly: a
-                // malformed entry means a buggy or hostile peer published it —
-                // or, more likely, plain version skew (#1405: a pre-2.0 peer
-                // publishing the retired openclaw runtime lands here).
+                // forever (the `>` cursor never redelivers it) and the loop
+                // keeps going to the next entry. Log loudly: a malformed entry
+                // means a buggy or hostile peer published it, or, most likely,
+                // plain schema-version skew (#1426 ship-3: a pre-4 peer's job
+                // fails the version-first gate and lands here with a reason that
+                // NAMES the version and the fix).
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
                         "darkmux-runner: dropping work entry {work_id} ({reason}) — malformed \
-                         or from an incompatible darkmux version (e.g. a pre-2.0 peer \
-                         publishing a retired runtime); XACK to clear it from the \
-                         pending-entries list"
+                         or from an incompatible darkmux schema version; XACK to clear it \
+                         from the pending-entries list and continue the claim loop"
                     ))
                 );
                 let _ = ack_job(&client, RUNNER_CONSUMER_GROUP, &work_id);
@@ -308,7 +309,6 @@ impl WorkJob {
         DispatchOpts {
             role_id: self.role_id,
             message: self.message,
-            deliver: self.deliver,
             session_id: Some(self.session_id),
             timeout_seconds: self.timeout_seconds,
             skip_preflight: false,
@@ -320,7 +320,6 @@ impl WorkJob {
             json: false,
             workdir: self.workdir.map(PathBuf::from),
             phase_id: self.phase_id,
-            runtime: self.runtime,
             // Runner-side opts: never recurse into the queue (would
             // ping-pong jobs back to redis); always run local synchronous.
             machine: None,

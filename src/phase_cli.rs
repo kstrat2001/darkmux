@@ -1040,7 +1040,6 @@ pub(crate) fn phase_review_output_at(
     let dispatch_opts = crate::crew::dispatch::DispatchOpts {
         role_id: "code-reviewer".to_string(),
         message: prompt,
-        deliver: None,
         session_id: Some(session_id.clone()),
         timeout_seconds: 600,
         skip_preflight: false,
@@ -1057,7 +1056,6 @@ pub(crate) fn phase_review_output_at(
         phase_id: None,
         // Phase review dispatches through the internal Docker-bounded
         // runtime — the only dispatch path (#309, #1405).
-        runtime: crate::crew::dispatch::Runtime::Internal,
         machine: None,
         wait: true,
         // Phase dispatch defaults to runtime's built-in compaction;

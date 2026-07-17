@@ -18,10 +18,6 @@ pub struct RunOpts {
     pub runs: u32,
     pub config_path: Option<String>,
     pub quiet: bool,
-    /// Which agent runtime to dispatch the workload through. The
-    /// in-house container-bounded runtime (`Runtime::Internal`) is the
-    /// only value (#1405 removed the legacy `openclaw` shell-out runtime).
-    pub runtime: darkmux_crew::dispatch::Runtime,
     /// (#986) Loop lab: per-run compaction overrides applied on top of the
     /// resolved profile's compaction config. `None` (the `lab run` /
     /// `characterize` / `tune` paths) leaves the profile intact, so those
@@ -247,7 +243,6 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         };
 
         let provider_id = loaded_workload.manifest.workload.provider.clone();
-        let runtime = opts.runtime;
         // (#488) Phase 1 — provider operates against the per-run
         // sandbox, not the source. Provider has no awareness of the
         // COW step; it just gets a sandbox dir and works against it.
@@ -259,7 +254,6 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 &per_run_sandbox_dir,
                 profile,
                 &profile_name,
-                runtime,
                 opts.config_path.as_deref(),
                 opts.loop_override.as_ref(),
             )
@@ -981,7 +975,6 @@ mod tests {
             runs: 1,
             config_path: Some(cfg.to_str().unwrap().into()),
             quiet: true,
-            runtime: darkmux_crew::dispatch::Runtime::Internal,
             loop_override: None,
             inject_context: None,
         })

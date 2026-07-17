@@ -246,7 +246,6 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
     let opts = crate::crew::dispatch::DispatchOpts {
         role_id: "mission-compiler".to_string(),
         message,
-        deliver: None,
         session_id: None,
         timeout_seconds: 600,
         skip_preflight: false,
@@ -261,7 +260,6 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // Mission propose is a system-level utility dispatch; runs
         // through the internal Docker-bounded runtime — the only
         // dispatch path (#309, #1405).
-        runtime: crate::crew::dispatch::Runtime::Internal,
         machine: None,
         wait: true,
         // Mission-compile dispatch uses runtime-default compaction;

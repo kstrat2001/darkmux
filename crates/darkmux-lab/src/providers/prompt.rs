@@ -39,7 +39,6 @@ impl WorkloadProvider for PromptProvider {
         _sandbox_dir: &Path,
         profile: &Profile,
         profile_name: &str,
-        runtime: darkmux_crew::dispatch::Runtime,
         config_path: Option<&str>,
         // (#986) The prompt provider runs trivial single-prompt workloads with
         // no compaction config to override — the loop lab targets coding-task
@@ -57,9 +56,6 @@ impl WorkloadProvider for PromptProvider {
                 .unwrap_or(0)
         );
 
-        // `Runtime` has a single variant post-#1405 (the legacy `openclaw`
-        // shell-out runtime was removed).
-        let darkmux_crew::dispatch::Runtime::Internal = runtime;
         let started = std::time::Instant::now();
         let (stdout, stderr, ok) = dispatch_via_internal(
             &role,
@@ -174,18 +170,16 @@ fn dispatch_via_internal(
     config_path: Option<&str>,
     profile_name: &str,
 ) -> Result<(String, String, bool)> {
-    use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
+    use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
         role_id: role_id.to_string(),
         message: prompt.to_string(),
-        deliver: None,
         session_id: Some(session_id.to_string()),
         timeout_seconds: 3600,
         skip_preflight: false,
         json: true,
         workdir: None,
         phase_id: None,
-        runtime: Runtime::Internal,
         machine: None,
         wait: true,
         // Prompt-only workloads don't accumulate context across turns

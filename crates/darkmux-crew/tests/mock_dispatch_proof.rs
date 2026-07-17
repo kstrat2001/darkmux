@@ -1,8 +1,8 @@
 //! Real end-to-end mock-dispatch proof (mock-model harness, v1, item 4).
 //!
-//! Runs `darkmux_crew::dispatch::dispatch(DispatchOpts { runtime:
-//! Runtime::Internal, .. })` — the SAME function `darkmux dispatch` /
-//! `darkmux mission run` / `darkmux phase review` call — for real:
+//! Runs `darkmux_crew::dispatch::dispatch(DispatchOpts { .. })`, the SAME
+//! function `darkmux dispatch` / `darkmux mission run` / `darkmux phase
+//! review` call, for real:
 //!
 //!   - a REAL, genuinely separate OS process (`tools/darkmux-mock-model`)
 //!     is spawned and reached over a real TCP socket, standing in for
@@ -39,7 +39,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts, Runtime};
+use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts};
 
 /// Repo root, resolved from this crate's own manifest dir at compile time —
 /// `crates/darkmux-crew` → repo root is two levels up.
@@ -191,14 +191,12 @@ fn run_mock_dispatch(
     let opts = DispatchOpts {
         role_id: "analyst".to_string(),
         message: message.to_string(),
-        deliver: None,
         session_id: Some(session_id.clone()),
         timeout_seconds: 120,
         skip_preflight: true,
         json: true,
         workdir: None,
         phase_id: None,
-        runtime: Runtime::Internal,
         machine: None,
         wait: true,
         compaction: CompactionDispatchArgs::default(),
