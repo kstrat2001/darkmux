@@ -232,8 +232,8 @@ fn memory_family_carries_both_kinds() {
 }
 
 /// (#1426 ship-4) `mission run` retired — the coder pipeline runs through
-/// `mission launch coder-phase`. `mission` survives (launch/ship/abort/…), so
-/// the error is an unknown SUB-verb WITHIN the surviving family. No compat
+/// `mission launch coder-phase`. `mission` survives (launch/finalize/abort/…),
+/// so the error is an unknown SUB-verb WITHIN the surviving family. No compat
 /// alias (pre-2.0 clean removal).
 #[test]
 fn retired_mission_run_subverb_is_unknown() {
@@ -244,6 +244,101 @@ fn retired_mission_run_subverb_is_unknown() {
         .stderr(predicate::str::contains("unrecognized subcommand").or(
             predicate::str::contains("unexpected argument"),
         ));
+}
+
+/// (#1463) The `phase` top-level verb family retired ENTIRELY: `estimate` +
+/// `review` + the `start`/`complete`/`abandon` lifecycle trio. Every spelling —
+/// the bare family and each old sub-verb — is now an unknown TOP-LEVEL verb with
+/// no compat alias (pre-2.0 clean removal). (`mission add-phase` is a DIFFERENT,
+/// surviving verb — it is NOT `darkmux phase`; see the mission-surface test.)
+#[test]
+fn retired_phase_family_is_unknown_entirely() {
+    for args in [
+        vec!["phase"],
+        vec!["phase", "estimate", "spec.json"],
+        vec!["phase", "review"],
+        vec!["phase", "start", "s1"],
+        vec!["phase", "complete", "s1"],
+        vec!["phase", "abandon", "s1"],
+    ] {
+        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        cmd.args(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unrecognized subcommand").or(
+                predicate::str::contains("unexpected argument"),
+            ));
+    }
+}
+
+/// (#1463) `mission ship` retired (the frontier does git/gh by hand, then
+/// `mission finalize`) and `mission close` renamed to `mission finalize`. Both
+/// old spellings are now unknown SUB-verbs within the surviving `mission`
+/// family. No compat alias (pre-2.0 clean removal).
+#[test]
+fn retired_mission_ship_and_close_subverbs_are_unknown() {
+    for args in [
+        vec!["mission", "ship", "some-mission"],
+        vec!["mission", "close", "some-mission"],
+    ] {
+        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        cmd.args(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unrecognized subcommand").or(
+                predicate::str::contains("unexpected argument"),
+            ));
+    }
+}
+
+/// (#1463) The replacement surface EXISTS: the `mission` family lists `finalize`
+/// and `abort` (the two whole-mission terminals) and keeps `add-phase`, while
+/// `ship`/`close` are gone. Proves the rename landed — a change that dropped
+/// `finalize` or re-added `ship`/`close` can't pass both this and the
+/// retirement test above.
+#[test]
+fn mission_family_has_finalize_abort_addphase_but_not_ship_close() {
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["mission", "--help"])
+        .output()
+        .expect("mission --help runs");
+    let help = String::from_utf8_lossy(&out.stdout);
+    let mut verbs: Vec<String> = Vec::new();
+    let mut in_commands = false;
+    for line in help.lines() {
+        if line.trim_start().starts_with("Commands:") {
+            in_commands = true;
+            continue;
+        }
+        if !in_commands {
+            continue;
+        }
+        if line.trim().is_empty() || line.starts_with("Options:") {
+            break;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 || indent > 3 {
+            continue; // section header or a wrapped description line
+        }
+        if let Some(tok) = line.split_whitespace().next() {
+            if tok.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+                verbs.push(tok.to_string());
+            }
+        }
+    }
+    for present in ["finalize", "abort", "add-phase"] {
+        assert!(
+            verbs.iter().any(|v| v == present),
+            "mission help must list `{present}` (#1463); parsed verbs: {verbs:?}"
+        );
+    }
+    for gone in ["ship", "close"] {
+        assert!(
+            !verbs.iter().any(|v| v == gone),
+            "the `mission {gone}` verb must stay retired (#1463); parsed verbs: {verbs:?}"
+        );
+    }
 }
 
 /// (#1426 ship-4) VERBPAT drift guard: the `mission` family exposes NO `run`

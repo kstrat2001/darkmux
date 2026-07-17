@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Missions, phases, and dispatch: darkmux user guide</title>
-<meta name="description" content="Structured agentic work in darkmux: dispatch local-AI roles, track multi-step plans as missions and phases, drive QA via phase review.">
+<meta name="description" content="Structured agentic work in darkmux: dispatch local-AI roles, track multi-step plans as missions and phases, drive QA via the review funnel.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -28,7 +28,7 @@
   <div class="wrap">
     <div class="label">04 <span class="dot">·</span> advanced</div>
     <h1>Missions, phases, and dispatch</h1>
-    <p class="lede">The advanced agentic surface. Use darkmux's <em>crew</em> abstraction to dispatch local-AI roles (coder, code-reviewer, scribe), track multi-step work as <em>missions</em> made of <em>phases</em>, and run structured QA via <code>phase review</code>. Optional: everything in earlier sections works without these concepts.</p>
+    <p class="lede">The advanced agentic surface. Use darkmux's <em>crew</em> abstraction to dispatch local-AI roles (coder, code-reviewer, scribe), track multi-step work as <em>missions</em> made of <em>phases</em>, and run structured QA via the review funnel (<code>mission launch review</code>). Optional: everything in earlier sections works without these concepts.</p>
   </div>
 </header>
 
@@ -40,7 +40,7 @@
     <ul>
       <li><strong>Named local-AI roles</strong> with specific tool palettes and system prompts (a "coder" that can edit files; a "code-reviewer" that can only read; a "scribe" that drafts prose).</li>
       <li><strong>Multi-step plans with structure</strong>: missions that contain phases, dependencies, lifecycle state (planned/running/complete/abandoned).</li>
-      <li><strong>QA-by-default discipline</strong>: every implementation phase should pass through <code>phase review</code>, which dispatches a code-reviewer crew against the diff.</li>
+      <li><strong>QA-by-default discipline</strong>: every implementation phase should pass through the review funnel (<code>mission launch review</code>), which dispatches a code-reviewer crew against the diff.</li>
       <li><strong>Visible orchestration in the viewer</strong>: mission start, phase transitions, dispatch start/complete, verdict, all rendered as a timeline in <code>/flow</code>.</li>
     </ul>
   </div>
@@ -170,7 +170,7 @@ next: <code>darkmux mission launch draft-blog-post</code> to begin (or pass <cod
 
     <h3>Launching a config: <code>mission launch</code></h3>
     <pre><code>darkmux mission launch draft-blog-post</code></pre>
-    <p>This resolves the config (user tier first, then any on-disk template, then an embedded built-in), validates it, and mints a running mission INSTANCE: <code>mission.json</code>, one <code>phases/&lt;id&gt;.json</code> per declared phase, and a <code>config-snapshot.json</code>, a frozen copy of the resolved config alongside the instance, so a later edit to the source config never orphans an already-running instance's own record of what it ran. For a config whose phases have no tasks (as above), <code>launch</code> mints the instance and starts the mission, then leaves every phase transition operator-driven from there: <code>darkmux phase start draft-blog-post-s1-outline</code>, and so on, exactly as before.</p>
+    <p>This resolves the config (user tier first, then any on-disk template, then an embedded built-in), validates it, and mints a running mission INSTANCE: <code>mission.json</code>, one <code>phases/&lt;id&gt;.json</code> per declared phase, and a <code>config-snapshot.json</code>, a frozen copy of the resolved config alongside the instance, so a later edit to the source config never orphans an already-running instance's own record of what it ran. For a config whose phases have no tasks (as above), <code>launch</code> mints the instance and starts the mission, then leaves the work to you: do each phase by hand (or via ad-hoc <code>darkmux dispatch</code> calls), and when the whole mission is done, close it out with <code>darkmux mission finalize draft-blog-post</code> (or <code>darkmux mission abort draft-blog-post</code> to kill it). The mission graph derives phase status; the whole-mission terminals reconcile the phases for you.</p>
     <p>With no inputs supplied, the instance id IS the config id, so the follow-up commands use the same name you launched. When you pass <code>--input</code>/<code>--param</code> values, the instance id gets a short deterministic suffix derived from those values, so different inputs launch distinct instances; the launch output prints the exact id either way.</p>
     <p>A config can declare runtime-only <code>inputs</code> it needs from its launcher (see the built-in <code>coder-phase</code> config for a worked example: it needs a worktree path, a branch, and a base ref). Supply them with a JSON file or individual overrides:</p>
     <pre><code>darkmux mission launch coder-phase \
@@ -225,14 +225,10 @@ next: <code>darkmux mission launch draft-blog-post</code> to begin (or pass <cod
     <pre><code>darkmux mission launch draft-blog-post
 <span class="comment"># mission `draft-blog-post` minted, Active, phase `draft-blog-post-s1-outline` Planned</span></code></pre>
 
-    <h4>4. Drive the lifecycle</h4>
-    <pre><code>darkmux phase start draft-blog-post-s1-outline
-<span class="comment"># phase `draft-blog-post-s1-outline` → Running</span>
+    <h4>4. Do the work, then finalize</h4>
+    <pre><code><span class="comment"># …do the work, by hand or via `darkmux dispatch scribe ...`…</span>
 
-<span class="comment"># …do the work, by hand or via `darkmux dispatch scribe ...`…</span>
-
-darkmux phase complete draft-blog-post-s1-outline
-darkmux mission close draft-blog-post
+darkmux mission finalize draft-blog-post
 <span class="comment"># mission `draft-blog-post` → Closed   duration=&lt;wall-clock seconds&gt;</span></code></pre>
     <p>Every transition emits a flow record. Open <a href="../flow/">darkmux.com/flow/</a>, click <strong>Connect</strong>, and you'll see the cyan operator-tier records as the lifecycle moves.</p>
 
@@ -243,7 +239,7 @@ darkmux mission close draft-blog-post
   "name": "Japan Trip 2026-05",
   "description": "10-day Japan trip, May 20-30."
 }</code></pre>
-    <p>Then <code>darkmux mission launch japan-trip-2026-05</code> once, when the trip begins, and <code>darkmux mission close japan-trip-2026-05</code> when it ends. The viewer will show the wall-clock duration.</p>
+    <p>Then <code>darkmux mission launch japan-trip-2026-05</code> once, when the trip begins, and <code>darkmux mission finalize japan-trip-2026-05</code> when it ends. The viewer will show the wall-clock duration.</p>
 
     <p>You can also <code>mission add-phase</code> later if structure emerges mid-trip. The empty-phase mission grows into a decomposed one as needed.</p>
 
@@ -258,16 +254,12 @@ darkmux mission close draft-blog-post
 
     <h3>Drive the lifecycle</h3>
     <pre><code><span class="comment"># Mission state machine</span>
-darkmux mission start &lt;id&gt;        <span class="comment"># → Active (stamps started_ts)</span>
+darkmux mission launch &lt;config&gt;   <span class="comment"># mint + start the instance → Active (stamps started_ts)</span>
 darkmux mission pause &lt;id&gt;        <span class="comment"># Active → Paused</span>
 darkmux mission resume &lt;id&gt;       <span class="comment"># Paused → Active (paused_ts preserved)</span>
-darkmux mission close &lt;id&gt;        <span class="comment"># → Closed (terminal)</span>
-
-<span class="comment"># Phase state machine</span>
-darkmux phase start &lt;id&gt;         <span class="comment"># Planned/Abandoned → Running</span>
-darkmux phase complete &lt;id&gt;      <span class="comment"># Running → Complete (terminal)</span>
-darkmux phase abandon &lt;id&gt;       <span class="comment"># Planned/Running → Abandoned</span></code></pre>
-    <p>Every transition emits a flow record. Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> as you run these. The phase-progress widget in the header shows N/M done across active missions, and the record stream below shows the cyan operator-tier transitions in order.</p>
+darkmux mission finalize &lt;id&gt;     <span class="comment"># → Closed (success terminal: phases → Complete, worktrees torn down)</span>
+darkmux mission abort &lt;id&gt;        <span class="comment"># → Closed (kill terminal: phases → Abandoned, worktrees torn down)</span></code></pre>
+    <p>There's no manual per-phase lifecycle any more: the mission graph derives each phase's status, and the whole-mission terminals (<code>finalize</code>/<code>abort</code>) reconcile the phases for you. Every transition emits a flow record. Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> as you run these. The phase-progress widget in the header shows N/M done across active missions, and the record stream below shows the cyan operator-tier transitions in order.</p>
   </div>
 </section>
 
@@ -292,12 +284,9 @@ darkmux mission add-phase &lt;mission-id&gt; \
 
 <section>
   <div class="wrap">
-    <h2>Phase review: QA-by-default</h2>
-    <p><code>darkmux phase review</code> runs a code review against the current branch's diff vs. base. It dispatches the <code>code-reviewer</code> role, parses the structured QA-REVIEW-SIGNOFF block from the response, and emits a verdict.</p>
-    <pre><code>darkmux phase review                          <span class="comment"># review current branch vs auto-detected base</span>
-darkmux phase review --base main              <span class="comment"># explicit base</span>
-darkmux phase review --phase-id deploy-s1    <span class="comment"># tag the review with a phase id</span>
-darkmux phase review --require-clean          <span class="comment"># exit 1 if any blockers</span></code></pre>
+    <h2>Standalone QA: the review funnel</h2>
+    <p><code>darkmux mission launch review</code> runs a code review against the current branch's diff vs. base. It's a full funnel — bundle → probe → dedup → judge → verify → synthesis — that dispatches the <code>code-reviewer</code> role and emits a verdict. This is the standalone form of the same QA the <code>coder-phase</code> pipeline runs automatically at its sign-off gate.</p>
+    <pre><code>darkmux mission launch review     <span class="comment"># review the current branch's diff vs. the base branch</span></code></pre>
 
     <p>Verdict bucket reflects the worst severity found:</p>
     <ul>
@@ -305,31 +294,34 @@ darkmux phase review --require-clean          <span class="comment"># exit 1 if 
       <li><strong>flags-only</strong>: no blockers; flags and/or nits present.</li>
       <li><strong>blockers</strong>: at least one BLOCKER-severity finding.</li>
     </ul>
-    <p>Output is structured JSON with the full findings list. Use <code>--require-clean</code> in CI or pre-commit scripts that need to gate on clean reviews.</p>
+    <p>Output is structured JSON with the full findings list. Gate CI or pre-commit scripts on the verdict bucket when you need to require clean reviews.</p>
 
-    <p>The review emits its own flow records (Review category, frontier-tier for the orchestrator narrative, local-tier for the actual reviewer dispatch). Watch the viewer during a phase review to see the full cascade.</p>
+    <p>The review emits its own flow records (Review category, frontier-tier for the orchestrator narrative, local-tier for the actual reviewer dispatch). Watch the viewer during a review-funnel run to see the full cascade.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>The automated loop: <code>mission launch coder-phase</code> + <code>mission ship</code></h2>
-    <p>Everything the previous sections do by hand (create a worktree, dispatch a coder, review the diff, open a PR) has a built-in automated form. The built-in <code>coder-phase</code> mission config declares exactly that graph as data, so <code>darkmux mission launch coder-phase</code> mints an instance and takes it through a local sign-off gate in one call; <code>darkmux mission ship</code> finishes the loop from there. This is the recommended path for work shaped like "dispatch a coder, get a diff, review it." The manual dance above is still there for anything that doesn't fit that shape, or when you want to drive each step yourself.</p>
+    <h2>The automated loop: <code>mission launch coder-phase</code> + <code>mission finalize</code></h2>
+    <p>Everything the previous sections do by hand (create a worktree, dispatch a coder, review the diff) has a built-in automated form. The built-in <code>coder-phase</code> mission config declares exactly that graph as data, so <code>darkmux mission launch coder-phase</code> mints an instance and takes it through a local sign-off gate in one call; from there your frontier orchestrator ships the git work by hand and <code>darkmux mission finalize</code> closes it out. This is the recommended path for work shaped like "dispatch a coder, get a diff, review it." The manual dance above is still there for anything that doesn't fit that shape, or when you want to drive each step yourself.</p>
 
     <h3><code>mission launch coder-phase</code>: worktree → coder → QA, then stop</h3>
     <pre><code>darkmux mission launch coder-phase --param workdir=&lt;path&gt; --param branch=&lt;name&gt; --param base=main
 darkmux mission launch coder-phase --param workdir=&lt;path&gt; --param branch=&lt;name&gt; --param base=main --param role=coder --timeout 600</code></pre>
-    <p>What happens: darkmux mints (or idempotently reuses) the mission instance, creates an isolated git worktree + branch off <code>base</code>, dispatches the coder role into it (default role: <code>coder</code>, override with <code>--param role=&lt;id&gt;</code>), then runs the local <code>code-reviewer</code> QA against the resulting diff: the same QA <code>phase review</code> runs standalone, but wired in automatically here. It surfaces the coder's result, the tokens-off-meter figure, and the QA findings, then <strong>stops</strong>: nothing is committed, pushed, or PR'd yet. The phase stays <code>Running</code> at the gate; adjudicating the findings is still your call (or the frontier orchestrator's). The launch gets you to a reviewed diff, not to a merged PR — <code>mission ship</code> or <code>mission abort</code> finish the loop.</p>
+    <p>What happens: darkmux mints (or idempotently reuses) the mission instance, creates an isolated git worktree + branch off <code>base</code>, dispatches the coder role into it (default role: <code>coder</code>, override with <code>--param role=&lt;id&gt;</code>), then runs the local <code>code-reviewer</code> QA against the resulting diff: the same QA <code>mission launch review</code> runs standalone, but wired in automatically here. It surfaces the coder's result, the tokens-off-meter figure, and the QA findings, then <strong>stops</strong>: nothing is committed, pushed, or PR'd yet. The phase stays <code>Running</code> at the gate; adjudicating the findings is still your call (or the frontier orchestrator's). The launch gets you to a reviewed diff, not to a merged PR — the frontier ships the git work by hand and <code>mission finalize</code> (or <code>mission abort</code>) finishes the loop.</p>
     <p>If a worktree already exists at the target path, the launch bails loud rather than guessing. Relaunching with the same params reuses the same instance rather than minting a duplicate.</p>
 
-    <h3><code>mission ship</code>: commit → push → PR (→ merge, opt-in)</h3>
-    <pre><code>darkmux mission ship deploy-rewrite                       <span class="comment"># commit, push, open the PR, then stop</span>
-darkmux mission ship deploy-rewrite --wait-ci              <span class="comment"># also block on CI, report green/red</span>
-darkmux mission ship deploy-rewrite --merge                <span class="comment"># squash-merge once CI is green, opt-in</span></code></pre>
-    <p>By default <code>ship</code> stops at the open PR. Merging is an explicit act. Pass <code>--merge</code> to opt into a green-gated squash-merge: it refuses to merge if CI isn't green, and on success it flips the phase to <code>Complete</code> and tears down the worktree for you (skip <code>darkmux phase complete</code> by hand in that case: <code>ship --merge</code> already did it).</p>
+    <h3><code>mission finalize</code>: ship the git work by hand, then close out</h3>
+    <p>darkmux no longer runs git or gh for you. Once you've adjudicated the QA findings at the gate, your frontier orchestrator ships the change by hand, then <code>mission finalize</code> closes out the darkmux-side state:</p>
+    <pre><code>git commit ...                             <span class="comment"># commit the reviewed diff</span>
+git push ...
+gh pr create ...
+gh pr merge ...                            <span class="comment"># merge when CI is green</span>
+darkmux mission finalize deploy-rewrite    <span class="comment"># close out darkmux-side state</span></code></pre>
+    <p><code>mission finalize</code> is the success terminal: it drives the mission's non-terminal phases to <code>Complete</code>, tears down the worktrees and branches the run created, and flips the mission to <code>Closed</code>.</p>
 
     <h3><code>mission abort</code>: clean teardown</h3>
-    <p>Decided not to ship a gate-held run's work? <code>darkmux mission abort &lt;mission&gt; [--phase &lt;id&gt;]</code> removes the phase's worktree and branch and flips the phase to <code>Abandoned</code>. It's the explicit counterpart to <code>ship</code>, so a backed-out run doesn't leave an orphan worktree on disk. When the abandoned phase was the mission's last open one, the mission closes with an honest envelope too.</p>
+    <p>Decided not to ship a gate-held run's work? <code>darkmux mission abort &lt;mission&gt;</code> is the kill terminal and the counterpart to <code>mission finalize</code>: by default it tears down every worktree and branch the mission created, flips all non-terminal phases to <code>Abandoned</code>, and closes the mission. Scope it to a single gate-held coder run with <code>--phase &lt;id&gt;</code>, which removes just that phase's worktree and branch and flips only that phase to <code>Abandoned</code>. Either way, a backed-out run doesn't leave an orphan worktree on disk.</p>
 
     <div class="callout">
       <strong>Under the hood: Task/Step.</strong>
@@ -346,17 +338,15 @@ darkmux mission ship deploy-rewrite --merge                <span class="comment"
     <h2>Putting it together: a typical agentic workflow</h2>
     <p>The fully manual version (useful when you want to drive every step yourself, or the phase's work isn't a clean "dispatch a coder, review the diff" shape):</p>
     <ol>
-      <li>Write a mission JSON describing what you're trying to do, with phase ids planned.</li>
-      <li>Write the first phase JSON.</li>
-      <li><code>darkmux mission start &lt;m&gt;</code> + <code>darkmux phase start &lt;s1&gt;</code>: operator/cyan records land in the viewer.</li>
-      <li>Dispatch the work: <code>darkmux dispatch coder "&lt;phase task&gt;"</code>: local/green records (start + complete) with the model field stamped.</li>
-      <li><code>darkmux phase complete &lt;s1&gt;</code>: duration arc visible in the wall-clock graphic.</li>
-      <li><code>darkmux phase review --phase-id &lt;s1&gt;</code>: QA pass; verdict emits to the viewer. Address findings.</li>
-      <li>Open a PR. If the verdict was clean (or flags-only with nothing material), merge.</li>
-      <li>Repeat for subsequent phases. Discover scope mid-flight? <code>darkmux mission add-phase</code> rather than filing a separate mission.</li>
-      <li><code>darkmux mission close &lt;m&gt;</code> when the plan is done.</li>
+      <li>Write a mission config describing what you're trying to do, with the phases planned.</li>
+      <li><code>darkmux mission launch &lt;config&gt;</code>: mints + starts the mission; operator/cyan records land in the viewer.</li>
+      <li>Dispatch the work: <code>darkmux dispatch coder "&lt;phase task&gt;"</code>: local/green records (start + complete) with the model field stamped, and the duration arc visible in the wall-clock graphic.</li>
+      <li><code>darkmux mission launch review</code>: QA pass; verdict emits to the viewer. Address findings.</li>
+      <li>Ship the git work by hand — commit, push, <code>gh pr create</code>, and <code>gh pr merge</code> when the verdict was clean (or flags-only with nothing material).</li>
+      <li>Discover scope mid-flight? <code>darkmux mission add-phase</code> rather than filing a separate mission.</li>
+      <li><code>darkmux mission finalize &lt;m&gt;</code> when the plan is done.</li>
     </ol>
-    <p>The automated equivalent of steps 3–7 above: <code>darkmux mission launch coder-phase --param workdir=&lt;path&gt; --param branch=&lt;name&gt; --param base=main</code>, adjudicate the QA findings it surfaces, then <code>darkmux mission ship &lt;m&gt; --merge</code>. See the previous section.</p>
+    <p>The automated equivalent of steps 2–5 above: <code>darkmux mission launch coder-phase --param workdir=&lt;path&gt; --param branch=&lt;name&gt; --param base=main</code>, adjudicate the QA findings it surfaces, ship the git work by hand, then <code>darkmux mission finalize &lt;m&gt;</code>. See the previous section.</p>
     <p>Every step writes a flow record. The viewer renders them as an annotated timeline. Wall-clock arcs on the dispatch + phase records show duration; the phase-progress widget shows N/M done.</p>
   </div>
 </section>

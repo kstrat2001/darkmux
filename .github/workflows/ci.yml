@@ -329,15 +329,21 @@ jobs:
           # crew registry dissolved; the registry-read verbs list/show/index
           # went with the crews map), so the bare `crew` alternative catches
           # every crew spelling. Ship-4: `darkmux mission run ...` ->
-          # `darkmux mission launch coder-phase` (ship/abort survive).
+          # `darkmux mission launch coder-phase`.
+          # Round 10 (#1463): the `phase` family retired ENTIRELY (estimate +
+          # review + start/complete/abandon), so the bare `phase` alternative
+          # catches every phase spelling; `darkmux mission ship ...` retired
+          # (the frontier does git/gh by hand, then `mission finalize`); and
+          # `darkmux mission close ...` renamed to `darkmux mission finalize`.
           # The word boundary + the literal `darkmux ` anchor keep the NEW
           # spellings clean: `darkmux machine status` does not contain the
           # two-word `darkmux status`, and `darkmux profile scan` does not
           # contain `darkmux scan`. `model`/`status`/`fleet` are common words,
           # so the anchor matches ONLY the `darkmux <verb>` invocation form,
-          # and the two-word alternative (`mission run`) anchors on the full
-          # spelling so the surviving `mission launch`/`ship`/`abort` family
-          # does NOT trip.
+          # and the two-word alternatives (`mission run`/`ship`/`close`) anchor
+          # on the full spelling so the surviving `mission launch`/`finalize`/
+          # `abort`/`add-phase` family does NOT trip (`add-phase` is `darkmux
+          # mission`, never `darkmux phase`).
           # Decision 17: `darkmux lessons ...` -> `darkmux memory lesson ...`
           # (the family retired into `memory`, whose second kind is
           # `memory correction`). `lessons` is plural + darkmux-specific, so the
@@ -347,9 +353,9 @@ jobs:
           # per release naming its `**vX.Y.Z**`) legitimately quote old verbs
           # — excluded by the -v filter; live prose never carries that
           # bold-version marker.
-          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|mission run)\b'
+          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|phase|mission run|mission ship|mission close)\b'
           if bad=$(grep -rniE $EXCL "$VERBPAT" $SCAN 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
-            echo "::error::Retired verb spelling in user-facing docs (#1426) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons); swap + recommendations retired:"
+            echo "::error::Retired verb spelling in user-facing docs (#1426/#1463) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family); swap + recommendations retired:"
             echo "$bad"
             exit 1
           fi

@@ -1,6 +1,6 @@
 //! `darkmux mission status` — the global mission-control read (#829).
 //!
-//! Every other `mission`/`phase` verb is a mutation or a single-shot op;
+//! Every other `mission` verb is a mutation or a single-shot op;
 //! none answers "show me the whole board, what's drifted, what needs closing
 //! out." This is that read — the CLI twin of the viewer's missions lens,
 //! headless and scriptable. It completes the `<noun> status` family that
@@ -47,62 +47,30 @@ fn is_terminal(s: PhaseStatus) -> bool {
     matches!(s, PhaseStatus::Complete | PhaseStatus::Abandoned)
 }
 
-/// State-accurate reconcile commands for a non-terminal phase. `complete`
-/// only transitions Running→Complete, so a PLANNED (never-started) phase
-/// needs `phase start` first — emitting a bare `phase complete` for it
-/// (the original bug) prints a command that errors. `abandon` works from
-/// either state. Surfaced by the cold-session reconcile of the
-/// cli-styling-foundation phases, which were planned, not running (#829).
-fn reconcile_cmds(s: &Phase) -> Vec<String> {
-    let shipped = match s.status {
-        PhaseStatus::Planned => format!(
-            "darkmux phase start {id} && darkmux phase complete {id}   # if its work shipped",
-            id = s.id
-        ),
-        // Running (or any other non-terminal): complete goes straight through.
-        _ => format!("darkmux phase complete {}   # if its work shipped", s.id),
-    };
-    vec![
-        shipped,
-        format!("darkmux phase abandon {}   # if it was dropped", s.id),
-    ]
-}
-
 /// Pure drift detection for one mission given its phases. `now` and
 /// `stale_days` are passed in (rather than read internally) so the function
 /// stays IO-free and unit-testable with fixed timestamps — see the module
-/// doc. Four load-bearing inconsistencies:
-///   - a CLOSED mission with a non-terminal (planned/running) phase — the
-///     work likely shipped outside `mission ship --merge`, or `mission close`
-///     didn't reconcile; the board reads "closed · 0/1".
+/// doc. Load-bearing inconsistencies:
 ///   - an ACTIVE/PAUSED mission whose phases are ALL terminal with at least
-///     one complete — done, just never closed out.
+///     one complete — done, just never finalized.
 ///   - (#1230 Packet 5) an ACTIVE mission with ZERO complete phases whose
 ///     `started_ts` is older than `stale_days` — the `doom-loop-m4` case
 ///     (0/4 phases for ~20 days, no drift surfaced by either check above).
 ///   - (#1230 Packet 5, revised #1341 for linear phases) a PLANNED phase
 ///     with an earlier-in-mission-order Abandoned phase — permanently
 ///     stuck even though the phase itself is still Planned.
+///
+/// (#1463) The old "CLOSED mission with a non-terminal phase" arm RETIRED:
+/// `mission finalize` / `mission abort` now reconcile EVERY phase to a
+/// terminal status as part of closing the mission, so a Closed mission with an
+/// open phase is no longer a reachable state to detect. (Its `phase
+/// complete`/`phase abandon` reconcile hints went with the retired `phase`
+/// family; the surviving hints point at `mission finalize` / `mission abort`.)
 fn detect_drift(m: &Mission, phases: &[&Phase], now: u64, stale_days: u64) -> Vec<Drift> {
     let mut out = Vec::new();
     let open: Vec<&&Phase> = phases.iter().filter(|s| !is_terminal(s.status)).collect();
     let complete = phases.iter().filter(|s| s.status == PhaseStatus::Complete).count();
     let all_terminal = !phases.is_empty() && open.is_empty();
-
-    if m.status == MissionStatus::Closed && !open.is_empty() {
-        let mut suggest = Vec::new();
-        for s in &open {
-            suggest.extend(reconcile_cmds(s));
-        }
-        out.push(Drift {
-            kind: "closed-with-open-phase",
-            detail: format!(
-                "mission is Closed but {} phase(s) are not terminal (planned/running)",
-                open.len()
-            ),
-            suggest,
-        });
-    }
 
     if matches!(m.status, MissionStatus::Active | MissionStatus::Paused)
         && all_terminal
@@ -112,7 +80,7 @@ fn detect_drift(m: &Mission, phases: &[&Phase], now: u64, stale_days: u64) -> Ve
             kind: "done-not-closed",
             detail: "all phases are terminal — the mission looks done but is still open"
                 .to_string(),
-            suggest: vec![format!("darkmux mission close {}", m.id)],
+            suggest: vec![format!("darkmux mission finalize {}", m.id)],
         });
     }
 
@@ -145,10 +113,10 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
              (staleness threshold: {stale_days} day(s))"
         ),
         suggest: vec![format!(
-            "darkmux mission status --json   # inspect phase details — consider \
-             `darkmux phase abandon <id>` for stalled work or `darkmux mission close {}` \
-             if the mission is done",
-            m.id
+            "darkmux mission status --json   # inspect phase details — then \
+             `darkmux mission abort {id}` to tear the stalled mission down, or \
+             `darkmux mission finalize {id}` if the work is actually done",
+            id = m.id
         )],
     })
 }
@@ -176,8 +144,12 @@ fn unreachable_phase_drifts(m: &Mission, phases: &[&Phase]) -> Vec<Drift> {
                     phase.id
                 ),
                 suggest: vec![format!(
-                    "darkmux phase abandon {}   # blocked by an earlier abandoned phase",
-                    phase.id
+                    "darkmux mission abort {mid} --phase {pid}   # abandon just this \
+                     permanently-blocked phase (a bare `mission abort {mid}` would abandon \
+                     every healthy phase too); the mission closes on its own once that \
+                     leaves every phase terminal",
+                    mid = m.id,
+                    pid = phase.id
                 )],
             });
         }
@@ -382,31 +354,17 @@ mod tests {
     }
 
     #[test]
-    fn closed_mission_with_running_phase_drifts() {
+    fn closed_mission_with_open_phase_no_longer_drifts() {
+        // (#1463) The "closed-with-open-phase" arm retired: `mission finalize`
+        // / `mission abort` reconcile every phase to terminal as part of
+        // closing, so this is no longer a reachable state — and a Closed
+        // mission never surfaces a drift on this axis anymore, even if a
+        // hand-edited JSON produced one. (Legacy on-disk data is a `mission
+        // finalize`/`abort` re-run away from clean.)
         let m = mission("m1", MissionStatus::Closed);
-        let s = phase("s1", "m1", PhaseStatus::Running);
-        let d = detect_drift(&m, &[&s], 0, 14);
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].kind, "closed-with-open-phase");
-        // RUNNING → complete transitions straight through (no `start`).
-        assert!(d[0].suggest.iter().any(|c| c.contains("phase complete s1")
-            && !c.contains("phase start")));
-        assert!(d[0].suggest.iter().any(|c| c.contains("phase abandon s1")));
-    }
-
-    #[test]
-    fn closed_mission_with_planned_phase_suggests_start_then_complete() {
-        // (#829 follow-up) A PLANNED phase can't go straight to complete —
-        // the cue must include `phase start` first, or it prints a command
-        // that errors. Caught by the cold-session reconcile.
-        let m = mission("m1", MissionStatus::Closed);
-        let s = phase("s1", "m1", PhaseStatus::Planned);
-        let d = detect_drift(&m, &[&s], 0, 14);
-        assert_eq!(d.len(), 1);
-        let shipped = d[0].suggest.iter().find(|c| c.contains("if its work shipped")).unwrap();
-        assert!(shipped.contains("phase start s1") && shipped.contains("phase complete s1"),
-            "planned-phase cue must start then complete; got: {shipped}");
-        assert!(d[0].suggest.iter().any(|c| c.contains("phase abandon s1")));
+        let running = phase("s1", "m1", PhaseStatus::Running);
+        let planned = phase("s2", "m1", PhaseStatus::Planned);
+        assert!(detect_drift(&m, &[&running, &planned], 0, 14).is_empty());
     }
 
     #[test]
@@ -417,13 +375,13 @@ mod tests {
     }
 
     #[test]
-    fn active_mission_all_terminal_suggests_close() {
+    fn active_mission_all_terminal_suggests_finalize() {
         let m = mission("m1", MissionStatus::Active);
         let s = phase("s1", "m1", PhaseStatus::Complete);
         let d = detect_drift(&m, &[&s], 0, 14);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].kind, "done-not-closed");
-        assert!(d[0].suggest[0].contains("mission close m1"));
+        assert!(d[0].suggest[0].contains("mission finalize m1"));
     }
 
     #[test]
@@ -506,9 +464,12 @@ mod tests {
         m.phase_ids = vec!["dead".to_string(), "blocked".to_string()];
 
         let d = detect_drift(&m, &[&dead, &blocked], 0, 14);
+        // (#1463 CONSIDER 5) The suggestion must scope the teardown to the ONE
+        // blocked phase (`--phase blocked`), not a bare whole-mission abort that
+        // would abandon every healthy phase too.
         assert!(d.iter().any(|dr| dr.kind == "unreachable-phase"
             && dr.detail.contains("blocked")
-            && dr.suggest.iter().any(|c| c.contains("phase abandon blocked"))));
+            && dr.suggest.iter().any(|c| c.contains("mission abort m1 --phase blocked"))));
     }
 
     #[test]

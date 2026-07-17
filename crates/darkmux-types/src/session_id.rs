@@ -33,7 +33,7 @@ pub fn session_id(kind: &str, owner: &str, disambiguator: &str) -> String {
 }
 
 /// Coder-phase dispatch id (worktree → coder → verify). Stable across the
-/// `mission launch coder-phase` path and the `mission ship`/`mission abort`
+/// `mission launch coder-phase` path and the `mission finalize`/`mission abort`
 /// verbs that finish or tear down the same gate-held run — the id is what
 /// ties every record of one phase's run together. Byte-identical to the
 /// retired `mission run`'s own `mission-run-{mission}-{phase}` so the viewer

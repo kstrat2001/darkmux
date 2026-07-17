@@ -1,23 +1,27 @@
-//! (#816) Repo-level shipping conventions — `<repo>/.darkmux/conventions.json`.
+//! (#816) Repo-level worktree-branch conventions —
+//! `<repo>/.darkmux/conventions.json`.
 //!
-//! `mission run`/`ship` default to darkmux-native output (branch
-//! `darkmux/<phase>`, phase-description commit subject, generated PR
-//! body, no labels). Repos with their own conventions — ticket-prefixed
-//! branches and commits, a PR template, required labels — declare them in
-//! an operator-owned file at the repo root, and the loop speaks them.
+//! A coder-phase mission's worktree branches `darkmux/<phase>` by default.
+//! Repos with their own branch shape — ticket-prefixed, say — declare a
+//! `branch_template` in an operator-owned file at the repo root, and the
+//! worktree-creation step speaks it.
+//!
+//! (#1463) The PR-authoring conventions (commit-subject/PR-title/PR-body
+//! templates, labels, the bot commit identity) retired with the `ship` verb:
+//! the frontier orchestrator now does the git/gh work by hand and owns those
+//! choices natively. Only the branch template — a property the darkmux-created
+//! worktree needs — remains here.
 //!
 //! Deliberately REPO-level, not engagement-level: per the #49 doctrine,
-//! engagement never enters the CLI arg surface — but branch/commit/PR
-//! conventions are properties of the repository itself, and a visible
-//! file in the repo is the operator-sovereign home for them (no hidden
-//! behavior, no `--engagement` flag).
+//! engagement never enters the CLI arg surface — but the branch shape is a
+//! property of the repository itself, and a visible file in the repo is the
+//! operator-sovereign home for it (no hidden behavior, no `--engagement` flag).
 //!
 //! Template variables: `{ticket}` (from the mission's `ticket` field, set
-//! via `mission propose --ticket`), `{phase}`, `{mission}`, `{subject}`
-//! (the default-computed commit subject). A template that references
-//! `{ticket}` on a ticketless mission falls back to the built-in default
-//! for that item with a soft warning — loud beats quiet, but conventions
-//! never block a ship.
+//! via `mission propose --ticket`), `{phase}`, `{mission}`. A template that
+//! references `{ticket}` on a ticketless mission falls back to the built-in
+//! default with a soft warning — loud beats quiet, but conventions never
+//! block a launch.
 //!
 //! Schema is lenient (all-`Option` + unknown keys ignored): a partial or
 //! hand-edited file never bricks the loop; a malformed one warns and
@@ -32,72 +36,11 @@ pub struct Conventions {
     /// absent: `darkmux/{phase}`.
     #[serde(default)]
     pub branch_template: Option<String>,
-    /// Commit subject template, e.g. `"{ticket}: {subject}"`.
-    #[serde(default)]
-    pub commit_subject_template: Option<String>,
-    /// PR title template. Defaults to the commit subject when absent.
-    #[serde(default)]
-    pub pr_title_template: Option<String>,
-    /// Repo-relative path to a PR body template file. Its content is used
-    /// as the PR body with `{summary}` replaced by the generated darkmux
-    /// summary; without a `{summary}` placeholder the summary is appended.
-    #[serde(default)]
-    pub pr_body_template: Option<String>,
-    /// Labels passed to `gh pr create --label <l>` (each must already
-    /// exist in the repo — gh errors otherwise, surfaced verbatim).
-    #[serde(default)]
-    pub pr_labels: Vec<String>,
-    /// (#834) The git identity `mission ship` commits under for this repo.
-    /// Git resolves author/committer from local→global config, so a repo
-    /// without a local identity falls back to the operator's global name —
-    /// silently breaking bot-authorship / separation-of-duties. Declaring it
-    /// here makes `ship` commit as the bot explicitly (`-c user.name=… -c
-    /// user.email=…`, setting BOTH author and committer). Absent → ship
-    /// commits under the resolved git identity and prints which one (soft
-    /// guard), so a managed repo never silently ships under a person.
-    #[serde(default)]
-    pub commit_author: Option<CommitAuthor>,
-}
-
-/// (#834) A declared git commit identity (the bot). Both fields required to
-/// take effect; a blank either-side is treated as undeclared.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct CommitAuthor {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub email: String,
-}
-
-impl CommitAuthor {
-    /// The `git -c …` config args that set author AND committer to this
-    /// identity for a single commit, or None when either field is blank.
-    pub fn config_args(&self) -> Option<[String; 4]> {
-        let (n, e) = (self.name.trim(), self.email.trim());
-        if n.is_empty() || e.is_empty() {
-            return None;
-        }
-        Some([
-            "-c".into(),
-            format!("user.name={n}"),
-            "-c".into(),
-            format!("user.email={e}"),
-        ])
-    }
 }
 
 /// Load `<repo_root>/.darkmux/conventions.json`. Absent file → None
 /// (darkmux defaults). Malformed file → soft warning + None, never an
 /// error: conventions polish output, they don't gate the loop.
-/// (#834) Whether the repo declares conventions at all — i.e. the file
-/// exists, regardless of whether it parses. The commit-identity soft guard
-/// keys on THIS (not on a successful `load`), so a managed repo whose
-/// conventions JSON has a typo still surfaces the identity its commit will
-/// land under, instead of silently degrading to the personal identity.
-pub fn file_present(repo_root: &Path) -> bool {
-    repo_root.join(".darkmux").join("conventions.json").is_file()
-}
-
 pub fn load(repo_root: &Path) -> Option<Conventions> {
     let path = repo_root.join(".darkmux").join("conventions.json");
     let raw = std::fs::read_to_string(&path).ok()?;
@@ -155,17 +98,6 @@ pub fn valid_branch(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-'))
 }
 
-/// Validate a `gh pr create --label` value before it reaches the subprocess:
-/// non-empty and **not starting with `-`**. A leading dash would be parsed by
-/// `gh` as a flag (e.g. a `--config` label → argument injection into the
-/// `gh pr create` invocation). GitHub labels otherwise permit spaces and most
-/// punctuation ("help wanted"), so — unlike [`valid_branch`] — this stays
-/// permissive beyond the leading-dash guard; the dash is the only injection
-/// vector since `gh` is invoked with explicit argv (no shell). (#1111)
-pub fn valid_label(name: &str) -> bool {
-    !name.is_empty() && !name.starts_with('-')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,24 +138,14 @@ mod tests {
     }
 
     #[test]
-    fn valid_label_blocks_flag_injection_but_allows_real_labels() {
-        // real GitHub labels — including spaces — pass
-        assert!(valid_label("agent-work"));
-        assert!(valid_label("help wanted"));
-        assert!(valid_label("good first issue"));
-        // the injection vector + empties are rejected
-        assert!(!valid_label("-foo")); // would parse as a gh flag
-        assert!(!valid_label("--config")); // the classic arg-injection case
-        assert!(!valid_label(""));
-    }
-
-    #[test]
     fn load_handles_absent_and_malformed() {
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(load(tmp.path()).is_none(), "absent file → None");
         std::fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
         std::fs::write(tmp.path().join(".darkmux/conventions.json"), "{not json").unwrap();
         assert!(load(tmp.path()).is_none(), "malformed → None (warn)");
+        // Lenient on read: unknown keys (including the retired PR-authoring
+        // fields, #1463) are ignored; only `branch_template` is parsed now.
         std::fs::write(
             tmp.path().join(".darkmux/conventions.json"),
             r#"{"branch_template":"{ticket}/{phase}","pr_labels":["agent-work"],"unknown_key":1}"#,
@@ -231,44 +153,5 @@ mod tests {
         .unwrap();
         let c = load(tmp.path()).expect("valid file loads");
         assert_eq!(c.branch_template.as_deref(), Some("{ticket}/{phase}"));
-        assert_eq!(c.pr_labels, vec!["agent-work"]);
-    }
-
-    #[test]
-    fn commit_author_config_args() {
-        // (#834) Both fields present → the -c args set author AND committer.
-        let a = CommitAuthor { name: "finhero-bot".into(), email: "bot@finhero.asia".into() };
-        let args=a.config_args().expect("declared identity yields args");
-        assert_eq!(args, ["-c","user.name=finhero-bot","-c","user.email=bot@finhero.asia"]);
-        // A blank either side → undeclared (no half-set identity).
-        assert!(CommitAuthor { name: "finhero-bot".into(), email: "  ".into() }.config_args().is_none());
-        assert!(CommitAuthor { name: "".into(), email: "bot@finhero.asia".into() }.config_args().is_none());
-    }
-
-    #[test]
-    fn file_present_is_true_even_when_parse_fails() {
-        // (#834 QA) The commit-identity guard keys on file_present, not load(),
-        // so a managed repo with a TYPO'd conventions file still surfaces the
-        // identity instead of silently committing under the personal one.
-        let tmp = tempfile::TempDir::new().unwrap();
-        assert!(!file_present(tmp.path()), "absent → not present");
-        std::fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
-        std::fs::write(tmp.path().join(".darkmux/conventions.json"), "{not json").unwrap();
-        assert!(load(tmp.path()).is_none(), "malformed → load None");
-        assert!(file_present(tmp.path()), "malformed but present → guard still fires");
-    }
-
-    #[test]
-    fn load_parses_commit_author() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
-        std::fs::write(
-            tmp.path().join(".darkmux/conventions.json"),
-            r#"{"commit_author":{"name":"finhero-bot","email":"bot@finhero.asia"}}"#,
-        ).unwrap();
-        let c = load(tmp.path()).expect("loads");
-        let a = c.commit_author.expect("commit_author parsed");
-        assert_eq!(a.name, "finhero-bot");
-        assert!(a.config_args().is_some());
     }
 }

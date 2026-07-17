@@ -29,7 +29,7 @@
 //! interpretation happens.
 //!
 //! **Gate semantics.** Review has no operator sign-off gate — unlike
-//! `coder-phase`, there is nothing for `mission ship`/`mission abort` to
+//! `coder-phase`, there is nothing for `mission finalize`/`mission abort` to
 //! finish. The mission/phase envelope finalizes GENERICALLY at the end of
 //! every dispatching run via `crew::envelope::finalize_mission`
 //! (Clean/Degraded -> Complete, Degenerate/Error -> Abandoned), matching

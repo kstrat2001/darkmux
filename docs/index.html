@@ -294,7 +294,7 @@
       <li><code>darkmux serve</code> — start the daemon in a separate terminal tab</li>
       <li><code>darkmux doctor</code> — pre-flight checks including <code>daemon: reachable</code></li>
       <li><a href="demo/">darkmux.com/demo/</a> — interactive demo, sample fleet data (no install required)</li>
-      <li><code>darkmux dispatch</code> / <code>phase review</code> — emit flow records as they run</li>
+      <li><code>darkmux dispatch</code> / <code>mission launch review</code> — emit flow records as they run</li>
     </ul>
     <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/observability.html">observability section of the user guide</a>.</p>
   </div>
@@ -323,9 +323,9 @@
     <p>On top of the profile and lab substrate, darkmux runs config-defined <em>missions</em> as a live task graph: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts form a <em>crew</em> that works the mission's <em>phases</em>, every dispatch gated on operator sign-off, tracked as JSON the operator owns. The profile and lab CLI works standalone if that's all you want, but launching a mission and watching the graph is what darkmux is for.</p>
     <ul class="plain">
       <li><code>darkmux dispatch coder "..."</code> — invoke a named role; emits flow records</li>
-      <li><code>darkmux mission launch coder-phase</code> / <code>mission ship</code> — the automated dispatch-to-PR loop: worktree, coder, QA review, operator sign-off gate, PR</li>
-      <li><code>darkmux phase review</code> — QA pass against the current branch's diff; dispatches code-reviewer, parses the SIGNOFF block</li>
-      <li><code>darkmux mission start/close/pause/resume</code> + <code>phase start/complete/abandon</code> — drive lifecycle state</li>
+      <li><code>darkmux mission launch coder-phase</code> — the automated dispatch loop: worktree, coder, QA review, stop at the operator sign-off gate; the frontier ships the git work by hand, then <code>darkmux mission finalize &lt;id&gt;</code> closes it out</li>
+      <li><code>darkmux mission launch review</code> — the review funnel (bundle → probe → dedup → judge → verify → synthesis) against the current branch's diff</li>
+      <li><code>darkmux mission launch/finalize/abort/pause/resume</code> — drive mission lifecycle state (the mission graph derives phase status)</li>
       <li><code>darkmux mission add-phase --after &lt;s&gt;</code> — insert scope mid-mission without restructuring</li>
     </ul>
     <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/missions.html">missions section of the user guide</a>.</p>
