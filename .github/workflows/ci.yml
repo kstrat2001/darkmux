@@ -285,8 +285,11 @@ jobs:
           # brew formula's caveats are printed to every installing user, and a
           # retired-verb spelling slipped through there once precisely because
           # packaging/ was outside this set (#1426 phase-2 gate finding).
+          # AGENTS.md joined the set at the ship-6 gate for the same reason:
+          # it carried the verbatim pre-2.0 identity block ("darkmux swap")
+          # precisely because it was outside this set (#1426 ship-6 finding).
           PAT='admin[- ]agent|admin</code>'
-          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null); then
+          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md AGENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null); then
             echo "::error::Retired term in user-facing docs — use 'utility', not 'admin' (the role_family loader rejects 'admin'):"
             echo "$bad"
             exit 1
@@ -321,7 +324,7 @@ jobs:
           # — excluded by the -v filter; live prose never carries that
           # bold-version marker.
           VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew dispatch|status|swap|model|fleet|recommendations|mission run)\b'
-          if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
+          if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md AGENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
             echo "::error::Retired verb spelling in user-facing docs (#1426) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch) / init (not skills) / mission launch coder-phase (not mission run); swap + recommendations retired:"
             echo "$bad"
             exit 1

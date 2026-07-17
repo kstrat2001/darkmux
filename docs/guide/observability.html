@@ -148,8 +148,12 @@ darkmux serve --port 9000 --bind 127.0.0.1   <span class="comment"># override th
         <td>Server-Sent Events stream: new records appended to that day's file, in real time.</td>
       </tr>
       <tr>
-        <td><code>GET /model/status</code></td>
-        <td>Snapshot of <code>lms ps --json</code>. Used by the viewer's model-status pill.</td>
+        <td><code>GET /machine/status</code></td>
+        <td>Snapshot of <code>lms ps --json</code>, loaded models grouped by ownership. Backs the <code>darkmux machine status &lt;id&gt;</code> peer read. (#1426: renamed from the retired <code>/model/status</code> alongside the <code>machine</code> CLI family.)</td>
+      </tr>
+      <tr>
+        <td><code>GET /machine/resources</code></td>
+        <td>Live machine resources: per-model RAM commitment vs observed footprint plus pressure rows. Backs <code>darkmux machine resources</code> and the viewer's machine lens. Read-only, zero model dispatches.</td>
       </tr>
       <tr>
         <td><code>GET /missions</code></td>
