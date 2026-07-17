@@ -237,7 +237,7 @@ src/                          CLI command layer (clap)
   coder_phase.rs              coder-phase pipeline StepKinds (worktree/coder/verify): Tier-3 bespoke, launch-owned (`mission run` retired #1426 ship-4)
   mission_propose.rs          `mission propose`: utility-agent intent → mission config (stdin/file)
   mission_status.rs           `mission status`: the read-only mission board
-  lab_cli.rs                  `lab` family (run/inspect/compare/runs/register/doctor/notebook)
+  lab_cli.rs                  `lab` family — kind-family shape (#1465): `run {<dispatch>·list·inspect·compare}` · `workload list` · `fixture {list·register·unregister}` · `notebook {draft·list}` · `eval <role>` · `loop`/`characterize`/`tune`/`doctor`
   phase_cli.rs                Code-review output rendering (`phase_review_output_at`) for the coder-phase QA gate; the `phase` verb family retired (#1463)
   role_cli.rs                 `role` family (list/show from the SQLite index)
   fleet_cli.rs                `machine list/add/remove` roster (the retired `fleet` family folded into `machine`, #1426)
@@ -359,7 +359,7 @@ If a user asks you to:
 |---|---|
 | "add a new workload" | Drop a JSON manifest at `templates/builtin/workloads/<id>.json`. If it's a `prompt` workload, register it in `EMBEDDED_WORKLOADS` in `src/workloads/load.rs`. coding-task workloads need a sandbox seed dir and CAN'T be embedded. |
 | "add a new provider" | Implement `WorkloadProvider` in `src/providers/<name>.rs`, register it in `src/workloads/registry.rs::register_builtins()`. |
-| "add a lab fixture" | Create a dir with a `.fixture.json` manifest (`name` required; `satisfies`, `verify_command`, `required_files` optional), then `darkmux lab register <path>`. A workload binds to it via `requires_fixture: "<name>@<version>"`. Built-ins live under `templates/builtin/lab-fixtures/` and register via `scripts/lab-init.sh`. |
+| "add a lab fixture" | Create a dir with a `.fixture.json` manifest (`name` required; `satisfies`, `verify_command`, `required_files` optional), then `darkmux lab fixture register <path>`. A workload binds to it via `requires_fixture: "<name>@<version>"`. Built-ins live under `templates/builtin/lab-fixtures/` and register via `scripts/lab-init.sh`. |
 | "check fixtures are healthy" | `darkmux lab doctor` — offline check that registered paths exist, manifests load, required files are present, and content hashes haven't drifted. |
 | "run the smoke test" | `cargo install --path . && darkmux lab run quick-q`. Should complete in ~6-10s if a model is loaded. |
 | "list notebook entries" | `darkmux lab notebook list` (optionally `--machine <id>` to filter). Enumerates `.md` files, parses headers. (#1426 — the notebook family folded into `lab`.) |

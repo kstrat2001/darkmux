@@ -40,7 +40,7 @@
     <ul>
       <li><strong>Reproducible workloads</strong>: named JSON manifests under <code>templates/builtin/workloads/</code> (and your own under <code>~/.darkmux/workloads/</code>).</li>
       <li><strong>On-disk artifacts</strong>: every run writes a manifest, trajectory, and verify outcome to <code>.darkmux/runs/&lt;id&gt;/</code>. No "I think I saw 30 seconds" hand-waving. The numbers are on disk, in JSON, comparable.</li>
-      <li><strong>Comparison primitives</strong>: <code>lab compare A B</code> diffs two runs by wall-clock, compaction events, and per-turn behavior.</li>
+      <li><strong>Comparison primitives</strong>: <code>lab run compare A B</code> diffs two runs by wall-clock, compaction events, and per-turn behavior.</li>
       <li><strong>Trait-based extension</strong>: add your own workload kinds via the <code>WorkloadProvider</code> trait in <code>src/workloads/types.rs</code>.</li>
     </ul>
   </div>
@@ -81,7 +81,7 @@
 <section>
   <div class="wrap">
     <h2>Inspect a run</h2>
-    <pre><code>darkmux lab inspect quick-q-deep-1778302418-1</code></pre>
+    <pre><code>darkmux lab run inspect quick-q-deep-1778302418-1</code></pre>
     <p>Shows: total wall-clock, turn count, compaction events, mode (fast vs slow per the bimodal wall-clock distribution observed in empirical testing), notes from the trajectory.</p>
 
     <p>The mode classification (fast/slow) reflects the bimodal wall-clock distribution observed in empirical testing. Wall-clock per turn splits into two clusters based on whether the prompt happened to hit a state that triggers heavy compaction or not. Inspect tells you which cluster a given run landed in. The output is a small report, best seen by running it on your own machine after a <code>quick-q</code> or <code>long-agentic</code> run. The methodology behind this is documented in <a href="https://darklyenergized.substack.com/p/part-2-charting-the-wake">Part 2 of the lab series</a> if you want the full empirical grounding.</p>
@@ -115,8 +115,8 @@
 <section>
   <div class="wrap">
     <h2>Compare runs</h2>
-    <p><code>darkmux lab compare A B</code> diffs two runs, typically a "before tuning" baseline vs "after" verification.</p>
-    <pre><code>darkmux lab compare quick-q-deep-1778302418-1 quick-q-deep-1778466601-1</code></pre>
+    <p><code>darkmux lab run compare A B</code> diffs two runs, typically a "before tuning" baseline vs "after" verification.</p>
+    <pre><code>darkmux lab run compare quick-q-deep-1778302418-1 quick-q-deep-1778466601-1</code></pre>
     <p>Reports: wall-clock delta, compaction-event delta, mode classification per side, any structural differences in the trajectory.</p>
     <p>The discipline behind it: <strong>baseline → single-variable change → re-measure → compare → record in notebook</strong>. Each step has a darkmux primitive. Don't skip the baseline. Don't change two variables at once. Without this discipline, the comparison is uninterpretable.</p>
   </div>
@@ -125,8 +125,8 @@
 <section>
   <div class="wrap">
     <h2>List your runs</h2>
-    <pre><code>darkmux lab runs --limit 10        <span class="comment"># most recent 10</span>
-darkmux lab runs --limit 50</code></pre>
+    <pre><code>darkmux lab run list --limit 10        <span class="comment"># most recent 10</span>
+darkmux lab run list --limit 50</code></pre>
     <p>Each row shows: run id, workload, profile, wall-clock, mode, verify outcome. Quick way to spot which run id to inspect or compare.</p>
   </div>
 </section>
@@ -164,10 +164,10 @@ darkmux lab runs --limit 50</code></pre>
 
     <h3>Register once, resolve by requirement</h3>
     <p>The fixture <em>directory</em> stays wherever it lives; the registry (<code>~/.darkmux/lab-registry.json</code>, or <code>.darkmux/lab-registry.json</code> project-scoped) is just a name → path lookup with integrity metadata. Registering computes and records the content hash so later drift is detectable.</p>
-    <pre><code>darkmux lab register ./my-fixture            <span class="comment"># add by path (reads .fixture.json)</span>
-darkmux lab register ./my-fixture --force    <span class="comment"># replace an existing entry</span>
-darkmux lab fixtures                         <span class="comment"># list registered fixtures</span>
-darkmux lab unregister demo-tiny-py          <span class="comment"># drop the entry (never deletes the dir)</span>
+    <pre><code>darkmux lab fixture register ./my-fixture            <span class="comment"># add by path (reads .fixture.json)</span>
+darkmux lab fixture register ./my-fixture --force    <span class="comment"># replace an existing entry</span>
+darkmux lab fixture list                         <span class="comment"># list registered fixtures</span>
+darkmux lab fixture unregister demo-tiny-py          <span class="comment"># drop the entry (never deletes the dir)</span>
 darkmux lab doctor                           <span class="comment"># offline integrity check (see below)</span></code></pre>
     <p>A workload opts into a fixture by declaring <code>requires_fixture</code> in its manifest, a <code>&lt;name&gt;@&lt;version&gt;</code> string. At run time the resolver finds a registered fixture whose <code>satisfies</code> matches and uses it as the source; with no <code>requires_fixture</code> set, the run falls back to <code>{sandboxes}/&lt;workload-id&gt;/</code> as before. (This replaces the old <code>DARKMUX_SANDBOX_&lt;ID&gt;</code> env-var binding; the registry is now the only persistent fixture binding.)</p>
 

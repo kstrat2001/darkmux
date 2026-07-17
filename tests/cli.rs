@@ -231,6 +231,99 @@ fn memory_family_carries_both_kinds() {
     }
 }
 
+/// (#1465) The `lab` second-level surface regrouped: the flat plural-noun
+/// leaves (`lab runs`/`lab workloads`/`lab fixtures`), the flat run leaves
+/// (`lab inspect`/`lab compare`), the flat fixture-mutation leaves
+/// (`lab register`/`lab unregister`), and the role-scoped snowflake
+/// (`lab review-bench`) all retired into kind-families (`lab run {list,
+/// inspect,compare}`, `lab workload list`, `lab fixture {list,register,
+/// unregister}`) and the generalized `lab eval`. `lab` survives, so each is an
+/// unknown SUB-verb within the surviving family. No compat alias (pre-2.0
+/// clean removal).
+#[test]
+fn retired_lab_flat_subverbs_are_unknown() {
+    for args in [
+        vec!["lab", "runs"],
+        vec!["lab", "workloads"],
+        vec!["lab", "fixtures"],
+        vec!["lab", "inspect", "some-run"],
+        vec!["lab", "compare", "a", "b"],
+        vec!["lab", "register", "/some/path"],
+        vec!["lab", "unregister", "some-name"],
+        vec!["lab", "review-bench"],
+    ] {
+        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        cmd.args(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unrecognized subcommand").or(
+                predicate::str::contains("unexpected argument"),
+            ));
+    }
+}
+
+/// (#1465) The `--crew` flag on the review-eval path retired with the crew
+/// family (#1426); it is now `--roster-profile`. clap rejects the old flag as
+/// an unexpected argument (no compat alias).
+#[test]
+fn retired_crew_flag_on_lab_eval_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.args(["lab", "eval", "--funnel", "--crew", "review-funnel"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
+}
+
+/// (#1465) The replacement `lab` surface EXISTS: `lab --help` lists the new
+/// kind-families, and each family's `--help` keeps its members. The retirement
+/// test above only proves the OLD spellings are gone; this proves the new ones
+/// landed, so a regroup that dropped a member can't pass both.
+#[test]
+fn lab_kind_families_carry_their_members() {
+    let help = |args: &[&str]| -> String {
+        let out = Command::cargo_bin("darkmux")
+            .unwrap()
+            .args(args)
+            .arg("--help")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let lab = help(&["lab"]);
+    for family in ["run", "workload", "fixture", "notebook", "eval"] {
+        assert!(lab.contains(family), "lab --help lists `{family}`: {lab}");
+    }
+
+    // `lab run` carries the recorded-run sub-verbs AND still takes a workload.
+    let run = help(&["lab", "run"]);
+    for sub in ["list", "inspect", "compare"] {
+        assert!(run.contains(sub), "lab run --help keeps `{sub}`: {run}");
+    }
+    assert!(
+        run.to_lowercase().contains("workload"),
+        "lab run --help still names the workload positional: {run}"
+    );
+
+    let workload = help(&["lab", "workload"]);
+    assert!(workload.contains("list"), "lab workload --help has `list`: {workload}");
+
+    let fixture = help(&["lab", "fixture"]);
+    for sub in ["list", "register", "unregister"] {
+        assert!(fixture.contains(sub), "lab fixture --help keeps `{sub}`: {fixture}");
+    }
+
+    // `lab eval` takes a role positional (default pr-reviewer) and the renamed
+    // roster flag.
+    let eval = help(&["lab", "eval"]);
+    assert!(eval.to_lowercase().contains("role"), "lab eval --help names the role positional: {eval}");
+    assert!(eval.contains("--roster-profile"), "lab eval --help has --roster-profile: {eval}");
+    // The retired `--crew` flag must be gone. The word may still appear in the
+    // `--roster-profile` doc's "renamed from `--crew`" note, so assert the
+    // FLAG-DEFINITION form (`--crew <`) is absent, not the bare substring.
+    assert!(!eval.contains("--crew <"), "lab eval --help must not define the retired --crew flag: {eval}");
+}
+
 /// (#1426 ship-4) `mission run` retired — the coder pipeline runs through
 /// `mission launch coder-phase`. `mission` survives (launch/finalize/abort/…),
 /// so the error is an unknown SUB-verb WITHIN the surviving family. No compat
@@ -1051,7 +1144,7 @@ fn notebook_draft_accepts_role_flag_under_dry_run() {
 
 // ─── (#491) Phase 4 lab CLI verbs: register / unregister / fixtures / doctor ──
 
-/// Operator runs `dm lab register <path>` against a fixture dir with
+/// Operator runs `dm lab fixture register <path>` against a fixture dir with
 /// a valid `.fixture.json`. Registry file is created at
 /// `{paths.root}/lab-registry.json` with one entry.
 #[test]
@@ -1072,7 +1165,7 @@ fn lab_register_creates_registry_entry() {
 
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.current_dir(tmp.path());
-    cmd.args(["lab", "register", fixture_dir.to_str().unwrap()])
+    cmd.args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Registered fixture `demo`"));
@@ -1099,7 +1192,7 @@ fn lab_fixtures_shows_registered_entries() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .current_dir(tmp.path())
-        .args(["lab", "register", fixture_dir.to_str().unwrap()])
+        .args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
         .assert()
         .success();
 
@@ -1107,7 +1200,7 @@ fn lab_fixtures_shows_registered_entries() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .current_dir(tmp.path())
-        .args(["lab", "fixtures"])
+        .args(["lab", "fixture", "list"])
         .assert()
         .success()
         .stdout(predicate::str::contains("demo"))
@@ -1127,14 +1220,14 @@ fn lab_unregister_removes_entry_but_not_dir() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .current_dir(tmp.path())
-        .args(["lab", "register", fixture_dir.to_str().unwrap()])
+        .args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
         .assert()
         .success();
 
     Command::cargo_bin("darkmux")
         .unwrap()
         .current_dir(tmp.path())
-        .args(["lab", "unregister", "demo"])
+        .args(["lab", "fixture", "unregister", "demo"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Unregistered"));
@@ -1162,7 +1255,7 @@ fn lab_doctor_warns_when_no_registry() {
     assert!(!output.status.success(), "doctor should exit non-zero on warnings");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("no registry found"), "got: {stdout}");
-    assert!(stdout.contains("lab-init.sh") || stdout.contains("dm lab register"), "got: {stdout}");
+    assert!(stdout.contains("lab-init.sh") || stdout.contains("dm lab fixture register"), "got: {stdout}");
 }
 
 /// `dm lab doctor` passes when a registered fixture is unchanged.
@@ -1178,7 +1271,7 @@ fn lab_doctor_passes_for_clean_fixture() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .current_dir(tmp.path())
-        .args(["lab", "register", fixture_dir.to_str().unwrap()])
+        .args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
         .assert()
         .success();
 
@@ -1206,7 +1299,7 @@ fn lab_doctor_warns_on_hash_drift() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .current_dir(tmp.path())
-        .args(["lab", "register", fixture_dir.to_str().unwrap()])
+        .args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
         .assert()
         .success();
 
@@ -1223,7 +1316,7 @@ fn lab_doctor_warns_on_hash_drift() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("content drift"), "got: {stdout}");
     assert!(
-        stdout.contains("dm lab register --force"),
+        stdout.contains("dm lab fixture register --force"),
         "expected recovery hint: {stdout}"
     );
 }
@@ -1247,7 +1340,7 @@ fn lab_register_builtin_demo_tiny_py_succeeds() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .current_dir(tmp.path())
-        .args(["lab", "register", &fixture_path])
+        .args(["lab", "fixture", "register", &fixture_path])
         .assert()
         .success()
         .stdout(predicate::str::contains("Registered fixture `demo-tiny-py`"))
@@ -1308,7 +1401,7 @@ fn lab_doctor_passes_for_builtin_demo_tiny_py() {
     Command::cargo_bin("darkmux")
         .unwrap()
         .current_dir(tmp.path())
-        .args(["lab", "register", &fixture_path])
+        .args(["lab", "fixture", "register", &fixture_path])
         .assert()
         .success();
 
@@ -1831,7 +1924,7 @@ fn pr_review_run_no_roster_profile_errors_loudly() {
 #[test]
 fn review_bench_funnel_conflicts_with_dialectic() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["lab", "review-bench", "--funnel", "--dialectic"])
+    cmd.args(["lab", "eval", "--funnel", "--dialectic"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
@@ -1840,13 +1933,13 @@ fn review_bench_funnel_conflicts_with_dialectic() {
 #[test]
 fn review_bench_funnel_conflicts_with_agentic_and_freeform() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["lab", "review-bench", "--funnel", "--agentic"])
+    cmd.args(["lab", "eval", "--funnel", "--agentic"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
 
     let mut cmd2 = Command::cargo_bin("darkmux").unwrap();
-    cmd2.args(["lab", "review-bench", "--funnel", "--freeform"])
+    cmd2.args(["lab", "eval", "--funnel", "--freeform"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
@@ -1857,7 +1950,7 @@ fn review_bench_crew_requires_funnel() {
     // --crew named without --funnel: clap's `requires = "funnel"` fires
     // before the command handler ever runs (no dispatch, no cases loaded).
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["lab", "review-bench", "--crew", "review-funnel"])
+    cmd.args(["lab", "eval", "--roster-profile", "review-funnel"])
         .assert()
         .failure()
         .stderr(
@@ -1874,7 +1967,7 @@ fn review_bench_exec_mode_k_and_bundler_each_require_funnel() {
         ("--bundler", "some-bundler"),
     ] {
         let mut cmd = Command::cargo_bin("darkmux").unwrap();
-        cmd.args(["lab", "review-bench", flag, value])
+        cmd.args(["lab", "eval", flag, value])
             .assert()
             .failure()
             .stderr(
@@ -1889,7 +1982,7 @@ fn review_bench_funnel_requires_workdirs() {
     // --funnel alone (no --workdirs): reuses the same preflight
     // --agentic/--dialectic already run, extended to include --funnel.
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["lab", "review-bench", "--funnel", "--crew", "review-funnel"])
+    cmd.args(["lab", "eval", "--funnel", "--roster-profile", "review-funnel"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--funnel requires --workdirs"));
@@ -1924,7 +2017,7 @@ fn review_bench_funnel_no_resolvable_roster_fails_preflight() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.args([
         "lab",
-        "review-bench",
+        "eval",
         "--cases-dir",
         cases_dir.to_str().unwrap(),
         "--funnel",
@@ -1948,9 +2041,9 @@ fn review_bench_funnel_k_zero_rejected_at_cli_layer() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.args([
         "lab",
-        "review-bench",
+        "eval",
         "--funnel",
-        "--crew",
+        "--roster-profile",
         "review-funnel",
         "--k",
         "0",
@@ -1996,13 +2089,13 @@ fn review_bench_funnel_roster_local_model_without_n_ctx_fails_loud() {
         .unwrap()
         .args([
             "lab",
-            "review-bench",
+            "eval",
             "--cases-dir",
             cases_dir.to_str().unwrap(),
             "--funnel",
             "--workdirs",
             workdirs.to_str().unwrap(),
-            "--crew",
+            "--roster-profile",
             "ctxless",
             "--profiles-file",
             profiles_path.to_str().unwrap(),
@@ -2076,13 +2169,13 @@ fn review_bench_funnel_nonexistent_roster_fails_preflight_listing_available() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.args([
         "lab",
-        "review-bench",
+        "eval",
         "--cases-dir",
         cases_dir.to_str().unwrap(),
         "--funnel",
         "--workdirs",
         workdirs.to_str().unwrap(),
-        "--crew",
+        "--roster-profile",
         "ghost",
         "--profiles-file",
         registry.to_str().unwrap(),
@@ -2111,13 +2204,13 @@ fn review_bench_funnel_degenerate_run_completes_offline_with_console_line_and_ar
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.args([
         "lab",
-        "review-bench",
+        "eval",
         "--cases-dir",
         cases_dir.to_str().unwrap(),
         "--funnel",
         "--workdirs",
         workdirs.to_str().unwrap(),
-        "--crew",
+        "--roster-profile",
         "review-funnel",
         "--exec-mode",
         "sequential",
@@ -2188,13 +2281,13 @@ fn review_bench_funnel_bundler_flag_reaches_external_bundles_and_fails_loud_per_
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.args([
         "lab",
-        "review-bench",
+        "eval",
         "--cases-dir",
         cases_dir.to_str().unwrap(),
         "--funnel",
         "--workdirs",
         workdirs.to_str().unwrap(),
-        "--crew",
+        "--roster-profile",
         "review-funnel",
         "--exec-mode",
         "sequential",

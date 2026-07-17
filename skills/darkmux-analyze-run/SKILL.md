@@ -12,7 +12,7 @@ ARGUMENTS expected: `<run-id-or-path>`
 ## Step 1 — If no run-id given, list recent runs
 
 ```bash
-darkmux lab runs --limit 5
+darkmux lab run list --limit 5
 ```
 
 This prints the 5 most-recent run IDs with workload + wall clock + ok/error status. Surface the table and ask the user which to analyze.
@@ -20,7 +20,7 @@ This prints the 5 most-recent run IDs with workload + wall clock + ok/error stat
 ## Step 2 — Inspect
 
 ```bash
-darkmux lab inspect "$ARGUMENTS"
+darkmux lab run inspect "$ARGUMENTS"
 ```
 
 Output shape:
@@ -54,7 +54,7 @@ Frame the run in human terms:
 
 # Data reference — where each piece of data lives
 
-`darkmux lab inspect` gives a fixed summary. When you need finer-grained signal (per-turn token timeline, compression ratio per compaction, partial-event cadence, etc.) you query the raw files directly. **This section names the canonical locations + field shapes** so jq queries work first try, not after three wrong guesses.
+`darkmux lab run inspect` gives a fixed summary. When you need finer-grained signal (per-turn token timeline, compression ratio per compaction, partial-event cadence, etc.) you query the raw files directly. **This section names the canonical locations + field shapes** so jq queries work first try, not after three wrong guesses.
 
 ## Run-artifact map
 

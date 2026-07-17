@@ -191,13 +191,13 @@ impl WorkloadProvider for CodingTaskProvider {
                       (resolver does literal-string matching today; semver support tracked in #496).\n\
                  \n\
                    2. Register the project as a fixture:\n\
-                        darkmux lab register <path-to-your-project>\n\
+                        darkmux lab fixture register <path-to-your-project>\n\
                  \n\
                    3. Make sure the workload manifest declares what it needs:\n\
                         \"requires_fixture\": \"{}\"\n\
                  \n\
                    4. Inspect what's registered:\n\
-                        darkmux lab fixtures\n\
+                        darkmux lab fixture list\n\
                  \n\
                  For a coding-task workload that runs out of the box (no external setup), try:\n\
                    darkmux lab run quick-coding",
@@ -1733,7 +1733,7 @@ not-valid-json
         // DARKMUX_SANDBOX_<W> env var. That path is removed; the
         // hint now points at the fixture-registry CLI verbs.
         assert!(
-            msg.contains("darkmux lab register"),
+            msg.contains("darkmux lab fixture register"),
             "expected register-verb hint; got: {msg}"
         );
         assert!(

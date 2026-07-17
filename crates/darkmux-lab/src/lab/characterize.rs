@@ -71,7 +71,7 @@ pub fn print_report(r: &CharacterizeReport) {
 
     if any_dispatch_failed {
         println!(
-            "verdict: at least one dispatch failed — inspect `darkmux lab inspect <run-id>` \
+            "verdict: at least one dispatch failed — inspect `darkmux lab run inspect <run-id>` \
              and check `darkmux doctor` for setup problems"
         );
     } else if any_verify_failed {
@@ -89,11 +89,11 @@ pub fn print_report(r: &CharacterizeReport) {
     }
     println!();
     println!("Next steps:");
-    println!("  • `darkmux lab inspect <run-id>` for the per-run breakdown");
+    println!("  • `darkmux lab run inspect <run-id>` for the per-run breakdown");
     if r.outcomes.len() == 1 {
         println!(
             "  • Re-run for distribution: `darkmux lab run {} --runs 5` then \
-             `darkmux lab compare <a> <b>` for variance",
+             `darkmux lab run compare <a> <b>` for variance",
             r.workload
         );
     }

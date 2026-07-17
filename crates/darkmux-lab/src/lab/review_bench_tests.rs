@@ -1010,6 +1010,7 @@
     fn funnel_opts(scores_out: PathBuf, with_exec_mode_and_k: bool) -> ReviewBenchOpts {
         ReviewBenchOpts {
             cases_dir: PathBuf::from("."),
+            role: "pr-reviewer".into(),
             profile_name: Some("test-profile".into()),
             config_path: None,
             timeout_seconds: 60,
@@ -1019,7 +1020,7 @@
             prosecutor_profile: None,
             defender_profile: None,
             judge_profile: None,
-            crew: Some("test-crew".into()),
+            roster_profile: Some("test-crew".into()),
             exec_mode: if with_exec_mode_and_k { Some("sequential".into()) } else { None },
             k_override: if with_exec_mode_and_k { Some(5) } else { None },
             bundler_cmd: None,
@@ -1315,7 +1316,7 @@
         let tmp = tempfile::TempDir::new().unwrap();
         let scores_out = tmp.path().join("scores.json");
         let mut opts = funnel_opts(scores_out.clone(), false);
-        opts.crew = Some("review-funnel".into());
+        opts.roster_profile = Some("review-funnel".into());
         opts.k_override = Some(9);
 
         let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_out, 0).unwrap();
@@ -1559,6 +1560,7 @@
     fn funnel_ctx_opts(config_path: PathBuf, roster: &str, exec_mode: Option<&str>, k_override: Option<u32>) -> ReviewBenchOpts {
         ReviewBenchOpts {
             cases_dir: PathBuf::from("."),
+            role: "pr-reviewer".into(),
             profile_name: None,
             config_path: Some(config_path.to_str().unwrap().to_string()),
             timeout_seconds: 30,
@@ -1568,7 +1570,7 @@
             prosecutor_profile: None,
             defender_profile: None,
             judge_profile: None,
-            crew: Some(roster.to_string()),
+            roster_profile: Some(roster.to_string()),
             exec_mode: exec_mode.map(str::to_string),
             k_override,
             bundler_cmd: None,

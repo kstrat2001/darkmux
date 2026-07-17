@@ -39,7 +39,7 @@ pub fn lab_doctor() -> Result<DoctorReport> {
 
     if !reg_path.exists() {
         report.warnings.push(format!(
-            "no registry found at {}\n  Options:\n    (a) Bootstrap built-in synthetic fixtures:  `scripts/lab-init.sh`\n    (b) Register your own fixture:              `dm lab register /path/to/your/fixture/`\n    (c) Hand-write the registry:                see docs/lab-registry.md (when published)\n  Until then, `dm lab run` can't resolve any fixture by name.",
+            "no registry found at {}\n  Options:\n    (a) Bootstrap built-in synthetic fixtures:  `scripts/lab-init.sh`\n    (b) Register your own fixture:              `dm lab fixture register /path/to/your/fixture/`\n    (c) Hand-write the registry:                see docs/lab-registry.md (when published)\n  Until then, `dm lab run` can't resolve any fixture by name.",
             reg_path.display()
         ));
         return Ok(report);
@@ -51,7 +51,7 @@ pub fn lab_doctor() -> Result<DoctorReport> {
 
     if registry.fixtures.is_empty() {
         report.warnings.push(format!(
-            "registry at {} is empty — no fixtures registered.\n  Add one: `dm lab register /path/to/your/fixture/`",
+            "registry at {} is empty — no fixtures registered.\n  Add one: `dm lab fixture register /path/to/your/fixture/`",
             reg_path.display()
         ));
         return Ok(report);
@@ -163,7 +163,7 @@ fn walk_for_artifacts(name: &str, dir: &Path, descend: bool, findings: &mut Vec<
 fn artifact_warning(name: &str, dir: &str, path: &Path) -> String {
     let p = path.display();
     format!(
-        "fixture '{name}': '{dir}' in source ({p}) is a run-artifact dir, not fixture content — it's excluded from the content hash but shouldn't live in a fixture. If it's leftover from a prior run: `rm -rf {p}` then `dm lab register --force <fixture-path>` to re-baseline."
+        "fixture '{name}': '{dir}' in source ({p}) is a run-artifact dir, not fixture content — it's excluded from the content hash but shouldn't live in a fixture. If it's leftover from a prior run: `rm -rf {p}` then `dm lab fixture register --force <fixture-path>` to re-baseline."
     )
 }
 
@@ -173,7 +173,7 @@ fn artifact_warning(name: &str, dir: &str, path: &Path) -> String {
 fn check_one(name: &str, entry: &RegisteredFixture) -> std::result::Result<(), String> {
     if !entry.path.exists() {
         return Err(format!(
-            "{name}: registered path no longer exists → {}\n  Either restore the dir OR `dm lab unregister {name}`",
+            "{name}: registered path no longer exists → {}\n  Either restore the dir OR `dm lab fixture unregister {name}`",
             entry.path.display()
         ));
     }
@@ -201,7 +201,7 @@ fn check_one(name: &str, entry: &RegisteredFixture) -> std::result::Result<(), S
         .map_err(|e| format!("{name}: hash recompute failed: {e}"))?;
     if current_hash != entry.content_hash {
         return Err(format!(
-            "{name}: content drift — recorded {} vs current {}\n  Either restore the fixture, OR\n  `dm lab register --force {}` to accept the new state",
+            "{name}: content drift — recorded {} vs current {}\n  Either restore the fixture, OR\n  `dm lab fixture register --force {}` to accept the new state",
             short_hash(&entry.content_hash),
             short_hash(&current_hash),
             entry.path.display()
@@ -211,7 +211,7 @@ fn check_one(name: &str, entry: &RegisteredFixture) -> std::result::Result<(), S
     // Manifest version drift (recorded vs on-disk).
     if entry.manifest_version != manifest.version {
         return Err(format!(
-            "{name}: manifest version drift — recorded {} vs on-disk {}\n  `dm lab register --force {}` to accept",
+            "{name}: manifest version drift — recorded {} vs on-disk {}\n  `dm lab fixture register --force {}` to accept",
             entry.manifest_version,
             manifest.version,
             entry.path.display()
@@ -283,7 +283,7 @@ mod tests {
         let entry = reg.get("demo").unwrap();
         let err = check_one("demo", entry).unwrap_err();
         assert!(err.contains("content drift"), "got: {err}");
-        assert!(err.contains("dm lab register --force"), "got: {err}");
+        assert!(err.contains("dm lab fixture register --force"), "got: {err}");
     }
 
     #[test]

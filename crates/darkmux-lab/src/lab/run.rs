@@ -424,9 +424,9 @@ pub(crate) fn resolve_source_sandbox(
                  \n\
                  Fix:\n\
                    1. Register an existing fixture that satisfies this requirement:\n\
-                      darkmux lab register /path/to/your/fixture\n\
+                      darkmux lab fixture register /path/to/your/fixture\n\
                    2. Or inspect what's registered:\n\
-                      darkmux lab fixtures\n\
+                      darkmux lab fixture list\n\
                    3. Or update the fixture's `.fixture.json` to set:\n\
                       \"satisfies\": \"{}\"",
                 loaded.manifest.workload.id,
@@ -808,8 +808,8 @@ mod tests {
         let err = resolve_source_sandbox(&loaded, &paths).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("never-registered@1.0"), "got: {msg}");
-        assert!(msg.contains("darkmux lab register"), "got: {msg}");
-        assert!(msg.contains("darkmux lab fixtures"), "got: {msg}");
+        assert!(msg.contains("darkmux lab fixture register"), "got: {msg}");
+        assert!(msg.contains("darkmux lab fixture list"), "got: {msg}");
     }
 
     /// (#489) Phase 2 — `enrich_manifest_with_fixture_info` adds the

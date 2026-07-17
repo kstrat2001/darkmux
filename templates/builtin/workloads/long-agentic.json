@@ -1,5 +1,5 @@
 {
-  "_comment": "Long-agentic coding workload. The canonical Article 2 workload — multi-turn QA review of refresh-token rotation in a Node project. Expects an external sandbox; register your project as a fixture via `darkmux lab register <path>` after creating a `.fixture.json` declaring `\"satisfies\": \"node-refresh-token-rotation@1.0\"`. The ${SANDBOX_DIR} placeholder in the prompt is substituted with the resolved sandbox path at dispatch time. (#490: pre-Phase-3, this used DARKMUX_SANDBOX_LONG_AGENTIC env var; removed in favor of the registry.)",
+  "_comment": "Long-agentic coding workload. The canonical Article 2 workload — multi-turn QA review of refresh-token rotation in a Node project. Expects an external sandbox; register your project as a fixture via `darkmux lab fixture register <path>` after creating a `.fixture.json` declaring `\"satisfies\": \"node-refresh-token-rotation@1.0\"`. The ${SANDBOX_DIR} placeholder in the prompt is substituted with the resolved sandbox path at dispatch time. (#490: pre-Phase-3, this used DARKMUX_SANDBOX_LONG_AGENTIC env var; removed in favor of the registry.)",
 
   "workload": {
     "id": "long-agentic",

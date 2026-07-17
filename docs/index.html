@@ -308,9 +308,9 @@
     <ul class="plain">
       <li><code>lab run quick-q</code> — single-turn smoke prompt against the active profile</li>
       <li><code>lab run long-agentic</code> — the workload that exercises compaction</li>
-      <li><code>lab inspect &lt;run&gt;</code> — turns, compactions, mode (fast/slow), notes</li>
+      <li><code>lab run inspect &lt;run&gt;</code> — turns, compactions, mode (fast/slow), notes</li>
       <li><code>lab tune long-agentic --runs 6</code> — bimodal cluster detection across N dispatches</li>
-      <li><code>lab compare &lt;A&gt; &lt;B&gt;</code> — diff two runs for variance / regression</li>
+      <li><code>lab run compare &lt;A&gt; &lt;B&gt;</code> — diff two runs for variance / regression</li>
     </ul>
     <p class="muted" style="margin-top: 24px;">Workloads are pluggable via a <code>WorkloadProvider</code> trait. Two ship out of the box (<code>prompt</code>, <code>coding-task</code>); add your own without forking the repo. Full walkthrough in the <a href="guide/lab.html">lab section of the user guide</a>.</p>
   </div>

@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 /// `LabCmd::Characterize`/`LabCmd::Tune` into
 /// one `#[command(flatten)]`-able struct — mechanical dedup only, the doc
 /// string + `--profiles-file` flag name are unchanged. Two other subcommands
-/// (`LabCmd::ReviewBench`, `LabCmd::Loop`) declare their own doc text for
+/// (`LabCmd::Eval`, `LabCmd::Loop`) declare their own doc text for
 /// this same flag (a shorter variant and a `#984`-specific one respectively)
 /// and are deliberately left un-flattened — collapsing them would change
 /// their help text.
@@ -43,7 +43,7 @@ pub(crate) struct JsonFlag {
 
 /// Shared `--json` flag ("Emit machine-readable JSON instead of styled
 /// text." doc variant, no `#907` reference). Collapses the identical
-/// declaration duplicated across `LessonsCmd::List`/`LessonsCmd::Recall`.
+/// declaration duplicated across `LessonCmd::List`/`LessonCmd::Recall`.
 #[derive(clap::Args)]
 pub(crate) struct JsonFlagPlain {
     /// Emit machine-readable JSON instead of styled text.
@@ -349,10 +349,11 @@ pub(crate) enum MissionCmd {
     /// material in one place: the loop pathologies darkmux's detectors flagged
     /// across the mission's runs (cautions), the corrections the reviewer
     /// recorded (#849), and the mission's phases + how each ended. READ-ONLY.
-    /// Run it (or let the close nudge prompt it) at mission completion; the
+    /// Run it (or let the finalize nudge prompt it) at mission completion; the
     /// `darkmux-mission-debrief` skill consumes `--json` to distill durable
-    /// `lessons` (with the why) for the next crew. NASA vocabulary:
-    /// Mission · Crew · Debrief · Lessons.
+    /// `memory lesson`s (with the why) for the next dispatch. NASA vocabulary:
+    /// Mission · Debrief · Lessons (`Crew` was a derived view — the crew
+    /// registry retired in #1426; staffing now resolves per dispatch). (#1465)
     Debrief {
         /// Mission id (filename stem under ~/.darkmux/missions/).
         id: String,
@@ -818,7 +819,7 @@ pub(crate) enum MemoryCmd {
     /// the cross-engagement `~/.darkmux/lessons.db`. (#994)
     Lesson {
         #[command(subcommand)]
-        sub: LessonsCmd,
+        sub: LessonCmd,
     },
     /// The adjudication corrections the user's reviewer RECORDED — the
     /// verdicts and overrides they logged against a dispatch (`darkmux flow
@@ -858,8 +859,11 @@ pub(crate) enum CorrectionCmd {
     },
 }
 
+/// (#1465) Singular `LessonCmd` to match `MemoryCmd::Lesson` (and the
+/// `profile`/`role`/`machine` singular sub-nouns). Pure internal rename from
+/// `LessonCmd` — no wire change.
 #[derive(Subcommand)]
-pub(crate) enum LessonsCmd {
+pub(crate) enum LessonCmd {
     /// Record an engagement-context lesson — a convention, constraint, or
     /// decision, WITH the reasoning behind it (explain the why, not just the
     /// rule). Appended to the durable `lessons.db`; surfaced to coder
@@ -952,13 +956,99 @@ pub(crate) enum LessonsCmd {
     },
 }
 
+/// (#1465, #1426) The recorded-run sub-verbs, folded out of the flat
+/// `lab runs`/`lab inspect`/`lab compare` leaves into the `lab run`
+/// kind-family. `lab run <workload>` still dispatches (a positional workload);
+/// these route when no workload positional is given.
+#[derive(Subcommand)]
+pub(crate) enum RunCmd {
+    /// List recent runs (most recent first). (was: `lab runs`)
+    List {
+        /// Show at most N runs (default: 5).
+        #[arg(long, short = 'l', default_value = "5")]
+        limit: usize,
+        /// Show all runs (overrides --limit).
+        #[arg(long, short = 'a')]
+        all: bool,
+    },
+    /// Inspect a previously-recorded run. (was: `lab inspect`)
+    Inspect {
+        run: String,
+        /// Also dump the full compaction summary text(s) the compactor model
+        /// wrote during this run (read from trajectory.jsonl). Useful for
+        /// methodology validation — confirming the compactor is producing
+        /// substantive summaries rather than degenerate / empty output.
+        #[arg(long)]
+        summary: bool,
+    },
+    /// Compare two runs. (was: `lab compare`)
+    Compare { run_a: String, run_b: String },
+}
+
+/// (#1465) The `lab workload` kind-family. `list` is the only member today —
+/// spelled `list` (round-9 universal convention) instead of the retired flat
+/// `lab workloads` plural-noun-as-verb leaf.
+#[derive(Subcommand)]
+pub(crate) enum WorkloadCmd {
+    /// List available workloads. (was: `lab workloads`)
+    List,
+}
+
+/// (#1465, #491) The `lab fixture` kind-family — the flat `lab fixtures`/
+/// `lab register`/`lab unregister` leaves folded into one singular sub-noun.
+#[derive(Subcommand)]
+pub(crate) enum FixtureCmd {
+    /// List registered fixtures + their paths + hashes (#491).
+    /// (was: `lab fixtures`)
+    List,
+    /// Register a fixture directory in the lab registry by name (#491).
+    /// Reads `.fixture.json` from `<path>`, computes a BLAKE3 content
+    /// hash, records the pointer in `~/.darkmux/lab-registry.json`.
+    /// The dir itself stays where it is — registry is just a lookup
+    /// table. (was: `lab register`)
+    Register {
+        /// Path to the fixture directory (must contain `.fixture.json`).
+        path: std::path::PathBuf,
+        /// Override the manifest's name field (registry key).
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace an existing registry entry with the same name.
+        /// Without this, duplicate names error out.
+        #[arg(long)]
+        force: bool,
+        /// Idempotent register: if the fixture is already registered,
+        /// skip with a no-op success instead of erroring. Lets scripts
+        /// (e.g. scripts/lab-init.sh) re-run cleanly without parsing
+        /// error text. Ignored when `--force` is also passed.
+        #[arg(long = "if-absent")]
+        if_absent: bool,
+    },
+    /// Remove a fixture from the lab registry by name (#491).
+    /// NEVER touches the underlying directory — operator-sovereignty
+    /// preserved. (was: `lab unregister`)
+    Unregister {
+        /// Registry key (name from `.fixture.json` or `--name` at
+        /// register time).
+        name: String,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum LabCmd {
-    /// List available workloads.
-    Workloads,
-    /// Run a workload (one or more times).
+    /// Dispatch a workload, or manage recorded runs (#1465, #1426).
+    ///
+    /// `lab run <workload>` dispatches a workload (one or more times — the
+    /// unchanged run path). With NO workload positional, a sub-verb manages
+    /// recorded runs: `lab run list`, `lab run inspect <id>`,
+    /// `lab run compare <a> <b>` (the retired flat `lab runs`/`lab inspect`/
+    /// `lab compare` leaves, folded into the `run` kind-family). `run` takes
+    /// EITHER a workload positional OR a sub-verb — `args_conflicts_with_
+    /// subcommands` keeps the two forms from mixing, and a token that is not a
+    /// known sub-verb fills the workload positional.
+    #[command(args_conflicts_with_subcommands = true)]
     Run {
-        workload: String,
+        /// Workload id to dispatch (omit when using a run sub-verb).
+        workload: Option<String>,
         #[arg(long, short = 'p')]
         profile: Option<String>,
         #[arg(long, short = 'n', default_value = "1")]
@@ -967,12 +1057,39 @@ pub(crate) enum LabCmd {
         profiles: ProfilesFileArg,
         #[arg(long, short = 'q')]
         quiet: bool,
+        #[command(subcommand)]
+        sub: Option<RunCmd>,
     },
-    /// PR-reviewer eval (#1119) — run the `pr-reviewer` role over a labeled
-    /// diff corpus and score precision / recall / verdict / anchor against the
-    /// ground-truth labels. Run across profiles (`--profile` / `--profiles-file`)
-    /// to compare models reproducibly — the rows are the bake-off matrix.
-    ReviewBench {
+    /// Workload registry (`lab workload list`). (#1465)
+    Workload {
+        #[command(subcommand)]
+        sub: WorkloadCmd,
+    },
+    /// Lab fixtures (`lab fixture list|register|unregister`). (#1465, #491)
+    Fixture {
+        #[command(subcommand)]
+        sub: FixtureCmd,
+    },
+    /// Role eval (#1119, generalized in #1465) — run a role over a labeled
+    /// corpus and score precision / recall / verdict / anchor against the
+    /// ground-truth labels. `<role>` defaults to `pr-reviewer` (today's
+    /// behavior); any role that emits the same `{verdict, findings}` JSON
+    /// contract is a caller (a future coder-eval is free). Run across profiles
+    /// (`--profile` / `--profiles-file`) to compare models reproducibly — the
+    /// rows are the bake-off matrix. (Was `lab review-bench`; generalizing the
+    /// snowflake dissolves the `lab review` vs `mission launch review`
+    /// naming collision — `eval` names what it does.)
+    Eval {
+        /// The role to evaluate against the corpus. Defaults to `pr-reviewer`
+        /// (the original `review-bench` behavior). The scorer is role-agnostic
+        /// — it matches the role's emitted `{verdict, findings}` JSON against
+        /// the ground-truth labels. The experimental condition flags below
+        /// (`--freeform`/`--agentic`/`--dialectic`/`--funnel`) are
+        /// `pr-reviewer`-specific and ignore this positional (they dispatch
+        /// fixed reviewer variant roles / pipelines); a follow-up moves those
+        /// behind per-role config (#1465).
+        #[arg(default_value = "pr-reviewer")]
+        role: String,
         /// Directory of labeled cases (`<id>.diff` + `<id>.label.json`).
         #[arg(
             long = "cases-dir",
@@ -1016,7 +1133,7 @@ pub(crate) enum LabCmd {
         /// validation mode: recall/precision scored EXACTLY like every other
         /// mode. Requires --workdirs (the probe/judge seats read the case's
         /// repo tree, like --agentic/--dialectic); seat staffing is derived
-        /// from the roster profile (--crew, else --profile, else the
+        /// from the roster profile (--roster-profile, else --profile, else the
         /// registry's default_profile) by the resourcing resolver (#1426).
         #[arg(long, conflicts_with_all = ["freeform", "agentic", "dialectic"])]
         funnel: bool,
@@ -1037,13 +1154,15 @@ pub(crate) enum LabCmd {
         /// denser local or remote-endpoint profile while the advocates stay.
         #[arg(long = "judge-profile", requires = "dialectic")]
         judge_profile: Option<String>,
-        /// (#1426 ship-2) The ROSTER profile the resourcing resolver staffs
-        /// the review seats (probe / judge / verify) from — capability
-        /// scoring per seat against the profile's models[]. Falls back to
-        /// --profile, else the registry's `default_profile`. (The crews map
-        /// retired; this no longer names a `crews.<name>` entry.)
-        #[arg(long, requires = "funnel")]
-        crew: Option<String>,
+        /// (#1426 ship-2, renamed in #1465) The ROSTER profile the resourcing
+        /// resolver staffs the review seats (probe / judge / verify) from —
+        /// capability scoring per seat against the profile's models[]. Falls
+        /// back to --profile, else the registry's `default_profile`. (Renamed
+        /// from `--crew`: the crew family retired entirely in #1426, so the
+        /// flag names the roster PROFILE it resolves against, not a retired
+        /// `crews.<name>` entry.)
+        #[arg(long = "roster-profile", requires = "funnel")]
+        roster_profile: Option<String>,
         /// (#1222) Funnel model-cycling mode: "sequential" | "parallel" |
         /// "auto" (default: auto — resolved once per run against the local
         /// hardware tier).
@@ -1128,27 +1247,6 @@ pub(crate) enum LabCmd {
         #[arg(long)]
         json: bool,
     },
-    /// List recent runs (most recent first).
-    Runs {
-        /// Show at most N runs (default: 5).
-        #[arg(long, short = 'l', default_value = "5")]
-        limit: usize,
-        /// Show all runs (overrides --limit).
-        #[arg(long, short = 'a')]
-        all: bool,
-    },
-    /// Inspect a previously-recorded run.
-    Inspect {
-        run: String,
-        /// Also dump the full compaction summary text(s) the compactor model
-        /// wrote during this run (read from trajectory.jsonl). Useful for
-        /// methodology validation — confirming the compactor is producing
-        /// substantive summaries rather than degenerate / empty output.
-        #[arg(long)]
-        summary: bool,
-    },
-    /// Compare two runs.
-    Compare { run_a: String, run_b: String },
     /// Run an opinionated single-command characterization of the local setup.
     /// Dispatches a single workload (default `quick-q`) on the active profile
     /// and returns a one-screen verdict — wall clock, verify outcome, hint at
@@ -1177,38 +1275,6 @@ pub(crate) enum LabCmd {
         #[command(flatten)]
         profiles: ProfilesFileArg,
     },
-    /// Register a fixture directory in the lab registry by name (#491).
-    /// Reads `.fixture.json` from `<path>`, computes a BLAKE3 content
-    /// hash, records the pointer in `~/.darkmux/lab-registry.json`.
-    /// The dir itself stays where it is — registry is just a lookup
-    /// table.
-    Register {
-        /// Path to the fixture directory (must contain `.fixture.json`).
-        path: std::path::PathBuf,
-        /// Override the manifest's name field (registry key).
-        #[arg(long)]
-        name: Option<String>,
-        /// Replace an existing registry entry with the same name.
-        /// Without this, duplicate names error out.
-        #[arg(long)]
-        force: bool,
-        /// Idempotent register: if the fixture is already registered,
-        /// skip with a no-op success instead of erroring. Lets scripts
-        /// (e.g. scripts/lab-init.sh) re-run cleanly without parsing
-        /// error text. Ignored when `--force` is also passed.
-        #[arg(long = "if-absent")]
-        if_absent: bool,
-    },
-    /// Remove a fixture from the lab registry by name (#491).
-    /// NEVER touches the underlying directory — operator-sovereignty
-    /// preserved.
-    Unregister {
-        /// Registry key (name from `.fixture.json` or `--name` at
-        /// register time).
-        name: String,
-    },
-    /// List registered fixtures + their paths + hashes (#491).
-    Fixtures,
     /// Lint the lab registry — schema check, path existence, content
     /// hash recompute, required-files presence (#491). Cheap + offline:
     /// no dispatches, no network. Doctor is the discoverability layer

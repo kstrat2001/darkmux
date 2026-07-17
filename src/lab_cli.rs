@@ -7,48 +7,68 @@
 
 use anyhow::Result;
 
-use crate::cli::LabCmd;
+use crate::cli::{FixtureCmd, LabCmd, RunCmd, WorkloadCmd};
 use crate::lab;
 use crate::workloads;
 
 pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
     match sub {
-        LabCmd::Workloads => {
-            let ids = lab::run::lab_workloads();
-            if ids.is_empty() {
-                println!("(no workloads found — check templates/builtin/workloads/ or .darkmux/workloads/)");
-            } else {
-                for id in ids {
-                    println!("{id}");
+        // (#1465) `lab workload list` — the retired flat `lab workloads` leaf,
+        // now the sole member of the `workload` kind-family.
+        LabCmd::Workload { sub } => match sub {
+            WorkloadCmd::List => {
+                let ids = lab::run::lab_workloads();
+                if ids.is_empty() {
+                    println!("(no workloads found — check templates/builtin/workloads/ or .darkmux/workloads/)");
+                } else {
+                    for id in ids {
+                        println!("{id}");
+                    }
                 }
+                Ok(0)
             }
-            Ok(0)
-        }
+        },
+        // (#1465) `lab run` takes EITHER a workload positional (dispatch) OR a
+        // run sub-verb (list/inspect/compare — the retired flat `lab runs`/
+        // `lab inspect`/`lab compare` leaves). `args_conflicts_with_subcommands`
+        // guarantees the two forms never mix.
         LabCmd::Run {
             workload,
             profile,
             runs,
             profiles: crate::cli::ProfilesFileArg { profiles },
             quiet,
-        } => {
-            let outcomes = lab::run::lab_run(lab::run::RunOpts {
-                workload_id: workload,
-                profile_name: profile,
-                runs,
-                config_path: profiles,
-                quiet,
-                loop_override: None,
-                inject_context: None,
-            })?;
-            if !quiet {
-                println!("\n{} run(s) complete:", outcomes.len());
-                for o in &outcomes {
-                    println!("  {} — {}", o.run_id, o.notes.join(" | "));
+            sub,
+        } => match sub {
+            Some(run_sub) => cmd_lab_run_sub(run_sub),
+            None => {
+                let workload_id = workload.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "specify a workload to dispatch (`lab run <workload>`) or a run \
+                         sub-verb (`lab run list` / `lab run inspect <id>` / \
+                         `lab run compare <a> <b>`)"
+                    )
+                })?;
+                let outcomes = lab::run::lab_run(lab::run::RunOpts {
+                    workload_id,
+                    profile_name: profile,
+                    runs,
+                    config_path: profiles,
+                    quiet,
+                    loop_override: None,
+                    inject_context: None,
+                })?;
+                if !quiet {
+                    println!("\n{} run(s) complete:", outcomes.len());
+                    for o in &outcomes {
+                        println!("  {} — {}", o.run_id, o.notes.join(" | "));
+                    }
                 }
+                Ok(if outcomes.iter().all(|o| o.ok) { 0 } else { 1 })
             }
-            Ok(if outcomes.iter().all(|o| o.ok) { 0 } else { 1 })
-        }
-        LabCmd::ReviewBench {
+        },
+        LabCmd::Eval {
+            role,
             cases_dir,
             profile,
             profiles,
@@ -62,12 +82,13 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             prosecutor_profile,
             defender_profile,
             judge_profile,
-            crew,
+            roster_profile,
             exec_mode,
             k,
             bundler,
         } => {
             lab::review_bench::run_review_bench(lab::review_bench::ReviewBenchOpts {
+                role,
                 cases_dir: std::path::PathBuf::from(cases_dir),
                 profile_name: profile,
                 config_path: profiles,
@@ -88,7 +109,7 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 prosecutor_profile,
                 defender_profile,
                 judge_profile,
-                crew,
+                roster_profile,
                 exec_mode,
                 k_override: k,
                 bundler_cmd: bundler,
@@ -126,13 +147,108 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             inject_from_mission,
             json,
         }),
-        LabCmd::Runs { limit, all } => {
+        LabCmd::Characterize {
+            workload,
+            profile,
+            profiles: crate::cli::ProfilesFileArg { profiles },
+        } => {
+            let report = lab::characterize::characterize(&lab::characterize::CharacterizeOpts {
+                workload,
+                profile,
+                config: profiles,
+            })?;
+            lab::characterize::print_report(&report);
+            Ok(if report.outcomes.iter().all(|o| o.ok) {
+                0
+            } else {
+                1
+            })
+        }
+        LabCmd::Tune {
+            workload,
+            profile,
+            runs,
+            profiles: crate::cli::ProfilesFileArg { profiles },
+        } => {
+            let report = lab::tune::tune(&lab::tune::TuneOpts {
+                workload,
+                profile,
+                runs,
+                config: profiles,
+            })?;
+            lab::tune::print_report(&report);
+            Ok(if report.outcomes.iter().all(|o| o.ok) {
+                0
+            } else {
+                1
+            })
+        }
+        // (#1465) `lab fixture list|register|unregister` — the retired flat
+        // `lab fixtures`/`lab register`/`lab unregister` leaves folded into the
+        // `fixture` kind-family.
+        LabCmd::Fixture { sub } => match sub {
+            FixtureCmd::List => {
+                let msg = lab::fixture_cli::cmd_list()?;
+                println!("{msg}");
+                Ok(0)
+            }
+            FixtureCmd::Register {
+                path,
+                name,
+                force,
+                if_absent,
+            } => {
+                let msg = lab::fixture_cli::cmd_register(&path, name, force, if_absent)?;
+                println!("{msg}");
+                Ok(0)
+            }
+            FixtureCmd::Unregister { name } => {
+                let msg = lab::fixture_cli::cmd_unregister(&name)?;
+                println!("{msg}");
+                Ok(0)
+            }
+        },
+        LabCmd::Doctor => {
+            let report = lab::doctor::lab_doctor()?;
+            // Warnings first so actionable items don't get buried
+            // behind a long list of passes when many fixtures are
+            // registered. Reviewer suggestion (#498 QA).
+            for w in &report.warnings {
+                println!("[warn] {w}");
+            }
+            for p in &report.passes {
+                println!("[ok]  {p}");
+            }
+            println!();
+            println!(
+                "{} pass, {} warn ({} fixture{} checked)",
+                report.passes.len(),
+                report.warnings.len(),
+                report.fixture_count,
+                if report.fixture_count == 1 { "" } else { "s" }
+            );
+            Ok(if report.has_warnings() { 1 } else { 0 })
+        }
+        // (#1426) `lab notebook draft|list` — the notebook family folded into
+        // `lab` (the retired top-level `notebook` verb). The handler stays in
+        // `main.rs` beside the other agent-as-scribe plumbing.
+        LabCmd::Notebook { sub } => crate::cmd_notebook(sub),
+    }
+}
+
+/// (#1465) The `lab run` sub-verbs — list/inspect/compare recorded runs.
+/// Split out of `cmd_lab` when the flat `lab runs`/`lab inspect`/`lab compare`
+/// leaves folded into the `run` kind-family; the handler bodies are the
+/// pre-#1465 arm bodies verbatim, zero behavior change.
+fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
+    match sub {
+        RunCmd::List { limit, all } => {
             let lim = if all { None } else { Some(limit) };
             let summaries = lab::list::list_runs(lim)?;
             print!("{}", lab::list::format_table(&summaries));
             Ok(0)
         }
-        LabCmd::Inspect { run, summary } => {
+        RunCmd::Inspect { run, summary } => {
             let report = lab::inspect::lab_inspect(&run)?;
             println!("run:         {}", report.run_id);
             println!("workload:    {}", report.workload_id);
@@ -181,94 +297,13 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             }
             Ok(0)
         }
-        LabCmd::Compare { run_a, run_b } => {
+        RunCmd::Compare { run_a, run_b } => {
             let result = lab::compare::lab_compare(&run_a, &run_b)?;
             for n in &result.notes {
                 println!("{n}");
             }
             Ok(0)
         }
-        LabCmd::Characterize {
-            workload,
-            profile,
-            profiles: crate::cli::ProfilesFileArg { profiles },
-        } => {
-            let report = lab::characterize::characterize(&lab::characterize::CharacterizeOpts {
-                workload,
-                profile,
-                config: profiles,
-            })?;
-            lab::characterize::print_report(&report);
-            Ok(if report.outcomes.iter().all(|o| o.ok) {
-                0
-            } else {
-                1
-            })
-        }
-        LabCmd::Tune {
-            workload,
-            profile,
-            runs,
-            profiles: crate::cli::ProfilesFileArg { profiles },
-        } => {
-            let report = lab::tune::tune(&lab::tune::TuneOpts {
-                workload,
-                profile,
-                runs,
-                config: profiles,
-            })?;
-            lab::tune::print_report(&report);
-            Ok(if report.outcomes.iter().all(|o| o.ok) {
-                0
-            } else {
-                1
-            })
-        }
-        LabCmd::Register {
-            path,
-            name,
-            force,
-            if_absent,
-        } => {
-            let msg = lab::fixture_cli::cmd_register(&path, name, force, if_absent)?;
-            println!("{msg}");
-            Ok(0)
-        }
-        LabCmd::Unregister { name } => {
-            let msg = lab::fixture_cli::cmd_unregister(&name)?;
-            println!("{msg}");
-            Ok(0)
-        }
-        LabCmd::Fixtures => {
-            let msg = lab::fixture_cli::cmd_list()?;
-            println!("{msg}");
-            Ok(0)
-        }
-        LabCmd::Doctor => {
-            let report = lab::doctor::lab_doctor()?;
-            // Warnings first so actionable items don't get buried
-            // behind a long list of passes when many fixtures are
-            // registered. Reviewer suggestion (#498 QA).
-            for w in &report.warnings {
-                println!("[warn] {w}");
-            }
-            for p in &report.passes {
-                println!("[ok]  {p}");
-            }
-            println!();
-            println!(
-                "{} pass, {} warn ({} fixture{} checked)",
-                report.passes.len(),
-                report.warnings.len(),
-                report.fixture_count,
-                if report.fixture_count == 1 { "" } else { "s" }
-            );
-            Ok(if report.has_warnings() { 1 } else { 0 })
-        }
-        // (#1426) `lab notebook draft|list` — the notebook family folded into
-        // `lab` (the retired top-level `notebook` verb). The handler stays in
-        // `main.rs` beside the other agent-as-scribe plumbing.
-        LabCmd::Notebook { sub } => crate::cmd_notebook(sub),
     }
 }
 

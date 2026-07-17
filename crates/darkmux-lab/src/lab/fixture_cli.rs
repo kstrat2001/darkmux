@@ -1,4 +1,4 @@
-//! CLI verb logic for `dm lab register / unregister / fixtures`.
+//! CLI verb logic for `dm lab fixture register / unregister / list`.
 //!
 //! Phase 4 of the lab-reproducibility cluster (#487, #491). Thin
 //! wrappers around `LabRegistry`'s in-memory API that load + save
@@ -11,7 +11,7 @@ use crate::lab::registry::{default_registry_path, LabRegistry};
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// `dm lab register <path>` — read `.fixture.json` from `path`,
+/// `dm lab fixture register <path>` — read `.fixture.json` from `path`,
 /// compute its content hash, add to registry, persist.
 ///
 /// `if_absent` makes register **idempotent**: if the fixture is already
@@ -98,7 +98,7 @@ pub fn cmd_register(
     Ok(msg)
 }
 
-/// `dm lab unregister <name>` — remove pointer from registry.
+/// `dm lab fixture unregister <name>` — remove pointer from registry.
 /// NEVER touches the underlying dir (operator-sovereignty).
 pub fn cmd_unregister(name: &str) -> Result<String> {
     let paths = paths::resolve(ResolveScope::Auto);
@@ -114,14 +114,14 @@ pub fn cmd_unregister(name: &str) -> Result<String> {
     ))
 }
 
-/// `dm lab fixtures` — show registered fixtures table.
+/// `dm lab fixture list` — show registered fixtures table.
 pub fn cmd_list() -> Result<String> {
     let paths = paths::resolve(ResolveScope::Auto);
     let reg_path = default_registry_path(&paths);
 
     if !reg_path.exists() {
         return Ok(format!(
-            "No registry at {}.\n  To get started:\n    `dm lab register <path-to-fixture>`",
+            "No registry at {}.\n  To get started:\n    `dm lab fixture register <path-to-fixture>`",
             reg_path.display()
         ));
     }
@@ -129,7 +129,7 @@ pub fn cmd_list() -> Result<String> {
     let registry = LabRegistry::load(&reg_path)?;
     if registry.fixtures.is_empty() {
         return Ok(format!(
-            "Registry at {} has no fixtures registered.\n  Add one: `dm lab register <path-to-fixture>`",
+            "Registry at {} has no fixtures registered.\n  Add one: `dm lab fixture register <path-to-fixture>`",
             reg_path.display()
         ));
     }
