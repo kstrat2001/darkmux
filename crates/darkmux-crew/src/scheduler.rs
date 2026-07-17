@@ -347,6 +347,19 @@ pub fn run_step_graph(
         ..Default::default()
     };
 
+    // (#1442) Scheduler-owned `bucket_group -> shared remote bucket` map,
+    // living for the WHOLE graph run so sibling steps naming the same group
+    // meter ONE per-execution allowance between them regardless of which
+    // wave each lands in. This is the allowance-multiplication fix: without
+    // it, `seats x k` sibling `dispatch.map` probe steps would each mint a
+    // fresh full allowance, multiplying the effective stage ceiling by the
+    // step count. A step that names no group gets a step-scoped bucket
+    // inside its own kind, so ungrouped behavior is unchanged.
+    let mut bucket_groups: std::collections::BTreeMap<
+        String,
+        std::sync::Arc<std::sync::Mutex<crate::step_kinds::MapRemoteBucket>>,
+    > = std::collections::BTreeMap::new();
+
     loop {
         let ready_ids: Vec<String> = steps
             .values()
@@ -370,6 +383,14 @@ pub fn run_step_graph(
             emit(step_lifecycle_record(step, "step start"));
             persist(step);
         }
+        // (#1442 gate C3, streaming) One channel per wave: every job's
+        // `StepRunCtx` holds a `Sender` clone, and the main thread drains the
+        // `Receiver` LIVE while `run_bounded` executes on a sibling scoped
+        // thread — so a step's per-item records reach `emit` (the scheduler's
+        // own sink, lab/fleet boundary already chosen by the caller) as they
+        // are produced, not batched at wave-drain. The step never touches the
+        // global flow sink directly; it emits THROUGH this seam.
+        let (tx, rx) = std::sync::mpsc::channel::<FlowRecord>();
         // Re-borrow immutably now that every ready step's status flip is
         // recorded — `gather_inputs` needs `&steps`/`&tasks` (completed
         // sibling/upstream outputs), and the job closures below need owned
@@ -393,9 +414,31 @@ pub fn run_step_graph(
                 Some(placement) => crate::concurrent_dispatch::Residency::Local(placement),
                 None => crate::concurrent_dispatch::Residency::Remote,
             };
+            // (#1442) Resolve the step's `bucket_group` to the scheduler-owned
+            // shared bucket (get-or-create), so grouped siblings share ONE
+            // allowance. Ungrouped steps carry `None` and fall back to a
+            // step-scoped bucket inside the kind.
+            let remote_bucket = step_snapshot
+                .config
+                .get("bucket_group")
+                .and_then(|v| v.as_str())
+                .map(|group| {
+                    bucket_groups
+                        .entry(group.to_string())
+                        .or_insert_with(|| {
+                            std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::step_kinds::MapRemoteBucket::new(
+                                    darkmux_types::config_access::remote_max_tokens_per_execution(),
+                                ),
+                            ))
+                        })
+                        .clone()
+                });
+            let ctx = crate::step_kinds::StepRunCtx::new(Some(tx.clone()), remote_bucket);
             let job: crate::concurrent_dispatch::DispatchJob<StepJobResult> =
                 Box::new(move || {
-                    let outcome = kind.run(&step_snapshot, &task_snapshot, &input)?;
+                    let outcome =
+                        kind.run_streaming(&step_snapshot, &task_snapshot, &input, &ctx)?;
                     Ok((
                         StepJobResult {
                             output: outcome.output,
@@ -410,7 +453,24 @@ pub fn run_step_graph(
             });
         }
 
-        let results = crate::concurrent_dispatch::run_bounded(jobs, facts, est, remote_cap, host_factory)?;
+        // (#1442 gate C3) The scheduler holds NO sender past job-building —
+        // only the jobs' `StepRunCtx`s do. When `run_bounded` finishes every
+        // job (each ctx dropped, each `Sender` clone dropped), the channel
+        // closes and the drain loop below ends naturally.
+        drop(tx);
+        // Run the wave on a sibling scoped thread and drain its live records
+        // on this (main) thread. `emit` stays main-thread-only (no `Send`
+        // bound needed on the caller's closure); the `Sender`s crossing into
+        // worker threads carry only owned `FlowRecord`s.
+        let results = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                crate::concurrent_dispatch::run_bounded(jobs, facts, est, remote_cap, host_factory)
+            });
+            for rec in rx.iter() {
+                emit(rec);
+            }
+            worker.join().expect("run_bounded worker thread panicked")
+        })?;
 
         let finished_at = now_unix();
         for (idx, outcome) in results {
