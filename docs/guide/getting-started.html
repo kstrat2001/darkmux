@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Getting started · darkmux user guide</title>
-<meta name="description" content="Install darkmux, run doctor, configure your first profile, swap to it. The on-ramp guide for new operators.">
+<meta name="description" content="Install darkmux, run init, declare a profile, dispatch a role, launch your first mission and watch the graph. The on-ramp guide for new operators.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -27,7 +27,7 @@
   <div class="wrap">
     <div class="label">01 <span class="dot">·</span> foundation</div>
     <h1>Getting started</h1>
-    <p class="lede">Install darkmux, verify the setup, configure your first profile, swap to it, and run a smoke test. Everything else in the guide assumes you've done this.</p>
+    <p class="lede">Install darkmux, verify the setup, declare your first profile, dispatch a role, and launch your first mission. Everything else in the guide assumes you've done this.</p>
   </div>
 </header>
 
@@ -48,7 +48,7 @@
       </tr>
       <tr>
         <td>At least one model in LMStudio</td>
-        <td>Nothing to swap to without one.</td>
+        <td>Nothing for a dispatch to load without one.</td>
         <td>Download via the LMStudio UI; verify with <code>lms ls</code>.</td>
       </tr>
     </table>
@@ -56,7 +56,7 @@
     <p class="muted">darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.</p>
 
     <h3>For the dispatch + lab path</h3>
-    <p class="muted">The <code>swap</code> / <code>status</code> / <code>profiles</code> core needs only LMStudio. Docker is required for <code>dispatch</code> / <code>lab run</code> (the only dispatch path).</p>
+    <p class="muted">The <code>profile</code> / <code>machine</code> core needs only LMStudio. Docker is required for <code>dispatch</code> / <code>lab run</code> (the only dispatch path).</p>
     <table>
       <tr><th>Tool</th><th>When you need it</th></tr>
       <tr>
@@ -116,7 +116,7 @@ darkmux init</code></pre>
 <section>
   <div class="wrap">
     <h2>Verify your setup</h2>
-    <p><code>darkmux doctor</code> runs pre-flight checks across the substrate: profile registry, <code>lms</code> binary, models loaded, runtime command, RAM headroom, power state, agent role scaffolds, crew role prompt coverage, daemon reachability, flow-sink health, audit integrity, machine_id resolution, orchestrator declaration, recommendation drift, per-role model-pin drift, plus a battery of empirical rules from the <code>eureka</code> set.</p>
+    <p><code>darkmux doctor</code> runs pre-flight checks across the substrate: profile registry, <code>lms</code> binary, models loaded, RAM headroom, power state, role prompt coverage, mission-config registry, daemon reachability, flow-sink health, audit integrity, machine_id resolution, orchestrator declaration, and bundled-skill freshness (it flags any stale <code>darkmux-*</code> skill and points you at <code>darkmux init</code>), plus a battery of empirical rules from the <code>eureka</code> set.</p>
     <pre><code>darkmux doctor</code></pre>
     <p>Each check returns Pass, Warn, or Fail. Fail-level lines include actionable hints; the exit code is 0 on all-pass-or-warn, 1 if anything Fails.</p>
 
@@ -126,7 +126,7 @@ darkmux init</code></pre>
     <ul>
       <li><strong><code>daemon: reachable</code> Warn</strong>: the daemon isn't running yet. That's fine; you start it in <a href="#see-it-work">See it work</a> below (one command on Homebrew). Non-fatal: it only affects live viewing.</li>
       <li><strong><code>profile match</code> Warn</strong>: your <code>~/.darkmux/profiles.json</code> doesn't yet reference what's loaded in LMStudio. That's also fine, we fix it next.</li>
-      <li><strong><code>runtime version</code> Warn</strong>: your installed agent runtime is older than darkmux's validated minimum. If you're not running an orchestrator, you can ignore this for now.</li>
+      <li><strong><code>orchestrator</code> Warn</strong>: you haven't declared which frontier is driving darkmux, so flow records won't carry orchestrator provenance. Export <code>DARKMUX_ORCHESTRATOR=claude-code</code> (or your harness) in the shell to clear it. Fine to ignore while you're just kicking the tires.</li>
     </ul>
   </div>
 </section>
@@ -141,10 +141,13 @@ darkmux init</code></pre>
 cat ~/.darkmux/profiles.json      <span class="comment"># see the actual JSON</span></code></pre>
     <p>The bootstrap config ships with four reference profiles in increasing capacity: <code>fast</code> (32K), <code>balanced</code> (100K), <code>deep</code> (200K), and a <code>gpt-oss</code> preset (the 120B MXFP4 build for Apple Silicon, at 100K). <code>fast</code>/<code>balanced</code>/<code>deep</code> carry a placeholder worker id, <code>&lt;your-worker-model-id&gt;</code>, for you to fill in; <code>gpt-oss</code> ships a concrete id (<code>mlx-community/gpt-oss-120b-MXFP4-Q8</code>). The <strong>default profile is <code>balanced</code></strong>, not the 120B preset.</p>
 
-    <h3>Swap a real model id in</h3>
-    <p>The quickest way: <code>darkmux profile scan</code> lists the models LMStudio has downloaded that aren't yet in any profile, with a suggestion for each, so you can see what's available to slot in without hand-matching ids.</p>
+    <h3>Point a profile at a real model</h3>
+    <p>The quickest way: <code>darkmux profile scan</code> lists the models LMStudio has downloaded that aren't yet in any profile, with a suggestion for each, so you can see what's available to slot in without hand-matching ids. Want a whole starter profile written for you? <code>darkmux profile draft --model &lt;model-id&gt; &lt;profile-name&gt;</code> prints a ready-to-paste profile JSON for a given model and task class (<code>--task-class fast|mid|long</code>).</p>
     <pre><code><span class="comment"># Downloaded models not yet in a profile, with suggestions</span>
-darkmux profile scan</code></pre>
+darkmux profile scan
+
+<span class="comment"># Or emit a starter profile for a specific model (prints to stdout)</span>
+darkmux profile draft --model &lt;model-id&gt; my-fast --task-class fast</code></pre>
     <p>Then replace a placeholder in <code>profiles.json</code> with a real id (<code>lms ls</code> shows the raw list if you prefer). Pick one to start, whatever you've been using day-to-day:</p>
     <pre><code><span class="comment"># See what's available (raw)</span>
 lms ls
@@ -166,21 +169,66 @@ darkmux doctor                    <span class="comment"># confirm "profile match
 
 <section>
   <div class="wrap">
-    <h2>Loading a profile's models</h2>
-    <p>You no longer load a profile by hand. A dispatch loads the models a named profile declares, under the resident RAM budget: it brings up what the profile needs and unloads to make room when the budget requires it. It writes nothing outside LMStudio. The internal runtime reads the loaded model directly.</p>
-    <pre><code>darkmux machine status            <span class="comment"># what's loaded right now; which profile (if any) matches</span></code></pre>
+    <h2>Residency is automatic</h2>
+    <p>You never load a profile by hand. A dispatch loads the models the named profile declares, under the resident RAM budget: it brings up what the profile needs and unloads to make room when the budget requires it, and writes nothing outside LMStudio. The <code>swap</code> verb that used to drive this is gone; the internal runtime reads the loaded model directly.</p>
 
     <div class="callout good">
       <strong>What happens on dispatch.</strong>
-      <p style="margin: 6px 0 0;">When a dispatch needs your profile's models, darkmux issues <code>lms load</code> for each with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), sets the context length, and reports success. Nothing outside LMStudio is modified. The internal runtime resolves the loaded model directly.</p>
+      <p style="margin: 6px 0 0;">When a dispatch needs your profile's models, darkmux issues <code>lms load</code> for each with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), sets the context length, and reports success. Nothing outside LMStudio is modified.</p>
     </div>
 
     <p>If a dispatch reports a warning about RAM headroom or a model not found in <code>lms ls</code>, that's doctor-style feedback at load time, usually fixable by either trimming context length or downloading the model first via the LMStudio UI.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Your first dispatch</h2>
+    <p>A dispatch is the task-grain execution entry point: hand one local-AI role a single message and let it run in the container-bounded runtime. The message is positional, so nothing but the role and the text is required:</p>
+    <pre><code>darkmux dispatch code-reviewer "Summarize the risk in this change." <span class="comment"># role + message, positional</span>
+git diff | darkmux dispatch pr-reviewer                             <span class="comment"># or pipe the message in on stdin</span></code></pre>
+    <p>darkmux loads the profile's model if it isn't resident, runs the role's tool loop, and prints the result. Every dispatch emits a flow record you can watch live (next section).</p>
+    <div class="callout">
+      <strong>Verified at release rehearsal.</strong>
+      <p style="margin: 6px 0 0;">This step calls a real model, so its output depends on your hardware and loaded model and isn't reproduced here. It is exercised live against a loaded model as part of the pre-release dogfood, per darkmux's release gate. Run it yourself once a model is loaded; that is the canonical reference for what your setup produces.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Launch your first mission <span class="muted" style="font-weight:400">(the centerpiece)</span></h2>
+    <p>A dispatch runs one role once. A <strong>mission</strong> runs a whole task graph: a crew of roles works the phases, and the graph is live in your browser as it goes. The built-in <code>coder-phase</code> config is the dispatch-to-PR loop, a worktree, a coder, a QA review, then a stop at an operator sign-off gate.</p>
+    <pre><code><span class="comment"># start the daemon first so you can watch the graph (the "See it work" section below has the details)</span>
+brew services start darkmux
+
+<span class="comment"># launch the built-in coder-phase mission; --param supplies its declared inputs</span>
+darkmux mission launch coder-phase \
+  --param workdir=/tmp/darkmux-first-mission \
+  --param base=main \
+  --param branch=darkmux/first-mission \
+  --param mission_id=first-mission</code></pre>
+    <p class="muted">Those four <code>--param</code> values are <code>coder-phase</code>'s declared inputs (worktree path, base branch, new branch name, mission id); launch bails with a copy-pasteable example if one is missing. In practice your frontier orchestrator fills these in for you, this is what it runs under the hood.</p>
+    <p>Open <code>http://127.0.0.1:8765/</code> and you see the mission graph come alive: phases light up as the crew works them, each dispatch streaming its tokens and detectors into the timeline. The run stops at the sign-off gate; <code>darkmux mission ship &lt;id&gt;</code> commits + pushes + opens the PR, or <code>darkmux mission abort &lt;id&gt;</code> tears the worktree down. <strong>Watching that graph is the first-wow moment: this is what darkmux is for.</strong></p>
+    <div class="callout">
+      <strong>Verified at release rehearsal.</strong>
+      <p style="margin: 6px 0 0;">A mission launch drives real model dispatches, so its trajectory and timing depend on your hardware and loaded model and aren't reproduced here. The <code>coder-phase</code> gate-held loop is exercised live before every release per darkmux's release gate (a real gate-held dogfood on the pepper-grinder fixture). Run it against a repo of your own to see your graph.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The health duo: machine + doctor</h2>
+    <p>Two read-only checks answer two different questions. <code>darkmux doctor</code> asks <em>is my setup correct</em> (preflight, config, pass/warn/fail, run earlier in this guide). <code>darkmux machine</code> asks <em>is my host healthy right now</em> (live residents, RAM truth). Bare <code>darkmux machine</code> routes to <code>machine status</code>:</p>
+    <pre><code>darkmux machine status            <span class="comment"># what's loaded right now; which profile (if any) matches</span>
+darkmux machine resources         <span class="comment"># live per-model RAM commitment vs footprint + machine pressure</span></code></pre>
+    <p><code>machine status</code> groups loaded models by ownership: darkmux-managed (under the <code>darkmux:</code> namespace) vs your own user state, which darkmux never touches. <code>machine resources</code> is the live memory ledger, kernel counters and <code>lms</code> metadata only, zero model dispatches. To release darkmux's own RAM footprint without disturbing anything you loaded yourself: <code>darkmux machine eject</code>.</p>
 
     <h3>The smoke test</h3>
     <pre><code>darkmux lab run quick-q           <span class="comment"># single-turn smoke prompt against the active profile</span>
 darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at what happened</span></code></pre>
-    <p>This runs through darkmux's internal Docker-bounded runtime. The runtime image is pulled from GHCR on first use, so you just need Docker running. No Docker yet? Skip this step and come back after the <a href="lab.html">lab</a> section.</p>
+    <p>This runs through darkmux's internal Docker-bounded runtime. The runtime image is pulled from GHCR on first use, so you just need Docker running. No Docker yet? Skip this step and come back after the <a href="lab.html">lab</a> section. (Like a dispatch, this calls a real model, so its numbers are yours to generate.)</p>
   </div>
 </section>
 

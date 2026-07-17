@@ -197,7 +197,7 @@ brew services restart redis</code></pre>
 <section id="phase-2">
   <div class="wrap">
     <h2>Phase 2: Run the daemon as a managed service</h2>
-    <p><code>darkmux serve</code> is the local HTTP daemon: flow records, mission/phase state, model status, the bundled live viewer. For a 24/7 hub you want it under a service manager so it auto-starts at boot and respawns on crash.</p>
+    <p><code>darkmux serve</code> is the local HTTP daemon: flow records, mission/phase state, machine status, the bundled live viewer. For a 24/7 hub you want it under a service manager so it auto-starts at boot and respawns on crash.</p>
 
     <h3>The easy path: brew services</h3>
     <p>If you installed via Homebrew, the formula already ships a launchd-managed service. Because your Redis is password-less, there's nothing to wire up: the daemon resolves its Redis connection from the <code>config.redis</code> you set in the quick path:</p>
@@ -412,7 +412,7 @@ launchctl list | grep -E 'redis|darkmux'
 <span class="comment"># 2) Doctor green on the load-bearing checks</span>
 darkmux doctor
 <span class="comment"># expect ✓: daemon reachable, flow sink health (Redis-backed), machine_id</span>
-<span class="comment"># ⚠ on anything left out of scope (no profile swapped yet, etc.) is fine</span>
+<span class="comment"># ⚠ on anything left out of scope (no profile loaded yet, etc.) is fine</span>
 
 <span class="comment"># 3) Cross-network write from a peer (on the peer):</span>
 darkmux flow note --text "post-reboot peer smoke $(date +%s)"
@@ -437,7 +437,7 @@ redis-cli XLEN darkmux:flow                         <span class="comment"># high
     <ul>
       <li><strong>Retention is your policy.</strong> Flow and audit JSONL files grow per-day. A quarterly find-and-delete is plenty for casual use; audit retention is part of your compliance posture if you keep one.</li>
       <li><strong>The hub is one machine.</strong> If its disk dies, the AOF goes with it, but each peer's local <code>~/.darkmux/flows/</code> sink survives independently, so per-machine history is preserved everywhere. The hub is the coordination point, not the sole source of truth: back it up like any machine you rely on.</li>
-      <li><strong>Rosters are per-machine.</strong> Each machine's <code>~/.darkmux/fleet.json</code> is its own, so adding a machine means registering it on the machines that need to see it (the <code>fleet add</code> commands above).</li>
+      <li><strong>Rosters are per-machine.</strong> Each machine's <code>~/.darkmux/fleet.json</code> is its own, so adding a machine means registering it on the machines that need to see it (the <code>machine add</code> commands above).</li>
     </ul>
   </div>
 </section>
