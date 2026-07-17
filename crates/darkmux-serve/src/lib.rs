@@ -764,6 +764,13 @@ fn build_startup_banner(
 /// before the process force-exits — SSE streams to the viewer would
 /// otherwise keep the daemon alive forever.
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
+    // (#1461) Capture the mtime of the binary we were launched from BEFORE
+    // serving anything. It has to be read at startup, not lazily on the first
+    // `/health`: `cargo install` REPLACES the file on disk, so a later read
+    // would return the mtime of the new binary and report a stale daemon as
+    // fresh — the exact false negative this check exists to prevent.
+    let _ = STARTUP_EXE_MTIME.set(current_exe_mtime());
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -909,10 +916,50 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
     })
 }
 
+/// (#1461) The mtime of the binary this daemon was launched from, captured at
+/// startup by `run()`. See `binary_mtime` on `/health` for why it is reported.
+static STARTUP_EXE_MTIME: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+
+/// Modification time of the currently-running executable, as whole seconds
+/// since the Unix epoch. `None` when the exe path can't be resolved or stat'd,
+/// or when the platform reports no mtime — doctor reads that as "nothing to
+/// compare" and stays silent rather than guessing.
+fn current_exe_mtime() -> Option<u64> {
+    let path = std::env::current_exe().ok()?;
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
+}
+
 /// GET /health — returns darkmux version + flow schema version.
+///
+/// (#1461) Two fields exist so `darkmux doctor` can tell whether a long-running
+/// daemon is still serving the operator's latest code. The daemon is the single
+/// most likely staleness trap: it is long-lived by design (the phone dashboard
+/// needs it up) and its staleness is otherwise invisible.
+///
+///   * `build` — `darkmux_types::build_version()`: the package version PLUS the
+///     git short SHA. `darkmux_version` alone is useless for this (two builds
+///     from different commits report the same one).
+///   * `binary_mtime` — when the binary this daemon loaded was last written.
+///     The SHA can't close the case on its own: a dev-box `cargo install` from
+///     an UNCOMMITTED tree produces a new binary at the SAME commit, so both
+///     builds tag identically and a pure build-string comparison silently never
+///     fires. The mtime moves on every install regardless of commit, which is
+///     what makes the check catch the loop the operator actually runs.
+///
+/// The mtime is deliberately reported as a bare integer rather than the exe
+/// PATH: `/health` is auth-exempt even for non-loopback peers, and a path would
+/// disclose the operator's home directory to anything that can reach the port.
 async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "darkmux_version": env!("CARGO_PKG_VERSION"),
+        "build": darkmux_types::build_version(),
+        "binary_mtime": STARTUP_EXE_MTIME.get().copied().flatten(),
         "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
     }))
 }

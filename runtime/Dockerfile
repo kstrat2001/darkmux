@@ -40,6 +40,18 @@ RUN cargo build --release --locked || cargo build --release
 # ─── runtime ──────────────────────────────────────────────────────────────
 FROM alpine:3.20
 
+# (#1461) Stamp WHICH darkmux version this image was built for, so `darkmux
+# doctor` can warn when a local `darkmux-runtime:latest` is older than the
+# installed binary. Dispatch prefers a local `:latest` over the version-pinned
+# GHCR image, so a stale local tag silently shadows the correct runtime.
+#
+# Unset (a plain `docker build` with no --build-arg) leaves the label empty,
+# which doctor reads as "nothing to compare" and reports as not-applicable —
+# never as a warning. Pass it to make the check live:
+#   docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/
+ARG DARKMUX_VERSION=""
+LABEL org.opencontainers.image.version=$DARKMUX_VERSION
+
 # The Unix toolkit agents reach for. Stays small.
 #
 #   bash       — agents prefer bash to ash for shell tool calls
