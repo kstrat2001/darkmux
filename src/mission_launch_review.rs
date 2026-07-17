@@ -621,6 +621,7 @@ pub(crate) fn launch(
                 "head_sha",
                 "bundler",
                 "k",
+                "passes",
             ] {
                 if collected.contains_key(key) {
                     ignored.push(key);
@@ -693,6 +694,10 @@ fn run_dispatch(
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         k: u32_input(collected, "k")?,
+        // (#1266) Judge consensus depth, sourced from the `passes` input;
+        // `None` => the resolver's double-confirm default. Validated `>= 1` in
+        // the resolver.
+        passes: u32_input(collected, "passes")?,
         request_changes: bool_input(collected, "request_changes"),
     };
     let crew = resolve_review_resourcing(&loaded.registry, &resourcing)?;
