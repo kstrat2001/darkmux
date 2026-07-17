@@ -961,7 +961,7 @@ pub struct ReviewEnvelope {
     /// `Option` (not a bare `Default`) so pre-#1247 envelopes deserialize
     /// as `None` rather than a misleadingly-empty snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub staffing: Option<CrewStaffingSnapshot>,
+    pub staffing: Option<StaffingSnapshot>,
     /// (#1260) Non-fatal run findings the operator should read — e.g. a
     /// remote probe seat failing after bounded retries (reduced coverage)
     /// or the probe stage's remote token budget exhausting. Empty on a
@@ -1094,7 +1094,7 @@ fn seat_endpoint(pm: &ProfileModel) -> Option<&ModelEndpoint> {
 /// One seat staffing's resolved config, snapshotted as ACTUALLY used —
 /// see [`ReviewEnvelope::staffing`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StaffingSnapshot {
+pub struct SeatStaffingSnapshot {
     pub name: String,
     /// The darkmux-namespaced LMStudio identifier for a LOCAL seat; the
     /// profile's bare model id for a REMOTE one — the same form
@@ -1150,14 +1150,14 @@ pub struct StaffingSnapshot {
 /// staffings) + `review-judge` (exactly one) + the optional `review-verify`
 /// seat (#1260). See [`ReviewEnvelope::staffing`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CrewStaffingSnapshot {
-    pub probes: Vec<StaffingSnapshot>,
-    pub judge: Option<StaffingSnapshot>,
+pub struct StaffingSnapshot {
+    pub probes: Vec<SeatStaffingSnapshot>,
+    pub judge: Option<SeatStaffingSnapshot>,
     /// (#1260) Present iff the crew declares the `review-verify` seat —
     /// absent (and never serialized) otherwise, so pre-#1260 snapshots
     /// round-trip unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify: Option<StaffingSnapshot>,
+    pub verify: Option<SeatStaffingSnapshot>,
     /// (#1302) The crew's resolved `request_changes` flag — snapshotted so the
     /// render path reads the run's own blocking-vs-advisory choice from its
     /// self-describing artifact, and a serialized envelope re-rendered later
@@ -1168,7 +1168,7 @@ pub struct CrewStaffingSnapshot {
     pub request_changes: bool,
 }
 
-/// (#1266) Snapshot default for `StaffingSnapshot::passes` — 2 (double-
+/// (#1266) Snapshot default for `SeatStaffingSnapshot::passes` — 2 (double-
 /// confirm), so a pre-1.3 envelope missing the field reads as today's judge.
 fn default_snapshot_passes() -> u32 {
     2
@@ -1179,9 +1179,9 @@ pub fn staffing_snapshot(
     judge: &ResolvedSeatStaffing,
     verify: Option<&ResolvedSeatStaffing>,
     request_changes: bool,
-) -> CrewStaffingSnapshot {
-    fn one(s: &ResolvedSeatStaffing) -> StaffingSnapshot {
-        StaffingSnapshot {
+) -> StaffingSnapshot {
+    fn one(s: &ResolvedSeatStaffing) -> SeatStaffingSnapshot {
+        SeatStaffingSnapshot {
             name: s.name.clone(),
             model: seat_identifier(&s.pm),
             remote: s.pm.is_remote(),
@@ -1195,12 +1195,12 @@ pub fn staffing_snapshot(
             provenance: s.provenance.clone(),
         }
     }
-    CrewStaffingSnapshot {
+    StaffingSnapshot {
         probes: probes.iter().map(one).collect(),
         judge: Some(one(judge)),
         verify: verify.map(one),
         // (#1302) The run's blocking-vs-advisory choice, snapshotted for the
-        // render path (see `CrewStaffingSnapshot::request_changes`).
+        // render path (see `StaffingSnapshot::request_changes`).
         request_changes,
     }
 }
@@ -5101,7 +5101,7 @@ pub fn run_review_graph(
     crew_name: &str,
     mode: ExecMode,
     fingerprint_val: serde_json::Value,
-    staffing: CrewStaffingSnapshot,
+    staffing: StaffingSnapshot,
     graph: BuiltReviewGraph,
     emitter: &mut dyn ReviewEmitter,
     persist: &mut dyn FnMut(&Step),

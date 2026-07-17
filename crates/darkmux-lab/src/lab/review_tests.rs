@@ -1100,10 +1100,10 @@
         // Round-trips through JSON; an old snapshot WITHOUT the field parses
         // as None.
         let json = serde_json::to_string(&snap).unwrap();
-        let back: CrewStaffingSnapshot = serde_json::from_str(&json).unwrap();
+        let back: StaffingSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.probes[0].provenance.as_ref().unwrap().kind, "scored");
         let old = r#"{"probes":[{"name":"fast","model":"m","k":2,"passes":2}],"judge":null}"#;
-        let old_snap: CrewStaffingSnapshot = serde_json::from_str(old).expect("pre-ship-2 snapshot parses");
+        let old_snap: StaffingSnapshot = serde_json::from_str(old).expect("pre-ship-2 snapshot parses");
         assert!(old_snap.probes[0].provenance.is_none());
     }
 
@@ -3221,7 +3221,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     // ── staffing_snapshot (#1247): migrated to direct pure-function tests ──
     //
     // `staffing_snapshot` is a pure function (`probes`, `judge`, `verify`,
-    // `request_changes` in; `CrewStaffingSnapshot` out) — the three tests
+    // `request_changes` in; `StaffingSnapshot` out) — the three tests
     // below only ever routed through `run_review` to get an `env.staffing`
     // to inspect. Calling `staffing_snapshot` directly is a MORE direct
     // test of the thing actually under test, and needs no driver — graph

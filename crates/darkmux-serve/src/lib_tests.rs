@@ -3978,7 +3978,7 @@
     /// (item 7) Shape test against a REAL review-config-interpreted graph:
     /// loads the embedded `review` mission config, interprets it with a
     /// launcher supplying two probe seats (mirroring how `pr-review run`
-    /// would resolve `crew_staffing` at launch), persists the resulting
+    /// would resolve `staffing` at launch), persists the resulting
     /// Mission/Phase/Task/Step graph, and asserts the graph.json node
     /// counts match what `review.json`'s own shape (3 phases; investigate
     /// = bundle + N probe + dedup; adjudicate = judge; report = verify +

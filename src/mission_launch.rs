@@ -56,7 +56,7 @@
 //! `--input`/`--param` collection or its generic header banner — review's
 //! rendered payload is a stdout CONTRACT the CI workflow parses, so nothing
 //! decorative may precede it). `review.*` Tier 3 kinds need crew-staffing
-//! resolution (`crew_staffing`, `judge_concurrency` — see `templates/
+//! resolution (`staffing`, `judge_concurrency` — see `templates/
 //! builtin/mission-configs/review.json`'s own `inputs` doc) that
 //! `crates/darkmux-lab/src/lab/review.rs::build_review_graph` already knows
 //! how to do — `mission_launch_review::launch` is a NEW CALLER of that
