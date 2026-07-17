@@ -25,6 +25,7 @@
             passes: 2,
             max_tokens: None,
             selector: None,
+            provenance: None,
         }
     }
 
@@ -1069,6 +1070,41 @@
         }"#;
         let env: ReviewEnvelope = serde_json::from_str(legacy).expect("legacy envelope without staffing parses");
         assert!(env.staffing.is_none());
+    }
+
+    /// (#1426 ship-2 / #44) The snapshot carries each seat's PROVENANCE
+    /// (scored vs pinned) verbatim from the resolver — the envelope records
+    /// WHY a seat was staffed, not just what resolved — and a pre-ship-2
+    /// snapshot without the field still parses (`None`), per the module's
+    /// schema-lenience discipline.
+    #[test]
+    fn staffing_snapshot_carries_provenance_and_reads_old_snapshots_leniently() {
+        use darkmux_crew::resourcing::StaffingProvenance;
+        let mut probe = staffing("fast", "probe-model", 2);
+        probe.provenance = Some(StaffingProvenance {
+            kind: "scored".to_string(),
+            detail: "select_model capability scoring for role \"review-probe\" against roster profile \"fast\"".to_string(),
+        });
+        let mut judge = staffing("fast", "judge-model", 1);
+        judge.provenance = Some(StaffingProvenance {
+            kind: "pinned".to_string(),
+            detail: "pinned by launch param judge_model=judge-model".to_string(),
+        });
+        let snap = staffing_snapshot(std::slice::from_ref(&probe), &judge, None, false);
+        assert_eq!(snap.probes[0].provenance.as_ref().unwrap().kind, "scored");
+        assert!(snap.probes[0].provenance.as_ref().unwrap().detail.contains("roster profile"));
+        let judge_snap = snap.judge.as_ref().unwrap();
+        assert_eq!(judge_snap.provenance.as_ref().unwrap().kind, "pinned");
+        assert!(judge_snap.provenance.as_ref().unwrap().detail.contains("judge_model"));
+
+        // Round-trips through JSON; an old snapshot WITHOUT the field parses
+        // as None.
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CrewStaffingSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.probes[0].provenance.as_ref().unwrap().kind, "scored");
+        let old = r#"{"probes":[{"name":"fast","model":"m","k":2,"passes":2}],"judge":null}"#;
+        let old_snap: CrewStaffingSnapshot = serde_json::from_str(old).expect("pre-ship-2 snapshot parses");
+        assert!(old_snap.probes[0].provenance.is_none());
     }
 
     // ── run_judge_only ────────────────────────────────────────────────
@@ -2125,6 +2161,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             passes: 2,
             max_tokens: None,
             selector: None,
+            provenance: None,
         }
     }
 
@@ -2302,6 +2339,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             passes: 2,
             max_tokens: None,
             selector: None,
+            provenance: None,
         }
     }
 
@@ -2825,6 +2863,271 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     // in this module — were CHARACTERIZATION tests of the gap; they now
     // pin the FIXED (positive) behavior instead.
 
+    // ─── #1426 ship-2 operator decision: verify pre-wave short-circuit ───
+
+    /// Recording `ModelHost` for the scheduler's `host_factory` seam — every
+    /// `load` lands in a shared list so a test can assert exactly which
+    /// models the residency wave loaded (or that it loaded none).
+    struct RecordingHost {
+        loads: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl darkmux_gestalt::ModelHost for RecordingHost {
+        fn list_resident(
+            &mut self,
+        ) -> std::result::Result<Vec<darkmux_gestalt::ResidentFact>, darkmux_gestalt::HostError>
+        {
+            Ok(Vec::new())
+        }
+        fn list_catalog(
+            &mut self,
+        ) -> std::result::Result<Vec<darkmux_gestalt::CatalogFact>, darkmux_gestalt::HostError>
+        {
+            Ok(Vec::new())
+        }
+        fn load(
+            &mut self,
+            _model_key: &str,
+            identifier: &str,
+            _min_ctx: u32,
+            _deadline: darkmux_gestalt::Deadline,
+        ) -> std::result::Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+            self.loads.lock().unwrap().push(identifier.to_string());
+            Ok(darkmux_gestalt::LoadReport::default())
+        }
+        fn unload(
+            &mut self,
+            _target: &darkmux_gestalt::OwnedTarget,
+            _deadline: darkmux_gestalt::Deadline,
+        ) -> std::result::Result<(), darkmux_gestalt::HostError> {
+            Ok(())
+        }
+    }
+
+    /// Build + run the review graph through the scheduler DIRECTLY, with a
+    /// recording `host_factory` — the mock seam `run_review_graph` itself
+    /// does not expose (it hardcodes the real `lms_host_factory`). Returns
+    /// the recorded load identifiers plus the final step map, so tests can
+    /// assert both the wave loader's behavior and each step's outcome.
+    fn run_graph_recording_loads(
+        ctx: &Arc<ReviewStepContext>,
+        verify: ResolvedSeatStaffing,
+    ) -> (Vec<String>, BTreeMap<String, Step>) {
+        let seats = validate_review_crew(&ctx.crew).expect("valid crew");
+        let judge = seats.judge.clone();
+        let probes: Vec<_> = seats.probes.clone();
+        let graph = build_review_graph(
+            ctx.clone(),
+            judge,
+            Some(verify.clone()),
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
+        let BuiltReviewGraph { tasks, mut steps, registry, .. } = graph;
+        let tasks_by_id: BTreeMap<String, Task> =
+            tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
+        let loads: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let loads_for_factory = loads.clone();
+        let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> {
+            Box::new(RecordingHost { loads: loads_for_factory.clone() })
+        };
+        // The verify model's estimate is small and fixed so the planner's
+        // Load decision is deterministic on any test machine.
+        let est = darkmux_gestalt::FixedEstimator(
+            [(verify.pm.id.clone(), 1_000_000_000u64)].into_iter().collect(),
+        );
+        darkmux_crew::scheduler::run_step_graph(
+            &mut steps,
+            &tasks_by_id,
+            &registry,
+            &darkmux_gestalt::Facts::default(),
+            &est,
+            8,
+            &host_factory,
+            &mut |_record| {},
+            &mut |_step| {},
+        )
+        .expect("graph run completes");
+        let recorded = loads.lock().unwrap().clone();
+        (recorded, steps)
+    }
+
+    /// (#1426 ship-2 operator decision) ZERO confirmed findings + a pinned,
+    /// DISTINCT local verify model: the verify step completes as a no-op and
+    /// the residency wave loads NO model at all — `residency()` returns
+    /// `None` from the confirmed-count check BEFORE the wave loader runs.
+    #[test]
+    fn verify_short_circuits_before_model_load_when_zero_confirmed_findings() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        // Pinned distinct verify model, LOCAL with a declared n_ctx — the
+        // exact shape whose placement the wave loader WOULD load absent the
+        // short-circuit (probe/judge stay n_ctx-less → Remote track).
+        let verify = staffing("fast", "verify-model", 1);
+        let needs_check_json = "```json\n{\"ruling\": \"needs_check\", \"decisive_evidence\": \"cannot tell\", \"note_for_author\": \"check manually\"}\n```";
+        let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), move |call: &ChatCall| {
+            assert_ne!(
+                call.system, "verify persona",
+                "verify must never dispatch on a zero-confirmed run"
+            );
+            if call.system == "probe prior" {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                // Judge pass-1 rules needs_check → confirmed docket is 0.
+                Ok(reply(needs_check_json))
+            }
+        });
+
+        let (loads, steps) = run_graph_recording_loads(&ctx, verify);
+
+        assert!(loads.is_empty(), "no model load may be issued: {loads:?}");
+        let verify_step = steps
+            .values()
+            .find(|s| s.kind == "review.verify")
+            .expect("verify step exists");
+        assert_eq!(verify_step.status, NodeStatus::Complete, "completed no-op");
+        // Judged flags pass through untouched: still NeedsCheck, no verify
+        // record — the envelope is unaffected.
+        let judged: Vec<JudgedFlag> =
+            serde_json::from_str(verify_step.output.as_deref().unwrap()).expect("output parses");
+        assert_eq!(judged.len(), 1);
+        assert_eq!(judged[0].tier, Tier::NeedsCheck);
+        assert!(judged[0].verify.is_none());
+    }
+
+    /// The normal path is unaffected: a NONZERO confirmed docket loads the
+    /// pinned verify model through the residency wave and dispatches the
+    /// verify pass exactly as before.
+    #[test]
+    fn verify_dispatches_normally_with_confirmed_findings() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let verify = staffing("fast", "verify-model", 1);
+        let verified_json = "```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"confirmed on the code\", \"note_for_author\": \"real\"}\n```";
+        let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), move |call: &ChatCall| {
+            if call.system == "probe prior" {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else if call.system == "verify persona" {
+                Ok(reply(verified_json))
+            } else {
+                Ok(reply(CONFIRM_JSON))
+            }
+        });
+
+        let (loads, steps) = run_graph_recording_loads(&ctx, verify);
+
+        assert_eq!(
+            loads,
+            vec!["darkmux:verify-model".to_string()],
+            "the residency wave loads exactly the pinned verify model"
+        );
+        let verify_step = steps
+            .values()
+            .find(|s| s.kind == "review.verify")
+            .expect("verify step exists");
+        assert_eq!(verify_step.status, NodeStatus::Complete);
+        let judged: Vec<JudgedFlag> =
+            serde_json::from_str(verify_step.output.as_deref().unwrap()).expect("output parses");
+        assert_eq!(judged.len(), 1);
+        assert_eq!(judged[0].tier, Tier::Confirmed);
+        let vrec = judged[0].verify.as_ref().expect("verify record present — the pass dispatched");
+        assert_eq!(vrec.ruling, VerifyRuling::Verified);
+    }
+
+    /// (#1374 gate coverage) The judge's per-flag global index is
+    /// deterministic UNDER PERMUTED COMPLETION ORDER: with `concurrency: 2`
+    /// and a chat stub that makes each chunk's FIRST flag finish LAST, the
+    /// serialized `judged` output still follows deduped-docket order. The
+    /// retired `results.lock().len()`-derived formula collided across
+    /// offsets for chunks after the first exactly under this permutation
+    /// (both flags of chunk 2 computed index 2), making output
+    /// completion-order; `chunk_start + offset` pins docket order.
+    #[test]
+    fn judge_indices_are_deterministic_under_permuted_completion_order() {
+        use std::sync::{Arc as StdArc, Mutex as TestMutex};
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![{
+                let mut j = staffing("fast", "judge-model", 1);
+                j.passes = 1; // single pass — one call per flag, timing stays simple
+                j
+            }]),
+        ]);
+        // Four deduped flags → chunks [f0,f1], [f2,f3] at concurrency 2.
+        let flags: Vec<ProbeFlag> = (0..4)
+            .map(|i| ProbeFlag {
+                bundle_id: format!("b{i}"),
+                fact_family: "unscoped".to_string(),
+                member: "darkmux:probe-model".to_string(),
+                draw: 1,
+                charge_text: format!("charge-{i}"),
+                anchor: None,
+                also_flagged: Vec::new(),
+            })
+            .collect();
+        // Chunk-first flags (charge-0, charge-2) sleep so they COMPLETE after
+        // their chunk sibling — the exact permutation that collided the old
+        // formula's indices.
+        let ctx = step_ctx_with_chat(&crew, vec![], move |call: &ChatCall| {
+            if call.user.contains("charge-0") || call.user.contains("charge-2") {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            Ok(reply(CONFIRM_JSON))
+        });
+        let kind = ReviewJudgeStepKind {
+            ctx,
+            judge: {
+                let mut j = staffing("fast", "judge-model", 1);
+                j.passes = 1;
+                j
+            },
+            members: StdArc::new(TestMutex::new(Vec::new())),
+            env: StdArc::new(TestMutex::new(ReviewEnvelope::default())),
+        };
+        let step = darkmux_crew::types::Step {
+            id: "judge-step".to_string(),
+            task_id: "judge-task".to_string(),
+            kind: "review.judge".to_string(),
+            status: NodeStatus::default(),
+            config: serde_json::json!({ "concurrency": 2 }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = darkmux_crew::types::Task {
+            id: "judge-task".to_string(),
+            phase_id: "adjudicate".to_string(),
+            description: "judge".to_string(),
+            display_name: None,
+            step_ids: vec!["judge-step".to_string()],
+            depends_on: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let mut input = BTreeMap::new();
+        input.insert("dedup".to_string(), serde_json::to_string(&flags).unwrap());
+
+        use darkmux_crew::step_kinds::StepKind as _;
+        let outcome = kind.run(&step, &task, &input).expect("judge step completes");
+        let judged: Vec<JudgedFlag> = serde_json::from_str(&outcome.output).expect("judged parses");
+        let order: Vec<&str> = judged.iter().map(|j| j.flag.charge_text.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["charge-0", "charge-1", "charge-2", "charge-3"],
+            "judged output follows deduped-docket order regardless of completion order (#1374)"
+        );
+    }
+
     /// Migrates `envelope_counts_and_steps_are_internally_consistent`'s
     /// INTENT (tier/count internal consistency) minus its `env.steps`
     /// assertions, which have no graph-path equivalent (see the retirement
@@ -3100,6 +3403,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                         max_bundles: None,
                         ..Default::default()
                     }),
+                    provenance: None,
                 }],
             ),
             ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),

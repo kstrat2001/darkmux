@@ -127,7 +127,6 @@ fn run(cmd: Cmd) -> Result<i32> {
         // (#1426) Bare `machine` routes to `machine status` (no id) — one
         // code path, no separate overview render.
         Cmd::Machine { sub } => cmd_machine(sub),
-        Cmd::Crew { sub } => cmd_crew(sub),
         Cmd::Lessons { sub } => cmd_lessons(sub),
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Phase { sub } => cmd_phase(sub),
@@ -1214,17 +1213,6 @@ pub fn speedup_verdict(
         // silent even if the math says speedup >= threshold (which can
         // only happen via clock skew or wall_ms misreporting).
         SpeedupVerdict::Inconclusive
-    }
-}
-
-fn cmd_crew(sub: CrewCmd) -> Result<i32> {
-    match sub {
-        CrewCmd::List => crew::cli::crew_list(),
-        CrewCmd::Show { id } => crew::cli::crew_show(&id),
-        CrewCmd::Index { sub } => match sub {
-            CrewIndexCmd::Rebuild => crew::index::rebuild().map(|_| 0),
-            CrewIndexCmd::Status => crew::index::status().map(|_| 0),
-        },
     }
 }
 

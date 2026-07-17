@@ -89,8 +89,23 @@ pub trait StepKind: Send + Sync {
     /// returns `None` rather than erroring — worst case the step is
     /// scheduled as `Remote` (today's behavior for every kind), never a
     /// hard failure purely from misclassification.
-    fn residency(&self, step: &Step, task: &Task) -> Option<darkmux_gestalt::Placement> {
-        let _ = (step, task);
+    ///
+    /// `input` is the SAME gathered dependency-output map `run` will
+    /// receive (the scheduler computes it once per ready step, before
+    /// residency classification — see `scheduler::run_step_graph`). A kind
+    /// whose model need is DATA-DEPENDENT can inspect it and return `None`
+    /// when the inputs make its dispatch a guaranteed no-op, so the wave
+    /// loader never loads a model the step is certain not to use (#1426
+    /// ship-2 operator decision — the review verify seat with an empty
+    /// confirmed docket is the first consumer). Kinds with static needs
+    /// ignore it.
+    fn residency(
+        &self,
+        step: &Step,
+        task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+    ) -> Option<darkmux_gestalt::Placement> {
+        let _ = (step, task, input);
         None
     }
 }

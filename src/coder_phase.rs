@@ -690,7 +690,12 @@ impl StepKind for MissionCoderStepKind {
         })
     }
 
-    fn residency(&self, _step: &crew::types::Step, _task: &crew::types::Task) -> Option<crew::step_kinds::Placement> {
+    fn residency(
+        &self,
+        _step: &crew::types::Step,
+        _task: &crew::types::Task,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Option<crew::step_kinds::Placement> {
         resolve_local_placement(&self.role_id, None, None, &format!("mission-coder:{}", self.phase_id))
     }
 }
@@ -759,7 +764,12 @@ impl StepKind for MissionVerifyStepKind {
         }
     }
 
-    fn residency(&self, _step: &crew::types::Step, _task: &crew::types::Task) -> Option<crew::step_kinds::Placement> {
+    fn residency(
+        &self,
+        _step: &crew::types::Step,
+        _task: &crew::types::Task,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Option<crew::step_kinds::Placement> {
         resolve_local_placement("code-reviewer", None, None, &format!("mission-verify:{}", self.phase_id))
     }
 }

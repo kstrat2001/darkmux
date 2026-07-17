@@ -65,7 +65,7 @@ leave a dangling launchd plist until the next reboot.
 `fleet`, `flow`, `init`), the `serve` daemon, the keychain wrapper, and
 the bundled skills.
 
-**Not included:** the `darkmux-runtime` Docker image that `darkmux crew
+**Not included:** the `darkmux-runtime` Docker image that `darkmux
 dispatch` and `darkmux lab run` need — that requires a source checkout
 of darkmux + `docker build -t darkmux-runtime:latest runtime/`. A
 published image is tracked in

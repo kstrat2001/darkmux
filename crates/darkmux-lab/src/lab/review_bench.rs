@@ -260,10 +260,11 @@ pub struct ReviewBenchOpts {
     pub prosecutor_profile: Option<String>,
     pub defender_profile: Option<String>,
     pub judge_profile: Option<String>,
-    /// (#1222 Phase B packet 7) `Funnel` mode's crew name — `crews.<name>`
-    /// in the profile registry, naming the `review-probe`/`review-judge`
-    /// seat staffing `lab::review::validate_review_crew` requires. Required
-    /// when `mode == Funnel` (checked at bench start, before any dispatch).
+    /// (#1426 ship-2) `Funnel` mode's ROSTER profile — the profile whose
+    /// `models[]` the resourcing resolver scores each review seat (probe /
+    /// judge / verify) against. Falls back to `profile_name`, else the
+    /// registry's `default_profile`. (The crews map retired; this no longer
+    /// names a `crews.<name>` entry.)
     pub crew: Option<String>,
     /// (#1222) `Funnel` mode's model-cycling mode override —
     /// `"sequential"` | `"parallel"` | `"auto"` (default: `auto`, resolved
@@ -497,7 +498,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
         }
         scored.push((c, s));
     }
-    print_summary(&scored, &opts);
+    print_summary(&scored, &meta, &opts);
     // (#1198) Persist the run as a scores.json artifact — the bench suite's
     // dual-key score substrate (#1197). Failure to persist is a WARNING, not
     // a bench failure: the operator already has the stdout report.
@@ -695,7 +696,7 @@ fn dispatch_case(
 /// [`resolve_funnel_ctx`] before the per-case loop (fail loud before any
 /// dispatch spends a token, same discipline as the `--workdirs` preflight).
 struct FunnelCtx {
-    crew: darkmux_profiles::crews::ResolvedCrew,
+    crew: darkmux_crew::resourcing::ResolvedCrew,
     exec_mode: super::review::ExecMode,
     probe_system: String,
     judge_system: String,
@@ -720,37 +721,35 @@ fn parse_exec_mode(s: Option<&str>) -> Result<super::review::ExecMode> {
     }
 }
 
-/// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, resolve
-/// `--crew` against it (`darkmux_profiles::crews::resolve_crew` — the same
-/// validation `dispatch` would apply), validate it carries the
-/// funnel's own seat requirements (`review::validate_review_crew` — the
-/// SAME check `run_review` runs internally, called here too so a
-/// misconfigured crew fails at bench START, not at the first case's
-/// dispatch), apply `--k` as an override on every `review-probe` staffing's
-/// draw count, parse `--exec-mode`, and resolve the `review-probe`/
-/// `review-judge` seat system prompts. Every failure here is loud and
-/// happens BEFORE any dispatch — a misconfigured crew or a missing seat
-/// prompt must never silently corrupt a bench run.
+/// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, DERIVE the
+/// review staffing from the roster via the resourcing resolver
+/// (`darkmux_crew::resourcing::resolve_review_resourcing` — #1426 ship-2, which
+/// scores a model per seat against the active profile), validate it carries the
+/// funnel's own seat requirements (`review::validate_review_crew` — the SAME
+/// check `run_review` runs internally, called here too so a misconfigured
+/// roster fails at bench START, not at the first case's dispatch), apply `--k`
+/// as the probe draw count, parse `--exec-mode`, and resolve the seat system
+/// prompts. Every failure here is loud and happens BEFORE any dispatch.
+///
+/// (#1426 ship-2) `--crew` no longer names a `crews.<name>` entry (the map
+/// retired) — it names the ROSTER PROFILE the seats are resourced from; absent,
+/// the bench's `--profile` (else the registry's `default_profile`) is the
+/// roster.
 fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
-    let crew_name = opts.crew.as_deref().ok_or_else(|| {
-        anyhow!(
-            "--funnel requires --crew <name> (the crews.<name> entry naming the \
-             review-probe/review-judge seat staffing)"
-        )
-    })?;
     let loaded = darkmux_profiles::profiles::load_registry(opts.config_path.as_deref())
         .context("loading profile registry for --funnel")?;
-    let mut crew = darkmux_profiles::crews::resolve_crew(&loaded.registry, crew_name)
-        .with_context(|| format!("resolving crew \"{crew_name}\" for --funnel"))?;
-    super::review::validate_review_crew(&crew)
-        .with_context(|| format!("crew \"{crew_name}\" for --funnel"))?;
-    if let Some(k) = opts.k_override {
-        if let Some(staffings) = crew.seats.get_mut("review-probe") {
-            for s in staffings.iter_mut() {
-                s.k = k;
-            }
-        }
-    }
+    let roster = opts
+        .crew
+        .clone()
+        .or_else(|| opts.profile_name.clone());
+    let resourcing = darkmux_crew::resourcing::ReviewResourcing {
+        profile: roster,
+        k: opts.k_override,
+        ..Default::default()
+    };
+    let crew = darkmux_crew::resourcing::resolve_review_resourcing(&loaded.registry, &resourcing)
+        .context("resolving review staffing for --funnel")?;
+    super::review::validate_review_crew(&crew).context("review staffing for --funnel")?;
     let exec_mode = parse_exec_mode(opts.exec_mode.as_deref())?;
     let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
         anyhow!("darkmux: role \"review-probe\" has no system prompt (missing review-probe.md)")
@@ -1342,13 +1341,37 @@ fn yn(b: bool) -> &'static str {
     }
 }
 
-fn print_summary(scored: &[(&Case, CaseScore)], opts: &ReviewBenchOpts) {
-    let clean: Vec<&CaseScore> = scored
+/// (#1210) Split `scored` into (capability cases, infra-fail count): a
+/// zero-token dispatch never ran the model, so it belongs to neither the
+/// capability tallies nor the degenerate count. Pure — shared by
+/// `print_summary`; `build_score_rows` applies the same predicate per row.
+pub(crate) fn infra_partition<'a>(
+    scored: &'a [(&'a Case, CaseScore)],
+    meta: &[EnvelopeMeta],
+) -> (Vec<&'a (&'a Case, CaseScore)>, usize) {
+    let mut capability = Vec::with_capacity(scored.len());
+    let mut infra = 0usize;
+    for (i, cs) in scored.iter().enumerate() {
+        if is_infra_failure(&cs.1, meta.get(i)) {
+            infra += 1;
+        } else {
+            capability.push(cs);
+        }
+    }
+    (capability, infra)
+}
+
+fn print_summary(scored: &[(&Case, CaseScore)], meta: &[EnvelopeMeta], opts: &ReviewBenchOpts) {
+    // (#1210) Partition off infra failures (zero-token dispatches) FIRST — they
+    // never ran the model, so they belong to neither the capability tallies nor
+    // the degenerate count; they get their own named line.
+    let (capability, infra) = infra_partition(scored, meta);
+    let clean: Vec<&CaseScore> = capability
         .iter()
         .filter(|(c, _)| c.label.kind == "clean")
         .map(|(_, s)| s)
         .collect();
-    let bugs: Vec<&CaseScore> = scored
+    let bugs: Vec<&CaseScore> = capability
         .iter()
         .filter(|(c, _)| c.label.kind == "bug")
         .map(|(_, s)| s)
@@ -1357,19 +1380,28 @@ fn print_summary(scored: &[(&Case, CaseScore)], opts: &ReviewBenchOpts) {
     let clean_pass = clean.iter().filter(|s| s.correct).count();
     let recall = bugs.iter().filter(|s| s.recall).count();
     let anchor = bugs.iter().filter(|s| s.anchor_ok).count();
-    let degenerate = scored.iter().filter(|(_, s)| s.degenerate).count();
+    // Degenerate is now the CAPABILITY-degenerate count (model ran, produced
+    // unparseable output) — infra-degenerate cases are reported separately.
+    let degenerate = capability.iter().filter(|(_, s)| s.degenerate).count();
     println!("\n── summary ({}) ──", opts.profile_name.as_deref().unwrap_or("default"));
     println!("clean: {}/{} pass · {} false positives", clean_pass, clean.len(), fp_total);
     println!("bug:   {}/{} recall · {}/{} correct anchor", recall, bugs.len(), anchor, bugs.len());
     if degenerate > 0 {
         println!("degenerate: {} (empty/unparseable — model unfit for this role)", degenerate);
     }
+    if infra > 0 {
+        println!(
+            "infra-fail: {} (zero tokens served — rate limit / unreachable endpoint / dead \
+             dispatch; excluded from capability scores, rerun) (#1210)",
+            infra
+        );
+    }
 
     // Corpus-wide parity (#1119) — the measuring stick against the control's
     // labels: per-bug recall + per-finding precision, with the access-gap vs
     // diff-visible split for lever attribution. Printed only when the corpus
     // carries the multi-finding schema.
-    if scored.iter().any(|(c, _)| c.label.uses_multi()) {
+    if capability.iter().any(|(c, _)| c.label.uses_multi()) {
         let pct = |num: usize, den: usize| -> f64 {
             if den == 0 {
                 100.0
@@ -1377,16 +1409,16 @@ fn print_summary(scored: &[(&Case, CaseScore)], opts: &ReviewBenchOpts) {
                 100.0 * num as f64 / den as f64
             }
         };
-        let expected_bugs: usize = scored.iter().map(|(_, s)| s.expected_bugs).sum();
-        let bugs_caught: usize = scored.iter().map(|(_, s)| s.bugs_caught).sum();
-        let tp: usize = scored.iter().map(|(_, s)| s.tp).sum();
-        let fp_all: usize = scored.iter().map(|(_, s)| s.fp).sum();
+        let expected_bugs: usize = capability.iter().map(|(_, s)| s.expected_bugs).sum();
+        let bugs_caught: usize = capability.iter().map(|(_, s)| s.bugs_caught).sum();
+        let tp: usize = capability.iter().map(|(_, s)| s.tp).sum();
+        let fp_all: usize = capability.iter().map(|(_, s)| s.fp).sum();
         let total_findings = tp + fp_all;
-        let anchors_ok: usize = scored.iter().map(|(_, s)| s.anchors_ok).sum();
-        let exp_access: usize = scored.iter().map(|(_, s)| s.expected_access).sum();
-        let exp_diff: usize = scored.iter().map(|(_, s)| s.expected_diff).sum();
-        let caught_access: usize = scored.iter().map(|(_, s)| s.caught_access).sum();
-        let caught_diff: usize = scored.iter().map(|(_, s)| s.caught_diff).sum();
+        let anchors_ok: usize = capability.iter().map(|(_, s)| s.anchors_ok).sum();
+        let exp_access: usize = capability.iter().map(|(_, s)| s.expected_access).sum();
+        let exp_diff: usize = capability.iter().map(|(_, s)| s.expected_diff).sum();
+        let caught_access: usize = capability.iter().map(|(_, s)| s.caught_access).sum();
+        let caught_diff: usize = capability.iter().map(|(_, s)| s.caught_diff).sum();
         let recall_pct = pct(bugs_caught, expected_bugs);
         let precision_pct = pct(tp, total_findings);
         // The BAR is only meaningful with must-catch bugs AND emitted findings;
@@ -1408,7 +1440,7 @@ fn print_summary(scored: &[(&Case, CaseScore)], opts: &ReviewBenchOpts) {
         );
         // Loud-fail if a bug case is still legacy while multi cases exist — its
         // findings would silently vanish from the precision denominator (QA #2).
-        let legacy_bug_cases = scored
+        let legacy_bug_cases = capability
             .iter()
             .filter(|(c, _)| c.label.kind == "bug" && !c.label.uses_multi())
             .count();
@@ -1489,9 +1521,40 @@ pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
     }
 }
 
+/// (#1210) A degenerate case whose dispatch served ZERO tokens is an INFRA
+/// failure, not a capability verdict — the #1113 lesson one level up: an
+/// endpoint that produced no tokens (a quota-exhausted / 429 hosted seat, an
+/// unreachable endpoint, a dead container) never RAN the model, so scoring it
+/// `CapabilityFail` writes a junk capability row (observed live 2026-07-05,
+/// Gemini free tier — the whole motivation for this issue). The discriminator
+/// is the envelope's own token count: a model that RAN and emitted unparseable
+/// output served tokens (`total_tokens > 0`) and stays a genuine capability
+/// `degenerate` (#1050); only a zero-token dispatch is reclassified. `None`
+/// tokens (metrics absent/unparsed) is deliberately NOT treated as infra —
+/// we reclassify only on POSITIVE evidence of zero tokens served.
+///
+/// The `Some(0)` discriminator matches the REAL quota-failure shape (verified
+/// against the runtime, 2026-07-17): the container runtime's `--json` envelope
+/// ALWAYS emits numeric `prompt_tokens`/`completion_tokens` — the success path
+/// carries the loop's totals, and the error path calls
+/// `build_json_envelope("error", ..., 0, 0, ...)` (`runtime/src/main.rs`) with
+/// literal zeros — so a quota-dead dispatch parses as `Some(0)`, never `None`.
+/// `None` only arises when stdout carried NO parseable envelope at all (a
+/// crash before envelope emission), which `dispatch_case` surfaces as a bench
+/// error rather than a scored row — the None-conservative arm is correct, not
+/// a coverage gap. (The 2026-07-05 junk rows themselves were operator-cleaned
+/// from the corpus, per #1210 — the runtime envelope contract above is the
+/// citable evidence.)
+pub(crate) fn is_infra_failure(s: &CaseScore, m: Option<&EnvelopeMeta>) -> bool {
+    s.degenerate && matches!(m.and_then(|m| m.total_tokens), Some(0))
+}
+
 /// Build the run's score rows: one capability row per case, plus the
 /// corpus-wide aggregates the summary prints (recall / precision / anchor
 /// rate on the multi-finding schema; clean-pass + legacy recall otherwise).
+/// (#1210) Cases the dispatch never actually ran (zero tokens served) emit an
+/// `InfraFail` row and are EXCLUDED from every capability denominator below —
+/// an infra failure is a rerun, never a zero against the model.
 /// Pure — unit-testable without dispatching.
 pub(crate) fn build_score_rows(
     scored: &[(&Case, CaseScore)],
@@ -1517,13 +1580,20 @@ pub(crate) fn build_score_rows(
         detail,
     };
 
+    // (#1210) Which case indices are infra failures (zero-token dispatch) —
+    // reused for the per-case outcome AND to exclude them from every
+    // capability aggregate denominator below.
+    let is_infra = |i: usize, s: &CaseScore| is_infra_failure(s, meta.get(i));
+
     let mut rows = Vec::new();
     for (i, (c, s)) in scored.iter().enumerate() {
-        // A degenerate review (empty/unparseable) is a CAPABILITY failure —
-        // the dispatch ran; the model failed the contract. (A dispatch that
-        // never ran bails the bench before scoring, so no infra rows here
-        // yet — per-case infra tolerance is #1199-adjacent follow-up.)
-        let outcome = if s.degenerate || !s.correct {
+        // (#1210) A degenerate review that served ZERO tokens never ran the
+        // model — an INFRA failure (rerun), not a capability verdict. A
+        // degenerate review that served tokens (the model RAN and emitted
+        // unparseable output, #1050) stays a CAPABILITY failure.
+        let outcome = if is_infra(i, s) {
+            Outcome::InfraFail
+        } else if s.degenerate || !s.correct {
             Outcome::CapabilityFail
         } else {
             Outcome::Pass
@@ -1538,17 +1608,26 @@ pub(crate) fn build_score_rows(
         rows.push(r);
     }
 
-    let clean: Vec<&CaseScore> = scored
+    // (#1210) Capability aggregates measure the MODEL — an infra-failed case
+    // (zero tokens served) is excluded from every denominator so a
+    // rate-limited endpoint can't drag recall/precision/clean-pass down.
+    let capability: Vec<(usize, &(&Case, CaseScore))> = scored
         .iter()
-        .filter(|(c, _)| c.label.kind == "clean")
-        .map(|(_, s)| s)
+        .enumerate()
+        .filter(|(i, (_, s))| !is_infra(*i, s))
+        .collect();
+
+    let clean: Vec<&CaseScore> = capability
+        .iter()
+        .filter(|(_, (c, _))| c.label.kind == "clean")
+        .map(|(_, (_, s))| s)
         .collect();
     let clean_pass = clean.iter().filter(|s| s.correct).count();
     // Clean-only fp here so this row's detail agrees with the printed
     // "clean: X/Y pass · Z false positives" line (review-QA on #1200);
     // corpus-wide fp lives on the `precision` row.
     let clean_fp: usize = clean.iter().map(|s| s.fp).sum();
-    let fp_total: usize = scored.iter().map(|(_, s)| s.fp).sum();
+    let fp_total: usize = capability.iter().map(|(_, (_, s))| s.fp).sum();
     let frac = |num: usize, den: usize| -> Option<f64> {
         (den > 0).then(|| num as f64 / den as f64)
     };
@@ -1559,12 +1638,12 @@ pub(crate) fn build_score_rows(
         serde_json::json!({ "passed": clean_pass, "clean_cases": clean.len(), "false_positives": clean_fp }),
     ));
 
-    if scored.iter().any(|(c, _)| c.label.uses_multi()) {
-        let expected_bugs: usize = scored.iter().map(|(_, s)| s.expected_bugs).sum();
-        let bugs_caught: usize = scored.iter().map(|(_, s)| s.bugs_caught).sum();
-        let tp: usize = scored.iter().map(|(_, s)| s.tp).sum();
+    if capability.iter().any(|(_, (c, _))| c.label.uses_multi()) {
+        let expected_bugs: usize = capability.iter().map(|(_, (_, s))| s.expected_bugs).sum();
+        let bugs_caught: usize = capability.iter().map(|(_, (_, s))| s.bugs_caught).sum();
+        let tp: usize = capability.iter().map(|(_, (_, s))| s.tp).sum();
         let total_findings = tp + fp_total;
-        let anchors_ok: usize = scored.iter().map(|(_, s)| s.anchors_ok).sum();
+        let anchors_ok: usize = capability.iter().map(|(_, (_, s))| s.anchors_ok).sum();
         rows.push(row(
             "recall",
             Outcome::NotApplicable,

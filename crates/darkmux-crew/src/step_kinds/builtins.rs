@@ -296,7 +296,12 @@ impl StepKind for DispatchInternalStepKind {
         })
     }
 
-    fn residency(&self, step: &Step, task: &Task) -> Option<darkmux_gestalt::Placement> {
+    fn residency(
+        &self,
+        step: &Step,
+        task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Option<darkmux_gestalt::Placement> {
         let role_id = task_or_config_str(task.role_id.as_ref(), step, "role_id")?;
         let profile_name = task_or_config_str(task.profile_name.as_ref(), step, "profile_name");
         let config_path = config_str(step, "config_path").map(str::to_string);

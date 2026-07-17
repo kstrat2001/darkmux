@@ -312,23 +312,26 @@ jobs:
           # `darkmux model ...` -> `darkmux machine {status,resources,eject}`,
           # `darkmux fleet ...` -> `darkmux machine {list,add,remove}`,
           # `darkmux recommendations ...` -> retired.
-          # Ship-4: `darkmux mission run ...` -> `darkmux mission launch
-          # coder-phase` (the coder pipeline's one entry; ship/abort survive).
+          # ship-2: the `crew` family retired ENTIRELY (#1426 round 4 — the
+          # crew registry dissolved; the registry-read verbs list/show/index
+          # went with the crews map), so the bare `crew` alternative catches
+          # every crew spelling. Ship-4: `darkmux mission run ...` ->
+          # `darkmux mission launch coder-phase` (ship/abort survive).
           # The word boundary + the literal `darkmux ` anchor keep the NEW
           # spellings clean: `darkmux machine status` does not contain the
           # two-word `darkmux status`, and `darkmux profile scan` does not
           # contain `darkmux scan`. `model`/`status`/`fleet` are common words,
           # so the anchor matches ONLY the `darkmux <verb>` invocation form,
-          # and the two-word alternatives (`crew dispatch`, `mission run`)
-          # anchor on the full spelling so the surviving `crew list`/`show`/
-          # `index` and `mission launch`/`ship`/`abort` families do NOT trip.
+          # and the two-word alternative (`mission run`) anchors on the full
+          # spelling so the surviving `mission launch`/`ship`/`abort` family
+          # does NOT trip.
           # Historical release-notes lines (README's status block, one line
           # per release naming its `**vX.Y.Z**`) legitimately quote old verbs
           # — excluded by the -v filter; live prose never carries that
           # bold-version marker.
-          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew dispatch|status|swap|model|fleet|recommendations|mission run)\b'
+          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|mission run)\b'
           if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md AGENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
-            echo "::error::Retired verb spelling in user-facing docs (#1426) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch) / init (not skills) / mission launch coder-phase (not mission run); swap + recommendations retired:"
+            echo "::error::Retired verb spelling in user-facing docs (#1426) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run); swap + recommendations retired:"
             echo "$bad"
             exit 1
           fi

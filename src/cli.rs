@@ -226,13 +226,11 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: Option<MachineCmd>,
     },
-    /// Crew registry reads — list/show/index the crews declared in the
-    /// profiles registry. (#1426 relocated single-role dispatch to the
-    /// top-level `darkmux dispatch` verb.)
-    Crew {
-        #[command(subcommand)]
-        sub: CrewCmd,
-    },
+    // (#1426 ship-2) The `crew` family retired ENTIRELY: phase 2 promoted
+    // single-role dispatch to the top-level `darkmux dispatch` verb, and the
+    // crew REGISTRY dissolved with the crews map — a crew is now a DERIVED
+    // VIEW of a mission's resourcing (`darkmux_crew::resourcing`), never a
+    // declared entity, so the registry-read verbs (list/show/index) go too.
     /// Engagement-context lessons — operator-authored conventions,
     /// constraints, and decisions (with the reasoning behind them) that surface
     /// to coder dispatches as a `<lessons>` block. Stored in a durable,
@@ -322,35 +320,6 @@ pub(crate) enum Cmd {
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum CrewCmd {
-    /// List every crew in the index.
-    List,
-    /// Show full details for a single crew.
-    Show {
-        /// Crew id to show.
-        id: String,
-    },
-    /// SQLite-backed derived index over crew manifests (Phase B of #45).
-    /// The index is derived state — JSON manifests under the crew root are
-    /// the source of truth — and the `role`/`crew` read-verbs rebuild it on
-    /// demand, so an explicit `rebuild` is rarely needed.
-    Index {
-        #[command(subcommand)]
-        sub: CrewIndexCmd,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum CrewIndexCmd {
-    /// Rebuild the index from manifests on disk. Drops + recreates the
-    /// derived tables, then repopulates — idempotent and self-healing across
-    /// schema changes.
-    Rebuild,
-    /// Report index status: last-rebuild timestamp, source counts, drift.
-    Status,
 }
 
 #[derive(Subcommand)]
@@ -1055,8 +1024,9 @@ pub(crate) enum LabCmd {
         /// single reviewer or the dialectic pipeline — the release-guard
         /// validation mode: recall/precision scored EXACTLY like every other
         /// mode. Requires --workdirs (the probe/judge seats read the case's
-        /// repo tree, like --agentic/--dialectic) and --crew (the resolved
-        /// review-probe/review-judge seat staffing).
+        /// repo tree, like --agentic/--dialectic); seat staffing is derived
+        /// from the roster profile (--crew, else --profile, else the
+        /// registry's default_profile) by the resourcing resolver (#1426).
         #[arg(long, conflicts_with_all = ["freeform", "agentic", "dialectic"])]
         funnel: bool,
         /// Evidence root for --agentic / --dialectic / --funnel: one
@@ -1076,9 +1046,11 @@ pub(crate) enum LabCmd {
         /// denser local or remote-endpoint profile while the advocates stay.
         #[arg(long = "judge-profile", requires = "dialectic")]
         judge_profile: Option<String>,
-        /// (#1222 Phase B packet 7) Crew name (`crews.<name>` in the profile
-        /// registry) naming the review-probe/review-judge seat staffing.
-        /// Required with --funnel.
+        /// (#1426 ship-2) The ROSTER profile the resourcing resolver staffs
+        /// the review seats (probe / judge / verify) from — capability
+        /// scoring per seat against the profile's models[]. Falls back to
+        /// --profile, else the registry's `default_profile`. (The crews map
+        /// retired; this no longer names a `crews.<name>` entry.)
         #[arg(long, requires = "funnel")]
         crew: Option<String>,
         /// (#1222) Funnel model-cycling mode: "sequential" | "parallel" |
@@ -1086,11 +1058,10 @@ pub(crate) enum LabCmd {
         /// hardware tier).
         #[arg(long = "exec-mode", requires = "funnel")]
         exec_mode: Option<String>,
-        /// (#1222) Override every review-probe staffing's draw count `k` for
-        /// this run (the crew registry's per-staffing `k` otherwise applies
-        /// unchanged). Must be >= 1 — a 0 draw count guarantees a degenerate
-        /// run (zero probe flags), same floor `resolve_crew` enforces on a
-        /// crew's own `k`.
+        /// (#1426 ship-2) The probe seat's draw count `k` for this run (the
+        /// resourcing resolver's default of 3 otherwise applies). Must be at
+        /// least 1 — a 0 draw count guarantees a degenerate run (zero probe
+        /// flags).
         #[arg(long, requires = "funnel", value_parser = clap::value_parser!(u32).range(1..))]
         k: Option<u32>,
         /// (#1222) Run an external bundler

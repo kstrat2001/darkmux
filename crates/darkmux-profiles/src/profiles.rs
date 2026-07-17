@@ -1,4 +1,4 @@
-use darkmux_types::{Crew, Profile, ProfileRegistry, QuarantinedEntry, QuarantinedEntryKind};
+use darkmux_types::{Profile, ProfileRegistry, QuarantinedEntry, QuarantinedEntryKind};
 use anyhow::{Context, Result, anyhow, bail};
 use std::env;
 use std::fs;
@@ -93,37 +93,30 @@ fn load_from(path: PathBuf, source: &str) -> Result<LoadedRegistry> {
 }
 
 /// (#1282) Two-stage registry parse — the per-entry quarantine that keeps one
-/// structurally-broken profile/crew entry from blasting the whole file
+/// structurally-broken profile entry from blasting the whole file
 /// (config-leniency contract #1269, applied one layer down):
 ///
 /// 1. **Whole-file JSON syntax** — a syntax error can't be scoped to one
 ///    entry, so it still fails the file (with serde_json's line/column).
-/// 2. **Per-entry typed conversion** — each `profiles{}` / `crews{}` entry is
-///    converted to its typed form individually; a failure quarantines THAT
-///    entry (name + serde's field-level message, e.g. ``missing field `id```)
-///    and is removed from the raw tree.
+/// 2. **Per-entry typed conversion** — each `profiles{}` entry is converted to
+///    its typed form individually; a failure quarantines THAT entry (name +
+///    serde's field-level message, e.g. ``missing field `id```) and is removed
+///    from the raw tree.
 /// 3. **Shell parse** — the remaining tree (registry shell + healthy entries)
 ///    goes through the normal typed parse. A failure here is shell-level
 ///    breakage (e.g. `profiles` isn't an object) and fails the file.
+///
+/// (#1426 ship-2) The `crews` map retired from the schema, so it is no longer
+/// quarantined per-entry — a `crews` key overflows into `ProfileRegistry.extras`
+/// (lenient-on-read) and is preserved verbatim as harmless residue.
 fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
     let mut root: serde_json::Value = serde_json::from_str(raw)?;
 
     let mut quarantined: Vec<QuarantinedEntry> = Vec::new();
-    for (key, kind) in [
-        ("profiles", QuarantinedEntryKind::Profile),
-        ("crews", QuarantinedEntryKind::Crew),
-    ] {
-        let Some(map) = root.get_mut(key).and_then(|v| v.as_object_mut()) else {
-            continue;
-        };
+    let kind = QuarantinedEntryKind::Profile;
+    if let Some(map) = root.get_mut("profiles").and_then(|v| v.as_object_mut()) {
         for (name, entry) in map.iter() {
-            let error = match kind {
-                QuarantinedEntryKind::Profile => {
-                    serde_json::from_value::<Profile>(entry.clone()).err()
-                }
-                QuarantinedEntryKind::Crew => serde_json::from_value::<Crew>(entry.clone()).err(),
-            };
-            if let Some(e) = error {
+            if let Some(e) = serde_json::from_value::<Profile>(entry.clone()).err() {
                 quarantined.push(QuarantinedEntry {
                     kind,
                     name: name.clone(),
@@ -131,7 +124,7 @@ fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
                 });
             }
         }
-        for q in quarantined.iter().filter(|q| q.kind == kind) {
+        for q in &quarantined {
             map.remove(&q.name);
         }
     }
@@ -152,16 +145,10 @@ fn validate_registry(reg: &ProfileRegistry, path: &Path) -> Result<()> {
     for (name, profile) in &reg.profiles {
         validate_profile(name, profile, path)?;
     }
-    // (#1269) Crew CONTENT is deliberately NOT validated here. Registries are
-    // lenient-on-read (the same doctrine `config.json` already follows): one
-    // operator typo in a crew's seat staffing must never fail the whole
-    // registry load and take down unrelated `--profile` dispatch with it.
-    // `crate::crews::resolve_crew` is the single place a crew's semantic
-    // validity (profile refs, remote-endpoint rejection, k bounds) is
-    // decided — callers that need a specific crew resolve it themselves
-    // (review preflight, `darkmux doctor`'s per-crew check) and get the same
-    // named error `validate_crew` used to produce, just scoped to that one
-    // crew instead of the whole file.
+    // (#1426 ship-2) The `crews` map retired from the schema — review staffing
+    // is now DERIVED by the resourcing resolver (`darkmux_crew::resourcing`)
+    // from the active profile's models plus launch-param seat pins, never a
+    // declared crew. A legacy `crews` key is harmless residue in `extras`.
     Ok(())
 }
 
@@ -357,161 +344,6 @@ mod tests {
         assert!(err.to_string().contains("not one of its models"));
     }
 
-    // ── crews (#1222 Phase B packet 1; blast-radius fix #1269) ─────
-    // Registry LOAD is lenient on crew content — a bad crew must never fail
-    // the whole file. `crate::crews::resolve_crew` is the ONLY place crew
-    // semantic validity is decided; these tests confirm a bad crew still
-    // LOADS (siblings — profiles AND other crews — are unaffected) and that
-    // `resolve_crew` on the bad crew itself produces the same named error
-    // `validate_crew` used to raise at load time. Resolution-semantics
-    // detail (default-model fallback, remote-endpoint rejection, etc.) is
-    // covered exhaustively in `crate::crews::tests`. ──────────────
-
-    #[test]
-    fn validates_crew_happy_path_loads_fine() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        write(
-            &p,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"review-deep":{"seats":{
-                    "review-probe":[{"profile":"fast"}],
-                    "review-judge":[{"profile":"fast"}]
-                }}}}"#,
-        );
-        let reg = load_registry(Some(p.to_str().unwrap())).unwrap().registry;
-        assert_eq!(reg.crews.len(), 1);
-        let crew = reg.crews.get("review-deep").unwrap();
-        assert_eq!(crew.seats.len(), 2);
-    }
-
-    /// The #1269 regression: one crew that fails RESOLUTION (not schema
-    /// parsing — here a LOCAL staffing whose model omits `n_ctx`, #1282)
-    /// must not fail registry load, and a sibling profile must be fully
-    /// usable via `get_profile` while `resolve_crew` on the bad crew fails
-    /// with the named error. (The original fixture used a remote-endpoint
-    /// seat, which #1260 made legal — the isolation property under test is
-    /// unchanged.)
-    #[test]
-    fn invalid_crew_does_not_fail_registry_load_sibling_profile_still_works() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        write(
-            &p,
-            r#"{"profiles":{
-                    "fast":{"models":[{"id":"a","n_ctx":1000}]},
-                    "ctxless":{"models":[{"id":"local-b"}]}
-                },
-                "default_profile":"fast",
-                "crews":{"bad":{"seats":{"review-probe":[{"profile":"ctxless"}]}}}}"#,
-        );
-        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        assert!(loaded.registry.crews.contains_key("bad"));
-
-        // Plain --profile dispatch on the sibling profile is fully unaffected.
-        let fast = get_profile(&loaded.registry, "fast").unwrap();
-        assert_eq!(fast.models.len(), 1);
-
-        // resolve_crew on the bad crew still fails, with the crew/seat and
-        // the missing field named.
-        let err = crate::crews::resolve_crew(&loaded.registry, "bad").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("n_ctx"), "names the missing field: {msg}");
-        assert!(msg.contains("review-probe"), "names the seat: {msg}");
-    }
-
-    #[test]
-    fn validates_crew_missing_profile_ref_does_not_fail_load() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        write(
-            &p,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"bad":{"seats":{"review-probe":[{"profile":"ghost"}]}}}}"#,
-        );
-        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        assert!(loaded.registry.crews.contains_key("bad"));
-        let err = crate::crews::resolve_crew(&loaded.registry, "bad").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("ghost") || msg.contains("not found"));
-    }
-
-    #[test]
-    fn validates_crew_k_zero_does_not_fail_load() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        write(
-            &p,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"bad":{"seats":{"review-probe":[{"profile":"fast","k":0}]}}}}"#,
-        );
-        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        let err = crate::crews::resolve_crew(&loaded.registry, "bad").unwrap_err();
-        assert!(err.to_string().contains("k must be >= 1"));
-    }
-
-    #[test]
-    fn validates_crew_bad_model_id_does_not_fail_load() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        write(
-            &p,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"bad":{"seats":{"review-probe":[
-                    {"profile":"fast","model":"nonexistent"}
-                ]}}}}"#,
-        );
-        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        let err = crate::crews::resolve_crew(&loaded.registry, "bad").unwrap_err();
-        assert!(err.to_string().contains("not found in profile"));
-    }
-
-    /// (#1260, contract 1) A remote-endpoint staffing loads AND resolves —
-    /// the v1 local-only fence is gone; the profile's endpoint declaration
-    /// is the routing signal, not a crew-side legality question.
-    #[test]
-    fn remote_endpoint_staffing_loads_and_resolves() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        write(
-            &p,
-            r#"{"profiles":{"cloud":{"models":[
-                    {"id":"gpt-remote",
-                     "endpoint":{"url":"https://example.azure.com/openai"}}
-                ]}},
-                "crews":{"hosted":{"seats":{"review-judge":[{"profile":"cloud"}]}}}}"#,
-        );
-        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        let crew = crate::crews::resolve_crew(&loaded.registry, "hosted")
-            .expect("remote staffing resolves (#1260)");
-        assert!(crew.seats.get("review-judge").unwrap()[0].pm.is_remote());
-    }
-
-    #[test]
-    fn validates_crew_empty_seats_does_not_fail_load() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        write(
-            &p,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"empty":{"seats":{}}}}"#,
-        );
-        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        let err = crate::crews::resolve_crew(&loaded.registry, "empty").unwrap_err();
-        assert!(err.to_string().contains("no seats"));
-    }
-
-    #[test]
-    fn registry_with_no_crews_key_loads_unaffected() {
-        // Old-shape profiles.json (no `crews` key at all) — unaffected by
-        // the new validation pass.
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        write(&p, minimal_json());
-        let reg = load_registry(Some(p.to_str().unwrap())).unwrap().registry;
-        assert!(reg.crews.is_empty());
-    }
-
     #[test]
     fn validates_empty_registry() {
         let tmp = TempDir::new().unwrap();
@@ -569,67 +401,6 @@ mod tests {
         assert!(err.contains("quarantined"), "got: {err}");
         assert!(err.contains("missing field `id`"), "got: {err}");
         assert!(err.contains("darkmux doctor"), "got: {err}");
-    }
-
-    #[test]
-    fn quarantined_crew_keeps_registry_loading_and_resolve_names_the_error() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        // "mangled" has a wrong-typed `seats` — a crew-entry structural
-        // failure that pre-#1282 killed the whole file.
-        write(
-            &p,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{
-                    "good":{"seats":{"review-probe":[{"profile":"fast"}]}},
-                    "mangled":{"seats":"not-a-map"}
-                }}"#,
-        );
-        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        assert!(loaded.registry.crews.contains_key("good"));
-        assert!(!loaded.registry.crews.contains_key("mangled"));
-        assert_eq!(loaded.registry.quarantined.len(), 1);
-        assert_eq!(
-            loaded.registry.quarantined[0].kind,
-            darkmux_types::QuarantinedEntryKind::Crew
-        );
-
-        // The healthy crew resolves; the quarantined one errors with reason.
-        crate::crews::resolve_crew(&loaded.registry, "good").unwrap();
-        let err = crate::crews::resolve_crew(&loaded.registry, "mangled")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("quarantined"), "got: {err}");
-        assert!(err.contains("darkmux doctor"), "got: {err}");
-    }
-
-    /// (#1282) A HEALTHY crew whose seat staffing names a QUARANTINED
-    /// profile: the crew entry itself parses fine, so the failure surfaces at
-    /// resolve time — and it must carry the profile's own quarantine error
-    /// (wrapped with the crew/seat label), never a misleading "not found".
-    #[test]
-    fn crew_staffing_referencing_quarantined_profile_surfaces_quarantine_error() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        write(
-            &p,
-            r#"{"profiles":{
-                    "fast":{"models":[{"id":"a","n_ctx":1000}]},
-                    "broken":{"models":[{"n_ctx":32000}]}
-                },
-                "crews":{"review":{"seats":{"review-probe":[{"profile":"broken"}]}}}}"#,
-        );
-        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        assert!(loaded.registry.crews.contains_key("review"));
-        let err = crate::crews::resolve_crew(&loaded.registry, "review")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("crew \"review\""), "got: {err}");
-        assert!(err.contains("review-probe"), "got: {err}");
-        assert!(err.contains("quarantined"), "got: {err}");
-        assert!(err.contains("missing field `id`"), "got: {err}");
-        assert!(err.contains("darkmux doctor"), "got: {err}");
-        assert!(!err.contains("not found"), "got: {err}");
     }
 
     #[test]
@@ -737,132 +508,4 @@ mod tests {
         );
     }
 
-    // ── coverage additions (#1222 Phase B — packet-1 gap sweep) ────
-    //
-    // The `--profiles-file` / `DARKMUX_PROFILES` precedence chain itself is
-    // already covered above (`darkmux_config_env_var_*`,
-    // `default_locations_does_not_include_env`) for generic registry
-    // loading; these confirm the SAME precedence holds when a `crews{}`
-    // section is in play — a bad crew loaded via the env var loads exactly
-    // like a bad crew loaded via `--profiles-file` does in
-    // `validates_crew_missing_profile_ref_does_not_fail_load` above (#1269:
-    // registry load is lenient on crew content either way).
-
-    #[serial_test::serial]
-    #[test]
-    fn darkmux_profiles_env_var_validates_crews_happy_path() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("env-crews.json");
-        write(
-            &p,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"review-deep":{"seats":{"review-probe":[{"profile":"fast"}]}}}}"#,
-        );
-        unsafe { env::set_var("DARKMUX_PROFILES", p.to_str().unwrap()) };
-        let result = load_registry(None);
-        unsafe { env::remove_var("DARKMUX_PROFILES") };
-        let reg = result.unwrap().registry;
-        assert_eq!(reg.crews.len(), 1);
-        assert!(reg.crews.contains_key("review-deep"));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn darkmux_profiles_env_var_invalid_crew_does_not_fail_load() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("env-bad-crews.json");
-        write(
-            &p,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"bad":{"seats":{"review-probe":[{"profile":"ghost"}]}}}}"#,
-        );
-        unsafe { env::set_var("DARKMUX_PROFILES", p.to_str().unwrap()) };
-        let result = load_registry(None);
-        unsafe { env::remove_var("DARKMUX_PROFILES") };
-        let reg = result.unwrap().registry;
-        assert!(reg.crews.contains_key("bad"));
-        let err = crate::crews::resolve_crew(&reg, "bad").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("ghost") || msg.contains("not found"), "got: {msg}");
-    }
-
-    /// An explicit `--profiles-file` (the `Some(path)` arg to
-    /// `load_registry`) wins over `DARKMUX_PROFILES` even when BOTH point at
-    /// files with a `crews{}` section — the loaded crews are the explicit
-    /// file's, never the env var's.
-    #[serial_test::serial]
-    #[test]
-    fn explicit_profiles_flag_wins_over_env_var_for_crews() {
-        let tmp = TempDir::new().unwrap();
-        let explicit_path = tmp.path().join("explicit.json");
-        let env_path = tmp.path().join("env.json");
-        write(
-            &explicit_path,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"from-explicit":{"seats":{"s":[{"profile":"fast"}]}}}}"#,
-        );
-        write(
-            &env_path,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"from-env":{"seats":{"s":[{"profile":"fast"}]}}}}"#,
-        );
-        unsafe { env::set_var("DARKMUX_PROFILES", env_path.to_str().unwrap()) };
-        let result = load_registry(Some(explicit_path.to_str().unwrap()));
-        unsafe { env::remove_var("DARKMUX_PROFILES") };
-        let reg = result.unwrap().registry;
-        assert!(reg.crews.contains_key("from-explicit"));
-        assert!(!reg.crews.contains_key("from-env"));
-    }
-
-    /// Forward-compat `extras` on BOTH `Crew` and nested `SeatStaffing`
-    /// survive a FULL save/load cycle through real file I/O (not just an
-    /// in-memory `serde_json::from_str`/`to_string` round trip, which the
-    /// schema-layer tests in `darkmux-types` already cover): parse from
-    /// disk via `load_registry`, re-serialize, write to a SECOND file, and
-    /// `load_registry` that one too — extras must still be there after both
-    /// hops.
-    #[test]
-    fn crew_extras_preserved_through_full_file_round_trip() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("profiles.json");
-        write(
-            &p,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"review-deep":{
-                    "description":"deep lineup",
-                    "future_crew_field":"kept",
-                    "seats":{"review-probe":[
-                        {"profile":"fast","future_staffing_field":42}
-                    ]}
-                }}}"#,
-        );
-        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        let crew = loaded.registry.crews.get("review-deep").unwrap();
-        assert_eq!(
-            crew.extras.get("future_crew_field").and_then(|v| v.as_str()),
-            Some("kept")
-        );
-        let staffing = &crew.seats.get("review-probe").unwrap()[0];
-        assert_eq!(
-            staffing.extras.get("future_staffing_field").and_then(|v| v.as_u64()),
-            Some(42)
-        );
-
-        // Second hop: re-serialize, write to a fresh file, reload.
-        let round_path = tmp.path().join("profiles-round.json");
-        write(&round_path, &serde_json::to_string(&loaded.registry).unwrap());
-        let reloaded = load_registry(Some(round_path.to_str().unwrap())).unwrap();
-        let crew2 = reloaded.registry.crews.get("review-deep").unwrap();
-        assert_eq!(
-            crew2.extras.get("future_crew_field").and_then(|v| v.as_str()),
-            Some("kept")
-        );
-        assert_eq!(
-            crew2.seats.get("review-probe").unwrap()[0]
-                .extras
-                .get("future_staffing_field")
-                .and_then(|v| v.as_u64()),
-            Some(42)
-        );
-    }
 }

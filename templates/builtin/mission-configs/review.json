@@ -35,8 +35,28 @@
       "required": false
     },
     {
-      "name": "crew",
-      "description": "Crew name from profiles.json's \"crews\" map, staffing the review-probe/review-judge/review-verify seats. Required unless `from_envelope` (synthesis-only needs no crew). Old flag: `--crew`.",
+      "name": "profile",
+      "description": "(#1426 ship-2) The ROSTER profile whose models the resourcing resolver scores per review seat (probe / judge / verify). Absent -> the registry's `default_profile`. Replaces the retired `crew` input: staffing is now DERIVED from the profile roster, not read from a `crews` map. Old flag: none (was `--crew` naming a crews entry).",
+      "required": false
+    },
+    {
+      "name": "probe_models",
+      "description": "(#1426 ship-2) Comma-separated model ids (each in the roster profile) that PIN the probe seat to explicit drawers, one staffing per id (`--param probe_models=id1,id2`). Absent -> one probe drawer chosen by capability scoring against the roster (the roster profile's DEFAULT model until models declare `capabilities` vectors).",
+      "required": false
+    },
+    {
+      "name": "judge_model",
+      "description": "(#1426 ship-2) Model id (in the roster profile) that PINS the judge seat (`--param judge_model=<id>`). Absent -> capability scoring for the review-judge role, which resolves to the roster profile's DEFAULT model until models declare `capabilities` vectors -- pin deliberately for measured runs.",
+      "required": false
+    },
+    {
+      "name": "verify_model",
+      "description": "(#1426 ship-2) Model id (in the roster profile) that PINS the verify seat (`--param verify_model=<id>`). Absent -> capability scoring for the review-verify role (the roster profile's DEFAULT model until models declare `capabilities` vectors).",
+      "required": false
+    },
+    {
+      "name": "request_changes",
+      "description": "(#1426 ship-2) When truthy (`true`/`1`/`yes`/`on`), confirmed findings render as a blocking REQUEST_CHANGES review; else (default) an advisory COMMENT. Replaces the retired crew's `request_changes` field.",
       "required": false
     },
     {
@@ -46,7 +66,7 @@
     },
     {
       "name": "k",
-      "description": "Overrides every review-probe staffing's draw count (k). Old flag: `--k`.",
+      "description": "The probe seat's draw count (k) — draw BREADTH. Absent -> the resolver's default (3). Old flag: `--k`.",
       "required": false
     },
     {
@@ -91,7 +111,7 @@
     },
     {
       "name": "crew_staffing",
-      "description": "Resolved probe/judge/verify seat staffing (CrewStaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from the resolved `crew` input -- never a literal CLI input. Determines HOW MANY review.probe:<seat-name> tasks the investigate phase's probe-template task expands into at launch time -- see the 'review-probe-template' task's notes below.",
+      "description": "Resolved probe/judge/verify seat staffing (CrewStaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from the resourcing resolver (#1426 ship-2 -- roster profile scoring + seat pins), never a literal CLI input. Determines HOW MANY review.probe:<seat-name> tasks the investigate phase's probe-template task expands into at launch time -- see the 'review-probe-template' task's notes below.",
       "required": false
     },
     {

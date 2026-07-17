@@ -2085,15 +2085,27 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         resolve_context_window_internal(opts.profile_name.as_deref(), opts.config_path.as_deref())?,
     );
 
-    // (#590) Pre-compaction loaded-check: warn (don't abort) if the resolved
-    // compactor model is registered but not resident in LMStudio, BEFORE a
-    // mid-dispatch compaction call fails. Best-effort — skipped when lms is
-    // unreachable. Host-side I/O, kept out of the pure argv builder.
-    if let Some(util_id) = compaction.compactor_model.as_deref() {
-        if let Ok(loaded) = darkmux_profiles::lms::list_loaded() {
-            if let Some(warning) = utility_preflight_warning(util_id, &loaded) {
-                eprintln!("{warning}");
-            }
+    // (#1280) Ensure the utility/compactor model is RESIDENT AT ITS DECLARED
+    // CONTEXT — namespaced — before the container starts, exactly as the
+    // dispatch model already is (#1135). Pre-#1280 this path only eprintln'd a
+    // warning, and its claim that compaction "will fail if it isn't resident"
+    // was wrong: LMStudio JIT-loads a downloaded-but-unloaded model on the chat
+    // call, UNNAMESPACED and at the model default (~4096) — so a compaction
+    // payload overflows 4096 into truncated/garbage summaries mid-long-dispatch
+    // (the #1135 silent-truncation mechanism on the path that exists to SAVE
+    // long dispatches), and the bare load fails `is_darkmux_owned` so `model
+    // eject` can't reclaim it (a RAM leak on the always-on hub). Loading it
+    // here at the compaction context window, under `darkmux:`, closes both.
+    // Best-effort (warn, don't abort — a compaction-less short dispatch still
+    // runs); skipped for the mock-model harness (no real LMStudio to load into,
+    // same gate as the dispatch model's residency).
+    if opts.model_base_url_override.is_none() {
+        if let Some(warning) = ensure_utility_resident(
+            compaction.compactor_model.as_deref(),
+            compaction.context_window,
+            ensure_model_loaded_at_ctx,
+        ) {
+            eprintln!("{warning}");
         }
     }
 
@@ -3930,26 +3942,46 @@ fn ensure_context_window(
     }
 }
 
-/// (#590) Returns a loud warning when the registered utility model isn't in
-/// the loaded set — compaction summons it mid-dispatch and a missing one
-/// fails at the LMStudio call. `None` ⇒ it's loaded (matched by either the
-/// `modelKey` or the namespaced `identifier`). Pure, for testing.
-fn utility_preflight_warning(
-    util_id: &str,
-    loaded: &[darkmux_types::LoadedModel],
+// (#1280) `utility_preflight_warning` (the #590 warn-only preflight) was
+// retired: the utility/compactor model is now ENSURED resident at its declared
+// context (namespaced) via `ensure_model_loaded_at_ctx` at dispatch start, the
+// same guard the dispatch model gets — not merely warned about.
+
+/// (#1280) Build the utility/compactor model's residency spec (the compaction
+/// CONTEXT WINDOW is its required `n_ctx` — a compaction payload is sized to
+/// that window, so the model must be loaded at least that large). Pure; the
+/// wiring's unit-test seam.
+fn utility_residency_pm(util_id: &str, context_window: u32) -> darkmux_types::ProfileModel {
+    darkmux_types::ProfileModel {
+        id: util_id.to_string(),
+        n_ctx: Some(context_window),
+        ..Default::default()
+    }
+}
+
+/// (#1280) Ensure the utility/compactor model is resident at the compaction
+/// context window via `load` (production: `ensure_model_loaded_at_ctx`, which
+/// loads under the `darkmux:` namespace with the bounded #1139 machinery).
+/// Returns `Some(warning)` on a load failure — WARN, never abort: a
+/// compaction-less short dispatch still runs; the warning names the risk
+/// (JIT-load at the model default, truncated summaries). `None` when there is
+/// no compactor, no window, or the load succeeded. Pure over the injected
+/// `load` so the warn-not-abort contract is unit-testable without LMStudio.
+fn ensure_utility_resident(
+    compactor_model: Option<&str>,
+    context_window: Option<u32>,
+    load: impl Fn(&darkmux_types::ProfileModel) -> Result<()>,
 ) -> Option<String> {
-    let is_loaded = loaded
-        .iter()
-        .any(|m| m.model == util_id || m.identifier == util_id);
-    if is_loaded {
-        None
-    } else {
-        Some(format!(
-            "darkmux dispatch: WARNING — utility model `{util_id}` \
-             (internal.utility) is NOT loaded; compaction summons it mid-dispatch \
-             and will fail if it isn't resident. Load it now (`lms load {util_id}`, \
-             or register it as `internal.utility` so a dispatch loads it). (#590)"
-        ))
+    let util_id = compactor_model?;
+    let window = context_window?;
+    let util_pm = utility_residency_pm(util_id, window);
+    match load(&util_pm) {
+        Ok(()) => None,
+        Err(e) => Some(format!(
+            "darkmux dispatch: WARNING — utility/compactor model `{util_id}` could not be \
+             ensured resident at n_ctx={window}: {e:#}. Compaction may JIT-load it at the \
+             model default and truncate its summaries. (#1280)"
+        )),
     }
 }
 
@@ -4028,14 +4060,55 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
         }
     }
     let identifier = swap::namespaced_identifier(pm);
-    lms::load_with_identifier(&pm.id, n_ctx, &identifier, true).with_context(|| {
-        format!(
-            "loading `{}` at n_ctx={} failed — likely insufficient RAM (free resources, \
-             lower the profile's n_ctx, or evict a resident model), or LMStudio could not \
-             load it. (#1135; load-failure detection/fallback is #1139)",
-            pm.id, n_ctx
-        )
-    })
+    load_at_ctx_bounded(&pm.id, &identifier, n_ctx)
+}
+
+/// (#1139) Load `model_key` under `identifier` at `n_ctx` through the bounded
+/// [`LmsHost`] `ModelHost` port (#1276) instead of the raw, uncapped
+/// `lms::load_with_identifier` (`Command::status`, which blocks indefinitely on
+/// a RAM-starved / stuck load until the workflow's outer kill). The port
+/// enforces the resolved model-load deadline and classifies the failure into a
+/// TYPED error, so a RAM-exhausted load becomes a clear, operator-actionable
+/// message — never a hang or a silent degrade.
+fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32) -> Result<()> {
+    use darkmux_gestalt::{Deadline, ModelHost};
+    let mut host = darkmux_profiles::gestalt_host::LmsHost::new();
+    let deadline = Deadline::from_secs(darkmux_types::config_access::model_load_timeout_seconds());
+    map_load_result(host.load(model_key, identifier, n_ctx, deadline), model_key, n_ctx)
+}
+
+/// (#1139) Map the bounded [`ModelHost::load`] outcome to an operator-actionable
+/// `anyhow` result — the RAM-exhaustion case becomes a clear, named error, not a
+/// hang or silent degrade. Pure so the message mapping is unit-testable without
+/// a live host.
+fn map_load_result(
+    result: Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError>,
+    model_key: &str,
+    n_ctx: u32,
+) -> Result<()> {
+    use darkmux_gestalt::HostError;
+    match result {
+        Ok(_report) => Ok(()),
+        Err(HostError::InsufficientResources { detail }) => bail!(
+            "darkmux: model `{model_key}` could not load at n_ctx={n_ctx} — insufficient RAM \
+             ({detail}). Free resources, lower the profile's n_ctx, or evict a resident \
+             darkmux model (`darkmux machine eject`), then retry. (#1139)"
+        ),
+        Err(HostError::Timeout { phase, waited }) => bail!(
+            "darkmux: model `{model_key}` load did not finish within the bounded {phase} \
+             deadline ({waited:?}) — the load is likely stuck (wrong id, waiting on a \
+             download, or a RAM-starved host). Raise DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS if \
+             the machine is just slow. (#1139/#1276)"
+        ),
+        Err(HostError::UnknownModel { model_key }) => bail!(
+            "darkmux: model `{model_key}` was not found by LMStudio at load time — check the \
+             id against `lms ls`. (#1139)"
+        ),
+        Err(e) => bail!(
+            "darkmux: loading `{model_key}` at n_ctx={n_ctx} failed: {e}. Likely insufficient \
+             RAM or an LMStudio load error. (#1139)"
+        ),
+    }
 }
 
 fn probe_loaded_model_list() -> Result<Vec<String>> {

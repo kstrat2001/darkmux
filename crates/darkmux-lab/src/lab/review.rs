@@ -11,7 +11,7 @@
 //! ```
 //!
 //! This module is the DRIVER: given a resolved crew (packet 1's
-//! `darkmux_profiles::crews::resolve_crew`), a diff, and an intent, it runs
+//! the resourcing resolver `darkmux_crew::resourcing`), a diff, and an intent, it runs
 //! the whole pipeline and returns a [`ReviewEnvelope`]. Dispatch itself goes
 //! through a caller-injected `chat` closure (the container-free single-shot
 //! primitive from packet 2, `darkmux_crew::single_shot::single_shot_chat`,
@@ -142,7 +142,7 @@ use darkmux_crew::telemetry_sampler::{sample_host, HostSample};
 // adapters (their first production call site) — see the "model cycling"
 // section below.
 use darkmux_gestalt::{AcquireOpts, AcquireScope, Action, CallerIntent, Facts, ModelHost, Placement, ResourceProbe, V1Estimator};
-use darkmux_profiles::crews::{ResolvedCrew, ResolvedSeatStaffing};
+use darkmux_crew::resourcing::{ResolvedCrew, ResolvedSeatStaffing};
 use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
 use darkmux_profiles::swap;
 use darkmux_types::{BundleSelector, ModelEndpoint, ProfileModel};
@@ -1135,6 +1135,15 @@ pub struct StaffingSnapshot {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<BundleSelector>,
+    /// (#1426 ship-2 / #44) HOW this seat's model was chosen — `scored`
+    /// (capability scoring against the roster profile, with what it scored
+    /// against) or `pinned` (which launch param pinned it). The snapshot
+    /// already recorded WHAT resolved; this records WHY, so the operator
+    /// never wonders where the staffing decision came from. `Option` +
+    /// `#[serde(default)]` — a pre-ship-2 snapshot (field absent)
+    /// deserializes as `None`, the module's standard schema-lenience.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<darkmux_crew::resourcing::StaffingProvenance>,
 }
 
 /// Per-seat resolved staffing snapshot — `review-probe` (one or more
@@ -1182,6 +1191,8 @@ pub fn staffing_snapshot(
             n_ctx: s.pm.n_ctx,
             max_tokens: s.max_tokens,
             selector: s.selector.clone(),
+            // (#44) Scored-vs-pinned, carried verbatim from the resolver.
+            provenance: s.provenance.clone(),
         }
     }
     CrewStaffingSnapshot {
@@ -1485,22 +1496,24 @@ pub fn validate_review_crew(crew: &ResolvedCrew) -> Result<ReviewSeats<'_>> {
         .filter(|v| !v.is_empty())
         .ok_or_else(|| {
             anyhow!(
-                "darkmux: crew \"{}\" is missing seat \"review-probe\" (the review \
-                 review needs >= 1 staffing) — add one under crews.\"{}\".seats.\"review-probe\"",
-                crew.name,
+                "darkmux: review staffing \"{}\" is missing the \"review-probe\" seat (the \
+                 review needs >= 1 probe staffing) — the resourcing resolver staffs it from \
+                 the roster profile; pin drawers explicitly with `--param probe_models=<id,...>` \
+                 (#1426 ship-2)",
                 crew.name
             )
         })?;
     let judges = crew.seats.get("review-judge").ok_or_else(|| {
         anyhow!(
-            "darkmux: crew \"{}\" is missing seat \"review-judge\" (the review \
-             review needs exactly 1 staffing)",
+            "darkmux: review staffing \"{}\" is missing the \"review-judge\" seat (the \
+             review needs exactly 1 judge staffing) — the resourcing resolver staffs it from \
+             the roster profile; pin it explicitly with `--param judge_model=<id>` (#1426 ship-2)",
             crew.name
         )
     })?;
     if judges.len() != 1 {
         bail!(
-            "darkmux: crew \"{}\" seat \"review-judge\" must have EXACTLY 1 staffing \
+            "darkmux: review staffing \"{}\" seat \"review-judge\" must have EXACTLY 1 staffing \
              (got {}) — the double-confirm judge is a single seat, unlike \"review-probe\"",
             crew.name,
             judges.len()
@@ -1510,7 +1523,7 @@ pub fn validate_review_crew(crew: &ResolvedCrew) -> Result<ReviewSeats<'_>> {
         None => None,
         Some(v) if v.len() == 1 => Some(&v[0]),
         Some(v) => bail!(
-            "darkmux: crew \"{}\" seat \"review-verify\" must have EXACTLY 1 staffing \
+            "darkmux: review staffing \"{}\" seat \"review-verify\" must have EXACTLY 1 staffing \
              when declared (got {}) — the adjudication seat is single, like \"review-judge\" \
              (#1260)",
             crew.name,
@@ -3925,7 +3938,12 @@ impl StepKind for ReviewProbeStepKind {
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 
-    fn residency(&self, _step: &Step, _task: &Task) -> Option<darkmux_gestalt::Placement> {
+    fn residency(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Option<darkmux_gestalt::Placement> {
         if self.staffing.pm.is_remote() {
             return None;
         }
@@ -4119,6 +4137,15 @@ impl StepKind for ReviewJudgeStepKind {
         let t0 = Instant::now();
         let results: StdMutex<Vec<JudgeChunkResult>> = StdMutex::new(Vec::with_capacity(deduped.len()));
 
+        // (#1374) The deterministic global index of a flag is its position in
+        // `deduped`: the chunk's start offset (running count of flags in
+        // already-scheduled chunks) plus its offset WITHIN the chunk. The old
+        // form read `results.lock().len()` — the COMPLETED count, which for
+        // chunks after the first collides across offsets whenever earlier
+        // threads in the chunk haven't finished at spawn time, making
+        // `env.judged` completion-order rather than deduped-docket order. Plain
+        // arithmetic in the main loop is both correct and lock-free.
+        let mut chunk_start = 0usize;
         for chunk in deduped.chunks(concurrency) {
             std::thread::scope(|scope| {
                 for (offset, flag) in chunk.iter().enumerate() {
@@ -4126,14 +4153,9 @@ impl StepKind for ReviewJudgeStepKind {
                     let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
                     let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
                     let prompt = judge_prompt(&self.ctx.intent_title, &self.ctx.intent_body, code, facts, &flag.charge_text);
-                    let index = {
-                        // deterministic global index for this flag — the
-                        // running count of already-scheduled flags plus this
-                        // chunk's offset, so output order matches `deduped`
-                        // order regardless of thread completion order.
-                        let done = results.lock().expect("judge results mutex poisoned").len();
-                        done - done.min(offset) + offset
-                    };
+                    // (#1374) `chunk_start + offset` = this flag's stable index
+                    // in `deduped`, independent of thread completion order.
+                    let index = chunk_start + offset;
                     let ctx = &self.ctx;
                     let judge_budgets = judge_budgets.as_ref();
                     let results = &results;
@@ -4191,6 +4213,9 @@ impl StepKind for ReviewJudgeStepKind {
                     });
                 }
             });
+            // (#1374) Advance the running start AFTER the chunk's threads join,
+            // so the next chunk's flags index from the correct base.
+            chunk_start += chunk.len();
         }
 
         let mut results = results.into_inner().expect("judge results mutex poisoned");
@@ -4285,7 +4310,12 @@ impl StepKind for ReviewJudgeStepKind {
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 
-    fn residency(&self, _step: &Step, _task: &Task) -> Option<darkmux_gestalt::Placement> {
+    fn residency(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Option<darkmux_gestalt::Placement> {
         if self.judge.pm.is_remote() {
             return None;
         }
@@ -4333,6 +4363,25 @@ impl StepKind for ReviewJudgeStepKind {
 /// `dispatch.single_shot` to grow a per-item loop concept and shared
 /// cross-step mutation it doesn't have today; left as a documented
 /// follow-up candidate, not forced here.
+/// (#1426 ship-2) Count the CONFIRMED flags in a verify step's gathered
+/// input (the judge task's serialized `Vec<JudgedFlag>` output). `Some(n)`
+/// when the input parses (an ABSENT/empty input is a real zero — the judge
+/// produced nothing); `None` when it is present but unparseable, so the
+/// caller can stay conservative rather than mask a malformed handoff that
+/// `run` must surface. Pure; shared by `ReviewVerifyStepKind::residency`
+/// (the pre-wave-loader short-circuit) and unit-testable directly.
+fn confirmed_count_in_judge_output(
+    input: &std::collections::BTreeMap<String, String>,
+) -> Option<usize> {
+    let judge_output = match input.values().next() {
+        None => return Some(0),
+        Some(s) if s.is_empty() => return Some(0),
+        Some(s) => s,
+    };
+    let judged: Vec<JudgedFlag> = serde_json::from_str(judge_output).ok()?;
+    Some(judged.iter().filter(|j| j.tier == Tier::Confirmed).count())
+}
+
 pub struct ReviewVerifyStepKind {
     pub ctx: Arc<ReviewStepContext>,
     pub verify: Option<ResolvedSeatStaffing>,
@@ -4374,6 +4423,23 @@ impl StepKind for ReviewVerifyStepKind {
 
         let docket_count = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
         if docket_count == 0 {
+            // (#1426 ship-2 operator decision) The completed no-op half of
+            // the pre-wave short-circuit: `residency()` already returned
+            // `None` for this input (no model was loaded); here the step
+            // completes with the reason NAMED in its step-result record, so
+            // the run's observability answers "why did verify not dispatch"
+            // directly. Judged flags pass through untouched — the envelope
+            // is unaffected.
+            emit_review_step_result(
+                "review.verify",
+                &step.id,
+                &self.ctx.case_id,
+                json!({
+                    "items_in": 0, "items_out": 0, "wall_ms": 0,
+                    "short_circuit":
+                        "zero confirmed findings — verify skipped before any model load",
+                }),
+            );
             let output = serde_json::to_string(&judged).context("serializing judged flags")?;
             return Ok(StepOutcome { output, flow_records: Vec::new() });
         }
@@ -4505,7 +4571,12 @@ impl StepKind for ReviewVerifyStepKind {
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 
-    fn residency(&self, _step: &Step, _task: &Task) -> Option<darkmux_gestalt::Placement> {
+    fn residency(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+    ) -> Option<darkmux_gestalt::Placement> {
         let vstaff = self.verify.as_ref()?;
         if vstaff.pm.is_remote() {
             return None;
@@ -4515,6 +4586,19 @@ impl StepKind for ReviewVerifyStepKind {
         // step's output is transitively guaranteed empty too, so verify is
         // certain to have nothing confirmed to check.
         if self.ctx.bundles.is_empty() {
+            return None;
+        }
+        // (#1426 ship-2 operator decision) DATA-DEPENDENT short-circuit,
+        // ahead of the wave loader: verify's docket is the judge output's
+        // CONFIRMED subset, and by the time this step is ready that output
+        // is real (`verify_task.depends_on == [judge_task]`), delivered in
+        // the same gathered `input` map `run` will receive. Zero confirmed
+        // findings means `run` is a guaranteed no-op — return `None` so the
+        // residency wave never loads the verify model for it. Conservative
+        // on unparseable input (fall through and keep the placement): `run`
+        // owns surfacing that error; residency stays a best-effort
+        // classification that must never mask it.
+        if confirmed_count_in_judge_output(input) == Some(0) {
             return None;
         }
         let n_ctx = vstaff.pm.n_ctx?;

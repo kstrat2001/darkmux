@@ -611,12 +611,11 @@ mod tests {
     /// `darkmux init` writes `EXAMPLE_PROFILES_JSON` VERBATIM to
     /// `~/.darkmux/profiles.json` — the next `darkmux` invocation that reads
     /// the registry runs it through `load_registry`'s validation pass
-    /// (profile-level only since #1269: crew content is no longer validated
-    /// at load time). A fresh `darkmux init` must never hand the operator a
-    /// registry that fails that pass, AND its bundled `review-deep` crew
-    /// must still resolve cleanly via `resolve_crew` — the example is meant
-    /// to be a working starting point for `dispatch` /
-    /// `review-bench --funnel`, not just load-valid.
+    /// (profile-level only). A fresh `darkmux init` must never hand the
+    /// operator a registry that fails that pass. Since #1426 ship-2 the example
+    /// carries NO `crews` map (review staffing is derived by the resourcing
+    /// resolver from the active profile) — this asserts that too, so the
+    /// example doesn't reintroduce the retired declaration surface.
     ///
     /// Also drift-guards the example's stamped `schema_version` against
     /// `PROFILES_SCHEMA_VERSION` (the same committed-reference-vs-code
@@ -630,9 +629,12 @@ mod tests {
         fs::write(&p, EXAMPLE_PROFILES_JSON).unwrap();
         let loaded = darkmux_profiles::profiles::load_registry(Some(p.to_str().unwrap()))
             .expect("embedded example registry must pass load_registry's validation");
-        assert!(loaded.registry.crews.contains_key("review-deep"));
-        darkmux_profiles::crews::resolve_crew(&loaded.registry, "review-deep")
-            .expect("embedded example's review-deep crew must resolve cleanly (#1269)");
+        // (#1426 ship-2) The example ships no declared crews map — staffing is
+        // derived from the profile roster, never a `crews` entry.
+        assert!(
+            !loaded.registry.extras.contains_key("crews"),
+            "the shipped example must not reintroduce the retired `crews` map"
+        );
         assert_eq!(
             loaded.registry.schema_version.as_deref(),
             Some(darkmux_types::PROFILES_SCHEMA_VERSION),

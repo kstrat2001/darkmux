@@ -14,7 +14,6 @@
 //! (2.0, #1405: the `runtime` module — the legacy `openclaw` shell-out
 //! runtime's config-file patcher — was removed along with that runtime.)
 
-pub mod crews;
 pub mod envelope;
 pub mod gestalt_host;
 pub mod lms;

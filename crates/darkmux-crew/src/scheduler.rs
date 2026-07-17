@@ -389,7 +389,7 @@ pub fn run_step_graph(
             // trait doc on `StepKind::residency` and the module doc above.
             // Best-effort: `None` (every kind's behavior before this hook
             // existed, and every non-dispatch kind today) schedules Remote.
-            let residency = match kind.residency(&step_snapshot, &task_snapshot) {
+            let residency = match kind.residency(&step_snapshot, &task_snapshot, &input) {
                 Some(placement) => crate::concurrent_dispatch::Residency::Local(placement),
                 None => crate::concurrent_dispatch::Residency::Remote,
             };

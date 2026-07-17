@@ -132,7 +132,7 @@ pub fn run() -> DoctorReport {
     let checks = vec![
         check_build_info(),
         check_profile_registry(),
-        check_crew_validation(),
+        check_crews_residue(),
         check_mission_config_registry(),
         check_lms_binary(),
         check_docker_runtime(),
@@ -1730,63 +1730,51 @@ fn check_profile_registry() -> Check {
     }
 }
 
-/// (#1269) The loud surface for crew content darkmux deliberately stopped
-/// validating at registry-LOAD time (`darkmux-profiles::profiles`'s
-/// `load_registry` is now lenient on crew content — one bad crew must not
-/// fail the whole registry, since that took down unrelated `--profile`
-/// dispatch with it). `crate::crews::resolve_crew` remains the single place
-/// a crew's semantic validity is decided; this check runs it for every crew
-/// in the registry and surfaces failures so a bad crew edit is visible
-/// without breaking anything.
-fn check_crew_validation() -> Check {
+/// (#1426 ship-2) The `crews` map retired from the profiles schema — a crew is
+/// now a DERIVED view of a mission's resourcing, staffed by
+/// `darkmux_crew::resourcing`, never declared. A profiles.json still carrying a
+/// `crews` key parses fine (the key overflows into `ProfileRegistry.extras`,
+/// lenient-on-read) and is harmless residue. This check just NOTES that residue
+/// so an operator upgrading from a pre-2.0 profiles.json knows the map no
+/// longer does anything and can delete it at leisure. Cheap: it inspects the
+/// already-parsed `extras`, no per-entry work.
+fn check_crews_residue() -> Check {
     let registry = match profiles::load_registry(None) {
         Ok(r) => r,
         Err(e) => {
             return Check {
-                name: "crew validation".into(),
+                name: "crews residue".into(),
                 status: Status::Warn,
-                message: format!("can't validate crews (profile registry load failed: {e})"),
+                message: format!("can't inspect the registry (load failed: {e})"),
                 hint: None,
             };
         }
     };
 
-    if registry.registry.crews.is_empty() {
-        return Check {
-            name: "crew validation".into(),
-            status: Status::Pass,
-            message: "no crews defined".into(),
-            hint: None,
-        };
-    }
-
-    let mut offending: Vec<String> = Vec::new();
-    let mut n_ok = 0usize;
-    for name in registry.registry.crews.keys() {
-        match darkmux_profiles::crews::resolve_crew(&registry.registry, name) {
-            Ok(_) => n_ok += 1,
-            Err(e) => offending.push(format!("crew \"{name}\": {e}")),
-        }
-    }
-
-    if offending.is_empty() {
+    if registry.registry.extras.contains_key("crews") {
         Check {
-            name: "crew validation".into(),
-            status: Status::Pass,
-            message: format!("{n_ok} crew(s) resolve cleanly"),
-            hint: None,
+            name: "crews residue".into(),
+            // WARN, not Pass-with-hint (gate CONSIDER): a config block that no
+            // longer does anything merits the warn tier — the operator should
+            // learn their declared crews stopped being read, not skim past it.
+            status: Status::Warn,
+            message: "a legacy `crews` map is present and DOES NOTHING — it stopped being read \
+                      in 2.0"
+                .into(),
+            hint: Some(
+                "the `crews` map retired in 2.0 (#1426) — review staffing is now derived from \
+                 the roster profile plus launch-param seat pins (probe_models / judge_model / \
+                 verify_model / k). The key is harmless residue; delete it from \
+                 ~/.darkmux/profiles.json."
+                    .into(),
+            ),
         }
     } else {
         Check {
-            name: "crew validation".into(),
-            status: Status::Warn,
-            message: offending.join("; "),
-            hint: Some(
-                "fix the named crew(s) in ~/.darkmux/profiles.json — the crew's OWN dispatch \
-                 (`dispatch`, review-bench `--crew`) will fail loud with the same error; \
-                 unaffected profiles and crews continue to work in the meantime."
-                    .into(),
-            ),
+            name: "crews residue".into(),
+            status: Status::Pass,
+            message: "no legacy crews residue".into(),
+            hint: None,
         }
     }
 }
@@ -3871,11 +3859,11 @@ mod tests {
         assert_eq!(check.status, Status::Pass);
     }
 
-    // ─── #1269: check_crew_validation tests ─────────────────────
+    // ─── #1426 ship-2: check_crews_residue tests ─────────────────────
 
     #[serial_test::serial]
     #[test]
-    fn check_crew_validation_passes_when_no_crews() {
+    fn check_crews_residue_passes_clean_when_no_crews_key() {
         let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
         std::fs::write(
             &config_path,
@@ -3883,14 +3871,20 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_crew_validation();
+        let check = check_crews_residue();
         assert_eq!(check.status, Status::Pass);
-        assert!(check.message.contains("no crews"));
+        assert!(check.message.contains("no legacy crews residue"));
+        assert!(check.hint.is_none());
     }
 
+    /// A pre-2.0 profiles.json still carrying a `crews` map parses fine (the
+    /// key overflows into `extras`) and surfaces as a WARN — a config block
+    /// that no longer does anything merits the warn tier, so the operator
+    /// learns their declared crews stopped being read. Never an error (the
+    /// residue is harmless to every code path).
     #[serial_test::serial]
     #[test]
-    fn check_crew_validation_passes_when_all_crews_resolve() {
+    fn check_crews_residue_warns_on_legacy_crews_key() {
         let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
         std::fs::write(
             &config_path,
@@ -3899,85 +3893,10 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_crew_validation();
-        assert_eq!(check.status, Status::Pass);
-        assert!(check.message.contains("1 crew"));
-    }
-
-    /// The exact #1269 scenario: one invalid crew (here a LOCAL staffing
-    /// whose model omits `n_ctx`, #1282 — the original remote-endpoint
-    /// fixture became LEGAL staffing when #1260 lifted the local-only
-    /// fence) must surface as a WARN naming the crew and the specific
-    /// error, and must NOT prevent the check from running at all (registry
-    /// load itself succeeds).
-    #[serial_test::serial]
-    #[test]
-    fn check_crew_validation_warns_on_invalid_crew_names_it() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        std::fs::write(
-            &config_path,
-            r#"{"profiles":{
-                    "fast":{"models":[{"id":"a","n_ctx":1000}]},
-                    "ctxless":{"models":[{"id":"local-b"}]}
-                },
-                "crews":{"bad-crew":{"seats":{"review-probe":[{"profile":"ctxless"}]}}}}"#,
-        )
-        .unwrap();
-
-        let check = check_crew_validation();
+        let check = check_crews_residue();
         assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("crew \"bad-crew\""));
-        assert!(check.message.contains("n_ctx"));
-        assert!(check.hint.is_some());
-    }
-
-    /// (#1260, contract 1) Remote staffing is LEGAL: a crew whose seats
-    /// name endpoint-bearing profiles resolves cleanly, so doctor's crew
-    /// validation passes it — the check keeps warning only on genuinely
-    /// broken staffing (the sibling tests above/below).
-    #[serial_test::serial]
-    #[test]
-    fn check_crew_validation_passes_remote_staffed_crew() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        std::fs::write(
-            &config_path,
-            r#"{"profiles":{
-                    "fast":{"models":[{"id":"a","n_ctx":1000}]},
-                    "cloud":{"models":[
-                        {"id":"gpt-remote",
-                         "endpoint":{"url":"https://example.azure.com/openai"}}
-                    ]}
-                },
-                "crews":{"hosted-review":{"seats":{
-                    "review-probe":[{"profile":"fast"}],
-                    "review-judge":[{"profile":"cloud"}]
-                }}}}"#,
-        )
-        .unwrap();
-
-        let check = check_crew_validation();
-        assert_eq!(check.status, Status::Pass, "remote staffing is legal: {}", check.message);
-        assert!(check.message.contains("1 crew"));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_crew_validation_reports_only_the_bad_crew_when_mixed() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        std::fs::write(
-            &config_path,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{
-                    "good-crew":{"seats":{"review-probe":[{"profile":"fast"}]}},
-                    "bad-crew":{"seats":{"review-probe":[{"profile":"ghost"}]}}
-                }}"#,
-        )
-        .unwrap();
-
-        let check = check_crew_validation();
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("bad-crew"));
-        assert!(!check.message.contains("good-crew"));
+        assert!(check.message.contains("DOES NOTHING"), "got: {}", check.message);
+        assert!(check.hint.as_deref().unwrap().contains("retired in 2.0"));
     }
 
     // ─── #1284 Packet 1: check_mission_config_registry ───────────────

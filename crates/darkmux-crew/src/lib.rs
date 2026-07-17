@@ -12,7 +12,6 @@
 //!   crew::loader — read JSON manifests from `~/.darkmux/crew/<entity>/`
 //!                  with binary-embedded built-ins as fallback
 
-pub mod cli;
 // (#1230 Packet 1) Bounded concurrent-dispatch executor over gestalt's
 // `plan_waves` — see the module doc. No production caller in this packet;
 // Packet 2's `run_step_graph` scheduler is the intended first consumer.
@@ -34,6 +33,7 @@ pub mod loader;
 // which those two functions (`darkmux-lab::lab::review`, `src/coder_phase.rs`)
 // now call as thin launchers — the configs ARE the executable graphs.
 pub mod mission_config;
+pub mod resourcing;
 pub mod select;
 // (#1230 Packet 2) Generic dependency-graph scheduler over `Step`/`Phase`
 // — see the module doc for the DependencyNode/is_ready/reachable/

@@ -3859,31 +3859,117 @@
     // first_user_symlink_in / is_macos_firmlink tests moved to
     // `darkmux_types::workdir::tests` as part of Wave-E.2 (#255).
 
-    // ─── #590 utility_preflight_warning ───────────────────────────────
-    fn lm(identifier: &str, model: &str) -> darkmux_types::LoadedModel {
-        darkmux_types::LoadedModel {
-            identifier: identifier.into(),
-            model: model.into(),
-            status: "loaded".into(),
-            size: "3 GB".into(),
-            context: 4096,
-        }
+    // (#1280) The #590 `utility_preflight_warning` tests were removed with the
+    // warn-only preflight — the utility/compactor model is now ensured resident
+    // at its declared context (namespaced) via `ensure_model_loaded_at_ctx`,
+    // the same guard the dispatch model gets. That guard's load path is covered
+    // by the bounded-`LmsHost` tests in `darkmux-profiles` (#1139/#1276).
+
+    // ─── #1280 utility-residency wiring ────────────────────────────────
+
+    /// The utility model's residency spec is built AT THE COMPACTION CONTEXT
+    /// WINDOW — the window is the payload size compaction sends, so the model
+    /// must load at least that large (the #1135-class hole this closes).
+    #[test]
+    fn utility_residency_pm_uses_the_compaction_window_as_n_ctx() {
+        let pm = super::utility_residency_pm("util-4b", 68_000);
+        assert_eq!(pm.id, "util-4b");
+        assert_eq!(pm.n_ctx, Some(68_000));
+    }
+
+    /// The residency spec loads under the `darkmux:` namespace — the same
+    /// `namespaced_identifier` path `ensure_model_loaded_at_ctx` uses, so
+    /// `machine eject` can reclaim the load (the #1280 RAM-leak half).
+    #[test]
+    fn utility_residency_pm_namespaces_like_the_dispatch_model() {
+        let pm = super::utility_residency_pm("util-4b", 68_000);
+        assert_eq!(darkmux_profiles::swap::namespaced_identifier(&pm), "darkmux:util-4b");
+    }
+
+    /// Warn, never abort: a failed utility load yields a warning naming the
+    /// model, the window, and the truncation risk — the dispatch proceeds
+    /// (a compaction-less short dispatch still runs).
+    #[test]
+    fn ensure_utility_resident_warns_and_does_not_abort_on_load_failure() {
+        let warning = super::ensure_utility_resident(Some("util-4b"), Some(68_000), |_pm| {
+            anyhow::bail!("insufficient RAM")
+        })
+        .expect("a failed load must produce a warning");
+        assert!(warning.contains("util-4b"), "{warning}");
+        assert!(warning.contains("68000"), "{warning}");
+        assert!(warning.contains("truncate"), "{warning}");
+        assert!(warning.contains("WARNING"), "{warning}");
+    }
+
+    /// Success and not-configured are both silent (no warning): the load ran
+    /// with the window-sized spec on success, and no compactor / no window
+    /// means nothing to ensure.
+    #[test]
+    fn ensure_utility_resident_silent_on_success_or_unconfigured() {
+        let loaded: std::sync::Mutex<Vec<(String, Option<u32>)>> = std::sync::Mutex::new(Vec::new());
+        let result = super::ensure_utility_resident(Some("util-4b"), Some(68_000), |pm| {
+            loaded.lock().unwrap().push((pm.id.clone(), pm.n_ctx));
+            Ok(())
+        });
+        assert!(result.is_none());
+        assert_eq!(*loaded.lock().unwrap(), vec![("util-4b".to_string(), Some(68_000))]);
+
+        assert!(super::ensure_utility_resident(None, Some(68_000), |_| Ok(())).is_none());
+        assert!(super::ensure_utility_resident(Some("util-4b"), None, |_| Ok(())).is_none());
+    }
+
+    // ─── #1139 map_load_result: bounded-load outcome → actionable error ───
+
+    #[test]
+    fn map_load_result_ok_is_ok() {
+        assert!(super::map_load_result(Ok(Default::default()), "m", 4096).is_ok());
     }
 
     #[test]
-    fn utility_preflight_no_warning_when_loaded() {
-        let loaded = vec![lm("darkmux:util-4b", "util-4b"), lm("worker", "worker-35b")];
-        // Matched by modelKey...
-        assert!(super::utility_preflight_warning("util-4b", &loaded).is_none());
-        // ...or by the namespaced identifier.
-        assert!(super::utility_preflight_warning("darkmux:util-4b", &loaded).is_none());
+    fn map_load_result_insufficient_resources_is_operator_actionable() {
+        use darkmux_gestalt::HostError;
+        let err = super::map_load_result(
+            Err(HostError::InsufficientResources {
+                detail: "out of memory while allocating KV cache".into(),
+            }),
+            "qwen3-35b",
+            65536,
+        )
+        .unwrap_err()
+        .to_string();
+        // Names the model, the ctx, the RAM cause, and a concrete next action —
+        // never a hang or a silent degrade (#1139).
+        assert!(err.contains("insufficient RAM"), "{err}");
+        assert!(err.contains("qwen3-35b"), "{err}");
+        assert!(err.contains("65536"), "{err}");
+        assert!(err.contains("machine eject") || err.contains("lower the profile"), "{err}");
+        assert!(err.contains("out of memory while allocating KV cache"), "{err}");
     }
 
     #[test]
-    fn utility_preflight_warns_loudly_when_not_loaded() {
-        let loaded = vec![lm("worker", "worker-35b")];
-        let w = super::utility_preflight_warning("util-4b", &loaded)
-            .expect("a registered-but-unloaded util model must warn");
-        assert!(w.contains("util-4b"), "names the model: {w}");
-        assert!(w.contains("NOT loaded"), "states the problem: {w}");
+    fn map_load_result_timeout_names_phase_and_the_knob() {
+        use darkmux_gestalt::HostError;
+        let err = super::map_load_result(
+            Err(HostError::Timeout { phase: "load", waited: std::time::Duration::from_secs(600) }),
+            "m",
+            4096,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(err.contains("DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS"), "{err}");
+    }
+
+    #[test]
+    fn map_load_result_unknown_model_points_at_lms_ls() {
+        use darkmux_gestalt::HostError;
+        let err = super::map_load_result(
+            Err(HostError::UnknownModel { model_key: "ghost".into() }),
+            "ghost",
+            4096,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ghost"), "{err}");
+        assert!(err.contains("lms ls"), "{err}");
     }

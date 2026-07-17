@@ -659,6 +659,123 @@
         assert!(rows.iter().all(|r| r.artifact.model == "m-x" && r.source == "native"));
     }
 
+    /// (#1210) A degenerate case whose dispatch served ZERO tokens is an INFRA
+    /// failure (rate-limited / unreachable endpoint / dead dispatch) — routed
+    /// to `Outcome::InfraFail` and EXCLUDED from the capability denominators,
+    /// never a `CapabilityFail` zero against the model. A degenerate case that
+    /// served tokens (model ran, output unparseable) stays a capability fail.
+    #[test]
+    fn build_score_rows_zero_token_degenerate_is_infra_not_capability() {
+        use crate::lab::scores::{ArtifactKey, Outcome};
+        let mk_case = |id: &str, kind: &str| Case {
+            id: id.into(),
+            label: Label {
+                kind: kind.into(),
+                intent_title: "t".into(),
+                intent_body: String::new(),
+                expect_verdict: String::new(),
+                bug_class: None,
+                anchor_contains: None,
+                expected: vec![],
+                notes: None,
+            },
+            diff: String::new(),
+        };
+        let clean_ok = mk_case("c1", "clean");
+        let clean_429 = mk_case("c2", "clean");
+        let clean_ran = mk_case("c3", "clean");
+        let pass = CaseScore { correct: true, verdict: "pass".into(), ..Default::default() };
+        let degen = CaseScore { degenerate: true, ..Default::default() };
+        let scored: Vec<(&Case, CaseScore)> = vec![
+            (&clean_ok, CaseScore { correct: true, verdict: "pass".into(), ..Default::default() }),
+            (&clean_429, CaseScore { degenerate: true, ..Default::default() }),
+            (&clean_ran, CaseScore { degenerate: true, ..Default::default() }),
+        ];
+        let _ = (&pass, &degen);
+        let meta = vec![
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(500) }, // ran + passed
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(0) },   // 429: zero served
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(200) }, // ran, unparseable
+        ];
+        let artifact = ArtifactKey { model: "m-x".into(), ..Default::default() };
+        let rows = build_score_rows(&scored, &meta, &artifact);
+
+        let case_rows: Vec<_> = rows.iter().filter(|r| r.axis == "case").collect();
+        assert_eq!(case_rows.len(), 3);
+        assert_eq!(case_rows[0].outcome, Outcome::Pass);
+        // Zero tokens served → infra, not capability.
+        assert_eq!(case_rows[1].outcome, Outcome::InfraFail);
+        // Ran but produced unparseable output → still a capability failure.
+        assert_eq!(case_rows[2].outcome, Outcome::CapabilityFail);
+
+        // clean_pass_rate denominator EXCLUDES the infra case (c2): 1 pass of
+        // the 2 clean cases that actually ran (c1 passed, c3 ran + degenerate),
+        // never 1 of 3.
+        let agg = rows.iter().find(|r| r.axis == "clean_pass_rate").unwrap();
+        assert_eq!(agg.value, Some(0.5));
+        let detail = &agg.detail;
+        assert_eq!(detail["clean_cases"].as_u64(), Some(2));
+    }
+
+    /// (#1210 gate coverage) `is_infra_failure`'s three arms, the `None`
+    /// tokens arm explicitly: only POSITIVE zero-token evidence reclassifies.
+    /// The runtime envelope always emits numeric token fields (see the fn
+    /// doc), so `None` means "no parseable envelope" — kept capability-side
+    /// deliberately, never guessed into infra.
+    #[test]
+    fn is_infra_failure_requires_degenerate_and_positive_zero_token_evidence() {
+        let degen = CaseScore { degenerate: true, ..Default::default() };
+        let ran_fine = CaseScore { correct: true, ..Default::default() };
+        let zero = EnvelopeMeta { model: None, total_tokens: Some(0) };
+        let served = EnvelopeMeta { model: None, total_tokens: Some(250) };
+        let unknown = EnvelopeMeta::default(); // total_tokens: None
+
+        assert!(is_infra_failure(&degen, Some(&zero)), "degenerate + zero tokens = infra");
+        assert!(!is_infra_failure(&degen, Some(&served)), "model ran = capability degenerate");
+        assert!(!is_infra_failure(&degen, Some(&unknown)), "None tokens is NOT infra evidence");
+        assert!(!is_infra_failure(&degen, None), "missing meta row is NOT infra evidence");
+        assert!(!is_infra_failure(&ran_fine, Some(&zero)), "non-degenerate never reclassifies");
+    }
+
+    /// (#1210 gate coverage) `print_summary`'s partition: infra cases leave
+    /// the capability set and are counted separately — via the shared pure
+    /// `infra_partition` helper.
+    #[test]
+    fn infra_partition_splits_capability_from_infra() {
+        let mk_case = |id: &str| Case {
+            id: id.into(),
+            label: Label {
+                kind: "clean".into(),
+                intent_title: "t".into(),
+                intent_body: String::new(),
+                expect_verdict: String::new(),
+                bug_class: None,
+                anchor_contains: None,
+                expected: vec![],
+                notes: None,
+            },
+            diff: String::new(),
+        };
+        let c1 = mk_case("c1");
+        let c2 = mk_case("c2");
+        let c3 = mk_case("c3");
+        let scored: Vec<(&Case, CaseScore)> = vec![
+            (&c1, CaseScore { correct: true, ..Default::default() }),
+            (&c2, CaseScore { degenerate: true, ..Default::default() }), // 429: zero tokens
+            (&c3, CaseScore { degenerate: true, ..Default::default() }), // ran, unparseable
+        ];
+        let meta = vec![
+            EnvelopeMeta { model: None, total_tokens: Some(500) },
+            EnvelopeMeta { model: None, total_tokens: Some(0) },
+            EnvelopeMeta { model: None, total_tokens: Some(120) },
+        ];
+        let (capability, infra) = infra_partition(&scored, &meta);
+        assert_eq!(infra, 1, "exactly the zero-token case");
+        assert_eq!(capability.len(), 2);
+        assert!(capability.iter().any(|(c, _)| c.id == "c1"));
+        assert!(capability.iter().any(|(c, _)| c.id == "c3"), "capability-degenerate stays");
+    }
+
     #[test]
     fn build_score_rows_emits_multi_schema_aggregates() {
         use crate::lab::scores::ArtifactKey;
@@ -1247,8 +1364,8 @@
     // reaches the probe phase, so both the degenerate-envelope path and the
     // `--bundler` wiring are reachable without any network dispatch.
 
-    fn valid_funnel_crew() -> darkmux_profiles::crews::ResolvedCrew {
-        use darkmux_profiles::crews::ResolvedSeatStaffing;
+    fn valid_funnel_crew() -> darkmux_crew::resourcing::ResolvedCrew {
+        use darkmux_crew::resourcing::ResolvedSeatStaffing;
         use std::collections::BTreeMap;
         let mut seats = BTreeMap::new();
         seats.insert(
@@ -1260,6 +1377,7 @@
                 passes: 2,
                 max_tokens: None,
                 selector: None,
+                provenance: None,
             }],
         );
         seats.insert(
@@ -1271,9 +1389,10 @@
                 passes: 2,
                 max_tokens: None,
                 selector: None,
+                provenance: None,
             }],
         );
-        darkmux_profiles::crews::ResolvedCrew { name: "test-crew".into(), seats, request_changes: false }
+        darkmux_crew::resourcing::ResolvedCrew { name: "test-crew".into(), seats, request_changes: false }
     }
 
     fn test_funnel_ctx(bundler_cmd: Option<String>, exec_mode: super::super::review::ExecMode) -> FunnelCtx {
@@ -1411,25 +1530,25 @@
         assert!(msg.contains("empty bundle set"), "the underlying named error must survive the wrap: {msg}");
     }
 
-    // ── resolve_funnel_ctx: crew lookup + --k / --exec-mode plumbing ───
+    // ── resolve_funnel_ctx: roster resolution + --k / --exec-mode plumbing ───
+    // (#1426 ship-2) The crews map retired — the funnel derives its staffing
+    // from the roster profile (the `--crew`/`--profile` name, else
+    // default_profile) via the resourcing resolver. `--crew` now names the
+    // roster profile, not a `crews.<name>` entry.
 
-    fn write_test_registry(dir: &Path, crews: Vec<(&str, darkmux_types::Crew)>) -> PathBuf {
+    fn write_test_registry(dir: &Path, roster: &str) -> PathBuf {
         use std::collections::BTreeMap;
         let mut profiles = BTreeMap::new();
         profiles.insert(
-            "fast".to_string(),
+            roster.to_string(),
             darkmux_types::Profile {
                 models: vec![dummy_pm("probe-model"), dummy_pm("judge-model")],
                 ..Default::default()
             },
         );
-        let mut crew_map = BTreeMap::new();
-        for (name, crew) in crews {
-            crew_map.insert(name.to_string(), crew);
-        }
         let registry = darkmux_types::ProfileRegistry {
             profiles,
-            crews: crew_map,
+            default_profile: Some(roster.to_string()),
             ..Default::default()
         };
         let path = dir.join("profiles.json");
@@ -1437,7 +1556,7 @@
         path
     }
 
-    fn funnel_ctx_opts(config_path: PathBuf, crew: &str, exec_mode: Option<&str>, k_override: Option<u32>) -> ReviewBenchOpts {
+    fn funnel_ctx_opts(config_path: PathBuf, roster: &str, exec_mode: Option<&str>, k_override: Option<u32>) -> ReviewBenchOpts {
         ReviewBenchOpts {
             cases_dir: PathBuf::from("."),
             profile_name: None,
@@ -1449,7 +1568,7 @@
             prosecutor_profile: None,
             defender_profile: None,
             judge_profile: None,
-            crew: Some(crew.to_string()),
+            crew: Some(roster.to_string()),
             exec_mode: exec_mode.map(str::to_string),
             k_override,
             bundler_cmd: None,
@@ -1457,19 +1576,9 @@
     }
 
     #[test]
-    fn resolve_funnel_ctx_crew_not_found_lists_available_crews() {
-        use darkmux_types::{Crew, SeatStaffing};
-        use std::collections::BTreeMap;
+    fn resolve_funnel_ctx_missing_roster_profile_names_available() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // (#1269) `load_registry` no longer validates crew CONTENT at load
-        // time — an empty `Crew::default()` would load fine now. Give
-        // "review-deep" real seats anyway so this test stays scoped to what
-        // it's actually checking: the "ghost" crew name isn't found and the
-        // error lists the crews that DO exist.
-        let mut seats = BTreeMap::new();
-        seats.insert("review-probe".to_string(), vec![SeatStaffing { profile: "fast".into(), k: 3, ..Default::default() }]);
-        seats.insert("review-judge".to_string(), vec![SeatStaffing { profile: "fast".into(), k: 1, ..Default::default() }]);
-        let path = write_test_registry(tmp.path(), vec![("review-deep", Crew { seats, ..Default::default() })]);
+        let path = write_test_registry(tmp.path(), "fast");
         let opts = funnel_ctx_opts(path, "ghost", None, None);
 
         // `Result::unwrap_err` requires `T: Debug`; `FunnelCtx` intentionally
@@ -1477,36 +1586,21 @@
         // extracts the error without that bound.
         let err = resolve_funnel_ctx(&opts).err().unwrap();
         let msg = format!("{err:#}");
-        assert!(msg.contains("resolving crew \"ghost\" for --funnel"), "got: {msg}");
-        assert!(msg.contains("not found"), "got: {msg}");
-        assert!(msg.contains("review-deep"), "the available crew names must be listed: {msg}");
+        assert!(msg.contains("roster profile \"ghost\""), "names the missing roster: {msg}");
+        assert!(msg.contains("fast"), "lists the available profile: {msg}");
     }
 
     #[test]
-    fn resolve_funnel_ctx_k_override_applies_only_to_review_probe_staffings_and_exec_mode_parses() {
-        use darkmux_types::{Crew, SeatStaffing};
-        use std::collections::BTreeMap;
+    fn resolve_funnel_ctx_k_override_applies_to_probe_and_exec_mode_parses() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut seats = BTreeMap::new();
-        seats.insert(
-            "review-probe".to_string(),
-            vec![
-                SeatStaffing { profile: "fast".into(), k: 3, ..Default::default() },
-                SeatStaffing { profile: "fast".into(), k: 3, ..Default::default() },
-            ],
-        );
-        seats.insert(
-            "review-judge".to_string(),
-            vec![SeatStaffing { profile: "fast".into(), k: 5, ..Default::default() }],
-        );
-        let path = write_test_registry(tmp.path(), vec![("review-funnel", Crew { seats, ..Default::default() })]);
-        let opts = funnel_ctx_opts(path, "review-funnel", Some("parallel"), Some(9));
+        let path = write_test_registry(tmp.path(), "fast");
+        let opts = funnel_ctx_opts(path, "fast", Some("parallel"), Some(9));
 
         let ctx = resolve_funnel_ctx(&opts).unwrap();
         let probes = ctx.crew.seats.get("review-probe").unwrap();
-        assert!(probes.iter().all(|s| s.k == 9), "every review-probe staffing's k is overridden");
+        assert!(probes.iter().all(|s| s.k == 9), "the probe seat's draw count is the k override");
         let judges = ctx.crew.seats.get("review-judge").unwrap();
-        assert_eq!(judges[0].k, 5, "k_override targets review-probe only — review-judge's registry k is untouched");
+        assert_eq!(judges[0].k, 1, "the judge seat draws once regardless of the probe k override");
         assert_eq!(
             ctx.exec_mode,
             super::super::review::ExecMode::Parallel,
@@ -1517,18 +1611,17 @@
     }
 
     #[test]
-    fn resolve_funnel_ctx_no_k_override_leaves_registry_k_unchanged_and_exec_mode_defaults_to_auto() {
-        use darkmux_types::{Crew, SeatStaffing};
-        use std::collections::BTreeMap;
+    fn resolve_funnel_ctx_no_k_override_uses_default_probe_k_and_exec_mode_defaults_to_auto() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut seats = BTreeMap::new();
-        seats.insert("review-probe".to_string(), vec![SeatStaffing { profile: "fast".into(), k: 4, ..Default::default() }]);
-        seats.insert("review-judge".to_string(), vec![SeatStaffing { profile: "fast".into(), k: 1, ..Default::default() }]);
-        let path = write_test_registry(tmp.path(), vec![("review-funnel", Crew { seats, ..Default::default() })]);
-        let opts = funnel_ctx_opts(path, "review-funnel", None, None);
+        let path = write_test_registry(tmp.path(), "fast");
+        let opts = funnel_ctx_opts(path, "fast", None, None);
 
         let ctx = resolve_funnel_ctx(&opts).unwrap();
-        assert_eq!(ctx.crew.seats.get("review-probe").unwrap()[0].k, 4, "no override ⇒ the registry's own k survives");
+        assert_eq!(
+            ctx.crew.seats.get("review-probe").unwrap()[0].k,
+            3,
+            "no override ⇒ the resolver's default probe k (3)"
+        );
         assert_eq!(
             ctx.exec_mode,
             super::super::review::ExecMode::Auto,
