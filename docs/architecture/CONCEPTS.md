@@ -31,10 +31,11 @@ darkmux is a Rust CLI for operators running local LLMs on Apple Silicon.
 It does three things:
 
 1. **Mission orchestrator.** Config-defined missions launched with
-   `darkmux mission launch <config>` run as a live task graph: local *utility*
-   and *specialist* agents work the phases, every dispatch gated on operator
-   sign-off, every dispatch recorded to an auditable flow stream.
-   `darkmux dispatch <role>` is the task-grain entry point. The 2.0 headline.
+   `darkmux mission launch <config>` run as a live task graph: *utility* and
+   *specialist* agents work the phases, each seat local or cloud, every
+   dispatch gated on operator sign-off, every dispatch recorded to an
+   auditable flow stream. `darkmux dispatch <role>` is the task-grain entry
+   point. The 2.0 headline.
 2. **Lab harness.** `darkmux lab run <workload>` dispatches a workload and
    records timing + trajectory + verify outcome, so empirical claims are
    reproducible.

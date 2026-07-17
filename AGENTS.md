@@ -6,7 +6,7 @@ This file is for any AI agent (Antigravity, Claude Code, Cursor, etc.) that's he
 
 A Rust CLI (v1.x, on the 2.0 track) that is two things for users running local LLMs (LMStudio + Ollama + llama.cpp):
 
-1. **Mission orchestrator**: config-defined missions launched with `darkmux mission launch <config>` that run as a live task graph. A crew of local-AI roles works the phases through the internal Docker-bounded runtime, every dispatch gated on operator sign-off, each run finalizing into a typed envelope. `darkmux dispatch <role> <message>` is the task-grain entry point (one role, one turn). This is the 2.0 headline.
+1. **Mission orchestrator**: config-defined missions launched with `darkmux mission launch <config>` that run as a live task graph. A crew of local-AI roles works the phases through the internal Docker-bounded runtime (any seat can instead be staffed by a hosted cloud endpoint), every dispatch gated on operator sign-off, each run finalizing into a typed envelope. `darkmux dispatch <role> <message>` is the task-grain entry point (one role, one turn). This is the 2.0 headline.
 2. **Lab harness**: `darkmux lab run <workload>` dispatches a workload against the same internal runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
 
 Managing model residency (the founding *profile multiplexer*: loading the right models at the right context under the RAM budget) is now an internal capability underneath both, not a verb the operator drives. The `swap` verb retired on the 2.0 track (#1426); gestalt loads what each dispatch's staffing declares.
