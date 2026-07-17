@@ -979,7 +979,7 @@ fn run_dispatch(
                         );
                         // (F2, gate remediation) Warn, never silently
                         // swallow — same dim-warning parity as
-                        // `mission_launch.rs`/`mission_run.rs`'s persist
+                        // `mission_launch.rs`/`coder_phase.rs`'s persist
                         // closures: a disk-full mid-review would otherwise
                         // freeze the graph page with zero operator signal.
                         if let Err(e) = crew::lifecycle::save_step(&mission_id_for_persist, phase_id, step) {
@@ -1421,6 +1421,31 @@ mod tests {
             &mut started,
         );
         assert_eq!(phase_status(&mission_id, &real_phase_ids["report"]), "running");
+    }
+
+    /// (#1432 item 2) The review launcher's mint path threads each phase's
+    /// `display_name` from the embedded review config onto the persisted
+    /// `Phase` — so the most-viewed mission kind shows "Investigate" /
+    /// "Adjudicate" / "Report" in the timeline header, not the raw
+    /// `review-<case>-investigate` id. Regression guard: the operator saw
+    /// `display_name: None` live (phone repro #2), and this pins the fix so
+    /// a future mint-path refactor cannot silently drop the threading again.
+    #[test]
+    #[serial_test::serial]
+    fn review_mint_threads_phase_display_names_from_config() {
+        let _guard = CrewDirGuard::new();
+        let (mission_id, phase_ids) = mint_review_instance("owner/repo@dispnames");
+        let expected = ["Investigate", "Adjudicate", "Report"];
+        for (phase_id, want) in phase_ids.iter().zip(expected) {
+            let path = crew::lifecycle::phase_path(&mission_id, phase_id);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                v["display_name"].as_str(),
+                Some(want),
+                "phase {phase_id} must carry its config display_name, not None"
+            );
+        }
     }
 
     #[test]

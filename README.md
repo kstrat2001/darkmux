@@ -12,12 +12,14 @@ Built for operators who need to see what their AI fleet did, when, and why.
 - 🔧 **Operator sovereignty by design.** Defaults are overridable, writes are auditable, suggestions are explainable.
 - 📊 **Reproducible benchmarks.** `darkmux lab run <workload>` captures timing + trajectory + verify outcome, so anyone with the binary can re-run the empirical claims from the article series.
 
-**AI-first local-AI orchestrator.** darkmux uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, utility-agent dispatch verbs (like `mission propose`), and a mission/phase lifecycle, on top of LMStudio. Developed on Apple Silicon. **Assumes a frontier orchestrator** (Claude Code): the engagement work happens in the frontier session.
+**AI-first local-AI orchestrator.** darkmux uses local-AI internally to manage your local-AI workflows. Two pillars: a **mission orchestrator** (config-defined missions that run as a live task graph, gated on your sign-off, each finalizing into a typed envelope) and a **lab** (the empirical harness that measures how your hardware runs a workload). Managing model residency (loading the right models at the right context under your RAM budget) is now an internal capability underneath both, not a verb you drive by hand. Developed on Apple Silicon. **Assumes a frontier orchestrator** (Claude Code): the engagement work happens in the frontier session.
 
 > **Heads up: read before running.**
 > darkmux orchestrates AI tools that execute on your machine. It sends commands to your local LMStudio server and, in lab mode, runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
 
 ## What darkmux is for
+
+darkmux is two things: a **mission orchestrator** and a **lab**. You define a mission in config, launch it with `darkmux mission launch <config>`, and watch it run as a live task graph in the browser: a crew of local-AI roles works the phases, every dispatch is gated on your sign-off, and each run finalizes into a typed envelope. The lab is the empirical half: `darkmux lab run <workload>` measures how your own hardware runs a workload (wall clock, compaction events, verify outcome), so the config choices behind your missions rest on numbers, not guesses. Underneath both, darkmux keeps the right models resident at the right context under your RAM budget. Every seat runs local or cloud: your own models off the meter, or a hosted endpoint when a role needs frontier weights. The first thing worth doing after setup is launching a mission and watching the graph come alive.
 
 Local AI is good at things frontier models aren't: fast iteration, repeatability across hardware, an offline foundation. darkmux exists to make frontier models *better* by giving them complementary teammates running locally. **Diversity-as-synergy, not replacement.**
 
@@ -51,7 +53,7 @@ See [DESIGN.md](DESIGN.md) for the implementation reasoning.
 
 ## Many machines become one
 
-If you have more than one Mac, darkmux makes them work as a single development environment. Operator hands off a role; the first available runner runs it. Open the topology viewer from any node and you see the whole fleet. Open the fleet status from any node and you see specs, RAM, loaded models per machine.
+If you have more than one Mac, darkmux makes them work as a single development environment. Operator hands off a role; the first available runner runs it. Open the topology viewer from any node and you see the whole fleet. Run `darkmux machine list --deep` from any node and you see specs, RAM, loaded models per machine.
 
 Concretely, the capabilities the multi-machine substrate ships today:
 
@@ -178,7 +180,7 @@ Optional integrations (Redis coordination, the audit log) are blocks you turn on
 
 **Secrets stay out of the file.** A Redis password is never written to `config.json`. It lives in the macOS Keychain (store it once: `security add-generic-password -a "$USER" -s darkmux-redis -w`), read at runtime and never logged. On non-macOS, pass a full `DARKMUX_REDIS_URL` instead.
 
-> `config.json` (darkmux's settings) is a separate file from `profiles.json` (your swap profiles). Point at a non-default profiles registry with `--profiles-file <path>` or `DARKMUX_PROFILES`.
+> `config.json` (darkmux's settings) is a separate file from `profiles.json` (your profile registry). Point at a non-default profiles registry with `--profiles-file <path>` or `DARKMUX_PROFILES`.
 
 ### First useful commands
 
@@ -241,13 +243,13 @@ Bigger context wins long tasks. Slim config wins bounded tasks. **No static conf
 
 darkmux is a CLI binary, not an HTTP proxy. Your frontier session (Claude Code) invokes `darkmux` verbs directly to operate four substrates:
 
-1. **Profile multiplexing.** A dispatch loads the models a named profile in `~/.darkmux/profiles.json` declares, under the resident RAM budget (the multiplexer is now internal to gestalt). `~10s` wall to load.
+1. **Mission + phase orchestration.** `darkmux dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the in-house container-bounded runtime. `darkmux mission propose` + `darkmux phase estimate` are utility-AI verbs that turn vague intent into a structured mission config without the operator authoring it by hand; `darkmux mission launch <config>` mints the running mission instance and drives it as a task graph, gated on operator sign-off, finalizing into a typed envelope. Each dispatch emits a flow record carrying provenance: `machine_id`, `orchestrator`, role, model, mission, phase.
 
-2. **Crew + mission + phase lifecycle.** `darkmux dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the in-house container-bounded runtime. `darkmux mission propose` + `darkmux phase estimate` are utility-AI verbs that turn vague intent into a structured mission config without the operator authoring it by hand; `darkmux mission launch <id>` mints the running mission instance from that config. Each dispatch emits a flow record carrying provenance: `machine_id`, `orchestrator`, role, model, mission, phase.
+2. **Model residency (internal).** A dispatch loads the models a named profile in `~/.darkmux/profiles.json` declares, under the resident RAM budget, and unloads to make room when the budget requires it. This is the old profile multiplexer, now an internal capability: you declare profiles, darkmux loads them at dispatch time. The `swap` verb that used to drive it by hand is retired. `~10s` wall to load.
 
 3. **Flow substrate.** Every dispatch, decision, and review is recorded as a structured JSONL event. `LocalFileSink` (always-on) writes to `~/.darkmux/flows/`. `AuditFileSink` (opt-in via `DARKMUX_AUDIT_DIR`) adds a BLAKE3 hash chain whose edits `flow integrity-check` detects (un-anchored: detects edits absent a full re-chain). `RedisSink` (opt-in via `DARKMUX_REDIS_URL`) adds a cross-machine coordination stream. `darkmux flow status` introspects the substrate; `darkmux flow integrity-check` walks the audit chain.
 
-4. **Observability daemon.** `darkmux serve` is a local HTTP daemon (default bind `127.0.0.1:8765`) that serves flow records + mission/phase state + the new `/flow-status` endpoint to the `/flow` + `/lab` viewers. Endpoints: `/health`, `/flow/<date>(.jsonl)`, `/flow/<date>/stream` (SSE tail), `/model/status`, `/missions`, `/phases`, `/flow-status`. Foreground process: run in a separate terminal tab. `darkmux doctor` includes a `daemon: reachable` check; dispatches print a one-line stderr nudge when the daemon isn't reachable.
+4. **Observability daemon.** `darkmux serve` is a local HTTP daemon (default bind `127.0.0.1:8765`) that serves flow records + mission/phase state + the new `/flow-status` endpoint to the `/flow` + `/lab` viewers. Endpoints: `/health`, `/flow/<date>(.jsonl)`, `/flow/<date>/stream` (SSE tail), `/machine/status`, `/machine/resources`, `/missions`, `/phases`, `/flow-status`. Foreground process: run in a separate terminal tab. `darkmux doctor` includes a `daemon: reachable` check; dispatches print a one-line stderr nudge when the daemon isn't reachable.
 
 Both `dispatch` and `lab run` use the internal Docker-bounded runtime. The frontier session (Claude Code) orchestrates the whole thing: see the `/darkmux-bootstrap` skill for a guided walkthrough.
 
@@ -258,7 +260,7 @@ Both `dispatch` and `lab run` use the internal Docker-bounded runtime. The front
 
 OSS-published under personal GitHub: `github.com/kstrat2001/darkmux`. Darkly Energized is the brand context but darkmux is intentionally independent (no commercial coupling).
 
-The name comes from the multiplexer core: task-class-aware routing of LMStudio loadouts. The project has since grown into an AI-first local-AI orchestrator: small CLI primitives for the routing, plus AI-built-in verbs (`mission propose`, `phase estimate`, `notebook draft`) that compose those primitives with utility-agent dispatch so the operator gets structured output without writing JSON by hand. Earlier framings of darkmux as *"infrastructure, not an agent framework"* were honest at the time, but the binary today embeds AI dispatch logic internally, so calling it AI-first out loud is the honest move.
+The name comes from the multiplexer core: task-class-aware routing of LMStudio loadouts. That routing is still there, but it runs internally now; the project has grown into an AI-first local-AI orchestrator whose headline is the mission-and-lab pair, with small CLI primitives plus AI-built-in verbs (`mission propose`, `phase estimate`, `lab notebook draft`) that compose those primitives with utility-agent dispatch so the operator gets structured output without writing JSON by hand. Earlier framings of darkmux as *"infrastructure, not an agent framework"* or as *"a profile multiplexer"* were honest at the time, but the binary today embeds AI dispatch logic internally and leads with missions, so calling it an AI-first orchestrator out loud is the honest move.
 
 ## Design principles
 
@@ -292,7 +294,7 @@ docker build -t darkmux-runtime:latest runtime/
 
 The `lab` subcommand mirrors `dispatch`'s contract — the internal runtime, no external agent runtime to install or configure. The `machine` / `profile` subcommands don't depend on any runtime at all. They read LMStudio and the registry directly.
 
-This means **darkmux's profile-multiplexing needs nothing beyond Docker + LMStudio**: `dispatch` ships with a self-contained internal runtime, so a new user never installs a second agent-runtime tool to get going. The empirical findings in the article series were measured against this runtime.
+This means **darkmux's dispatch path needs nothing beyond Docker + LMStudio**: `dispatch` ships with a self-contained internal runtime, so a new user never installs a second agent-runtime tool to get going. The empirical findings in the article series were measured against this runtime.
 
 ### Internal-runtime safety net + model-facing telemetry
 
@@ -358,14 +360,12 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 **Shipped:**
 
-- ✅ Profile registry + `swap`/`status`/`profile list`/`profile scan` CLI
+- ✅ Profile registry + `profile list`/`profile scan`/`profile draft` CLI, with `machine status` for the loaded-state read (the founding `swap` verb retired in 2.0; gestalt manages residency)
 - ✅ Lab subcommands (`run`/`inspect`/`compare`/`characterize`/`tune`/`runs`), `WorkloadProvider` trait, embedded smoke workloads, always-on cross-layer flow telemetry (#557)
 - ✅ Lab reproducibility (#487): per-run copy-on-write sandbox isolation (source never mutated), `baseline_hash` + `final_hash` content hashing in the run manifest, a fixture registry with `lab register`/`unregister`/`fixtures`/`doctor` verbs, workload `requires_fixture` resolution, and `scripts/lab-init.sh` + the built-in `demo-tiny-py` fixture
 - ✅ Lab notebook (`lab notebook draft`/`list`), cross-machine via `DARKMUX_NOTEBOOK_DIR`
 - ✅ Agent-invocable skills bundle (12 skills including `/darkmux-bootstrap`)
 - ✅ Crew + Role + Mission + Phase schema with SQLite-backed index; `mission propose` + `phase estimate` utility-AI verbs; mission configs + `mission launch` as the config-launched instance-creation path
-- ✅ Per-role `agent.model` pinning (#160) with bake-off-derived defaults; doctor surfaces drift
-- ✅ Recommendation registry per hardware tier (#159) with `swap recommended` + `model pull-recommended`; doctor surfaces drift
 - ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
 - ✅ `darkmux flow status` + `darkmux flow integrity-check` diagnostic verbs
 - ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers

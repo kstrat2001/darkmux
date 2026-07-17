@@ -1,13 +1,13 @@
 ---
 name: darkmux-add-machine
-description: Walk an operator through joining a new Mac to an existing darkmux fleet. Read + propose pattern — operator runs every command. Configures DARKMUX_MACHINE_ID + DARKMUX_REDIS_URL on the new machine, registers it in the operator's other-machines' rosters, and runs a smoke test to confirm cross-fleet flow records land. Sibling to darkmux-bootstrap (first-time setup); use this when the operator already has a fleet running and is adding the Nth machine. (#176)
+description: Walk an operator through joining a new Mac to an existing fleet of darkmux machines. Read + propose pattern — operator runs every command. Configures DARKMUX_MACHINE_ID + DARKMUX_REDIS_URL on the new machine, registers it in the operator's other-machines' rosters, and runs a smoke test to confirm cross-fleet flow records land. Sibling to darkmux-bootstrap (first-time setup); use this when the operator already has a fleet running and is adding the Nth machine. (#176)
 user_invocable: true
 allowed-tools: "Bash(darkmux:*),Bash(lms:*),Bash(echo:*),Bash(env:*),Bash(ls:*),Bash(ping:*),Bash(nc:*),Read"
 ---
 
 # Darkmux add machine
 
-This skill walks the operator through adding a new Mac to an existing darkmux fleet. It's the sibling of `darkmux-bootstrap` (first-time setup) — use this skill when:
+This skill walks the operator through adding a new Mac to an existing fleet of darkmux machines. It's the sibling of `darkmux-bootstrap` (first-time setup) — use this skill when:
 
 - The operator already has 1+ machines running darkmux successfully
 - A coordinator (Redis-running machine) is reachable on the operator's tailnet
@@ -43,7 +43,7 @@ Report the state back to the operator; don't continue until darkmux + lms are bo
 
 ## Step 2 — Get the fleet coordinator details from the operator
 
-Ask: *"Which machine is your darkmux fleet's hub (the Redis-running machine)?"*
+Ask: *"Which machine is your fleet's hub (the Redis-running machine)?"*
 
 Need from the operator:
 
@@ -81,7 +81,7 @@ If the proposed id collides with an existing machine — pause; ask for a differ
 Tell the operator to add these to `~/.zshrc` (or `~/.bashrc`):
 
 ```bash
-# darkmux fleet membership — added by /darkmux-add-machine
+# darkmux — fleet membership, added by /darkmux-add-machine
 export DARKMUX_MACHINE_ID=<picked-in-step-3>
 export DARKMUX_REDIS_URL=redis://default:<password>@<coord-addr>:6379
 # Optional: name this frontier session in flow records

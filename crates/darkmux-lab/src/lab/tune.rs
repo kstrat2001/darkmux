@@ -59,7 +59,6 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
         quiet: false,
         // tune() runs the workload through the default runtime
         // (internal, post-Phase-D).
-        runtime: darkmux_crew::dispatch::Runtime::Internal,
         // tune() varies model behavior across N runs, not loop config (#986).
         loop_override: None,
         inject_context: None, // tune() never injects engagement-context (#1004)

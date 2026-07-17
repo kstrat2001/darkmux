@@ -15,7 +15,7 @@
 //!   crate-dependency direction) — that's what keeps a Tier 2 pattern
 //!   actually reusable rather than one mission's code with extra ceremony.
 //! - A mission's own module (e.g. `darkmux-lab`'s `review.rs`, this
-//!   crate's own `mission_run.rs` caller in the `darkmux` binary) — Tier 3,
+//!   crate's own `coder_phase.rs` caller in the `darkmux` binary) — Tier 3,
 //!   genuinely bespoke, stays physically co-located with the mission that
 //!   owns it, never migrates here "just in case."
 //!

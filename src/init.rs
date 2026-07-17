@@ -214,6 +214,25 @@ const CLAUDE_MD_FOOTER: &str = "<!-- darkmux:integration:end -->";
 const AGENTS_MD_HEADER: &str = "<!-- darkmux:integration:agents:start -->";
 const AGENTS_MD_FOOTER: &str = "<!-- darkmux:integration:agents:end -->";
 
+/// Shared body of the integration section that `--with-claude-md` /
+/// `--with-agents-md` emit into users' project docs. One constant feeds both
+/// templates so they cannot drift from each other or from the 2.0 identity
+/// (#1449).
+const INTEGRATION_SECTION_BODY: &str = r#"# darkmux
+
+This project uses [darkmux](https://github.com/kstrat2001/darkmux), a mission orchestrator and lab for local AI. You dispatch roles and launch missions to a crew of local-AI seats; each seat runs local (your own models, off the meter) or cloud (a hosted endpoint when a role needs frontier weights). darkmux keeps the right models resident at the right context under your RAM budget — you don't manage residency by hand.
+
+## Available skills
+
+- `/darkmux-status` — what's currently loaded
+- `/darkmux-list-stacks` — see all available profiles
+- `/darkmux-list-workloads` / `/darkmux-lab-run` — execute lab workloads
+- `/darkmux-list-runs` / `/darkmux-analyze-run` / `/darkmux-compare-runs` — inspect run history
+
+## Dispatch policy
+
+Launch a config-defined mission with `darkmux mission launch <config>` and watch it run as a live task graph, gated on your sign-off; each run finalizes into a typed envelope. For a single turn, `darkmux dispatch <role> "<text>"` sends work to one seat. Before relying on a config, measure it with `darkmux lab run <workload>` (wall clock, compaction events, verify outcome) so your choices rest on numbers, not guesses."#;
+
 fn claude_settings_path() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
     Ok(home.join(".claude").join("settings.json"))
@@ -315,32 +334,9 @@ fn ensure_claude_md_section(target: &Path, dry_run: bool) -> Result<bool> {
 
 fn darkmux_claude_md_section() -> String {
     format!(
-        r#"{header}
-
-# darkmux
-
-This project uses [darkmux](https://github.com/kstrat2001/darkmux) to multiplex local LLM stacks. Three reference profiles are available: `fast`, `balanced`, and `deep`.
-
-## When to swap stacks
-
-- **`fast`** — single-turn tasks (audits, TODO fills, short Q&A). Slim primary, no compactor.
-- **`balanced`** — mid-range tasks. Tuned compaction with a small companion compactor.
-- **`deep`** — long agentic tasks (multi-file refactors, exploratory test authoring). Maximum primary context for fewer compactions.
-
-## Available skills
-
-- `/darkmux-status` — what's currently loaded
-- `/darkmux-list-stacks` — see all available profiles
-- `/darkmux-list-workloads` / `/darkmux-lab-run` — execute lab workloads
-- `/darkmux-list-runs` / `/darkmux-analyze-run` / `/darkmux-compare-runs` — inspect run history
-
-## Dispatch policy
-
-Before starting a long agentic task that may grow context past ~30K tokens, consider swapping to `deep`. Before doing a single-turn audit or short review, consider swapping to `fast` to skip the compactor's idle KV-cache cost. Use `/darkmux-status` to confirm before making the change — swapping is idempotent so a status-matched call is a no-op.
-
-{footer}
-"#,
+        "{header}\n\n{body}\n\n{footer}\n",
         header = CLAUDE_MD_HEADER,
+        body = INTEGRATION_SECTION_BODY,
         footer = CLAUDE_MD_FOOTER,
     )
 }
@@ -377,32 +373,9 @@ fn ensure_agents_md_section(target: &Path, dry_run: bool) -> Result<bool> {
 
 fn darkmux_agents_md_section() -> String {
     format!(
-        r#"{header}
-
-# darkmux
-
-This project uses [darkmux](https://github.com/kstrat2001/darkmux) to multiplex local LLM stacks. Three reference profiles are available: `fast`, `balanced`, and `deep`.
-
-## When to swap stacks
-
-- **`fast`** — single-turn tasks (audits, TODO fills, short Q&A). Slim primary, no compactor.
-- **`balanced`** — mid-range tasks. Tuned compaction with a small companion compactor.
-- **`deep`** — long agentic tasks (multi-file refactors, exploratory test authoring). Maximum primary context for fewer compactions.
-
-## Available skills
-
-- `/darkmux-status` — what's currently loaded
-- `/darkmux-list-stacks` — see all available profiles
-- `/darkmux-list-workloads` / `/darkmux-lab-run` — execute lab workloads
-- `/darkmux-list-runs` / `/darkmux-analyze-run` / `/darkmux-compare-runs` — inspect run history
-
-## Dispatch policy
-
-Before starting a long agentic task that may grow context past ~30K tokens, consider swapping to `deep`. Before doing a single-turn audit or short review, consider swapping to `fast` to skip the compactor's idle KV-cache cost. Use `/darkmux-status` to confirm before making the change — swapping is idempotent so a status-matched call is a no-op.
-
-{footer}
-"#,
+        "{header}\n\n{body}\n\n{footer}\n",
         header = AGENTS_MD_HEADER,
+        body = INTEGRATION_SECTION_BODY,
         footer = AGENTS_MD_FOOTER,
     )
 }
@@ -507,10 +480,28 @@ mod tests {
         let s = darkmux_claude_md_section();
         assert!(s.contains(CLAUDE_MD_HEADER));
         assert!(s.contains(CLAUDE_MD_FOOTER));
+        assert!(s.contains(INTEGRATION_SECTION_BODY));
+    }
+
+    #[test]
+    fn agents_md_section_includes_marker_comments() {
+        let s = darkmux_agents_md_section();
+        assert!(s.contains(AGENTS_MD_HEADER));
+        assert!(s.contains(AGENTS_MD_FOOTER));
+        assert!(s.contains(INTEGRATION_SECTION_BODY));
+    }
+
+    #[test]
+    fn integration_section_body_teaches_current_identity() {
+        // Both templates share this body, so one guard covers both.
+        let s = INTEGRATION_SECTION_BODY;
         assert!(s.contains("/darkmux-status"));
-        assert!(s.contains("fast"));
-        assert!(s.contains("balanced"));
-        assert!(s.contains("deep"));
+        assert!(s.contains("mission orchestrator and lab"));
+        assert!(s.contains("mission launch"));
+        assert!(s.contains("lab run"));
+        // The retired multiplexer/swap identity must not resurface (#1449).
+        assert!(!s.contains("multiplex"));
+        assert!(!s.contains("swap"));
     }
 
     #[test]

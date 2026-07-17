@@ -28,7 +28,7 @@ use std::time::Duration;
 /// (post-#1341, dependency edges are derived from `Task::depends_on`, not a
 /// `Step::depends_on` that no longer exists). `pub` (#1402) so the root
 /// `darkmux` binary crate can pin `mission_step_kind_display_name`'s static
-/// `mission.*` table against `src/mission_run.rs`'s live `StepKind::
+/// `mission.*` table against `src/coder_phase.rs`'s live `StepKind::
 /// display_name()` impls — see that constant's own doc for why the table
 /// can't be verified from THIS crate (the dependency edge runs the other
 /// way).
@@ -955,7 +955,7 @@ pub fn worktree_contained(
 /// across the two lexicographically last `.jsonl` day files, and extract
 /// payload.worktree/base/branch. (#1230 Packet 4: migrated off the retired
 /// `mission.run.start` action — the worktree step now emits this generic
-/// `"step result"` companion record instead; see `mission_run.rs`'s
+/// `"step result"` companion record instead; see `coder_phase.rs`'s
 /// `emit_step_result` doc.)
 pub fn resolve_session(
     session_id: &str,
@@ -1290,7 +1290,10 @@ async fn mission_graph_html() -> impl IntoResponse {
 /// otherwise always `200` — a mission with phases but no task/step graph
 /// still returns a (phases-only) graph with `legacy: true` + a `note`,
 /// never an error (item 6).
-async fn mission_graph_json_handler(Path(id): Path<String>) -> axum::response::Response {
+async fn mission_graph_json_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
     if !is_valid_catalog_id(&id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1299,8 +1302,14 @@ async fn mission_graph_json_handler(Path(id): Path<String>) -> axum::response::R
             .into_response();
     }
     let id_owned = id.clone();
-    let result =
-        tokio::task::spawn_blocking(move || mission_graph::build_mission_graph(&id_owned)).await;
+    // (#1432 item 4) The flow-record backfill folds completed steps' finalized
+    // token/turn totals into graph.json at page load — read from the daemon's
+    // flows_dir once, off the async runtime.
+    let flows_dir = state.flows_dir.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        mission_graph::build_mission_graph(&id_owned, &flows_dir)
+    })
+    .await;
     match result {
         Ok(Ok(Some(graph))) => axum::Json(graph).into_response(),
         Ok(Ok(None)) => (

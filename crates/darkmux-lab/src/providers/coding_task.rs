@@ -218,7 +218,6 @@ impl WorkloadProvider for CodingTaskProvider {
         sandbox_dir: &Path,
         profile: &Profile,
         profile_name: &str,
-        runtime: darkmux_crew::dispatch::Runtime,
         config_path: Option<&str>,
         loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
     ) -> Result<RunResult> {
@@ -227,20 +226,20 @@ impl WorkloadProvider for CodingTaskProvider {
         // a superset of the old primary-only check here), so it isn't
         // repeated per provider — a coding-task run warns once, not twice.
 
-        // `Runtime` has a single variant post-#1405 — the internal runtime
-        // mounts sandbox_dir at /workspace in the container, so the prompt
-        // substitutes the container-side path.
-        let darkmux_crew::dispatch::Runtime::Internal = runtime;
+        // The internal runtime mounts sandbox_dir at /workspace in the
+        // container, so the prompt substitutes the container-side path.
         let raw_prompt = resolve_prompt(loaded)?;
         let prompt = expand_placeholders_with(&raw_prompt, "/workspace");
         let role = pick_role(loaded);
-        let session_id = format!(
-            "darkmux-coding-{}-{}",
-            loaded.manifest.workload.id,
-            SystemTime::now()
+        // (#1436) Through the canonical session-id helper; byte-identical shape.
+        let session_id = darkmux_types::session_id::session_id(
+            "darkmux-coding",
+            &loaded.manifest.workload.id,
+            &SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0)
+                .to_string(),
         );
 
         // (#421) Pre-dispatch workspace snapshot. Pure observability:
@@ -782,18 +781,16 @@ fn dispatch_via_internal(
     image: Option<&str>,
     config_path: Option<&str>,
 ) -> Result<(String, String, bool, Option<PathBuf>)> {
-    use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
+    use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
         role_id: role_id.to_string(),
         message: prompt.to_string(),
-        deliver: None,
         session_id: Some(session_id.to_string()),
         timeout_seconds: 3600,
         skip_preflight: false,
         json: true,
         workdir,
         phase_id: None,
-        runtime: Runtime::Internal,
         machine: None,
         wait: true,
         compaction,

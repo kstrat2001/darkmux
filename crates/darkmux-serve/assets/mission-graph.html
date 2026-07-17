@@ -92,20 +92,13 @@
   .mnode.s-error{border-color:var(--bad)}
   .mnode.s-error .mn-label{color:var(--bad)}
   .mnode.s-abandoned{border-color:var(--muted);opacity:.6}
-  /* (#1401) Step ROWS inside a task node's card — replaces the former
-     separate step-node styling above. Each row is kind label + a status
-     dot; a running row's dot pulses (same @keyframes lpulse the top-level
-     livepill/node-corner indicators already use). */
-  .mnode .mn-steps{margin-top:6px;padding-top:6px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:4px}
-  .mnode .mn-step-row{display:flex;align-items:center;gap:6px;font:11px/1.3 'JetBrains Mono',monospace;color:var(--muted)}
-  .mnode .mn-step-row .mn-step-dot{display:inline-block;flex:0 0 auto;width:6px;height:6px;border-radius:50%;background:var(--line)}
-  .mnode .mn-step-row .mn-step-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .mnode .mn-step-row.s-running .mn-step-dot{background:var(--run);animation:lpulse 1.1s ease-in-out infinite}
-  .mnode .mn-step-row.s-running .mn-step-label{color:var(--run)}
-  .mnode .mn-step-row.s-complete .mn-step-dot{background:var(--good)}
-  .mnode .mn-step-row.s-error .mn-step-dot{background:var(--bad)}
-  .mnode .mn-step-row.s-error .mn-step-label{color:var(--bad)}
-  .mnode .mn-step-row.s-abandoned .mn-step-dot{background:var(--muted);opacity:.6}
+  /* (#1401/#1432 item 6) Step ROWS inside a task node's card. The row
+     STRUCTURE (hollow ring + tree rail + muted-caps kind lead) is the
+     shared `.steprow` Concept A block below — used by BOTH this canvas node
+     and the mobile timeline so the sub-item vocabulary is one. This just
+     sizes the container; the canvas node's tighter 260px width shrinks the
+     lead column via the `.mnode` override in the shared block. */
+  .mnode .mn-steps{margin-top:6px;padding-top:6px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:2px}
   .react-flow__edge-path{stroke:var(--muted)}
   .react-flow__edge.edge-depends_on .react-flow__edge-path{stroke:var(--amber-dim);stroke-width:1.6}
   .react-flow__edge.edge-contains .react-flow__edge-path{stroke:var(--line);stroke-dasharray:3 3}
@@ -133,7 +126,42 @@
   .mn-step-meter .tok{color:var(--amber)}
   .mn-step-meter .tok.cloud{color:var(--warn)}
   .mn-step-meter .idle{opacity:.45}
-  .mnode .mn-step-row{gap:6px}
+
+  /* (#1432 item 6) Concept A step hierarchy — SHARED by both renderers (the
+     canvas `.mn-steps` and the timeline `.tlt-steps`). A step reads as a
+     sub-item INSIDE its task via three stacked signals: (1) a hollow OUTLINE
+     ring, vs the task's FILLED dot — border-color carries status; (2) a drawn
+     tree connector rail down the ring column, clipped to a half-height on the
+     first/last row so the line begins/ends at the outer rings; (3) a
+     muted-caps kind lead label (the #1410 display names — PROBE / JUDGE /
+     VERIFY / …), whose vocabulary itself signals "this is a step". Concept C
+     (rings + lead, no rail) is one rule away — deleting the `::before`/
+     `::after` rail rules leaves a valid downgrade on the same markup. */
+  .steprow{position:relative;display:flex;align-items:center;gap:8px;padding:5px 0 5px 32px;
+    font:11px/1.3 'JetBrains Mono',monospace;color:var(--muted)}
+  .steprow::before{content:"";position:absolute;left:9px;top:0;bottom:0;width:1px;background:var(--amber-dim);opacity:.5}
+  .steprow:first-child::before{top:50%}
+  .steprow:last-child::before{bottom:50%}
+  .steprow::after{content:"";position:absolute;left:9px;top:50%;width:8px;height:1px;background:var(--amber-dim);opacity:.5}
+  .steprow .sring{position:absolute;left:17px;top:50%;transform:translateY(-50%);width:9px;height:9px;
+    border-radius:50%;border:1.5px solid var(--muted);background:var(--bg2);box-sizing:border-box}
+  .steprow.s-running .sring{border-color:var(--run);animation:lpulse 1.1s ease-in-out infinite}
+  .steprow.s-complete .sring{border-color:var(--good)}
+  .steprow.s-error .sring{border-color:var(--bad)}
+  .steprow.s-abandoned .sring{border-color:var(--muted);opacity:.55}
+  .steprow .slead{flex:0 0 auto;font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.09em;
+    text-transform:uppercase;color:var(--muted);min-width:58px;max-width:110px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .steprow .sname{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .steprow.s-running .sname{color:var(--run)}
+  .steprow.s-error .sname{color:var(--bad)}
+  .steprow .mn-step-meter{margin-left:auto}
+  /* Canvas node is a tight 260px card — shrink the lead column so the step
+     name still gets room (the rail/rings survive the narrower column). */
+  .mnode .steprow{padding-left:30px}
+  .mnode .steprow::before,.mnode .steprow::after{left:8px}
+  .mnode .steprow .sring{left:15px}
+  .mnode .steprow .slead{min-width:50px}
 
   /* (#1403) Mission-scoped events panel — a right-side rail on desktop, a
      bottom sheet on phones. Newest first, this mission's flow records only. */
@@ -174,7 +202,14 @@
   .tlphase .tlph-hd .tlph-tag{margin-left:auto;font:10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
   .tltasks{display:flex;flex-direction:column;gap:8px;padding:10px}
   .tltask{border:1px solid var(--line);border-radius:7px;background:var(--panel);overflow:hidden}
-  .tltask .tlt-hd{display:flex;align-items:center;gap:8px;padding:10px 11px;cursor:pointer;min-height:44px}
+  /* (#1432 item 5) Fixed grid for the collapsed task row — dot | title |
+     count | meter | chevron — so the meter + chevron pin to consistent
+     columns instead of drifting with the title's length (the old two
+     `margin-left:auto` flow layout floated the "· tok" meter at a different
+     offset per title). Every cell is ALWAYS rendered (the count + meter
+     cells are empty spans when they have nothing) so the five grid tracks
+     never shift out from under each other. */
+  .tltask .tlt-hd{display:grid;grid-template-columns:auto 1fr auto auto auto;align-items:center;gap:9px;padding:10px 11px;cursor:pointer;min-height:44px}
   .tltask .tlt-hd .tlt-dot{flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:var(--line)}
   .tltask.s-running{border-color:var(--run)}
   .tltask.s-running .tlt-dot{background:var(--run);animation:lpulse 1.1s ease-in-out infinite}
@@ -184,18 +219,20 @@
   .tltask.s-error{border-color:var(--bad)}
   .tltask.s-error .tlt-dot{background:var(--bad)}
   .tltask.s-abandoned{opacity:.6}
-  .tltask .tlt-name{font:600 12px/1.3 'JetBrains Mono',monospace;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .tltask .tlt-chev{margin-left:auto;flex:0 0 auto;color:var(--muted);font-size:11px;transition:transform .15s}
+  .tltask .tlt-name{font:600 12px/1.3 'JetBrains Mono',monospace;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  /* (#1432 item 6) Collapsed step count — "N steps" is visible BEFORE any
+     tap, so the presence of expandable sub-items is announced. Hidden while
+     the card is open (the steps themselves are then on screen). */
+  .tltask .tlt-count{font:10px/1 'JetBrains Mono',monospace;color:var(--muted);white-space:nowrap}
+  .tltask .tlt-hd .tlt-meter-cell{display:inline-flex;min-width:0}
+  .tltask .tlt-hd .tlt-meter-cell .mn-step-meter{margin-left:0}
+  .tltask .tlt-chev{flex:0 0 auto;color:var(--muted);font-size:11px;transition:transform .15s}
   .tltask.open .tlt-chev{transform:rotate(90deg)}
   .tltask .tlt-waits{padding:0 11px 8px;font:10px/1.3 'JetBrains Mono',monospace;color:var(--muted)}
-  .tltask .tlt-steps{border-top:1px solid var(--line);padding:8px 11px;display:flex;flex-direction:column;gap:7px}
-  .tltask .tlt-step{display:flex;align-items:center;gap:7px;font:11px/1.3 'JetBrains Mono',monospace;color:var(--muted)}
-  .tltask .tlt-step .tlt-sdot{flex:0 0 auto;width:6px;height:6px;border-radius:50%;background:var(--line)}
-  .tltask .tlt-step.s-running .tlt-sdot{background:var(--run);animation:lpulse 1.1s ease-in-out infinite}
-  .tltask .tlt-step.s-running{color:var(--run)}
-  .tltask .tlt-step.s-complete .tlt-sdot{background:var(--good)}
-  .tltask .tlt-step.s-error .tlt-sdot{background:var(--bad)}
-  .tltask .tlt-step .tlt-slabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* Step region + rows: the shared `.steprow` Concept A block (rings + rail +
+     kind lead) styles the rows; this just sizes the container. */
+  .tltask .tlt-steps{border-top:1px solid var(--line);padding:8px 11px;display:flex;flex-direction:column;gap:2px}
+  .tltask .tlt-empty{padding:5px 2px;font:11px/1.3 'JetBrains Mono',monospace;color:var(--muted)}
   .tlnote{padding:14px;color:var(--muted);font:12px/1.4 'Inter',sans-serif;background:var(--panel);border:1px solid var(--line);border-radius:6px;margin:12px}
 
   /* (#1404) Compact single-line header on phones — the desktop header wrapped
@@ -205,6 +242,37 @@
   .legendpop{position:absolute;top:44px;right:8px;z-index:30;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;display:none;flex-direction:column;gap:6px}
   .legendpop.on{display:flex}
   .legbtn{display:none}
+
+  /* (#1432 item 1) Timeline renderer -> document scroll. The base shell locks
+     the page to a 100vh viewport with `overflow:hidden` because the React
+     Flow canvas needs a fixed-height pan surface. On a phone the vertical
+     timeline REPLACES that canvas, and the lock clips the list so it cannot
+     scroll at all (a nested-flex `overflow-y:auto` child is unreliable on
+     iOS). Release the lock for the TIMELINE BRANCH ONLY — keyed on the
+     `timeline-mode` class the app stamps on <html> when the timeline
+     renders — so the page flows in the document and scrolls natively. The
+     canvas branch keeps the untouched locked viewport. The header sticks so
+     the in-site nav (the only way out of a chromeless home-screen shortcut)
+     stays reachable while scrolling. Same overflow-escape shape as the main
+     viewer's machine/lab modes. Deleting these rules is the Concept-C-style
+     graceful fallback: the timeline then relies on its inner scroll again. */
+  html.timeline-mode,html.timeline-mode body{height:auto;min-height:100vh;overflow:visible}
+  html.timeline-mode #root{height:auto;min-height:100vh}
+  html.timeline-mode .top{position:sticky;top:0;z-index:40}
+  html.timeline-mode .timeline{overflow:visible}
+  /* (#1432·1 consider) With the document scrolling, a flex-child events
+     panel would scroll away with the page — pin the open panel to the
+     viewport as a fixed bottom sheet instead (it already IS a bottom sheet
+     below the breakpoint; this keeps it one at any width while the timeline
+     renders). The timeline's tall bottom padding keeps the last card
+     reachable above it. */
+  html.timeline-mode .evpanel{position:fixed;left:0;right:0;bottom:0;z-index:45;
+    max-height:45vh;border-left:none;border-top:1px solid var(--line)}
+  /* Only pad the list past the sheet while the sheet is actually open
+     (`:has` — degrades to the base 40px padding on engines without it,
+     where the open sheet may cover the last card until closed). */
+  html.timeline-mode .body:has(.evpanel) .timeline{padding-bottom:48vh}
+
   @media (max-width:700px){
     html,body{overflow:hidden}
     .top{gap:8px;padding:0 10px}
@@ -308,9 +376,10 @@ function computeLayout(nodes){
 }
 
 // ─── node component ─────────────────────────────────────────────────────
-// (#1401) A task node renders its OWN steps as rows — kind display label
-// (server-resolved via the fallback chain — #1402) + a status dot; a
-// running row's dot pulses via the `.mn-step-row.s-running` CSS rule. A
+// (#1401) A task node renders its OWN steps as rows — kind lead label
+// (server-resolved via the fallback chain — #1402) + a hollow status ring;
+// a running row's ring pulses via the shared `.steprow.s-running` CSS rule
+// (#1432 item 6 — the old `.mn-step-row` dot styling retired with it). A
 // phase node has no `steps` array (empty), so `mnSteps` is a no-op for it.
 // (#1403) A per-step token/turn meter element from the step's precomputed
 // `_meter` (attached in `toRfNodes`). Shared by the canvas node and — via the
@@ -340,14 +409,39 @@ function stepMeterFor(step, metrics){
   return { show: show, tokens: d.tokens, turns: d.turns, cloud: d.cloud };
 }
 
+// (#1432 item 6) The muted-caps kind LEAD for a step row — the #1410 display
+// name for the step's kind ("Probe"/"Judge"/"Verify"/…, uppercased by CSS).
+// This vocabulary is the signal that a row is a STEP inside its task.
+function stepLead(s){ return s.label || s.kind || "step"; }
+// A step's distinguishing NAME, shown after the lead. A probe seat rides in
+// the kind as `review.probe:<seat>`; surfacing the seat here is what tells six
+// otherwise-identical "Probe" rows apart. No `:` suffix -> the lead stands
+// alone (a judge/verify/bundle step needs no second token).
+function stepSeat(kind){
+  if (!kind) return "";
+  var i = kind.lastIndexOf(":");
+  return i >= 0 ? kind.slice(i + 1) : "";
+}
+// (#1432 item 6) One step row's children, Concept A shape, shared by BOTH
+// renderers so the sub-item vocabulary (hollow ring + kind lead + name) is
+// identical on the canvas node and the mobile timeline. The rail is pure CSS
+// (`.steprow::before/::after`), so it needs no element here.
+function stepRowEls(s, meter){
+  var seat = stepSeat(s.kind);
+  return [
+    h("span", {key:"r", className:"sring"}),
+    h("span", {key:"l", className:"slead"}, stepLead(s)),
+    seat ? h("span", {key:"n", className:"sname"}, seat) : null,
+    stepMeterEl(meter)
+  ];
+}
+
 function MissionNode(props){
   var d = props.data;
   var mnSteps = (d.steps && d.steps.length)
     ? h("div", {className:"mn-steps"}, d.steps.map(function(s){
-        return h("div", {key: s.id, className: "mn-step-row s-" + s.status, title: s.label},
-          h("span", {className:"mn-step-dot"}),
-          h("span", {className:"mn-step-label"}, s.label),
-          stepMeterEl(s._meter)
+        return h("div", {key: s.id, className: "steprow mn-step-row s-" + s.status, title: s.label},
+          stepRowEls(s, s._meter)
         );
       }))
     : null;
@@ -491,16 +585,19 @@ function indexGraph(g){
   var stepIds = new Set();
   var taskIds = new Set();
   var phaseIds = new Set();
-  var sessionToStep = {};   // "step:<stepId>" -> stepId (dispatch.internal default session)
+  var sessionToStep = {};   // "step-<stepId>" -> stepId (dispatch.internal default session)
   var sessions = new Set();  // every session id a mission record could carry
+  // (#1436) Session ids are hyphen-delimited: `task-<id>` / `step-<id>` (the
+  // pre-2.0 colon forms `task:`/`step:` retired in lockstep with their Rust
+  // producers — scheduler.rs / step_kinds/builtins.rs).
   g.nodes.forEach(function(n){
     if (n.kind === "phase") phaseIds.add(n.id);
-    if (n.kind === "task") { taskIds.add(n.id); sessions.add("task:" + n.id); }
+    if (n.kind === "task") { taskIds.add(n.id); sessions.add("task-" + n.id); }
     (n.steps || []).forEach(function(s){
       stepToTask[s.id] = n.id;
       stepIds.add(s.id);
-      sessionToStep["step:" + s.id] = s.id;
-      sessions.add("step:" + s.id);
+      sessionToStep["step-" + s.id] = s.id;
+      sessions.add("step-" + s.id);
     });
   });
   return { nodeIds: nodeIds, stepToTask: stepToTask, stepIds: stepIds,
@@ -514,7 +611,7 @@ function indexGraph(g){
 //   1. a `"step result"` record's `payload.step_id` (review.* + mission.coder/
 //      verify use this — their `handle` is the crew/`"mission-run"` label, not
 //      the step id);
-//   2. a dispatch record whose `session_id` is the `step:<id>` default a
+//   2. a dispatch record whose `session_id` is the `step-<id>` default a
 //      `dispatch.internal` step sets (the live per-turn token/turn climb);
 //   3. `handle === stepId` (the scheduler's step-lifecycle records + a hosted
 //      single-shot `"step result"`).
@@ -550,19 +647,53 @@ function applyRecordToMetrics(metrics, rec, idx){
   var isComplete = action === "dispatch complete" || action === "dispatch.complete";
   var isStepResult = action === "step result";
   if (p.endpoint) next.cloud = true;
+  // (#1445 gate) Finalized token totals read `total_tokens` first, falling
+  // back to `tokens` — the review vocabulary's probe/judge/verify step
+  // results carry `tokens`, never `total_tokens`, and without the fallback
+  // the most-viewed mission kind's meters never fill. Same precedence as
+  // the server-side fold (`mission_graph.rs::fold_step_finals`).
+  var finalTok = p.total_tokens || p.tokens || 0;
   if (isTok) { next.tokRun += (p.total_tokens || 0); }
   else if (isTurn) { next.turnRun += 1; }
   else if (isComplete) {
-    if (p.total_tokens) next.tokFinal = Math.max(next.tokFinal, p.total_tokens);
+    if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
     if (p.total_turns) next.turnFinal = Math.max(next.turnFinal, p.total_turns);
   } else if (isStepResult) {
-    if (p.total_tokens) next.tokFinal = Math.max(next.tokFinal, p.total_tokens);
+    if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
   }
   if (next.tokRun === cur.tokRun && next.tokFinal === cur.tokFinal
       && next.turnRun === cur.turnRun && next.turnFinal === cur.turnFinal
       && next.cloud === cur.cloud) return metrics;
   var out = Object.assign({}, metrics);
   out[sid] = next;
+  return out;
+}
+// (#1432 item 4) Seed the per-step metric accumulator from the finalized
+// totals the SERVER folded into graph.json (`tokensFinal`/`turnsFinal`/
+// `cloud` on each step row). SSE is tail-from-now, so a page opened after a
+// step's dispatch closed would otherwise show a blank meter; this backfills
+// its `tokFinal`/`turnFinal` so the meter reads the real total immediately.
+// Merges into whatever's already there (taking the max), so a live SSE value
+// already climbing is never regressed, and a reconcile re-applying the same
+// backfill is idempotent. Returns the SAME object when nothing changed, so it
+// never churns React state.
+function seedMetricsFromGraph(metrics, g){
+  var out = metrics;
+  (g && g.nodes || []).forEach(function(n){
+    (n.steps || []).forEach(function(s){
+      var tf = (typeof s.tokensFinal === "number") ? s.tokensFinal : 0;
+      var nf = (typeof s.turnsFinal === "number") ? s.turnsFinal : 0;
+      var cl = !!s.cloud;
+      if (!tf && !nf && !cl) return;
+      var cur = out[s.id] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, cloud:false };
+      var ntf = Math.max(cur.tokFinal, tf);
+      var nnf = Math.max(cur.turnFinal, nf);
+      var ncl = cur.cloud || cl;
+      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncl === cur.cloud) return;
+      if (out === metrics) out = Object.assign({}, metrics);
+      out[s.id] = Object.assign({}, cur, { tokFinal:ntf, turnFinal:nnf, cloud:ncl });
+    });
+  });
   return out;
 }
 // The number a step row shows: the finalized total when the dispatch closed,
@@ -612,6 +743,13 @@ var EVENTS_CAP = 250;
 // would show the mobile header chrome with the desktop canvas at 700px even.
 function isNarrowViewport(){
   return typeof window !== "undefined" && window.innerWidth <= 700;
+}
+// (#1404/#1432) THE renderer decision, in one place: the timeline renders
+// when manually selected, or in "auto" below the breakpoint. Both the
+// render branch and the timeline-mode <html> class effect call this — the
+// two must never drift (the CSS overflow escape keys on the class).
+function timelineActive(viewMode, isMobile){
+  return viewMode === "timeline" || (viewMode === "auto" && isMobile);
 }
 
 // ─── (#1404) Mobile vertical-timeline renderer (plain DOM, no React Flow) ──
@@ -674,25 +812,34 @@ function renderMissionTimeline(g, metrics, expanded, toggleTask){
         var open = !!expanded[task.id];
         var deps = waitsOn[task.id] || [];
         var agg = taskAggMetrics(task, metrics);
+        // (#1432 item 6) Collapsed step count — "N steps" announces the
+        // expandable sub-items before any tap; hidden once open (steps show).
+        var stepCount = (task.steps || []).length;
+        var countEl = (!open && stepCount > 0)
+          ? h("span", {className:"tlt-count"}, stepCount + (stepCount === 1 ? " step" : " steps"))
+          : h("span", {className:"tlt-count"});
         return h("div", {key: task.id, className: "tltask s-" + task.status + (open ? " open" : "")},
+          // (#1432 item 5) Grid cells in fixed column order: dot | name |
+          // count | meter | chevron. The count + meter cells are ALWAYS
+          // present (empty spans when they carry nothing) so the five grid
+          // tracks never shift and the meter/chevron stop drifting.
           h("div", {className:"tlt-hd", role:"button", tabIndex:0,
                     onClick: function(){ toggleTask(task.id); },
                     onKeyDown: function(ev){ if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggleTask(task.id); } }},
             h("span", {className:"tlt-dot"}),
             h("span", {className:"tlt-name", title: task.description || task.label}, task.label),
-            stepMeterEl(agg),
+            countEl,
+            h("span", {className:"tlt-meter-cell"}, stepMeterEl(agg)),
             h("span", {className:"tlt-chev"}, "▸")
           ),
           deps.length ? h("div", {className:"tlt-waits"}, "waits on: " + deps.join(", ")) : null,
           open ? h("div", {className:"tlt-steps"}, (task.steps || []).length
             ? task.steps.map(function(s){
-                return h("div", {key: s.id, className: "tlt-step s-" + s.status},
-                  h("span", {className:"tlt-sdot"}),
-                  h("span", {className:"tlt-slabel", title: s.label}, s.label),
-                  stepMeterEl(stepMeterFor(s, metrics))
+                return h("div", {key: s.id, className: "steprow tlt-step s-" + s.status, title: s.label},
+                  stepRowEls(s, stepMeterFor(s, metrics))
                 );
               })
-            : h("div", {className:"tlt-step"}, h("span", {className:"tlt-slabel"}, "no steps"))) : null
+            : h("div", {className:"tlt-empty"}, "no steps")) : null
         );
       }) : h("div", {className:"tlt-waits", style:{padding:"6px 4px"}}, "no tasks in this phase"))
     ));
@@ -769,6 +916,9 @@ function App(){
     fetchGraph().then(function(g){
       if (cancelled) return;
       idxRef.current = indexGraph(g);
+      // (#1432 item 4) Seed the meters from the server's finalized backfill
+      // BEFORE the SSE stream (which only carries deltas from now on) starts.
+      setMetrics(function(prev){ return seedMetricsFromGraph(prev, g); });
       setState({loading:false, error:null, graph:g});
     }).catch(function(e){
       if (cancelled) return;
@@ -776,6 +926,17 @@ function App(){
     });
     return function(){ cancelled = true; };
   }, [missionId]);
+
+  // (#1432 item 1) Reflect the active renderer onto <html> so the CSS can
+  // release the locked 100vh viewport for the TIMELINE branch (which needs
+  // the document to scroll — the canvas branch keeps the lock). Mirrors the
+  // `useTimeline` decision the render below makes.
+  React.useEffect(function(){
+    var timeline = timelineActive(viewMode, isMobile);
+    var root = document.documentElement;
+    if (root) root.classList.toggle("timeline-mode", timeline);
+    return function(){ if (root) root.classList.remove("timeline-mode"); };
+  }, [viewMode, isMobile]);
 
   // (#1404) Track the viewport-width breakpoint so the renderer switches
   // between the React Flow canvas (wide) and the vertical timeline (narrow).
@@ -877,6 +1038,10 @@ function App(){
       if (todayUtc() !== sseDate) openStream();
       fetchGraph().then(function(g){
         idxRef.current = indexGraph(g);
+        // (#1432 item 4) The reconcile also refolds the server backfill — a
+        // step that completed while the tab was open (and whose SSE delta an
+        // intervening reconnect may have missed) then still shows its total.
+        setMetrics(function(prev){ return seedMetricsFromGraph(prev, g); });
         setState(function(prev){
           if (!prev.graph) return prev;
           return Object.assign({}, prev, {graph: mergeGraphs(prev.graph, g)});
@@ -896,7 +1061,7 @@ function App(){
   var g = state.graph;
   // (#1404) One data source, two renderers. Timeline is the narrow-viewport
   // default (viewMode "auto" + mobile) and available anywhere via the toggle.
-  var useTimeline = viewMode === "timeline" || (viewMode === "auto" && isMobile);
+  var useTimeline = timelineActive(viewMode, isMobile);
   var tot = missionTotals(metrics);
 
   var body;
@@ -964,6 +1129,7 @@ root.render(h(App));
 // the browser console during manual verification (not a formal test hook).
 window.__missionGraphComputeLayout = computeLayout;
 window.__missionGraphMergeGraphs = mergeGraphs;
+window.__missionGraphSeedMetricsFromGraph = seedMetricsFromGraph;
 })();
 </script>
 </body>

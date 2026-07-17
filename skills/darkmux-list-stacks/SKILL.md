@@ -1,6 +1,6 @@
 ---
 name: darkmux-list-stacks
-description: List the darkmux profiles (stacks) available in the registry — names, descriptions, model counts, context lengths. Use this to discover the stack names available to run a dispatch against. The default stack is marked.
+description: List the profiles (stacks) available in the darkmux registry — names, descriptions, model counts, context lengths. Use this to discover the stack names available to run a dispatch against. The default stack is marked.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*)"
 ---

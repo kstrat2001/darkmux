@@ -231,15 +231,15 @@ pub(crate) trait WorkloadProvider: Send + Sync {
     fn description(&self) -> &'static str;
     fn setup(&self, loaded: &LoadedWorkload, run_dir: &Path, sandbox_dir: &Path) -> Result<()>;
     /// Run the workload through darkmux's in-house container-bounded
-    /// runtime. `runtime` is a single-variant type post-#1405 (the legacy
-    /// `openclaw` shell-out runtime was removed) — kept in the signature
-    /// for the provenance it threads through, not because implementers
-    /// branch on it.
+    /// runtime, the only dispatch path (#1405). The former `runtime`
+    /// parameter (a single-variant enum) retired in #1426 ship-3 along with
+    /// the enum itself; there is only one runtime, so the trait no longer
+    /// threads it.
     ///
-    /// Argument count exceeds clippy's default threshold (8 vs 7); the
-    /// trait shape mirrors the dispatch contract closely (profile and
-    /// runtime are inherent to a dispatch). A `RunContext` struct is a
-    /// candidate cleanup but out of scope here.
+    /// Argument count exceeds clippy's default threshold; the trait shape
+    /// mirrors the dispatch contract closely (the profile is inherent to a
+    /// dispatch). A `RunContext` struct is a candidate cleanup but out of
+    /// scope here.
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
@@ -248,7 +248,6 @@ pub(crate) trait WorkloadProvider: Send + Sync {
         sandbox_dir: &Path,
         profile: &Profile,
         profile_name: &str,
-        runtime: darkmux_crew::dispatch::Runtime,
         // (#984) The `--profiles-file` the dispatch's model + context-window
         // resolution must load from, so a lab `--profiles-file` actually
         // reaches the dispatch (not just lab run's own profile lookup).

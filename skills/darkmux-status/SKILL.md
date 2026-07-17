@@ -1,6 +1,6 @@
 ---
 name: darkmux-status
-description: Quick check of what local LLM configuration is currently loaded — which models, which context lengths, and which darkmux profile (if any) it matches. Run this when you need to decide whether to swap stacks before a task, or to confirm a swap took effect.
+description: Quick check of what local LLM configuration is currently loaded — which models, which context lengths, and which darkmux profile (if any) it matches. Run this before dispatching a task to see what is resident, or to confirm what a dispatch left loaded.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*)"
 ---

@@ -1,5 +1,5 @@
     use super::*;
-    use crew::types::{Phase, PhaseStatus};
+    use crew::types::{NodeStatus, Phase, PhaseStatus, Task};
 
     /// (#1402) `darkmux-serve`'s `mission_graph::mission_step_kind_display_name`
     /// is a STATIC literal table (that crate can't depend on this root
@@ -220,6 +220,56 @@
 
         // Empty lessons → no block.
         assert!(!coder_brief(&s, &m, &[], &corrections, &cautions).contains("<lessons>"));
+    }
+
+    /// (#1256 frozen-text / #1426 ship-4) GOLDEN: the FULLY-ASSEMBLED coder
+    /// brief with the operator source-input and ALL THREE injected blocks
+    /// populated, byte-locked. The launch coder-phase path is now the ONLY
+    /// producer of this model-facing text; per the frozen-model-facing-text
+    /// contract, "frozen" means one hash — a drive-by rewording of any block's
+    /// framing (or a lost block, the class of the retired-verb collapse's
+    /// near-miss) fails here, not in production dispatches.
+    #[test]
+    fn coder_brief_fully_assembled_matches_the_golden_byte_for_byte() {
+        let m = {
+            let mut m = mission("m-golden", "improve the widget pipeline");
+            m.source_input = Some("Original operator request: make widgets faster.".to_string());
+            m
+        };
+        let p = phase("s1", "m-golden", PhaseStatus::Running);
+        let brief = coder_brief(
+            &p,
+            &m,
+            &["Always run the linter — CI enforces it.".to_string()],
+            &["Do not rename the config field — downstream parses it.".to_string()],
+            &["edit loop detected on src/widget.rs in an earlier dispatch".to_string()],
+        );
+        let golden = r#"desc s1
+
+<operator-source-input>
+The user's original, unabridged request that produced this phase. The summary above is derived from it; where this text adds constraints, exact strings, or scope limits beyond the summary, THIS text is authoritative.
+
+Original operator request: make widgets faster.
+</operator-source-input>
+
+<lessons>
+The user recorded these conventions and decisions for this codebase — the rules the team actually follows and the reasoning behind them. Treat them as authoritative: follow them, and prefer them over a generic default when they conflict. If one is clearly stale against the current code, say so in your final message rather than silently ignoring it:
+
+Always run the linter — CI enforces it.
+</lessons>
+
+<prior-adjudication-corrections>
+The user's reviewer recorded these corrections while reviewing earlier dispatches in this mission. Treat each as a finding from an earlier context, not a fact about your current workspace. If a correction names a concrete change (a renamed field, a config key, a command, an exact string), check it against the code or by running the command it names, and apply it if it holds. If it names a diagnosis (a race condition, a broken invariant, a failing test), reproduce the specific claim before changing anything: run the test or trace the code path it names. If a correction does not hold against your current workspace, say so in your final message and re-diagnose; if re-diagnosis does not converge quickly, surface the blocker and stop rather than looping:
+
+- Do not rename the config field — downstream parses it.
+</prior-adjudication-corrections>
+
+<detected-cautions>
+darkmux's loop detectors flagged these patterns in earlier dispatches in this mission — repeated tool calls, looping reasoning, tool-failure cascades. They are signals from earlier contexts, not facts about your current workspace: a pattern that fired earlier may be irrelevant now. Use them to avoid walking back into a known dead end — if you notice yourself about to repeat one, stop and change your approach. None of these is a required action:
+
+edit loop detected on src/widget.rs in an earlier dispatch
+</detected-cautions>"#;
+        assert_eq!(brief, golden, "the assembled coder brief is frozen model-facing text (#1256)");
     }
 
     /// (#994) `engagement_lessons` reads the lessons.db store and formats
@@ -768,6 +818,15 @@
                     && r.get("mission_id").and_then(|v| v.as_str()) == Some("m-x")
                 {
                     found = true;
+                    // (#1436) The prompt joins the mission's lifecycle session
+                    // bucket under the canonical HYPHEN form — the colon form
+                    // (`mission:m-x`) is retired; a regression to it splits the
+                    // viewer's session grouping between close and debrief.
+                    assert_eq!(
+                        r.get("session_id").and_then(|v| v.as_str()),
+                        Some("mission-m-x"),
+                        "debrief prompt must carry the canonical hyphen session id"
+                    );
                 }
             }
         }
@@ -833,8 +892,10 @@
 
     /// A no-assignment Task fixture for `StepKind::run` tests that don't
     /// exercise Task-sourced `role_id`/`profile_name`/`workdir`/`image`
-    /// (#1230/#1341) — `default_phase_graph_has_the_expected_shape` covers
-    /// the real assignment-carrying shape.
+    /// (#1230/#1341) — the assignment-carrying coder-phase graph shape is now
+    /// covered by `darkmux-crew`'s `mission_config` interpret tests (which
+    /// materialize the built-in `coder-phase.json` and assert the
+    /// `mission.worktree`/`mission.coder`/`mission.verify` kinds).
     fn test_task(id: &str) -> Task {
         Task {
             id: id.to_string(),
@@ -1178,105 +1239,12 @@
 
     // ─── (#1230 Packet 3) Task/Step graph migration ─────────────────────
 
-    #[test]
-    fn default_phase_graph_has_the_expected_shape() {
-        let wt_path = std::path::Path::new("/tmp/wt-s1");
-        let (tasks, steps) = default_phase_graph("s1", "coder", wt_path, None).expect("built-in coder-phase config interprets cleanly");
-
-        assert_eq!(tasks.len(), 3, "worktree, coder, verify — one Task each");
-        for t in &tasks {
-            assert_eq!(t.phase_id, "s1");
-            assert_eq!(t.step_ids.len(), 1, "each Task holds exactly one Step");
-        }
-
-        assert_eq!(steps.len(), 3);
-        let worktree = &steps["s1-worktree-step"];
-        let coder = &steps["s1-coder-step"];
-        let verify = &steps["s1-verify-step"];
-
-        assert_eq!(worktree.kind, "mission.worktree");
-        assert_eq!(coder.kind, "mission.coder");
-        assert_eq!(verify.kind, "mission.verify");
-
-        // (#1341) Dependency now lives on Task, not Step.
-        let by_id: std::collections::BTreeMap<&str, &Task> =
-            tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-        assert!(by_id["s1-worktree"].depends_on.is_empty(), "worktree is the root");
-        assert_eq!(by_id["s1-coder"].depends_on, vec!["s1-worktree".to_string()]);
-        assert_eq!(by_id["s1-verify"].depends_on, vec!["s1-coder".to_string()]);
-        // The coder/verify Tasks carry the resource assignment (#1341).
-        assert_eq!(by_id["s1-coder"].role_id.as_deref(), Some("coder"));
-        assert_eq!(by_id["s1-coder"].workdir.as_deref(), Some(wt_path));
-        assert_eq!(by_id["s1-verify"].role_id.as_deref(), Some("code-reviewer"));
-
-        for s in steps.values() {
-            assert_eq!(s.status, NodeStatus::Planned);
-        }
-    }
-
-    /// (#1284 Packet 3) The prior test only exercises `role == "coder"` —
-    /// the built-in `coder-phase` config's own DEFAULT, which can't
-    /// distinguish "the config's default happened to match" from "the
-    /// launcher's override is actually wired." A non-default role proves
-    /// the `TaskOverride` path: role_id AND the dynamic `dispatch
-    /// \`{role}\` into the worktree` description both come from the
-    /// LAUNCHER's override, not the document; the verify Task's role_id
-    /// stays "code-reviewer" (unaffected — it's a document default, not
-    /// something the coder role touches) and the image override threads
-    /// through unchanged.
-    #[test]
-    fn default_phase_graph_with_a_non_default_role_overrides_role_and_description() {
-        let wt_path = std::path::Path::new("/tmp/wt-s2");
-        let (tasks, _steps) = default_phase_graph("s2", "reviewer-bot", wt_path, Some("rust:slim"))
-            .expect("built-in coder-phase config interprets cleanly");
-
-        let by_id: std::collections::BTreeMap<&str, &Task> =
-            tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-        assert_eq!(by_id["s2-coder"].role_id.as_deref(), Some("reviewer-bot"));
-        assert_eq!(by_id["s2-coder"].description, "dispatch `reviewer-bot` into the worktree");
-        assert_eq!(by_id["s2-coder"].image.as_deref(), Some("rust:slim"));
-        assert_eq!(by_id["s2-verify"].role_id.as_deref(), Some("code-reviewer"), "verify's role is untouched by the coder role override");
-    }
-
-    /// (#1284 Packet 3, review round 2 MUST FIX 2) LAUNCHER-LEVEL
-    /// conformance golden — `build_review_graph`'s twin (see
-    /// `build_review_graph_matches_the_pre_cutover_golden_exactly` in
-    /// `darkmux-lab`'s `lab::review`): the full serialized `(tasks, steps)`
-    /// this launcher produces must be equal (as JSON values) to the output
-    /// CAPTURED FROM MAIN's pre-cutover hand-built `default_phase_graph` —
-    /// every task id, `phase_id`, description (em dashes included — the
-    /// exact axis round 1's untouched tests missed), step id, `depends_on`,
-    /// kind id, `Step.config`, role/workdir/image, and `Vec<Task>` ORDER (a
-    /// JSON array pins order under `Value` equality). The golden was
-    /// generated by running main's builder itself (commit c802f87, a
-    /// temporary in-tree dump test) with these EXACT inputs — a non-default
-    /// role ("analyst") so the dynamic description is pinned, and an image
-    /// override so that axis is too.
-    #[test]
-    fn default_phase_graph_matches_the_pre_cutover_golden_exactly() {
-        let wt_path = std::path::Path::new("/tmp/wt-golden");
-        let (tasks, steps) = default_phase_graph("s9", "analyst", wt_path, Some("rust:slim"))
-            .expect("built-in coder-phase config interprets cleanly");
-
-        let actual = serde_json::json!({"tasks": tasks, "steps": steps});
-        let golden: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/golden/coder_phase_graph.json"
-        )))
-        .expect("golden parses");
-        assert_eq!(
-            actual,
-            golden,
-            "interpreted coder-phase graph diverged from main's pre-cutover builder output:\n{}",
-            serde_json::to_string_pretty(&actual).unwrap()
-        );
-    }
 
     /// `MissionWorktreeStepKind` against a REAL git repo (no LMStudio, no
     /// Docker — pure git plumbing) — proves the migrated worktree step
     /// reproduces `add_worktree`'s two real-world outcomes: a clean
     /// creation, and the "already exists" bail on a second run for the
-    /// same phase (the exact scenario a resumed/un-shipped `mission run`
+    /// same phase (the exact scenario a resumed/un-shipped coder-phase run
     /// hits).
     #[test]
     fn mission_worktree_step_kind_creates_then_rejects_duplicate() {
@@ -1459,4 +1427,143 @@
 
         // An unresolvable role fails open to None, not a panic/error.
         assert!(resolve_local_placement("no-such-role-xyz", None, Some(path_str), "seat").is_none());
+    }
+
+    // ── (#1426 ship-4 / #1433) ship/abort honest-finalize + workdir align ──
+
+    /// Point `DARKMUX_CREW_DIR` + `DARKMUX_FLOWS_DIR` at fresh TempDirs and
+    /// restore on drop. Every user MUST be `#[serial]` (global env mutation).
+    struct CrewEnvGuard {
+        _crew: tempfile::TempDir,
+        _flows: tempfile::TempDir,
+        prev_crew: Option<String>,
+        prev_flows: Option<String>,
+    }
+    impl CrewEnvGuard {
+        fn new() -> Self {
+            let crew = tempfile::TempDir::new().unwrap();
+            let flows = tempfile::TempDir::new().unwrap();
+            let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+            let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+            // SAFETY: serialized via #[serial_test::serial] on every caller.
+            unsafe {
+                std::env::set_var("DARKMUX_CREW_DIR", crew.path());
+                std::env::set_var("DARKMUX_FLOWS_DIR", flows.path());
+            }
+            Self { _crew: crew, _flows: flows, prev_crew, prev_flows }
+        }
+    }
+    impl Drop for CrewEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized via #[serial_test::serial] on every caller.
+            unsafe {
+                match &self.prev_crew {
+                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                }
+                match &self.prev_flows {
+                    Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                    None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+                }
+            }
+        }
+    }
+
+    /// Seed an Active mission + its phases at the given statuses.
+    fn seed_finalize_mission(mid: &str, phases: &[(&str, PhaseStatus)]) {
+        let mut m = mission(mid, "finalize test");
+        m.phase_ids = phases.iter().map(|(id, _)| id.to_string()).collect();
+        crew::lifecycle::save_mission(&m).unwrap();
+        for (id, status) in phases {
+            let mut p = phase(id, mid, *status);
+            match status {
+                PhaseStatus::Complete => p.completed_ts = Some(1),
+                PhaseStatus::Abandoned => p.abandoned_ts = Some(1),
+                _ => {}
+            }
+            crew::lifecycle::save_phase(&p).unwrap();
+        }
+    }
+
+    fn mission_status_now(mid: &str) -> crew::types::MissionStatus {
+        crew::loader::load_missions()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == mid)
+            .expect("mission on disk")
+            .status
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn finalize_closes_mission_when_every_phase_is_terminal() {
+        // ship completing the (single) phase leaves the mission all-terminal →
+        // it closes honestly with a Clean envelope, not stranded Active.
+        let _g = CrewEnvGuard::new();
+        let mid = "fin-all-complete";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Complete)]);
+        finalize_mission_if_complete(mid);
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+        let env = crew::lifecycle::load_envelope(mid).unwrap().expect("envelope.json persisted");
+        assert_eq!(env.status, crew::envelope::MissionOutcomeStatus::Clean);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn finalize_abandoned_phase_closes_mission_degraded() {
+        // abort abandoning the only phase → the mission closes (no strand), but
+        // Degraded: real work happened yet no phase completed cleanly.
+        let _g = CrewEnvGuard::new();
+        let mid = "fin-abandoned";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Abandoned)]);
+        finalize_mission_if_complete(mid);
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+        let env = crew::lifecycle::load_envelope(mid).unwrap().expect("envelope.json persisted");
+        assert_eq!(env.status, crew::envelope::MissionOutcomeStatus::Degraded);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn finalize_leaves_mission_active_when_a_phase_is_still_open() {
+        // A multi-phase mission where ship/abort closed only ONE phase: the
+        // mission stays Active (the operator finishes the rest), no envelope.
+        let _g = CrewEnvGuard::new();
+        let mid = "fin-partial";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Complete), ("p2", PhaseStatus::Planned)]);
+        finalize_mission_if_complete(mid);
+        assert_eq!(
+            mission_status_now(mid),
+            crew::types::MissionStatus::Active,
+            "an open phase keeps the mission Active"
+        );
+        assert!(
+            crew::lifecycle::load_envelope(mid).unwrap().is_none(),
+            "no finalize envelope while a phase is still open"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_run_workdir_reads_task_workdir_then_falls_back() {
+        // A launched coder-phase run persists its worktree on Task.workdir;
+        // ship/abort must target THAT, not the derived default.
+        let _g = CrewEnvGuard::new();
+        let mid = "wd-align";
+        let mut t = test_task("p1-worktree");
+        t.phase_id = "p1".to_string();
+        t.workdir = Some(std::path::PathBuf::from("/custom/launch/wt"));
+        crew::lifecycle::save_task(mid, &t).unwrap();
+
+        let root = std::path::Path::new("/repo");
+        assert_eq!(
+            resolve_run_workdir(mid, "p1", root),
+            std::path::PathBuf::from("/custom/launch/wt"),
+            "reads the persisted launch workdir"
+        );
+        // A phase with no task record → the derived-path fallback.
+        assert_eq!(
+            resolve_run_workdir(mid, "p2", root),
+            worktree_path(root, "p2"),
+            "falls back to the derived worktree path"
+        );
     }

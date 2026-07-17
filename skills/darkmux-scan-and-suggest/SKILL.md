@@ -3,7 +3,7 @@ name: darkmux-scan-and-suggest
 description: Scan LMStudio for downloaded models that aren't yet in any darkmux profile and offer opinionated commentary on which ones are worth adding. Wraps `darkmux profile scan` with extra context-aware reasoning per model.
 ---
 
-# Scan + suggest darkmux profiles
+# Scan + suggest profiles
 
 ## When to use this skill
 
@@ -46,7 +46,7 @@ If the user wants a more bespoke profile for one of the recommended models — *
 
 ## Notes
 
-- **Memory check before bulk-adding.** If the user goes wild and adds 4 new profiles all paired with the 4B compactor, RAM usage at swap time can balloon. Suggest they run `darkmux doctor` after additions to verify RAM headroom.
+- **Memory check before bulk-adding.** If the user goes wild and adds 4 new profiles all paired with the 4B compactor, RAM usage at load time can balloon. Suggest they run `darkmux doctor` after additions to verify RAM headroom.
 - **`darkmux profile scan` doesn't auto-edit anything.** Every recommendation is a print-only suggestion until the user actually edits `~/.darkmux/profiles.json`.
 - **Architectural caveats.** MoE models (qwen3_5_moe, gpt_oss) load all expert weights into RAM even though only a fraction activates per token. The footprint is "full size" not "active params." Mention this when the user seems to assume MoE = small RAM.
 

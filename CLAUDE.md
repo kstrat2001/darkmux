@@ -4,12 +4,14 @@ This file is for any AI agent (Claude Code, Cursor, OpenClaw, etc.) that's helpi
 
 ## What darkmux is
 
-A pre-1.0 Rust CLI that does two things for users running local LLMs (LMStudio + Ollama + llama.cpp):
+A Rust CLI (v1.x, on the 2.0 track) that is two things for users running local LLMs (LMStudio + Ollama + llama.cpp):
 
-1. **Profile multiplexer** — a dispatch loads the models a named profile declares (model + context length + optional compaction settings) from `~/.darkmux/profiles.json`, under the resident budget (the multiplexer is now internal to gestalt).
-2. **Lab harness** — `darkmux lab run <workload>` dispatches a workload against the internal Docker-bounded runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
+1. **Mission orchestrator**: config-defined missions launched with `darkmux mission launch <config>` that run as a live task graph. A crew of local-AI roles works the phases through the internal Docker-bounded runtime (any seat can instead be staffed by a hosted cloud endpoint), every dispatch gated on operator sign-off, each run finalizing into a typed envelope. `darkmux dispatch <role> <message>` is the task-grain entry point (one role, one turn). This is the 2.0 headline.
+2. **Lab harness**: `darkmux lab run <workload>` dispatches a workload against the same internal runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
 
-The CLI is the *engine*; the empirical findings in the Genesis series on Darkly Energized (<https://darklyenergized.substack.com>) are what it backs. The reproducibility story is the product story — users should be able to rerun a workload and get numbers comparable to the published claims.
+Managing model residency (the founding *profile multiplexer*: loading the right models at the right context under the RAM budget) is now an internal capability underneath both, not a verb the operator drives. The `swap` verb retired on the 2.0 track (#1426); gestalt loads what each dispatch's staffing declares.
+
+The CLI is the *engine*; the empirical findings in the Genesis series on Darkly Energized (<https://darklyenergized.substack.com>) are what it backs. The reproducibility story is the product story: users should be able to rerun a workload and get numbers comparable to the published claims.
 
 ## darkmux's grand vision (agent-facing)
 
@@ -45,7 +47,7 @@ The release binary is self-contained (~11 MB as of 1.18.x — embedded workloads
 >
 > **#1135 is exactly why.** `dispatch --profile` silently JIT-loaded the model at LMStudio's 4096 default instead of the profile's `n_ctx`, but **a trivial smoke message FITS 4096** — so `result: "stop"` looked perfectly healthy while the feature was broken and would have shipped garbage reviews. Only a dispatch that exercised the feature *and read `lms ps` to confirm the loaded context* caught it. A path-only smoke ships this class of bug.
 
-**Before cutting ANY release, run a real dogfood dispatch as a critical-path smoke test.** A trivial `darkmux dispatch <role> "<smoke>"` (or a `mission run`) on the build you're about to tag is the floor — it proves the end-to-end dispatch path (model selection → container spawn → `docker run` → runtime loop → envelope) runs. But the floor is not the gate (see the mandate above): also exercise the actual features. `cargo test` + `cargo clippy` are necessary but NOT sufficient: they exercise the *pieces*, not the live invocation, and never the feature behavior.
+**Before cutting ANY release, run a real dogfood dispatch as a critical-path smoke test.** A trivial `darkmux dispatch <role> "<smoke>"` (or a `mission launch coder-phase`) on the build you're about to tag is the floor — it proves the end-to-end dispatch path (model selection → container spawn → `docker run` → runtime loop → envelope) runs. But the floor is not the gate (see the mandate above): also exercise the actual features. `cargo test` + `cargo clippy` are necessary but NOT sufficient: they exercise the *pieces*, not the live invocation, and never the feature behavior.
 
 This is load-bearing, not ceremony. **v1.3.x–1.4.0 shipped a completely broken internal-runtime dispatch** (`docker docker run`, exit 125 — #975): every unit test asserted the docker *argv vector*, but nothing ever constructed and ran the real `Command`, so the break sailed through four releases of green CI. One dogfood dispatch before any of those cuts would have caught it on the first try; it was finally found only when a `dispatch` happened to run for an unrelated reason.
 
@@ -223,39 +225,42 @@ When working on darkmux from a Claude Code (or other frontier) session, export `
 
 ## Where things live
 
+The workspace is a thin `src/` command layer over a set of `crates/` library members (the monolithic `src/` of the 0.x era split out; `swap.rs`, `src/crew/`, `src/lab/`, `src/workloads/`, `src/providers/` no longer exist at that path). The internal runtime lives in a separate `runtime/` crate that is NOT a workspace member (it needs its own `cargo clippy --manifest-path runtime/Cargo.toml`).
+
 ```
-src/
-  main.rs                    CLI dispatch (clap)
-  types.rs                   Profile / ProfileRegistry / ProfileModel
-  profiles.rs                Registry loader + lookup
-  swap.rs / lms.rs           darkmux: namespace helpers + lms CLI wrapper
-  init.rs / skills.rs        `darkmux init` + skill installer
-  notebook.rs                Notebook draft generator
-  lab/
-    paths.rs                 Workspace dir resolution (project vs user) + default_registry_path
-    run.rs                   Workload dispatch + source-sandbox resolution + manifest fixture-enrichment
-    inspect.rs               Single-run analysis
-    compare.rs               Run-vs-run diff
-    list.rs                  Recent runs table
-    cow_clone.rs             Per-run copy-on-write sandbox clone (#487 phase 1)
-    sandbox_hash.rs          BLAKE3 content hashing (baseline_hash / final_hash)
-    fixture.rs               .fixture.json manifest type + validation (#487 phase 2)
-    registry.rs              Fixture registry load/save/find_satisfying (lab-registry.json)
-    fixture_cli.rs           lab register/unregister/fixtures verbs (#487 phase 4)
-    doctor.rs                lab doctor — offline fixture integrity check
-  workloads/
-    types.rs                 WorkloadProvider trait + manifest types (incl. requires_fixture)
-    load.rs                  Manifest loading (user → on-disk → embedded)
-    registry.rs              Provider registry
-  providers/
-    prompt.rs                Trivial single-prompt provider
-    coding_task.rs           Sandbox + verify-command provider (writes final_hash)
-  crew/
-    types.rs                 Role + Skill + Capability schema; capabilities() derivation; is_specialist()
-    select.rs                select_model(role, profile) — dispatch model selection (phase-1 stub, E14)
-    dispatch_internal.rs     Internal-runtime dispatch path (typed-config consumer)
-    dispatch.rs              Runtime-neutral dispatch plumbing (ack gate, identity augmentation, flow-record builders, fleet routing)
-runtime/                      Internal-runtime crate (built into darkmux-runtime Docker image)
+src/                          CLI command layer (clap)
+  main.rs                     Entry point
+  cli.rs                      The clap Command enum (the top-level verb surface)
+  (dispatch is a top-level verb; the per-command modules:)
+  mission_launch.rs           `mission launch <config>`: mint + drive a mission instance from a config
+  mission_launch_review.rs    The `review` config's dedicated launcher (bundle→probe→dedup→judge→verify→synthesis)
+  coder_phase.rs              coder-phase pipeline StepKinds (worktree/coder/verify): Tier-3 bespoke, launch-owned (`mission run` retired #1426 ship-4)
+  mission_propose.rs          `mission propose`: utility-agent intent → mission config (stdin/file)
+  mission_status.rs           `mission status`: the read-only mission board
+  lab_cli.rs                  `lab` family (run/inspect/compare/runs/register/doctor/notebook)
+  phase_cli.rs                `phase` family (estimate, lifecycle transitions)
+  role_cli.rs                 `role` family (list/show from the SQLite index)
+  fleet_cli.rs                `machine list/add/remove` roster (the retired `fleet` family folded into `machine`, #1426)
+  flow_cli.rs                 `flow` family (note, status, integrity-check, tail)
+  config_cmd.rs               `config` get/set/list
+  init.rs / skills.rs         `darkmux init` (idempotent setup + bundled-skill refresh) + skill installer
+  conventions.rs              Shared CLI helpers
+  notebook.rs                 Notebook draft generator (surfaced as `lab notebook`)
+  migrate.rs                  Storage-layout migrations
+  pr_review.rs                pr-review render/post plumbing (the `review` config's output path)
+crates/
+  darkmux-types/              Profile / ProfileRegistry / config / flow record schemas + config_access
+  darkmux-profiles/           Registry loader + lookup
+  darkmux-gestalt/            Residency arbiter (ResourceProbe/pools; loads what each dispatch's staffing declares)
+  darkmux-crew/               Roles, dispatch core, the Task/Step scheduler + step_kinds/ (builtins/patterns), lessons
+  darkmux-lab/                Lab harness (lab/, providers/, workloads/) + the review pipeline (lab/review.rs)
+  darkmux-fleet/              Roster + cross-machine routing
+  darkmux-flow/               Flow sinks (LocalFile/Audit/Redis/Tee) + Keychain-secret machinery
+  darkmux-serve/              HTTP daemon + the bundled viewer (assets/viewer.html)
+  darkmux-doctor/             `darkmux doctor` checks
+  darkmux-eureka/             Rules engine (RULES_SCHEMA_VERSION)
+  darkmux-hardware/ darkmux-heuristics/  Apple-Silicon tier detection + heuristics providers
+runtime/                      Internal-runtime crate (built into the darkmux-runtime Docker image; NOT a workspace member)
   src/loop_runner.rs          Agent loop; budget caps; inactivity deadline; detector + recovery wiring
   src/compaction.rs           Narrative + structured-slot compaction; JSON repair; escalation
   src/feedback.rs             Feedback-injection channel + default per-signal templates
@@ -266,8 +271,9 @@ runtime/                      Internal-runtime crate (built into darkmux-runtime
   src/json_repair.rs          Truncated-JSON repair for compactor output (#401)
   src/trajectory.rs           Trajectory JSONL event writers (the analyze-run skill documents the shapes)
 templates/builtin/
-  roles/                      Crew role library (manifest + .md) embedded at compile time
-  skills/                     Skill library embedded at compile time (work-shape descriptors with keyword routing; renamed from `capabilities/` in refactor 0 — see #448)
+  roles/                      Role library (manifest + .md) embedded at compile time
+  mission-configs/            Built-in mission configs (coder-phase, review, …) embedded at compile time
+  skills/                     Skill library embedded at compile time (work-shape descriptors with keyword routing; renamed from `capabilities/` in refactor 0, see #448)
   workloads/                  Workload manifests embedded at compile time
   lab-fixtures/               Built-in lab fixtures (e.g. demo-tiny-py) registered via scripts/lab-init.sh
   AUTONOMOUS_DISPATCH_PREAMBLE.md  Injected ahead of specialist-role dispatches (#427)
@@ -319,11 +325,11 @@ crates/darkmux-crew/src/step_kinds/
     registry.rs   — StepKindRegistry.
 ```
 
-Tier 3 — genuinely bespoke, single-purpose kinds — **never lives in `darkmux-crew` at all.** It stays physically co-located with the mission module that owns it: the PR-review pipeline's bundle/probe/dedup/judge/verify/synthesis kinds live in `crates/darkmux-lab/src/lab/review.rs`; `mission run`'s worktree/coder/verify kinds live in `src/mission_run.rs`. This is reserved for when a second plausible use case genuinely isn't visible yet — revisit if one shows up, same as any other "not yet, but named" call.
+Tier 3 — genuinely bespoke, single-purpose kinds — **never lives in `darkmux-crew` at all.** It stays physically co-located with the mission module that owns it: the PR-review pipeline's bundle/probe/dedup/judge/verify/synthesis kinds live in `crates/darkmux-lab/src/lab/review.rs`; the coder-phase pipeline's worktree/coder/verify kinds live in `src/coder_phase.rs` (the launch-owned module — `mission run` retired in #1426, ship-4). This is reserved for when a second plausible use case genuinely isn't visible yet — revisit if one shows up, same as any other "not yet, but named" call.
 
 **The physical location IS the enforceable test.** Is this in `step_kinds/builtins.rs`? Config it. Is it in `step_kinds/patterns/`? Reuse it, plug in your own strategy. Is it inside a mission's own module? It's bespoke on purpose — don't look here for shared infrastructure. A fresh agent session asking "where does my new Step behavior go" answers the question by reading the directory, not by re-deriving the decision procedure from a comment that may have drifted.
 
-Two audited findings worth knowing before proposing a collapse yourself. First: the PR-review pipeline's probe/verify kinds LOOK like `dispatch.single_shot` wearing bespoke wrapping, but audited honestly they are NOT a clean Tier 1 collapse. Each is a whole per-item LOOP (probe's bundle × k-draw loop, verify's per-confirmed-flag loop) with cross-step shared state (a remote-token bucket shared across sibling probe steps, `MemberRecord` accumulation into a shared handle) that `dispatch.single_shot`'s one-call-per-`Step` shape doesn't have and can't gain without a real behavior/envelope change. Second: `mission run`'s coder kind wraps the SAME `crew::dispatch::dispatch` primitive Tier 1's `dispatch.internal` wraps, a genuine follow-up candidate, but its CLI printing, its own `mission.coder` flow-record vocabulary, and its `result_slot` readback mechanism are real differences a collapse would have to resolve first. Both are documented in place (code comments citing #1352) rather than forced. The general rule: a collapse that changes observable behavior isn't a tiering fix, it's a feature change wearing a tiering fix's clothes.
+Two audited findings worth knowing before proposing a collapse yourself. First: the PR-review pipeline's probe/verify kinds LOOK like `dispatch.single_shot` wearing bespoke wrapping, but audited honestly they are NOT a clean Tier 1 collapse. Each is a whole per-item LOOP (probe's bundle × k-draw loop, verify's per-confirmed-flag loop) with cross-step shared state (a remote-token bucket shared across sibling probe steps, `MemberRecord` accumulation into a shared handle) that `dispatch.single_shot`'s one-call-per-`Step` shape doesn't have and can't gain without a real behavior/envelope change. Second: the coder-phase pipeline's coder kind (`src/coder_phase.rs`) wraps the SAME `crew::dispatch::dispatch` primitive Tier 1's `dispatch.internal` wraps, a genuine follow-up candidate, but its CLI printing, its own `mission.coder` flow-record vocabulary, and its `result_slot` readback mechanism are real differences a collapse would have to resolve first. Both are documented in place (code comments citing #1352) rather than forced. The general rule: a collapse that changes observable behavior isn't a tiering fix, it's a feature change wearing a tiering fix's clothes.
 
 ## Versioning — rules schema
 

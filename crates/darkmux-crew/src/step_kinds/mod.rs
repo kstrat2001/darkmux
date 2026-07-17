@@ -32,7 +32,7 @@
 //! see that module's own doc. Tier 3 (genuinely bespoke, single-purpose
 //! kinds) never lives in this crate at all: it stays physically co-located
 //! with the mission module that owns it (`darkmux-lab`'s `review.rs`, the
-//! `darkmux` binary's own `mission_run.rs`) — see `step_kinds::patterns`'s
+//! `darkmux` binary's own `coder_phase.rs`) — see `step_kinds::patterns`'s
 //! module doc for the full three-tier picture and `CLAUDE.md`'s "StepKind
 //! tiering" section for the doctrine this physical layout enforces.
 
@@ -49,7 +49,7 @@ pub use registry::StepKindRegistry;
 pub use types::{StepKind, StepOutcome};
 
 /// Re-exported so callers OUTSIDE this crate (e.g. `darkmux`'s own
-/// `mission_run` — the `run_step_graph`/`StepKind::residency` caller for
+/// `coder_phase` — the `run_step_graph`/`StepKind::residency` caller for
 /// the mission-run migration, #1230 Packet 3) can name these types without
 /// a direct `darkmux-gestalt` dependency of their own — only DIRECT
 /// dependencies get an implicit extern-prelude entry, so a transitive user

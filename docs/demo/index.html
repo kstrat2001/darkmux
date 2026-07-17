@@ -179,7 +179,19 @@
   body.machine-mode .log,body.machine-mode .split,body.machine-mode .scrub{display:none}
   body.machine-mode .wrap{display:block;height:auto}
   body.machine-mode .stage{padding:16px 16px 32px}
-  .memwrap{display:flex;flex-direction:column;gap:12px;margin-top:10px;max-width:760px}
+  /* (UI nit, 2026-07-13) `.wrap{height:auto}` above lets machine/lab-mode
+     content grow past the viewport; without an overflow escape on the
+     document itself, `html,body{overflow:hidden;height:100vh}` (the
+     desktop split-pane default) just silently clips anything past the
+     fold — e.g. the "warnings" card at the bottom of a long machine-memory
+     read. Scoped to these two modes only; the flow/mission views keep the
+     desktop-locked layout `.stage{overflow:auto}` already handles. */
+  body.machine-mode,body.lab-mode{overflow:auto;height:auto;min-height:100vh}
+  html:has(body.machine-mode),html:has(body.lab-mode){overflow:auto;height:auto;min-height:100vh}
+  /* Was a hardcoded 760px even though the log panel is hidden in this mode
+     (full width available) — widened so wide/ultrawide monitors don't
+     waste most of the screen on a single narrow column of cards. */
+  .memwrap{display:flex;flex-direction:column;gap:12px;margin-top:10px;max-width:min(1200px,92vw)}
   .memcard{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
   .memcard.green{border-color:var(--good)}
   .memcard.amber{border-color:var(--warn)}

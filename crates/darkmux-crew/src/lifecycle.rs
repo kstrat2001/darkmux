@@ -547,6 +547,15 @@ pub(crate) fn load_phase_by_id(phase_id: &str) -> Result<Phase> {
     }
 }
 
+/// (#1433) Read a mission by id for a caller that needs its current status —
+/// `envelope::finalize_mission` classifies a `mission_close` refusal (benign
+/// already-Closed vs genuine drift) off this. Thin pub(crate) wrapper over the
+/// private loader; the `Err` (missing file, parse failure) is itself treated
+/// as "unknown status" by the classifier.
+pub(crate) fn load_mission_by_id(id: &str) -> Result<Mission> {
+    load_mission(id)
+}
+
 fn load_mission(id: &str) -> Result<Mission> {
     let path = mission_path(id);
     if !path.is_file() {
@@ -571,15 +580,14 @@ fn emit_phase_transition_record(phase_id: &str, mission_id: &str, action: &str) 
         action: action.to_string(),
         handle: phase_id.to_string(),
         phase_id: Some(phase_id.to_string()),
-        session_id: Some(format!("mission:{mission_id}")),
+        session_id: Some(darkmux_types::session_id::mission(mission_id)),
         source: Some("phase_lifecycle".to_string()),
         model: None,
         reasoning: None,
-        // #136 schema 1.3: first-class mission_id. The session_id
-        // workaround above (`mission:<id>`) stays in place this PR for
-        // back-compat with existing readers; future readers should
-        // prefer this field. The redundancy retires once readers
-        // migrate (follow-up).
+        // #136 schema 1.3: first-class mission_id. The session_id above
+        // (`session_id::mission(mission_id)`, hyphen-delimited since #1436)
+        // stays as the record-grouping key; readers should prefer this
+        // first-class field for mission lookups.
         mission_id: Some(mission_id.to_string()),
         machine_id: None,
         machine_uid: None,
@@ -617,7 +625,7 @@ fn emit_mission_transition_record_with_reasoning(
         action: action.to_string(),
         handle: mission_id.to_string(),
         phase_id: None,
-        session_id: Some(format!("mission:{mission_id}")),
+        session_id: Some(darkmux_types::session_id::mission(mission_id)),
         source: Some("mission_lifecycle".to_string()),
         model: None,
         reasoning: reasoning.map(String::from),
@@ -660,7 +668,7 @@ fn emit_phase_added_record_with_reasoning(
         action: "phase added".to_string(),
         handle: phase_id.to_string(),
         phase_id: Some(phase_id.to_string()),
-        session_id: Some(format!("mission:{mission_id}")),
+        session_id: Some(darkmux_types::session_id::mission(mission_id)),
         source: Some("mission_lifecycle".to_string()),
         model: None,
         reasoning: reasoning.map(String::from),
