@@ -255,10 +255,10 @@ crates/
   darkmux-crew/               Roles, dispatch core, the Task/Step scheduler + step_kinds/ (builtins/patterns), lessons
   darkmux-lab/                Lab harness (lab/, providers/, workloads/) + the review pipeline (lab/review.rs)
   darkmux-fleet/              Roster + cross-machine routing
-  darkmux-flow/              Flow sinks (LocalFile/Audit/Redis/Tee) + Keychain-secret machinery
-  darkmux-serve/             HTTP daemon + the bundled viewer (assets/viewer.html)
-  darkmux-doctor/            `darkmux doctor` checks
-  darkmux-eureka/            Rules engine (RULES_SCHEMA_VERSION)
+  darkmux-flow/               Flow sinks (LocalFile/Audit/Redis/Tee) + Keychain-secret machinery
+  darkmux-serve/              HTTP daemon + the bundled viewer (assets/viewer.html)
+  darkmux-doctor/             `darkmux doctor` checks
+  darkmux-eureka/             Rules engine (RULES_SCHEMA_VERSION)
   darkmux-hardware/ darkmux-heuristics/  Apple-Silicon tier detection + heuristics providers
 runtime/                      Internal-runtime crate (built into the darkmux-runtime Docker image; NOT a workspace member)
   src/loop_runner.rs          Agent loop; budget caps; inactivity deadline; detector + recovery wiring

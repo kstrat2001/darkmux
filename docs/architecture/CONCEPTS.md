@@ -30,16 +30,19 @@ When in doubt, the code is the source of truth (per `CLAUDE.md`). This doc is th
 darkmux is a Rust CLI for operators running local LLMs on Apple Silicon.
 It does three things:
 
-1. **Profile multiplexer.** A dispatch loads the model stack a named profile
-   declares (model + context length + compaction settings), under the resident
-   budget (the multiplexer is now internal to gestalt).
+1. **Mission orchestrator.** Config-defined missions launched with
+   `darkmux mission launch <config>` run as a live task graph: local *utility*
+   and *specialist* agents work the phases, every dispatch gated on operator
+   sign-off, every dispatch recorded to an auditable flow stream.
+   `darkmux dispatch <role>` is the task-grain entry point. The 2.0 headline.
 2. **Lab harness.** `darkmux lab run <workload>` dispatches a workload and
    records timing + trajectory + verify outcome, so empirical claims are
    reproducible.
-3. **AI-first local-AI orchestrator.** darkmux dispatches local *utility* and
-   *specialist* agents internally (compaction, mission proposal, phase
-   estimation, code review) and records every dispatch to an auditable flow
-   stream.
+3. **Model residency (internal).** A dispatch loads the model stack a named
+   profile declares (model + context length + compaction settings), under the
+   resident budget. This is the founding profile multiplexer, now internal to
+   gestalt: the operator declares profiles; the `swap` verb that drove it by
+   hand retired in 2.0 (#1426).
 
 The strategic reasoning loop lives in your **frontier orchestrator** (Claude
 Code today). darkmux operates the local tier as a self-contained capability the
