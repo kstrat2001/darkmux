@@ -222,11 +222,11 @@ pub fn print_report(r: &TuneReport) {
 
     println!();
     println!("Next steps:");
-    println!("  • `darkmux lab inspect <run-id>` for any individual run");
+    println!("  • `darkmux lab run inspect <run-id>` for any individual run");
     if r.outcomes.len() >= 2 {
         let a = r.outcomes.first().map(|o| o.run_id.as_str()).unwrap_or("");
         let b = r.outcomes.last().map(|o| o.run_id.as_str()).unwrap_or("");
-        println!("  • `darkmux lab compare {a} {b}` for a head-to-head diff");
+        println!("  • `darkmux lab run compare {a} {b}` for a head-to-head diff");
     }
     if s.slow_cluster.count > 0 {
         println!("  • Slow cluster present — re-tune compaction knobs and re-run");

@@ -1,10 +1,10 @@
-//! `darkmux lab compare <run-A> <run-B>` — diff two runs.
+//! `darkmux lab run compare <run-A> <run-B>` — diff two runs.
 
 use crate::lab::inspect::lab_inspect;
 use crate::workloads::types::InspectionReport;
 use anyhow::Result;
 
-/// Result of `darkmux lab compare`. Fields are read by the CLI's print
+/// Result of `darkmux lab run compare`. Fields are read by the CLI's print
 /// path (formatted in main.rs); the dead-code lint doesn't see that
 /// because the formatter accesses via `{:?}`/`Debug` on the whole
 /// struct. Allowing keeps the public-API shape stable for downstream

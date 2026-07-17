@@ -227,7 +227,7 @@ darkmux machine resources         <span class="comment"># live per-model RAM com
 
     <h3>The smoke test</h3>
     <pre><code>darkmux lab run quick-q           <span class="comment"># single-turn smoke prompt against the active profile</span>
-darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at what happened</span></code></pre>
+darkmux lab run inspect &lt;run-id&gt;      <span class="comment"># quick look at what happened</span></code></pre>
     <p>This runs through darkmux's internal Docker-bounded runtime. The runtime image is pulled from GHCR on first use, so you just need Docker running. No Docker yet? Skip this step and come back after the <a href="lab.html">lab</a> section. (Like a dispatch, this calls a real model, so its numbers are yours to generate.)</p>
   </div>
 </section>

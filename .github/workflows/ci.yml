@@ -349,13 +349,28 @@ jobs:
           # `memory correction`). `lessons` is plural + darkmux-specific, so the
           # `darkmux ` anchor + word boundary can't false-match the singular
           # `memory lesson` spelling or the word "lessons" in prose.
+          # Round 11 (#1465): the `lab` SECOND-LEVEL surface regrouped. The flat
+          # plural-noun-as-verb leaves + flat run/fixture leaves + the
+          # role-scoped snowflake all retired into kind-families: `lab runs` ->
+          # `lab run list`, `lab workloads` -> `lab workload list`, `lab
+          # fixtures` -> `lab fixture list`, `lab inspect` -> `lab run inspect`,
+          # `lab compare` -> `lab run compare`, `lab register`/`lab unregister`
+          # -> `lab fixture register`/`unregister`, `lab review-bench` -> `lab
+          # eval <role>`. Each retired spelling is anchored ADJACENT-two-word,
+          # so the surviving forms don't trip: `lab run compare` does not
+          # contain the adjacent `lab compare`, `lab fixture register` does not
+          # contain `lab register`, `lab run list` does not contain `lab runs`,
+          # and the valid `lab run` dispatch verb is not `lab runs` (needs the
+          # trailing `s`). The `--crew` -> `--roster-profile` flag rename is NOT
+          # verb-guardable here (VERBPAT anchors on `darkmux <verb>`, and
+          # `--crew` is a flag) — tests/cli.rs guards it instead.
           # Historical release-notes lines (README's status block, one line
           # per release naming its `**vX.Y.Z**`) legitimately quote old verbs
           # — excluded by the -v filter; live prose never carries that
           # bold-version marker.
-          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|phase|mission run|mission ship|mission close)\b'
+          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|phase|mission run|mission ship|mission close|lab runs|lab workloads|lab fixtures|lab inspect|lab compare|lab register|lab unregister|lab review-bench)\b'
           if bad=$(grep -rniE $EXCL "$VERBPAT" $SCAN 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
-            echo "::error::Retired verb spelling in user-facing docs (#1426/#1463) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family); swap + recommendations retired:"
+            echo "::error::Retired verb spelling in user-facing docs (#1426/#1463/#1465) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family) / lab run list|inspect|compare (not lab runs/inspect/compare) / lab workload list (not lab workloads) / lab fixture list|register|unregister (not lab fixtures/register/unregister) / lab eval (not lab review-bench); swap + recommendations retired:"
             echo "$bad"
             exit 1
           fi

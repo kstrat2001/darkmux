@@ -1,4 +1,4 @@
-//! `darkmux lab runs [--limit N]` — list recent runs, most-recent first.
+//! `darkmux lab run list [--limit N]` — list recent runs, most-recent first.
 //!
 //! Reads run-dirs under .darkmux/runs/, peeks at each manifest.json for
 //! workload + duration + ok status, and surfaces a compact table.

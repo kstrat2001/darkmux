@@ -237,6 +237,14 @@ impl BenchMode {
 }
 
 pub struct ReviewBenchOpts {
+    /// (#1465) The role to evaluate in `Strict` mode — defaults to
+    /// `pr-reviewer` (the original `review-bench` behavior). The scorer is
+    /// role-agnostic (it matches the emitted `{verdict, findings}` JSON against
+    /// the labels), so any role honoring that contract is a caller. The
+    /// experimental condition modes (`FreeForm`/`Agentic`/`Dialectic`/`Funnel`)
+    /// dispatch fixed `pr-reviewer`-variant roles / pipelines and ignore this
+    /// field — a follow-up moves those behind per-role config (#1465).
+    pub role: String,
     pub cases_dir: PathBuf,
     pub profile_name: Option<String>,
     pub config_path: Option<String>,
@@ -260,12 +268,14 @@ pub struct ReviewBenchOpts {
     pub prosecutor_profile: Option<String>,
     pub defender_profile: Option<String>,
     pub judge_profile: Option<String>,
-    /// (#1426 ship-2) `Funnel` mode's ROSTER profile — the profile whose
-    /// `models[]` the resourcing resolver scores each review seat (probe /
-    /// judge / verify) against. Falls back to `profile_name`, else the
-    /// registry's `default_profile`. (The crews map retired; this no longer
-    /// names a `crews.<name>` entry.)
-    pub crew: Option<String>,
+    /// (#1426 ship-2, renamed in #1465) `Funnel` mode's ROSTER profile — the
+    /// profile whose `models[]` the resourcing resolver scores each review seat
+    /// (probe / judge / verify) against. Falls back to `profile_name`, else the
+    /// registry's `default_profile`. (Renamed from `crew`: the crew family
+    /// retired entirely in #1426, so this names the roster PROFILE it resolves
+    /// against, not a retired `crews.<name>` entry — the `--roster-profile`
+    /// flag.)
+    pub roster_profile: Option<String>,
     /// (#1222) `Funnel` mode's model-cycling mode override —
     /// `"sequential"` | `"parallel"` | `"auto"` (default: `auto`, resolved
     /// once against the local hardware tier — see `review::resolve_mode`).
@@ -287,6 +297,26 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
         return Err(anyhow!(
             "no cases (*.label.json + sibling *.diff) found in {}",
             opts.cases_dir.display()
+        ));
+    }
+    // (#1465/#1469) The experimental condition modes dispatch fixed
+    // `pr-reviewer`-variant roles / pipelines and IGNORE the `role` positional
+    // (a follow-up moves them behind per-role config). Naming a role AND an
+    // experimental mode would silently run a DIFFERENT role than the operator
+    // asked for, with nothing in the artifact revealing it — so bail LOUD here,
+    // before any dispatch spends a token (same "fail loud before spending
+    // tokens" discipline as the workdirs preflight below). `pr-reviewer` + any
+    // mode still works; any role + `Strict` still works.
+    if opts.mode != BenchMode::Strict && opts.role != "pr-reviewer" {
+        return Err(anyhow!(
+            "the --{} mode is pr-reviewer-specific and ignores the `{}` role positional \
+             (it dispatches fixed pr-reviewer-variant roles / pipelines) — drop the role \
+             positional to run `pr-reviewer` in {} mode, or use `--strict` (the default) to \
+             evaluate `{}`. Per-role config for the experimental modes is a tracked follow-up (#1465).",
+            opts.mode.label(),
+            opts.role,
+            opts.mode.label(),
+            opts.role,
         ));
     }
     // Agentic mode's preflight: every case must have its evidence tree BEFORE
@@ -347,8 +377,12 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     // (#1247 Part 1) Funnel mode's per-run-local flow-event sink — see
     // `LocalJsonlEmitter`'s doc for why this is NOT the fleet flow stream.
     let mut funnel_emitter = LocalJsonlEmitter::new(scores_path.with_file_name("funnel-events.jsonl"));
+    // (#1465) Operator-facing console line reads `lab eval` (the current verb);
+    // the internal run_id / run-dir (`review-bench-<ts>`) + scores `bench` key
+    // stay `review-bench` — self-consistent internal identifiers, a declared
+    // non-goal to rename.
     eprintln!(
-        "pr-review-bench: {} cases · profile={} · profiles-file={} · mode={}",
+        "lab eval: {} cases · profile={} · profiles-file={} · mode={}",
         cases.len(),
         opts.profile_name.as_deref().unwrap_or("(default)"),
         opts.config_path.as_deref().unwrap_or("(registry)"),
@@ -443,11 +477,19 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
             let workdir = (opts.mode == BenchMode::Agentic)
                 .then(|| workdir_for(&c.id))
                 .flatten();
+            // (#1465) `Strict` mode evaluates the operator-named `role`
+            // (default `pr-reviewer`); the experimental modes dispatch fixed
+            // reviewer-variant roles via `mode.role_id()`.
+            let role_id: &str = if opts.mode == BenchMode::Strict {
+                &opts.role
+            } else {
+                opts.mode.role_id()
+            };
             let stdout = dispatch_case(
                 &prompt,
                 &c.id,
                 workdir,
-                opts.mode.role_id(),
+                role_id,
                 None,
                 &opts,
             )
@@ -731,15 +773,15 @@ fn parse_exec_mode(s: Option<&str>) -> Result<super::review::ExecMode> {
 /// as the probe draw count, parse `--exec-mode`, and resolve the seat system
 /// prompts. Every failure here is loud and happens BEFORE any dispatch.
 ///
-/// (#1426 ship-2) `--crew` no longer names a `crews.<name>` entry (the map
-/// retired) — it names the ROSTER PROFILE the seats are resourced from; absent,
-/// the bench's `--profile` (else the registry's `default_profile`) is the
-/// roster.
+/// (#1426 ship-2, renamed in #1465) `--roster-profile` names the ROSTER
+/// PROFILE the seats are resourced from (the retired `crews.<name>` map is
+/// gone); absent, the bench's `--profile` (else the registry's
+/// `default_profile`) is the roster.
 fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
     let loaded = darkmux_profiles::profiles::load_registry(opts.config_path.as_deref())
         .context("loading profile registry for --funnel")?;
     let roster = opts
-        .crew
+        .roster_profile
         .clone()
         .or_else(|| opts.profile_name.clone());
     let resourcing = darkmux_crew::resourcing::ReviewResourcing {
@@ -1718,13 +1760,24 @@ fn write_scores_artifact(
         "mode".to_string(),
         serde_json::Value::String(opts.mode.label().to_string()),
     );
-    // (#1222 Phase B packet 7) Funnel-mode provenance: crew name + resolved
-    // exec mode + k override — the cell-identity fields a future comparison
-    // needs to know two funnel runs are the same condition.
+    // (#1465) `role` is now an operator knob (was a `pr-reviewer` constant
+    // pre-#1465), so the artifact snapshots it — otherwise `lab eval coder` and
+    // `lab eval pr-reviewer` emit indistinguishable scores.json. Satisfies the
+    // no-blind-runs doctrine: every run self-describes its knobs.
+    doc.extras.insert(
+        "role".to_string(),
+        serde_json::Value::String(opts.role.clone()),
+    );
+    // (#1222 Phase B packet 7) Funnel-mode provenance: roster profile +
+    // resolved exec mode + k override — the cell-identity fields a future
+    // comparison needs to know two funnel runs are the same condition. The
+    // `"crew"` envelope KEY is unchanged (the serve daemon + viewer consume it
+    // — a schema field, out of scope for #1465's flag rename); only its source
+    // moved from the retired `--crew` flag to `--roster-profile`.
     if opts.mode == BenchMode::Funnel {
         doc.extras.insert(
             "crew".to_string(),
-            serde_json::Value::String(opts.crew.clone().unwrap_or_default()),
+            serde_json::Value::String(opts.roster_profile.clone().unwrap_or_default()),
         );
         let exec_mode_label = funnels
             .first()

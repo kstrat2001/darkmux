@@ -1,6 +1,6 @@
 ---
 name: darkmux-compare-runs
-description: Diff two darkmux lab runs — wall clock delta, turn delta, compaction delta, mode change. Use this when isolating the effect of a single config change (the "scientific A/B" pattern) or investigating variance between repeated runs of the same config.
+description: Diff two darkmux lab run records — wall clock delta, turn delta, compaction delta, mode change. Use this when isolating the effect of a single config change (the "scientific A/B" pattern) or investigating variance between repeated runs of the same config.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*)"
 ---
@@ -14,7 +14,7 @@ ARGUMENTS expected: `<run-A> <run-B>`
 ## Step 0 — If user didn't provide run IDs, list recent runs first
 
 ```bash
-darkmux lab runs --limit 5
+darkmux lab run list --limit 5
 ```
 
 This prints the 5 most-recent run IDs with their workload, profile, wall clock, and ok/error status. Surface the table and ask which two to compare.
@@ -22,7 +22,7 @@ This prints the 5 most-recent run IDs with their workload, profile, wall clock, 
 ## Step 1 — Diff
 
 ```bash
-darkmux lab compare "$ARGUMENTS"
+darkmux lab run compare "$ARGUMENTS"
 ```
 
 (Pass both args separated by a space — clap parses them.)

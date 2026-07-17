@@ -189,8 +189,8 @@ darkmux profile list                  # list configured profiles
 darkmux machine status                # what's loaded; which profile (if any) matches
 darkmux lab characterize              # one-command "QA my Mac": dispatch a smoke workload, get a verdict
 darkmux lab run quick-q               # the smoke workload directly
-darkmux lab runs --limit 5            # see your recent runs
-darkmux lab inspect <run-id>          # full per-run breakdown
+darkmux lab run list --limit 5         # see your recent runs
+darkmux lab run inspect <run-id>      # full per-run breakdown
 darkmux lab notebook draft <run-id>   # ask the active role to author a lab-style notebook entry
 darkmux mission propose --from-stdin   # AI-built-in: vague intent → a structured mission config
 darkmux mission launch <id>            # mint + start a running mission instance from a config
@@ -216,7 +216,7 @@ git pull
 cargo install --path . --force
 ```
 
-The `--force` flag tells cargo to replace the existing binary even when the source path or version metadata hasn't changed. Without it, cargo can silently skip the reinstall and leave you running an older binary while reporting the same `darkmux --version`. If a new feature (like `lab register`) is missing despite a fresh `git pull`, that's the most likely cause. Re-run with `--force`.
+The `--force` flag tells cargo to replace the existing binary even when the source path or version metadata hasn't changed. Without it, cargo can silently skip the reinstall and leave you running an older binary while reporting the same `darkmux --version`. If a new feature (like `lab fixture register`) is missing despite a fresh `git pull`, that's the most likely cause. Re-run with `--force`.
 
 ## Why this exists
 
@@ -361,8 +361,8 @@ The case for darkmux: **once you accept that static configs leave performance on
 **Shipped:**
 
 - ✅ Profile registry + `profile list`/`profile scan`/`profile draft` CLI, with `machine status` for the loaded-state read (the founding `swap` verb retired in 2.0; gestalt manages residency)
-- ✅ Lab subcommands (`run`/`inspect`/`compare`/`characterize`/`tune`/`runs`), `WorkloadProvider` trait, embedded smoke workloads, always-on cross-layer flow telemetry (#557)
-- ✅ Lab reproducibility (#487): per-run copy-on-write sandbox isolation (source never mutated), `baseline_hash` + `final_hash` content hashing in the run manifest, a fixture registry with `lab register`/`unregister`/`fixtures`/`doctor` verbs, workload `requires_fixture` resolution, and `scripts/lab-init.sh` + the built-in `demo-tiny-py` fixture
+- ✅ Lab subcommands (`run` + `run inspect`/`run compare`/`run list`, `characterize`/`tune`), `WorkloadProvider` trait, embedded smoke workloads, always-on cross-layer flow telemetry (#557)
+- ✅ Lab reproducibility (#487): per-run copy-on-write sandbox isolation (source never mutated), `baseline_hash` + `final_hash` content hashing in the run manifest, a fixture registry with `lab fixture register`/`unregister`/`list` + `lab doctor` verbs, workload `requires_fixture` resolution, and `scripts/lab-init.sh` + the built-in `demo-tiny-py` fixture
 - ✅ Lab notebook (`lab notebook draft`/`list`), cross-machine via `DARKMUX_NOTEBOOK_DIR`
 - ✅ Agent-invocable skills bundle (12 skills including `/darkmux-bootstrap`)
 - ✅ Crew + Role + Mission + Phase schema with SQLite-backed index; `mission propose` utility-AI verb; mission configs + `mission launch` as the config-launched instance-creation path

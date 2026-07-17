@@ -167,10 +167,10 @@ fn run(cmd: Cmd) -> Result<i32> {
     }
 }
 
-fn cmd_lessons(sub: LessonsCmd) -> Result<i32> {
+fn cmd_lessons(sub: LessonCmd) -> Result<i32> {
     use darkmux_crew::lessons;
     match sub {
-        LessonsCmd::Add {
+        LessonCmd::Add {
             title,
             body,
             file,
@@ -190,7 +190,7 @@ fn cmd_lessons(sub: LessonsCmd) -> Result<i32> {
             println!("{}", darkmux_types::style::dim(&format!("  {}", path.display())));
             Ok(0)
         }
-        LessonsCmd::List {
+        LessonCmd::List {
             json: cli::JsonFlagPlain { json },
         } => {
             let repo_path = lessons::repo_db_path();
@@ -222,7 +222,7 @@ fn cmd_lessons(sub: LessonsCmd) -> Result<i32> {
             print_lessons_tier("global (all engagements)", &global);
             Ok(0)
         }
-        LessonsCmd::Edit {
+        LessonCmd::Edit {
             id,
             title,
             body,
@@ -272,7 +272,7 @@ fn cmd_lessons(sub: LessonsCmd) -> Result<i32> {
                 Ok(1)
             }
         }
-        LessonsCmd::Remove { id, global } => {
+        LessonCmd::Remove { id, global } => {
             let (path, tier) = lessons_tier(global);
             let conn = lessons::open_at(&path)?;
             if lessons::remove(&conn, id)? {
@@ -291,7 +291,7 @@ fn cmd_lessons(sub: LessonsCmd) -> Result<i32> {
                 Ok(1)
             }
         }
-        LessonsCmd::Export { global } => {
+        LessonCmd::Export { global } => {
             let (path, _) = lessons_tier(global);
             // export reads the store; if absent, emit an empty envelope rather
             // than creating the db (a read must not write). Build the envelope
@@ -304,7 +304,7 @@ fn cmd_lessons(sub: LessonsCmd) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&env)?);
             Ok(0)
         }
-        LessonsCmd::Import { file, global } => {
+        LessonCmd::Import { file, global } => {
             let (path, tier) = lessons_tier(global);
             let data = match file {
                 Some(p) => std::fs::read_to_string(&p)
@@ -329,7 +329,7 @@ fn cmd_lessons(sub: LessonsCmd) -> Result<i32> {
             );
             Ok(0)
         }
-        LessonsCmd::Recall {
+        LessonCmd::Recall {
             term,
             file,
             json: cli::JsonFlagPlain { json },

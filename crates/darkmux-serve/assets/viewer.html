@@ -3532,7 +3532,7 @@ function renderLabRunsList(){
   const groups = groupLabRunsByTask(LAB_RUNS);
   const body = groups.length
     ? groups.map(renderLabTaskCard).join("")
-    : `<div class="none">no lab runs found under the configured lab dir yet — run <code>darkmux lab review-bench --funnel …</code> to produce one.</div>`;
+    : `<div class="none">no lab runs found under the configured lab dir yet — run <code>darkmux lab eval --funnel …</code> to produce one.</div>`;
   $("stage").innerHTML = `<div class="stagehdr">lab observer · ${LAB_RUNS.length} run${LAB_RUNS.length===1?"":"s"} · ${groups.length} task${groups.length===1?"":"s"}</div>${notice}
     <div class="lablist">${body}</div>`;
 }
@@ -3633,7 +3633,7 @@ function renderLabFeed(events){
 function labCliHint(env, scores){
   const crew = (env && env.crew) || (scores && scores.crew) || "<crew>";
   const mode = (env && env.mode) || (scores && scores.exec_mode) || "auto";
-  return `darkmux lab review-bench --funnel --crew ${crew} --exec-mode ${mode} --workdirs <workdirs-root> <cases-dir>`;
+  return `darkmux lab eval --funnel --roster-profile ${crew} --exec-mode ${mode} --workdirs <workdirs-root> <cases-dir>`;
 }
 function renderLabRun(){
   const dir = state.labRunDir;

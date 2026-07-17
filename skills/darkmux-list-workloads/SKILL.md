@@ -12,7 +12,7 @@ ARGUMENTS: none — this skill takes no arguments.
 ## Step 1 — List
 
 ```bash
-darkmux lab workloads
+darkmux lab workload list
 ```
 
 ## Step 2 — Output shape

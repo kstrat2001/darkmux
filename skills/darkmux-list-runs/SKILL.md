@@ -1,6 +1,6 @@
 ---
 name: darkmux-list-runs
-description: List recent darkmux lab runs in most-recent-first order. Use this to discover run IDs for 'darkmux-analyze-run' or 'darkmux-compare-runs'. Default shows the last 5 — pass --limit N for more, --all for everything.
+description: List recent darkmux lab run records in most-recent-first order. Use this to discover run IDs for 'darkmux-analyze-run' or 'darkmux-compare-runs'. Default shows the last 5 — pass --limit N for more, --all for everything.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*)"
 ---
@@ -14,7 +14,7 @@ ARGUMENTS expected (all optional):
 ## Step 1 — List
 
 ```bash
-darkmux lab runs $ARGUMENTS
+darkmux lab run list $ARGUMENTS
 ```
 
 `$ARGUMENTS` passes through directly to the CLI, so any of these work:

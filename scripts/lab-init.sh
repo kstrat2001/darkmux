@@ -93,7 +93,7 @@ fi
 echo "lab-init: found ${#fixtures_found[@]} built-in fixture(s) under $BUILTINS_DIR"
 
 # Register each. With --force we replace existing entries; otherwise
-# --if-absent makes `dm lab register` idempotent (#544): it exits 0
+# --if-absent makes `dm lab fixture register` idempotent (#544): it exits 0
 # whether it registered or skipped an already-present fixture, so a
 # re-run after `git pull` is clean WITHOUT parsing error text. (force
 # and if-absent are mutually exclusive; force wins.)
@@ -119,7 +119,7 @@ for fixture in "${fixtures_found[@]}"; do
     # Strip trailing slash for clean output.
     fixture_clean="${fixture%/}"
     if [ "$DRY" = true ]; then
-        echo "  [dry-run] darkmux lab register$register_args_str $fixture_clean"
+        echo "  [dry-run] darkmux lab fixture register$register_args_str $fixture_clean"
         ok=$((ok + 1))
         continue
     fi
@@ -132,7 +132,7 @@ for fixture in "${fixtures_found[@]}"; do
     # `${register_args[@]+"${register_args[@]}"}` is the bash-3.2-safe
     # empty-array expansion (macOS bash 3.2 trips `set -u` on a bare
     # `"${arr[@]}"` over an empty array; the `+`-guard expands to nothing).
-    if out="$(darkmux lab register ${register_args[@]+"${register_args[@]}"} "$fixture_clean" 2>&1)"; then
+    if out="$(darkmux lab fixture register ${register_args[@]+"${register_args[@]}"} "$fixture_clean" 2>&1)"; then
         # COSMETIC ONLY: a skip prints "skipped (--if-absent)"; matching it
         # just splits the summary counts. A miss mis-labels (counts as
         # registered) but never fails the run, so this grep is no longer
@@ -161,7 +161,7 @@ fi
 if [ "$DRY" = false ]; then
     echo ""
     echo "Next steps:"
-    echo "  darkmux lab fixtures              # confirm registrations"
+    echo "  darkmux lab fixture list              # confirm registrations"
     echo "  darkmux lab doctor                # lint the registry"
     echo "  darkmux lab run demo-quickstart   # end-to-end sanity check"
 fi

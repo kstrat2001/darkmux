@@ -261,7 +261,7 @@ fn bundle_inputs_from_set(set: &BundleSet, source: &FileSource) -> Result<Vec<Bu
 /// stream `dispatch`/`phase review` write through. This is the FLEET
 /// sink: `mission launch review` drives ONE case per invocation (a real PR
 /// review), so its run/step/ruling records belong on the operator's real
-/// engagement stream — contrast `darkmux lab review-bench --funnel`'s
+/// engagement stream — contrast `darkmux lab eval --funnel`'s
 /// per-run-local JSONL sink (lab-vs-fleet scope boundary). Failure to
 /// record is swallowed (`let _ =`) — same discipline as every other flow
 /// emit site; a flow-record write failure must never abort a review.

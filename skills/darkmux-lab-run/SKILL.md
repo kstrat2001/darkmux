@@ -12,7 +12,7 @@ ARGUMENTS expected: `<workload-id> [--profile <p>] [--runs N]`
 ## Step 1 — List available workloads (if user didn't specify)
 
 ```bash
-darkmux lab workloads
+darkmux lab workload list
 ```
 
 If the user's prompt didn't name a workload, surface the list and ask which to run.
@@ -41,7 +41,7 @@ Total wall depends on the workload — single-turn `prompt` workloads land in se
 ## Step 4 — Report
 
 For each run, report:
-- Run ID (use this for follow-up `darkmux lab inspect` calls)
+- Run ID (use this for follow-up `darkmux lab run inspect` calls)
 - Wall clock
 - ok / error
 - Verify outcome (pass/fail + details)
@@ -53,9 +53,9 @@ If `--runs N` was used (N > 1), produce a quick aggregate at the end: min / max 
 Some workloads declare `requires_fixture: "<name>@<version>"` — they need a registered fixture directory as their starting sandbox. If a run errors with a "no fixture satisfies" hint, the registry is missing the fixture. Check + repair with:
 
 ```bash
-darkmux lab fixtures                  # list registered fixtures
+darkmux lab fixture list                  # list registered fixtures
 darkmux lab doctor                    # offline integrity check (paths exist, hashes match)
-darkmux lab register ./path/to/fixture  # register a fixture by path (reads its .fixture.json)
+darkmux lab fixture register ./path/to/fixture  # register a fixture by path (reads its .fixture.json)
 scripts/lab-init.sh                   # populate the registry with built-in fixtures (e.g. demo-tiny-py)
 ```
 

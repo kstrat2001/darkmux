@@ -92,7 +92,7 @@ impl LabRegistry {
                 "parsing {} as lab registry — the file appears corrupt. \
                  New writes are atomic (#543), so this is most likely a legacy \
                  torn write or a bad hand-edit. Back it up and remove it to rebuild \
-                 from `scripts/lab-init.sh` (+ re-`darkmux lab register` any custom fixtures).",
+                 from `scripts/lab-init.sh` (+ re-`darkmux lab fixture register` any custom fixtures).",
                 path.display()
             )
         })?;

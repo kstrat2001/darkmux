@@ -45,20 +45,20 @@ fn parallel_lab_registers_keep_every_entry() {
         let name = format!("fix-{i:02}");
         handles.push(std::thread::spawn(move || {
             std::process::Command::new(&bin)
-                .args(["lab", "register", &fixture, "--name", &name])
+                .args(["lab", "fixture", "register", &fixture, "--name", &name])
                 .current_dir(&home)
                 .env("HOME", &home)
                 .env_remove("DARKMUX_HOME")
                 .output()
-                .expect("running `darkmux lab register`")
+                .expect("running `darkmux lab fixture register`")
         }));
     }
 
     for h in handles {
-        let out = h.join().expect("join lab register thread");
+        let out = h.join().expect("join lab fixture register thread");
         assert!(
             out.status.success(),
-            "lab register failed: stdout={} stderr={}",
+            "lab fixture register failed: stdout={} stderr={}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
