@@ -4046,33 +4046,37 @@
         let nodes = json["nodes"].as_array().unwrap();
         let count_kind = |kind: &str| nodes.iter().filter(|n| n["kind"] == kind).count();
         assert_eq!(count_kind("phase"), 3, "{nodes:?}");
-        assert_eq!(count_kind("task"), 7, "expected bundle+2 probes+dedup+judge+verify+synthesis: {nodes:?}");
+        // (#1442 ship-2b) The two expansion items here stand in for two
+        // (seat, draw) pairs — k is expansion fan-out, so the probe stage
+        // is one task per pair, each a generic dispatch.map step.
+        assert_eq!(count_kind("task"), 7, "expected bundle+2 probe maps+dedup+judge+verify+synthesis: {nodes:?}");
         // (#1401) No separate "step" node kind anymore — every task's
         // steps render as rows on ITS OWN node instead. Sum the `steps`
-        // array lengths across every task node: still 7 (every task in
-        // review.json is single-step), just no longer a separate node per
-        // step.
+        // array lengths across every task node: 8 (#1442 — the verify task
+        // is two sequential rows now: the frozen-prompt render, then the
+        // dispatch.map), no longer a separate node per step.
         assert_eq!(count_kind("step"), 0, "steps are rows now, not nodes (#1401): {nodes:?}");
         let total_step_rows: usize = nodes
             .iter()
             .filter(|n| n["kind"] == "task")
             .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
             .sum();
-        assert_eq!(total_step_rows, 7, "every task in review.json is single-step: {nodes:?}");
+        assert_eq!(total_step_rows, 8, "verify carries two rows (render + map): {nodes:?}");
         assert_eq!(tasks.len(), 7);
-        assert_eq!(steps.len(), 7);
+        assert_eq!(steps.len(), 8);
 
         // (#1402) Every row's label resolves through the real StepKind
-        // display-name fallback chain — a probe row (rendered per-seat
-        // kind id "review.probe:seat-a") still reads "Probe", the base
-        // label, not the raw suffixed id.
+        // display-name fallback chain — the probe/verify dispatch rows are
+        // generic `dispatch.map` steps (#1442) and read the BUILTIN
+        // registry's "Dispatch (map)" label; the bespoke review kinds keep
+        // their own labels.
         let all_labels: Vec<String> = nodes
             .iter()
             .filter(|n| n["kind"] == "task")
             .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
             .filter_map(|row| row["label"].as_str().map(String::from))
             .collect();
-        for expected in ["Bundle", "Probe", "Dedup", "Judge", "Verify", "Synthesis"] {
+        for expected in ["Bundle", "Dispatch (map)", "Dedup", "Judge", "Verify prompts", "Synthesis"] {
             assert!(
                 all_labels.iter().any(|l| l == expected),
                 "expected a \"{expected}\" row label among {all_labels:?}"

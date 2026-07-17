@@ -46,8 +46,11 @@ pub use builtins::{
     DispatchMapStepKind, DispatchSingleShotStepKind, FailedVerifier, MapItemResult,
     ProceduralNoopStepKind, ProceduralShellStepKind,
 };
+pub use builtins::MAP_BUDGET_SKIP_ERROR;
 pub use registry::StepKindRegistry;
-pub use types::{MapRemoteBucket, StepKind, StepOutcome, StepRunCtx};
+pub use types::{
+    MapDispatchOverride, MapRemoteBucket, OverrideDispatchCall, StepKind, StepOutcome, StepRunCtx,
+};
 
 /// Re-exported so callers OUTSIDE this crate (e.g. `darkmux`'s own
 /// `mission_run` — the `run_step_graph`/`StepKind::residency` caller for
