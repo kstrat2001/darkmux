@@ -63,7 +63,7 @@ fn build_version_static() -> &'static str {
 }
 
 #[derive(Parser)]
-#[command(name = "darkmux", version = build_version_static(), about = "Lab and multiplexer for local LLM configurations")]
+#[command(name = "darkmux", version = build_version_static(), about = "Mission orchestrator and lab for local AI")]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Cmd,
@@ -271,7 +271,7 @@ pub(crate) enum Cmd {
     },
     /// Read/write `~/.darkmux/config.json` settings (#937). `set` validates the
     /// key + coerces the value; secrets stay in the Keychain. Distinct from
-    /// `profile` (the swap-profiles registry).
+    /// `profile` (the profiles registry).
     Config {
         #[command(subcommand)]
         sub: crate::config_cmd::ConfigCmd,
