@@ -490,12 +490,26 @@ impl StepKind for DispatchSingleShotStepKind {
 /// carries). Local items never touch it. A `budget` of 0 is exhausted from
 /// the FIRST item (`used (0) >= budget (0)`), so a zero allowance refuses
 /// every hosted call in the collection — the same hard opt-out
-/// `admit_remote_execution` gives a single hosted dispatch. Cross-STEP
-/// sharing (one bucket across sibling `dispatch.map` steps of the same
-/// stage) is the SAME deferred concern `DispatchSingleShotStepKind`'s own
-/// doc names (#1414): a Tier 1 config-driven kind holds no caller-supplied
-/// `Arc`, so the bucket is step-scoped here — enough to bound one step's
-/// whole collection, which is what "bucket exhaustion mid-collection" means.
+/// `admit_remote_execution` gives a single hosted dispatch.
+///
+/// **Budget-0 contract divergence, named (#1442 gate):** where CLAUDE.md's
+/// `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` doc promises "setting it to 0
+/// refuses all remote calls with a typed error," `dispatch.single_shot`'s
+/// hosted arm honors that as a step-level `Err` (`admit_remote_execution`);
+/// `dispatch.map` instead completes `Ok` with EVERY item skipped and the
+/// budget reason named per item. Coherent for a map — surviving partial
+/// failure is its whole point, and an all-skipped result array is louder
+/// per item than one opaque step error — but the two surfaces do differ,
+/// and this sentence is where that difference is recorded.
+///
+/// **Allowance multiplication, for the ship-2b follow-on (#1442):** the
+/// review pipeline today shares ONE stage bucket across every probe seat
+/// (`Arc<Mutex<RemoteBucket>>` cloned into each `ReviewProbeStepKind`).
+/// Restructuring probe onto seats x k sibling `dispatch.map` steps gives
+/// each step its OWN full per-execution allowance — multiplying the
+/// effective stage budget by the step count. The follow-on must resolve
+/// that deliberately (a shared bucket-group mechanism, or an explicitly
+/// accepted per-step reading), never inherit it silently.
 struct MapRemoteBucket {
     budget: u64,
     used: u64,
@@ -508,6 +522,12 @@ impl MapRemoteBucket {
     }
     fn exhausted(&self) -> bool {
         self.used >= self.budget
+    }
+    /// What is left to grant a single call (#1442 gate C6): per-item
+    /// `max_tokens` clamps to THIS, not the full budget, so one late item
+    /// cannot request more than the bucket has left.
+    fn remaining(&self) -> u64 {
+        self.budget.saturating_sub(self.used)
     }
     /// `false` ⇒ the bucket is exhausted and this item's call must not fire
     /// (counted as skipped, for the item's named-reason result).
@@ -522,6 +542,16 @@ impl MapRemoteBucket {
     fn spend(&mut self, tokens: u64) {
         self.used = self.used.saturating_add(tokens);
     }
+}
+
+/// (#1442 gate C4) What one hosted map item SPENDS from the bucket: the
+/// reply's reported `usage.total_tokens` when present, else — conservatively
+/// — the clamped `max_tokens` the call was granted. An endpoint that omits
+/// usage entirely must not mint an infinite allowance (spending 0 per call
+/// would let an omitting endpoint dispatch the whole collection off the
+/// meter); over-counting a capped grant is the safe direction.
+fn conservative_hosted_spend(total_tokens: Option<u64>, granted_max_tokens: u32) -> u64 {
+    total_tokens.unwrap_or(u64::from(granted_max_tokens))
 }
 
 /// (#1442) One `dispatch.map` item's outcome, serialized (in input-collection
@@ -557,21 +587,61 @@ fn map_item_text(v: &serde_json::Value) -> String {
 /// Resolve a `dispatch.map` step's collection. Precedence: an explicit
 /// `config.collection` JSON array wins; otherwise the collection is a RUNTIME
 /// INPUT — the dependency output named by `config.collection_input`, or (when
-/// the step has exactly one dependency) that one input. An absent/empty
-/// source is an empty collection (a real zero — the upstream produced
-/// nothing), not an error. A present-but-non-array source is a loud `Err`
-/// (`run` surfaces it; `residency` stays best-effort and swallows it) — a
-/// malformed handoff must never masquerade as an empty collection.
+/// the step has exactly one dependency) that one input.
+///
+/// **Loud on every typo-shaped source (#1442 gate — the #1418 class: a
+/// silent empty masks a config typo as a clean no-op run):**
+/// - a present-but-non-array `config.collection` is a loud `Err`, never a
+///   silent fall-through to input resolution;
+/// - a `collection_input` naming a key ABSENT from `input` is a loud `Err`
+///   naming the missing key AND the inputs actually present;
+/// - two or more dependency inputs with NO `collection_input` is a loud
+///   `Err` ("name one") — returning empty there would not be a refusal to
+///   guess, it would BE a guess ("there is no collection");
+/// - a present-but-non-array INPUT source is a loud `Err` too.
+///
+/// What stays a REAL empty (and short-circuits cleanly): a genuinely absent
+/// source (no `collection` key, no `collection_input`, zero dependency
+/// inputs) and a present-but-blank source string (the upstream truly
+/// produced nothing). `run` surfaces every `Err` here; `residency` stays
+/// best-effort and swallows them (see its doc).
 fn resolve_map_collection(
     step: &Step,
     input: &BTreeMap<String, String>,
 ) -> Result<Vec<serde_json::Value>> {
-    if let Some(arr) = step.config.get("collection").and_then(|v| v.as_array()) {
-        return Ok(arr.clone());
+    if let Some(v) = step.config.get("collection") {
+        return match v.as_array() {
+            Some(arr) => Ok(arr.clone()),
+            None => bail!(
+                "step `{}`: `dispatch.map` config.collection must be a JSON array",
+                step.id
+            ),
+        };
     }
+    let present_keys = || {
+        if input.is_empty() {
+            "none".to_string()
+        } else {
+            input.keys().cloned().collect::<Vec<_>>().join(", ")
+        }
+    };
     let source: Option<&String> = match config_str(step, "collection_input") {
-        Some(key) => input.get(key),
+        Some(key) => match input.get(key) {
+            Some(s) => Some(s),
+            None => bail!(
+                "step `{}`: `dispatch.map` config.collection_input names `{key}`, which is \
+                 not among this step's dependency inputs (present: {})",
+                step.id,
+                present_keys()
+            ),
+        },
         None if input.len() == 1 => input.values().next(),
+        None if input.len() > 1 => bail!(
+            "step `{}`: `dispatch.map` has two or more dependency inputs ({}) and no \
+             config.collection_input — name which input carries the collection",
+            step.id,
+            present_keys()
+        ),
         None => None,
     };
     let Some(source) = source else {
@@ -622,6 +692,15 @@ fn resolve_map_collection(
 /// only), `timeout_seconds` (u32, default 120), `endpoint`
 /// (`darkmux_types::ModelEndpoint` JSON — presence selects the HOSTED
 /// dialect), `n_ctx`/`identifier` (residency hints — see [`Self::residency`]).
+///
+/// **Templating boundary (by design, #1442).** `user_template` can reference
+/// ONLY `{item}` — never another dependency's output. A consumer that needs
+/// richer per-item prompts pre-renders each full prompt UPSTREAM and passes
+/// the rendered strings as the collection items themselves, with
+/// `user_template: "{item}"` verbatim. This is deliberate foreclosure: the
+/// moment this block learns to weave other inputs into a template it starts
+/// growing mission-specific templating (the review pipeline being the
+/// obvious tempter), and it stops being a Tier 1 generic block.
 ///
 /// **Per-item error isolation (the defined policy).** A dispatch error for
 /// ONE item is captured into that item's [`MapItemResult`] (`ok: false`,
@@ -675,6 +754,53 @@ impl DispatchMapStepKind {
                 "remote": remote,
                 "total_tokens": res.total_tokens,
                 "error": res.error,
+            })),
+            work_id: None,
+            attempt: None,
+        }
+    }
+
+    /// (#1442 gate C1) The ONE step-level aggregate record emitted after the
+    /// whole loop: items_in, ok_count, failed_count, remote, and SUMMED
+    /// total_tokens across every item. See the emission site in `run` for
+    /// why the sum (not the per-item values) is what the mission graph's
+    /// max-fold token meter must see.
+    fn aggregate_record(
+        step: &Step,
+        model: &str,
+        remote: bool,
+        results: &[MapItemResult],
+    ) -> darkmux_flow::FlowRecord {
+        let ok_count = results.iter().filter(|r| r.ok).count();
+        let failed_count = results.len() - ok_count;
+        let total_tokens: u64 = results.iter().filter_map(|r| r.total_tokens).sum();
+        darkmux_flow::FlowRecord {
+            ts: darkmux_flow::ts_utc_now(),
+            level: if failed_count == 0 { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
+            category: darkmux_flow::Category::Work,
+            tier: darkmux_flow::Tier::Local,
+            stage: darkmux_flow::Stage::Dispatch,
+            action: "step result".to_string(),
+            handle: step.id.clone(),
+            phase_id: None,
+            session_id: Some(format!("task:{}", step.task_id)),
+            source: Some("scheduler".to_string()),
+            model: Some(model.to_string()),
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            machine_uid: None,
+            orchestrator: None,
+            prev_hash: None,
+            hash: None,
+            payload: Some(serde_json::json!({
+                "step_id": step.id,
+                "kind": "dispatch.map",
+                "items_in": results.len(),
+                "ok_count": ok_count,
+                "failed_count": failed_count,
+                "remote": remote,
+                "total_tokens": total_tokens,
             })),
             work_id: None,
             attempt: None,
@@ -776,7 +902,10 @@ impl StepKind for DispatchMapStepKind {
                         total_tokens: None,
                     }
                 } else {
-                    let clamped = clamp_hosted_max_tokens(max_tokens, budget);
+                    // (#1442 gate C6) Clamp to what the bucket has LEFT, not
+                    // the full budget — a late item must not be granted more
+                    // than the remaining allowance.
+                    let clamped = clamp_hosted_max_tokens(max_tokens, bucket.remaining());
                     let req = HostedSingleShotRequest {
                         endpoint: ep,
                         model,
@@ -787,7 +916,7 @@ impl StepKind for DispatchMapStepKind {
                     };
                     match single_shot_chat_hosted(&req) {
                         Ok(reply) => {
-                            bucket.spend(reply.total_tokens.unwrap_or(0));
+                            bucket.spend(conservative_hosted_spend(reply.total_tokens, clamped));
                             MapItemResult {
                                 index,
                                 ok: true,
@@ -840,6 +969,15 @@ impl StepKind for DispatchMapStepKind {
             results.push(res);
         }
 
+        // (#1442 gate C1) ONE step-level aggregate record after the loop.
+        // Load-bearing: the mission graph's token meter folds "step result"
+        // token fields per step with Math.max (a one-record-per-step
+        // assumption) — with only N per-item records, a map step's meter
+        // would render as the LARGEST single item, not the step's spend. The
+        // aggregate's SUMMED total_tokens is >= every per-item value, so the
+        // existing max-fold reads the true spend with zero viewer changes.
+        flow_records.push(Self::aggregate_record(step, model, endpoint.is_some(), &results));
+
         let output = serde_json::to_string(&results).context("serializing dispatch.map results")?;
         Ok(StepOutcome { output, flow_records })
     }
@@ -878,7 +1016,9 @@ impl StepKind for DispatchMapStepKind {
             model_key: model.to_string(),
             identifier,
             min_ctx,
-            seat: format!("map:{}", step.id),
+            // (#1442 gate C7) "step:<id>", consistent with the placement
+            // provenance `dispatch.internal`'s residency uses.
+            seat: format!("step:{}", step.id),
         })
     }
 }
@@ -1181,20 +1321,65 @@ mod tests {
     }
 
     #[test]
-    fn resolve_map_collection_absent_or_empty_source_is_an_empty_collection() {
-        // No config.collection, no inputs.
+    fn resolve_map_collection_truly_absent_or_blank_source_is_an_empty_collection() {
+        // No config.collection, no collection_input, ZERO inputs — the one
+        // genuinely collection-less shape that stays a real, silent zero.
         let s = map_step(json!({}));
         assert!(resolve_map_collection(&s, &BTreeMap::new()).unwrap().is_empty());
-        // A present-but-blank input string is a real zero, not an error.
+        // A present-but-blank input string is a real zero too (the upstream
+        // truly produced nothing), not an error.
         let mut input = BTreeMap::new();
         input.insert("u".to_string(), "   ".to_string());
         assert!(resolve_map_collection(&s, &input).unwrap().is_empty());
-        // Ambiguous (two inputs, no collection_input) resolves to empty
-        // rather than guessing which is the collection.
+    }
+
+    #[test]
+    fn resolve_map_collection_two_inputs_without_collection_input_is_a_loud_error() {
+        // (#1442 gate MUST FIX iii) Two or more dependency inputs and no
+        // collection_input bails — resolving to empty would not be a refusal
+        // to guess, it would BE a guess ("there is no collection").
+        let s = map_step(json!({}));
         let mut two = BTreeMap::new();
         two.insert("a".to_string(), r#"["x"]"#.to_string());
         two.insert("b".to_string(), r#"["y"]"#.to_string());
-        assert!(resolve_map_collection(&s, &two).unwrap().is_empty());
+        let err = resolve_map_collection(&s, &two).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("two or more dependency inputs"), "{msg}");
+        assert!(msg.contains("collection_input"), "the fix is named: {msg}");
+        assert!(msg.contains("a, b"), "the ambiguous inputs are listed: {msg}");
+    }
+
+    #[test]
+    fn resolve_map_collection_missing_named_input_key_is_a_loud_error() {
+        // (#1442 gate MUST FIX i) A collection_input naming a key absent from
+        // the gathered inputs is a typo-shaped config error — bail naming the
+        // missing key AND the inputs actually present, never a silent empty.
+        let s = map_step(json!({ "collection_input": "bundles" }));
+        let mut input = BTreeMap::new();
+        input.insert("upstream".to_string(), r#"["x"]"#.to_string());
+        let err = resolve_map_collection(&s, &input).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`bundles`"), "the missing key is named: {msg}");
+        assert!(msg.contains("upstream"), "the present inputs are named: {msg}");
+
+        // Zero inputs at all: same loud error, with "none" as the roster.
+        let err = resolve_map_collection(&s, &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("none"), "{err}");
+    }
+
+    #[test]
+    fn resolve_map_collection_non_array_config_collection_is_a_loud_error() {
+        // (#1442 gate MUST FIX ii) A present-but-non-array config.collection
+        // bails, matching the input-side non-array error's loudness — it must
+        // never silently fall through to input resolution.
+        let s = map_step(json!({ "collection": "not-an-array" }));
+        let mut input = BTreeMap::new();
+        input.insert("u".to_string(), r#"["would-be-used-on-fallthrough"]"#.to_string());
+        let err = resolve_map_collection(&s, &input).unwrap_err();
+        assert!(
+            err.to_string().contains("config.collection must be a JSON array"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1250,6 +1435,9 @@ mod tests {
         assert_eq!(placement.model_key, "qwen3.6-35b-a3b");
         assert_eq!(placement.min_ctx, 8192);
         assert!(placement.identifier.starts_with("darkmux:"), "default identifier is namespaced: {}", placement.identifier);
+        // (#1442 gate C7) "step:<id>", consistent with dispatch.internal's
+        // placement provenance.
+        assert_eq!(placement.seat, "step:m1");
     }
 
     #[test]
@@ -1295,6 +1483,64 @@ mod tests {
     }
 
     #[test]
+    fn map_remote_bucket_remaining_shrinks_with_spend_and_never_underflows() {
+        // (#1442 gate C6) The per-item clamp target: what is LEFT, not the
+        // full budget — a late item must not be granted more than remains.
+        let mut b = MapRemoteBucket::new(100);
+        assert_eq!(b.remaining(), 100);
+        b.spend(70);
+        assert_eq!(b.remaining(), 30, "a later item's grant clamps to 30, not 100");
+        assert_eq!(
+            clamp_hosted_max_tokens(4096, b.remaining()),
+            30,
+            "the clamp reads the remaining allowance"
+        );
+        b.spend(60); // overshoot: used 130 > budget 100
+        assert_eq!(b.remaining(), 0, "saturating, never an underflow wrap");
+    }
+
+    #[test]
+    fn conservative_hosted_spend_charges_the_granted_cap_when_usage_is_omitted() {
+        // (#1442 gate C4) A reply that reports usage spends what it reports;
+        // a reply that OMITS usage spends the clamped max_tokens it was
+        // granted — an omitting endpoint must not mint an infinite allowance.
+        assert_eq!(conservative_hosted_spend(Some(1234), 4096), 1234);
+        assert_eq!(conservative_hosted_spend(None, 4096), 4096);
+        assert_eq!(conservative_hosted_spend(None, 0), 0);
+    }
+
+    #[test]
+    fn dispatch_map_aggregate_record_sums_tokens_and_counts_outcomes() {
+        // (#1442 gate C1) The one step-level aggregate: items_in, ok_count,
+        // failed_count, remote, and SUMMED total_tokens — the record the
+        // mission graph's max-fold token meter reads as the step's true
+        // spend (any per-item value is <= the sum).
+        let results = vec![
+            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100) },
+            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None },
+            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250) },
+        ];
+        let s = map_step(json!({}));
+        let rec = DispatchMapStepKind::aggregate_record(&s, "m", true, &results);
+        let p = rec.payload.as_ref().unwrap();
+        assert_eq!(p["kind"], "dispatch.map");
+        assert_eq!(p["items_in"], 3);
+        assert_eq!(p["ok_count"], 2);
+        assert_eq!(p["failed_count"], 1);
+        assert_eq!(p["remote"], true);
+        assert_eq!(p["total_tokens"], 350, "summed across items, absent usage counted as 0 here");
+        assert!(
+            matches!(rec.level, darkmux_flow::Level::Warn),
+            "any failed item raises the level"
+        );
+
+        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5) }];
+        let rec = DispatchMapStepKind::aggregate_record(&s, "m", false, &clean);
+        assert!(matches!(rec.level, darkmux_flow::Level::Info));
+        assert_eq!(rec.payload.as_ref().unwrap()["remote"], false);
+    }
+
+    #[test]
     #[serial_test::serial]
     fn dispatch_map_local_per_item_error_isolation_continues_past_a_failure() {
         // Point the local dialect at an unroutable endpoint (port 1 refuses
@@ -1321,8 +1567,14 @@ mod tests {
         assert!(results.iter().all(|r| r.error.is_some()), "each failure named");
         assert_eq!(results[0].index, 0);
         assert_eq!(results[2].index, 2);
-        // A per-item flow record was emitted for every item.
-        assert_eq!(out.flow_records.len(), 3);
+        // A per-item flow record for every item, PLUS the one step-level
+        // aggregate after the loop (#1442 gate C1) — 3 + 1.
+        assert_eq!(out.flow_records.len(), 4);
+        let agg = out.flow_records.last().unwrap().payload.as_ref().unwrap();
+        assert_eq!(agg["items_in"], 3);
+        assert_eq!(agg["ok_count"], 0);
+        assert_eq!(agg["failed_count"], 3);
+        assert_eq!(agg["total_tokens"], 0);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(url_key, v),
