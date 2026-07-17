@@ -141,7 +141,7 @@ The `<new-machine-tailnet-addr>` is THIS machine's Tailscale IP / Magic DNS name
 
 Surface this clearly to the operator:
 
-> Adding a peer to a fleet currently requires running `fleet add` on every existing fleet member's machine. Cross-machine roster replication is filed as #280 and will close that loop. For now, walk over to each of your other Macs and run `fleet add <this-id> --address <addr>:8765` once.
+> Adding a peer to a fleet currently requires running `machine add` on every existing fleet member's machine. Cross-machine roster replication is filed as #280 and will close that loop. For now, walk over to each of your other Macs and run `darkmux machine add <this-id> --address <addr>:8765` once.
 
 ## Step 8 — Smoke test: cross-fleet flow record
 

@@ -228,7 +228,7 @@ src/
   main.rs                    CLI dispatch (clap)
   types.rs                   Profile / ProfileRegistry / ProfileModel
   profiles.rs                Registry loader + lookup
-  swap.rs / lms.rs           Stack swap orchestration + lms CLI wrapper
+  swap.rs / lms.rs           darkmux: namespace helpers + lms CLI wrapper
   init.rs / skills.rs        `darkmux init` + skill installer
   notebook.rs                Notebook draft generator
   lab/
@@ -270,7 +270,6 @@ templates/builtin/
   skills/                     Skill library embedded at compile time (work-shape descriptors with keyword routing; renamed from `capabilities/` in refactor 0 — see #448)
   workloads/                  Workload manifests embedded at compile time
   lab-fixtures/               Built-in lab fixtures (e.g. demo-tiny-py) registered via scripts/lab-init.sh
-  recommendations/            Tier-aware recommendation registry
   AUTONOMOUS_DISPATCH_PREAMBLE.md  Injected ahead of specialist-role dispatches (#427)
 scripts/lab-init.sh           Standalone fixture-registry bootstrapper (NOT a CLI verb; #487 phase 5)
 skills/darkmux-<name>/        Agent-invokable skill wrappers
@@ -383,7 +382,7 @@ Live findings from cross-machine testing (M1 Max Studio fresh-Claude session, 20
 
 - **Empirical defaults are load-bearing, not decorative.** When choosing compaction modes, context windows, or compactor pairings, the shipped profile defaults (`default` mode beats `safeguard` for local; small dedicated compactor at ~68K cuts wall-clock substantially) reflect measured configurations, not arbitrary picks. Don't deviate from a profile's settings without acknowledging the empirical reason — the operator has chosen them deliberately.
 
-- **Name the model-on-test when characterizing local-AI behavior.** darkmux uses a bake-off methodology to validate model hires per hardware tier — a documented head-to-head comparison with criteria written before the runs (tracked in the recommendation registry, [#159](https://github.com/kstrat2001/darkmux/issues/159)). But what's actually loaded in LMStudio at any moment may differ from the registry's pick — operators swap for reasons (debugging, A/B comparison, evaluating a new candidate, defensive escalation, or simply not having swapped back after a focused test). When you (the orchestrator) characterize behavior from a dispatch — *"the local layer's response was X"* — **know which model produced it**. `darkmux doctor` shows the active profile; `lms ps` shows the loaded models. If the loaded model differs from the recommended hire and the analysis is making generalizable claims about *the local layer*, name the model explicitly. Silent misattribution (analyzing dispatch outputs as if from the recommended model when they're actually from a reserve / candidate) inherits class-wide errors into every downstream claim. The architectural fixes are tracked as [#159](https://github.com/kstrat2001/darkmux/issues/159) (recommendation registry per hardware tier) and [#160](https://github.com/kstrat2001/darkmux/issues/160) (per-role `agent.model` pinning); this anti-pattern is the awareness layer until both ship. *Not restriction — operators have preferences and models evolve.* Just awareness, surfaced.
+- **Name the model-on-test when characterizing local-AI behavior.** darkmux uses a bake-off methodology to validate model hires per hardware tier — a documented head-to-head comparison with criteria written before the runs (documented in the lab + notebook; the static per-tier recommendation registry from [#159](https://github.com/kstrat2001/darkmux/issues/159) retired in #1426). But what's actually loaded in LMStudio at any moment may differ from the registry's pick — operators swap for reasons (debugging, A/B comparison, evaluating a new candidate, defensive escalation, or simply not having swapped back after a focused test). When you (the orchestrator) characterize behavior from a dispatch — *"the local layer's response was X"* — **know which model produced it**. `darkmux doctor` shows the active profile; `lms ps` shows the loaded models. If the loaded model differs from the recommended hire and the analysis is making generalizable claims about *the local layer*, name the model explicitly. Silent misattribution (analyzing dispatch outputs as if from the recommended model when they're actually from a reserve / candidate) inherits class-wide errors into every downstream claim. Per-role `agent.model` pinning is tracked as [#160](https://github.com/kstrat2001/darkmux/issues/160); this anti-pattern is the awareness layer until it ships. *Not restriction — operators have preferences and models evolve.* Just awareness, surfaced.
 
 ## Operator sovereignty (architectural principle)
 

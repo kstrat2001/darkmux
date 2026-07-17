@@ -1273,7 +1273,6 @@ mod tests {
             schema_version: None,
             extras: Default::default(),
             profiles,
-            hooks: None,
             default_profile: None,
             internal: None,
             crews: Default::default(),

@@ -24,7 +24,7 @@ darkmux started as ~200 lines that collapsed a manual sequence:
 lms unload <model> ; lms load <model> --context-length N --identifier <id>   # repeated per model, per profile
 ```
 
-into one `darkmux` profile-multiplexer command. No proxy, no classifier, no daemon. The bet was modest: switching local-model *stacks* (model + context window + compaction settings together) is enough recurring friction that a one-command profile multiplexer earns its keep. It still does. `swap` is the floor, and everything since builds up from it rather than replacing it.
+into one `darkmux` profile-multiplexer command. No proxy, no classifier, no daemon. The bet was modest: switching local-model *stacks* (model + context window + compaction settings together) is enough recurring friction that a one-command profile multiplexer earns its keep. It did — and in 2.0 that multiplexer moved inside gestalt (the residency arbiter loads what each dispatch's staffing declares; the manual `swap` verb retired, #1426). The profile stack remains the floor, and everything since builds up from it rather than replacing it.
 
 ### The pivot — "check the harness before the model"
 
