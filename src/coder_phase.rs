@@ -1991,7 +1991,10 @@ pub fn nudge_mission_debrief(mission_id: &str) {
         action: "mission.debrief.prompt".to_string(),
         handle: mission_id.to_string(),
         phase_id: None,
-        session_id: Some(format!("mission:{mission_id}")),
+        // (#1436) The canonical mission-lifecycle session id — the same hyphen
+        // form the close transition just emitted under, so the debrief prompt
+        // lands in the SAME viewer session bucket as the close record.
+        session_id: Some(darkmux_types::session_id::mission(mission_id)),
         source: Some("mission_debrief".to_string()),
         model: None,
         reasoning: None,
@@ -2203,8 +2206,8 @@ fn pr_body(mission: &crew::types::Mission, phase: &crew::types::Phase) -> String
          - **Mission:** `{mission_id}` — {mission_desc}\n\
          - **Phase:** `{phase_id}`\n\n\
          The implementation was produced by the local-AI coder under \
-         `darkmux mission run` and reviewed by the local `code-reviewer` before \
-         sign-off. The frontier/operator adjudicated the QA findings at the gate.",
+         `darkmux mission launch coder-phase` and reviewed by the local \
+         `code-reviewer` before sign-off. The frontier/operator adjudicated the QA findings at the gate.",
         phase_desc = phase.description.lines().next().unwrap_or("").trim(),
         mission_id = mission.id,
         mission_desc = mission.description.lines().next().unwrap_or("").trim(),
@@ -2417,7 +2420,8 @@ pub fn ship(
 
     if !wt_path.exists() {
         bail!(
-            "no worktree at {} — run `darkmux mission run {mission_id} --phase {}` first.",
+            "no worktree at {} — run `darkmux mission launch coder-phase` for this phase \
+             first (phase `{}`).",
             wt_path.display(),
             phase.id
         );
@@ -2453,7 +2457,7 @@ pub fn ship(
         &phase, &mission, "commit subject",
     );
         let msg = format!(
-            "{subject}\n\nAuthored via `darkmux mission run` (local-AI coder, phase {}).",
+            "{subject}\n\nAuthored via `darkmux mission launch coder-phase` (local-AI coder, phase {}).",
             phase.id
         );
         // (#834) Commit under the declared bot identity when the repo's
@@ -2534,7 +2538,7 @@ pub fn ship(
                 // fail the whole dispatch over a bad label.
                 if !crate::conventions::valid_label(l) {
                     eprintln!(
-                        "darkmux mission run: skipping unsafe pr label {l:?} \
+                        "darkmux mission ship: skipping unsafe pr label {l:?} \
                          (empty or starts with `-` — would parse as a gh flag)"
                     );
                     continue;
@@ -2604,7 +2608,7 @@ pub fn ship(
                     "  the PR is open ({pr_url}) and the worktree is intact — nothing was \
                      discarded. Review the diff + SIGNOFF; if verification really is sound, merge \
                      manually (`gh pr merge {branch} --squash`). If the toolchain was broken, fix \
-                     it and re-run `darkmux mission run {mission_id} --phase {}`.",
+                     it and relaunch the phase (`darkmux mission launch coder-phase`, phase `{}`).",
                     phase.id
                 ))
             );

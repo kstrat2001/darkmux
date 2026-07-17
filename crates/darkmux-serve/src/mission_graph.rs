@@ -348,7 +348,7 @@ fn current_millis() -> u64 {
 
 // ─── Step kind display-name fallback chain (#1402) ─────────────────────
 
-/// (#1402) Static kind-id → display-name table for `src/mission_run.rs`'s
+/// (#1402) Static kind-id → display-name table for `src/coder_phase.rs`'s
 /// three Tier 3 `mission.*` kinds — `darkmux-serve` structurally cannot
 /// depend on the root `darkmux` binary crate (that crate depends on
 /// `darkmux-serve` to embed the daemon; the reverse edge would be
@@ -358,9 +358,9 @@ fn current_millis() -> u64 {
 /// directly. It's a literal duplication, guarded per #1352's "a
 /// conformance test in a crate that sees both is acceptable and preferred
 /// over duplication without a guard": the root crate (which depends on
-/// BOTH this crate and owns `mission_run.rs`) pins this table against the
+/// BOTH this crate and owns `coder_phase.rs`) pins this table against the
 /// live impls in its own test suite
-/// (`mission_run::tests::mission_step_kind_display_names_match_this_table`).
+/// (`coder_phase::tests::mission_step_kind_display_names_match_this_crates_static_table`).
 pub fn mission_step_kind_display_name(kind: &str) -> Option<&'static str> {
     match kind {
         "mission.worktree" => Some("Worktree"),
@@ -576,7 +576,7 @@ fn split_on_placeholders(pattern: &str) -> Vec<String> {
 /// corrupt single files show up in practice.
 ///
 /// **Mid-run step synthesis:** the three production graph runners persist
-/// Step JSONs only AFTER `run_step_graph` returns (`mission_run.rs`,
+/// Step JSONs only AFTER `run_step_graph` returns (`coder_phase.rs`,
 /// `mission_launch.rs`, `review.rs`) — so a page opened DURING a run sees
 /// tasks whose `step_ids` name steps with no file on disk yet. Rather than
 /// omitting those rows (which would leave the SSE layer with no row to

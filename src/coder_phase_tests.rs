@@ -222,6 +222,56 @@
         assert!(!coder_brief(&s, &m, &[], &corrections, &cautions).contains("<lessons>"));
     }
 
+    /// (#1256 frozen-text / #1426 ship-4) GOLDEN: the FULLY-ASSEMBLED coder
+    /// brief with the operator source-input and ALL THREE injected blocks
+    /// populated, byte-locked. The launch coder-phase path is now the ONLY
+    /// producer of this model-facing text; per the frozen-model-facing-text
+    /// contract, "frozen" means one hash — a drive-by rewording of any block's
+    /// framing (or a lost block, the class of the retired-verb collapse's
+    /// near-miss) fails here, not in production dispatches.
+    #[test]
+    fn coder_brief_fully_assembled_matches_the_golden_byte_for_byte() {
+        let m = {
+            let mut m = mission("m-golden", "improve the widget pipeline");
+            m.source_input = Some("Original operator request: make widgets faster.".to_string());
+            m
+        };
+        let p = phase("s1", "m-golden", PhaseStatus::Running);
+        let brief = coder_brief(
+            &p,
+            &m,
+            &["Always run the linter — CI enforces it.".to_string()],
+            &["Do not rename the config field — downstream parses it.".to_string()],
+            &["edit loop detected on src/widget.rs in an earlier dispatch".to_string()],
+        );
+        let golden = r#"desc s1
+
+<operator-source-input>
+The user's original, unabridged request that produced this phase. The summary above is derived from it; where this text adds constraints, exact strings, or scope limits beyond the summary, THIS text is authoritative.
+
+Original operator request: make widgets faster.
+</operator-source-input>
+
+<lessons>
+The user recorded these conventions and decisions for this codebase — the rules the team actually follows and the reasoning behind them. Treat them as authoritative: follow them, and prefer them over a generic default when they conflict. If one is clearly stale against the current code, say so in your final message rather than silently ignoring it:
+
+Always run the linter — CI enforces it.
+</lessons>
+
+<prior-adjudication-corrections>
+The user's reviewer recorded these corrections while reviewing earlier dispatches in this mission. Treat each as a finding from an earlier context, not a fact about your current workspace. If a correction names a concrete change (a renamed field, a config key, a command, an exact string), check it against the code or by running the command it names, and apply it if it holds. If it names a diagnosis (a race condition, a broken invariant, a failing test), reproduce the specific claim before changing anything: run the test or trace the code path it names. If a correction does not hold against your current workspace, say so in your final message and re-diagnose; if re-diagnosis does not converge quickly, surface the blocker and stop rather than looping:
+
+- Do not rename the config field — downstream parses it.
+</prior-adjudication-corrections>
+
+<detected-cautions>
+darkmux's loop detectors flagged these patterns in earlier dispatches in this mission — repeated tool calls, looping reasoning, tool-failure cascades. They are signals from earlier contexts, not facts about your current workspace: a pattern that fired earlier may be irrelevant now. Use them to avoid walking back into a known dead end — if you notice yourself about to repeat one, stop and change your approach. None of these is a required action:
+
+edit loop detected on src/widget.rs in an earlier dispatch
+</detected-cautions>"#;
+        assert_eq!(brief, golden, "the assembled coder brief is frozen model-facing text (#1256)");
+    }
+
     /// (#994) `engagement_lessons` reads the lessons.db store and formats
     /// entries as bullets — the file scope rendered as the "where", the why in
     /// the body. `#[serial]` — mutates DARKMUX_HOME (which collapses both
@@ -768,6 +818,15 @@
                     && r.get("mission_id").and_then(|v| v.as_str()) == Some("m-x")
                 {
                     found = true;
+                    // (#1436) The prompt joins the mission's lifecycle session
+                    // bucket under the canonical HYPHEN form — the colon form
+                    // (`mission:m-x`) is retired; a regression to it splits the
+                    // viewer's session grouping between close and debrief.
+                    assert_eq!(
+                        r.get("session_id").and_then(|v| v.as_str()),
+                        Some("mission-m-x"),
+                        "debrief prompt must carry the canonical hyphen session id"
+                    );
                 }
             }
         }
@@ -1185,7 +1244,7 @@
     /// Docker — pure git plumbing) — proves the migrated worktree step
     /// reproduces `add_worktree`'s two real-world outcomes: a clean
     /// creation, and the "already exists" bail on a second run for the
-    /// same phase (the exact scenario a resumed/un-shipped `mission run`
+    /// same phase (the exact scenario a resumed/un-shipped coder-phase run
     /// hits).
     #[test]
     fn mission_worktree_step_kind_creates_then_rejects_duplicate() {

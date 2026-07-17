@@ -322,7 +322,7 @@ pub enum PhaseStatus {
 /// on a Task in an EARLIER Phase (this is how cross-phase data actually
 /// flows, e.g. `adjudicate`'s `judge` Task depending on `investigate`'s
 /// `dedup` Task); Phase itself carries no dependency semantics to check.
-/// "The phase before this one" (needed by `mission_run::select_phase`'s
+/// "The phase before this one" (needed by `coder_phase::select_phase`'s
 /// "next runnable phase" scan) is simply `Mission::phase_ids[i - 1]` for
 /// a phase at index `i`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

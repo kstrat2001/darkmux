@@ -102,7 +102,7 @@ pub fn resolve_local_placement(
 /// (#1230 Packet 4 DRY pass) One `failed_tool_invocations` entry from the
 /// internal runtime's `--json` envelope — a verifier command the dispatched
 /// role's tool loop attempted to run but never actually executed (missing
-/// binary, toolchain not present, etc). Moved here from `src/mission_run.rs`
+/// binary, toolchain not present, etc). Moved here from `src/coder_phase.rs`
 /// (was mission-run-private) so ANY `dispatch.internal`-shaped step can
 /// surface it, not just `mission.coder` — see `parse_failed_verifiers` and
 /// `DispatchInternalStepKind`'s `parse_verifiers` config opt-in below.
@@ -160,7 +160,7 @@ pub fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedVerifier> {
 /// `config_path` (string, `--profiles-file` passthrough), `phase_id`
 /// (string, threads a Phase-scoped context file into the dispatch — see
 /// `DispatchOpts::phase_id`), `session_id` (string, overrides the default
-/// `step:<id>` session id so a caller's own flow records line up with this
+/// `step-<id>` session id (#1436) so a caller's own flow records line up with this
 /// dispatch's), `parse_verifiers` (bool, default false — when true,
 /// attaches a `failed_verifiers`/`count` field pair, parsed via
 /// `parse_failed_verifiers`, onto the returned `StepOutcome`'s companion
@@ -302,6 +302,9 @@ impl StepKind for DispatchInternalStepKind {
         let role_id = task_or_config_str(task.role_id.as_ref(), step, "role_id")?;
         let profile_name = task_or_config_str(task.profile_name.as_ref(), step, "profile_name");
         let config_path = config_str(step, "config_path").map(str::to_string);
+        // NOTE: `step:{id}` here is a gestalt SEAT LABEL (placement-plan
+        // diagnostics), NOT a flow-record session id — exempt from the #1436
+        // hyphen convention; future colon sweeps should skip it.
         resolve_local_placement(&role_id, profile_name.as_deref(), config_path.as_deref(), &format!("step:{}", step.id))
     }
 }

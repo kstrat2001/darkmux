@@ -201,12 +201,15 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
     // Emit mission.compile.start flow record (#204) — pairs with
     // .complete below via the synthesized session_id so the viewer can
     // measure compile wall-time + render the input/output sizes.
-    let synth_session_id = format!(
-        "mission-compile-{}",
-        std::time::SystemTime::now()
+    // (#1436) Through the canonical session-id helper; byte-identical shape.
+    let synth_session_id = darkmux_types::session_id::session_id(
+        "mission-compile",
+        &std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros())
             .unwrap_or(0)
+            .to_string(),
+        "",
     );
     let input_chars = input.chars().count();
 

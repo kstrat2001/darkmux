@@ -2655,7 +2655,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     }
 
     /// (#1397) The review pipeline runs through the SAME `run_step_graph`
-    /// call `mission_run.rs`/`mission_launch.rs` use, so it gets the
+    /// call `coder_phase.rs`/`mission_launch.rs` use, so it gets the
     /// identical transition-time persistence hook — proven here the same
     /// way the crew scheduler's own `run_step_graph_persists_running_
     /// before_the_step_completes` test proves it: a `persist` closure that

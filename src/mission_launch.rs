@@ -467,22 +467,13 @@ pub fn launch(
     }
 
     // (#1284 review round 1, must-fix 1) A coder-phase graph has GATE
-    // semantics: stop at the operator sign-off gate exactly as `mission
-    // run` does — phase stays Running, mission stays Active, NO
-    // finalize_mission, and the exit code mirrors `coder_phase::run`'s own
-    // outcome map. `mission ship` finishes the loop from here.
+    // semantics: stop at the operator sign-off gate — phase stays Running,
+    // mission stays Active, NO finalize_mission. `mission ship` finishes the
+    // loop from here. See [`gate_outcome_reached_no_gate`] for the one
+    // exception class (failure exits that never reached a reviewable gate).
     if let Some(handles) = &coder_handles {
         let outcome = coder_phase_gate_outcome(&mission_id, handles, &steps);
-        // (#1433 follow-up) The gate arm's FAILURE exits — a worktree-creation
-        // bail (`Err`) or a coder dispatch error (`Ok(1)`) — reach no reviewable
-        // gate, so leaving the phase `Running` and the mission `Active` is the
-        // same stranded drift the scheduler-error path reconciles. Reconcile
-        // those to an honest terminal Error state. The gate exits PROPER
-        // (`Ok(0)` clean, `Ok(2)` blockers, `Ok(3)` QA-unavailable) deliberately
-        // keep the phase `Running` — `mission ship`/`mission abort` finish or
-        // tear down the loop from there and finalize the mission themselves.
-        let failed = matches!(&outcome, Err(_) | Ok(1));
-        if failed {
+        if gate_outcome_reached_no_gate(&outcome) {
             let e = match &outcome {
                 Err(e) => anyhow!("{e:#}"),
                 _ => anyhow!("coder dispatch failed before a reviewable gate (exit 1)"),
@@ -1051,6 +1042,19 @@ fn register_coder_phase_kinds(
         real_phase_id,
         session_id,
     })
+}
+
+/// (#1433 follow-up) Whether a coder-phase gate outcome is a FAILURE exit
+/// that never reached a reviewable gate — a worktree-creation bail (`Err`) or
+/// a coder dispatch error (`Ok(1)`). ONLY these reconcile+finalize the
+/// mission: leaving them `Running`/`Active` is the stranded drift the
+/// scheduler-error path reconciles. The gate exits PROPER — `Ok(0)` clean,
+/// `Ok(2)` QA found blockers, `Ok(3)` QA unavailable — must return `false`:
+/// they deliberately hold the phase `Running` at the sign-off gate so
+/// `mission ship`/`mission abort` finish or tear down the loop (finalizing
+/// `Ok(2)` would close the mission under QA-blockers and lock out `ship`).
+fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
+    matches!(outcome, Err(_) | Ok(1))
 }
 
 /// The post-scheduler gate decision for a coder-phase graph — a faithful
@@ -2003,6 +2007,22 @@ mod tests {
         let sid = launch_session_id("m1", "m1-build");
         assert_eq!(sid, "mission-run-m1-m1-build");
         assert!(sid.starts_with("mission-run-"));
+    }
+
+    // ── gate-arm failure predicate (#1433 follow-up) ────────────────────
+
+    #[test]
+    fn gate_predicate_finalizes_only_the_no_gate_failures() {
+        // Failure exits that never reached a reviewable gate: reconcile.
+        assert!(gate_outcome_reached_no_gate(&Err(anyhow!("worktree bail"))));
+        assert!(gate_outcome_reached_no_gate(&Ok(1)), "coder dispatch error finalizes");
+        // Gate exits PROPER must NOT finalize. Ok(2) is the load-bearing pin:
+        // a regression to `Err(_) | Ok(1) | Ok(2)` would close the mission
+        // under QA-blockers and lock out `mission ship` — this line is what
+        // fails on that regression.
+        assert!(!gate_outcome_reached_no_gate(&Ok(0)), "clean gate holds for ship");
+        assert!(!gate_outcome_reached_no_gate(&Ok(2)), "QA-blockers gate holds for fix + ship, never finalizes");
+        assert!(!gate_outcome_reached_no_gate(&Ok(3)), "QA-unavailable gate holds for manual review");
     }
 
     // ── pre-mint coder-input check (#1284 review round 1, consider 11) ──

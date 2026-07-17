@@ -761,7 +761,12 @@ impl WorkloadProvider for ToolBenchProvider {
                     fs::write(&dst, content)?;
                 }
 
-                let session_id = format!("darkmux-toolbench-{}-t{trial}-{now_ms}", task.id);
+                // (#1436) Through the canonical session-id helper; byte-identical shape.
+                let session_id = darkmux_types::session_id::session_id(
+                    "darkmux-toolbench",
+                    &task.id,
+                    &format!("t{trial}-{now_ms}"),
+                );
                 eprintln!("darkmux: tool-bench dispatch {} (trial {trial})", task.id);
                 let (stdout, stderr, ok, out_dir) = dispatch_task(
                     &role,
@@ -876,7 +881,7 @@ impl WorkloadProvider for ToolBenchProvider {
                 "profile_description": profile.description.clone().unwrap_or_default(),
                 "duration_ms": duration_ms,
                 "ok": true,
-                "session_id": format!("darkmux-toolbench-{now_ms}"),
+                "session_id": darkmux_types::session_id::session_id("darkmux-toolbench", &now_ms.to_string(), ""),
             }))?,
         )?;
 

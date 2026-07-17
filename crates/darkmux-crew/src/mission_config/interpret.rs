@@ -6,7 +6,7 @@
 //! [`LaunchParams`] into the `Vec<Task>` + `BTreeMap<String, Step>` shape
 //! `darkmux-crew`'s `scheduler::run_step_graph` consumes — the SAME shape
 //! `build_review_graph` (`darkmux-lab::lab::review`) and `default_phase_graph`
-//! (`src/mission_run.rs`) used to build by hand. This module owns exactly
+//! (`src/coder_phase.rs`) used to build by hand. This module owns exactly
 //! three things, and only these three (per the packet's own scope — Tier 3
 //! `StepKind` construction/registration stays mission-owned, #1352):
 //!
@@ -24,7 +24,7 @@
 //! DOES at runtime — a launcher calls [`interpret`], gets back real
 //! `Task`/`Step` values, and separately registers its own Tier 3 kinds
 //! against the SAME kind ids [`interpret`] produced (see
-//! `darkmux_lab::lab::review::build_review_graph` and `mission_run.rs`'s
+//! `darkmux_lab::lab::review::build_review_graph` and `coder_phase.rs`'s
 //! `default_phase_graph` for the two production launchers).
 //!
 //! [`interpret`] assumes the config is well-formed (document-wide-unique

@@ -48,13 +48,15 @@ impl WorkloadProvider for PromptProvider {
     ) -> Result<RunResult> {
         let prompt = resolve_prompt(loaded)?;
         let role = pick_role(loaded);
-        let session_id = format!(
-            "darkmux-prompt-{}-{}",
-            loaded.manifest.workload.id,
-            SystemTime::now()
+        // (#1436) Through the canonical session-id helper; byte-identical shape.
+        let session_id = darkmux_types::session_id::session_id(
+            "darkmux-prompt",
+            &loaded.manifest.workload.id,
+            &SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0)
+                .to_string(),
         );
 
         // `Runtime` has a single variant post-#1405 (the legacy `openclaw`
