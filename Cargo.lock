@@ -341,7 +341,6 @@ dependencies = [
  "darkmux-heuristics",
  "darkmux-lab",
  "darkmux-profiles",
- "darkmux-recommendations",
  "darkmux-serve",
  "darkmux-types",
  "dirs",
@@ -388,7 +387,6 @@ dependencies = [
  "darkmux-hardware",
  "darkmux-heuristics",
  "darkmux-profiles",
- "darkmux-recommendations",
  "darkmux-types",
  "dirs",
  "serde_json",
@@ -498,18 +496,6 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
-]
-
-[[package]]
-name = "darkmux-recommendations"
-version = "1.18.5"
-dependencies = [
- "anyhow",
- "darkmux-hardware",
- "darkmux-heuristics",
- "darkmux-types",
- "serde",
- "serde_json",
 ]
 
 [[package]]

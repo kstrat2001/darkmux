@@ -79,7 +79,7 @@ darkmux doctor</code></pre>
     <pre><code>darkmux flow note --text "hello from mini-1"</code></pre>
     <p>Open the hub's live viewer (the hub itself, or <code>https://&lt;hub&gt;.&lt;tailnet&gt;.ts.net/</code> if you set up <a href="always-on-hub.html#viewer">Tailscale Serve</a>). The note appears, tagged with this machine's id. That's the peer participating: its records flow to the hub, you see the whole fleet in one place.</p>
     <div class="callout">
-      <strong>No daemon required for this.</strong> Writing flow records to the hub happens in-process on every <code>darkmux</code> command; the peer does not need to run <code>darkmux serve</code> for its activity to show up in the hub's viewer. (The trade-off: without a local daemon, the peer won't appear in <code>darkmux fleet status --deep</code>'s live specs probe, which fans out to each machine's daemon. Its flow records are still in the hub viewer.)
+      <strong>No daemon required for this.</strong> Writing flow records to the hub happens in-process on every <code>darkmux</code> command; the peer does not need to run <code>darkmux serve</code> for its activity to show up in the hub's viewer. (The trade-off: without a local daemon, the peer won't appear in <code>darkmux machine list --deep</code>'s live specs probe, which fans out to each machine's daemon. Its flow records are still in the hub viewer.)
     </div>
   </div>
 </section>
@@ -114,12 +114,12 @@ brew services start darkmux                         <span class="comment"># daem
 darkmux doctor 2>&amp;1 | grep -i "daemon reachable"   <span class="comment"># ✓</span></code></pre>
     <p>The worker enables itself because Redis is configured, and shares a consumer group with every other worker on the fleet, so each job goes to exactly one of them. To take the machine back out of the pool, <code>brew services stop darkmux</code>: it reverts to a Part 1 observability peer (records still flow, it just stops claiming).</p>
     <p>Because the queue is first-available, any worker can claim any job. Match a worker to the work you send the fleet: a small box is great for light dispatches, but a big-model job that lands on it will run out of memory. If you want a machine to take only the work you hand it, keep it a Part 1 peer and dispatch on it directly.</p>
-    <p>Register it in the hub's roster so it shows in <code>fleet status</code>, and add the hub to the peer's roster:</p>
+    <p>Register it in the hub's roster so it shows in <code>machine list</code>, and add the hub to the peer's roster:</p>
     <pre><code><span class="comment"># On the hub:</span>
-darkmux fleet add mini-1 --address &lt;peer-tailnet-addr&gt;:8765
+darkmux machine add mini-1 --address &lt;peer-tailnet-addr&gt;:8765
 <span class="comment"># On the peer:</span>
-darkmux fleet add &lt;hub-id&gt; --address "$HUB_IP":8765
-darkmux fleet status</code></pre>
+darkmux machine add &lt;hub-id&gt; --address "$HUB_IP":8765
+darkmux machine list</code></pre>
   </div>
 </section>
 
@@ -130,9 +130,9 @@ darkmux fleet status</code></pre>
     <ul>
       <li><strong>Identity:</strong> each machine declares a logical fleet name (<code>machine_id</code>). That's what flow records carry and what <code>--machine</code> hints reference.</li>
       <li><strong>Coordination:</strong> the hub's Redis carries two stream classes: <code>darkmux:work</code> (the global job queue; workers claim via a shared consumer group) and <code>darkmux:flow</code> (the fleet-wide event log; every machine writes, any daemon's <code>/flow</code> endpoint reads).</li>
-      <li><strong>Observability:</strong> any daemon hosts the live viewer at <code>http://localhost:8765/</code>; with Redis configured it aggregates events from every machine on the shared stream. The <a href="../demo/">demo at darkmux.com/demo</a> shows the bundled showcase. <code>darkmux fleet status --deep</code> is the same per-machine view from the terminal.</li>
+      <li><strong>Observability:</strong> any daemon hosts the live viewer at <code>http://localhost:8765/</code>; with Redis configured it aggregates events from every machine on the shared stream. The <a href="../demo/">demo at darkmux.com/demo</a> shows the bundled showcase. <code>darkmux machine list --deep</code> is the same per-machine view from the terminal.</li>
     </ul>
-    <pre><code>darkmux fleet status --deep</code></pre>
+    <pre><code>darkmux machine list --deep</code></pre>
     <pre><code>MACHINE        ADDRESS                PROBE      RAM-FREE    OS              VERSION  MODELS
 laptop         100.64.1.5:8765        ✓ 23ms     78 GB       macos aarch64   1.17.0   darkmux:qwen3.6-35b-a3b-mlx
 studio         100.64.2.1:8765        ✓ 45ms     12 GB       macos aarch64   1.17.0   darkmux:qwen3-4b-instruct</code></pre>

@@ -1,34 +1,23 @@
-//! `darkmux fleet` command handlers — extracted from `main.rs` (mechanical,
-//! zero behavior change) alongside the `lab_cli`/`cli` split. `FleetCmd`
-//! itself (the arg surface) lives in `cli.rs`; this module owns the
-//! dispatch logic `cli::run` calls into.
+//! `darkmux machine` roster-facing command handlers (#1426 — the retired
+//! `fleet add`/`remove`/`status` folded into the machine family: `machine
+//! add`/`machine remove`/`machine list`). The `MachineCmd` arg surface lives
+//! in `cli.rs`; `cmd_machine` in `main.rs` routes the roster sub-verbs here.
+//! The "fleet" concept survives (roster, `fleet.mode`, flow records) — only
+//! the CLI family moved under `machine`.
 
 use anyhow::Result;
 
-use crate::cli::FleetCmd;
 use crate::fleet;
 use crate::flow;
 
-pub(crate) fn cmd_fleet(sub: FleetCmd) -> Result<i32> {
-    match sub {
-        FleetCmd::Add {
-            id,
-            address,
-            description,
-        } => cmd_fleet_add(&id, &address, description.as_deref()),
-        FleetCmd::Remove { id } => cmd_fleet_remove(&id),
-        FleetCmd::Status { json, deep } => cmd_fleet_status(json, deep),
-    }
-}
-
-fn cmd_fleet_add(id: &str, address: &str, description: Option<&str>) -> Result<i32> {
+pub(crate) fn cmd_machine_add(id: &str, address: &str, description: Option<&str>) -> Result<i32> {
     let was_present = fleet::mutate_roster(|roster| {
         let was_present = roster.machines.contains_key(id);
         fleet::add_machine(roster, id, address, description)?;
         Ok(was_present)
     })?;
     let verb = if was_present { "updated" } else { "added" };
-    println!("fleet: {verb} {id} (address={address})");
+    println!("machine: {verb} {id} (address={address})");
     if let Some(d) = description {
         println!("  description: {d}");
     }
@@ -36,22 +25,80 @@ fn cmd_fleet_add(id: &str, address: &str, description: Option<&str>) -> Result<i
     Ok(0)
 }
 
-fn cmd_fleet_remove(id: &str) -> Result<i32> {
+pub(crate) fn cmd_machine_remove(id: &str) -> Result<i32> {
     let removed = fleet::mutate_roster(|roster| Ok(fleet::remove_machine(roster, id)))?;
     match removed {
         Some(entry) => {
-            println!("fleet: removed {id} (address was {})", entry.address);
+            println!("machine: removed {id} (address was {})", entry.address);
             println!("  roster: {}", fleet::roster_path().display());
             Ok(0)
         }
         None => {
-            eprintln!("fleet: no machine `{id}` in roster — nothing to remove");
+            eprintln!("machine: no machine `{id}` in roster — nothing to remove");
             Ok(2)
         }
     }
 }
 
-fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
+/// Resolve a roster `id` to its normalized daemon base URL, then GET `path`
+/// with the shared fleet bearer token (#1426, #881). Used by `machine status
+/// [id]` / `machine resources [id]` to read a peer over its serve daemon —
+/// the same shared-token mechanism `machine list --deep` uses. Reads only;
+/// mutations never target a peer.
+pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value> {
+    let roster = fleet::load_roster()?;
+    let entry = roster.machines.get(id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no machine `{id}` in roster — add it with `darkmux machine add {id} --address <addr>`, \
+             or omit the id to read this host"
+        )
+    })?;
+    let base = normalize_daemon_base(&entry.address);
+    let url = format!("{base}{path}");
+    let token = darkmux_flow::serve_token();
+    let token_str = token.as_ref().map(|t| t.expose_for_compare());
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_millis(2000))
+        .build();
+    let mut req = agent.get(&url);
+    if let Some(tok) = token_str {
+        req = req.set("Authorization", &format!("Bearer {tok}"));
+    }
+    match req.call() {
+        Ok(resp) => {
+            let body = resp
+                .into_string()
+                .map_err(|e| anyhow::anyhow!("reading response from `{id}` ({url}): {e}"))?;
+            serde_json::from_str(&body)
+                .map_err(|e| anyhow::anyhow!("parsing JSON from `{id}` ({url}): {e}"))
+        }
+        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => anyhow::bail!(
+            "peer `{id}` requires a bearer token this machine isn't sending. Set DARKMUX_SERVE_TOKEN \
+             (or the darkmux-serve-token Keychain item) to the shared fleet token."
+        ),
+        // A 404 means the peer IS reachable — its daemon just doesn't serve
+        // this route. "Could not reach" would be the wrong vocabulary.
+        Err(ureq::Error::Status(404, _)) => anyhow::bail!(
+            "peer `{id}` answered but has no `{path}` route — it may be running an older \
+             darkmux (route not found). Upgrade darkmux on `{id}` and retry."
+        ),
+        Err(e) => anyhow::bail!("could not reach `{id}` ({url}): {e}"),
+    }
+}
+
+/// Normalize a roster address into an `http://host:port` daemon base URL,
+/// mirroring `fetch_machine_specs`' normalization (IPv6 / port-less forms).
+fn normalize_daemon_base(address: &str) -> String {
+    if address.contains("://") {
+        address.trim_end_matches('/').to_string()
+    } else if address.contains(':') {
+        format!("http://{address}")
+    } else {
+        format!("http://{address}:{}", crate::serve::DEFAULT_DAEMON_PORT)
+    }
+}
+
+pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
     let roster = fleet::load_roster()?;
 
     // Probe each machine's reachability (TCP connect to its daemon port).
@@ -136,7 +183,7 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
 
     // Human-readable table.
     use darkmux_types::style;
-    println!("{}", style::header("darkmux fleet status"));
+    println!("{}", style::header("darkmux machine list"));
     println!(
         "  roster:           {}",
         style::dim(&fleet::roster_path().display().to_string())
@@ -149,7 +196,7 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
     if probes.is_empty() {
         println!("(no peers in roster — single-machine fleet)");
         println!();
-        println!("Add a peer: darkmux fleet add <id> --address <tailnet-addr>");
+        println!("Add a peer: darkmux machine add <id> --address <tailnet-addr>");
         return Ok(0);
     }
     // Column-header row dimmed as secondary structure. Styling wraps the
@@ -312,4 +359,142 @@ fn fetch_machine_specs(address: &str, token: Option<&str>) -> SpecsProbe {
 fn human_gb(bytes: u64) -> String {
     let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     format!("{:.0} GB", gb.round())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── normalize_daemon_base (#1426) — the three roster address forms ──
+
+    #[test]
+    fn normalize_daemon_base_passes_through_full_urls_sans_trailing_slash() {
+        assert_eq!(
+            normalize_daemon_base("http://studio.tailnet:9000/"),
+            "http://studio.tailnet:9000"
+        );
+        assert_eq!(
+            normalize_daemon_base("https://hub.example:8765"),
+            "https://hub.example:8765"
+        );
+    }
+
+    #[test]
+    fn normalize_daemon_base_prefixes_host_port_forms() {
+        assert_eq!(
+            normalize_daemon_base("100.74.208.36:8765"),
+            "http://100.74.208.36:8765"
+        );
+    }
+
+    #[test]
+    fn normalize_daemon_base_appends_default_port_to_bare_hosts() {
+        assert_eq!(
+            normalize_daemon_base("100.74.208.36"),
+            format!("http://100.74.208.36:{}", crate::serve::DEFAULT_DAEMON_PORT)
+        );
+    }
+
+    // ── fetch_peer_json error shapes (#1426) ────────────────────────────
+    //
+    // Each test isolates the roster via DARKMUX_FLEET_FILE (read live per
+    // access by config_access) and, where a peer is needed, serves canned
+    // HTTP from a one-shot std TcpListener on a loopback ephemeral port.
+    // Env-mutating, so #[serial_test::serial].
+
+    /// Point the roster at a fresh tempfile and register `entries`.
+    /// Returns the TempDir guard (dropping it removes the roster).
+    fn isolated_roster(entries: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("fleet.json");
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &file) };
+        for (id, addr) in entries {
+            fleet::mutate_roster(|roster| {
+                fleet::add_machine(roster, id, addr, None)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        tmp
+    }
+
+    /// One-shot HTTP responder: accepts a single connection on an ephemeral
+    /// loopback port and answers with `status_line` + `body`. Returns the
+    /// bound address.
+    fn one_shot_http(status_line: &'static str, body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf); // consume request
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        addr
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_unknown_roster_id_names_machine_add() {
+        let _tmp = isolated_roster(&[]);
+        let err = fetch_peer_json("no-such-machine", "/machine/status").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no machine `no-such-machine` in roster"), "{msg}");
+        assert!(msg.contains("darkmux machine add"), "hint names the fix: {msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_401_names_the_shared_fleet_token() {
+        let addr = one_shot_http("401 Unauthorized", "{}");
+        let _tmp = isolated_roster(&[("peer1", addr.as_str())]);
+        let err = fetch_peer_json("peer1", "/machine/status").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bearer token"), "{msg}");
+        assert!(msg.contains("DARKMUX_SERVE_TOKEN"), "{msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_404_says_older_darkmux_not_unreachable() {
+        let addr = one_shot_http("404 Not Found", "{}");
+        let _tmp = isolated_roster(&[("peer1", addr.as_str())]);
+        let err = fetch_peer_json("peer1", "/machine/resources").unwrap_err();
+        let msg = err.to_string();
+        // The peer answered — "could not reach" is the wrong vocabulary.
+        assert!(msg.contains("older"), "names the likely cause: {msg}");
+        assert!(msg.contains("route not found"), "{msg}");
+        assert!(!msg.contains("could not reach"), "{msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_unreachable_peer_says_could_not_reach() {
+        // Port 1 on loopback has no listener (and connecting is refused fast).
+        let _tmp = isolated_roster(&[("ghost", "127.0.0.1:1")]);
+        let err = fetch_peer_json("ghost", "/machine/status").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("could not reach `ghost`"), "{msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_non_json_200_reports_a_parse_error() {
+        let addr = one_shot_http("200 OK", "this is not json");
+        let _tmp = isolated_roster(&[("peer1", addr.as_str())]);
+        let err = fetch_peer_json("peer1", "/machine/status").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("parsing JSON from `peer1`"), "{msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
 }

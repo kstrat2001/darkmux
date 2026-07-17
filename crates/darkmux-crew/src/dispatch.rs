@@ -337,8 +337,8 @@ impl CompactionDispatchArgs {
         // no legacy-shape `extras["model"]` fallback. Until a typed
         // `compaction.compactor_model` field exists, the runtime uses
         // its hardcoded default `darkmux:qwen3-4b-instruct-2507`,
-        // which matches what LMStudio has loaded in the standard
-        // `darkmux swap`-based workflow.
+        // which matches what a dispatch loads for the standard
+        // gestalt-residency workflow.
         let compactor_model: Option<String> = None;
         // (#368 clean break) Read from the typed schema field.
         // Operators wanting the adaptive trigger set

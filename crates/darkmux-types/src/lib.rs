@@ -76,7 +76,7 @@ pub type CapabilityProfile = BTreeMap<Capability, f32>;
 pub struct ProfileModel {
     pub id: String,
     /// Context window. For a LOCAL model this is the load parameter (a
-    /// minimum — see `swap::ctx_sufficient`) and is REQUIRED at resolution
+    /// minimum — see `darkmux_gestalt::ctx_sufficient`) and is REQUIRED at resolution
     /// time (`require_n_ctx`); for an endpoint-bearing model it is an
     /// optional *declared* ceiling (the provider owns the real window, so
     /// operators aren't forced to invent a number — #1282, needed by the
@@ -450,20 +450,12 @@ impl RuntimeCompactionConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProfileHookCommand {
-    pub command: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub condition: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RegistryHooks {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pre_swap: Vec<ProfileHookCommand>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub post_swap: Vec<ProfileHookCommand>,
-}
+// (#1426 phase 3) `RegistryHooks`/`ProfileHookCommand` (the registry's
+// `hooks.pre_swap`/`hooks.post_swap` blocks) were deleted with the retired
+// `swap` verb — swap's executor was their ONLY trigger, so the hooks retire
+// with it. Lenient-on-read (the `#[serde(flatten)] extras` overflow on
+// `ProfileRegistry`) means an operator profiles.json still carrying a
+// `hooks` block parses fine and is ignored.
 
 /// Machine-level internal bindings — darkmux's own standing infrastructure
 /// for this machine, a sibling to the operator's `profiles`. Decoupled from
@@ -762,8 +754,9 @@ pub struct ProfileRegistry {
     /// renaming/retyping a field is major.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<RegistryHooks>,
+    // (#1426 phase 3) A `hooks` field (RegistryHooks — pre/post-swap shell
+    // commands) lived here until the `swap` verb retired; a registry still
+    // carrying that block parses fine (it lands in `extras`) and is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
     /// Machine-level internal bindings (the utility model, …) — sibling to
@@ -858,9 +851,12 @@ impl ProfileRegistry {
     }
 }
 
-// `Serialize` so `darkmux serve`'s `/model/status` endpoint (#87) can
+// `Serialize` so `darkmux serve`'s `/machine/status` endpoint (#87; renamed
+// from `/model/status` in #1426) can
 // return loaded-model state as JSON for the flow viewer's toolbar pill.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+// `Deserialize` (#1426) so `darkmux machine status <id>` can read a roster
+// peer's residents back out of that same endpoint's JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadedModel {
     pub identifier: String,
     pub model: String,
@@ -1525,7 +1521,6 @@ mod tests {
         let back: ProfileRegistry = serde_json::from_str(&json).unwrap();
         assert!(back.profiles.is_empty());
         assert!(back.schema_version.is_none());
-        assert!(back.hooks.is_none());
         assert!(back.default_profile.is_none());
         assert!(back.internal.is_none());
         assert!(back.crews.is_empty());
@@ -1556,7 +1551,9 @@ mod tests {
         let p = reg.profiles.get("fast").unwrap();
         assert_eq!(p.description.as_deref(), Some("tiny profile"));
         assert_eq!(p.default_model_id(), Some("model-a"));
-        assert_eq!(reg.hooks.as_ref().unwrap().pre_swap.len(), 1);
+        // (#1426 phase 3) A legacy `hooks` block (retired with `swap`) is
+        // lenient-on-read: it parses into `extras` and is ignored.
+        assert!(reg.extras.contains_key("hooks"));
         assert_eq!(reg.default_profile.as_deref(), Some("fast"));
         assert!(reg.internal.is_some());
         assert_eq!(reg.utility_model_id(), Some("darkmux:util-4b"));

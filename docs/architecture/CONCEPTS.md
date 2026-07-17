@@ -30,8 +30,9 @@ When in doubt, the code is the source of truth (per `CLAUDE.md`). This doc is th
 darkmux is a Rust CLI for operators running local LLMs on Apple Silicon.
 It does three things:
 
-1. **Profile multiplexer.** `darkmux swap <profile>` switches the loaded model
-   stack (model + context length + compaction settings) to a named profile.
+1. **Profile multiplexer.** A dispatch loads the model stack a named profile
+   declares (model + context length + compaction settings), under the resident
+   budget (the multiplexer is now internal to gestalt).
 2. **Lab harness.** `darkmux lab run <workload>` dispatches a workload and
    records timing + trajectory + verify outcome, so empirical claims are
    reproducible.
@@ -359,7 +360,7 @@ optional fields are minor bumps that older viewers safely ignore (the
 
 ```
 /health   /flow/:date   /flow/:date/stream   /flow-status
-/model/status   /machine/specs   /missions   /phases
+/machine/status /machine/specs   /missions   /phases
 ```
 
 - `/flow/:date` aggregates fleet-wide records from Redis (`XRANGE`) with a

@@ -1206,8 +1206,8 @@ pub trait ModelCycler {
 
 /// Production [`ModelCycler`] (#1230 Packet 1 cutover): every residency
 /// decision now routes through `darkmux_gestalt::plan_acquire`/
-/// `plan_release` — the pure planner `darkmux swap` and the dispatch
-/// preflight are converging on — executed via the real `LmsHost`/`MacProbe`
+/// `plan_release` — the pure planner the dispatch preflight routes
+/// through — executed via the real `LmsHost`/`MacProbe`
 /// port adapters (`darkmux_profiles::gestalt_host`). Those adapters existed
 /// fully built and unit-tested but had ZERO production callers before this
 /// cutover; this is their first one.
@@ -1293,8 +1293,8 @@ impl ModelCycler for LmsCycler {
                     // (#1271) Reconcile rather than attempt a doomed second
                     // load: the stale instance's free-phase unload always
                     // precedes its reload in `plan.actions` (the planner's
-                    // free-then-load ordering contract), matching the style
-                    // of `swap::swap`'s own unload-then-load logging.
+                    // free-then-load ordering contract), logged in the same
+                    // unload-then-load style.
                     println!("cycler: unload {} — reconciling for {}", target.identifier(), pm.id);
                     host.unload(target, deadline).map_err(|e| {
                         anyhow!("darkmux: unload failed for \"{}\": {e}", target.identifier())

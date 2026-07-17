@@ -1,0 +1,5 @@
+/Users/kain/de-projects/darkmux-public/.claude/worktrees/agent-a50c825068be5c8ac/target-review/debug/build/zerocopy-1d7aed1d092e4994/build_script_build-1d7aed1d092e4994.d: /Users/kain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerocopy-0.8.48/build.rs
+
+/Users/kain/de-projects/darkmux-public/.claude/worktrees/agent-a50c825068be5c8ac/target-review/debug/build/zerocopy-1d7aed1d092e4994/build_script_build-1d7aed1d092e4994: /Users/kain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerocopy-0.8.48/build.rs
+
+/Users/kain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerocopy-0.8.48/build.rs:

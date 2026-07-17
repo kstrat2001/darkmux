@@ -219,9 +219,10 @@ fn claude_settings_path() -> Result<PathBuf> {
     Ok(home.join(".claude").join("settings.json"))
 }
 
-/// Add a SessionStart hook that runs `darkmux status` so Claude sees the
-/// current stack at the start of every session. Returns true if the hook
-/// was newly added (false if already present).
+/// Add a SessionStart hook that runs `darkmux machine status` so Claude sees
+/// the current stack at the start of every session. Returns true if the hook
+/// was newly added (false if already present). (#1426 — `status` folded into
+/// the `machine` family.)
 fn ensure_session_start_hook(settings_path: &Path, dry_run: bool, force: bool) -> Result<bool> {
     if !settings_path.exists() {
         if dry_run {
@@ -272,7 +273,7 @@ fn ensure_session_start_hook(settings_path: &Path, dry_run: bool, force: bool) -
 
     arr.push(serde_json::json!({
         "type": "command",
-        "command": format!("# {HOOK_MARKER}\n/usr/bin/env -S sh -c 'darkmux status 2>/dev/null || true'")
+        "command": format!("# {HOOK_MARKER}\n/usr/bin/env -S sh -c 'darkmux machine status 2>/dev/null || true'")
     }));
 
     if !dry_run {
@@ -330,7 +331,6 @@ This project uses [darkmux](https://github.com/kstrat2001/darkmux) to multiplex 
 
 - `/darkmux-status` — what's currently loaded
 - `/darkmux-list-stacks` — see all available profiles
-- `/darkmux-swap-stack <name>` — switch to a profile
 - `/darkmux-list-workloads` / `/darkmux-lab-run` — execute lab workloads
 - `/darkmux-list-runs` / `/darkmux-analyze-run` / `/darkmux-compare-runs` — inspect run history
 
@@ -393,7 +393,6 @@ This project uses [darkmux](https://github.com/kstrat2001/darkmux) to multiplex 
 
 - `/darkmux-status` — what's currently loaded
 - `/darkmux-list-stacks` — see all available profiles
-- `/darkmux-swap-stack <name>` — switch to a profile
 - `/darkmux-list-workloads` / `/darkmux-lab-run` — execute lab workloads
 - `/darkmux-list-runs` / `/darkmux-analyze-run` / `/darkmux-compare-runs` — inspect run history
 

@@ -123,7 +123,7 @@ pmset -g                                          <span class="comment"># verify
 <span class="comment"># Auto-login: System Settings → Users &amp; Groups → Login Options → Automatic login</span>
 <span class="comment"># Updates:    set major-version auto-install OFF; schedule them manually.</span></code></pre>
     <p><code>autorestart 1</code> recovers from a brief power blip. Tailscale "Run at login" + an auto-login user means: after any reboot the machine boots straight into a session where Tailscale + your services start automatically, instead of sitting at the login screen with Tailscale down and no remote way in.</p>
-    <p>You also need <a href="https://brew.sh">Homebrew</a> (to install darkmux and Redis) and a private mesh network reaching the hub. This guide assumes <a href="https://tailscale.com">Tailscale</a>; WireGuard / ZeroTier / plain LAN work the same. And run darkmux on a version that ships <code>darkmux fleet</code> + <code>darkmux config</code> (check with <code>darkmux config --help</code>; if it errors, <code>brew upgrade darkmux</code>).</p>
+    <p>You also need <a href="https://brew.sh">Homebrew</a> (to install darkmux and Redis) and a private mesh network reaching the hub. This guide assumes <a href="https://tailscale.com">Tailscale</a>; WireGuard / ZeroTier / plain LAN work the same. And run darkmux on a version that ships <code>darkmux machine</code> + <code>darkmux config</code> (check with <code>darkmux config --help</code>; if it errors, <code>brew upgrade darkmux</code>).</p>
     <div class="callout">
       <strong>macOS vs Linux:</strong> the deep phases below use launchd + newsyslog (macOS-native). Linux operators substitute systemd units for launchd plists, logrotate for newsyslog, and your distro's <code>redis.conf</code> path (<code>/etc/redis/redis.conf</code>). The decisions and verification steps are the same; only the file formats change.
     </div>
@@ -261,8 +261,8 @@ sleep 14                                            <span class="comment"># Thro
 launchctl list | grep com.darkmux.serve            <span class="comment"># expect: a NEW PID</span></code></pre>
 
     <h3>Register the hub in its own fleet roster</h3>
-    <pre><code>darkmux fleet add &lt;your-machine-id&gt; --address 127.0.0.1:8765
-darkmux fleet status</code></pre>
+    <pre><code>darkmux machine add &lt;your-machine-id&gt; --address 127.0.0.1:8765
+darkmux machine list</code></pre>
 
     <h3>Phase 2 rollback</h3>
     <pre><code><span class="comment"># brew path:</span>

@@ -48,10 +48,6 @@ const EMBEDDED_SKILLS: &[(&str, &str)] = &[
         include_str!("../skills/darkmux-list-stacks/SKILL.md"),
     ),
     (
-        "darkmux-swap-stack",
-        include_str!("../skills/darkmux-swap-stack/SKILL.md"),
-    ),
-    (
         "darkmux-list-workloads",
         include_str!("../skills/darkmux-list-workloads/SKILL.md"),
     ),
@@ -393,7 +389,7 @@ mod tests {
     fn install_copies_all_skills_to_target() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("skills");
-        write_skill(&src, "swap-stack", "---\nname: x\n---\nbody");
+        write_skill(&src, "list-runs", "---\nname: x\n---\nbody");
         write_skill(&src, "status", "---\nname: y\n---\nbody");
 
         let target = tmp.path().join("dest");
@@ -408,9 +404,9 @@ mod tests {
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
 
         assert_eq!(report.installed.len(), 2);
-        assert!(report.installed.contains(&"swap-stack".to_string()));
+        assert!(report.installed.contains(&"list-runs".to_string()));
         assert!(report.installed.contains(&"status".to_string()));
-        assert!(target.join("swap-stack/SKILL.md").exists());
+        assert!(target.join("list-runs/SKILL.md").exists());
         assert!(target.join("status/SKILL.md").exists());
     }
 

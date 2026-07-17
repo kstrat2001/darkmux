@@ -291,25 +291,35 @@ jobs:
             echo "$bad"
             exit 1
           fi
-          # (#1426) Verb spellings retired with NO compat alias:
-          # phase 1 — `darkmux profiles` -> `darkmux profile list`,
-          # `darkmux scan` -> `darkmux profile scan`, `darkmux notebook ...` ->
-          # `darkmux lab notebook ...`, `darkmux pr-review ...` -> `darkmux
-          # mission launch review`, `darkmux external ...` -> pipe into
-          # `mission propose`. phase 2 — `darkmux crew dispatch <role>` ->
-          # `darkmux dispatch <role>` (dispatch promoted to a top-level verb),
-          # and `darkmux skills ...` -> `darkmux init` (init is the one
-          # setup/refresh verb; doctor flags stale darkmux-* skills). The word
-          # boundary keeps NEW spellings clean (`darkmux profile scan` does not
-          # contain `darkmux scan`), and the `crew dispatch` alternative anchors
-          # on the two-word spelling so the surviving `crew list`/`show`/`index`
-          # family does NOT trip. Historical release-notes lines (README's
-          # status block, one line per release naming its `**vX.Y.Z**`)
-          # legitimately quote old verbs — excluded by the -v filter; live prose
-          # never carries that bold-version marker.
-          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew dispatch)\b'
+          # (#1426) Verb spellings retired with NO compat alias.
+          # Phase 1: `darkmux profiles` -> `darkmux profile list`, `darkmux
+          # scan` -> `darkmux profile scan`, `darkmux notebook ...` -> `darkmux
+          # lab notebook ...`, `darkmux pr-review ...` -> `darkmux mission
+          # launch review`, `darkmux external ...` -> pipe into `mission
+          # propose`.
+          # Phase 2: `darkmux crew dispatch <role>` -> `darkmux dispatch
+          # <role>` (dispatch promoted to a top-level verb), and `darkmux
+          # skills ...` -> `darkmux init` (init is the one setup/refresh verb;
+          # doctor flags stale darkmux-* skills).
+          # Phase 3: `darkmux status` -> `darkmux machine status`, `darkmux
+          # swap ...` -> retired (gestalt loads residents at dispatch),
+          # `darkmux model ...` -> `darkmux machine {status,resources,eject}`,
+          # `darkmux fleet ...` -> `darkmux machine {list,add,remove}`,
+          # `darkmux recommendations ...` -> retired.
+          # The word boundary + the literal `darkmux ` anchor keep the NEW
+          # spellings clean: `darkmux machine status` does not contain the
+          # two-word `darkmux status`, and `darkmux profile scan` does not
+          # contain `darkmux scan`. `model`/`status`/`fleet` are common words,
+          # so the anchor matches ONLY the `darkmux <verb>` invocation form,
+          # and the `crew dispatch` alternative anchors on the two-word
+          # spelling so the surviving `crew list`/`show`/`index` family does
+          # NOT trip. Historical release-notes lines (README's status block,
+          # one line per release naming its `**vX.Y.Z**`) legitimately quote
+          # old verbs — excluded by the -v filter; live prose never carries
+          # that bold-version marker.
+          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew dispatch|status|swap|model|fleet|recommendations)\b'
           if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
-            echo "::error::Retired verb spelling in user-facing docs (#1426) — use profile list / profile scan / lab notebook / mission launch review / pipe into mission propose / dispatch (not crew dispatch) / init (not skills):"
+            echo "::error::Retired verb spelling in user-facing docs (#1426) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch) / init (not skills); swap + recommendations retired:"
             echo "$bad"
             exit 1
           fi

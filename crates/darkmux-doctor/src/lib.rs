@@ -157,8 +157,6 @@ pub fn run() -> DoctorReport {
         check_audit_integrity(),
         check_audit_write_drops(),
         check_daemon_auth(),
-        check_recommendation_drift(),
-        check_recommended_profile_name_not_shadowed(),
         check_utility_model_binding(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
@@ -720,45 +718,6 @@ fn check_daemon_auth() -> Check {
     Check { name: "serve daemon auth".into(), status, message, hint }
 }
 
-/// Warn when the operator's profile registry contains a profile literally
-/// named `recommended` — that name is reserved by `darkmux swap
-/// recommended`, so the operator-defined profile is shadowed and
-/// unreachable via the `swap` verb. (#159)
-fn check_recommended_profile_name_not_shadowed() -> Check {
-    let loaded = match darkmux_profiles::profiles::load_registry(None) {
-        Ok(l) => l,
-        Err(_) => {
-            // Registry load failures are surfaced by check_profile_registry;
-            // this check passes here to avoid duplicate noise.
-            return Check {
-                name: "recommended profile name not shadowed".into(),
-                status: Status::Pass,
-                message: "registry not loaded; check skipped".into(),
-                hint: None,
-            };
-        }
-    };
-    if darkmux_recommendations::operator_has_shadowed_recommended_profile(&loaded.registry) {
-        Check {
-            name: "recommended profile name not shadowed".into(),
-            status: Status::Warn,
-            message: "`recommended` is a reserved profile name; the literal profile in your registry is unreachable via `darkmux swap`".into(),
-            hint: Some(
-                "Rename the `recommended` profile in ~/.darkmux/profiles.json to something else (e.g. `my-recommended`). The reserved name routes through the bake-off recommendation registry — `darkmux swap recommended` resolves to the validated profile for your hardware tier."
-                    .into(),
-            ),
-        }
-    } else {
-        Check {
-            name: "recommended profile name not shadowed".into(),
-            status: Status::Pass,
-            message: "no shadowing — `recommended` is free to route to the recommendation registry"
-                .into(),
-            hint: None,
-        }
-    }
-}
-
 /// `utility model`: surfaces the machine-level `internal.utility` binding
 /// (#590) — the standing support model the runtime summons for compaction
 /// (and future estimation / mission-compile). When it's registered the model
@@ -822,101 +781,10 @@ fn utility_binding_status(
                     status: Status::Warn,
                     message: format!("utility model `{id}` registered but NOT loaded"),
                     hint: Some(
-                        "Load it before dispatching — compaction summons the utility model mid-dispatch; if it isn't resident the compactor call fails. Run `lms load <id>`, or include it in the profile you `darkmux swap` to. (#590)".into(),
+                        "Load it before dispatching — compaction summons the utility model mid-dispatch; if it isn't resident the compactor call fails. Run `lms load <id>`, or register it as `internal.utility` so a dispatch loads it automatically. (#590)".into(),
                     ),
                 }
             }
-        }
-    }
-}
-
-/// Warn (not fail) when the active LMStudio loads don't match the
-/// recommendation registry's pick for this hardware tier. The operator
-/// may have swapped intentionally — doctor surfaces the drift; doesn't
-/// block dispatches. (#159)
-fn check_recommendation_drift() -> Check {
-    let rec = match darkmux_recommendations::for_active_hardware() {
-        Ok(r) => r,
-        Err(e) => {
-            return Check {
-                name: "recommendation drift".into(),
-                status: Status::Warn,
-                message: format!("could not resolve recommendation: {e:#}"),
-                hint: None,
-            };
-        }
-    };
-
-    // Only `Validated` tiers have a recommendation to drift from. For
-    // pending-bake-off / no-recommendation tiers, the check warns
-    // because the operator's tier has no opinion they can align with —
-    // a passive "drift check inactive" would read as all-clear in
-    // doctor's red/yellow/green summary glance, hiding the gap.
-    if rec.status != darkmux_recommendations::RecommendationStatus::Validated {
-        return Check {
-            name: "recommendation drift".into(),
-            status: Status::Warn,
-            message: format!(
-                "tier `{}` has no validated recommendation (status: {:?}) — pick a profile manually",
-                rec.tier, rec.status
-            ),
-            hint: Some(rec.rationale.clone()),
-        };
-    }
-
-    let required = rec.required_model_ids();
-    let loaded = match darkmux_profiles::lms::list_loaded() {
-        Ok(l) => l,
-        Err(_) => {
-            return Check {
-                name: "recommendation drift".into(),
-                status: Status::Warn,
-                message: "could not query LMStudio for loaded models — `lms` unreachable".into(),
-                hint: Some(
-                    "Start LMStudio and ensure `lms ps` returns successfully. The drift check needs to know what's loaded to compare against the recommendation."
-                        .into(),
-                ),
-            };
-        }
-    };
-
-    // Match against the LMStudio `modelKey` regardless of the namespaced
-    // identifier (which may carry `darkmux:` prefix). `LoadedModel.model`
-    // holds the model_key in current lms ps --json output.
-    let loaded_keys: std::collections::HashSet<&str> =
-        loaded.iter().map(|m| m.model.as_str()).collect();
-    let missing: Vec<&String> = required
-        .iter()
-        .filter(|id| !loaded_keys.contains(id.as_str()))
-        .collect();
-
-    if missing.is_empty() {
-        Check {
-            name: "recommendation drift".into(),
-            status: Status::Pass,
-            message: format!(
-                "tier `{}` — all {} recommended model(s) loaded",
-                rec.tier,
-                required.len()
-            ),
-            hint: None,
-        }
-    } else {
-        let missing_list: Vec<String> = missing.iter().map(|s| s.to_string()).collect();
-        Check {
-            name: "recommendation drift".into(),
-            status: Status::Warn,
-            message: format!(
-                "tier `{}` — {} of {} recommended model(s) not loaded: {}",
-                rec.tier,
-                missing.len(),
-                required.len(),
-                missing_list.join(", ")
-            ),
-            hint: Some(format!(
-                "Run `darkmux swap recommended` to align with the bake-off pick ({}). Ignore if you swapped intentionally.",
-                rec.bake_off_url.as_deref().unwrap_or("see registry for rationale")
-            )),
         }
     }
 }
@@ -1043,20 +911,20 @@ fn classify_openai_base_url(base: Option<&str>, lms_url: &str) -> (Status, Strin
         ),
         Some(b) if normalize_openai_base(b) == normalize_openai_base(lms_url) => (
             Status::Pass,
-            format!("OPENAI_BASE_URL points at darkmux's LMStudio ({lms_url}) — swaps reach downstream agents"),
+            format!("OPENAI_BASE_URL points at darkmux's LMStudio ({lms_url}) — darkmux's loaded models reach downstream agents"),
             None,
         ),
         Some(b) => (
             Status::Warn,
             format!("OPENAI_BASE_URL={b} does not point at darkmux's LMStudio ({lms_url})"),
             Some(
-                "darkmux doesn't set or manage OPENAI_BASE_URL — `darkmux swap` loads models into the LMStudio at lmstudio_url. OpenAI-compatible agents reading this env var talk to the other endpoint, so a swap won't change the model they see. Point OPENAI_BASE_URL at darkmux's LMStudio (or unset it) if you want swaps to reach those agents. (If it's a reverse proxy fronting the SAME LMStudio, this warning is benign.) (#5)".into(),
+                "darkmux doesn't set or manage OPENAI_BASE_URL — darkmux loads models into the LMStudio at lmstudio_url. OpenAI-compatible agents reading this env var talk to the other endpoint, so they won't see the models darkmux loaded. Point OPENAI_BASE_URL at darkmux's LMStudio (or unset it) if you want those agents to reach darkmux's models. (If it's a reverse proxy fronting the SAME LMStudio, this warning is benign.) (#5)".into(),
             ),
         ),
     }
 }
 
-/// (#5) Warn when a shell-exported `OPENAI_BASE_URL` would defeat `darkmux swap`
+/// (#5) Warn when a shell-exported `OPENAI_BASE_URL` would defeat darkmux's model loading
 /// for downstream OpenAI-compatible agents (they read the env var, not darkmux).
 fn check_openai_base_url_conflict() -> Check {
     let base = std::env::var("OPENAI_BASE_URL").ok();
@@ -2133,8 +2001,9 @@ fn check_models_loaded() -> Check {
             status: Status::Warn,
             message: "no models loaded in LMStudio".into(),
             hint: Some(
-                "load a model via the LMStudio GUI or `lms load <id> --context-length <N>`, \
-                 or run `darkmux swap <profile>` to load a profile's models automatically"
+                "load a model via the LMStudio GUI or `lms load <id> --context-length <N>` — \
+                 or just dispatch: a `darkmux dispatch` / `mission launch` loads what its \
+                 staffing needs, under the resident budget"
                     .into(),
             ),
         },
@@ -2210,7 +2079,7 @@ fn check_profile_loaded_match() -> Check {
             message: "loaded models don't match any profile".into(),
             hint: Some(
                 "edit ~/.darkmux/profiles.json so a profile's primary model id matches what \
-                 LMStudio is serving (compare `darkmux status` and `darkmux profile list`)"
+                 LMStudio is serving (compare `darkmux machine status` and `darkmux profile list`)"
                     .into(),
             ),
         }
@@ -3430,14 +3299,15 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 34 static checks via run() (#1405 removed the 4 openclaw-gated
-        // checks), incl. build-identity [#1129] + docker-runtime [#680] +
+        // 32 static checks via run() (#1405 removed the 4 openclaw-gated
+        // checks; #1426 removed recommendation-drift +
+        // recommended-profile-not-shadowed with the retired recommendations
+        // family), incl. build-identity [#1129] + docker-runtime [#680] +
         // load projection + daemon reachable +
         // darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
         // machine_id + orchestrator [#167] + openai-base-url-conflict [#5] +
-        // audit-integrity [#163] + recommendation-drift +
-        // recommended-profile-not-shadowed [#159] + utility-model-binding
+        // audit-integrity [#163] + utility-model-binding
         // [#590] + legacy-mission-layout [#148] + beat-33-crew-dir [Beat 33
         // directory flatten] + role-tool-vocab [#340] +
         // legacy-compaction-extras [#380] + redis-config [#661] +
@@ -3447,7 +3317,7 @@ mod tests {
         // mission-config-registry [#1284]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 34 + darkmux_eureka::all_rules().len();
+        let expected = 32 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

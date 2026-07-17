@@ -11,8 +11,9 @@
 use clap::{Parser, Subcommand};
 
 /// Shared `--profiles-file` flag (#661, renamed from `--config`). Collapses
-/// the identical declaration that was duplicated across `Swap`/`Status`/
-/// `Profiles`/`Scan`/`LabCmd::Run`/`LabCmd::Characterize`/`LabCmd::Tune` into
+/// the identical declaration that was duplicated across `ProfileCmd::List`/
+/// `ProfileCmd::Scan`/`MachineCmd::Status`/`LabCmd::Run`/
+/// `LabCmd::Characterize`/`LabCmd::Tune` into
 /// one `#[command(flatten)]`-able struct — mechanical dedup only, the doc
 /// string + `--profiles-file` flag name are unchanged. Two other subcommands
 /// (`LabCmd::ReviewBench`, `LabCmd::Loop`) declare their own doc text for
@@ -29,10 +30,10 @@ pub(crate) struct ProfilesFileArg {
 
 /// Shared `--json` flag ("Emit machine-readable JSON instead of styled text
 /// (#907)." doc variant). Collapses the identical declaration duplicated
-/// across `Cmd::Status`/`Cmd::Profiles`/`RecommendationsCmd::Show`/
-/// `RoleCmd::List`/`RoleCmd::Show`/`ModelCmd::Status`. Other `--json` flags
-/// with distinct doc text (schema descriptions, "instead of the table", the
-/// #907-less short form, etc.) are deliberately left un-flattened.
+/// across `ProfileCmd::List`/`RoleCmd::List`/`RoleCmd::Show`/
+/// `MachineCmd::Status`. Other `--json` flags with distinct doc text (schema
+/// descriptions, "instead of the table", the #907-less short form, etc.) are
+/// deliberately left un-flattened.
 #[derive(clap::Args)]
 pub(crate) struct JsonFlag {
     /// Emit machine-readable JSON instead of styled text (#907).
@@ -70,30 +71,6 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Cmd {
-    /// Swap the LMStudio stack to a profile. Touches ONLY LMStudio — no
-    /// other config file is read or written.
-    Swap {
-        /// Name of the profile to swap to (from profiles.json).
-        #[arg(required = false)]
-        profile: Option<String>,
-        /// Swap to the tier-recommended profile for this machine instead of
-        /// a named profile.
-        #[arg(long)]
-        recommended: bool,
-        #[command(flatten)]
-        profiles: ProfilesFileArg,
-        #[arg(long, short = 'n')]
-        dry_run: bool,
-        #[arg(long, short = 'q')]
-        quiet: bool,
-    },
-    /// Show what's loaded and which profile (if any) it matches.
-    Status {
-        #[command(flatten)]
-        profiles: ProfilesFileArg,
-        #[command(flatten)]
-        json: JsonFlag,
-    },
     /// Lab subcommands.
     Lab {
         #[command(subcommand)]
@@ -242,23 +219,17 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: ProfileCmd,
     },
-    /// Model lifecycle subcommands — operate on the darkmux-managed model
-    /// group (anything in `lms ps` under the `darkmux:` namespace).
-    /// User-loaded models (non-namespaced identifiers) are off-limits to
-    /// these commands by design.
-    Model {
+    /// This host's AI state — residents, live resources, roster (#1426).
+    /// `machine` = is my host HEALTHY RIGHT NOW (live state, RAM truth);
+    /// `doctor` = is my setup CORRECT (preflight, config). Bare `machine`
+    /// routes to `machine status` (no separate overview render). Reads may
+    /// target a roster peer over its serve daemon; MUTATIONS STAY LOCAL —
+    /// `machine eject` only ever releases THIS host's `darkmux:` namespace.
+    /// (#1426 folded the retired top-level `model`, `status`, and `fleet`
+    /// families into this one.)
+    Machine {
         #[command(subcommand)]
-        sub: ModelCmd,
-    },
-    /// Fleet management — declare which machines compose your darkmux
-    /// fleet and probe their reachability. The substrate for tier-aware
-    /// dispatch routing (PR-C / #247) and the topology view's fleet
-    /// pane. Single-machine fleets work without any roster entries;
-    /// multi-machine fleets need `darkmux fleet add <id>` per peer.
-    /// (#246 / #248)
-    Fleet {
-        #[command(subcommand)]
-        sub: FleetCmd,
+        sub: Option<MachineCmd>,
     },
     /// Crew registry reads — list/show/index the crews declared in the
     /// profiles registry. (#1426 relocated single-role dispatch to the
@@ -297,13 +268,6 @@ pub(crate) enum Cmd {
     Mission {
         #[command(subcommand)]
         sub: MissionCmd,
-    },
-    /// Per-hardware-tier recommendations — primary + compactor model
-    /// picks validated via the project's bake-off methodology. Read-only;
-    /// surfaces the registry's pick for the active or a specified tier.
-    Recommendations {
-        #[command(subcommand)]
-        sub: RecommendationsCmd,
     },
     /// Flow observability — record operator-facing flow events.
     Flow {
@@ -344,7 +308,8 @@ pub(crate) enum Cmd {
     /// `darkmux doctor` flags stale darkmux-* skills and points here).
     Init {
         /// Add a SessionStart hook to ~/.claude/settings.json that runs
-        /// `darkmux status` so Claude sees the current stack at session start.
+        /// `darkmux machine status` so Claude sees the current stack at
+        /// session start.
         #[arg(long)]
         with_hook: bool,
         /// Append a darkmux integration section to the given CLAUDE.md.
@@ -361,22 +326,6 @@ pub(crate) enum Cmd {
         /// Show what would be installed without writing.
         #[arg(long, short = 'n')]
         dry_run: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum RecommendationsCmd {
-    /// Show the recommendation registry entry for a hardware tier.
-    /// Defaults to the active tier (resolved via the same hardware
-    /// fingerprint `darkmux doctor` uses); pass `<tier>` to inspect a
-    /// non-active tier (`m-series-128`, `m-series-64`, `m-series-32`,
-    /// `generic`). Operator-readable output: status, profile name,
-    /// primary + compactor model ids, rationale.
-    Show {
-        /// Optional tier id; defaults to the active hardware tier.
-        tier: Option<String>,
-        #[command(flatten)]
-        json: JsonFlag,
     },
 }
 
@@ -815,57 +764,79 @@ pub(crate) enum MissionCmd {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum ModelCmd {
+pub(crate) enum MachineCmd {
     /// Show models currently loaded in LMStudio, grouped by ownership:
     /// darkmux-managed (under the `darkmux:` namespace) vs user state
-    /// (everything else). Read-only.
+    /// (everything else), plus which registered profile(s) the loaded set
+    /// matches. Read-only. (#1426 — absorbs the retired top-level `status`
+    /// verb's profile-match dimension; the default when `machine` is run
+    /// with no sub-verb.)
+    ///
+    /// With a roster `[id]`, fetches THAT peer's residents over its serve
+    /// daemon (same shared-token mechanism as `machine list --deep`); the
+    /// profile-match column is local-only (it reads THIS host's registry).
+    /// No id = this host.
     Status {
+        /// Optional roster machine id to read remotely; omit for this host.
+        id: Option<String>,
+        #[command(flatten)]
+        profiles: ProfilesFileArg,
         #[command(flatten)]
         json: JsonFlag,
     },
+    /// Live machine resources (#1286, renamed from `model ledger` in #1426
+    /// for vocabulary alignment — gestalt's port is `ResourceProbe`/`pools`,
+    /// and this panel shows what that arbiter sees): per resident model,
+    /// POTENTIAL (the commitment — weights + KV cache at the loaded ctx +
+    /// transient margin) vs CURRENT (observed inference-worker footprint),
+    /// color-stated green / amber ("made it by luck" — under the limit only
+    /// because lazy allocation hasn't materialized; names the config shrink
+    /// to reach green) / red (over the limit or memory pressure active),
+    /// plus machine pressure rows (swap, compressor, memory-pressure free%).
+    /// Read-only: kernel counters + lms metadata calls only — zero model
+    /// dispatches; the output stamps the gather's own cost. The same data
+    /// serves live at the daemon's GET /machine/resources (the viewer's
+    /// machine lens).
+    ///
+    /// With a roster `[id]`, reads THAT peer's resources over its serve
+    /// daemon; no id = this host.
+    Resources {
+        /// Optional roster machine id to read remotely; omit for this host.
+        id: Option<String>,
+        /// Emit machine-readable JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Eject all darkmux-managed model loads (anything in the `darkmux:`
-    /// namespace). User-loaded models are never touched. Use this when
-    /// you want to release darkmux's RAM footprint without affecting
-    /// other tools using LMStudio.
+    /// namespace) on THIS host. User-loaded models are never touched. Use
+    /// this when you want to release darkmux's RAM footprint without
+    /// affecting other tools using LMStudio. MUTATION — local-only by
+    /// design: never takes a roster id, never touches a peer (#1426).
     Eject {
         /// Show what would be ejected without actually unloading.
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
-    /// Download the bake-off-validated models for the active hardware
-    /// tier (per `templates/builtin/recommendations/<tier>.json`).
-    /// Composes with `darkmux swap --recommended` — the swap verb errors
-    /// loudly when the prescribed models aren't on disk; this verb is
-    /// the fix-it.
-    ///
-    /// Skips models that are already downloaded. Errors with the
-    /// recommendation's rationale when the active tier has no
-    /// validated recommendation (pending-bake-off or no-recommendation
-    /// status). (#159)
-    PullRecommended,
-    /// Global memory ledger (#1286): per resident model, POTENTIAL (the
-    /// commitment — weights + KV cache at the loaded ctx + transient
-    /// margin) vs CURRENT (observed inference-worker footprint), color-
-    /// stated green / amber ("made it by luck" — under the limit only
-    /// because lazy allocation hasn't materialized; names the config
-    /// shrink to reach green) / red (over the limit or memory pressure
-    /// active), plus machine pressure rows (swap, compressor,
-    /// memory-pressure free%). Read-only: kernel counters + lms metadata
-    /// calls only — zero model dispatches; the output stamps the gather's
-    /// own cost. The same data serves live at the daemon's
-    /// GET /machine/memory (the viewer's machine lens).
-    Ledger {
-        /// Emit machine-readable JSON instead of the table.
+    /// List the fleet roster + per-machine reachability (#1426 — absorbs the
+    /// retired `fleet status`). Each machine gets a TCP-probe to its daemon
+    /// port (300ms budget per probe). `--deep` additionally fetches each
+    /// reachable peer's spec sheet (RAM, CPU, loaded models, darkmux
+    /// version) via the daemon's `/machine/specs` endpoint (#275). `--json`
+    /// for scripting; default is a table for operator eyes.
+    List {
+        /// Emit JSON instead of the human-readable table.
         #[arg(long)]
         json: bool,
+        /// Aggregate `/machine/specs` from each reachable peer in
+        /// addition to the reachability probe. Adds one HTTP GET per
+        /// peer (~hundreds of ms over a tailnet).
+        #[arg(long)]
+        deep: bool,
     },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum FleetCmd {
-    /// Register a machine in the fleet roster. Idempotent — calling
-    /// again with the same `<id>` updates fields but preserves the
-    /// original `added_unix_ms` so the fleet-age signal stays honest.
+    /// Register a machine in the fleet roster (#1426 — absorbs the retired
+    /// `fleet add`). Idempotent — calling again with the same `<id>` updates
+    /// fields but preserves the original `added_unix_ms` so the fleet-age
+    /// signal stays honest.
     Add {
         /// Logical machine id (what flow records carry as `machine_id`).
         /// Example: `studio`, `laptop`, `mini-1`.
@@ -875,34 +846,19 @@ pub(crate) enum FleetCmd {
         /// no `:port` suffix, port 8765 is assumed.
         #[arg(long)]
         address: String,
-        /// Optional one-line description for `fleet status` + topology
+        /// Optional one-line description for `machine list` + topology
         /// tooltips.
         #[arg(long)]
         description: Option<String>,
     },
-    /// Remove a machine from the fleet roster. Doesn't touch the actual
-    /// remote machine — just removes the local routing reference.
-    /// Historical flow records from that machine remain in the audit
-    /// chain and are still visible in the topology view.
+    /// Remove a machine from the fleet roster (#1426 — absorbs the retired
+    /// `fleet remove`). Doesn't touch the actual remote machine — just
+    /// removes the local routing reference. Historical flow records from
+    /// that machine remain in the audit chain and are still visible in the
+    /// topology view.
     Remove {
         /// Logical machine id to remove.
         id: String,
-    },
-    /// Print the fleet roster + per-machine reachability. Each machine
-    /// gets a TCP-probe to its daemon port (300ms budget per probe).
-    /// `--deep` additionally fetches each reachable peer's spec sheet
-    /// (RAM, CPU, loaded models, darkmux version) via the daemon's
-    /// `/machine/specs` endpoint (#275). `--json` for scripting;
-    /// default is a table for operator eyes.
-    Status {
-        /// Emit JSON instead of the human-readable table.
-        #[arg(long)]
-        json: bool,
-        /// Aggregate `/machine/specs` from each reachable peer in
-        /// addition to the reachability probe. Adds one HTTP GET per
-        /// peer (~hundreds of ms over a tailnet).
-        #[arg(long)]
-        deep: bool,
     },
 }
 

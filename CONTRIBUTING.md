@@ -68,7 +68,7 @@ When filing a bug, please include:
 
 - darkmux version (`darkmux --version`)
 - LMStudio version (`lms --version`) if relevant
-- Output of `darkmux status`
+- Output of `darkmux machine status`
 - A minimal `profiles.json` that reproduces the issue (the `profiles.example.json` in the repo is a starting point)
 - The CWD where you ran the command (project-local `.darkmux/` vs. user-global `~/.darkmux/` resolution affects path-related issues)
 
