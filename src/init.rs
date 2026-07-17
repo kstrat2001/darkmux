@@ -38,6 +38,9 @@ pub struct InitReport {
     pub skills_installed: Vec<String>,
     pub skills_overwritten: Vec<String>,
     pub skills_skipped: Vec<String>,
+    /// (#1449) Retired `darkmux-*` skills the install step pruned (or, in
+    /// dry-run, would prune).
+    pub skills_pruned: Vec<String>,
     pub hook_added: Option<PathBuf>,
     pub hook_already_present: bool,
     pub claude_md_path: Option<PathBuf>,
@@ -105,6 +108,7 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     report.skills_installed = skills_report.installed;
     report.skills_overwritten = skills_report.overwritten;
     report.skills_skipped = skills_report.skipped;
+    report.skills_pruned = skills_report.pruned;
 
     // 4) SessionStart hook (optional)
     if opts.with_hook {
@@ -114,17 +118,18 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         report.hook_already_present = !result;
     }
 
-    // 5) CLAUDE.md merge (optional)
+    // 5) CLAUDE.md merge (optional). `--force` refreshes a stale block in place
+    //    (#1449 — the upgrade path); without it, an existing block is a no-op.
     if let Some(target) = opts.with_claude_md.as_ref() {
-        let appended = ensure_claude_md_section(target, opts.dry_run)?;
+        let appended = ensure_claude_md_section(target, opts.dry_run, opts.force)?;
         report.claude_md_path = Some(target.clone());
         report.claude_md_appended = appended;
         report.claude_md_already_present = !appended;
     }
 
-    // 6) AGENTS.md merge (optional)
+    // 6) AGENTS.md merge (optional). Same --force refresh semantics (#1449).
     if let Some(target) = opts.with_agents_md.as_ref() {
-        let appended = ensure_agents_md_section(target, opts.dry_run)?;
+        let appended = ensure_agents_md_section(target, opts.dry_run, opts.force)?;
         report.agents_md_path = Some(target.clone());
         report.agents_md_appended = appended;
         report.agents_md_already_present = !appended;
@@ -304,20 +309,29 @@ fn ensure_session_start_hook(settings_path: &Path, dry_run: bool, force: bool) -
 
 /// Append (or replace, with --force) a darkmux integration section into a
 /// CLAUDE.md file. Idempotent via the marker comments — running twice
-/// without --force is a no-op.
-fn ensure_claude_md_section(target: &Path, dry_run: bool) -> Result<bool> {
+/// without --force is a no-op. (#1449) With --force, a stale block is
+/// refreshed in place: the content between the existing start/end markers is
+/// replaced with the freshly generated block, and everything OUTSIDE the
+/// markers (the user's own prose) is preserved. Without this, an existing
+/// user's doc never receives the 2.0-clean generator — there was no upgrade
+/// path at all.
+fn ensure_claude_md_section(target: &Path, dry_run: bool, force: bool) -> Result<bool> {
     let existing = if target.exists() {
         fs::read_to_string(target)?
     } else {
         String::new()
     };
 
-    if existing.contains(CLAUDE_MD_HEADER) {
+    let has_block = existing.contains(CLAUDE_MD_HEADER);
+    if has_block && !force {
         return Ok(false);
     }
 
     let section = darkmux_claude_md_section();
-    let new_contents = if existing.is_empty() {
+    let new_contents = if has_block {
+        // --force refresh: replace the marked block in place.
+        replace_marked_section(&existing, CLAUDE_MD_HEADER, CLAUDE_MD_FOOTER, &section)?
+    } else if existing.is_empty() {
         section
     } else {
         format!("{}\n\n{}", existing.trim_end(), section)
@@ -332,6 +346,56 @@ fn ensure_claude_md_section(target: &Path, dry_run: bool) -> Result<bool> {
     Ok(true)
 }
 
+/// Replace the marked darkmux block `[header ..= footer]` in `existing` with
+/// `section` (a freshly generated `header\n\nbody\n\nfooter\n`), preserving
+/// everything before the start marker and after the end marker — the user's own
+/// prose. (#1449)
+///
+/// Marker handling is robust: it bails LOUDLY rather than corrupt the file when
+/// the end marker is missing (a half-written block) or the markers are out of
+/// order (footer before header). The caller only reaches this when the header
+/// is present, so a missing footer means a genuinely malformed block the
+/// operator should fix by hand, never one we silently overwrite.
+fn replace_marked_section(
+    existing: &str,
+    header: &str,
+    footer: &str,
+    section: &str,
+) -> Result<String> {
+    let start = existing
+        .find(header)
+        .ok_or_else(|| anyhow!("darkmux start marker `{header}` unexpectedly absent"))?;
+    let end = existing.find(footer).ok_or_else(|| {
+        anyhow!(
+            "darkmux start marker `{header}` is present but the end marker `{footer}` is missing \
+             — refusing to rewrite a malformed block. Fix the markers in {} by hand, or remove \
+             the darkmux block entirely and re-run.",
+            "the target doc"
+        )
+    })?;
+    if end < start {
+        return Err(anyhow!(
+            "darkmux markers are out of order (`{footer}` appears before `{header}`) — refusing \
+             to rewrite a malformed block. Fix the markers by hand and re-run."
+        ));
+    }
+    let end_idx = end + footer.len();
+    let before = &existing[..start];
+    let after = &existing[end_idx..];
+    // The generated section carries a trailing newline; drop it when splicing so
+    // we don't inject a blank line ahead of the user's following prose.
+    let block = section.trim_end_matches('\n');
+    let mut out = String::with_capacity(before.len() + block.len() + after.len() + 1);
+    out.push_str(before);
+    out.push_str(block);
+    out.push_str(after);
+    // Preserve a trailing newline when the block sat at end-of-file.
+    if after.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 fn darkmux_claude_md_section() -> String {
     format!(
         "{header}\n\n{body}\n\n{footer}\n",
@@ -343,20 +407,25 @@ fn darkmux_claude_md_section() -> String {
 
 /// Append (or replace, with --force) a darkmux integration section into an
 /// AGENTS.md file. Idempotent via the marker comments — running twice
-/// without --force is a no-op.
-fn ensure_agents_md_section(target: &Path, dry_run: bool) -> Result<bool> {
+/// without --force is a no-op. (#1449) With --force, a stale block is refreshed
+/// in place (see `ensure_claude_md_section` — same marker-replace semantics, so
+/// an existing user's AGENTS.md finally receives the 2.0-clean generator).
+fn ensure_agents_md_section(target: &Path, dry_run: bool, force: bool) -> Result<bool> {
     let existing = if target.exists() {
         fs::read_to_string(target)?
     } else {
         String::new()
     };
 
-    if existing.contains(AGENTS_MD_HEADER) {
+    let has_block = existing.contains(AGENTS_MD_HEADER);
+    if has_block && !force {
         return Ok(false);
     }
 
     let section = darkmux_agents_md_section();
-    let new_contents = if existing.is_empty() {
+    let new_contents = if has_block {
+        replace_marked_section(&existing, AGENTS_MD_HEADER, AGENTS_MD_FOOTER, &section)?
+    } else if existing.is_empty() {
         section
     } else {
         format!("{}\n\n{}", existing.trim_end(), section)
@@ -509,7 +578,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("CLAUDE.md");
         fs::write(&p, "# Project\n\nExisting content here.\n").unwrap();
-        let appended = ensure_claude_md_section(&p, false).unwrap();
+        let appended = ensure_claude_md_section(&p, false, false).unwrap();
         assert!(appended);
         let after = fs::read_to_string(&p).unwrap();
         assert!(after.contains("Existing content here"));
@@ -521,7 +590,7 @@ mod tests {
     fn ensure_claude_md_creates_when_missing() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("CLAUDE.md");
-        let appended = ensure_claude_md_section(&p, false).unwrap();
+        let appended = ensure_claude_md_section(&p, false, false).unwrap();
         assert!(appended);
         assert!(p.exists());
     }
@@ -530,8 +599,8 @@ mod tests {
     fn ensure_claude_md_idempotent() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("CLAUDE.md");
-        ensure_claude_md_section(&p, false).unwrap();
-        let second = ensure_claude_md_section(&p, false).unwrap();
+        ensure_claude_md_section(&p, false, false).unwrap();
+        let second = ensure_claude_md_section(&p, false, false).unwrap();
         assert!(!second);
         // Verify the section appears exactly once.
         let after = fs::read_to_string(&p).unwrap();
@@ -542,18 +611,84 @@ mod tests {
     fn ensure_agents_md_idempotent() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("AGENTS.md");
-        ensure_agents_md_section(&p, false).unwrap();
-        let second = ensure_agents_md_section(&p, false).unwrap();
+        ensure_agents_md_section(&p, false, false).unwrap();
+        let second = ensure_agents_md_section(&p, false, false).unwrap();
         assert!(!second);
         let after = fs::read_to_string(&p).unwrap();
         assert_eq!(after.matches(AGENTS_MD_HEADER).count(), 1);
     }
 
     #[test]
+    fn ensure_claude_md_force_refreshes_block_in_place() {
+        // (#1449) --force replaces a stale block between the markers while
+        // preserving the user's prose above and below — the upgrade path.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("CLAUDE.md");
+        let stale = format!(
+            "# My Project\n\nMy own notes above.\n\n{CLAUDE_MD_HEADER}\n\n# darkmux\n\nSTALE: multiplex local LLM stacks with `darkmux swap`.\n\n{CLAUDE_MD_FOOTER}\n\nMy own notes below.\n"
+        );
+        fs::write(&p, &stale).unwrap();
+
+        // Without --force it's a no-op (the stale block survives).
+        let noop = ensure_claude_md_section(&p, false, false).unwrap();
+        assert!(!noop);
+        assert!(fs::read_to_string(&p).unwrap().contains("STALE"));
+
+        // With --force the block refreshes to the clean generator output.
+        let changed = ensure_claude_md_section(&p, false, true).unwrap();
+        assert!(changed);
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(!after.contains("STALE"), "stale block must be gone: {after}");
+        assert!(!after.contains("multiplex"), "retired identity gone: {after}");
+        assert!(!after.contains("darkmux swap"), "retired verb gone: {after}");
+        assert!(after.contains("mission orchestrator and lab"));
+        // User prose on both sides is preserved.
+        assert!(after.contains("My own notes above."));
+        assert!(after.contains("My own notes below."));
+        // Exactly one block.
+        assert_eq!(after.matches(CLAUDE_MD_HEADER).count(), 1);
+        assert_eq!(after.matches(CLAUDE_MD_FOOTER).count(), 1);
+    }
+
+    #[test]
+    fn ensure_claude_md_force_bails_on_missing_end_marker() {
+        // (#1449) A half-written block (start present, end missing) must NOT be
+        // silently rewritten — bail loudly and leave the file untouched.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("CLAUDE.md");
+        let malformed = format!("# Project\n\n{CLAUDE_MD_HEADER}\n\n# darkmux\n\nno end marker here.\n");
+        fs::write(&p, &malformed).unwrap();
+
+        let err = ensure_claude_md_section(&p, false, true).unwrap_err();
+        assert!(
+            err.to_string().contains("end marker"),
+            "error names the missing end marker: {err}"
+        );
+        // File is untouched.
+        assert_eq!(fs::read_to_string(&p).unwrap(), malformed);
+    }
+
+    #[test]
+    fn ensure_claude_md_force_bails_on_out_of_order_markers() {
+        // (#1449) footer-before-header is malformed — bail, don't corrupt.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("CLAUDE.md");
+        let malformed = format!("{CLAUDE_MD_FOOTER}\n\nbody\n\n{CLAUDE_MD_HEADER}\n");
+        fs::write(&p, &malformed).unwrap();
+
+        let err = ensure_claude_md_section(&p, false, true).unwrap_err();
+        assert!(
+            err.to_string().contains("out of order"),
+            "error names the ordering problem: {err}"
+        );
+        assert_eq!(fs::read_to_string(&p).unwrap(), malformed);
+    }
+
+    #[test]
     fn ensure_claude_md_dry_run_does_not_write() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("CLAUDE.md");
-        let appended = ensure_claude_md_section(&p, true).unwrap();
+        let appended = ensure_claude_md_section(&p, true, false).unwrap();
         assert!(appended);
         assert!(!p.exists());
     }

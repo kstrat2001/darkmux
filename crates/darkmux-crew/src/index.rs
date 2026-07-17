@@ -862,7 +862,7 @@ struct StatusReport {
 fn status_at(path: &Path) -> Result<StatusReport> {
     if !path.exists() {
         anyhow::bail!(
-            "no index at {} — run `darkmux crew index rebuild` first",
+            "no index at {} — it builds automatically on the next `darkmux role list` (#914)",
             path.display()
         );
     }
@@ -1015,7 +1015,7 @@ pub fn status() -> Result<()> {
             println!("  - [{kind}] {p}");
         }
         println!();
-        println!("re-run `darkmux crew index rebuild` to apply.");
+        println!("the index rebuilds automatically on the next `darkmux role list` to apply (#914).");
     }
     Ok(())
 }

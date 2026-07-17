@@ -28,22 +28,21 @@
 //! `MissionCoderStepKind` / `MissionVerifyStepKind` Tier 3 kinds verbatim
 //! (elevated to `pub(crate)` for this module — see their doc comments) so
 //! the `mission.worktree`/`mission.coder`/`mission.verify` flow-record
-//! shape and `darkmux-serve`'s `/diff` contract stay byte-identical
-//! whether a mission was minted by `mission run` or `mission launch`.
-//! `darkmux mission run` is UNCHANGED and still the primary path for an
-//! operator working an EXISTING hand-authored (or `mission propose`-drafted
-//! pre-Packet-4a) mission one phase at a time; `mission launch` is the new,
-//! ADDITIONAL config-driven path, proven out here.
+//! shape and `darkmux-serve`'s `/diff` contract stay byte-identical to what
+//! the retired `mission run` produced. (#1426 ship-4) `darkmux mission run`
+//! retired: `mission launch coder-phase` is now the ONE path that runs the
+//! coder pipeline, absorbing what `mission run` did — the launch-owned
+//! `coder_phase.rs` kinds it reuses are the same ones `mission run` drove.
 //!
 //! **Gate semantics (#1284 review round 1, must-fix 1).** The coder-phase
-//! path deliberately does NOT finalize the mission. `mission run` stops at
-//! the "gate — awaiting frontier/operator sign-off" banner with the phase
-//! left `Running`, so the operator adjudicates and `mission ship` finishes
-//! the loop — and `mission launch coder-phase` mirrors that outcome map
-//! EXACTLY (same gate banners, same exit codes, same Running end state;
+//! path deliberately does NOT finalize the mission. It stops at the "gate —
+//! awaiting frontier/operator sign-off" banner with the phase left
+//! `Running`, so the operator adjudicates and `mission ship` finishes the
+//! loop (the outcome map the retired `mission run` also produced — same gate
+//! banners, same exit codes, same Running end state;
 //! see [`coder_phase_gate_outcome`]). Auto-closing past that gate was an
-//! operator-sovereignty violation (#44) at precisely the decision point
-//! `mission run` reserves, and it broke `mission ship` (which refuses a
+//! operator-sovereignty violation (#44) at precisely the decision point the
+//! gate reserves, and it broke `mission ship` (which refuses a
 //! terminal-Complete phase). Generic `finalize_mission` stays reserved for
 //! graphs with NO gate semantics (a Tier-1-only graph); a freeform config
 //! mints + starts and finalizes nothing.

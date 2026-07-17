@@ -8,7 +8,7 @@ Per-milestone **charters** — the full goal, research grounding, scope, success
 
 ## The north star
 
-darkmux orchestrates **local** LLMs to do real work — a profile multiplexer + a dispatch-to-PR loop + a unified observability stream, driven by a frontier orchestrator (Claude Code, Cursor, etc.) that "writes the loop." Optimization, not replacement; the harness before the model; the operator always in the loop with full provenance. See [`README.md`](README.md) and [`CLAUDE.md`](CLAUDE.md).
+darkmux orchestrates **local** LLMs to do real work — a mission orchestrator and a lab, with a unified observability stream, driven by a frontier orchestrator (Claude Code, Cursor, etc.) that "writes the loop." Every seat runs your own models off the meter, or a hosted endpoint when a role needs frontier weights. Optimization, not replacement; the harness before the model; the operator always in the loop with full provenance. See [`README.md`](README.md) and [`CLAUDE.md`](CLAUDE.md).
 
 ## Now — M4: Dispatch-to-PR loop depth
 

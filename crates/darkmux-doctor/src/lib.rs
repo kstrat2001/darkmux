@@ -179,20 +179,40 @@ const SKILLS_FRESHNESS_CHECK_NAME: &str = "darkmux skills freshness";
 ///
 /// Scope is the `darkmux-*` namespace ONLY. A non-darkmux entry in the skills
 /// directory is the operator's own state and is never inspected or reported
-/// (the namespace contract). The WARN driver is exclusively an installed
-/// `darkmux-*` skill whose content differs from the embedded copy. Two other
-/// conditions are surfaced informationally but do NOT warn, because `darkmux
-/// init` cannot resolve either and a warning whose fix_hint can't fix it is
-/// noise: an embedded skill that is not installed (a minimal install is a
-/// legitimate operator choice, not drift), and an installed `darkmux-*` skill
-/// the binary no longer bundles (a retired skill left on disk, which `init`
-/// does not prune).
+/// (the namespace contract). Two conditions now drive the WARN:
+///   1. an installed `darkmux-*` skill whose content differs from the embedded
+///      copy (stale — an older darkmux installed it), and
+///   2. an installed `darkmux-*` skill the binary no longer bundles (RETIRED —
+///      a dead skill left on disk).
+///
+/// (#1449) The retired case was previously surfaced informationally but did NOT
+/// warn, on the rationale that `darkmux init` couldn't fix it so a warning would
+/// be noise. That reversed once `init` gained a prune pass (same #1449 batch):
+/// the fix IS now actionable (`darkmux init` removes the retired dir), and these
+/// artifacts are NOT inert — `darkmux-swap-stack` is a LIVE skill teaching
+/// `darkmux swap` + `darkmux status`, both retired verbs an agent will invoke.
+/// This is exactly #1449's class: the generator was fixed, but the installed
+/// artifact still teaches dead verbs. So a retired skill now warns, naming it,
+/// with `darkmux init` as the fix.
+///
+/// One condition stays informational (no warn): an embedded skill that is not
+/// installed — a minimal install is a legitimate operator choice, not drift, and
+/// nothing is actively wrong on disk.
 ///
 /// Pure evaluator: `targets` (the install directories) and `embedded` (the
 /// reference set) are supplied by the caller (`main.rs`, the root crate that
 /// owns the `include_str!` embed), because this crate cannot depend on the root
 /// binary crate where the skills live.
-pub fn check_installed_skills_freshness(targets: &[PathBuf], embedded: &[EmbeddedSkill]) -> Check {
+/// `maintainer_exclusions` (#1449): `darkmux-*` skills that are deliberately not
+/// embedded (maintainer-only, e.g. `darkmux-point-release`) and so must NOT be
+/// reported retired when a maintainer has them installed from a source checkout.
+/// Supplied by `main.rs` from `skills::MAINTAINER_ONLY_SKILLS` — the doctor crate
+/// can't depend on the root binary crate where that list lives.
+pub fn check_installed_skills_freshness(
+    targets: &[PathBuf],
+    embedded: &[EmbeddedSkill],
+    maintainer_exclusions: &[String],
+) -> Check {
     let mut matched = 0usize;
     let mut stale: Vec<String> = Vec::new();
     let mut not_installed: Vec<String> = Vec::new();
@@ -232,6 +252,11 @@ pub fn check_installed_skills_freshness(targets: &[PathBuf], embedded: &[Embedde
             if !path.is_dir() || !path.join("SKILL.md").exists() {
                 continue;
             }
+            // (#1449) Maintainer-only skills are deliberately not embedded but
+            // legitimately installed on a source checkout — never "retired".
+            if maintainer_exclusions.iter().any(|e| e == name) {
+                continue;
+            }
             let owned = name.to_string();
             if !embedded_names.contains(name) && !retired.contains(&owned) {
                 retired.push(owned);
@@ -263,7 +288,11 @@ pub fn check_installed_skills_freshness(targets: &[PathBuf], embedded: &[Embedde
     }
     let message = format!("darkmux-* skills: {}", detail.join("; "));
 
-    if stale.is_empty() {
+    // (#1449) WARN when EITHER a skill is stale (older darkmux installed it) OR a
+    // retired skill is left on disk (a live dead-verb skill an agent will
+    // invoke). Both are now fixed by `darkmux init` — stale ones refresh, retired
+    // ones prune. The "up to date" pass path holds when neither is present.
+    if stale.is_empty() && retired.is_empty() {
         Check {
             name: SKILLS_FRESHNESS_CHECK_NAME.into(),
             status: Status::Pass,
@@ -271,11 +300,20 @@ pub fn check_installed_skills_freshness(targets: &[PathBuf], embedded: &[Embedde
             hint: None,
         }
     } else {
+        let hint = if !retired.is_empty() && stale.is_empty() {
+            format!(
+                "retired skill(s) still installed ({}) teach dead verbs; run `darkmux init` to prune",
+                retired.join(", ")
+            )
+        } else {
+            "installed from an older darkmux; run `darkmux init` to refresh (and prune retired skills)"
+                .into()
+        };
         Check {
             name: SKILLS_FRESHNESS_CHECK_NAME.into(),
             status: Status::Warn,
             message,
-            hint: Some("installed from an older darkmux; run `darkmux init` to refresh".into()),
+            hint: Some(hint),
         }
     }
 }
@@ -2935,7 +2973,7 @@ mod tests {
         write_installed_skill(&target, "darkmux-beta", "body-b");
         let embedded_set = vec![embedded("darkmux-alpha", "body-a"), embedded("darkmux-beta", "body-b")];
 
-        let c = check_installed_skills_freshness(&[target], &embedded_set);
+        let c = check_installed_skills_freshness(&[target], &embedded_set, &[]);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert!(c.hint.is_none());
         assert!(c.message.contains("2 up to date"), "{}", c.message);
@@ -2950,7 +2988,7 @@ mod tests {
         write_installed_skill(&target, "darkmux-beta", "OLD-body-b");
         let embedded_set = vec![embedded("darkmux-alpha", "body-a"), embedded("darkmux-beta", "body-b")];
 
-        let c = check_installed_skills_freshness(&[target], &embedded_set);
+        let c = check_installed_skills_freshness(&[target], &embedded_set, &[]);
         assert_eq!(c.status, Status::Warn, "{}", c.message);
         assert!(c.message.contains("darkmux-beta"), "{}", c.message);
         assert!(
@@ -2971,7 +3009,7 @@ mod tests {
         write_installed_skill(&target, "my-personal-skill", "user-owned content");
         let embedded_set = vec![embedded("darkmux-alpha", "body-a")];
 
-        let c = check_installed_skills_freshness(&[target], &embedded_set);
+        let c = check_installed_skills_freshness(&[target], &embedded_set, &[]);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert!(
             !c.message.contains("my-personal-skill"),
@@ -2988,7 +3026,7 @@ mod tests {
         // beta is embedded but not installed — a minimal install, not drift.
         let embedded_set = vec![embedded("darkmux-alpha", "body-a"), embedded("darkmux-beta", "body-b")];
 
-        let c = check_installed_skills_freshness(&[target], &embedded_set);
+        let c = check_installed_skills_freshness(&[target], &embedded_set, &[]);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert!(c.hint.is_none());
         assert!(
@@ -2999,20 +3037,49 @@ mod tests {
     }
 
     #[test]
-    fn skills_freshness_notes_retired_installed_skill_without_warning() {
+    fn skills_freshness_warns_on_retired_installed_skill() {
+        // (#1449) A darkmux-* skill the binary no longer bundles is now a WARN
+        // (was informational-only). `init`'s prune pass makes the fix actionable,
+        // and a retired skill like darkmux-swap-stack is a live dead-verb teacher.
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
         write_installed_skill(&target, "darkmux-alpha", "body-a");
-        // A darkmux-* skill the binary no longer bundles — informational, not a
-        // warn (init refreshes, it does not prune).
         write_installed_skill(&target, "darkmux-retired", "leftover");
         let embedded_set = vec![embedded("darkmux-alpha", "body-a")];
 
-        let c = check_installed_skills_freshness(&[target], &embedded_set);
-        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        let c = check_installed_skills_freshness(&[target], &embedded_set, &[]);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
         assert!(
             c.message.contains("no longer bundled") && c.message.contains("darkmux-retired"),
             "{}",
+            c.message
+        );
+        let hint = c.hint.as_deref().unwrap();
+        assert!(
+            hint.contains("darkmux init") && hint.contains("darkmux-retired"),
+            "fix_hint names the retired skill + the prune command: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn skills_freshness_excludes_maintainer_only_from_retired() {
+        // (#1449) A maintainer-only skill (not embedded, installed from a source
+        // checkout) must NOT be reported retired.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().to_path_buf();
+        write_installed_skill(&target, "darkmux-alpha", "body-a");
+        write_installed_skill(&target, "darkmux-point-release", "maintainer skill");
+        let embedded_set = vec![embedded("darkmux-alpha", "body-a")];
+
+        let c = check_installed_skills_freshness(
+            &[target],
+            &embedded_set,
+            &["darkmux-point-release".to_string()],
+        );
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(
+            !c.message.contains("darkmux-point-release"),
+            "maintainer-only skill is never flagged retired: {}",
             c.message
         );
     }

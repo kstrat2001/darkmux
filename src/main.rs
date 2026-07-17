@@ -560,9 +560,14 @@ fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
         })
         .collect();
     let skill_targets = skills::install_target_dirs().unwrap_or_default();
+    let maintainer_only: Vec<String> = skills::MAINTAINER_ONLY_SKILLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     report.checks.push(doctor::check_installed_skills_freshness(
         &skill_targets,
         &embedded_skills,
+        &maintainer_only,
     ));
 
     // (#1177) Opt-in live endpoint probes append to the same report so they
@@ -1842,6 +1847,17 @@ fn cmd_init(
             "  skipped ({}): {}",
             report.skills_skipped.len(),
             report.skills_skipped.join(", ")
+        );
+    }
+    if !report.skills_pruned.is_empty() {
+        // (#1449) Retired darkmux-* skills removed from the install target so an
+        // upgraded machine stops teaching dead verbs.
+        let verb = if dry_run { "would prune" } else { "pruned" };
+        println!(
+            "  {} ({}): {}",
+            verb,
+            report.skills_pruned.len(),
+            report.skills_pruned.join(", ")
         );
     }
     if let Some(p) = report.hook_added {
