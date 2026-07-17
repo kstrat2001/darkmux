@@ -78,6 +78,10 @@ jobs:
           push: true
           # Plain single-arch image (no attestation manifest) — simplest to pull.
           provenance: false
+          # (#1461) Stamp the darkmux version into the image so `darkmux doctor`
+          # can flag a runtime image that is older than the installed binary.
+          build-args: |
+            DARKMUX_VERSION=${{ steps.ver.outputs.version }}
           tags: |
             ghcr.io/kstrat2001/darkmux-runtime:${{ steps.ver.outputs.version }}
             ghcr.io/kstrat2001/darkmux-runtime:latest
