@@ -1184,6 +1184,7 @@ pub fn run(
                 );
             }
         },
+        None,
     )?;
 
     for step in steps.values() {

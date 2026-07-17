@@ -16,11 +16,24 @@
 //! CONFIG on one of these four kinds. See `step_kinds::patterns`'s module
 //! doc for the full three-tier picture.
 
-use super::types::{MapRemoteBucket, StepKind, StepOutcome, StepRunCtx};
+use super::types::{
+    MapDispatchOverride, MapRemoteBucket, OverrideDispatchCall, StepKind, StepOutcome, StepRunCtx,
+};
 use crate::types::{Step, Task};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+
+/// (#1442) The named per-item reason a `dispatch.map` hosted item records
+/// when the remote per-execution bucket refuses its FIRST attempt. Public
+/// (and `const`) because downstream reconstruction — the review pipeline's
+/// dedup boundary rebuilding per-seat member accounting from
+/// [`MapItemResult`]s — must distinguish a budget SKIP (call never fired;
+/// not a draw) from a dispatch ERROR (call fired and failed; a real draw),
+/// and matching this one canonical string is how it does so without the
+/// generic block growing a domain-shaped result field.
+pub const MAP_BUDGET_SKIP_ERROR: &str =
+    "remote token budget exhausted for this step — call skipped";
 
 /// Compose a step kind's base prompt/message with the gathered output of
 /// its already-`Complete` dependencies. Shared by `dispatch.internal` and
@@ -902,14 +915,26 @@ impl DispatchMapStepKind {
         // (#1442, the allowance-multiplication fix). Ungrouped (or ctx-free)
         // steps get their own step-scoped bucket from the same budget, so
         // the one-execution contract reads identically either way. Local
-        // items never draw from it.
+        // items never draw from it. `bucket_budget` (u64, optional) lets a
+        // LAUNCHER stamp its already-resolved per-execution allowance into
+        // the step's own config — self-describing config, and the same
+        // value the scheduler honors when it creates a group bucket —
+        // instead of this block re-reading the environment at run time;
+        // absent, the `config_access` resolution applies as before.
         let bucket: Arc<Mutex<MapRemoteBucket>> = match ctx.and_then(|c| c.remote_bucket()) {
             Some(shared) => shared.clone(),
             None => {
-                let budget = darkmux_types::config_access::remote_max_tokens_per_execution();
+                let budget = step
+                    .config
+                    .get("bucket_budget")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_else(darkmux_types::config_access::remote_max_tokens_per_execution);
                 Arc::new(Mutex::new(MapRemoteBucket::new(budget)))
             }
         };
+        // (#1442 ship-2b) The scheduler-supplied dispatch override, if any —
+        // threaded into every item's arm; `None` on all production paths.
+        let ovr = ctx.and_then(|c| c.dispatch_override());
 
         let temperature =
             step.config.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
@@ -919,15 +944,41 @@ impl DispatchMapStepKind {
             let res = match &endpoint {
                 Some(ep) => map_hosted_item(
                     index, &bucket, ep, model, system, &user, max_tokens, timeout_seconds,
-                    retry_on_empty,
+                    retry_on_empty, ovr,
                 ),
                 None => map_local_item(
                     index, model, system, &user, temperature, max_tokens, timeout_seconds,
-                    retry_on_empty,
+                    retry_on_empty, ovr,
                 ),
             };
             // (#1442 gate C3) LIVE per-item emission when streaming.
             push(Self::item_record(step, model, endpoint.is_some(), &res), &mut batched);
+            // (#1442 ship-2b, #1361 continuity) One `telemetry.tokens`
+            // record per item that actually reported usage, so the fleet
+            // dashboard's off-meter token sum (`category: telemetry,
+            // source: tokens` records ONLY) stays sighted on map-dispatched
+            // work — the review pipeline's probe/verify stages ride this
+            // block now, and their per-call telemetry emission retired with
+            // their bespoke kinds. Only the honestly-known field is carried
+            // (the accumulated `total_tokens`); the per-reply prompt/
+            // completion split is not surfaced by [`MapItemResult`] and is
+            // NEVER fabricated here.
+            if let Some(total) = res.total_tokens {
+                push(
+                    crate::dispatch::build_telemetry_record(
+                        darkmux_flow::Level::Info,
+                        "telemetry.tokens",
+                        "tokens",
+                        &step.id,
+                        &format!("task:{}", step.task_id),
+                        Some(model),
+                        None,
+                        None,
+                        serde_json::json!({ "total_tokens": total }),
+                    ),
+                    &mut batched,
+                );
+            }
             results.push(res);
         }
 
@@ -1000,6 +1051,7 @@ fn map_local_item(
     max_tokens: u32,
     timeout_seconds: u32,
     retry_on_empty: u32,
+    ovr: Option<&MapDispatchOverride>,
 ) -> MapItemResult {
     use crate::single_shot::{single_shot_chat, SingleShotRequest};
     let mut sum = 0u64;
@@ -1021,7 +1073,21 @@ fn map_local_item(
             timeout_seconds,
         };
         let t0 = std::time::Instant::now();
-        let dispatch = single_shot_chat(&req);
+        // (#1442 ship-2b) The scheduler-supplied override replaces the
+        // TRANSPORT only — retry semantics and token accounting are
+        // identical on both paths (see [`MapDispatchOverride`]).
+        let dispatch = match ovr {
+            Some(f) => f(&OverrideDispatchCall {
+                model,
+                system,
+                user,
+                temperature,
+                max_tokens,
+                timeout_seconds,
+                endpoint: None,
+            }),
+            None => single_shot_chat(&req),
+        };
         wall_ms += t0.elapsed().as_millis() as u64;
         match dispatch {
             Ok(reply) => {
@@ -1088,6 +1154,7 @@ fn map_hosted_item(
     max_tokens: u32,
     timeout_seconds: u32,
     retry_on_empty: u32,
+    ovr: Option<&MapDispatchOverride>,
 ) -> MapItemResult {
     use crate::single_shot::HostedSingleShotRequest;
     let mut sum = 0u64;
@@ -1101,16 +1168,21 @@ fn map_hosted_item(
     let mut wall_ms = 0u64;
     let mut served_model: Option<String> = None;
     for attempt in 0..=retry_on_empty {
-        let admitted = bucket.lock().expect("map remote bucket mutex poisoned").admit();
-        if !admitted {
+        // (#1442 fan-out) admit_reserve grants — and RESERVES — the clamped
+        // completion cap in one locked operation, so concurrent sibling
+        // steps sharing this bucket (`bucket_group`) cannot all admit
+        // against the same untouched balance; see the method's own doc.
+        let granted = bucket
+            .lock()
+            .expect("map remote bucket mutex poisoned")
+            .admit_reserve(max_tokens);
+        let Some(clamped) = granted else {
             if attempt == 0 {
                 return MapItemResult {
                     index,
                     ok: false,
                     content: String::new(),
-                    error: Some(
-                        "remote token budget exhausted for this step — call skipped".to_string(),
-                    ),
+                    error: Some(MAP_BUDGET_SKIP_ERROR.to_string()),
                     total_tokens: None,
                     served_model: None,
                     wall_ms,
@@ -1118,9 +1190,7 @@ fn map_hosted_item(
             }
             // A retry the bucket can no longer fund — stop, keep what fired.
             break;
-        }
-        let remaining = bucket.lock().expect("map remote bucket mutex poisoned").remaining();
-        let clamped = clamp_hosted_max_tokens(max_tokens, remaining);
+        };
         let req = HostedSingleShotRequest {
             endpoint,
             model,
@@ -1130,14 +1200,27 @@ fn map_hosted_item(
             timeout_seconds,
         };
         let t0 = std::time::Instant::now();
-        let dispatch = map_hosted_dispatch(&req);
+        // (#1442 ship-2b) Scheduler-supplied override replaces the TRANSPORT
+        // only — the reserve/settle metering around it is identical.
+        let dispatch = match ovr {
+            Some(f) => f(&OverrideDispatchCall {
+                model,
+                system,
+                user,
+                temperature: 0.0,
+                max_tokens: clamped,
+                timeout_seconds,
+                endpoint: Some(endpoint),
+            }),
+            None => map_hosted_dispatch(&req),
+        };
         wall_ms += t0.elapsed().as_millis() as u64;
         match dispatch {
             Ok(reply) => {
                 bucket
                     .lock()
                     .expect("map remote bucket mutex poisoned")
-                    .spend(conservative_hosted_spend(reply.total_tokens, clamped));
+                    .settle(clamped, conservative_hosted_spend(reply.total_tokens, clamped));
                 if let Some(t) = reply.total_tokens {
                     sum += t;
                     any_usage = true;
@@ -1160,6 +1243,9 @@ fn map_hosted_item(
             }
             // Per-item error ISOLATION: capture, continue (never retried).
             Err(e) => {
+                // Release the reservation — a dispatch-level error spent
+                // nothing (the pre-reserve accounting billed 0 here too).
+                bucket.lock().expect("map remote bucket mutex poisoned").settle(clamped, 0);
                 return MapItemResult {
                     index,
                     ok: false,
@@ -1246,8 +1332,15 @@ impl StepKind for DispatchMapStepKind {
         let identifier = config_str(step, "identifier")
             .map(str::to_string)
             .unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(model, None));
+        // (#1442 ship-2b) `model_key` — the LOADABLE model key when it
+        // differs from the wire `model` id. A local seat dispatches against
+        // its darkmux-NAMESPACED identifier (`darkmux:<id>` as the wire
+        // `model`), but the wave loader's `lms load` needs the bare model
+        // key; without this override the loader would try to load the
+        // namespaced string as if it were a model key.
+        let model_key = config_str(step, "model_key").unwrap_or(model);
         Some(darkmux_gestalt::Placement {
-            model_key: model.to_string(),
+            model_key: model_key.to_string(),
             identifier,
             min_ctx,
             // (#1442 gate C7) "step:<id>", consistent with the placement
@@ -1699,12 +1792,35 @@ mod tests {
     #[test]
     fn map_remote_bucket_admits_until_exhausted_then_skips() {
         let mut b = MapRemoteBucket::new(100);
-        assert!(b.admit(), "fresh bucket admits");
-        b.spend(60);
-        assert!(b.admit(), "still under budget");
-        b.spend(60); // now 120 >= 100
-        assert!(!b.admit(), "over budget -> skip");
+        let g1 = b.admit_reserve(60).expect("fresh bucket admits");
+        b.settle(g1, 60);
+        let g2 = b.admit_reserve(60).expect("still under budget");
+        b.settle(g2, 60); // now 120 >= 100 (the endpoint reported above its grant)
+        assert!(b.admit_reserve(60).is_none(), "over budget -> skip");
         assert_eq!(b.skipped(), 1);
+    }
+
+    #[test]
+    fn map_remote_bucket_reservation_holds_the_grant_until_settled() {
+        // (#1442 fan-out) The reserve-then-settle shape: a granted call's cap
+        // is held against the budget WHILE the call is in flight, so a
+        // concurrent sibling admitting mid-flight sees the reservation —
+        // never the untouched balance (the allowance-multiplication race a
+        // spend-after pair reintroduces under `seats x k` sibling
+        // concurrency).
+        let mut b = MapRemoteBucket::new(100);
+        let granted = b.admit_reserve(4096).expect("admits");
+        assert_eq!(granted, 100, "the grant clamps to what remains");
+        assert!(b.admit_reserve(10).is_none(), "an in-flight reservation blocks siblings");
+        assert_eq!(b.skipped(), 1);
+        // Settling with the real (higher) usage keeps the overshoot honest…
+        b.settle(granted, 600);
+        assert!(b.exhausted());
+        // …and settling an ERRORED call with 0 releases the whole grant.
+        let mut b2 = MapRemoteBucket::new(100);
+        let g = b2.admit_reserve(4096).expect("admits");
+        b2.settle(g, 0);
+        assert_eq!(b2.remaining(), 100, "an errored call spends nothing");
     }
 
     #[test]
@@ -1712,7 +1828,7 @@ mod tests {
         // The hard opt-out: a 0 allowance refuses every hosted call, the same
         // as `admit_remote_execution` refuses a single hosted dispatch.
         let mut b = MapRemoteBucket::new(0);
-        assert!(!b.admit(), "zero budget admits nothing");
+        assert!(b.admit_reserve(10).is_none(), "zero budget admits nothing");
         assert!(b.exhausted());
     }
 
@@ -1722,14 +1838,15 @@ mod tests {
         // full budget — a late item must not be granted more than remains.
         let mut b = MapRemoteBucket::new(100);
         assert_eq!(b.remaining(), 100);
-        b.spend(70);
+        let g = b.admit_reserve(70).expect("admits");
+        b.settle(g, 70);
         assert_eq!(b.remaining(), 30, "a later item's grant clamps to 30, not 100");
         assert_eq!(
-            clamp_hosted_max_tokens(4096, b.remaining()),
+            b.admit_reserve(4096).expect("still admits"),
             30,
-            "the clamp reads the remaining allowance"
+            "the grant reads the remaining allowance"
         );
-        b.spend(60); // overshoot: used 130 > budget 100
+        b.settle(30, 60); // overshoot: the endpoint reported above its grant
         assert_eq!(b.remaining(), 0, "saturating, never an underflow wrap");
     }
 

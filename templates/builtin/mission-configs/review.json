@@ -1,7 +1,7 @@
 {
   "id": "review",
   "name": "PR Review",
-  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired from `darkmux pr-review run` in Packet 4b): investigate (resolve bundles from the diff, probe every staffed seat, dedup the flags) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of Packet 3, this document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config, resolves staffing into the probe-template task's `expand` collection, and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
+  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired from `darkmux pr-review run` in Packet 4b): investigate (resolve bundles from the diff, probe every staffed seat as seats x k generic dispatch.map steps (#1442), dedup the flags with domain reconstruction at the dedup boundary) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of Packet 3, this document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config, resolves staffing into the probe-template task's `expand` collection, and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
   "schema_version": "1.2",
   "inputs": [
     {
@@ -116,7 +116,7 @@
     },
     {
       "name": "staffing",
-      "description": "Resolved probe/judge/verify seat staffing (StaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from the resourcing resolver (#1426 ship-2 -- roster profile scoring + seat pins), never a literal CLI input. Determines HOW MANY probe tasks the investigate phase's probe-template task expands into at launch time -- see the 'review-probe-template' task's notes below.",
+      "description": "Resolved probe/judge/verify seat staffing (StaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from the resourcing resolver (#1426 ship-2 -- roster profile scoring + seat pins), never a literal CLI input. Determines HOW MANY probe tasks the investigate phase's probe-template task expands into at launch time: one per (staffed seat, draw) -- seats x k (#1442, k as expansion fan-out). See the 'review-probe-template' task's notes below.",
       "required": false
     },
     {
@@ -145,14 +145,14 @@
         },
         {
           "id": "review-probe-template-task",
-          "description": "TEMPLATE for the probe stage. build_review_graph builds ONE task/step PER STAFFED PROBE SEAT (kind `review.probe:<seat-name>`, ids `review-probe-{index}-task` / `review-probe-{index}-step`) -- a count and a set of names only known once `staffing` (see inputs) resolves. The `expand` block below (#1284 Packet 3, schema 1.1) is the typed, interpretable primitive mission_config::interpret uses to turn this ONE template into N real tasks at launch -- the launcher resolves `probe_seats` from staffing's staffed probe seats (in staffing order) and passes it as a LaunchParams.expansions entry.",
+          "description": "TEMPLATE for the probe stage. build_review_graph expands ONE task/step PER (STAFFED SEAT, DRAW) — k is expansion FAN-OUT (#1442): the launcher flattens the (seat, draw) product into the `probe_seats` expansion collection (items named `<seat>/draw-<n>`, both counts known once `staffing` resolves), so every draw is a visible graph node the scheduler parallelizes. Each expanded step is a GENERIC `dispatch.map` (ids `review-probe-{index}-task` / `review-probe-{index}-step`): build_review_graph stamps its full per-step config after interpretation — the pre-rendered probe prompts as the inline collection (`user_template: \"{item}\"`, byte parity by construction), the seat's dispatch identity, `bucket_group: \"probe\"` (ONE shared per-execution remote allowance across ALL probe steps), `retry_on_empty: 1`, and local-residency hints. Domain reconstruction (ProbeFlags, per-seat member accounting summed across k sibling steps, warnings, the probe budget row) happens at the dedup boundary against mint-time (seat, draw) specs.",
           "depends_on": [
             "review-bundle-task"
           ],
           "steps": [
             {
               "id": "review-probe-template-step",
-              "kind": "review.probe",
+              "kind": "dispatch.map",
               "config": null
             }
           ],
@@ -160,8 +160,9 @@
             "over": "probe_seats",
             "task_id_pattern": "review-probe-{index}-task",
             "step_id_pattern": "review-probe-{index}-step",
-            "kind_pattern": "{kind}:{name}",
-            "description_pattern": "probe seat `{name}`"
+            "kind_pattern": "{kind}",
+            "description_pattern": "probe seat `{name}`",
+            "display_name_pattern": "Probe {name}"
           }
         },
         {
@@ -210,26 +211,33 @@
       "tasks": [
         {
           "id": "review-verify-task",
-          "description": "verify — adjudicate confirmed findings",
+          "description": "verify — render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
           "depends_on": [
             "review-judge-task"
           ],
           "steps": [
             {
+              "id": "review-verify-render-step",
+              "kind": "review.verify-render",
+              "config": null
+            },
+            {
               "id": "review-verify-step",
-              "kind": "review.verify",
+              "kind": "dispatch.map",
               "config": null
             }
           ],
           "notes": [
-            "always present in the graph even when no verify seat is staffed -- ReviewVerifyStepKind itself no-ops on an absent seat; this config does not (yet) express that conditionality."
+            "always present in the graph even when no verify seat is staffed -- the render step (review.verify-render) emits an EMPTY collection in that case (and on a judge-doomed run, and on a zero-confirmed docket), which makes the dispatch.map step a completed no-op with residency None: zero model loads, zero dispatches (#1442, the generic port of the empty-docket short-circuit).",
+            "the render step consumes the judge task's output and emits one frozen verify_prompt per CONFIRMED finding (byte parity with the #1256 golden by construction); build_review_graph stamps the map step's dispatch config (model/system/max_tokens/bucket_budget/...) only when a verify seat is staffed. The verify-APPLY boundary (state machine, member accounting, budget row) lives in the synthesis step."
           ]
         },
         {
           "id": "review-synthesis-task",
-          "description": "synthesis — finalize tier counts + needs-check clustering",
+          "description": "synthesis — apply verify adjudications, finalize tier counts + needs-check clustering",
           "depends_on": [
             "review-dedup-task",
+            "review-judge-task",
             "review-verify-task"
           ],
           "steps": [

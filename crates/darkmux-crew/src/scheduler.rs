@@ -339,6 +339,12 @@ pub fn run_step_graph(
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
     emit: &mut dyn FnMut(FlowRecord),
     persist: &mut dyn FnMut(&Step),
+    // (#1442 ship-2b) Optional dispatch interceptor threaded into every
+    // step's `StepRunCtx` — `None` on every production path; a test
+    // harness passes `Some` so `dispatch.map` items dispatch through the
+    // caller's mock ON THE WORKER THREAD (see `MapDispatchOverride`'s doc
+    // for why a thread-local seam structurally cannot serve here).
+    dispatch_override: Option<crate::step_kinds::MapDispatchOverride>,
 ) -> Result<SchedulerReport> {
     detect_cycles(tasks)?;
 
@@ -433,18 +439,36 @@ pub fn run_step_graph(
                 .get("bucket_group")
                 .and_then(|v| v.as_str())
                 .map(|group| {
+                    // (#1442 ship-2b) A launcher may stamp the group's
+                    // already-resolved per-execution allowance into the
+                    // step's own config (`bucket_budget`, u64) — the same
+                    // self-describing-config key `dispatch.map`'s
+                    // step-scoped fallback honors. Sibling steps of one
+                    // group are expected to declare the SAME value; the
+                    // first step to create the group's bucket wins (the
+                    // bucket lives for the whole graph run). Absent, the
+                    // `config_access` resolution applies as before.
+                    let budget = step_snapshot
+                        .config
+                        .get("bucket_budget")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_else(
+                            darkmux_types::config_access::remote_max_tokens_per_execution,
+                        );
                     bucket_groups
                         .entry(group.to_string())
                         .or_insert_with(|| {
                             std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::step_kinds::MapRemoteBucket::new(
-                                    darkmux_types::config_access::remote_max_tokens_per_execution(),
-                                ),
+                                crate::step_kinds::MapRemoteBucket::new(budget),
                             ))
                         })
                         .clone()
                 });
-            let ctx = crate::step_kinds::StepRunCtx::new(Some(tx.clone()), remote_bucket);
+            let ctx = crate::step_kinds::StepRunCtx::new(
+                Some(tx.clone()),
+                remote_bucket,
+                dispatch_override.clone(),
+            );
             let job: crate::concurrent_dispatch::DispatchJob<StepJobResult> =
                 Box::new(move || {
                     let outcome =
@@ -951,6 +975,7 @@ mod tests {
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
+            None,
         )
         .unwrap()
     }
@@ -1066,6 +1091,7 @@ mod tests {
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
+            None,
         )
         .expect("the scheduler returns Ok even when a step panics — the panic is a per-step error");
 
@@ -1125,6 +1151,7 @@ mod tests {
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("cycle detected"));
@@ -1152,6 +1179,7 @@ mod tests {
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
+            None,
         )
         .unwrap();
 
@@ -1198,6 +1226,7 @@ mod tests {
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |step| persisted.push(step.clone()),
+            None,
         )
         .unwrap();
 
@@ -1231,6 +1260,7 @@ mod tests {
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |step| persisted.push(step.clone()),
+            None,
         )
         .unwrap();
 
@@ -1289,11 +1319,12 @@ mod tests {
             let entry = match ctx.remote_bucket() {
                 Some(b) => {
                     let mut g = b.lock().expect("bucket poisoned");
-                    let admitted = g.admit();
-                    if admitted {
-                        let remaining = g.remaining();
-                        g.spend(remaining);
-                    }
+                    // Reserve the WHOLE remaining allowance (u32::MAX
+                    // requested clamps to what's left) — the reservation is
+                    // never settled down, so one admitted step exhausts the
+                    // shared bucket for its siblings, the same shape the old
+                    // admit-then-spend(remaining) pair produced.
+                    let admitted = g.admit_reserve(u32::MAX).is_some();
                     (step.id.clone(), true, admitted)
                 }
                 None => (step.id.clone(), false, false),
@@ -1323,6 +1354,7 @@ mod tests {
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
+            None,
         )
         .unwrap();
         emitted
@@ -1379,6 +1411,84 @@ mod tests {
         let entries = log.lock().unwrap().clone();
         let solo = entries.iter().find(|e| e.0 == "solo-step").expect("ran");
         assert!(!solo.1, "ungrouped step receives no scheduler-shared bucket (step-scoped instead)");
+    }
+
+    /// (#1442 ship-2b, the operator-recorded seam decision on PR #1455) The
+    /// `MapDispatchOverride` conformance test: an override handed to
+    /// `run_step_graph` reaches a REAL `dispatch.map` step's item loop on the
+    /// `run_bounded` WORKER THREAD and replaces the transport there. The
+    /// endpoint deliberately points at an unroutable address (port 1) — if
+    /// the override did NOT intercept, the item would come back `ok: false`
+    /// with a connection error instead of the canned reply asserted below.
+    /// This is exactly the coverage a thread-local seam cannot provide (the
+    /// worker thread never sees the test thread's thread-local), which is
+    /// why the seam rides `StepRunCtx`.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_override_intercepts_dispatch_map_items_on_the_worker_thread() {
+        let kinds = StepKindRegistry::with_builtins();
+        let (ta, sa) = kinded_step(
+            "mapped",
+            "dispatch.map",
+            json!({
+                "model": "override-model",
+                "user_template": "check {item}",
+                "collection": ["alpha", "beta"],
+                "endpoint": { "url": "http://127.0.0.1:1" },
+                "timeout_seconds": 1,
+            }),
+            &[],
+        );
+        let (tasks, mut steps) = graph(vec![(ta, sa)]);
+
+        let seen: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_write = seen.clone();
+        let override_fn: crate::step_kinds::MapDispatchOverride =
+            Arc::new(move |call: &crate::step_kinds::OverrideDispatchCall| {
+                seen_write.lock().unwrap().push((
+                    call.model.to_string(),
+                    call.user.to_string(),
+                    call.endpoint.is_some(),
+                ));
+                Ok(crate::single_shot::SingleShotReply {
+                    content: format!("mocked reply for {}", call.user),
+                    total_tokens: Some(7),
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: Some("served-by-mock".to_string()),
+                })
+            });
+
+        let facts = Facts::default();
+        let est = FixedEstimator(Default::default());
+        run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            Some(override_fn),
+        )
+        .unwrap();
+
+        let step = &steps["mapped-step"];
+        assert_eq!(step.status, NodeStatus::Complete, "the map step completed via the override");
+        let results: Vec<crate::step_kinds::MapItemResult> =
+            serde_json::from_str(step.output.as_deref().unwrap()).expect("map output parses");
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert!(r.ok, "no connection error — the transport was replaced: {:?}", r.error);
+            assert!(r.content.starts_with("mocked reply for check "));
+            assert_eq!(r.total_tokens, Some(7));
+            assert_eq!(r.served_model.as_deref(), Some("served-by-mock"), "hosted item surfaces the mock's served model");
+        }
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "one override call per item");
+        assert!(calls.iter().all(|c| c.0 == "override-model" && c.2), "hosted dialect surfaced to the override");
     }
 
     /// (#1442 gate C3) Emits `n` per-item records LIVE through the ctx during
@@ -1536,7 +1646,7 @@ mod tests {
         kinds.register(Arc::new(EmitCollectionKind)).unwrap();
         let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}).unwrap();
+        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}, None).unwrap();
 
         assert!(loads.lock().unwrap().is_empty(), "empty-collection dispatch.map loads no model");
         assert_eq!(steps["map-step"].status, NodeStatus::Complete, "the empty map short-circuits to Complete");
@@ -1580,7 +1690,7 @@ mod tests {
         kinds.register(Arc::new(EmitCollectionKind)).unwrap();
         let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}).unwrap();
+        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}, None).unwrap();
 
         unsafe {
             match prev_url {
