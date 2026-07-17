@@ -8,7 +8,6 @@
 use anyhow::Result;
 
 use crate::cli::LabCmd;
-use crate::crew;
 use crate::lab;
 use crate::workloads;
 
@@ -38,7 +37,6 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 runs,
                 config_path: profiles,
                 quiet,
-                runtime: crew::dispatch::Runtime::Internal,
                 loop_override: None,
                 inject_context: None,
             })?;
@@ -404,7 +402,6 @@ fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
             runs: 1,
             config_path: args.profiles.clone(),
             quiet: args.json,
-            runtime: crew::dispatch::Runtime::Internal,
             // When no compaction flag was set, pass `None` so the dispatch takes
             // the exact `lab run` compaction path (caps still apply via env).
             loop_override: if loop_override.is_empty() {
