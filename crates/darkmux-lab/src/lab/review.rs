@@ -3478,7 +3478,7 @@ pub fn run_judge_only(
 // review's structure — which stages exist, in what order — is declared
 // as a real `Task`/`Step` graph BEFORE any dispatch happens, and executed
 // through ONE `darkmux_crew::scheduler::run_step_graph` call (mirrors
-// `mission_run.rs`'s own migration, #1230 Packet 3). What's NOT knowable
+// `coder_phase.rs`'s own migration, #1230 Packet 3). What's NOT knowable
 // upfront — how many deduped flags exist — is handled entirely INSIDE the
 // judge/verify steps' own internal bounded-concurrency for-each loops,
 // never as graph shape.
@@ -3579,7 +3579,7 @@ pub struct ReviewStepContext {
 /// The production dispatch primitive every review step kind below calls —
 /// routes on `call.endpoint` exactly like `pr_review.rs::run_dispatch`'s
 /// own `chat` closure (contract 1: a consumer routes on what the profile
-/// declares, never re-derives its own local/remote judgment). `mission_run.rs`'s
+/// declares, never re-derives its own local/remote judgment). `coder_phase.rs`'s
 /// `MissionCoderStepKind`/`MissionWorktreeStepKind` still call their real
 /// primitive directly with no seam at all; this call gets one
 /// (`ReviewStepContext::chat_override`) because #1355 found the "no seam"
@@ -3676,7 +3676,7 @@ fn review_token_telemetry_payload(reply: &SingleShotReply) -> Option<serde_json:
 }
 
 /// A "step result" companion flow record — the review's own equivalent of
-/// `mission_run.rs`'s `emit_step_result` (#1230 Packet 4 sibling
+/// `coder_phase.rs`'s `emit_step_result` (#1230 Packet 4 sibling
 /// convention): one generic action, `kind` distinguishing which review step
 /// produced it, free-form `payload` for the rest. Called directly (not via
 /// `StepOutcome.flow_records`) so it's usable from inside a step's own
@@ -4666,7 +4666,7 @@ impl StepKind for ReviewSynthesisStepKind {
 /// The shared, mutex-guarded `ReviewEnvelope` every review step kind
 /// contributes cross-cutting metrics to (member records, warnings, remote
 /// budgets — fields with no single "owning" step) — the review's own
-/// equivalent of `mission_run.rs`'s `Arc<Mutex<Option<T>>>` result-slot
+/// equivalent of `coder_phase.rs`'s `Arc<Mutex<Option<T>>>` result-slot
 /// pattern for rich results that don't fit `StepOutcome.output: String`.
 /// The FLAG DATA itself (`env.flags`/`env.judged`) flows graph-natively
 /// through `Step.output`/`gather_inputs` instead (dedup → judge → verify →
@@ -4997,7 +4997,7 @@ pub fn build_review_graph(
 /// `Planned` snapshot `build_review_graph` produced.
 /// `persist` (#1397 — "the review pipeline may not run through the crew
 /// scheduler; check how `run_review_graph` executes its steps" — it DOES,
-/// via the same `run_step_graph` call `mission_run.rs`/`mission_launch.rs`
+/// via the same `run_step_graph` call `coder_phase.rs`/`mission_launch.rs`
 /// use, so it gets the identical transition-time persistence hook rather
 /// than a bespoke one) fires at every step's OWN status flip — `Running`
 /// at dispatch, `Complete`/`Error` at completion — mirroring

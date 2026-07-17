@@ -650,13 +650,15 @@ fn dispatch_case(
     opts: &ReviewBenchOpts,
 ) -> Result<String> {
     use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts};
-    let session_id = format!(
-        "pr-review-bench-{}-{}",
+    // (#1436) Through the canonical session-id helper; byte-identical shape.
+    let session_id = darkmux_types::session_id::session_id(
+        "pr-review-bench",
         case_id,
-        SystemTime::now()
+        &SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0)
+            .to_string(),
     );
     let d = DispatchOpts {
         role_id: role_id.to_string(),

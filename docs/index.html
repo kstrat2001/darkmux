@@ -323,7 +323,7 @@
     <p>Beyond the swap/lab CLI surface, darkmux ships a <em>crew</em> abstraction: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts, plus a <em>mission/phase</em> lifecycle that tracks multi-step plans as JSON files the operator owns. Optional: none of this is required to use darkmux as a CLI.</p>
     <ul class="plain">
       <li><code>darkmux dispatch coder "..."</code> — invoke a named role; emits flow records</li>
-      <li><code>darkmux mission run</code> / <code>ship</code> — the automated dispatch-to-PR loop: worktree, coder, QA review, operator sign-off gate, PR</li>
+      <li><code>darkmux mission launch coder-phase</code> / <code>mission ship</code> — the automated dispatch-to-PR loop: worktree, coder, QA review, operator sign-off gate, PR</li>
       <li><code>darkmux phase review</code> — QA pass against the current branch's diff; dispatches code-reviewer, parses the SIGNOFF block</li>
       <li><code>darkmux mission start/close/pause/resume</code> + <code>phase start/complete/abandon</code> — drive lifecycle state</li>
       <li><code>darkmux mission add-phase --after &lt;s&gt;</code> — insert scope mid-mission without restructuring</li>

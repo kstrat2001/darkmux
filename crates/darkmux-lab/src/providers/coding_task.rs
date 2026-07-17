@@ -231,13 +231,15 @@ impl WorkloadProvider for CodingTaskProvider {
         let raw_prompt = resolve_prompt(loaded)?;
         let prompt = expand_placeholders_with(&raw_prompt, "/workspace");
         let role = pick_role(loaded);
-        let session_id = format!(
-            "darkmux-coding-{}-{}",
-            loaded.manifest.workload.id,
-            SystemTime::now()
+        // (#1436) Through the canonical session-id helper; byte-identical shape.
+        let session_id = darkmux_types::session_id::session_id(
+            "darkmux-coding",
+            &loaded.manifest.workload.id,
+            &SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0)
+                .to_string(),
         );
 
         // (#421) Pre-dispatch workspace snapshot. Pure observability:

@@ -24,12 +24,12 @@
 //! doc — a resolution miss fails OPEN to `Remote`, never a hard error).
 //! `DispatchInternalStepKind` implements it via `step_kinds::
 //! resolve_local_placement` (role→profile→`select_model`, mirroring the
-//! dispatch preflight's own resolution); `mission_run`'s own
+//! dispatch preflight's own resolution); `coder_phase`'s own
 //! `MissionCoderStepKind`/`MissionVerifyStepKind` do the same for the
 //! `mission.coder`/`mission.verify` kinds. `dispatch.single_shot`'s
 //! residency (the review's probe/judge seats) is left at the default
 //! (`None` → `Remote`) — Packet 4's job, once real concurrent local
-//! seats exist to benefit from it; today's linear graphs (mission_run's
+//! seats exist to benefit from it; today's linear graphs (coder_phase's
 //! 3-step chain) never have more than one step ready per wave, so the
 //! classification is correctness/observability, not a measured speedup.
 
@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // `Task::step_ids` position). The only real graph left is Task-level
 // (`Task::depends_on`), handled by the direct functions below — Phase's
 // "is this the next runnable one"/"is this unreachable" questions
-// (`mission_run::select_phase`, `mission_status::unreachable_phase_drifts`)
+// (`coder_phase::select_phase`, `mission_status::unreachable_phase_drifts`)
 // are now simple linear scans over `Mission::phase_ids`, needing no
 // graph-walking trait at all.
 
@@ -524,7 +524,7 @@ fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
         action: action.to_string(),
         handle: step.id.clone(),
         phase_id: None,
-        session_id: Some(format!("task:{}", step.task_id)),
+        session_id: Some(darkmux_types::session_id::task(&step.task_id)),
         source: Some("scheduler".to_string()),
         model: None,
         reasoning: None,

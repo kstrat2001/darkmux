@@ -491,16 +491,19 @@ function indexGraph(g){
   var stepIds = new Set();
   var taskIds = new Set();
   var phaseIds = new Set();
-  var sessionToStep = {};   // "step:<stepId>" -> stepId (dispatch.internal default session)
+  var sessionToStep = {};   // "step-<stepId>" -> stepId (dispatch.internal default session)
   var sessions = new Set();  // every session id a mission record could carry
+  // (#1436) Session ids are hyphen-delimited: `task-<id>` / `step-<id>` (the
+  // pre-2.0 colon forms `task:`/`step:` retired in lockstep with their Rust
+  // producers — scheduler.rs / step_kinds/builtins.rs).
   g.nodes.forEach(function(n){
     if (n.kind === "phase") phaseIds.add(n.id);
-    if (n.kind === "task") { taskIds.add(n.id); sessions.add("task:" + n.id); }
+    if (n.kind === "task") { taskIds.add(n.id); sessions.add("task-" + n.id); }
     (n.steps || []).forEach(function(s){
       stepToTask[s.id] = n.id;
       stepIds.add(s.id);
-      sessionToStep["step:" + s.id] = s.id;
-      sessions.add("step:" + s.id);
+      sessionToStep["step-" + s.id] = s.id;
+      sessions.add("step-" + s.id);
     });
   });
   return { nodeIds: nodeIds, stepToTask: stepToTask, stepIds: stepIds,
@@ -514,7 +517,7 @@ function indexGraph(g){
 //   1. a `"step result"` record's `payload.step_id` (review.* + mission.coder/
 //      verify use this — their `handle` is the crew/`"mission-run"` label, not
 //      the step id);
-//   2. a dispatch record whose `session_id` is the `step:<id>` default a
+//   2. a dispatch record whose `session_id` is the `step-<id>` default a
 //      `dispatch.internal` step sets (the live per-turn token/turn climb);
 //   3. `handle === stepId` (the scheduler's step-lifecycle records + a hosted
 //      single-shot `"step result"`).

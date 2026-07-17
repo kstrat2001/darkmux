@@ -70,7 +70,7 @@
 //! indistinguishable from a stuck mission in `darkmux mission status`).
 
 use crate::lifecycle;
-use crate::types::PhaseStatus;
+use crate::types::{MissionStatus, PhaseStatus};
 use serde::{Deserialize, Serialize};
 
 /// Current schema version for `MissionEnvelope` documents. Plain semver
@@ -246,6 +246,55 @@ impl MissionEnvelope {
 /// mission's last-run outcome without re-deriving it from flow records.
 /// Best-effort like everything else here: a persistence hiccup degrades
 /// only the VIEW, never the run itself (already finished by this point).
+/// (#1406/#1433) A finalize transition refusal, classified for signaling.
+/// `finalize_mission` applies each phase's declared outcome and closes the
+/// mission through the `lifecycle` legality check; when that check REFUSES
+/// (`Err`), this says whether the refusal is a benign idempotent no-op (the
+/// target already sits in the terminal state the finalize asked for) or
+/// genuine drift worth a loud, named warning.
+#[derive(Debug, PartialEq, Eq)]
+enum FinalizeRefusal {
+    /// The target is already in the terminal state the outcome wanted — a
+    /// reopen re-finalizing an already-terminal phase/mission. Stay quiet.
+    Benign,
+    /// The target is in a state the declared outcome can't reach — the #1406
+    /// bug shape (a `Planned` phase asked to `Complete`; an `Active` mission a
+    /// close refused for a non-idempotent reason). Warn, loud and named.
+    Drift,
+}
+
+/// Classify a PHASE finalize refusal from the outcome finalize wanted and the
+/// phase's CURRENT on-disk status. Benign iff the phase already sits in the
+/// matching terminal state; a `Planned` phase asked to `Complete` is Drift
+/// (the exact #1406 bug the honest per-phase derivation upstream prevents).
+fn classify_phase_refusal(
+    outcome: PhaseOutcomeKind,
+    current: Option<PhaseStatus>,
+) -> FinalizeRefusal {
+    let already_terminal = matches!(
+        (outcome, current),
+        (PhaseOutcomeKind::Complete, Some(PhaseStatus::Complete))
+            | (PhaseOutcomeKind::Abandoned, Some(PhaseStatus::Abandoned))
+    );
+    if already_terminal {
+        FinalizeRefusal::Benign
+    } else {
+        FinalizeRefusal::Drift
+    }
+}
+
+/// Classify a MISSION-close refusal from the mission's CURRENT status. Benign
+/// iff the mission is already `Closed` (an idempotent re-finalize); every other
+/// refusal — including an unknown status because the mission can't be read — is
+/// Drift (#1433: the mission-close arm was previously `let _`-swallowed, hiding
+/// a Closed mission whose envelope disagreed with disk).
+fn classify_mission_close_refusal(current: Option<MissionStatus>) -> FinalizeRefusal {
+    match current {
+        Some(MissionStatus::Closed) => FinalizeRefusal::Benign,
+        _ => FinalizeRefusal::Drift,
+    }
+}
+
 pub fn finalize_mission(envelope: &MissionEnvelope) {
     for phase in &envelope.phases {
         let result = match phase.outcome {
@@ -253,16 +302,8 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
             PhaseOutcomeKind::Abandoned => lifecycle::phase_abandon(&phase.phase_id),
         };
         if let Err(e) = result {
-            // (#1406) Classify the refusal: a phase ALREADY in the outcome's
-            // terminal state is a benign idempotent no-op (a reopen
-            // re-finalizing an already-terminal phase); anything else is real
-            // drift worth a loud, named warning.
-            let already_terminal = matches!(
-                (phase.outcome, lifecycle::load_phase_by_id(&phase.phase_id).map(|p| p.status)),
-                (PhaseOutcomeKind::Complete, Ok(PhaseStatus::Complete))
-                    | (PhaseOutcomeKind::Abandoned, Ok(PhaseStatus::Abandoned))
-            );
-            if !already_terminal {
+            let current = lifecycle::load_phase_by_id(&phase.phase_id).map(|p| p.status).ok();
+            if classify_phase_refusal(phase.outcome, current) == FinalizeRefusal::Drift {
                 eprintln!(
                     "warning: mission `{}` finalize could not drive phase `{}` to {:?}: {e:#}; \
                      phase left as-is, reconcile with `darkmux phase` verbs (#1406)",
@@ -275,7 +316,20 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
         .reason
         .clone()
         .unwrap_or_else(|| envelope.status.default_reason().to_string());
-    let _ = lifecycle::mission_close_with_reasoning(&envelope.mission_id, Some(&reason));
+    if let Err(e) = lifecycle::mission_close_with_reasoning(&envelope.mission_id, Some(&reason)) {
+        // (#1433 follow-up) Was `let _`-swallowed — a mission that couldn't be
+        // closed left its envelope.json disagreeing with an Active mission on
+        // disk, silently. Classify like the phase refusals: quiet only when the
+        // mission is ALREADY Closed (idempotent re-finalize), loud otherwise.
+        let current = lifecycle::load_mission_by_id(&envelope.mission_id).map(|m| m.status).ok();
+        if classify_mission_close_refusal(current) == FinalizeRefusal::Drift {
+            eprintln!(
+                "warning: mission `{}` finalize could not close it: {e:#}; mission left as-is, \
+                 reconcile with `darkmux mission close` (#1433)",
+                envelope.mission_id
+            );
+        }
+    }
     let _ = lifecycle::save_envelope(&envelope.mission_id, envelope);
 }
 
@@ -285,6 +339,62 @@ mod tests {
     use crate::types::{Mission, MissionStatus, Phase, PhaseStatus};
     use std::env;
     use tempfile::TempDir;
+
+    // ── Finalize refusal classifier (#1406/#1433) — pure, no I/O ──────────
+
+    #[test]
+    fn phase_refusal_loud_on_planned_asked_to_complete() {
+        // The exact #1406 bug shape: a phase that never started, asked to
+        // Complete, must classify as Drift (a loud, named warning).
+        assert_eq!(
+            classify_phase_refusal(PhaseOutcomeKind::Complete, Some(PhaseStatus::Planned)),
+            FinalizeRefusal::Drift
+        );
+    }
+
+    #[test]
+    fn phase_refusal_quiet_when_already_in_the_target_terminal_state() {
+        assert_eq!(
+            classify_phase_refusal(PhaseOutcomeKind::Complete, Some(PhaseStatus::Complete)),
+            FinalizeRefusal::Benign
+        );
+        assert_eq!(
+            classify_phase_refusal(PhaseOutcomeKind::Abandoned, Some(PhaseStatus::Abandoned)),
+            FinalizeRefusal::Benign
+        );
+    }
+
+    #[test]
+    fn phase_refusal_loud_on_cross_terminal_mismatch_and_unknown() {
+        // Abandoned-asked-to-Complete (and vice versa) is drift, not idempotent.
+        assert_eq!(
+            classify_phase_refusal(PhaseOutcomeKind::Complete, Some(PhaseStatus::Abandoned)),
+            FinalizeRefusal::Drift
+        );
+        // Unreadable phase (None) can't be proven idempotent -> loud.
+        assert_eq!(
+            classify_phase_refusal(PhaseOutcomeKind::Abandoned, None),
+            FinalizeRefusal::Drift
+        );
+    }
+
+    #[test]
+    fn mission_close_refusal_quiet_only_when_already_closed() {
+        assert_eq!(
+            classify_mission_close_refusal(Some(MissionStatus::Closed)),
+            FinalizeRefusal::Benign
+        );
+        assert_eq!(
+            classify_mission_close_refusal(Some(MissionStatus::Active)),
+            FinalizeRefusal::Drift
+        );
+        assert_eq!(
+            classify_mission_close_refusal(Some(MissionStatus::Paused)),
+            FinalizeRefusal::Drift
+        );
+        // Unknown status (mission unreadable) is loud.
+        assert_eq!(classify_mission_close_refusal(None), FinalizeRefusal::Drift);
+    }
 
     /// Mirrors `lifecycle::tests::CrewGuard` — isolates both the crew root
     /// (mission/phase JSON) and the flow-record sink so these tests never

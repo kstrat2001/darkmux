@@ -28,7 +28,7 @@ use std::time::Duration;
 /// (post-#1341, dependency edges are derived from `Task::depends_on`, not a
 /// `Step::depends_on` that no longer exists). `pub` (#1402) so the root
 /// `darkmux` binary crate can pin `mission_step_kind_display_name`'s static
-/// `mission.*` table against `src/mission_run.rs`'s live `StepKind::
+/// `mission.*` table against `src/coder_phase.rs`'s live `StepKind::
 /// display_name()` impls — see that constant's own doc for why the table
 /// can't be verified from THIS crate (the dependency edge runs the other
 /// way).
@@ -955,7 +955,7 @@ pub fn worktree_contained(
 /// across the two lexicographically last `.jsonl` day files, and extract
 /// payload.worktree/base/branch. (#1230 Packet 4: migrated off the retired
 /// `mission.run.start` action — the worktree step now emits this generic
-/// `"step result"` companion record instead; see `mission_run.rs`'s
+/// `"step result"` companion record instead; see `coder_phase.rs`'s
 /// `emit_step_result` doc.)
 pub fn resolve_session(
     session_id: &str,

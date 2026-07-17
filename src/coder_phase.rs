@@ -1,24 +1,31 @@
-//! `darkmux mission run` — the local dispatch-to-PR loop, up to the gate.
+//! Coder-phase execution — the launch-owned worktree → coder → QA loop.
 //!
-//! `mission dispatch` (see `cmd_mission_dispatch`) fans a mission's ready
-//! phases onto the global Redis work queue for the fleet to claim. `mission
-//! run` is its **local, synchronous, single-phase sibling**: it owns the
-//! mechanical per-phase loop on THIS machine —
+//! (#1426, ship-4) The `mission run` verb retired: the coder pipeline now
+//! runs EXCLUSIVELY through `mission launch coder-phase`, which materializes
+//! the same three-Task/three-Step graph as data (`mission-configs/
+//! coder-phase.json`) and executes it through the generic scheduler. This
+//! module is what the launch path OWNS for that pipeline — per #1352's
+//! physical StepKind tiering, the bespoke Tier 3 kinds live with the mission
+//! module that drives them:
 //!
-//!   1. create an isolated git worktree for the phase,
-//!   2. dispatch the coder role into it (phase-bound, internal runtime),
-//!   3. run the local `code-reviewer` QA against the worktree diff,
-//!   4. surface the coder result + tokens-off-meter + QA findings,
-//!   5. **stop at the gate** — worktree left in place, nothing committed.
+//!   * [`MissionWorktreeStepKind`] — create an isolated git worktree,
+//!   * [`MissionCoderStepKind`] — dispatch the coder role into it,
+//!   * [`MissionVerifyStepKind`] — run local `code-reviewer` QA on the diff,
 //!
-//! Why it stops: adjudicating the QA findings and deciding to merge are
-//! judgment/gate steps that belong to the frontier orchestrator + operator,
-//! never to a CLI verb (operator sovereignty, #44; never-auto-merge). `mission
-//! run` tees everything up so sign-off is one follow-on step — `darkmux mission
-//! ship <id> --phase <phase-id>` (PR2) does the commit → PR → CI → merge →
-//! teardown after the operator/frontier signs off. This verb kills the
-//! worktree-dance + manual-token-tally frictions (#782) without taking the
-//! merge decision out of the operator's hands.
+//! plus the injected-context brief-building the coder step feeds on
+//! ([`coder_brief`] + the cautions/lessons/corrections allocation), and the
+//! two operator-facing lifecycle verbs that finish or back out a gate-held
+//! run: [`ship`] (commit → PR → CI → merge → teardown) and [`abort`]
+//! (worktree + branch teardown, phase Abandoned). [`debrief`] reports on how
+//! a mission's phases ended.
+//!
+//! Why the pipeline stops at a gate: adjudicating the QA findings and
+//! deciding to merge are judgment steps that belong to the frontier
+//! orchestrator + operator, never to a CLI verb (operator sovereignty, #44;
+//! never-auto-merge). `mission launch coder-phase` tees everything up so
+//! sign-off is one follow-on step — `darkmux mission ship <id> --phase
+//! <phase-id>` does the commit → PR → CI → merge → teardown after the
+//! operator/frontier signs off (#782).
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -444,110 +451,8 @@ fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> R
 // returns — `Step.output` still carries a plain-text summary for
 // consistency with every other step kind's convention.
 
-use crew::scheduler::run_step_graph;
-use crew::step_kinds::{resolve_local_placement, StepKind, StepKindRegistry, StepOutcome};
-use crew::types::{NodeStatus, Task};
+use crew::step_kinds::{resolve_local_placement, StepKind, StepOutcome};
 use std::sync::{Arc, Mutex};
-
-/// Build the 3-Task/3-Step graph `run()` executes: worktree → coder →
-/// verify, wired with `depends_on` so the scheduler enforces the same
-/// ordering the pre-migration hand-written sequence always had — coder
-/// only becomes ready once worktree completes; verify only becomes ready
-/// once coder completes (which `MissionCoderStepKind` makes conditional
-/// on a clean exit — see its doc). `kind` strings are step-kind registry
-/// ids the caller's `StepKindRegistry` resolves at scheduling time; this
-/// function only builds the graph SHAPE, not the registry (production vs.
-/// test registries wire different implementations behind the same ids).
-///
-/// (#1230/#1341) A Task is the ASSIGNABLE unit — the coder Task carries
-/// `role_id`/`workdir`/`image` (the assignee + environment for the whole
-/// job, fixed for its duration) rather than these being re-declared at
-/// Step level; the verify Task carries `role_id` too (`code-reviewer` is
-/// hardcoded inside `phase_review_output_at`, but the Task still records
-/// WHO is assigned for inspection — `darkmux mission status`/the graph
-/// lens read this, even though `MissionVerifyStepKind` itself dispatches
-/// directly rather than through `task.role_id`). The worktree Task is
-/// purely procedural (git plumbing, no crew assignment) — its resource
-/// fields stay `None`.
-///
-/// (#1284 Packet 3) A THIN LAUNCHER as of this packet: loads the built-in
-/// "coder-phase" mission config (`crew::mission_config::load`), resolves
-/// this call's own per-launch parameters (the real phase id, the dispatched
-/// role, the worktree path, the image override) into
-/// `crew::mission_config::interpret::LaunchParams::task_overrides`, and
-/// calls `crew::mission_config::interpret` to materialize the real
-/// `Vec<Task>`/`BTreeMap<String, Step>`. Still builds the graph SHAPE only,
-/// not the registry — same contract as before this packet.
-fn default_phase_graph(
-    phase_id: &str,
-    role: &str,
-    wt_path: &Path,
-    image: Option<&str>,
-) -> Result<(Vec<Task>, std::collections::BTreeMap<String, crew::types::Step>)> {
-    use crew::mission_config::{interpret, LaunchParams, TaskOverride};
-
-    // (#1284 review round 2, consider 7 — same hazard as
-    // `build_review_graph`'s load) `load` resolves user → on-disk →
-    // embedded, so a malformed USER-tier
-    // `~/.darkmux/mission-configs/coder-phase.json` lands here — graceful
-    // error, never a panic blaming the built-in; the loader's own context
-    // names the failing file's path, which identifies the tier.
-    let loaded = crew::mission_config::load("coder-phase").context(
-        "loading mission config \"coder-phase\" — note: a user-tier copy \
-         (~/.darkmux/mission-configs/coder-phase.json) or an on-disk template \
-         overrides the embedded built-in; the failing file is named below",
-    )?;
-
-    let mut phase_ids = std::collections::BTreeMap::new();
-    phase_ids.insert("build".to_string(), phase_id.to_string());
-
-    let mut task_overrides = std::collections::BTreeMap::new();
-    // `role`/`description` are ALWAYS overridden dynamically (matching the
-    // pre-Packet-3 hand-built Task literal above, which always wrote
-    // `role_id: Some(role.to_string())` and a dynamic `dispatch \`{role}\`
-    // into the worktree` description regardless of whether `role` happens
-    // to equal the document's own default "coder").
-    task_overrides.insert(
-        "build-coder".to_string(),
-        TaskOverride {
-            role_id: Some(role.to_string()),
-            workdir: Some(wt_path.to_path_buf()),
-            image: image.map(String::from),
-            description: Some(format!("dispatch `{role}` into the worktree")),
-            ..Default::default()
-        },
-    );
-    // The verify task's role_id ("code-reviewer") and description already
-    // match the document's own static defaults — only `workdir` (genuinely
-    // per-launch) needs an override.
-    task_overrides.insert(
-        "build-verify".to_string(),
-        TaskOverride { workdir: Some(wt_path.to_path_buf()), ..Default::default() },
-    );
-
-    let params = LaunchParams {
-        phase_ids,
-        task_overrides,
-        step_config_overrides: std::collections::BTreeMap::new(),
-        expansions: std::collections::BTreeMap::new(),
-    };
-
-    // (#1418) `coder-phase.json` declares no `expand` tasks today, so
-    // `warnings` is always empty here; printed anyway (never silently
-    // dropped) in case a future edit to the built-in or a user-tier
-    // override adds one.
-    let (tasks, steps, warnings) = interpret(&loaded.config, &params).with_context(|| {
-        format!(
-            "interpreting mission config \"coder-phase\" (resolved from the {} tier at {})",
-            loaded.source,
-            loaded.manifest_path.display()
-        )
-    })?;
-    for w in &warnings {
-        eprintln!("{}", style::dim(&format!("mission run: {w}")));
-    }
-    Ok((tasks, steps))
-}
 
 /// Wraps the worktree-creation half of the old hand-written sequence
 /// (moved here verbatim from the pre-migration `add_worktree` free
@@ -710,7 +615,7 @@ impl StepKind for MissionCoderStepKind {
         let result = crew::dispatch::dispatch(opts)?;
         eprintln!(
             "{}",
-            style::dim(&format!("darkmux mission run: session id `{}`", self.session_id))
+            style::dim(&format!("darkmux coder-phase: session id `{}`", self.session_id))
         );
 
         let tokens = result
@@ -859,516 +764,85 @@ impl StepKind for MissionVerifyStepKind {
     }
 }
 
-/// `darkmux mission run` entry. Returns the process exit code:
-/// `0` clean (coder ran, QA clean or flags-only), `1` coder dispatch error,
-/// `2` QA found blockers (operator must resolve before ship),
-/// `3` QA could not run (reviewer dispatch failed — manual review required).
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    mission_id: &str,
-    phase_id: Option<&str>,
-    role: &str,
-    image: Option<&str>,
-    base: &str,
-    timeout_seconds: u32,
-) -> Result<i32> {
-    use crew::loader::{load_missions, load_roles, load_phases};
 
-    // CLI-boundary charset validation — these flow into branch names,
-    // worktree paths, session ids, and flow records.
-    fleet::validate_identifier("mission_id", mission_id)?;
-    fleet::validate_identifier("role_id", role)?;
-    if let Some(s) = phase_id {
-        fleet::validate_identifier("--phase", s)?;
+/// (#1426 ship-4) Resolve the on-disk worktree of a gate-held coder-phase run
+/// for `mission ship`/`mission abort`. `mission launch coder-phase` sets the
+/// worktree from its operator-supplied `workdir` input and persists it on the
+/// phase's tasks (`Task.workdir`); read it back so ship/abort target the ACTUAL
+/// worktree even when the operator launched into a non-default location. Falls
+/// back to the derived `worktree_path(root, phase_id)` (the retired `mission
+/// run`'s own convention) when no task records a workdir — an old on-disk run,
+/// or a phase whose task records predate the workdir plumbing.
+fn resolve_run_workdir(mission_id: &str, phase_id: &str, root: &Path) -> PathBuf {
+    crew::lifecycle::load_tasks_for_phase(mission_id, phase_id)
+        .ok()
+        .into_iter()
+        .flatten()
+        .find_map(|t| t.workdir)
+        .unwrap_or_else(|| worktree_path(root, phase_id))
+}
+
+/// (#1426 ship-4 / #1433) After `ship`/`abort` drives a phase to a terminal
+/// status, bring the MISSION to an honest terminal state too — but only when
+/// EVERY phase is terminal (Complete/Abandoned). A mission with a still-open
+/// phase elsewhere stays Active so the operator finishes the remaining phases.
+/// The envelope's per-phase outcomes come from each phase's ACTUAL on-disk
+/// status (#1433's honest-finalize discipline — never a uniform status stamped
+/// across phases): a phase `ship` completed reads `Complete`, one `abort`
+/// abandoned reads `Abandoned`. Best-effort — a load hiccup leaves the mission
+/// as-is (reconcilable via `darkmux mission close`), never fails ship/abort.
+fn finalize_mission_if_complete(mission_id: &str) {
+    use crew::envelope::{MissionEnvelope, MissionOutcomeStatus, PhaseOutcome, PhaseOutcomeKind};
+    use crew::types::PhaseStatus;
+
+    let phases = match crew::loader::load_phases() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mine: Vec<&crew::types::Phase> =
+        phases.iter().filter(|p| p.mission_id == mission_id).collect();
+    if mine.is_empty() {
+        return;
     }
-
-    // 1. Validate the mission + role exist.
-    let missions = load_missions()?;
-    let mission = missions
+    let all_terminal = mine
         .iter()
-        .find(|m| m.id == mission_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "mission `{mission_id}` not found. Run `darkmux mission propose` then \
-                 `darkmux mission launch <config-id>` first, or check the id."
-            )
-        })?;
-    if !matches!(mission.status, crew::types::MissionStatus::Active) {
-        eprintln!(
-            "{}",
-            style::warn(&format!(
-                "darkmux mission run: warning — mission `{mission_id}` status is {:?}, not Active. \
-                 Proceeding anyway (operator-explicit override).",
-                mission.status
-            ))
-        );
+        .all(|p| matches!(p.status, PhaseStatus::Complete | PhaseStatus::Abandoned));
+    if !all_terminal {
+        return;
     }
-    let roles = load_roles()?;
-    if !roles.iter().any(|r| r.id == role) {
-        bail!("role `{role}` not found (check `darkmux crew roles`)");
-    }
-
-    // 2. Select the phase to run.
-    let phases = load_phases()?;
-    let phase = select_phase(&phases, &mission.phase_ids, mission_id, phase_id)?;
-
-    // Shared session id for every record this run emits — the frontier
-    // tails the stream on this id to track the run end to end.
-    let session_id = format!("mission-run-{}-{}", mission_id, phase.id);
-
-    // 3. Set up the isolated worktree.
-    let root = repo_root()?;
-    let wt_path = worktree_path(&root, &phase.id);
-    let conv = crate::conventions::load(&root);
-    let branch = conventions_branch(&phase, mission, conv.as_ref());
-
-    println!(
-        "{}",
-        style::header(&format!(
-            "▶ mission run — {} · phase {}",
-            mission_id, phase.id
-        ))
-    );
-    println!("  {}  {}", style::dim("mission:"), mission.description);
-    println!("  {}   {}", style::dim("phase:"), phase.description);
-    println!(
-        "  {} {} {} {}",
-        style::dim("worktree:"),
-        wt_path.display(),
-        style::dim("← branch"),
-        style::accent(&branch)
-    );
-    println!();
-
-    // (#1230 Packet 3) Worktree creation itself — plus the "✓ worktree
-    // ready" print and the `mission.run.start` flow record — now happens
-    // inside `MissionWorktreeStepKind::run`, the first step of the graph
-    // built + executed further down. Kept at the exact same point in the
-    // sequence (right after the header prints above), just moved behind
-    // the step-kind boundary.
-
-    // 4. Flip the phase Planned → Running (consistent with `mission
-    //    dispatch`). It IS being worked on now; `mission ship` flips it to
-    //    Complete on merge. If it was already Running (a resumed run), the
-    //    lifecycle call is a no-op-ish; surface any error softly.
-    if matches!(phase.status, crew::types::PhaseStatus::Planned) {
-        if let Err(e) = crew::lifecycle::phase_start(&phase.id) {
-            eprintln!(
-                "{}",
-                style::warn(&format!(
-                    "darkmux mission run: phase_start({}) failed: {e:#} — continuing; \
-                     state can be reconciled with `darkmux phase` verbs.",
-                    phase.id
-                ))
-            );
-        }
-    }
-
-    // 5. Dispatch the coder into the worktree, phase-bound, internal
-    //    runtime, --json so the token totals (#782a) land in metrics.json.
-    println!(
-        "\n{}",
-        style::header(&format!("▶ dispatching `{role}` into the worktree…"))
-    );
-    // (#849 half 1) Carry forward corrections the reviewer recorded on earlier
-    // dispatches in this mission (the doom-loop fix). Scope to the mission's
-    // EXACT dispatch session ids (built from its phases) — a `mission-run-<id>-`
-    // prefix match would bleed a sibling mission whose id is a hyphen-extension.
-    // Surface the texts so the operator sees what's injected — provenance, not
-    // a silent rule (#44).
-    let mission_session_ids: std::collections::HashSet<String> = phases
+    let outcomes: Vec<PhaseOutcome> = mine
         .iter()
-        .filter(|s| s.mission_id.as_str() == mission_id)
-        .map(|s| format!("mission-run-{}-{}", mission_id, s.id))
+        .map(|p| {
+            let outcome = match p.status {
+                PhaseStatus::Complete => PhaseOutcomeKind::Complete,
+                _ => PhaseOutcomeKind::Abandoned,
+            };
+            PhaseOutcome { phase_id: p.id.clone(), outcome, reason: None }
+        })
         .collect();
-    // (#1002) Files this dispatch is about to work on (from the phase
-    // description) — used to rank file-in-play cautions + lessons above
-    // engagement-level ones, and to staleness-check cautions against the
-    // worktree's current content.
-    let intent = intent_files(&phase.description);
-
-    // (#994 retrieve+inject) The three injected-context sources, each fully
-    // ranked but UNCAPPED here — the proportional budget (#1011) decides how
-    // much of each lands, so a large-window profile uses its headroom and a
-    // small one isn't over-fed. Authority order: corrections (operator/reviewer
-    // overrides) > lessons (authored) > cautions (auto-derived, flood-prone).
-    let corrections = mission_adjudication_notes(&mission_session_ids);
-    let cautions = mission_cautions(&mission_session_ids, &intent, &wt_path);
-    let authored = engagement_lessons(&intent);
-
-    // (#1011) Distribute a single budget — a fraction of THIS dispatch model's
-    // context window — across the blocks with per-authority floors (no category
-    // starves another), priority-ordered remainder, and a cautions cap.
-    let budget = injected_budget_chars(
-        // (#1282) `Err` = the default profile is quarantined; the coder
-        // dispatch below would hard-fail with the same error, so fail early.
-        crew::dispatch_internal::resolve_context_window_internal(None, None)?,
-    );
-    let (prior_corrections, detected_cautions, lessons) =
-        allocate_injected_context(corrections, cautions, authored, budget);
-
-    // Surface what's injected — provenance, not a silent rule (#44). Counts
-    // reflect the post-budget selection.
-    if !prior_corrections.is_empty() {
-        println!(
-            "{}",
-            style::dim(&format!(
-                "  carrying {} prior adjudication correction(s) into the brief \
-                 (recorded by the reviewer on earlier dispatches in this mission):",
-                prior_corrections.len()
-            ))
-        );
-        for c in &prior_corrections {
-            let first = c.lines().next().unwrap_or("").trim();
-            println!("{}", style::dim(&format!("    • {first}")));
-        }
-    }
-    if !detected_cautions.is_empty() {
-        println!(
-            "{}",
-            style::dim(&format!(
-                "  carrying {} detected loop caution(s) into the brief \
-                 (darkmux's detectors flagged these on earlier dispatches in this mission):",
-                detected_cautions.len()
-            ))
-        );
-        for c in &detected_cautions {
-            let first = c.lines().next().unwrap_or("").trim();
-            println!("{}", style::dim(&format!("    • {first}")));
-        }
-    }
-    if !lessons.is_empty() {
-        println!(
-            "{}",
-            style::dim(&format!(
-                "  carrying {} engagement lesson(s) into the brief:",
-                lessons.len()
-            ))
-        );
-        for c in &lessons {
-            let first = c.lines().next().unwrap_or("").trim();
-            println!("{}", style::dim(&format!("    • {first}")));
-        }
-    }
-    // (#1230 Packet 3) The coder's dispatch options — unchanged from the
-    // pre-migration inline construction, now captured by the coder Step
-    // kind (`MissionCoderStepKind`) instead of being dispatched directly
-    // here.
-    let opts = crew::dispatch::DispatchOpts {
-        role_id: role.to_string(),
-        message: coder_brief(&phase, mission, &lessons, &prior_corrections, &detected_cautions),
-        session_id: Some(session_id.clone()),
-        timeout_seconds,
-        skip_preflight: false,
-        json: true,
-        workdir: Some(wt_path.clone()),
-        phase_id: Some(phase.id.clone()),
-        // `--machine` is not a `mission run` flag — always local. See
-        // `MissionCoderStepKind`'s doc for why that means calling
-        // `dispatch::dispatch` directly is behavior-identical to the old
-        // `fleet::dispatch_routed`.
-        machine: None,
-        wait: true,
-        compaction: crew::dispatch::CompactionDispatchArgs::default(),
-        profile_name: None,
-        // (#984) mission run uses the default registry — no --profiles-file.
-        config_path: None,
-        // (#1199) Bench-only knobs; defaults preserve existing behavior.
-        force_container: false,
-        max_completion_tokens: None,
-        image: image.map(String::from),
-        model_base_url_override: None,
+    let all_complete = outcomes.iter().all(|o| o.outcome == PhaseOutcomeKind::Complete);
+    let status = if all_complete {
+        MissionOutcomeStatus::Clean
+    } else {
+        // A mix (or all abandoned) — real work happened but not every phase
+        // completed cleanly; Degraded reads honestly on the board.
+        MissionOutcomeStatus::Degraded
     };
-
-    // (#1230 Packet 3) Build the data-defined Task/Step graph — worktree →
-    // coder → verify — and execute it through Packet 2's `run_step_graph`
-    // instead of the pre-migration hand-written sequence. Persist the
-    // Task/Step records (`lifecycle::save_task`/`save_step`) for future
-    // observability (the graph lens, #1230 Packet 6) — best-effort, not
-    // load-bearing for this run's own control flow, which reads the
-    // in-memory `steps` map below.
-    let (tasks, mut steps) = default_phase_graph(&phase.id, role, &wt_path, image)?;
-    for task in &tasks {
-        if let Err(e) = crew::lifecycle::save_task(mission_id, task) {
-            eprintln!(
-                "{}",
-                style::dim(&format!("darkmux mission run: task persist warning: {e:#}"))
-            );
-        }
-    }
-
-    let coder_result_slot: Arc<Mutex<Option<CoderStepResult>>> = Arc::new(Mutex::new(None));
-    let verify_result_slot: Arc<
-        Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>,
-    > = Arc::new(Mutex::new(None));
-
-    let registry = StepKindRegistry::new();
-    registry
-        .register(Arc::new(MissionWorktreeStepKind {
-            repo_root: root.clone(),
-            wt_path: wt_path.clone(),
-            branch: branch.clone(),
-            base: base.to_string(),
-            mission_id: mission_id.to_string(),
-            phase_id: phase.id.clone(),
-            session_id: session_id.clone(),
-            role: role.to_string(),
-        }))
-        .expect("mission.worktree registered once");
-    registry
-        .register(Arc::new(MissionCoderStepKind {
-            opts: Mutex::new(Some(opts)),
-            wt_path: wt_path.clone(),
-            mission_id: mission_id.to_string(),
-            phase_id: phase.id.clone(),
-            session_id: session_id.clone(),
-            role_id: role.to_string(),
-            result_slot: coder_result_slot.clone(),
-        }))
-        .expect("mission.coder registered once");
-    registry
-        .register(Arc::new(MissionVerifyStepKind {
-            wt_path: wt_path.clone(),
-            base: base.to_string(),
-            phase_id: phase.id.clone(),
-            result_slot: verify_result_slot.clone(),
-        }))
-        .expect("mission.verify registered once");
-
-    // Best-effort classification only (see `StepKind::residency`) — never
-    // load-bearing for correctness here: this graph is a strict linear
-    // chain (each step `depends_on` the last), so no wave ever has more
-    // than one ready step and `Local` vs `Remote` has zero effect on what
-    // actually runs, only on how the (never-contended) scheduling is
-    // classified. `Facts::default()` (no known residents/pools) + a
-    // `FixedEstimator` mirror the same "not yet meaningful" placeholder
-    // Packet 1's own production caller uses.
-    let facts = crew::step_kinds::Facts::default();
-    let est = crew::step_kinds::FixedEstimator::default();
-    let tasks_by_id: std::collections::BTreeMap<String, Task> =
-        tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
-    // (#1397) `persist` durably saves each step at ITS OWN transition
-    // (Running at dispatch, Complete/Error at completion) — not just at
-    // the end of the whole run — so a graph-lens page opened mid-run
-    // reads a truthful, non-stale step status instead of the pre-run
-    // `Planned` snapshot. The bulk save loop right after this call stays
-    // in place as a cheap, idempotent final reconcile.
-    run_step_graph(
-        &mut steps,
-        &tasks_by_id,
-        &registry,
-        &facts,
-        &est,
-        1,
-        &crew::concurrent_dispatch::lms_host_factory,
-        &mut |record| {
-            let _ = flow::record(record);
-        },
-        &mut |step| {
-            if let Err(e) = crew::lifecycle::save_step(mission_id, &phase.id, step) {
-                eprintln!(
-                    "{}",
-                    style::dim(&format!("darkmux mission run: step persist warning (transition): {e:#}"))
-                );
-            }
-        },
-    )?;
-
-    for step in steps.values() {
-        if let Err(e) = crew::lifecycle::save_step(mission_id, &phase.id, step) {
-            eprintln!(
-                "{}",
-                style::dim(&format!("darkmux mission run: step persist warning: {e:#}"))
-            );
-        }
-    }
-
-    let worktree_step_id = format!("{}-worktree-step", phase.id);
-    let coder_step_id = format!("{}-coder-step", phase.id);
-    let verify_step_id = format!("{}-verify-step", phase.id);
-
-    // Worktree creation failing is a hard stop — same as the pre-migration
-    // `add_worktree(...)?` propagating straight out of `run()` (an
-    // already-exists worktree, or a `git worktree add` failure). Not one
-    // of the structured `Ok(1)/(2)/(3)` gate codes.
-    if steps[&worktree_step_id].status == NodeStatus::Error {
-        anyhow::bail!(
-            "{}",
-            steps[&worktree_step_id]
-                .output
-                .clone()
-                .unwrap_or_else(|| "worktree step failed".to_string())
-        );
-    }
-
-    // Coder dispatch failing (a non-zero exit — see `MissionCoderStepKind`)
-    // maps to the pre-migration early `return Ok(1)`; the step kind itself
-    // already printed the error + emitted `mission.run.error`. `verify`
-    // never ran (unreachable — see `scheduler::reachable`).
-    if steps[&coder_step_id].status == NodeStatus::Error {
-        return Ok(1);
-    }
-
-    let coder_result = coder_result_slot
-        .lock()
-        .expect("mission.coder result mutex poisoned")
-        .take();
-    let failed_verifiers = coder_result
-        .as_ref()
-        .map(|r| r.failed_verifiers.clone())
-        .unwrap_or_default();
-    let tokens_total = coder_result.map(|r| r.tokens_total).unwrap_or(0);
-
-    // QA dispatch itself failing (reviewer image pull, timeout, etc.) is
-    // NOT a coder failure — the pre-migration distinct exit 3 path. The
-    // step kind already printed the immediate warning; this reconstructs
-    // the "gate — QA unavailable" block that used to sit inline.
-    if steps[&verify_step_id].status == NodeStatus::Error {
-        let verify_err = verify_result_slot
-            .lock()
-            .expect("mission.verify result mutex poisoned")
-            .take();
-        let err_text = match verify_err {
-            Some(Err(msg)) => msg,
-            _ => "QA dispatch failed".to_string(),
-        };
-        emit_step_result(
-            flow::Level::Warn,
-            "mission.verify",
-            &verify_step_id,
-            mission_id,
-            &phase.id,
-            &session_id,
-            serde_json::json!({ "error": err_text, "total_tokens": tokens_total }),
-        );
-        println!("\n{}", style::header("▶ gate — QA unavailable, manual review required"));
-        print_unverified_banner(&failed_verifiers);
-        println!("  {} {}", style::dim("worktree:"), wt_path.display());
-        println!("  {} {}", style::dim("branch:  "), style::accent(&branch));
-        println!(
-            "\n{}",
-            style::warn(&format!(
-                "review the diff manually, then:  darkmux mission ship {mission_id} --phase {} \
-                 (or abort: darkmux mission abort {mission_id} --phase {})",
-                phase.id, phase.id
-            ))
-        );
-        return Ok(3);
-    }
-
-    let review = match verify_result_slot
-        .lock()
-        .expect("mission.verify result mutex poisoned")
-        .take()
-    {
-        Some(Ok(review)) => review,
-        // Unreachable in practice: verify is `Complete` only on the `Ok`
-        // path of `MissionVerifyStepKind::run` (which always populates
-        // this slot before returning `Ok`), and `Error` is handled above.
-        _ => anyhow::bail!(
-            "internal error: mission.verify step completed without a review result"
-        ),
-    };
-
-    // 7. Stop at the gate. Tee up the ship step; never commit/PR/merge here.
-    println!("\n{}", style::header("▶ gate — awaiting frontier/operator sign-off"));
-    println!(
-        "  {} {}",
-        style::dim("worktree:"),
-        wt_path.display()
-    );
-    println!(
-        "  {} {}",
-        style::dim("branch:  "),
-        style::accent(&branch)
-    );
-    print_unverified_banner(&failed_verifiers);
-
-    let blockers = review.by_severity.block > 0;
-    if blockers {
-        println!(
-            "\n{}",
-            style::warn(&format!(
-                "⚠ QA found {} blocker(s). Resolve them (dispatch a fix into the worktree, or \
-                 edit directly) before shipping.",
-                review.by_severity.block
-            ))
-        );
-        println!(
-            "  {}",
-            style::dim("re-run QA after fixing: darkmux phase review (in the worktree)")
-        );
-        println!(
-            "  {}",
-            style::dim(&format!(
-                "or abandon this run: darkmux mission abort {mission_id} --phase {}",
-                phase.id
-            ))
-        );
-        emit_step_result(
-            flow::Level::Warn,
-            "mission.verify",
-            &verify_step_id,
-            mission_id,
-            &phase.id,
-            &session_id,
-            serde_json::json!({
-                "verdict": review.verdict,
-                "blockers": review.by_severity.block,
-                "flags": review.by_severity.flag,
-                "total_tokens": tokens_total,
-            }),
-        );
-        return Ok(2);
-    }
-
-    println!(
-        "\n{}",
-        style::success(&format!(
-            "✓ ready for sign-off. After review:  darkmux mission ship {mission_id} --phase {}",
-            phase.id
-        ))
-    );
-    // (#807/#817) Cue the frontier orchestrator at the decision moment —
-    // tool output is the one hint channel every harness reads, and the
-    // scaffold's placeholder IS the style direction (operator feedback:
-    // the first cut's "<verdict · what you overrode · why>" produced wordy
-    // technical notes on the dashboard card). Two channels, routed by tag:
-    //   source=adjudication → the audit trail (technical reasoning, never
-    //                          rendered on the hero card)
-    //   source=orchestrator → the dashboard card (positive, digestible)
-    println!(
-        "{}",
-        style::dim(&format!(
-            "  record your adjudication (audit trail):  darkmux flow note \
-             --session-id {session_id} \
-             --text \"<verdict · what you overrode · why>\" --source adjudication",
-        ))
-    );
-    emit_step_result(
-        flow::Level::Info,
-        "mission.verify",
-        &verify_step_id,
-        mission_id,
-        &phase.id,
-        &session_id,
-        serde_json::json!({
-            "verdict": review.verdict,
-            "blockers": 0,
-            "flags": review.by_severity.flag,
-            "nits": review.by_severity.nit,
-            "total_tokens": tokens_total,
-        }),
-    );
-    Ok(0)
+    let mut envelope = MissionEnvelope::new(mission_id, status, &[]);
+    envelope.phases = outcomes;
+    // `finalize_mission` re-applies each (already-terminal) phase outcome as a
+    // benign idempotent no-op, closes the mission, and persists envelope.json.
+    crew::envelope::finalize_mission(&envelope);
 }
 
 /// `darkmux mission abort` — the explicit teardown half of the hybrid
-/// contract. Removes the phase's worktree + its branch and flips the phase
-/// `Running → Abandoned`, so a frontier/operator who decides mid-loop that the
-/// run is going nowhere can cleanly back it out (vs. leaving an orphan
-/// worktree). Idempotent-ish: a missing worktree/branch is reported, not
-/// fatal. Returns `0` on a clean teardown.
+/// contract. Removes the gate-held coder-phase run's worktree + its branch and
+/// flips the phase `Running → Abandoned`, so a frontier/operator who decides
+/// mid-loop that the run is going nowhere can cleanly back it out (vs. leaving
+/// an orphan worktree). When abandoning the phase leaves EVERY phase terminal,
+/// the mission is finalized honestly too (#1426 ship-4). Idempotent-ish: a
+/// missing worktree/branch is reported, not fatal. Returns `0` on a clean
+/// teardown.
 pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
     use crew::loader::{load_missions, load_phases};
 
@@ -1389,9 +863,14 @@ pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
     let phase = resolve_phase(&phases, &mission.phase_ids, mission_id, phase_id)?;
 
     let root = repo_root()?;
-    let wt_path = worktree_path(&root, &phase.id);
+    // (#1426 ship-4) Target the ACTUAL launch worktree (Task.workdir), and
+    // delete the branch the worktree is actually on — a launch may have used a
+    // non-default workdir/branch. Fall back to the derived path/name when the
+    // worktree is already gone or a task didn't record one.
+    let wt_path = resolve_run_workdir(mission_id, &phase.id, &root);
     let conv = crate::conventions::load(&root);
-    let branch = conventions_branch(&phase, mission, conv.as_ref());
+    let branch =
+        worktree_branch(&wt_path).unwrap_or_else(|| conventions_branch(&phase, mission, conv.as_ref()));
 
     println!(
         "{}",
@@ -1454,7 +933,7 @@ pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
         ),
     }
 
-    let session_id = format!("mission-run-{}-{}", mission_id, phase.id);
+    let session_id = darkmux_types::session_id::mission_run(mission_id, &phase.id);
     emit_run_record(
         flow::Level::Info,
         "mission.run.abort",
@@ -1463,6 +942,11 @@ pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
         &session_id,
         serde_json::json!({ "branch": branch, "worktree": wt_path.display().to_string() }),
     );
+
+    // (#1426 ship-4 / #1433) Honest finalize: abandoning this phase may have
+    // left every phase terminal — if so, close the mission with an honest
+    // envelope instead of stranding it Active with all-terminal phases.
+    finalize_mission_if_complete(mission_id);
     Ok(0)
 }
 
@@ -1688,6 +1172,107 @@ fn append_injected_blocks(
     out
 }
 
+/// (#1426 ship-4) Build the coder brief for `phase` WITH the injected context
+/// the retired `mission run` gathered before every coder dispatch: prior
+/// adjudication corrections (#849), detector cautions (#994), and engagement
+/// lessons, ranked and budgeted against the dispatch model's context window
+/// (#1011). Prints the SAME operator-facing provenance lines `mission run`
+/// printed — what's carried into the brief, and why — then returns the
+/// assembled brief. Moved out of the deleted `run()` in the ship-4 collapse so
+/// `mission launch coder-phase` (now the ONLY coder path) keeps the doom-loop
+/// fix instead of dispatching a bare brief. `wt_path` is the phase worktree the
+/// staleness check reads.
+pub(crate) fn coder_brief_with_injected_context(
+    mission_id: &str,
+    mission: &crew::types::Mission,
+    phase: &crew::types::Phase,
+    wt_path: &Path,
+) -> Result<String> {
+    // The mission's EXACT dispatch session ids (built from its real phase
+    // ids), so the collectors scope to THIS mission's sessions — an exact-set
+    // match, never a `mission-run-<id>-` prefix that would bleed a sibling
+    // mission whose id is a hyphen-extension (see `mission_adjudication_notes`).
+    let mission_session_ids: std::collections::HashSet<String> = mission
+        .phase_ids
+        .iter()
+        .map(|pid| darkmux_types::session_id::mission_run(mission_id, pid))
+        .collect();
+    // (#1002) Files this dispatch is about to work on (from the phase
+    // description) — used to rank file-in-play cautions + lessons above
+    // engagement-level ones, and to staleness-check cautions against the
+    // worktree's current content.
+    let intent = intent_files(&phase.description);
+
+    // (#994) The three injected-context sources, each fully ranked but UNCAPPED
+    // here — the proportional budget (#1011) decides how much of each lands.
+    // Authority order: corrections > lessons > cautions.
+    let corrections = mission_adjudication_notes(&mission_session_ids);
+    let cautions = mission_cautions(&mission_session_ids, &intent, wt_path);
+    let authored = engagement_lessons(&intent);
+
+    // (#1011) Distribute a single budget — a fraction of THIS dispatch model's
+    // context window — across the blocks with per-authority floors.
+    let budget = injected_budget_chars(
+        // (#1282) `Err` = the default profile is quarantined; the coder
+        // dispatch below would hard-fail with the same error, so fail early.
+        crew::dispatch_internal::resolve_context_window_internal(None, None)?,
+    );
+    let (prior_corrections, detected_cautions, lessons) =
+        allocate_injected_context(corrections, cautions, authored, budget);
+
+    // Surface what's injected — provenance, not a silent rule (#44). Counts
+    // reflect the post-budget selection.
+    if !prior_corrections.is_empty() {
+        println!(
+            "{}",
+            style::dim(&format!(
+                "  carrying {} prior adjudication correction(s) into the brief \
+                 (recorded by the reviewer on earlier dispatches in this mission):",
+                prior_corrections.len()
+            ))
+        );
+        for c in &prior_corrections {
+            let first = c.lines().next().unwrap_or("").trim();
+            println!("{}", style::dim(&format!("    • {first}")));
+        }
+    }
+    if !detected_cautions.is_empty() {
+        println!(
+            "{}",
+            style::dim(&format!(
+                "  carrying {} detected loop caution(s) into the brief \
+                 (darkmux's detectors flagged these on earlier dispatches in this mission):",
+                detected_cautions.len()
+            ))
+        );
+        for c in &detected_cautions {
+            let first = c.lines().next().unwrap_or("").trim();
+            println!("{}", style::dim(&format!("    • {first}")));
+        }
+    }
+    if !lessons.is_empty() {
+        println!(
+            "{}",
+            style::dim(&format!(
+                "  carrying {} engagement lesson(s) into the brief:",
+                lessons.len()
+            ))
+        );
+        for c in &lessons {
+            let first = c.lines().next().unwrap_or("").trim();
+            println!("{}", style::dim(&format!("    • {first}")));
+        }
+    }
+
+    Ok(coder_brief(
+        phase,
+        mission,
+        &lessons,
+        &prior_corrections,
+        &detected_cautions,
+    ))
+}
+
 /// (#1004) Build the engagement-context blocks the loop-lab A/B injects — the
 /// SAME `<lessons>` / `<prior-adjudication-corrections>` / `<detected-cautions>`
 /// blocks a real coder dispatch gets, run through the SAME #1011 budget, so the
@@ -1714,7 +1299,7 @@ pub(crate) fn injected_context_for_lab(
                 .unwrap_or_default()
                 .iter()
                 .filter(|s| s.mission_id.as_str() == mid)
-                .map(|s| format!("mission-run-{}-{}", mid, s.id))
+                .map(|s| darkmux_types::session_id::mission_run(mid, &s.id))
                 .collect();
             (
                 mission_adjudication_notes(&ids),
@@ -2264,11 +1849,12 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
         .filter(|s| s.mission_id.as_str() == mission_id)
         .collect();
 
-    // The mission's exact dispatch session ids — same construction as `run`,
-    // so the collectors scope to THIS mission's sessions (no sibling bleed).
+    // The mission's exact dispatch session ids — the coder-phase dispatch id
+    // for each phase, so the collectors scope to THIS mission's sessions (no
+    // sibling bleed).
     let mission_session_ids: std::collections::HashSet<String> = mission_phases
         .iter()
-        .map(|s| format!("mission-run-{}-{}", mission_id, s.id))
+        .map(|s| darkmux_types::session_id::mission_run(mission_id, &s.id))
         .collect();
 
     Ok(DebriefReport {
@@ -2405,7 +1991,10 @@ pub fn nudge_mission_debrief(mission_id: &str) {
         action: "mission.debrief.prompt".to_string(),
         handle: mission_id.to_string(),
         phase_id: None,
-        session_id: Some(format!("mission:{mission_id}")),
+        // (#1436) The canonical mission-lifecycle session id — the same hyphen
+        // form the close transition just emitted under, so the debrief prompt
+        // lands in the SAME viewer session bucket as the close record.
+        session_id: Some(darkmux_types::session_id::mission(mission_id)),
         source: Some("mission_debrief".to_string()),
         model: None,
         reasoning: None,
@@ -2617,8 +2206,8 @@ fn pr_body(mission: &crew::types::Mission, phase: &crew::types::Phase) -> String
          - **Mission:** `{mission_id}` — {mission_desc}\n\
          - **Phase:** `{phase_id}`\n\n\
          The implementation was produced by the local-AI coder under \
-         `darkmux mission run` and reviewed by the local `code-reviewer` before \
-         sign-off. The frontier/operator adjudicated the QA findings at the gate.",
+         `darkmux mission launch coder-phase` and reviewed by the local \
+         `code-reviewer` before sign-off. The frontier/operator adjudicated the QA findings at the gate.",
         phase_desc = phase.description.lines().next().unwrap_or("").trim(),
         mission_id = mission.id,
         mission_desc = mission.description.lines().next().unwrap_or("").trim(),
@@ -2816,20 +2405,23 @@ pub fn ship(
     }
 
     let root = repo_root()?;
-    let wt_path = worktree_path(&root, &phase.id);
+    // (#1426 ship-4) Target the ACTUAL launch worktree (Task.workdir), falling
+    // back to the derived path for an old on-disk run.
+    let wt_path = resolve_run_workdir(mission_id, &phase.id, &root);
     let conv = crate::conventions::load(&root);
     // (#816) Ship pushes the branch the worktree is ACTUALLY on — created at
-    // `mission run` time — not a recomputation. If conventions.json changed
-    // between run and ship, recomputing would target a branch that doesn't
+    // launch time — not a recomputation. If conventions.json changed
+    // between launch and ship, recomputing would target a branch that doesn't
     // exist (QA drift finding). The computed name is only the fallback for
     // a worktree whose HEAD can't be read.
     let branch = worktree_branch(&wt_path)
         .unwrap_or_else(|| conventions_branch(&phase, &mission, conv.as_ref()));
-    let session_id = format!("mission-run-{}-{}", mission_id, phase.id);
+    let session_id = darkmux_types::session_id::mission_run(mission_id, &phase.id);
 
     if !wt_path.exists() {
         bail!(
-            "no worktree at {} — run `darkmux mission run {mission_id} --phase {}` first.",
+            "no worktree at {} — run `darkmux mission launch coder-phase` for this phase \
+             first (phase `{}`).",
             wt_path.display(),
             phase.id
         );
@@ -2865,7 +2457,7 @@ pub fn ship(
         &phase, &mission, "commit subject",
     );
         let msg = format!(
-            "{subject}\n\nAuthored via `darkmux mission run` (local-AI coder, phase {}).",
+            "{subject}\n\nAuthored via `darkmux mission launch coder-phase` (local-AI coder, phase {}).",
             phase.id
         );
         // (#834) Commit under the declared bot identity when the repo's
@@ -2946,7 +2538,7 @@ pub fn ship(
                 // fail the whole dispatch over a bad label.
                 if !crate::conventions::valid_label(l) {
                     eprintln!(
-                        "darkmux mission run: skipping unsafe pr label {l:?} \
+                        "darkmux mission ship: skipping unsafe pr label {l:?} \
                          (empty or starts with `-` — would parse as a gh flag)"
                     );
                     continue;
@@ -3016,7 +2608,7 @@ pub fn ship(
                     "  the PR is open ({pr_url}) and the worktree is intact — nothing was \
                      discarded. Review the diff + SIGNOFF; if verification really is sound, merge \
                      manually (`gh pr merge {branch} --squash`). If the toolchain was broken, fix \
-                     it and re-run `darkmux mission run {mission_id} --phase {}`.",
+                     it and relaunch the phase (`darkmux mission launch coder-phase`, phase `{}`).",
                     phase.id
                 ))
             );
@@ -3187,6 +2779,10 @@ pub fn ship(
             return Ok(2);
         }
         println!("\n{}", style::success("✓ phase shipped + merged. Loop closed."));
+        // (#1426 ship-4 / #1433) Honest finalize: completing this phase may have
+        // left every phase terminal — if so, close the mission with an honest
+        // envelope instead of stranding it Active with a shipped-out phase.
+        finalize_mission_if_complete(mission_id);
         // (#807/#817) The arc just concluded — soft-nudge if the run's trail
         // has no adjudication note (session-id pre-filled scaffold), then cue
         // the DASHBOARD note: the operator-facing card line. The placeholder
@@ -3264,5 +2860,5 @@ fn print_review_summary(review: &crate::phase_cli::PhaseReviewOutput) {
 }
 
 #[cfg(test)]
-#[path = "mission_run_tests.rs"]
+#[path = "coder_phase_tests.rs"]
 mod tests;

@@ -685,7 +685,7 @@ fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
 /// the capture path emits one per detector trajectory event.
 ///
 /// (#994 QA / #1002) This typed predicate has a Value-based twin in
-/// `mission_run::mission_cautions` (the hot per-dispatch brief-inject path,
+/// `coder_phase::mission_cautions` (the hot per-dispatch brief-inject path,
 /// which scans the raw flow stream). They classify the same records from
 /// different representations — keep them in sync: a change to `source`/
 /// `category` semantics must update BOTH.

@@ -201,12 +201,15 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
     // Emit mission.compile.start flow record (#204) — pairs with
     // .complete below via the synthesized session_id so the viewer can
     // measure compile wall-time + render the input/output sizes.
-    let synth_session_id = format!(
-        "mission-compile-{}",
-        std::time::SystemTime::now()
+    // (#1436) Through the canonical session-id helper; byte-identical shape.
+    let synth_session_id = darkmux_types::session_id::session_id(
+        "mission-compile",
+        &std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros())
             .unwrap_or(0)
+            .to_string(),
+        "",
     );
     let input_chars = input.chars().count();
 
@@ -367,7 +370,7 @@ fn parse_proposal(response: &str) -> Result<Proposal> {
 /// would otherwise escape the crew dir — a controlled `.json`/`mission.json`
 /// write-primitive from untrusted local-model output. `validate_identifier`
 /// rejects anything outside `[a-z0-9_-]`, so `.`/`/` (hence `..`) can't pass;
-/// this mirrors the guard `mission_run.rs:316` / `main.rs:1645` already apply
+/// this mirrors the guard `coder_phase.rs:316` / `main.rs:1645` already apply
 /// to operator-supplied ids. Shared by `validate_proposal_invariants` (early /
 /// UX rejection) and `persist` (the write boundary) so the two never drift.
 fn validate_proposal_ids(p: &Proposal) -> Result<()> {

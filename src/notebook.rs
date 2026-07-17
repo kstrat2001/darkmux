@@ -92,13 +92,15 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
     // Dispatch through darkmux's in-house Docker-bounded runtime via
     // `crew::dispatch::dispatch()`, mirroring the pattern used by
     // `lab run` + `dispatch`.
-    let session_id = format!(
-        "darkmux-notebook-{}-{}",
-        opts.run_id,
-        SystemTime::now()
+    // (#1436) Through the canonical session-id helper; byte-identical shape.
+    let session_id = darkmux_types::session_id::session_id(
+        "darkmux-notebook",
+        &opts.run_id,
+        &SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0)
+            .to_string(),
     );
 
     let entry_text = if opts.dry_run {

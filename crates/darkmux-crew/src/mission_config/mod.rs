@@ -7,7 +7,7 @@
 //! turns a resolved config into the executable `Vec<Task>`/`BTreeMap<String,
 //! Step>` shape `darkmux-crew`'s `scheduler::run_step_graph` consumes — the
 //! SAME shape `build_review_graph` (`darkmux-lab`'s `lab::review`) and
-//! `default_phase_graph` (the `darkmux` binary's `mission_run.rs`) used to
+//! `default_phase_graph` (the `darkmux` binary's `coder_phase.rs`) used to
 //! build BY HAND, one Rust function per mission type, before Packet 3 cut
 //! both over to load their config through this module and call
 //! [`interpret`] instead. Packet 1 built the schema, the loader, the

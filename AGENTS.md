@@ -4,12 +4,14 @@ This file is for any AI agent (Antigravity, Claude Code, Cursor, etc.) that's he
 
 ## What darkmux is
 
-A pre-1.0 Rust CLI that does two things for users running local LLMs (LMStudio + Ollama + llama.cpp):
+A Rust CLI (v1.x, on the 2.0 track) that is two things for users running local LLMs (LMStudio + Ollama + llama.cpp):
 
-1. **Mission orchestrator** — `darkmux mission launch <config>` runs a config-defined mission as a live task graph: a crew of local-AI roles works the phases, every dispatch is gated on the user's sign-off, and each run finalizes into a typed envelope. Model residency (the right models at the right context under the RAM budget, per `~/.darkmux/profiles.json`) is managed internally.
-2. **Lab harness** — `darkmux lab run <workload>` dispatches a workload against the internal Docker-bounded runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
+1. **Mission orchestrator**: config-defined missions launched with `darkmux mission launch <config>` that run as a live task graph. A crew of local-AI roles works the phases through the internal Docker-bounded runtime (any seat can instead be staffed by a hosted cloud endpoint), every dispatch gated on operator sign-off, each run finalizing into a typed envelope. `darkmux dispatch <role> <message>` is the task-grain entry point (one role, one turn). This is the 2.0 headline.
+2. **Lab harness**: `darkmux lab run <workload>` dispatches a workload against the same internal runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
 
-The CLI is the *engine*; the empirical findings in the Genesis series on Darkly Energized (<https://darklyenergized.substack.com>) are what it backs. The reproducibility story is the product story — users should be able to rerun a workload and get numbers comparable to the published claims.
+Managing model residency (the founding *profile multiplexer*: loading the right models at the right context under the RAM budget) is now an internal capability underneath both, not a verb the operator drives. The `swap` verb retired on the 2.0 track (#1426); gestalt loads what each dispatch's staffing declares.
+
+The CLI is the *engine*; the empirical findings in the Genesis series on Darkly Energized (<https://darklyenergized.substack.com>) are what it backs. The reproducibility story is the product story: users should be able to rerun a workload and get numbers comparable to the published claims.
 
 ## darkmux's grand vision (agent-facing)
 
@@ -122,7 +124,7 @@ Refer to the "Common tasks for an agent" section in `CLAUDE.md` for CLI command 
 ## Things to ASK before doing
 
 - Anything that mutates `~/.darkmux/profiles.json` — that's user state.
-- Anything that runs a real dispatch or lab run (loads models) — uses real LMStudio resources.
+- Anything that runs a real lab dispatch or a dispatch that loads models — uses real LMStudio resources.
 - Anything that does `git push` or `git commit --amend` — irreversible-ish.
 - Adding external runtime dependencies — has knock-on effects on install size and license surface.
 
@@ -166,17 +168,24 @@ An engagement is operator-defined, never system-defined. The system doesn't impo
 
 # darkmux
 
-This project uses [darkmux](https://github.com/kstrat2001/darkmux), a mission orchestrator and lab for local AI. You dispatch roles and launch missions to a crew of local-AI seats; each seat runs local (your own models, off the meter) or cloud (a hosted endpoint when a role needs frontier weights). darkmux keeps the right models resident at the right context under your RAM budget — you don't manage residency by hand.
+This project uses [darkmux](https://github.com/kstrat2001/darkmux) to multiplex local LLM stacks. Three reference profiles are available: `fast`, `balanced`, and `deep`.
+
+## When to swap stacks
+
+- **`fast`** — single-turn tasks (audits, TODO fills, short Q&A). Slim primary, no compactor.
+- **`balanced`** — mid-range tasks. Tuned compaction with a small companion compactor.
+- **`deep`** — long agentic tasks (multi-file refactors, exploratory test authoring). Maximum primary context for fewer compactions.
 
 ## Available skills
 
 - `/darkmux-status` — what's currently loaded
 - `/darkmux-list-stacks` — see all available profiles
+- `/darkmux-swap-stack <name>` — switch to a profile
 - `/darkmux-list-workloads` / `/darkmux-lab-run` — execute lab workloads
 - `/darkmux-list-runs` / `/darkmux-analyze-run` / `/darkmux-compare-runs` — inspect run history
 
 ## Dispatch policy
 
-Launch a config-defined mission with `darkmux mission launch <config>` and watch it run as a live task graph, gated on your sign-off; each run finalizes into a typed envelope. For a single turn, `darkmux dispatch <role> "<text>"` sends work to one seat. Before relying on a config, measure it with `darkmux lab run <workload>` (wall clock, compaction events, verify outcome) so your choices rest on numbers, not guesses.
+Before starting a long agentic task that may grow context past ~30K tokens, consider swapping to `deep`. Before doing a single-turn audit or short review, consider swapping to `fast` to skip the compactor's idle KV-cache cost. Use `/darkmux-status` to confirm before making the change — swapping is idempotent so a status-matched call is a no-op.
 
 <!-- darkmux:integration:agents:end -->

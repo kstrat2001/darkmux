@@ -114,7 +114,7 @@ pub fn validate_workdir(path: &Path) -> Result<PathBuf> {
 /// `~/.darkmux/worktrees` (HOME-less fallback `/tmp/darkmux/worktrees`).
 ///
 /// The single canonical implementation — previously triplicated across
-/// `mission_run.rs`, this module, and `darkmux-serve/src/lib.rs`, two of
+/// `coder_phase.rs`, this module, and `darkmux-serve/src/lib.rs`, two of
 /// which resolved HOME via `std::env::var("HOME")` while the third used
 /// `dirs::home_dir()`. The two can disagree (e.g. HOME set but malformed
 /// UTF-8, or a platform where `dirs::home_dir()` consults an API beyond
