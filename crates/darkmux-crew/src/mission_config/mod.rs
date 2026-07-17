@@ -232,7 +232,7 @@ pub struct ExpansionSpec {
     /// Name of the launch-time collection [`interpret::LaunchParams::expansions`]
     /// resolves this task's copies from — e.g. `"probe_seats"`. The schema
     /// only records the NAME; the launcher decides what populates it (the
-    /// review launcher resolves it from `crew_staffing`'s staffed probe
+    /// review launcher resolves it from `staffing`'s staffed probe
     /// seats, in staffing order).
     pub over: String,
     /// Real Task-id pattern for one expanded copy, e.g.
@@ -915,7 +915,7 @@ mod tests {
         assert_eq!(cfg.schema_version.as_deref(), Some(MISSION_CONFIG_SCHEMA));
         assert!(!cfg.inputs.is_empty(), "review declares its runtime-only inputs");
         assert!(
-            cfg.inputs.iter().any(|i| i.name == "crew_staffing"),
+            cfg.inputs.iter().any(|i| i.name == "staffing"),
             "the dynamic-probe-count limitation must be named as a declared input"
         );
 

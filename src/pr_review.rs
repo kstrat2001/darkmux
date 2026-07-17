@@ -909,7 +909,7 @@ mod tests {
     /// renders the non-blocking `COMMENT`).
     fn blocking_envelope(judged: Vec<JudgedFlag>) -> ReviewEnvelope {
         ReviewEnvelope {
-            staffing: Some(darkmux_lab::lab::review::CrewStaffingSnapshot {
+            staffing: Some(darkmux_lab::lab::review::StaffingSnapshot {
                 request_changes: true,
                 ..Default::default()
             }),

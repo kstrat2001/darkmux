@@ -1488,7 +1488,7 @@ struct LabRunSummary {
     /// actually used — `None` only for a brand-new live run whose first case
     /// hasn't completed yet (no `funnels.json` snapshot exists).
     #[serde(skip_serializing_if = "Option::is_none")]
-    staffing: Option<darkmux_lab::lab::review::CrewStaffingSnapshot>,
+    staffing: Option<darkmux_lab::lab::review::StaffingSnapshot>,
     bundles: usize,
     raw_flags: usize,
     deduped_flags: usize,
