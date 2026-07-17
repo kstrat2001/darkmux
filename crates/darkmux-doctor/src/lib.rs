@@ -140,6 +140,10 @@ pub fn run() -> DoctorReport {
         check_profile_loaded_match(),
         check_darkmux_version_vs_latest_release(),
         check_daemon_reachable(),
+        // (#1461) Staleness: what is RUNNING vs what is INSTALLED vs the source.
+        check_daemon_freshness(),
+        check_binary_vs_source(),
+        check_runtime_image_freshness(),
         check_ram_headroom(),
         check_ram_headroom_load_projection(),
         check_power_state(),
@@ -1662,6 +1666,370 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
     }
 }
 
+// ─── (#1461) staleness checks — running vs installed vs source vs image ───
+//
+// `cargo install --path .` refreshes the binary ON DISK, but a long-running
+// `darkmux serve` daemon keeps its OLD code in memory, and nothing connects the
+// two. The operator (or an agent) then tests against a stale daemon and
+// diagnoses a phantom bug — which is exactly what happened on the 2.0 pre-tag
+// smoke: a pre-2.0 daemon serving post-2.0 data produced a "no mission with id"
+// error that was never a bug at all.
+//
+// The rule already existed and did not fire. This is the structural-over-
+// procedural answer: the system surfaces staleness instead of depending on
+// anyone remembering it. Same shape as the installed-skills freshness check
+// (#1426) — compare what is RUNNING against what is INSTALLED, name both
+// resolved values, hand back a copy-pasteable fix.
+//
+// All three are WARN, never Fail: a deliberately-old daemon is a legitimate
+// operator choice (sovereignty, #44). None of them mutate anything — doctor
+// surfaces and suggests; the operator runs the command.
+
+/// Name of the daemon-freshness check (#1461). Distinct from
+/// `DAEMON_CHECK_NAME` (reachability): a daemon can be perfectly reachable and
+/// still be serving code from three releases ago.
+const DAEMON_FRESHNESS_CHECK_NAME: &str = "daemon freshness";
+
+/// Name of the binary-vs-source check (#1461).
+const BINARY_SOURCE_CHECK_NAME: &str = "binary vs source";
+
+/// Name of the runtime-image freshness check (#1461).
+const RUNTIME_IMAGE_CHECK_NAME: &str = "runtime image freshness";
+
+/// A `Pass` row that exists only to say "this check does not apply to you".
+/// Brew users must never see a source-tree warning, and the vast majority of
+/// users never run a daemon — a warning whose fix_hint cannot fix anything is
+/// noise, so those cases resolve to a silent Pass carrying the reason.
+fn not_applicable(name: &str, reason: &str) -> Check {
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!("(not applicable: {reason})"),
+        hint: None,
+    }
+}
+
+/// Run `cmd` with a hard wall-clock bound, killing the child at expiry.
+/// Returns `None` on spawn failure (binary absent) or timeout — both of which
+/// every caller here treats as "not applicable", never as an error. Doctor must
+/// never hang on a wedged `docker`, so the bound is mandatory rather than
+/// optional (the same reasoning as the bounded host load/unload phase, #1276).
+///
+/// Dep-free by design (CLAUDE.md: "don't add dependencies casually") — poll
+/// `try_wait` on a short tick rather than pulling in an async runtime.
+fn bounded_output(cmd: &mut Command, timeout: std::time::Duration) -> Option<std::process::Output> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if std::time::Instant::now() >= deadline {
+            // Hard-kill and report absence. A hung docker is indistinguishable
+            // from an absent one for our purposes, and both mean "skip".
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+// ─── A. daemon freshness ──────────────────────────────────────────────────
+
+/// GET `path` from a loopback HTTP server and return the response BODY.
+/// `None` on any failure (nothing listening, timeout, malformed response) —
+/// a dead socket is "not running", never an error.
+///
+/// Reads to EOF rather than taking a single `read()`: the body is what we came
+/// for, and one read is only guaranteed to deliver the headers.
+fn loopback_http_body(host: &str, port: u16, path: &str) -> Option<String> {
+    let addr: std::net::SocketAddr = format!("{host}:{port}").parse().ok()?;
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)).ok()?;
+    let to = std::time::Duration::from_millis(1000);
+    // Bail rather than risk an unbounded read if the OS won't honor timeouts
+    // on this socket (same defense as `check_daemon_reachable_impl`).
+    stream.set_read_timeout(Some(to)).ok()?;
+    stream.set_write_timeout(Some(to)).ok()?;
+
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.flush().ok()?;
+
+    // `Connection: close` makes the server hang up at the end of the body, so
+    // read_to_end terminates. Cap the buffer: doctor is not obliged to read an
+    // unbounded response from whatever happens to hold the port.
+    let mut buf = Vec::new();
+    std::io::Read::by_ref(&mut stream)
+        .take(64 * 1024)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let response = String::from_utf8_lossy(&buf).into_owned();
+    if !response.starts_with("HTTP/1.1 200") {
+        return None;
+    }
+    // Split headers from body on the blank line.
+    response.split_once("\r\n\r\n").map(|(_, b)| b.to_string())
+}
+
+/// Pull the running daemon's build identifier out of a `/health` body.
+///
+/// Prefers `build` (`darkmux_types::build_version()` — carries the git short
+/// SHA, so it distinguishes two daemons built from different commits at the
+/// same package version, which is the common dev-box case). Falls back to
+/// `darkmux_version` for a daemon that predates the `build` field: such a
+/// daemon is BY DEFINITION older than this binary, but the honest comparison is
+/// still the one we can actually make, and same-package-version is the weakest
+/// possible false negative here (every daemon built from this commit onward
+/// carries `build`).
+fn parse_daemon_build(health_body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(health_body).ok()?;
+    v.get("build")
+        .and_then(|b| b.as_str())
+        .or_else(|| v.get("darkmux_version").and_then(|b| b.as_str()))
+        .map(|s| s.to_string())
+}
+
+fn check_daemon_freshness() -> Check {
+    // Same locator the reachability check uses (127.0.0.1:8765) — there is no
+    // port resolver in the codebase to reuse; the daemon's port is a `serve`
+    // flag with this default, and both checks hardcode it identically.
+    let running = loopback_http_body("127.0.0.1", 8765, "/health")
+        .as_deref()
+        .and_then(parse_daemon_build);
+    classify_daemon_freshness(running.as_deref(), &darkmux_types::build_version())
+}
+
+/// Pure classifier — `running` is the daemon's self-reported build (`None` when
+/// no daemon answered), `installed` is this binary's.
+fn classify_daemon_freshness(running: Option<&str>, installed: &str) -> Check {
+    let Some(running) = running else {
+        // No daemon is the common case — most users never run one. Silent.
+        return not_applicable(
+            DAEMON_FRESHNESS_CHECK_NAME,
+            "no darkmux serve daemon running on this machine",
+        );
+    };
+    if running == installed {
+        return Check {
+            name: DAEMON_FRESHNESS_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: format!("running daemon matches this binary ({installed})"),
+            hint: None,
+        };
+    }
+    Check {
+        name: DAEMON_FRESHNESS_CHECK_NAME.into(),
+        status: Status::Warn,
+        message: format!(
+            "a darkmux serve daemon is running an OLDER build ({running}) than this binary \
+             ({installed}) — it serves its in-memory code until restarted, so anything you \
+             verify against it is testing the old build"
+        ),
+        hint: Some(
+            "restart it: stop the running `darkmux serve` (Ctrl-C in its terminal, or \
+             `pkill -f 'darkmux serve'`) and start it again"
+                .into(),
+        ),
+    }
+}
+
+// ─── B. binary vs source ──────────────────────────────────────────────────
+
+/// The git short SHA this binary was built from, or `None` when that is not a
+/// meaningful question: a packaged release (`(release)`) or a source-tarball
+/// build (no tag) has no commit to compare against.
+///
+/// Parses the tag `darkmux_types::build_version()` renders — `"2.0.0 (a1b2c3d)"`
+/// or `"2.0.0 (a1b2c3d✱)"` (`✱` = built from a dirty tree). The dirty marker is
+/// stripped: it says the tree had uncommitted edits at build time, which does
+/// not change WHICH commit the binary came from.
+fn built_from_sha(build_version: &str) -> Option<String> {
+    let start = build_version.find('(')? + 1;
+    let end = build_version.rfind(')')?;
+    let tag = build_version.get(start..end)?.trim();
+    if tag.is_empty() || tag == "release" {
+        return None;
+    }
+    Some(tag.trim_end_matches('\u{2731}').to_string())
+}
+
+/// Walk up from `start` looking for the darkmux SOURCE tree root: a directory
+/// holding BOTH a `.git` and a `Cargo.toml` that declares the darkmux
+/// workspace. Both halves are load-bearing — a brew user with some other Rust
+/// checkout as cwd must not get a darkmux staleness warning, and a darkmux
+/// tarball with no `.git` has no HEAD to compare against.
+fn find_darkmux_source_root(start: &std::path::Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let manifest = dir.join("Cargo.toml");
+        if !dir.join(".git").exists() || !manifest.exists() {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        if body.contains("[workspace]") && body.contains("darkmux-types") {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+/// `git rev-parse --short HEAD` in `root`. `None` on any failure — an empty or
+/// detached repo is "nothing to compare", not an error.
+fn source_head_sha(root: &std::path::Path) -> Option<String> {
+    let out = bounded_output(
+        Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .current_dir(root),
+        std::time::Duration::from_secs(5),
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+fn check_binary_vs_source() -> Check {
+    let built = built_from_sha(&darkmux_types::build_version());
+    let head = env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_darkmux_source_root)
+        .as_deref()
+        .and_then(source_head_sha);
+    classify_binary_vs_source(built.as_deref(), head.as_deref())
+}
+
+/// Pure classifier — `built` is the commit this binary was compiled from,
+/// `head` is the darkmux source tree's current HEAD (`None` = cwd is not a
+/// darkmux source tree, the case for every brew/installed user).
+fn classify_binary_vs_source(built: Option<&str>, head: Option<&str>) -> Check {
+    let Some(head) = head else {
+        return not_applicable(
+            BINARY_SOURCE_CHECK_NAME,
+            "not running from a darkmux source tree",
+        );
+    };
+    let Some(built) = built else {
+        // A packaged release or tarball build carries no commit. Nothing to
+        // compare, and a release binary sitting in a source tree is a normal
+        // thing to do (that is what `brew install` + `git clone` looks like).
+        return not_applicable(
+            BINARY_SOURCE_CHECK_NAME,
+            "this binary is a packaged build with no source commit to compare",
+        );
+    };
+    if built == head {
+        return Check {
+            name: BINARY_SOURCE_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: format!("running binary was built from this tree's HEAD ({head})"),
+            hint: None,
+        };
+    }
+    Check {
+        name: BINARY_SOURCE_CHECK_NAME.into(),
+        status: Status::Warn,
+        message: format!(
+            "the darkmux you are running was built from {built}, but this source tree's HEAD is \
+             {head} — your latest code is NOT in the binary under test"
+        ),
+        hint: Some("rebuild + install it: `cargo install --path .`".into()),
+    }
+}
+
+// ─── C. runtime image freshness ───────────────────────────────────────────
+
+/// What doctor could learn about the local `darkmux-runtime:latest` image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeImageProbe {
+    /// Docker absent, wedged, daemon down, or no such image. Never a warning:
+    /// docker is not a hard dependency of doctor, and plenty of users have none.
+    NotApplicable(String),
+    /// The image carries `org.opencontainers.image.version`.
+    Labeled(String),
+    /// The image exists but carries no version label — built before the label
+    /// shipped, or built without the build-arg. Nothing to compare.
+    Unlabeled,
+}
+
+/// The OCI label the runtime image stamps its darkmux version into.
+const RUNTIME_IMAGE_VERSION_LABEL: &str = "org.opencontainers.image.version";
+
+fn probe_runtime_image() -> RuntimeImageProbe {
+    use darkmux_crew::dispatch_internal::RUNTIME_IMAGE;
+    let format = format!("{{{{index .Config.Labels \"{RUNTIME_IMAGE_VERSION_LABEL}\"}}}}");
+    let Some(out) = bounded_output(
+        Command::new("docker").args(["image", "inspect", RUNTIME_IMAGE, "--format", &format]),
+        std::time::Duration::from_secs(5),
+    ) else {
+        return RuntimeImageProbe::NotApplicable("`docker` not available".into());
+    };
+    if !out.status.success() {
+        // Covers both "no such image" and "daemon not reachable". Neither is a
+        // staleness finding, and `docker runtime` already reports daemon health.
+        return RuntimeImageProbe::NotApplicable(format!("no local `{RUNTIME_IMAGE}` image"));
+    }
+    let label = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Docker renders a missing map key as `<no value>`.
+    if label.is_empty() || label == "<no value>" {
+        return RuntimeImageProbe::Unlabeled;
+    }
+    RuntimeImageProbe::Labeled(label)
+}
+
+fn check_runtime_image_freshness() -> Check {
+    classify_runtime_image_freshness(probe_runtime_image(), env!("CARGO_PKG_VERSION"))
+}
+
+/// Pure classifier — compares the image's stamped version against this binary's
+/// package version.
+fn classify_runtime_image_freshness(probe: RuntimeImageProbe, installed: &str) -> Check {
+    use darkmux_crew::dispatch_internal::RUNTIME_IMAGE;
+    match probe {
+        RuntimeImageProbe::NotApplicable(reason) => {
+            not_applicable(RUNTIME_IMAGE_CHECK_NAME, &reason)
+        }
+        RuntimeImageProbe::Unlabeled => Check {
+            name: RUNTIME_IMAGE_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: format!(
+                "local `{RUNTIME_IMAGE}` carries no version label — nothing to compare"
+            ),
+            hint: None,
+        },
+        RuntimeImageProbe::Labeled(version) if version == installed => Check {
+            name: RUNTIME_IMAGE_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: format!("local `{RUNTIME_IMAGE}` matches this binary ({installed})"),
+            hint: None,
+        },
+        RuntimeImageProbe::Labeled(version) => Check {
+            name: RUNTIME_IMAGE_CHECK_NAME.into(),
+            status: Status::Warn,
+            message: format!(
+                "local `{RUNTIME_IMAGE}` was built for darkmux {version}, but this binary is \
+                 {installed} — dispatches prefer the local image, so they run the OLD runtime"
+            ),
+            hint: Some(format!(
+                "rebuild it from a source checkout: `docker build --build-arg \
+                 DARKMUX_VERSION={installed} -t {RUNTIME_IMAGE} runtime/` — or drop the local tag \
+                 (`docker rmi {RUNTIME_IMAGE}`) to let darkmux pull the version-pinned image"
+            )),
+        },
+    }
+}
+
 fn check_profile_registry() -> Check {
     match profiles::load_registry(None) {
         Ok(loaded) => {
@@ -2911,6 +3279,214 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    // ─── (#1461) staleness: daemon / binary-vs-source / runtime image ───────
+    //
+    // Every check is exercised as a pure function over injected inputs — no
+    // live daemon, no docker, no git. The probes that gather those inputs are
+    // thin and deliberately total (every failure resolves to "not applicable").
+
+    #[test]
+    fn daemon_freshness_passes_when_builds_match() {
+        let c = classify_daemon_freshness(Some("2.0.0 (a1b2c3d)"), "2.0.0 (a1b2c3d)");
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.hint.is_none());
+    }
+
+    #[test]
+    fn daemon_freshness_warns_naming_both_builds_when_they_differ() {
+        let c = classify_daemon_freshness(Some("1.18.5 (0ldc0de)"), "2.0.0 (a1b2c3d)");
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        // Provenance: the operator must see BOTH resolved values, not just that
+        // "something is stale" (#44 — never wonder where a decision came from).
+        assert!(c.message.contains("1.18.5 (0ldc0de)"), "{}", c.message);
+        assert!(c.message.contains("2.0.0 (a1b2c3d)"), "{}", c.message);
+        let hint = c.hint.as_deref().unwrap();
+        assert!(hint.contains("darkmux serve"), "restart fix: {hint}");
+    }
+
+    #[test]
+    fn daemon_freshness_not_applicable_when_no_daemon_running() {
+        // The common case — most users never run a daemon. Never a warning.
+        let c = classify_daemon_freshness(None, "2.0.0 (a1b2c3d)");
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("not applicable"), "{}", c.message);
+        assert!(c.hint.is_none());
+    }
+
+    #[test]
+    fn daemon_build_parses_build_field_in_preference_to_package_version() {
+        let body = r#"{"darkmux_version":"2.0.0","build":"2.0.0 (a1b2c3d)"}"#;
+        assert_eq!(parse_daemon_build(body).as_deref(), Some("2.0.0 (a1b2c3d)"));
+    }
+
+    #[test]
+    fn daemon_build_falls_back_to_package_version_on_a_pre_build_field_daemon() {
+        // A daemon older than #1461 has no `build` field. The coarser comparison
+        // is still the honest one — it is all such a daemon reports.
+        let body = r#"{"darkmux_version":"1.18.5","flow_schema_version":"1.4"}"#;
+        assert_eq!(parse_daemon_build(body).as_deref(), Some("1.18.5"));
+    }
+
+    #[test]
+    fn daemon_build_is_none_on_garbage() {
+        assert!(parse_daemon_build("not json").is_none());
+        assert!(parse_daemon_build(r#"{"unrelated":true}"#).is_none());
+    }
+
+    #[test]
+    fn built_from_sha_extracts_git_tag_and_strips_the_dirty_marker() {
+        assert_eq!(built_from_sha("2.0.0 (a1b2c3d)").as_deref(), Some("a1b2c3d"));
+        // `✱` means the tree was dirty at build time — it does not change WHICH
+        // commit the binary came from, so it must not defeat the comparison.
+        assert_eq!(
+            built_from_sha("2.0.0 (a1b2c3d\u{2731})").as_deref(),
+            Some("a1b2c3d")
+        );
+    }
+
+    #[test]
+    fn built_from_sha_is_none_for_release_and_tarball_builds() {
+        // A packaged release has no commit to compare against...
+        assert!(built_from_sha("2.0.0 (release)").is_none());
+        // ...and neither does a bare source-tarball build.
+        assert!(built_from_sha("2.0.0").is_none());
+    }
+
+    #[test]
+    fn binary_vs_source_passes_when_binary_was_built_from_head() {
+        let c = classify_binary_vs_source(Some("a1b2c3d"), Some("a1b2c3d"));
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.hint.is_none());
+    }
+
+    #[test]
+    fn binary_vs_source_warns_naming_both_commits_when_they_differ() {
+        let c = classify_binary_vs_source(Some("0ldc0de"), Some("a1b2c3d"));
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("0ldc0de"), "{}", c.message);
+        assert!(c.message.contains("a1b2c3d"), "{}", c.message);
+        assert!(
+            c.hint.as_deref().unwrap().contains("cargo install --path ."),
+            "fix_hint points at the reinstall: {:?}",
+            c.hint
+        );
+    }
+
+    #[test]
+    fn binary_vs_source_not_applicable_without_a_source_tree() {
+        // A brew user must NEVER see this check fire. No source tree = silent.
+        let c = classify_binary_vs_source(Some("a1b2c3d"), None);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("not applicable"), "{}", c.message);
+    }
+
+    #[test]
+    fn binary_vs_source_not_applicable_for_a_release_binary_in_a_source_tree() {
+        // `brew install darkmux` + `git clone darkmux` is a normal thing to do.
+        let c = classify_binary_vs_source(None, Some("a1b2c3d"));
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("not applicable"), "{}", c.message);
+    }
+
+    #[test]
+    fn source_root_found_only_for_a_darkmux_workspace_with_git() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\".\", \"crates/darkmux-types\"]\n",
+        )
+        .unwrap();
+        let nested = root.join("crates").join("darkmux-doctor");
+        std::fs::create_dir_all(&nested).unwrap();
+        // Found from the root and from anywhere beneath it.
+        assert_eq!(find_darkmux_source_root(root).as_deref(), Some(root));
+        assert_eq!(find_darkmux_source_root(&nested).as_deref(), Some(root));
+    }
+
+    #[test]
+    fn source_root_rejects_a_foreign_rust_checkout() {
+        // Someone else's Cargo workspace is not a darkmux source tree.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+        assert!(find_darkmux_source_root(root).is_none());
+    }
+
+    #[test]
+    fn source_root_rejects_a_darkmux_tarball_with_no_git() {
+        // No `.git` = no HEAD to compare against.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/darkmux-types\"]\n",
+        )
+        .unwrap();
+        assert!(find_darkmux_source_root(root).is_none());
+    }
+
+    #[test]
+    fn runtime_image_passes_when_the_label_matches_the_binary() {
+        let c = classify_runtime_image_freshness(
+            RuntimeImageProbe::Labeled("2.0.0".into()),
+            "2.0.0",
+        );
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.hint.is_none());
+    }
+
+    #[test]
+    fn runtime_image_warns_naming_both_versions_when_the_label_is_older() {
+        let c = classify_runtime_image_freshness(
+            RuntimeImageProbe::Labeled("1.18.5".into()),
+            "2.0.0",
+        );
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("1.18.5"), "{}", c.message);
+        assert!(c.message.contains("2.0.0"), "{}", c.message);
+        let hint = c.hint.as_deref().unwrap();
+        assert!(hint.contains("docker build"), "build fix: {hint}");
+        // The hint must name a version the operator can paste, not a placeholder.
+        assert!(hint.contains("DARKMUX_VERSION=2.0.0"), "{hint}");
+    }
+
+    #[test]
+    fn runtime_image_not_applicable_when_docker_or_the_image_is_absent() {
+        // Docker is NOT a hard dependency of doctor — many users have none.
+        let c = classify_runtime_image_freshness(
+            RuntimeImageProbe::NotApplicable("`docker` not available".into()),
+            "2.0.0",
+        );
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("not applicable"), "{}", c.message);
+        assert!(c.hint.is_none());
+    }
+
+    #[test]
+    fn runtime_image_unlabeled_is_informational_not_a_warning() {
+        // An image built before the label shipped has nothing to compare.
+        let c = classify_runtime_image_freshness(RuntimeImageProbe::Unlabeled, "2.0.0");
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("no version label"), "{}", c.message);
+    }
+
+    #[test]
+    fn staleness_checks_never_fail_only_warn() {
+        // Sovereignty (#44): a deliberately-old daemon/image is a legitimate
+        // operator choice. These checks surface; they never block.
+        let all = [
+            classify_daemon_freshness(Some("old"), "new"),
+            classify_binary_vs_source(Some("0ldc0de"), Some("a1b2c3d")),
+            classify_runtime_image_freshness(RuntimeImageProbe::Labeled("1.0.0".into()), "2.0.0"),
+        ];
+        for c in all {
+            assert_ne!(c.status, Status::Fail, "{} must never fail", c.name);
+        }
+    }
+
     // ─── (#1426) installed darkmux-* skills freshness ───────────────────────
 
     /// Write an installed `SKILL.md` for `name` under `target/<name>/`.
@@ -3302,10 +3878,11 @@ mod tests {
         // remote-endpoint-credentials [#85/#91] + audit-write-drops [#877] +
         // serve-daemon-auth [#881] + fleet.mode [#933] + env-masks-config
         // [#934] + binary-split-brain [#934] + crew-validation [#1269] +
-        // mission-config-registry [#1284]) + one per active eureka rule.
-        // Every check should appear regardless of environment — even if the
-        // underlying probe couldn't read state.
-        let expected = 32 + darkmux_eureka::all_rules().len();
+        // mission-config-registry [#1284] + daemon-freshness +
+        // binary-vs-source + runtime-image-freshness [#1461]) + one per active
+        // eureka rule. Every check should appear regardless of environment —
+        // even if the underlying probe couldn't read state.
+        let expected = 35 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

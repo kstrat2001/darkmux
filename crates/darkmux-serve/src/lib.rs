@@ -910,9 +910,18 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
 }
 
 /// GET /health — returns darkmux version + flow schema version.
+///
+/// (#1461) `build` carries `darkmux_types::build_version()` — the package
+/// version PLUS the git short SHA this daemon was compiled from. The package
+/// version alone can't tell doctor whether a long-running daemon has the
+/// operator's latest code (two builds from different commits report the same
+/// `darkmux_version`), and a daemon serving its stale in-memory code is the
+/// single most likely staleness trap: it is long-lived by design (the phone
+/// dashboard needs it up) and its staleness is otherwise invisible.
 async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "darkmux_version": env!("CARGO_PKG_VERSION"),
+        "build": darkmux_types::build_version(),
         "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
     }))
 }
