@@ -216,7 +216,7 @@
         {
           "id": "review-verify-task",
           "display_name": "Verify",
-          "description": "verify — adjudicate confirmed findings",
+          "description": "verify — render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
           "depends_on": [
             "review-judge-task"
           ],
@@ -240,7 +240,7 @@
         {
           "id": "review-synthesis-task",
           "display_name": "Synthesis",
-          "description": "synthesis — finalize tier counts + needs-check clustering",
+          "description": "synthesis — apply verify adjudications, finalize tier counts + needs-check clustering",
           "depends_on": [
             "review-dedup-task",
             "review-judge-task",

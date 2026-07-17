@@ -133,6 +133,7 @@
     {
       "depends_on": [],
       "description": "resolve review bundles from the diff",
+      "display_name": "Bundle",
       "id": "review-bundle-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
@@ -194,7 +195,8 @@
         "review-probe-2-task",
         "review-probe-3-task"
       ],
-      "description": "dedup probe flags — mechanism-family keying + anchor matching",
+      "description": "dedup probe flags \u2014 mechanism-family keying + anchor matching",
+      "display_name": "Dedup",
       "id": "review-dedup-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
@@ -205,7 +207,8 @@
       "depends_on": [
         "review-dedup-task"
       ],
-      "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
+      "description": "double-confirm judge \u2014 internal pass1/pass2 loop over deduped flags",
+      "display_name": "Judge",
       "id": "review-judge-task",
       "phase_id": "pr-review-golden-adjudicate",
       "step_ids": [
@@ -216,7 +219,8 @@
       "depends_on": [
         "review-judge-task"
       ],
-      "description": "verify — render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
+      "description": "verify \u2014 render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
+      "display_name": "Verify",
       "id": "review-verify-task",
       "phase_id": "pr-review-golden-report",
       "step_ids": [
@@ -230,7 +234,8 @@
         "review-judge-task",
         "review-verify-task"
       ],
-      "description": "synthesis — apply verify adjudications, finalize tier counts + needs-check clustering",
+      "description": "synthesis \u2014 apply verify adjudications, finalize tier counts + needs-check clustering",
+      "display_name": "Synthesis",
       "id": "review-synthesis-task",
       "phase_id": "pr-review-golden-report",
       "step_ids": [
