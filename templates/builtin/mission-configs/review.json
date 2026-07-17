@@ -108,6 +108,7 @@
       "tasks": [
         {
           "id": "review-bundle-task",
+          "display_name": "Bundle",
           "description": "resolve review bundles from the diff",
           "depends_on": [],
           "steps": [
@@ -120,6 +121,7 @@
         },
         {
           "id": "review-probe-template-task",
+          "display_name": "Probe",
           "description": "TEMPLATE for the probe stage. build_review_graph builds ONE task/step PER STAFFED PROBE SEAT (kind `review.probe:<seat-name>`, ids `review-probe-{index}-task` / `review-probe-{index}-step`) -- a count and a set of names only known once `crew_staffing` (see inputs) resolves. The `expand` block below (#1284 Packet 3, schema 1.1) is the typed, interpretable primitive mission_config::interpret uses to turn this ONE template into N real tasks at launch -- the launcher resolves `probe_seats` from crew_staffing's staffed probe seats (in staffing order) and passes it as a LaunchParams.expansions entry.",
           "depends_on": [
             "review-bundle-task"
@@ -136,11 +138,13 @@
             "task_id_pattern": "review-probe-{index}-task",
             "step_id_pattern": "review-probe-{index}-step",
             "kind_pattern": "{kind}:{name}",
-            "description_pattern": "probe seat `{name}`"
+            "description_pattern": "probe seat `{name}`",
+            "display_name_pattern": "Probe {index}"
           }
         },
         {
           "id": "review-dedup-task",
+          "display_name": "Dedup",
           "description": "dedup probe flags — mechanism-family keying + anchor matching",
           "depends_on": [
             "review-probe-template-task"
@@ -162,6 +166,7 @@
       "tasks": [
         {
           "id": "review-judge-task",
+          "display_name": "Judge",
           "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
           "depends_on": [
             "review-dedup-task"
@@ -185,6 +190,7 @@
       "tasks": [
         {
           "id": "review-verify-task",
+          "display_name": "Verify",
           "description": "verify — adjudicate confirmed findings",
           "depends_on": [
             "review-judge-task"
@@ -202,6 +208,7 @@
         },
         {
           "id": "review-synthesis-task",
+          "display_name": "Synthesis",
           "description": "synthesis — finalize tier counts + needs-check clustering",
           "depends_on": [
             "review-dedup-task",

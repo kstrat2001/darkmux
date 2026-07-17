@@ -67,7 +67,8 @@
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-bundle-step"
-      ]
+      ],
+      "display_name": "Bundle"
     },
     {
       "depends_on": [
@@ -78,7 +79,8 @@
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-probe-0-step"
-      ]
+      ],
+      "display_name": "Probe 0"
     },
     {
       "depends_on": [
@@ -89,7 +91,8 @@
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-probe-1-step"
-      ]
+      ],
+      "display_name": "Probe 1"
     },
     {
       "depends_on": [
@@ -100,7 +103,8 @@
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-probe-2-step"
-      ]
+      ],
+      "display_name": "Probe 2"
     },
     {
       "depends_on": [
@@ -108,46 +112,50 @@
         "review-probe-1-task",
         "review-probe-2-task"
       ],
-      "description": "dedup probe flags — mechanism-family keying + anchor matching",
+      "description": "dedup probe flags \u2014 mechanism-family keying + anchor matching",
       "id": "review-dedup-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-dedup-step"
-      ]
+      ],
+      "display_name": "Dedup"
     },
     {
       "depends_on": [
         "review-dedup-task"
       ],
-      "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
+      "description": "double-confirm judge \u2014 internal pass1/pass2 loop over deduped flags",
       "id": "review-judge-task",
       "phase_id": "pr-review-golden-adjudicate",
       "step_ids": [
         "review-judge-step"
-      ]
+      ],
+      "display_name": "Judge"
     },
     {
       "depends_on": [
         "review-judge-task"
       ],
-      "description": "verify — adjudicate confirmed findings",
+      "description": "verify \u2014 adjudicate confirmed findings",
       "id": "review-verify-task",
       "phase_id": "pr-review-golden-report",
       "step_ids": [
         "review-verify-step"
-      ]
+      ],
+      "display_name": "Verify"
     },
     {
       "depends_on": [
         "review-dedup-task",
         "review-verify-task"
       ],
-      "description": "synthesis — finalize tier counts + needs-check clustering",
+      "description": "synthesis \u2014 finalize tier counts + needs-check clustering",
       "id": "review-synthesis-task",
       "phase_id": "pr-review-golden-report",
       "step_ids": [
         "review-synthesis-step"
-      ]
+      ],
+      "display_name": "Synthesis"
     }
   ]
 }

@@ -2517,6 +2517,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// that review's task/step ids are FIXED (no placeholder-prefix
     /// substitution applies to them). `judge_concurrency: 3` (non-default)
     /// pins the operator override into `Step.config`.
+    ///
+    /// (#1432 item 3) The golden also now pins each task's `display_name`
+    /// (Bundle / Probe {index} / Dedup / Judge / Verify / Synthesis) — the
+    /// phone-facing labels the config gained beyond main's pre-cutover
+    /// output, threaded through `interpret` (task `display_name` +
+    /// the probe expansion's `display_name_pattern`).
     #[test]
     fn build_review_graph_matches_the_pre_cutover_golden_exactly() {
         let crew = crew_with(vec![
