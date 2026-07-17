@@ -60,12 +60,6 @@ impl MapRemoteBucket {
     pub(crate) fn spend(&mut self, tokens: u64) {
         self.used = self.used.saturating_add(tokens);
     }
-    /// Total granted so far — read by tests asserting shared-bucket
-    /// exhaustion across sibling steps.
-    #[cfg(test)]
-    pub(crate) fn used(&self) -> u64 {
-        self.used
-    }
     /// Count of calls refused because the bucket was exhausted — read by
     /// tests asserting the skip path fired.
     #[cfg(test)]

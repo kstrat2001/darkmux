@@ -1176,4 +1176,345 @@ mod tests {
         assert_eq!(report.completed.len(), 2, "the warning never blocks the run");
         assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     }
+
+    // ─── (#1442) StepRunCtx seam: bucket groups + live streaming ─────────
+
+    use crate::step_kinds::{StepKind, StepOutcome, StepRunCtx};
+    use std::sync::{Arc, Mutex};
+
+    /// A step with a specific kind id + config, chained after `deps`.
+    fn kinded_step(id: &str, kind: &str, config: serde_json::Value, deps: &[&str]) -> (Task, Step) {
+        let (task, mut step) = task_and_step(id, deps);
+        step.kind = kind.to_string();
+        step.config = config;
+        (task, step)
+    }
+
+    /// (#1442) Draws from whatever bucket the scheduler handed it: admits
+    /// once, then spends the WHOLE remaining allowance (so a shared bucket is
+    /// exhausted for the next grouped sibling). Records `(step_id,
+    /// had_shared_bucket, admitted)` so a test can prove one allowance was
+    /// shared across siblings — vs an ungrouped step getting `None`.
+    struct BucketProbeKind {
+        log: Arc<Mutex<Vec<(String, bool, bool)>>>,
+    }
+    impl StepKind for BucketProbeKind {
+        fn id(&self) -> &'static str {
+            "test.bucket-probe"
+        }
+        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            Ok(StepOutcome { output: "ctx-free".to_string(), flow_records: vec![] })
+        }
+        fn run_streaming(
+            &self,
+            step: &Step,
+            _t: &Task,
+            _i: &BTreeMap<String, String>,
+            ctx: &StepRunCtx,
+        ) -> Result<StepOutcome> {
+            let entry = match ctx.remote_bucket() {
+                Some(b) => {
+                    let mut g = b.lock().expect("bucket poisoned");
+                    let admitted = g.admit();
+                    if admitted {
+                        let remaining = g.remaining();
+                        g.spend(remaining);
+                    }
+                    (step.id.clone(), true, admitted)
+                }
+                None => (step.id.clone(), false, false),
+            };
+            self.log.lock().unwrap().push(entry);
+            Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![] })
+        }
+    }
+
+    fn run_graph_with_kind(
+        kind: Arc<dyn StepKind>,
+        tasks: &BTreeMap<String, Task>,
+        steps: &mut BTreeMap<String, Step>,
+    ) -> Vec<FlowRecord> {
+        let kinds = StepKindRegistry::new();
+        kinds.register(kind).unwrap();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut emitted = Vec::new();
+        run_step_graph(
+            steps,
+            tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |r| emitted.push(r),
+            &mut |_step| {},
+        )
+        .unwrap();
+        emitted
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bucket_group_siblings_share_one_allowance_between_them() {
+        // Two CHAINED grouped steps (deterministic order, distinct waves)
+        // both name bucket_group "probe". The budget only funds ONE full
+        // draw, so step A admits + exhausts and step B is refused — proving
+        // the scheduler handed both the SAME shared bucket, not a fresh
+        // per-step allowance each.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "100");
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let kind = Arc::new(BucketProbeKind { log: log.clone() });
+        let cfg = json!({ "bucket_group": "probe" });
+        let (ta, sa) = kinded_step("a", "test.bucket-probe", cfg.clone(), &[]);
+        let (tb, sb) = kinded_step("b", "test.bucket-probe", cfg, &["a"]);
+        let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb)]);
+
+        run_graph_with_kind(kind, &tasks, &mut steps);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        let entries = log.lock().unwrap().clone();
+        let a = entries.iter().find(|e| e.0 == "a-step").expect("a ran");
+        let b = entries.iter().find(|e| e.0 == "b-step").expect("b ran");
+        assert!(a.1 && b.1, "both grouped steps got a scheduler-supplied shared bucket");
+        assert!(a.2, "step A admitted (fresh shared allowance)");
+        assert!(!b.2, "step B refused — the SAME bucket A exhausted, one allowance shared between them");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ungrouped_step_gets_no_shared_bucket() {
+        // A step naming NO bucket_group is handed `None` — it falls back to a
+        // step-scoped bucket inside its own kind, never joining a group.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let kind = Arc::new(BucketProbeKind { log: log.clone() });
+        let (ta, sa) = kinded_step("solo", "test.bucket-probe", json!({}), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa)]);
+
+        run_graph_with_kind(kind, &tasks, &mut steps);
+
+        let entries = log.lock().unwrap().clone();
+        let solo = entries.iter().find(|e| e.0 == "solo-step").expect("ran");
+        assert!(!solo.1, "ungrouped step receives no scheduler-shared bucket (step-scoped instead)");
+    }
+
+    /// (#1442 gate C3) Emits `n` per-item records LIVE through the ctx during
+    /// its run — the streaming-seam probe. If the seam batched at wave-drain
+    /// instead, these would land AFTER the step-complete bookend.
+    struct StreamingKind {
+        n: usize,
+    }
+    impl StepKind for StreamingKind {
+        fn id(&self) -> &'static str {
+            "test.streaming"
+        }
+        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            Ok(StepOutcome { output: "ctx-free".to_string(), flow_records: vec![] })
+        }
+        fn run_streaming(
+            &self,
+            step: &Step,
+            _t: &Task,
+            _i: &BTreeMap<String, String>,
+            ctx: &StepRunCtx,
+        ) -> Result<StepOutcome> {
+            for i in 0..self.n {
+                let mut rec = step_lifecycle_record(step, "item");
+                rec.payload = Some(json!({ "i": i }));
+                ctx.emit(rec);
+            }
+            Ok(StepOutcome { output: "done".to_string(), flow_records: vec![] })
+        }
+    }
+
+    #[test]
+    fn streaming_records_reach_emit_before_the_step_completes() {
+        let log_kind = Arc::new(StreamingKind { n: 5 });
+        let (ta, sa) = kinded_step("s", "test.streaming", json!({}), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa)]);
+
+        let emitted = run_graph_with_kind(log_kind, &tasks, &mut steps);
+
+        let item_positions: Vec<usize> = emitted
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.action == "item")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(item_positions.len(), 5, "all five streamed items reached emit");
+        let complete_pos = emitted
+            .iter()
+            .position(|r| r.action == "step complete")
+            .expect("step complete emitted");
+        assert!(
+            item_positions.iter().all(|&p| p < complete_pos),
+            "every streamed item lands BEFORE the step-complete bookend (live, not batched at drain): \
+             items at {item_positions:?}, complete at {complete_pos}"
+        );
+        // Emission ORDER preserved: item i=0..5 in sequence.
+        let item_indices: Vec<u64> = emitted
+            .iter()
+            .filter(|r| r.action == "item")
+            .map(|r| r.payload.as_ref().unwrap()["i"].as_u64().unwrap())
+            .collect();
+        assert_eq!(item_indices, vec![0, 1, 2, 3, 4], "records visible in emission order");
+    }
+
+    // ─── (#1442 gate) dispatch.map scheduler integration ────────────────
+
+    /// Hands its `config.output_json` back verbatim — a dependency-fed
+    /// collection SOURCE for the dispatch.map integration test, exercising
+    /// the real `gather_inputs` path (dispatch.map reads THIS step's output
+    /// as its single dependency input).
+    struct EmitCollectionKind;
+    impl StepKind for EmitCollectionKind {
+        fn id(&self) -> &'static str {
+            "test.emit-collection"
+        }
+        fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            let out = step
+                .config
+                .get("output_json")
+                .and_then(|v| v.as_str())
+                .unwrap_or("[]")
+                .to_string();
+            Ok(StepOutcome { output: out, flow_records: vec![] })
+        }
+    }
+
+    /// A `host_factory` that records every model_key it is asked to load into
+    /// a shared log — so a test can prove the wave loader loaded (or did not
+    /// load) a model for a dispatch.map step.
+    #[derive(Default)]
+    struct RecordingHost {
+        loads: Arc<Mutex<Vec<String>>>,
+        residents: Vec<darkmux_gestalt::ResidentFact>,
+    }
+    impl ModelHost for RecordingHost {
+        fn list_resident(&mut self) -> std::result::Result<Vec<darkmux_gestalt::ResidentFact>, darkmux_gestalt::HostError> {
+            Ok(self.residents.clone())
+        }
+        fn list_catalog(&mut self) -> std::result::Result<Vec<darkmux_gestalt::CatalogFact>, darkmux_gestalt::HostError> {
+            Ok(vec![])
+        }
+        fn load(
+            &mut self,
+            model_key: &str,
+            identifier: &str,
+            min_ctx: u32,
+            _deadline: darkmux_gestalt::Deadline,
+        ) -> std::result::Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+            self.loads.lock().unwrap().push(model_key.to_string());
+            self.residents.push(darkmux_gestalt::ResidentFact {
+                identifier: identifier.to_string(),
+                model_key: model_key.to_string(),
+                ctx: u64::from(min_ctx),
+                est_bytes: None,
+            });
+            Ok(darkmux_gestalt::LoadReport { resolved_ctx: Some(u64::from(min_ctx)), ..Default::default() })
+        }
+        fn unload(
+            &mut self,
+            _target: &darkmux_gestalt::plan::OwnedTarget,
+            _deadline: darkmux_gestalt::Deadline,
+        ) -> std::result::Result<(), darkmux_gestalt::HostError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dispatch_map_empty_dependency_collection_loads_no_model_at_the_wave_loader() {
+        // Upstream produces an EMPTY collection; the downstream dispatch.map
+        // (a LOCAL model with an n_ctx residency hint) must load NOTHING —
+        // its `residency()` returns `None` on the empty input, so the wave
+        // loader is never asked for the model. Proven at the ACTUAL loader via
+        // the recording host.
+        let loads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let loads_for_factory = loads.clone();
+        let factory = move || -> Box<dyn ModelHost> {
+            Box::new(RecordingHost { loads: loads_for_factory.clone(), residents: vec![] })
+        };
+
+        let (t_src, s_src) = kinded_step(
+            "src",
+            "test.emit-collection",
+            json!({ "output_json": "[]" }),
+            &[],
+        );
+        let (t_map, s_map) = kinded_step(
+            "map",
+            "dispatch.map",
+            json!({ "model": "map-model", "user_template": "check {item}", "n_ctx": 8000 }),
+            &["src"],
+        );
+        let (tasks, mut steps) = graph(vec![(t_src, s_src), (t_map, s_map)]);
+
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(Arc::new(EmitCollectionKind)).unwrap();
+        let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
+        let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
+        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}).unwrap();
+
+        assert!(loads.lock().unwrap().is_empty(), "empty-collection dispatch.map loads no model");
+        assert_eq!(steps["map-step"].status, NodeStatus::Complete, "the empty map short-circuits to Complete");
+        assert_eq!(steps["map-step"].output.as_deref(), Some("[]"), "empty output");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_nonempty_dependency_collection_wave_loads_the_right_model() {
+        // Upstream produces a NON-EMPTY collection; the dispatch.map step's
+        // `residency()` now resolves a Local placement, so the wave loader
+        // loads "map-model" before running it. The dispatch itself is pointed
+        // at an unroutable URL so no real model is contacted — per-item error
+        // isolation captures the connect failure; the LOAD is what we assert.
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev_url = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, "http://127.0.0.1:1");
+        }
+        let loads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let loads_for_factory = loads.clone();
+        let factory = move || -> Box<dyn ModelHost> {
+            Box::new(RecordingHost { loads: loads_for_factory.clone(), residents: vec![] })
+        };
+
+        let (t_src, s_src) = kinded_step(
+            "src",
+            "test.emit-collection",
+            json!({ "output_json": "[\"x\"]" }),
+            &[],
+        );
+        let (t_map, s_map) = kinded_step(
+            "map",
+            "dispatch.map",
+            json!({ "model": "map-model", "user_template": "check {item}", "n_ctx": 8000, "timeout_seconds": 1 }),
+            &["src"],
+        );
+        let (tasks, mut steps) = graph(vec![(t_src, s_src), (t_map, s_map)]);
+
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(Arc::new(EmitCollectionKind)).unwrap();
+        let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
+        let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
+        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}).unwrap();
+
+        unsafe {
+            match prev_url {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+        let loaded = loads.lock().unwrap().clone();
+        assert!(loaded.contains(&"map-model".to_string()), "the wave loader loaded the map's model: {loaded:?}");
+    }
 }

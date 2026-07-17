@@ -1689,6 +1689,110 @@ mod tests {
         }
     }
 
+    // ── (#1442 gate) dispatch.map hosted-seam tests ─────────────────────
+    // The hosted override (MAP_HOSTED_OVERRIDE, the unit-struct builtin's
+    // equivalent of review.rs's chat_override) makes item 1 a GENUINE
+    // successful hosted dispatch that spends, so mid-collection exhaustion
+    // (items 2+ skip) is exercisable without a network — the coverage the
+    // budget-0 test (whole collection skipped) cannot reach.
+
+    fn install_hosted_override(
+        f: impl Fn(&crate::single_shot::HostedSingleShotRequest) -> Result<crate::single_shot::SingleShotReply>
+            + 'static,
+    ) {
+        MAP_HOSTED_OVERRIDE.with(|o| *o.borrow_mut() = Some(Box::new(f)));
+    }
+    fn clear_hosted_override() {
+        MAP_HOSTED_OVERRIDE.with(|o| *o.borrow_mut() = None);
+    }
+    fn hosted_reply(total: Option<u64>) -> crate::single_shot::SingleShotReply {
+        crate::single_shot::SingleShotReply {
+            content: "flag".to_string(),
+            total_tokens: total,
+            prompt_tokens: None,
+            completion_tokens: None,
+            model: Some("hosted".to_string()),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_hosted_partial_exhaustion_mid_collection() {
+        // item 1 spends the WHOLE 100-token allowance, so the SHARED bucket
+        // is exhausted for items 2 and 3 — they skip with the named reason.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "100");
+        }
+        clear_hosted_override();
+        install_hosted_override(|_req| Ok(hosted_reply(Some(100))));
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a", "b", "c"],
+            "endpoint": { "url": "https://example.com" },
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].ok, "item 1 dispatched and succeeded");
+        assert_eq!(results[0].total_tokens, Some(100), "item 1 reported its real usage");
+        for r in &results[1..] {
+            assert!(!r.ok, "item {} skipped after exhaustion", r.index);
+            let msg = r.error.as_deref().unwrap();
+            assert!(msg.contains("remote token budget exhausted"), "named skip reason: {msg}");
+            // (#1442 gate) A skipped item reports HONEST None — never a
+            // fabricated 0 that a run-level token sum would silently swallow.
+            assert_eq!(r.total_tokens, None, "skipped item's total_tokens stays honest None");
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_hosted_reply_without_usage_stays_honest_none_at_run_level() {
+        // An endpoint that omits usage entirely: the item is `ok` (it
+        // dispatched) but its `total_tokens` is honest `None` — the run-level
+        // result array never fabricates a number the endpoint didn't send.
+        // (The bucket still charges the conservative clamped grant so an
+        // omitting endpoint can't run the whole collection off the meter.)
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        install_hosted_override(|_req| Ok(hosted_reply(None)));
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a", "b"],
+            "endpoint": { "url": "https://example.com" },
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.ok), "both dispatched");
+        assert!(
+            results.iter().all(|r| r.total_tokens.is_none()),
+            "no fabricated token count when the endpoint omitted usage"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     // ── (#1412) dispatch.single_shot hosted-arm metering ────────────────
 
     #[test]
