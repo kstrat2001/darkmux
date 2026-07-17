@@ -985,20 +985,21 @@
             .expect("sampler thread did not stop within 5s — thread leak");
     }
 
-    /// `ReviewRunGuard` owns the sampler's whole-run lifecycle (see its
-    /// doc). Clean finish: `task_started` -> `task_finished` -> the guard
-    /// drops — the sampler thread must already be stopped by the time that
-    /// drop returns. Same bounded-timeout discipline as the sampler-only
-    /// test above (drop runs on a spawned thread; the test thread asserts
-    /// via `recv_timeout` so a hang fails loud instead of wedging the run).
+    /// (#1434 — successor of `bookend_guard_clean_finish_stops_telemetry_
+    /// sampler_thread`; the run-guard / per-run task bookend it drove
+    /// was retired.) `ReviewObs` now owns the sampler's whole-run lifecycle
+    /// (see its doc). Clean finish: emit a `step result` -> the obs drops —
+    /// the sampler thread must already be stopped by the time that drop
+    /// returns. Same bounded-timeout discipline as the sampler-only test
+    /// above (drop runs on a spawned thread; the test thread asserts via
+    /// `recv_timeout` so a hang fails loud instead of wedging the run).
     #[test]
-    fn bookend_guard_clean_finish_stops_telemetry_sampler_thread() {
+    fn review_obs_clean_finish_stops_telemetry_sampler_thread() {
         let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut emitter = RecordingEmitter::new();
-            let mut sink = EmitterSink(&mut emitter);
-            let mut guard = ReviewRunGuard::new_with_telemetry(
-                &mut sink,
+            let mut obs = ReviewObs::new_with_telemetry(
+                &mut emitter,
                 "case-1",
                 "crew-1",
                 Duration::from_millis(5),
@@ -1006,35 +1007,29 @@
                 fake_sample,
                 fake_lms,
             );
-            guard.task_started(json!({"status": "started"}));
-            let env = ReviewEnvelope {
-                case_id: "case-1".to_string(),
-                crew: "crew-1".to_string(),
-                ..Default::default()
-            };
-            guard.task_finished(&env);
-            drop(guard); // blocks until the sampler thread stops + joins
+            obs.step_result("review.bundle", "bundle", json!({ "items_out": 0 }));
+            drop(obs); // blocks until the sampler thread stops + joins
             let _ = done_tx.send(());
         });
         done_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("guard drop (clean finish) did not stop the telemetry sampler thread within 5s — thread leak");
+            .expect("obs drop (clean finish) did not stop the telemetry sampler thread within 5s — thread leak");
     }
 
-    /// The error-path mirror: `task_started` with no matching
-    /// `task_finished` (an early `?`-return / panic unwind) — the guard's
-    /// Drop path (still ARMED) closes open steps + emits a terminal error
-    /// record AND must still stop the sampler thread, exactly like the
-    /// clean-finish path above.
+    /// (#1434 — successor of `bookend_guard_error_path_drop_stops_telemetry_
+    /// sampler_thread`.) The abandoned-path mirror: an early `?`-return /
+    /// panic unwind drops `ReviewObs` before it emits any completion record —
+    /// its `Drop` must still stop the sampler thread, exactly like the
+    /// clean-finish path above. (Run liveness on the real early-return path
+    /// is the caller's `with_dispatch_bookends` wrap, not this struct.)
     #[test]
-    fn bookend_guard_error_path_drop_stops_telemetry_sampler_thread() {
+    fn review_obs_early_drop_stops_telemetry_sampler_thread() {
         let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut emitter = RecordingEmitter::new();
             {
-                let mut sink = EmitterSink(&mut emitter);
-                let mut guard = ReviewRunGuard::new_with_telemetry(
-                    &mut sink,
+                let _obs = ReviewObs::new_with_telemetry(
+                    &mut emitter,
                     "case-2",
                     "crew-2",
                     Duration::from_millis(5),
@@ -1042,15 +1037,13 @@
                     fake_sample,
                     fake_lms,
                 );
-                guard.task_started(json!({"status": "started"}));
-                // No `task_finished` call — the guard drops here still
-                // ARMED, exercising the error path.
+                // No emission — `_obs` drops here, exercising the early path.
             }
             let _ = done_tx.send(());
         });
         done_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("guard drop (error path) did not stop the telemetry sampler thread within 5s — thread leak");
+            .expect("obs drop (early path) did not stop the telemetry sampler thread within 5s — thread leak");
     }
 
     // ── staffing snapshot (#1247 lab-view addition) ────────────────────
@@ -1159,6 +1152,69 @@
         let mut chat = |_call: &ChatCall| Ok(reply(FP_JSON));
         let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         assert_eq!(env.mode, "parallel", "a judge-only re-run of a parallel review keeps its provenance");
+    }
+
+    /// (#1434) The `--charges-file` re-judge path (`run_judge_only`) emits the
+    /// SAME generic `step result` companion vocabulary the graph path emits
+    /// — never the retired bespoke per-run task/step/ruling `review.*`
+    /// vocabulary. Drives `run_judge_only` through a `RecordingEmitter` and
+    /// pins the record SHAPES: every emitted record is a `step result` (or a
+    /// best-effort `telemetry.*` sample), and the step-result `kind`s cover
+    /// the sequential pipeline's stages (`review.bundle`/`review.dedup`/
+    /// `review.judge`). Run-level `dispatch start`/`dispatch complete`
+    /// liveness bookends are the caller's `with_dispatch_bookends` wrap (per
+    /// contract 2 — covered by `mission_launch_review`'s own bookend tests),
+    /// NOT this driver, so they're deliberately absent here.
+    #[test]
+    fn run_judge_only_emits_step_result_vocabulary_not_legacy_review_actions() {
+        let crew = valid_crew();
+        let inputs = ReviewInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent_title: "add a feature",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 500_000,
+            bundles: None,
+        };
+        let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |_call: &ChatCall| Ok(reply(CONFIRM_JSON));
+        let mut emitter = RecordingEmitter::new();
+        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
+        assert_eq!(env.judged.len(), 1);
+
+        // Every emitted record is a generic `step result` companion or a
+        // best-effort telemetry sample — NEVER a legacy per-run action.
+        for r in &emitter.records {
+            assert!(
+                r.action == "step result" || r.action.starts_with("telemetry."),
+                "run_judge_only emitted an unexpected action `{}` — the retired \
+                 task/step/ruling vocabulary must not reappear",
+                r.action
+            );
+        }
+        // The step-result `kind`s cover the sequential pipeline's stages —
+        // the SAME `kind` set the graph step kinds emit.
+        let kinds: Vec<String> = emitter
+            .records
+            .iter()
+            .filter(|r| r.action == "step result")
+            .filter_map(|r| {
+                r.payload
+                    .as_ref()
+                    .and_then(|p| p.get("kind"))
+                    .and_then(|k| k.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        assert!(kinds.iter().any(|k| k == "review.bundle"), "bundle step result present: {kinds:?}");
+        assert!(kinds.iter().any(|k| k == "review.dedup"), "dedup step result present: {kinds:?}");
+        assert!(kinds.iter().any(|k| k == "review.judge"), "judge step result present: {kinds:?}");
     }
 
     /// (#1355/#1357 review round) `finish_review`'s judge remote-budget
@@ -2680,13 +2736,16 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         }
         // (#1349) `run_review_graph` itself must emit NO task-level bookend
         // at all — that liveness edge belongs entirely to the caller's
-        // `with_dispatch_bookends` wrap (`src/pr_review.rs`), which brackets
-        // the WHOLE call in the canonical `dispatch start`/`dispatch
-        // complete` record. A `review.task` (or any `dispatch *`) record
-        // emitted from inside this function would be the exact redundant,
-        // competing-vocabulary bug #1349 retired.
+        // `with_dispatch_bookends` wrap (`src/mission_launch_review.rs`),
+        // which brackets the WHOLE call in the canonical `dispatch start`/
+        // `dispatch complete` record. Any `dispatch *` record emitted from
+        // inside this function would be the exact redundant,
+        // competing-vocabulary bug #1349 retired. (#1434 retired the bespoke
+        // per-run task/step/ruling vocabulary the old driver emitted, so the
+        // only remaining shapes here are the scheduler's generic `step *`
+        // lifecycle records + this module's own `step result` companions.)
         assert!(
-            emitter.records.iter().all(|r| r.action != "review.task" && !r.action.starts_with("dispatch ")),
+            emitter.records.iter().all(|r| !r.action.starts_with("dispatch ")),
             "run_review_graph must not emit its own task-level bookend: {:?}",
             emitter.records.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
         );
@@ -2793,16 +2852,18 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     //   bundle_step` / `bookend_guard_probe_dispatch_error_closes_open_
     //   steps_and_emits_terminal_task_record` / `bookend_guard_chat_error_
     //   mid_judge_docket_still_yields_terminal_task_record` — asserted the
-    //   old driver's bespoke `review.task`/`review.step`/`review.ruling`
-    //   emission vocabulary (`ReviewRunGuard`). #1349 retired that
+    //   old driver's bespoke per-run task/step/ruling `review.*` emission
+    //   vocabulary (the retired run-guard). #1349 retired that
     //   vocabulary from the graph path entirely: `run_review_graph` emits
     //   ONLY the scheduler's generic `step start`/`step complete`/`step
     //   error` records (already covered by `run_review_graph_with_empty_
     //   bundles_completes_with_zero_dispatches`, which now also pins the
     //   zero-bundle degenerate reason text) plus this module's own
     //   `emit_review_step_result` ("step result") records — the former
-    //   `review.task` bookend now lives entirely in `src/pr_review.rs`'s
+    //   task-level bookend now lives entirely in `src/mission_launch_review.rs`'s
     //   `with_dispatch_bookends` wrap (see `run_review_graph`'s own doc).
+    //   (#1434 extended the same retirement to the sequential
+    //   `run_judge_only` path.)
     //   The GENUINE behavioral intent behind the two bookend-guard tests —
     //   a probe/judge dispatch error reaches a clean terminal envelope
     //   rather than hanging or panicking — is re-covered below by
@@ -2829,11 +2890,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     //   observability now lives in the flow-record stream
     //   (`emit_review_step_result`'s `wall_ms` fields) instead.
     // - `remote_tokens_bookend_present_when_remote_absent_when_local` —
-    //   asserted the old `review.task` bookend's `remote_tokens` field,
-    //   which now lives in `src/pr_review.rs`'s `with_dispatch_bookends`
+    //   asserted the old task-level bookend's `remote_tokens` field,
+    //   which now lives in `src/mission_launch_review.rs`'s `with_dispatch_bookends`
     //   payload (outside this module's crate boundary — see
-    //   `run_review_graph`'s doc); an equivalent belongs in
-    //   `src/pr_review.rs`'s own test suite, not here.
+    //   `run_review_graph`'s doc); an equivalent belongs in that binary
+    //   crate's own test suite, not here.
     //
     // ── a real, distinct gap found DURING the #1355/#1357 migration ─────
     //

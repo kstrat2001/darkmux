@@ -3532,47 +3532,60 @@ function renderLabRunsList(){
 
 // ── run detail: pipeline strip + live/playback event feed ──────────────
 
-/// Fold `review.step`/`review.ruling`/`review.task` records (in arrival
-/// order — the SAME code path serves a live-polling run and a finished
-/// run's full backfilled history, so there is exactly one pipeline-
-/// computation function for both) into per-step latest-state + a running
-/// judge-ruling tally. `env` (the completed envelope, when the run has one)
-/// supplies the AUTHORITATIVE confirmed/needs_check/archived totals; before
-/// any case completes, the synthesis row shows a clearly-labeled provisional
-/// tally derived from ruling records instead.
+/// Fold the review pipeline's generic `step result` companion records (in
+/// arrival order — the SAME code path serves a live-polling run and a
+/// finished run's full backfilled history, so there is exactly one
+/// pipeline-computation function for both) into per-step latest-state + a
+/// running judge/verify ruling tally. (#1434 — the review path emits ONE
+/// `step result` vocabulary now; the retired per-run task/step/ruling records
+/// are gone. Per-ruling records arrive with `step_id === "review-ruling"`;
+/// every other step-result is a stage completion keyed by its own `step_id`.)
+/// `env` (the completed envelope, when the run has one) supplies the
+/// AUTHORITATIVE confirmed/needs_check/archived totals; before any case
+/// completes, the synthesis row shows a clearly-labeled provisional tally
+/// derived from ruling records instead.
 function computeLabPipeline(events){
   const steps={};
+  const order=[];
   const rulingTally={1:{}, 2:{}};
-  let taskFinished=false;
   events.forEach(r=>{
-    if(r.action==="review.task" && r.payload && r.payload.status==="finished") taskFinished=true;
-    if(r.action==="review.step" && r.payload && r.payload.step_id) steps[r.payload.step_id]=r.payload;
-    if(r.action==="review.ruling" && r.payload){
-      const p=r.payload.pass, rul=r.payload.ruling;
-      if((p===1||p===2) && rul) rulingTally[p][rul]=(rulingTally[p][rul]||0)+1;
+    if(r.action!=="step result" || !r.payload) return;
+    const p=r.payload;
+    if(p.step_id==="review-ruling"){
+      const pass=p.pass, rul=p.ruling;
+      if((pass===1||pass===2) && rul) rulingTally[pass][rul]=(rulingTally[pass][rul]||0)+1;
+      return;
+    }
+    if(p.step_id){
+      if(!(p.step_id in steps)) order.push(p.step_id);
+      steps[p.step_id]=p;
     }
   });
-  return {steps, rulingTally, taskFinished};
+  return {steps, order, rulingTally};
 }
 function labStageMeta(payload){
   if(!payload) return "not started";
-  const bits=[payload.status||"—"];
+  const bits=[];
   if(payload.draws_total!=null) bits.push(`${payload.draws_done||0}/${payload.draws_total} draws${payload.model?" · "+shortModel(payload.model):""}`);
   else if(payload.items_in!=null || payload.items_out!=null) bits.push(`${payload.items_in??"—"} → ${payload.items_out??"—"}`);
-  return bits.join(" · ");
+  else if(payload.model) bits.push(shortModel(payload.model));
+  if(payload.wall_ms!=null) bits.push(`${payload.wall_ms}ms`);
+  return bits.length?bits.join(" · "):"done";
 }
 function labStageRow(label, payload){
-  const status = payload && payload.status ? payload.status : "pending";
+  // (#1434) A `step result` record IS the stage's completion — no separate
+  // status field, so a present payload renders "complete", an absent one
+  // "pending".
+  const status = payload ? "complete" : "pending";
   return `<div class="labstage ${esc(status)}"><span class="labstagename">${esc(label)}</span><span class="labstagemeta">${esc(labStageMeta(payload))}</span></div>`;
 }
 function renderLabPipeline(pipe, env){
-  const rows=[labStageRow("bundle", pipe.steps["bundle"])];
-  const probeKeys = Object.keys(pipe.steps).filter(k=>k==="probe"||k.indexOf("probe:")===0).sort();
-  if(probeKeys.length) probeKeys.forEach(k=>rows.push(labStageRow(k, pipe.steps[k])));
-  else rows.push(labStageRow("probe", null));
-  rows.push(labStageRow("dedup", pipe.steps["dedup"]));
-  rows.push(labStageRow("judge-pass1", pipe.steps["judge-pass1"]));
-  rows.push(labStageRow("judge-pass2", pipe.steps["judge-pass2"]));
+  // (#1434) Render each stage that reported a `step result`, in arrival
+  // order — the step_ids come straight from the review graph / sequential
+  // driver, so this stays correct whichever path produced the run without a
+  // hardcoded stage list.
+  const rows = pipe.order.map(id=>labStageRow(id, pipe.steps[id]));
+  if(!rows.length) rows.push(labStageRow("pipeline", null));
   const tallyStr=t=>Object.entries(t).map(([k,v])=>k+":"+v).join(" ")||"—";
   const synthMeta = env
     ? `confirmed ${env.confirmed} · needs_check ${env.needs_check} · archived ${env.archived}`
@@ -3588,14 +3601,16 @@ function labFeedRow(r){
   if(r.category==="telemetry" && r.source==="process"){
     return `<div class="labfeedrow host"><span class="labfeedts">${tt}</span><span class="labfeedtag">host</span><span class="labfeedtext">cpu ${esc(f.cpu??"–")}% · mem ${esc(f.mem??"–")}% · gpu ${esc(f.gpu??"–")}%</span></div>`;
   }
-  if(r.action==="review.ruling"){
-    return `<div class="labfeedrow ruling ${esc(f.ruling||"")}"><span class="labfeedts">${tt}</span><span class="labfeedtag">ruling</span><span class="labfeedtext">${esc(labShortId(f.bundle_id))} pass${esc(f.pass)} → ${esc(f.ruling)}${f.seconds!=null?" ("+Number(f.seconds).toFixed(1)+"s)":""}</span></div>`;
-  }
-  if(r.action==="review.step"){
-    return `<div class="labfeedrow step ${esc(f.status||"")}"><span class="labfeedts">${tt}</span><span class="labfeedtag">${esc(f.step_id||"step")}</span><span class="labfeedtext">${esc(labStageMeta(f))}</span></div>`;
-  }
-  if(r.action==="review.task"){
-    return `<div class="labfeedrow task ${esc(f.status||"")}"><span class="labfeedts">${tt}</span><span class="labfeedtag">task</span><span class="labfeedtext">${esc(f.status||"")}${f.case_id?" · "+esc(f.case_id):""}</span></div>`;
+  // (#1434) The review path emits ONE `step result` companion vocabulary.
+  // A `step_id === "review-ruling"` record is a per-flag judge/verify ruling
+  // ticker; every other `step result` is a stage completion.
+  if(r.action==="step result"){
+    if(f.step_id==="review-ruling"){
+      const stage = f.stage ? esc(f.stage) : "ruling";
+      const passLbl = f.pass!=null ? " pass"+esc(f.pass) : "";
+      return `<div class="labfeedrow ruling ${esc(f.ruling||"")}"><span class="labfeedts">${tt}</span><span class="labfeedtag">${stage}</span><span class="labfeedtext">${esc(labShortId(f.bundle_id))}${passLbl} → ${esc(f.ruling)}${f.seconds!=null?" ("+Number(f.seconds).toFixed(1)+"s)":""}</span></div>`;
+    }
+    return `<div class="labfeedrow step complete"><span class="labfeedts">${tt}</span><span class="labfeedtag">${esc(f.step_id||"step")}</span><span class="labfeedtext">${esc(labStageMeta(f))}</span></div>`;
   }
   return `<div class="labfeedrow"><span class="labfeedts">${tt}</span><span class="labfeedtext">${esc(r.action||"")}</span></div>`;
 }
@@ -3623,7 +3638,9 @@ function renderLabRun(){
   const env = (LAB_DETAIL.funnels && LAB_DETAIL.funnels[0]) || null;
   const scores = LAB_DETAIL.scores || null;
   const pipe = computeLabPipeline(LAB_EVENTS);
-  const finished = !!env || pipe.taskFinished || (scores!=null);
+  // (#1434) No task-finished record exists anymore; a run is "finished" when
+  // its completed envelope or scores artifact is present.
+  const finished = !!env || (scores!=null);
   $("stage").innerHTML = `
     <div class="stagehdr"><a data-act="lab">‹ lab</a> · ${esc(dir)} ${finished?labBadge({finished:true}):labBadge({finished:false})}</div>
     <div class="labpipe">${renderLabPipeline(pipe, env)}</div>

@@ -670,16 +670,16 @@ fn inactivity_timeout_seconds() -> u64 {
 /// A thin wrapper: this is a flat, depth-≤1 case of the generic
 /// `darkmux_flow::BookendGuard` stack (one dispatch, one open unit) — the
 /// `open`/`close` bookkeeping and the Drop-time abort emission both live in
-/// `darkmux-flow` now, shared with `ReviewRunGuard`
-/// (`darkmux-lab::lab::review`, renamed from `FunnelBookendGuard`/
-/// `darkmux-lab::lab::funnel` in #1349) and `pr_review.rs`'s
-/// review→dispatch bridge (`with_dispatch_bookends`, #1349's `run_review_graph`
-/// top-level wrap since retired its OWN task-level bookend — see that
-/// function's doc). Emits through the process-wide default sink
-/// (`darkmux_flow::record`) — same as every other record on this dispatch
-/// path — so, unlike the review guards, there's no injected `ReviewEmitter`
-/// to bridge and no re-lending concern (see `darkmux_flow::bookend`'s
-/// module doc for why that matters elsewhere).
+/// `darkmux-flow` now, shared with the review→dispatch bridge
+/// (`darkmux-lab::lab::review` + `src/mission_launch_review.rs`'s
+/// `with_dispatch_bookends`), which brackets a review run in the canonical
+/// `dispatch start`/`dispatch complete`/`dispatch error` record — the review
+/// module retired its own per-run task/step/ruling vocabulary in #1349/#1434
+/// and now relies on that outer wrap for liveness. Emits through the
+/// process-wide default sink (`darkmux_flow::record`) — same as every other
+/// record on this dispatch path — so, unlike the review bridge, there's no
+/// injected `ReviewEmitter` to bridge and no re-lending concern (see
+/// `darkmux_flow::bookend`'s module doc for why that matters elsewhere).
 struct DispatchBookendGuard<'a> {
     inner: darkmux_flow::DynBookendGuard<'a>,
 }

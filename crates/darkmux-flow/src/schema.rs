@@ -145,8 +145,8 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.17.0";
 //   (code-internal, no FLOW_SCHEMA_VERSION bump) — #1349: the review
 //           pipeline's module (`darkmux_lab::lab::funnel` -> `::lab::review`)
 //           and its `funnel.task`/`funnel.step`/`funnel.ruling` action
-//           vocabulary from 1.17.0 above are renamed to `review.task`/
-//           `review.step`/`review.ruling` — "funnel" described a separate,
+//           vocabulary from 1.17.0 above are renamed to the `review.`
+//           `{task,step,ruling}` family — "funnel" described a separate,
 //           bespoke execution mechanism that #1348 retired (the pipeline is
 //           just a mission now, like any other); the name outlived the
 //           thing it named. Same payload shapes, same semantics, action
@@ -156,13 +156,21 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.17.0";
 //           production caller already wraps that call in
 //           `src/pr_review.rs`'s `with_dispatch_bookends`, which opens the
 //           canonical `dispatch start`/`dispatch complete`/`dispatch error`
-//           bookend around it (#1230 Packet 0); the inner `review.task`
+//           bookend around it (#1230 Packet 0); the inner per-run task
 //           bookend now fires ONLY from the still-used sequential
 //           `--charges-file` driver (`run_judge_only` — its sibling
 //           `run_review` was deleted as dead code in #1357), never from the
 //           Task/Step graph driver. Older readers that don't recognize the
 //           renamed actions degrade the same way 1.17.0 documented:
 //           additive, unknown-action-tolerant.
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #1434: the review
+//           pipeline's bespoke per-run task/step/ruling action vocabulary
+//           (the two prior entries above) is RETIRED entirely. The sequential
+//           `--charges-file` driver folded onto the SAME generic `step result`
+//           companion vocabulary the Task/Step graph driver already emitted,
+//           so exactly one review record vocabulary now exists. These records
+//           are per-run-local/ephemeral (no versioned consumer), so no bump
+//           and no migration — the vocabulary simply stops being written.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
