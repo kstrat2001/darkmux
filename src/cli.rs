@@ -63,7 +63,7 @@ fn build_version_static() -> &'static str {
 }
 
 #[derive(Parser)]
-#[command(name = "darkmux", version = build_version_static(), about = "Lab and multiplexer for local LLM configurations")]
+#[command(name = "darkmux", version = build_version_static(), about = "Mission orchestrator and lab for local AI")]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Cmd,
