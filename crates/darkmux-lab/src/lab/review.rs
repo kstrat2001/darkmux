@@ -59,60 +59,49 @@
 //!
 //! ## Flow-record emission (#1247 Part 1)
 //!
-//! (#1355/#1357 update: this section describes the vocabulary
-//! [`run_judge_only`]/`finish_review` still emit via [`ReviewRunGuard`] — the
-//! `--charges-file` re-judge path. The graph path (`run_review_graph`) emits
-//! a DIFFERENT, simpler vocabulary — the scheduler's generic `step start`/
-//! `step complete`/`step error` records plus this module's own
-//! `emit_review_step_result` ("step result") records — never `review.task`/
-//! `review.step`/`review.ruling`; see `run_review_graph`'s own doc for why.)
+//! (#1434 update: the sequential `--charges-file` re-judge driver
+//! [`run_judge_only`]/`finish_review` now emits the SAME generic
+//! `step result` vocabulary the graph path (`run_review_graph`) emits — via
+//! [`emit_review_step_result`], through the run's [`ReviewObs`] helper. The
+//! bespoke per-run task/step/ruling `review.*` action vocabulary and the
+//! run-guard that emitted it were retired: exactly one record vocabulary now
+//! exists across BOTH review paths. Run-level liveness is the caller's
+//! `with_dispatch_bookends` `dispatch start`/`dispatch complete`/`dispatch
+//! error` wrap (`src/mission_launch_review.rs`, brackets both paths) — never
+//! a review-scoped task bookend from inside the driver, per contract 2 /
+//! #1349.)
 //!
-//! The driver (`run_judge_only`/`finish_review`) emits
-//! [`darkmux_flow::FlowRecord`]s through a
-//! caller-injected [`ReviewEmitter`] — same injection discipline as `chat`/
-//! `cycler` above, so a scripted test can assert the exact record SEQUENCE
-//! via a recording mock. The driver is deliberately SINK-AGNOSTIC: it never
-//! calls `darkmux_flow::record` itself and has no idea whether the records
-//! land on the real engagement-scoped flow stream or a per-run-local file —
-//! that choice belongs to the caller (`darkmux mission launch review` wires
-//! the real stream; `darkmux lab review-bench --review` wires a per-run-local JSONL
-//! file, per the lab-vs-fleet scope boundary — a bench's hundreds of
-//! per-flag ruling records must never spam an operator's engagement
-//! stream). Three action families, vocabulary aligned with #1230/#1240's
-//! Mission → Phase → Task → Step hierarchy so the records forward-port to
-//! the generic mission-flow graph view unchanged:
+//! The driver emits [`darkmux_flow::FlowRecord`]s through a caller-injected
+//! [`ReviewEmitter`] — same injection discipline as `chat`/`cycler` above,
+//! so a scripted test can assert the exact record SEQUENCE via a recording
+//! mock. The driver is deliberately SINK-AGNOSTIC: it has no idea whether
+//! the records land on the real engagement-scoped flow stream or a
+//! per-run-local file — that choice belongs to the caller (`darkmux mission
+//! launch review` wires the real stream via `FleetFlowEmitter`, per the
+//! lab-vs-fleet scope boundary — a bench's hundreds of per-flag ruling
+//! records must never spam an operator's engagement stream). One action
+//! family — the generic `step result` record ([`emit_review_step_result`],
+//! `action = "step result"`, `handle = step_id`, `session_id = case_id`),
+//! with a `kind` field distinguishing which review step produced it, aligned
+//! with #1230/#1240's Mission → Phase → Task → Step hierarchy so the records
+//! forward-port to the generic mission-flow graph view unchanged:
 //!
-//! - `review.task` — one review RUN's bookends (`payload.status` = `started`
-//!   | `finished` | `error`): case id, crew, exec mode, bundle count on
-//!   start; confirmed/needs_check/archived counts + `degenerate` reason
-//!   (when set) on finish. `error` is the [`ReviewRunGuard`]'s Drop-path
-//!   terminal record — emitted when the driver `?`-returns or panics after
-//!   `started`, so no consumer ever sees an orphaned, perpetually-in-flight
-//!   run (the same guarantee `darkmux-crew`'s `DispatchBookendGuard`, #717,
-//!   gives `dispatch.start`).
-//! - `review.step` — a step transition, payload shape matching #1230's
-//!   named substrate exactly: `{step_id, kind: "procedural"|"dispatch",
-//!   items_in, items_out, status: "started"|"finished", wall_ms}` (plus
-//!   `status: "error"` from the guard's Drop path, closing any step still
-//!   open at an abort — innermost-first, so start/terminal pairing holds on
-//!   every path).
-//!   `step_id` is `bundle` | `probe` | `probe:<staffing-name>` (one per
-//!   probe seat — a future graph engine renders these as PARALLEL sibling
-//!   steps under `probe`, #1230's parallel-step vision) | `dedup` |
-//!   `judge-pass1` | `judge-pass2`. Seat-level (`probe:*`) records carry
-//!   extra `model`/`draws_done`/`draws_total`/`tokens` fields. A `confirmed`
-//!   pass-1 gets its pass-2 ruling immediately, interleaved within the SAME
-//!   per-flag judge loop as pass-1 — so `judge-pass2`'s `started` record
-//!   opens the moment the FIRST pass-2 ruling actually fires (`items_in` is
-//!   the running count at that point, not the final docket size), rather
-//!   than waiting for the whole loop to finish. Opening it late let a live
-//!   observer see `review.ruling{pass:2}` records stream in while the
-//!   `judge-pass2` step still read "not started" — a real contradiction
-//!   caught live in the lab lens. `finished` closes once the loop
-//!   completes, carrying the real final docket size and elapsed `wall_ms`.
-//! - `review.ruling` — the live ticker: one record per judge ruling (every
-//!   pass-1, plus pass-2 when it ran) with `bundle_id`/`pass`/`ruling`/
-//!   `seconds`.
+//! - `kind = "review.bundle"` — the bundle step's completion (`items_out` =
+//!   the resolved bundle count).
+//! - `kind = "review.dedup"` — dedup completion (`items_in`/`items_out`/
+//!   `wall_ms`).
+//! - `kind = "review.judge"`, `step_id = "review-ruling"` — the live judge
+//!   ticker: one record per judge ruling (every pass-1, plus the decisive
+//!   later pass when it ran) with `bundle_id`/`pass`/`ruling`/`seconds`.
+//! - `kind = "review.judge"`, `step_id = "judge"` — the judge stage's single
+//!   completion record (`items_in`/`items_out`/`wall_ms`, plus
+//!   `pass1_wall_ms`/`pass2_wall_ms`/`model`/`tokens`/`calls`/
+//!   `dispatch_errors`/`served_model`), matching the graph judge kind's shape.
+//! - `kind = "review.verify"`, `step_id = "review-ruling"` — per-adjudication
+//!   verify ticker (`bundle_id`/`stage`/`ruling`/`seconds`).
+//! - `kind = "review.verify"`, `step_id = "verify"` — the verify stage's
+//!   single completion record (`items_in`/`items_out`/`wall_ms`/`model`/
+//!   `tokens`/`calls`/`remote`/`endpoint`/`served_model`).
 //!
 //! Emission happens ONLY in the driver — never inside the pure protocol
 //! functions (`dedup_flags`, `mechanism_family`, `parse_judge_ruling`,
@@ -123,9 +112,9 @@
 //! ## Host telemetry sampling (#1247 doctrine surface — "No blind runs")
 //!
 //! `run_review_graph`/`run_judge_only` also start a background host cpu/ram/gpu
-//! sampler for the run's whole lifetime — see [`ReviewRunGuard`] and
+//! sampler for the run's whole lifetime — see [`ReviewObs`] and
 //! [`HostTelemetrySampler`]. Samples emit as `telemetry.process` records
-//! through the SAME injected [`ReviewEmitter`] the `review.*` action family
+//! through the SAME injected [`ReviewEmitter`] the `step result` action family
 //! above uses (so a bench run's samples stay per-run-local and a
 //! `mission launch review`'s samples ride the fleet stream, same split), with the
 //! identical field shape `darkmux_crew::dispatch_internal`'s always-on
@@ -359,7 +348,7 @@ pub struct MemberRecord {
 /// One pipeline step's in/out counts + wall time — the issue #1230 bridge:
 /// a future flow-record consumer can render the review as a step timeline
 /// without re-deriving it from the envelope's nested arrays. Realized by
-/// the `review.step` flow record (#1247 Part 1, see the module doc) — the
+/// the `step result` flow record (#1247 Part 1, see the module doc) — the
 /// live-run counterpart of this end-of-run summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecord {
@@ -393,86 +382,6 @@ impl ReviewEmitter for NullEmitter {
     fn emit(&mut self, _record: darkmux_flow::FlowRecord) {}
 }
 
-const REVIEW_TASK_ACTION: &str = "review.task";
-const REVIEW_STEP_ACTION: &str = "review.step";
-const REVIEW_RULING_ACTION: &str = "review.ruling";
-
-/// Build one review observability record. `handle` = the crew name (this
-/// review's addressable identity, the role `handle` plays for `crew
-/// dispatch`'s per-role records); `session_id` = the case id (one review
-/// RUN's identity, the role `session_id` plays for a single dispatch).
-/// `source = "review"` distinguishes these from `crew_dispatch`/
-/// `phase_review` records that may share the same sink. `category = Work`
-/// / `tier = Local` / `stage = Dispatch` mirror `dispatch`'s own
-/// per-turn records (`dispatch.tool`, `dispatch.turn`) — the review is,
-/// mechanically, a multi-dispatch alternative shape of the same "produce a
-/// local review" job.
-fn review_flow_record(
-    case_id: &str,
-    crew_name: &str,
-    action: &str,
-    level: darkmux_flow::Level,
-    payload: serde_json::Value,
-) -> darkmux_flow::FlowRecord {
-    darkmux_flow::FlowRecord {
-        ts: darkmux_flow::ts_utc_now(),
-        level,
-        category: darkmux_flow::Category::Work,
-        tier: darkmux_flow::Tier::Local,
-        stage: darkmux_flow::Stage::Dispatch,
-        action: action.to_string(),
-        handle: crew_name.to_string(),
-        phase_id: None,
-        session_id: Some(case_id.to_string()),
-        source: Some("review".to_string()),
-        model: None,
-        reasoning: None,
-        mission_id: None,
-        machine_id: None,
-        machine_uid: None,
-        orchestrator: None,
-        prev_hash: None,
-        hash: None,
-        payload: Some(payload),
-        work_id: None,
-        attempt: None,
-    }
-}
-
-/// The `review.task` "finished" record's payload + level, shared by every
-/// return point (`run_review`'s two early degenerate returns,
-/// `run_judge_only`'s one, and `finish_review`'s normal end) so the shape
-/// can't drift between call sites. `Level::Warn` when `env.degenerate` is
-/// set — a degenerate run is a loud, scoreable outcome, never quietly
-/// `Info`.
-fn task_finished_record(env: &ReviewEnvelope) -> darkmux_flow::FlowRecord {
-    let mut payload = json!({
-        "status": "finished",
-        "case_id": env.case_id,
-        "crew": env.crew,
-        "confirmed": env.confirmed,
-        "needs_check": env.needs_check,
-        "archived": env.archived,
-    });
-    if let Some(reason) = &env.degenerate {
-        payload["degenerate"] = serde_json::Value::String(reason.clone());
-    }
-    // (#1260/#1186) Remote-seat tokens, carried separately so downstream
-    // savings surfaces can EXCLUDE them — cloud tokens are never counted
-    // "off the meter". Present iff any seat dispatched remotely.
-    if env.members.iter().any(|m| m.remote) {
-        let remote_tokens: u64 = env.members.iter().filter(|m| m.remote).map(|m| m.total_tokens).sum();
-        payload["remote_tokens"] = remote_tokens.into();
-    }
-    if !env.warnings.is_empty() {
-        payload["warnings"] = serde_json::Value::Array(
-            env.warnings.iter().map(|w| serde_json::Value::String(w.clone())).collect(),
-        );
-    }
-    let level = if env.degenerate.is_some() { darkmux_flow::Level::Warn } else { darkmux_flow::Level::Info };
-    review_flow_record(&env.case_id, &env.crew, REVIEW_TASK_ACTION, level, payload)
-}
-
 // ─── host telemetry sampling (#1247 doctrine surface) ────────────────────
 
 /// Production sample cadence — identical to `dispatch_internal`'s always-on
@@ -503,13 +412,13 @@ const REVIEW_TELEMETRY_POLL: Duration = Duration::from_millis(500);
 /// payload `{cpu, mem, gpu}`), so the run-monitor/viewer code that already
 /// renders `telemetry.process` records applies unchanged. `handle`/
 /// `session_id` carry the crew name / case id — the same identity fields
-/// `review_flow_record` stamps on the `review.*` action family, so a
+/// [`emit_review_step_result`] stamps on the `step result` action family, so a
 /// telemetry record for this run groups with its other records under the
 /// same `session_id`.
 ///
 /// The sampling FUNCTION is injected (`sample_fn`, a plain fn pointer
 /// defaulting to `sample_host` at every production call site — see
-/// [`ReviewRunGuard::new`]) so tests can drive the sampler with an
+/// [`ReviewObs::new`]) so tests can drive the sampler with an
 /// instant fake instead of racing real `top -l 1` subprocess latency
 /// (~600-900ms per call) against a scripted deadline on a shared CI
 /// runner — the same injection discipline as `chat`/`cycler`/`emitter`.
@@ -523,9 +432,10 @@ const REVIEW_TELEMETRY_POLL: Duration = Duration::from_millis(500);
 /// deliberately not wrapped in a `Mutex` (that would force every
 /// `ReviewEmitter` impl and every existing emission call site in this file
 /// through lock-guarded access for a feature this narrow). Instead,
-/// [`ReviewRunGuard`] drains the channel immediately before every
-/// record it already emits (`review.task`/`review.step`/`review.ruling`)
-/// and once more in its own `Drop`, so telemetry interleaves with the
+/// [`ReviewObs`] (the sequential `run_judge_only` path) drains the channel
+/// immediately before every `step result` record it emits, and
+/// `run_review_graph` drains it inside the scheduler's own emit closure,
+/// so telemetry interleaves with the
 /// run's other records close to when it was sampled — never batched at
 /// end-of-run, which is exactly the failure the doctrine calls out
 /// ("per-event records stream durably as they happen").
@@ -657,9 +567,10 @@ impl HostTelemetrySampler {
     }
 
     /// Signal the stop flag and join the thread. Called from `Drop` — the
-    /// RAII tie-in that guarantees no orphaned sampler thread outlives a
-    /// [`ReviewRunGuard`], on every exit path (clean finish, early
-    /// `?`-return, or panic).
+    /// RAII tie-in that guarantees no orphaned sampler thread outlives its
+    /// owner ([`ReviewObs`] on the sequential path, `run_review_graph`'s own
+    /// local sampler on the graph path), on every exit path (clean finish,
+    /// early `?`-return, or panic).
     fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
@@ -674,72 +585,38 @@ impl Drop for HostTelemetrySampler {
     }
 }
 
-/// Adapts a [`ReviewEmitter`] to `darkmux_flow`'s generic
-/// [`darkmux_flow::BookendSink`] (#1230 Packet 0) so [`ReviewRunGuard`]
-/// can wrap `darkmux_flow::BookendGuard` without `darkmux-flow` (a
-/// dependency LEAF) knowing this crate's own emitter trait exists. A local
-/// type implementing a foreign trait — no orphan-rule friction.
-struct EmitterSink<'a>(&'a mut dyn ReviewEmitter);
-
-impl darkmux_flow::BookendSink for EmitterSink<'_> {
-    fn emit(&mut self, record: darkmux_flow::FlowRecord) {
-        self.0.emit(record);
-    }
-}
-
-/// (#1247 review round, unified onto `darkmux_flow::BookendGuard` in #1230
-/// Packet 0) Bookend guard for the review's flow-record lifecycle — same
-/// class of problem `darkmux-crew`'s `DispatchBookendGuard` (#717) solves
-/// for `dispatch.start`: once `review.task started` is emitted, the driver
-/// can still `?`-return before the clean `finished` bookend (a probe
-/// dispatch error, a cycler load/release failure) — or panic. Without a
-/// terminal record that leaves an orphaned task (rendering as perpetually
-/// in-flight to any consumer) plus whatever step-`started` records were
-/// open at the abort point.
+/// (#1434) Run-observability helper for the sequential `run_judge_only`
+/// path (the `--charges-file` re-judge). Emits the SAME generic
+/// `step result` records `run_review_graph`'s step kinds emit (via
+/// [`emit_review_step_result`]) — but through the injected [`ReviewEmitter`]
+/// rather than the global `darkmux_flow::record`, so the sink-agnostic /
+/// lab-vs-fleet-boundary discipline the driver has always kept is preserved
+/// (a bench emitter suppresses; `FleetFlowEmitter` writes the real stream).
 ///
-/// All driver emission routes THROUGH this guard, which delegates the
-/// task/step open-stack bookkeeping to the shared `darkmux_flow::BookendGuard`
-/// (`inner`) — the task itself is pushed as one open unit (`kind == "task"`)
-/// and each step nests inside it as another (`kind` = the step's own kind,
-/// `"dispatch"`/`"procedural"`), so `inner`'s Drop pops every still-open
-/// unit innermost-first (steps before the task) and builds the right
-/// `review.step`- or `review.task`-shaped abort record via its `on_abort`
-/// closure — every `started` gets a matching terminal event, on every path.
-/// The clean finish (`task_finished`, which every success/degenerate return
-/// point calls) closes the task unit, disarming `inner` once the stack
-/// empties — a run that reached its own terminal record is never
-/// double-counted.
+/// It also owns the run's [`HostTelemetrySampler`] (#1247 "no blind runs")
+/// and interleaves its samples with the run's own records: [`Self::drain`]
+/// fires before every `step result` emission (and once more in `Drop`), so
+/// telemetry streams alongside the run rather than batching at the end. The
+/// sampler thread is torn down by [`HostTelemetrySampler`]'s own `Drop`
+/// (a field of this struct, run automatically after `ReviewObs::drop`
+/// returns), so it never outlives the run on any exit path.
 ///
-/// Emission on `Drop` is best-effort by construction — [`ReviewEmitter`]
-/// impls are already infallible (`emit` returns nothing), so a sink problem
-/// can't mask the original error propagating out.
-///
-/// Also owns the run's [`HostTelemetrySampler`] (#1247 doctrine surface):
-/// started in [`Self::new`]/[`Self::new_with_telemetry`] and
-/// stopped by its own `Drop` — which Rust runs automatically as a field of
-/// this struct, right after `ReviewRunGuard`'s own `Drop::drop` body
-/// returns, so the sampler thread never outlives the guard on any exit
-/// path. This telemetry-draining half is genuinely review-specific (it
-/// doesn't belong in `darkmux-flow`) — only the open/close stack moved.
-struct ReviewRunGuard<'a> {
+/// There is deliberately NO task-level liveness bookend here — the caller's
+/// `with_dispatch_bookends` wrap (`src/mission_launch_review.rs`) opens/closes
+/// the canonical `dispatch start`/`dispatch complete`/`dispatch error`
+/// record around the whole `run_judge_only` call (contract 2 / #1349), the
+/// same edge the graph path relies on. A second review-scoped bookend would
+/// be exactly the competing-vocabulary duplication #1349 retired.
+struct ReviewObs<'a> {
     case_id: String,
-    crew: String,
-    inner: darkmux_flow::BookendGuard<'a, EmitterSink<'a>>,
+    emitter: &'a mut dyn ReviewEmitter,
     telemetry: HostTelemetrySampler,
 }
 
-/// The fixed unit id/kind [`ReviewRunGuard::task_started`]/
-/// [`ReviewRunGuard::task_finished`] open/close under — the review has
-/// exactly one task per run, so this is a constant rather than something
-/// derived per-call. `inner`'s `on_abort` closure matches on `kind == this`
-/// to decide whether a still-open unit at Drop time needs a `review.task`-
-/// or `review.step`-shaped abort record.
-const REVIEW_TASK_UNIT_KIND: &str = "task";
-
-impl<'a> ReviewRunGuard<'a> {
-    fn new(sink: &'a mut EmitterSink<'a>, case_id: &str, crew: &str) -> Self {
+impl<'a> ReviewObs<'a> {
+    fn new(emitter: &'a mut dyn ReviewEmitter, case_id: &str, crew: &str) -> Self {
         Self::new_with_telemetry(
-            sink,
+            emitter,
             case_id,
             crew,
             REVIEW_TELEMETRY_INTERVAL,
@@ -749,8 +626,8 @@ impl<'a> ReviewRunGuard<'a> {
         )
     }
 
-    /// Same as [`Self::new`] but with a caller-chosen telemetry cadence
-    /// AND sampling functions — the test-only seam a scripted run uses to
+    /// Same as [`Self::new`] but with a caller-chosen telemetry cadence AND
+    /// sampling functions — the test-only seam a scripted run uses to
     /// observe deterministic samples without a multi-second sleep and
     /// without shelling to the real (macOS-only, ~600-900ms-per-call)
     /// `top`/`vm_stat`/`ioreg` commands, or to the real `lms` CLI.
@@ -758,7 +635,7 @@ impl<'a> ReviewRunGuard<'a> {
     /// [`REVIEW_TELEMETRY_INTERVAL`] and the samplers at the real
     /// `sample_host` / `darkmux_profiles::lms::list_loaded`.
     fn new_with_telemetry(
-        sink: &'a mut EmitterSink<'a>,
+        emitter: &'a mut dyn ReviewEmitter,
         case_id: &str,
         crew: &str,
         telemetry_interval: Duration,
@@ -766,32 +643,6 @@ impl<'a> ReviewRunGuard<'a> {
         sample_fn: fn() -> HostSample,
         lms_fn: fn() -> anyhow::Result<Vec<darkmux_types::LoadedModel>>,
     ) -> Self {
-        let case_id_owned = case_id.to_string();
-        let crew_owned = crew.to_string();
-        let on_abort = move |id: &str, kind: &str| -> darkmux_flow::FlowRecord {
-            if kind == REVIEW_TASK_UNIT_KIND {
-                review_flow_record(
-                    &case_id_owned,
-                    &crew_owned,
-                    REVIEW_TASK_ACTION,
-                    darkmux_flow::Level::Error,
-                    json!({
-                        "status": "error",
-                        "case_id": case_id_owned,
-                        "crew": crew_owned,
-                        "error": "review terminated before completion (early return or panic)",
-                    }),
-                )
-            } else {
-                review_flow_record(
-                    &case_id_owned,
-                    &crew_owned,
-                    REVIEW_STEP_ACTION,
-                    darkmux_flow::Level::Error,
-                    json!({ "step_id": id, "kind": kind, "status": "error" }),
-                )
-            }
-        };
         Self {
             telemetry: HostTelemetrySampler::start(
                 case_id.to_string(),
@@ -802,117 +653,43 @@ impl<'a> ReviewRunGuard<'a> {
                 lms_fn,
             ),
             case_id: case_id.to_string(),
-            crew: crew.to_string(),
-            inner: darkmux_flow::BookendGuard::new(sink, on_abort),
+            emitter,
         }
     }
 
     /// Drain every telemetry sample buffered since the last drain and emit
-    /// each through the same sink the driver's own records go through —
-    /// called immediately before every record this guard emits (see
-    /// [`Self::emit_now`]) so telemetry streams alongside the run rather
+    /// each through the injected emitter — called immediately before every
+    /// `step result` record so telemetry streams alongside the run rather
     /// than batching at the end.
-    fn drain_telemetry(&mut self) {
+    fn drain(&mut self) {
         let records: Vec<darkmux_flow::FlowRecord> = self.telemetry.rx.try_iter().collect();
         for record in records {
-            self.inner.emit_now(record);
+            self.emitter.emit(record);
         }
     }
 
-    /// Drain pending telemetry, then emit `record` with no open/close
-    /// bookend of its own. Every direct emission in this guard routes
-    /// through here so telemetry ordering stays close to wall-clock
-    /// without needing the sampler thread to touch the sink itself.
-    fn emit_now(&mut self, record: darkmux_flow::FlowRecord) {
-        self.drain_telemetry();
-        self.inner.emit_now(record);
-    }
-
-    /// Emit the `review.task started` bookend and ARM the guard — from here
-    /// until `task_finished`, an early return or panic fires the Drop path.
-    fn task_started(&mut self, payload: serde_json::Value) {
-        self.drain_telemetry();
-        let started = review_flow_record(
-            &self.case_id,
-            &self.crew,
-            REVIEW_TASK_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        );
-        self.inner.open(REVIEW_TASK_UNIT_KIND, REVIEW_TASK_UNIT_KIND, started);
-    }
-
-    /// Emit a `review.step` `status: "started"` record and track the step
-    /// as open until [`Self::step_finished`] closes it.
-    fn step_started(&mut self, step_id: &str, kind: &str, payload: serde_json::Value) {
-        self.drain_telemetry();
-        let started = review_flow_record(
-            &self.case_id,
-            &self.crew,
-            REVIEW_STEP_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        );
-        self.inner.open(step_id, kind, started);
-    }
-
-    /// Emit a `review.step` `status: "finished"` record and close the step.
-    /// Also the entry point for one-shot steps that emit `finished` with no
-    /// prior `started` (`bundle`, `dedup` — instantaneous procedural steps);
-    /// the close is then a no-op on the open-step stack.
-    fn step_finished(&mut self, step_id: &str, payload: serde_json::Value) {
-        self.drain_telemetry();
-        let finished = review_flow_record(
-            &self.case_id,
-            &self.crew,
-            REVIEW_STEP_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        );
-        self.inner.close(step_id, finished);
-    }
-
-    /// Emit a `review.ruling` ticker record (no open/close semantics).
-    fn ruling(&mut self, payload: serde_json::Value) {
-        self.emit_now(review_flow_record(
-            &self.case_id,
-            &self.crew,
-            REVIEW_RULING_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        ));
-    }
-
-    /// Emit the terminal `review.task` record for `env` (finished, or
-    /// degenerate-finished — see [`task_finished_record`]) and close the
-    /// task unit: this run reached its own terminal record, so `inner`
-    /// disarms once the stack empties (every real call site already closed
-    /// its own steps before calling this, so the stack is just `[task]`).
-    fn task_finished(&mut self, env: &ReviewEnvelope) {
-        self.drain_telemetry();
-        self.inner.close(REVIEW_TASK_UNIT_KIND, task_finished_record(env));
+    /// Drain pending telemetry, then emit one generic `step result` record —
+    /// the SAME shape [`emit_review_step_result`] builds for the graph path
+    /// (`action = "step result"`, `handle = step_id`, `session_id = case_id`,
+    /// a `kind` field), just routed through the injected emitter.
+    fn step_result(&mut self, kind: &str, step_id: &str, payload: serde_json::Value) {
+        self.drain();
+        self.emitter.emit(review_step_result_record(kind, step_id, &self.case_id, payload));
     }
 }
 
-impl Drop for ReviewRunGuard<'_> {
+impl Drop for ReviewObs<'_> {
     fn drop(&mut self) {
-        // Flush any sample the sampler produced since the last drain — even
-        // on the clean-finish path (`task_finished` already closed `inner`'s
-        // task unit), a sample can land in the brief window between that
-        // drain and this `Drop` running. `inner`'s own Drop (a field of this
-        // struct, run automatically right after this function returns) then
-        // emits abort records for any still-open units through the same
-        // sink if it's still armed. The sampler thread itself stops right
-        // after, via `HostTelemetrySampler`'s own `Drop` (also a field,
-        // torn down last), so it never outlives the guard on any exit path.
+        // Flush any sample the sampler produced since the last drain. The
+        // sampler thread itself stops right after, via
+        // `HostTelemetrySampler`'s own `Drop` (a field, torn down after this
+        // body returns), so it never outlives the run on any exit path.
         //
         // Known, accepted loss window: a sample the sampler thread sends
-        // AFTER this final drain but BEFORE the join in the sampler's
-        // `Drop` completes is dropped with the channel — at most one
-        // final-tick sample, consistent with the sampler's best-effort
-        // framing (telemetry never blocks or extends teardown to chase
-        // one more data point).
-        self.drain_telemetry();
+        // AFTER this final drain but BEFORE the join in the sampler's `Drop`
+        // completes is dropped with the channel — at most one final-tick
+        // sample, consistent with the sampler's best-effort framing.
+        self.drain();
     }
 }
 
@@ -2886,9 +2663,12 @@ fn verify_pass_with_retry(
 /// to today. Zero confirms ⇒ no stage at all (no dispatch, no records).
 /// The stage is its own EXECUTION for the remote token bucket; exhausting
 /// it is load-bearing (degraded run — see the caller in `finish_review`).
-/// Emits its own `review.step`/`review.ruling` records under `step_id =
-/// "verify"` through the same bookend guard (contract 2 — the stage runs
-/// inside the run's existing liveness envelope).
+/// Emits its own `step result` records (the graph verify kind's shape —
+/// `kind = "review.verify"`, per-adjudication `step_id = "review-ruling"`
+/// records plus one completion `step_id = "verify"`) through the run's
+/// [`ReviewObs`]. Run-level liveness is the caller's `with_dispatch_bookends`
+/// wrap (contract 2 — the stage runs inside the run's existing dispatch
+/// envelope), not a review-scoped bookend here.
 /// (#1373 gates a/c, verify half) The verify stage's remote-budget
 /// exhaustion warning + budget row — the SAME decision `run_verify_stage`
 /// (`finish_review`'s path, via `run_judge_only`) has always applied,
@@ -2932,7 +2712,7 @@ fn run_verify_stage(
     vstaff: &ResolvedSeatStaffing,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    guard: &mut ReviewRunGuard<'_>,
+    obs: &mut ReviewObs<'_>,
 ) -> Result<()> {
     let docket = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
     if docket == 0 {
@@ -2947,15 +2727,6 @@ fn run_verify_stage(
     if !vstaff.pm.is_remote() {
         cycler.ensure_loaded(&vstaff.pm)?;
     }
-    let mut started = json!({
-        "step_id": "verify", "kind": "dispatch", "status": "started",
-        "items_in": docket, "items_out": 0, "wall_ms": 0, "model": identifier,
-    });
-    if let Some(host) = &endpoint_host {
-        started["remote"] = true.into();
-        started["endpoint"] = host.clone().into();
-    }
-    guard.step_started("verify", "dispatch", started);
 
     let t0 = Instant::now();
     let mut calls = 0u32;
@@ -3004,10 +2775,14 @@ fn run_verify_stage(
         if served_model.is_none() {
             served_model = served;
         }
-        guard.ruling(json!({
-            "bundle_id": j.flag.bundle_id, "stage": "verify",
-            "ruling": record.ruling, "seconds": record.seconds,
-        }));
+        obs.step_result(
+            "review.verify",
+            "review-ruling",
+            json!({
+                "bundle_id": j.flag.bundle_id, "stage": "verify",
+                "ruling": record.ruling, "seconds": record.seconds,
+            }),
+        );
         if record.ruling == VerifyRuling::Refuted {
             j.tier = Tier::Archived;
             j.demoted_by_verify = true;
@@ -3027,7 +2802,7 @@ fn run_verify_stage(
         total_tokens: tokens,
         remote: endpoint.is_some(),
         endpoint: endpoint_host.clone(),
-        served_model,
+        served_model: served_model.clone(),
     });
     env.steps.push(StepRecord {
         step_id: "verify".to_string(),
@@ -3036,16 +2811,17 @@ fn run_verify_stage(
         items_out: docket,
         wall_ms,
     });
-    let mut finished = json!({
-        "step_id": "verify", "kind": "dispatch", "status": "finished",
-        "items_in": docket, "items_out": docket, "wall_ms": wall_ms,
-        "model": identifier, "tokens": tokens,
-    });
-    if let Some(host) = &endpoint_host {
-        finished["remote"] = true.into();
-        finished["endpoint"] = host.clone().into();
-    }
-    guard.step_finished("verify", finished);
+    // The verify stage's single completion record — the SAME shape the graph
+    // path's `ReviewVerifyStepKind` emits (#1434).
+    obs.step_result(
+        "review.verify",
+        "verify",
+        json!({
+            "items_in": docket, "items_out": docket, "wall_ms": wall_ms,
+            "model": identifier, "tokens": tokens, "calls": calls,
+            "remote": endpoint.is_some(), "endpoint": endpoint_host, "served_model": served_model,
+        }),
+    );
 
     // (#1373 gates a/c) Shared with the graph path's `ReviewVerifyStepKind`
     // — see `verify_budget_outcome`'s own doc. NEVER sets run-level
@@ -3167,7 +2943,7 @@ fn finish_review(
     verify: Option<&ResolvedSeatStaffing>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    guard: &mut ReviewRunGuard<'_>,
+    obs: &mut ReviewObs<'_>,
 ) -> Result<ReviewEnvelope> {
     env.raw_flags = raw_flags.len();
 
@@ -3181,12 +2957,10 @@ fn finish_review(
         items_out: deduped.len(),
         wall_ms: dedup_ms,
     });
-    guard.step_finished(
+    obs.step_result(
+        "review.dedup",
         "dedup",
-        json!({
-            "step_id": "dedup", "kind": "procedural", "status": "finished",
-            "items_in": env.raw_flags, "items_out": deduped.len(), "wall_ms": dedup_ms,
-        }),
+        json!({ "items_in": env.raw_flags, "items_out": deduped.len(), "wall_ms": dedup_ms }),
     );
     env.deduped_flags = deduped.len();
 
@@ -3204,14 +2978,6 @@ fn finish_review(
     if !judge.pm.is_remote() {
         cycler.ensure_loaded(&judge.pm)?;
     }
-    guard.step_started(
-        "judge-pass1",
-        "dispatch",
-        json!({
-            "step_id": "judge-pass1", "kind": "dispatch", "status": "started",
-            "items_in": deduped.len(), "items_out": 0, "wall_ms": 0,
-        }),
-    );
     let mut judged = Vec::with_capacity(deduped.len());
     let mut pass1_ms = 0u64;
     let mut pass2_ms = 0u64;
@@ -3250,43 +3016,31 @@ fn finish_review(
         }
         pass1_ms += outcome.pass1_ms;
         pass2_ms += outcome.pass2_ms;
-        // The per-ruling ticker (#1247 Part 1) — one record per judge
-        // dispatch outcome, emitted BEFORE `outcome`'s fields move into the
-        // `JudgedFlag` below.
-        guard.ruling(json!({
-            "bundle_id": flag.bundle_id, "pass": 1,
-            "ruling": outcome.pass1.ruling, "seconds": outcome.pass1.seconds,
-        }));
+        // The per-ruling ticker (#1247 Part 1) — one `step result` record per
+        // judge dispatch outcome (the graph judge kind's `step_id =
+        // "review-ruling"` shape, #1434), emitted BEFORE `outcome`'s fields
+        // move into the `JudgedFlag` below.
+        obs.step_result(
+            "review.judge",
+            "review-ruling",
+            json!({
+                "bundle_id": flag.bundle_id, "pass": 1,
+                "ruling": outcome.pass1.ruling, "seconds": outcome.pass1.seconds,
+            }),
+        );
         if let Some(p2) = &outcome.pass2 {
             pass2_flags += 1;
-            if pass2_flags == 1 {
-                // A `confirmed` pass-1 gets its pass-2 ruling immediately,
-                // interleaved within THIS per-flag loop (see the module
-                // doc) — so the `judge-pass2` step must open the moment the
-                // FIRST pass-2 ruling actually fires, not once the whole
-                // docket is known. Opening it only after the loop finishes
-                // (the prior behavior) let `review.ruling{pass:2}` records
-                // stream to a live observer while the `judge-pass2` step
-                // still read "not started" — a contradiction observed live
-                // in the lab lens. `items_in` here is the running count (1
-                // so far); `step_finished` below reports the real final
-                // docket size.
-                guard.step_started(
-                    "judge-pass2",
-                    "dispatch",
-                    json!({
-                        "step_id": "judge-pass2", "kind": "dispatch", "status": "started",
-                        "items_in": pass2_flags, "items_out": 0, "wall_ms": 0,
-                    }),
-                );
-            }
             // (#1266) The decisive later pass's REAL pass number — 2 under
             // the default double-confirm (byte-identical to before), or the
             // demoting/final pass under an N-pass consensus judge.
-            guard.ruling(json!({
-                "bundle_id": flag.bundle_id, "pass": p2.pass,
-                "ruling": p2.ruling, "seconds": p2.seconds,
-            }));
+            obs.step_result(
+                "review.judge",
+                "review-ruling",
+                json!({
+                    "bundle_id": flag.bundle_id, "pass": p2.pass,
+                    "ruling": p2.ruling, "seconds": p2.seconds,
+                }),
+            );
         }
         judged.push(JudgedFlag {
             flag: flag.clone(),
@@ -3303,7 +3057,7 @@ fn finish_review(
     }
 
     env.members.push(MemberRecord {
-        model: judge_identifier,
+        model: judge_identifier.clone(),
         seat: "review-judge".to_string(),
         // Actual dispatches, unparsed retries included — never fewer calls
         // than the operator paid for.
@@ -3312,7 +3066,7 @@ fn finish_review(
         total_tokens: judge_tokens,
         remote: judge.pm.is_remote(),
         endpoint: seat_endpoint_host(&judge.pm),
-        served_model: judge_served_model,
+        served_model: judge_served_model.clone(),
     });
     env.steps.push(StepRecord {
         step_id: "judge-pass1".to_string(),
@@ -3321,13 +3075,6 @@ fn finish_review(
         items_out: deduped.len(),
         wall_ms: pass1_ms,
     });
-    guard.step_finished(
-        "judge-pass1",
-        json!({
-            "step_id": "judge-pass1", "kind": "dispatch", "status": "finished",
-            "items_in": deduped.len(), "items_out": deduped.len(), "wall_ms": pass1_ms,
-        }),
-    );
     if pass2_flags > 0 {
         env.steps.push(StepRecord {
             step_id: "judge-pass2".to_string(),
@@ -3336,18 +3083,21 @@ fn finish_review(
             items_out: pass2_flags,
             wall_ms: pass2_ms,
         });
-        // `started` was already emitted above, in the per-flag loop, the
-        // moment the first pass-2 ruling fired — this only closes it, now
-        // that the loop has finished and the real final docket size +
-        // elapsed `wall_ms` are known.
-        guard.step_finished(
-            "judge-pass2",
-            json!({
-                "step_id": "judge-pass2", "kind": "dispatch", "status": "finished",
-                "items_in": pass2_flags, "items_out": pass2_flags, "wall_ms": pass2_ms,
-            }),
-        );
     }
+    // The judge stage's single completion record — the SAME shape the graph
+    // path's `ReviewJudgeStepKind` emits (#1434). This sequential driver runs
+    // one flag at a time, so `concurrency` is always 1.
+    obs.step_result(
+        "review.judge",
+        "judge",
+        json!({
+            "items_in": deduped.len(), "items_out": judged.len(), "wall_ms": pass1_ms + pass2_ms,
+            "pass1_wall_ms": pass1_ms, "pass2_wall_ms": pass2_ms,
+            "model": judge_identifier, "tokens": judge_tokens, "calls": judge_calls,
+            "dispatch_errors": judge_dispatch_errors, "concurrency": 1,
+            "served_model": judge_served_model,
+        }),
+    );
 
     // (#1260, revised #1329, extracted #1373) Judge-stage degeneracy is
     // decided BEFORE the optional verify stage so a run the judge already
@@ -3393,7 +3143,7 @@ fn finish_review(
     // on a doomed run).
     if let Some(vstaff) = verify {
         if env.degenerate.is_none() {
-            run_verify_stage(&mut env, &mut judged, bundles, inputs, vstaff, chat, cycler, guard)?;
+            run_verify_stage(&mut env, &mut judged, bundles, inputs, vstaff, chat, cycler, obs)?;
         }
     }
 
@@ -3411,7 +3161,6 @@ fn finish_review(
 
     env.flags = deduped;
     env.judged = judged;
-    guard.task_finished(&env);
     Ok(env)
 }
 
@@ -3451,14 +3200,12 @@ pub fn run_judge_only(
         staffing: Some(staffing_snapshot(probes, judge, verify, inputs.crew.request_changes)),
         ..Default::default()
     };
-    // Same guard discipline as `run_review` — see its comment at the
-    // matching site.
-    let mut sink = EmitterSink(emitter);
-    let mut guard = ReviewRunGuard::new(&mut sink, &inputs.case_id, &inputs.crew.name);
-    guard.task_started(json!({
-        "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
-        "exec_mode": mode_label(mode), "bundles": bundles.len(),
-    }));
+    // (#1434) Run observability rides the injected emitter via `ReviewObs`,
+    // which also owns the host-telemetry sampler for the run's lifetime. No
+    // task-level bookend here — the caller's `with_dispatch_bookends` wrap
+    // owns run liveness (contract 2). `obs` drops at function end (early
+    // `?`-return or clean), tearing down its sampler thread.
+    let mut obs = ReviewObs::new(emitter, &inputs.case_id, &inputs.crew.name);
     env.steps.push(StepRecord {
         step_id: "bundle".to_string(),
         kind: "procedural".to_string(),
@@ -3466,20 +3213,13 @@ pub fn run_judge_only(
         items_out: bundles.len(),
         wall_ms: bundle_ms,
     });
-    guard.step_finished(
-        "bundle",
-        json!({
-            "step_id": "bundle", "kind": "procedural", "status": "finished",
-            "items_in": 1, "items_out": bundles.len(), "wall_ms": bundle_ms,
-        }),
-    );
+    obs.step_result("review.bundle", "bundle", json!({ "items_out": bundles.len() }));
     if flags.is_empty() {
         env.degenerate = Some("--charges-file carried zero flags".to_string());
-        guard.task_finished(&env);
         return Ok(env);
     }
 
-    finish_review(env, flags, &bundles, inputs, judge, verify, &mut chat, cycler, &mut guard)
+    finish_review(env, flags, &bundles, inputs, judge, verify, &mut chat, cycler, &mut obs)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3528,8 +3268,8 @@ pub fn run_judge_only(
 // `verify_pass_with_retry`, `parse_judge_ruling`, `parse_verify_ruling`,
 // `cluster_needs_check`, `mechanism_family`, `judge_prompt`,
 // `verify_prompt`) verbatim — only the ORCHESTRATION shape (six sequential
-// calls → one declared graph) and the telemetry plumbing (the guard-
-// coupled `ReviewRunGuard` can't cross a `run_bounded` worker-thread
+// calls → one declared graph) and the telemetry plumbing (the sequential
+// path's `ReviewObs` can't cross a `run_bounded` worker-thread
 // boundary — see `darkmux_crew::step_kinds::StepOutcome`'s doc — so
 // per-step telemetry now rides `StepOutcome.flow_records` / direct
 // `darkmux_flow::record()` calls instead) changed.
@@ -3688,20 +3428,26 @@ fn review_token_telemetry_payload(reply: &SingleShotReply) -> Option<serde_json:
     }))
 }
 
-/// A "step result" companion flow record — the review's own equivalent of
-/// `coder_phase.rs`'s `emit_step_result` (#1230 Packet 4 sibling
-/// convention): one generic action, `kind` distinguishing which review step
-/// produced it, free-form `payload` for the rest. Called directly (not via
-/// `StepOutcome.flow_records`) so it's usable from inside a step's own
-/// internal concurrent loop (judge's bounded worker pool) — a plain
-/// `darkmux_flow::record()` call has no non-`Send` state, unlike
-/// `ReviewRunGuard` (see the module doc).
-fn emit_review_step_result(kind: &str, step_id: &str, case_id: &str, payload: serde_json::Value) {
+/// Build a "step result" companion flow record — the review's own
+/// equivalent of `coder_phase.rs`'s `emit_step_result` (#1230 Packet 4
+/// sibling convention): one generic action, `kind` distinguishing which
+/// review step produced it, free-form `payload` for the rest. Split from the
+/// emit so BOTH dispatch paths can share the exact record shape: the graph
+/// step kinds emit it globally via [`emit_review_step_result`] (they run in
+/// worker threads with no injected emitter to hold), and the sequential
+/// `run_judge_only` path emits it through its injected [`ReviewEmitter`] via
+/// [`ReviewObs::step_result`] (#1434 — one vocabulary across both paths).
+fn review_step_result_record(
+    kind: &str,
+    step_id: &str,
+    case_id: &str,
+    payload: serde_json::Value,
+) -> darkmux_flow::FlowRecord {
     let mut full = serde_json::json!({ "step_id": step_id, "kind": kind });
     if let (serde_json::Value::Object(extra), serde_json::Value::Object(base)) = (payload, &mut full) {
         base.extend(extra);
     }
-    let _ = darkmux_flow::record(darkmux_flow::FlowRecord {
+    darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
         category: darkmux_flow::Category::Work,
@@ -3723,7 +3469,15 @@ fn emit_review_step_result(kind: &str, step_id: &str, case_id: &str, payload: se
         payload: Some(full),
         work_id: None,
         attempt: None,
-    });
+    }
+}
+
+/// Emit a [`review_step_result_record`] to the GLOBAL flow sink
+/// (`darkmux_flow::record`). Used by the graph step kinds, which run inside
+/// the scheduler's `run_bounded` worker threads and so can't hold the
+/// caller-injected emitter (`ReviewObs` covers the sequential path instead).
+fn emit_review_step_result(kind: &str, step_id: &str, case_id: &str, payload: serde_json::Value) {
+    let _ = darkmux_flow::record(review_step_result_record(kind, step_id, case_id, payload));
 }
 
 // ─── investigate: bundle ────────────────────────────────────────────────
@@ -5065,14 +4819,16 @@ pub fn build_review_graph(
 /// canonical `dispatch start`/`dispatch complete`/`dispatch error` record
 /// (`darkmux_flow::bookend::BookendGuard`, #1230 Packet 0) around the whole
 /// call — the SAME liveness edge #1272 fixed the viewer's running-dispatch
-/// surfaces to key on. A second, review-scoped `review.task` bookend here
+/// surfaces to key on. A second, review-scoped task-level bookend here
 /// was pure duplication of that outer wrap, not an independent liveness
 /// fix, and its competing vocabulary is exactly the "bespoke top-level
 /// record instead of the generic mechanism" bug #1349 retires — see
-/// `with_dispatch_bookends`'s payload construction in `pr_review.rs` for
-/// where this function's former `review.task` payload fields (exec mode,
-/// bundle count, confirmed/needs_check/archived, degenerate reason) now
-/// ride instead, so no data is lost, only the redundant vocabulary.
+/// `with_dispatch_bookends`'s payload construction for where this function's
+/// former task-bookend payload fields (exec mode, bundle count,
+/// confirmed/needs_check/archived, degenerate reason) now ride instead, so
+/// no data is lost, only the redundant vocabulary. (#1434 extended the same
+/// retirement to the sequential `run_judge_only` path, so BOTH review paths
+/// now emit only the generic `step result` companion vocabulary.)
 /// Assembles the final [`ReviewEnvelope`] from the synthesis step's output
 /// merged with the shared cross-cutting state, and returns the COMPLETED
 /// `steps` map (status/output/timestamps all reflect the real run) so the

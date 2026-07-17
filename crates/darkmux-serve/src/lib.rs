@@ -1676,13 +1676,14 @@ fn build_lab_run_summary(
         }
     }
 
-    // A brand-new live funnel run (no case has completed yet, so
-    // `funnels.json` doesn't exist) has ONLY the events file — best-effort
-    // case_id/crew/exec_mode from its `funnel.task` "started" records so the
-    // run card isn't blank before the first case lands.
-    if case_ids.is_empty() && has_events {
-        scan_events_prefix_for_task_meta(&dir.join("funnel-events.jsonl"), &mut case_ids, &mut crew, &mut exec_mode);
-    }
+    // (#1434) A brand-new live run with ONLY the events file (no case has
+    // completed, so `funnels.json` doesn't exist) leaves case_ids empty until
+    // its first case lands. The former best-effort prefix scan keyed on the
+    // retired per-run task-started record, which the graph path no longer
+    // emits — so it matched nothing in current output and was removed rather
+    // than ported (the graph's `step result` companions carry no equivalent
+    // case/crew/exec_mode-on-start payload). The run card simply shows minimal
+    // metadata until the first case completes.
 
     case_ids.sort();
 
@@ -1716,54 +1717,6 @@ fn mtime_ms_of(path: &StdPath) -> std::io::Result<u64> {
         .unwrap_or(0))
 }
 
-/// Best-effort case_id/crew/exec_mode extraction from a LIVE run's
-/// `funnel-events.jsonl` before any case has completed — reads only the
-/// first `PREFIX_SCAN_LINES` lines (a `funnel.task` "started" record for
-/// each case lands near where that case's block of events begins) rather
-/// than the whole file, so a long-running live file doesn't make the run
-/// LIST endpoint expensive.
-fn scan_events_prefix_for_task_meta(
-    path: &StdPath,
-    case_ids: &mut Vec<String>,
-    crew: &mut Option<String>,
-    exec_mode: &mut Option<String>,
-) {
-    const PREFIX_SCAN_LINES: usize = 200;
-    let Ok(file) = std::fs::File::open(path) else {
-        return;
-    };
-    let reader = std::io::BufReader::new(file);
-    for line in reader.lines().take(PREFIX_SCAN_LINES) {
-        let Ok(line) = line else { break };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if rec.get("action").and_then(|a| a.as_str()) != Some("review.task") {
-            continue;
-        }
-        let Some(payload) = rec.get("payload") else {
-            continue;
-        };
-        if payload.get("status").and_then(|s| s.as_str()) != Some("started") {
-            continue;
-        }
-        if let Some(cid) = payload.get("case_id").and_then(|v| v.as_str()) {
-            if !case_ids.contains(&cid.to_string()) {
-                case_ids.push(cid.to_string());
-            }
-        }
-        if crew.is_none() {
-            *crew = payload.get("crew").and_then(|v| v.as_str()).map(str::to_string);
-        }
-        if exec_mode.is_none() {
-            *exec_mode = payload.get("exec_mode").and_then(|v| v.as_str()).map(str::to_string);
-        }
-    }
-}
 
 #[derive(serde::Deserialize)]
 struct LabDirQuery {
