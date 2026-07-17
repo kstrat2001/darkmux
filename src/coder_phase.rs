@@ -1353,53 +1353,22 @@ pub(crate) fn injected_context_for_lab(
 /// **newest-first** and NOT count-capped (#1011) — corrections are the highest-
 /// authority block, so the proportional budget keeps the freshest from the front.
 /// Mirrors `session_has_orchestrator_note`.
+///
+/// (#1426) The SCAN itself now lives in `crew::corrections` — the single
+/// definition of "what a correction is", shared with `darkmux memory correction
+/// list` so the verb can never show the operator a different set than the one
+/// this brief injects. The dedup + newest-first ordering below stay HERE: they
+/// are this path's budget policy (#1011), not part of what a correction is.
 fn mission_adjudication_notes(mission_session_ids: &std::collections::HashSet<String>) -> Vec<String> {
-    const ADJUDICATION_LOOKBACK_DAYS: usize = 7;
-    if mission_session_ids.is_empty() {
-        return Vec::new();
-    }
-    let flows_dir = darkmux_types::config_access::flows_dir();
-    let Ok(entries) = std::fs::read_dir(&flows_dir) else {
-        return Vec::new();
-    };
-    let mut days: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .collect();
-    days.sort();
-    // Most-recent N day-files, oldest→newest within the window (so the cap
-    // below keeps the freshest corrections).
-    let recent: Vec<PathBuf> = days
-        .iter()
-        .rev()
-        .take(ADJUDICATION_LOOKBACK_DAYS)
-        .rev()
-        .cloned()
-        .collect();
     let mut notes: Vec<String> = Vec::new();
-    for day in &recent {
-        let Ok(raw) = std::fs::read_to_string(day) else {
-            continue;
-        };
-        for line in raw.lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            if r.get("action").and_then(|v| v.as_str()) == Some("note")
-                && r.get("source").and_then(|v| v.as_str()) == Some("adjudication")
-                && r.get("session_id")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| mission_session_ids.contains(s))
-            {
-                if let Some(text) = r.get("handle").and_then(|v| v.as_str()) {
-                    let t = text.trim();
-                    // Skip empties + exact duplicates (a correction re-recorded
-                    // verbatim shouldn't repeat in the brief).
-                    if !t.is_empty() && !notes.iter().any(|n| n == t) {
-                        notes.push(t.to_string());
-                    }
-                }
-            }
+    for c in crew::corrections::scan(
+        crew::corrections::ADJUDICATION_LOOKBACK_DAYS,
+        Some(mission_session_ids),
+    ) {
+        // Skip exact duplicates (a correction re-recorded verbatim shouldn't
+        // repeat in the brief). The reader already drops empties.
+        if !notes.iter().any(|n| n == &c.text) {
+            notes.push(c.text);
         }
     }
     // Newest-first so the budget's front-take keeps the freshest corrections
@@ -1977,7 +1946,7 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
         "{}",
         style::dim(
             "distill these into durable lessons (with the why) for the next crew:\n  \
-             run the `darkmux-mission-debrief` skill, or:  darkmux lessons add --title <t> --body <b>"
+             run the `darkmux-mission-debrief` skill, or:  darkmux memory lesson add --title <t> --body <b>"
         )
     );
     Ok(0)

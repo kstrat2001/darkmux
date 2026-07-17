@@ -325,13 +325,18 @@ jobs:
           # and the two-word alternative (`mission run`) anchors on the full
           # spelling so the surviving `mission launch`/`ship`/`abort` family
           # does NOT trip.
+          # Decision 17: `darkmux lessons ...` -> `darkmux memory lesson ...`
+          # (the family retired into `memory`, whose second kind is
+          # `memory correction`). `lessons` is plural + darkmux-specific, so the
+          # `darkmux ` anchor + word boundary can't false-match the singular
+          # `memory lesson` spelling or the word "lessons" in prose.
           # Historical release-notes lines (README's status block, one line
           # per release naming its `**vX.Y.Z**`) legitimately quote old verbs
           # — excluded by the -v filter; live prose never carries that
           # bold-version marker.
-          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|mission run)\b'
+          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|mission run)\b'
           if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md AGENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
-            echo "::error::Retired verb spelling in user-facing docs (#1426) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run); swap + recommendations retired:"
+            echo "::error::Retired verb spelling in user-facing docs (#1426) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons); swap + recommendations retired:"
             echo "$bad"
             exit 1
           fi

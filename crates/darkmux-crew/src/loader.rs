@@ -190,7 +190,7 @@ pub(crate) fn crew_root() -> PathBuf {
     // env(DARKMUX_CREW_DIR) > config.dirs.crew > <root>/crew (#661 Slice 3).
     // (#1012) ForceUser, NOT Auto: crew manifests are operator/fleet-level state.
     // Auto flipped to PROJECT scope the moment a bare `<cwd>/.darkmux/` existed
-    // (e.g. created by repo-tier `lessons add` or lab runs), silently shadowing
+    // (e.g. created by repo-tier `memory lesson add` or lab runs), silently shadowing
     // the operator's user-scope crew/missions. DARKMUX_HOME + the explicit
     // override above still win; only the default no longer hijacks on a stray dir.
     darkmux_types::config_access::crew_dir_override()
@@ -207,7 +207,7 @@ pub fn user_state_root() -> PathBuf {
     // (#1012) ForceUser, NOT Auto — missions/phases are operator-level work
     // tracking (the operator's board lives in ~/.darkmux), never a project's
     // stray `.darkmux/`. Auto made them VANISH from the CLI + viewer the moment
-    // a repo got a bare `.darkmux/` (from `lessons add` / lab runs). DARKMUX_HOME
+    // a repo got a bare `.darkmux/` (from `memory lesson add` / lab runs). DARKMUX_HOME
     // and the explicit override still win.
     darkmux_types::config_access::crew_dir_override()
         .unwrap_or_else(|| resolve(ResolveScope::ForceUser).root)

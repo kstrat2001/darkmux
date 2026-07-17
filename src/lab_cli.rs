@@ -444,7 +444,7 @@ fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
         if ctx.trim().is_empty() {
             anyhow::bail!(
                 "--ab: nothing to inject — no authored lessons for this repo{}. \
-                 Record a lesson (`darkmux lessons add`){}, then retry.",
+                 Record a lesson (`darkmux memory lesson add`){}, then retry.",
                 args.inject_from_mission
                     .as_deref()
                     .map(|m| format!(" and no detected cautions for mission `{m}`"))

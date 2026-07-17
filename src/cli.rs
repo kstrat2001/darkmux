@@ -231,15 +231,16 @@ pub(crate) enum Cmd {
     // crew REGISTRY dissolved with the crews map — a crew is now a DERIVED
     // VIEW of a mission's resourcing (`darkmux_crew::resourcing`), never a
     // declared entity, so the registry-read verbs (list/show/index) go too.
-    /// Engagement-context lessons — operator-authored conventions,
-    /// constraints, and decisions (with the reasoning behind them) that surface
-    /// to coder dispatches as a `<lessons>` block. Stored in a durable,
-    /// concurrent-safe SQLite `lessons.db`. Per-repo by default
-    /// (`<repo>/.darkmux/lessons.db`, engagement-scoped); `--global` targets
-    /// the cross-engagement `~/.darkmux/lessons.db`. (#994)
-    Lessons {
+    /// What darkmux knows — the durable memory that briefs future dispatches,
+    /// one sub-noun per KIND. `memory lesson` is what the user authored
+    /// (conventions, constraints, decisions + the reasoning behind them);
+    /// `memory correction` is what their reviewer recorded when adjudicating a
+    /// dispatch. Both surface to coder dispatches as injected brief blocks; new
+    /// kinds slot in here rather than growing a new top-level verb. (#1426 —
+    /// the `lessons` top-level verb retired into this family.)
+    Memory {
         #[command(subcommand)]
-        sub: LessonsCmd,
+        sub: MemoryCmd,
     },
     /// Role management — list and show role details from the SQLite index.
     Role {
@@ -868,6 +869,59 @@ pub(crate) enum NotebookCmd {
     },
 }
 
+/// (#1426, decision 17) The memory KINDS. Singular sub-nouns, matching the
+/// `profile`/`role`/`machine` singulars — a new kind is a new sub-noun here,
+/// never a new top-level verb.
+#[derive(Subcommand)]
+pub(crate) enum MemoryCmd {
+    /// Engagement-context lessons the user AUTHORED — conventions,
+    /// constraints, and decisions (with the reasoning behind them) that surface
+    /// to coder dispatches as a `<lessons>` block. Stored in a durable,
+    /// concurrent-safe SQLite `lessons.db`. Per-repo by default
+    /// (`<repo>/.darkmux/lessons.db`, engagement-scoped); `--global` targets
+    /// the cross-engagement `~/.darkmux/lessons.db`. (#994)
+    Lesson {
+        #[command(subcommand)]
+        sub: LessonsCmd,
+    },
+    /// The adjudication corrections the user's reviewer RECORDED — the
+    /// verdicts and overrides they logged against a dispatch (`darkmux flow
+    /// note --source adjudication`), carried forward into every later coder
+    /// brief in the same mission so a correction made once is never re-derived.
+    /// Read-only: corrections are recorded by the review path, never authored
+    /// as a memory entry, so there is no `add` here. (#849)
+    Correction {
+        #[command(subcommand)]
+        sub: CorrectionCmd,
+    },
+}
+
+/// (#1426) The first verb #849's persisted corrections have ever had. READ-ONLY
+/// by construction — see [`MemoryCmd::Correction`].
+#[derive(Subcommand)]
+pub(crate) enum CorrectionCmd {
+    /// List the adjudication corrections recorded in the flow trail's recent
+    /// window, oldest→newest. With no scope flag, every session in the window;
+    /// `--mission` scopes to one mission's dispatches (exactly as the coder
+    /// brief does), `--session` to a single dispatch.
+    List {
+        /// Scope to one mission's dispatch sessions — the same exact-set match
+        /// the coder brief uses, so this shows precisely what that mission's
+        /// next brief would carry. Conflicts with `--session`.
+        #[arg(long, conflicts_with = "session")]
+        mission: Option<String>,
+        /// Scope to a single dispatch session id.
+        #[arg(long)]
+        session: Option<String>,
+        /// How many of the most-recent day-files to read. Defaults to the same
+        /// window the coder-brief injection reads.
+        #[arg(long, default_value_t = darkmux_crew::corrections::ADJUDICATION_LOOKBACK_DAYS)]
+        days: usize,
+        #[command(flatten)]
+        json: JsonFlagPlain,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum LessonsCmd {
     /// Record an engagement-context lesson — a convention, constraint, or
@@ -897,7 +951,8 @@ pub(crate) enum LessonsCmd {
         #[command(flatten)]
         json: JsonFlagPlain,
     },
-    /// Edit a recorded lesson in place by its id (from `lessons list --json`).
+    /// Edit a recorded lesson in place by its id (from `memory lesson list
+    /// --json`).
     /// Only the flags you pass change; `created_ts` is preserved.
     Edit {
         /// The lesson's rowid (ids are per-tier — pass `--global` to target the
@@ -919,7 +974,7 @@ pub(crate) enum LessonsCmd {
         #[arg(long)]
         global: bool,
     },
-    /// Remove a recorded lesson by its id (from `lessons list --json`).
+    /// Remove a recorded lesson by its id (from `memory lesson list --json`).
     Remove {
         /// The lesson's rowid (per-tier — pass `--global` for the global store).
         id: i64,

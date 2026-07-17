@@ -1,6 +1,6 @@
 ---
 name: darkmux-mission-debrief
-description: Run a mission's debrief — the post-mission review ceremony that turns one mission's transient signal into durable engagement lessons. Reads `darkmux mission debrief <id> --json` (the loop pathologies darkmux's detectors flagged across the mission's runs, the corrections the reviewer recorded, and the mission's phases + how each ended), reviews the engagement's own docs, and — for a coding mission — `git show`s the shipped work, then proposes durable lessons WITH the why and records each via `darkmux lessons add`. Lessons then brief every future crew in this engagement as a `<lessons>` block (#994/#1000). Read + propose + approve — the skill proposes; the operator approves before any write. Run it at mission completion (the close nudge prompts it). NASA vocabulary: Mission · Crew · Debrief · Lessons.
+description: Run a mission's debrief — the post-mission review ceremony that turns one mission's transient signal into durable engagement lessons. Reads `darkmux mission debrief <id> --json` (the loop pathologies darkmux's detectors flagged across the mission's runs, the corrections the reviewer recorded, and the mission's phases + how each ended), reviews the engagement's own docs, and — for a coding mission — `git show`s the shipped work, then proposes durable lessons WITH the why and records each via `darkmux memory lesson add`. Lessons then brief every future crew in this engagement as a `<lessons>` block (#994/#1000). Read + propose + approve — the skill proposes; the operator approves before any write. Run it at mission completion (the close nudge prompts it). NASA vocabulary: Mission · Crew · Debrief · Lessons.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*),Bash(git:*),Read,Glob,Grep"
 ---
@@ -21,10 +21,10 @@ Ask the operator which mission to debrief (the id under `~/.darkmux/missions/`).
 
 ```bash
 darkmux mission status        # the board — find the completed mission's id
-darkmux lessons list          # what's already banked (repo + global tiers)
+darkmux memory lesson list          # what's already banked (repo + global tiers)
 ```
 
-If `darkmux lessons list` errors, stop and surface it.
+If `darkmux memory lesson list` errors, stop and surface it.
 
 ## Step 1 — Read the debrief material
 
@@ -86,23 +86,23 @@ Ask the operator to approve, edit, drop, or re-scope each. **Do not write anythi
 
 ## Step 5 — Record the approved lessons
 
-For each approved lesson, one `darkmux lessons add` (the `--file` and `--global` flags as decided):
+For each approved lesson, one `darkmux memory lesson add` (the `--file` and `--global` flags as decided):
 
 ```bash
-darkmux lessons add \
+darkmux memory lesson add \
   --title "Bound the retry loop" \
   --body "The runtime caps retries at N on purpose — the loop entrenches its first answer (self-verification dilemma), so re-running rarely corrects it. Don't add another retry path; escalate to a fresh-context review instead." \
   --file runtime/src/loop_runner.rs
 ```
 
 ```bash
-darkmux lessons add --title "American English" --body "House style across all engagements; no British spellings." --global
+darkmux memory lesson add --title "American English" --body "House style across all engagements; no British spellings." --global
 ```
 
 Then confirm what landed:
 
 ```bash
-darkmux lessons list
+darkmux memory lesson list
 ```
 
 ## Step 6 — Tell the operator how it pays off

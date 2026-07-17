@@ -12,7 +12,7 @@
 //! store; SQLite transactions are atomic (a crash rolls back), its locking
 //! serializes writers, WAL lets reads proceed during a write, and
 //! `PRAGMA user_version` gives a real migration path (JSON has none). Edited via
-//! verbs (`darkmux lessons add`/`list`), not raw-file editing; an
+//! verbs (`darkmux memory lesson add`/`list`), not raw-file editing; an
 //! `export`/`import` can restore the hand-edit/git roundtrip later.
 //!
 //! TWO TIERS (the gitconfig model), so lessons stay engagement-scoped and
@@ -111,7 +111,7 @@ pub fn repo_db_path() -> PathBuf {
 /// User-global lessons db: `~/.darkmux/lessons.db`. Conventions that apply
 /// to ALL the operator's work regardless of engagement (house style, language,
 /// universal constraints). Injected into every coder brief ALONGSIDE the repo's
-/// own lessons — universal by opt-in (`lessons add --global`), never by
+/// own lessons — universal by opt-in (`memory lesson add --global`), never by
 /// accident. (When `$DARKMUX_HOME` relocates the root, both tiers resolve to it
 /// — a deliberate single-root install collapses the two tiers into one.)
 pub fn global_db_path() -> PathBuf {
@@ -127,7 +127,7 @@ fn now_unix() -> i64 {
 
 /// Open (creating if absent) a lessons db at `path`, ensuring the schema +
 /// version. WAL mode so a reader (an in-flight dispatch's inject) doesn't block
-/// a writer (`lessons add`) and vice versa — the concurrency the store exists
+/// a writer (`memory lesson add`) and vice versa — the concurrency the store exists
 /// to survive. Creates the parent dir as needed.
 pub fn open_at(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
@@ -141,7 +141,7 @@ pub fn open_at(path: &Path) -> Result<Connection> {
     // (#994 QA) Wait for a concurrent writer rather than instantly returning
     // SQLITE_BUSY. `open_at` is shared by the write verb AND the best-effort
     // inject read, and the schema-init DDL/pragma below take a lock. Without
-    // this, a dispatch reading lessons while a `lessons add` (or the future
+    // this, a dispatch reading lessons while a `memory lesson add` (or the future
     // distiller) is mid-write would degrade to "no lessons" for that run —
     // silently losing exactly the concurrency the SQLite store was chosen to
     // survive. With it, the read waits out the (sub-second) write and gets the
@@ -377,7 +377,7 @@ pub fn import_json(conn: &mut Connection, data: &str) -> Result<ImportStats> {
 /// Read lessons for the per-dispatch inject — best-effort: a MISSING db is an
 /// empty list (and is NOT created, so a read never writes), and any open/query
 /// error also degrades to empty rather than erroring the dispatch (mirrors the
-/// #849 corrections + #994 cautions collectors). The `lessons add` write path
+/// #849 corrections + #994 cautions collectors). The `memory lesson add` write path
 /// uses [`open_at`] directly (loud on error) — only this read path is silent.
 pub fn load_entries_best_effort(path: &Path) -> Vec<Lesson> {
     if !path.exists() {
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn open_sets_busy_timeout_so_reads_wait_out_a_writer() {
-        // (#994 QA) Without a busy_timeout, a read racing a `lessons add`
+        // (#994 QA) Without a busy_timeout, a read racing a `memory lesson add`
         // returns SQLITE_BUSY immediately and the best-effort inject degrades to
         // "no lessons". Assert the connection is configured to wait instead.
         let tmp = TempDir::new().unwrap();

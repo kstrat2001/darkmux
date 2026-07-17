@@ -164,6 +164,73 @@ fn retired_crew_family_is_unknown_entirely() {
     }
 }
 
+/// (#1426, decision 17) The `lessons` top-level verb retired into the `memory`
+/// family — every spelling, the bare family and each old sub-verb, is now an
+/// unknown TOP-LEVEL verb with no compat alias (pre-2.0 clean removal). The
+/// surface moved to `memory lesson <sub>`; see the companion test below.
+#[test]
+fn retired_lessons_family_is_unknown_entirely() {
+    for args in [
+        vec!["lessons"],
+        vec!["lessons", "list"],
+        vec!["lessons", "add", "--title", "t", "--body", "b"],
+        vec!["lessons", "recall", "--term", "x"],
+        vec!["lessons", "export"],
+    ] {
+        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        cmd.args(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unrecognized subcommand").or(
+                predicate::str::contains("unexpected argument"),
+            ));
+    }
+}
+
+/// (#1426, decision 17) The replacement surface EXISTS: `memory` carries both
+/// kinds, `memory lesson` keeps all seven of the retired family's sub-verbs
+/// (behavior + flags unchanged — the verb moved, nothing else), and
+/// `memory correction` is read-only (a `list` and no write verb, since
+/// corrections are recorded by the review path, never hand-authored).
+/// The retirement test above only proves the OLD spelling is gone; this proves
+/// the new one landed, so a rename that dropped a sub-verb can't pass both.
+#[test]
+fn memory_family_carries_both_kinds() {
+    let help = |args: &[&str]| -> String {
+        let out = Command::cargo_bin("darkmux")
+            .unwrap()
+            .args(args)
+            .arg("--help")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let memory = help(&["memory"]);
+    for kind in ["lesson", "correction"] {
+        assert!(memory.contains(kind), "memory --help lists `{kind}`: {memory}");
+    }
+
+    let lesson = help(&["memory", "lesson"]);
+    for sub in ["add", "list", "edit", "remove", "export", "import", "recall"] {
+        assert!(
+            lesson.contains(sub),
+            "memory lesson --help keeps the retired family's `{sub}`: {lesson}"
+        );
+    }
+
+    let correction = help(&["memory", "correction"]);
+    assert!(correction.contains("list"), "{correction}");
+    // Read-only by construction (#849): the review path records corrections as
+    // flow notes, so a write verb here would be inventing a surface.
+    for write_verb in ["add", "edit", "remove", "import"] {
+        assert!(
+            !correction.contains(&format!("  {write_verb} ")),
+            "memory correction stays read-only — no `{write_verb}`: {correction}"
+        );
+    }
+}
+
 /// (#1426 ship-4) `mission run` retired — the coder pipeline runs through
 /// `mission launch coder-phase`. `mission` survives (launch/ship/abort/…), so
 /// the error is an unknown SUB-verb WITHIN the surviving family. No compat
