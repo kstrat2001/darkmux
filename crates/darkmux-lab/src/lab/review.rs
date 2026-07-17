@@ -4119,6 +4119,15 @@ impl StepKind for ReviewJudgeStepKind {
         let t0 = Instant::now();
         let results: StdMutex<Vec<JudgeChunkResult>> = StdMutex::new(Vec::with_capacity(deduped.len()));
 
+        // (#1374) The deterministic global index of a flag is its position in
+        // `deduped`: the chunk's start offset (running count of flags in
+        // already-scheduled chunks) plus its offset WITHIN the chunk. The old
+        // form read `results.lock().len()` — the COMPLETED count, which for
+        // chunks after the first collides across offsets whenever earlier
+        // threads in the chunk haven't finished at spawn time, making
+        // `env.judged` completion-order rather than deduped-docket order. Plain
+        // arithmetic in the main loop is both correct and lock-free.
+        let mut chunk_start = 0usize;
         for chunk in deduped.chunks(concurrency) {
             std::thread::scope(|scope| {
                 for (offset, flag) in chunk.iter().enumerate() {
@@ -4126,14 +4135,9 @@ impl StepKind for ReviewJudgeStepKind {
                     let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
                     let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
                     let prompt = judge_prompt(&self.ctx.intent_title, &self.ctx.intent_body, code, facts, &flag.charge_text);
-                    let index = {
-                        // deterministic global index for this flag — the
-                        // running count of already-scheduled flags plus this
-                        // chunk's offset, so output order matches `deduped`
-                        // order regardless of thread completion order.
-                        let done = results.lock().expect("judge results mutex poisoned").len();
-                        done - done.min(offset) + offset
-                    };
+                    // (#1374) `chunk_start + offset` = this flag's stable index
+                    // in `deduped`, independent of thread completion order.
+                    let index = chunk_start + offset;
                     let ctx = &self.ctx;
                     let judge_budgets = judge_budgets.as_ref();
                     let results = &results;
@@ -4191,6 +4195,9 @@ impl StepKind for ReviewJudgeStepKind {
                     });
                 }
             });
+            // (#1374) Advance the running start AFTER the chunk's threads join,
+            // so the next chunk's flags index from the correct base.
+            chunk_start += chunk.len();
         }
 
         let mut results = results.into_inner().expect("judge results mutex poisoned");
