@@ -115,6 +115,26 @@ pub struct StepRow {
     pub started_ts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_ts: Option<u64>,
+    /// (#1432 item 4) FINALIZED token/turn totals folded from this
+    /// mission's flow records at page-load time, so a completed step whose
+    /// dispatch ran BEFORE the page opened shows its real total immediately
+    /// (the page's SSE channel is tail-from-now, so without this a page
+    /// opened after a step finished renders its meter blank). Absent (None)
+    /// for a step that never dispatched or whose records aren't on disk (a
+    /// mixed-era mission) — the page then shows the idle placeholder, an
+    /// honest "no data" rather than a wrong zero. The SSE stream stays the
+    /// LIVE-increment channel; these are only the terminal totals. Additive
+    /// camelCase (`tokensFinal`/`turnsFinal`/`cloud`); pre-#1432 consumers
+    /// ignore them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_final: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns_final: Option<u64>,
+    /// `Some(true)` when any folded record for this step carried a hosted
+    /// endpoint (a remote/cloud call) — the page colors the backfilled total
+    /// the same "cloud" hue the live meter uses. Absent when local-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<bool>,
 }
 
 /// One edge in the rendered graph. Same `camelCase` wire contract as
@@ -561,8 +581,138 @@ fn split_on_placeholders(pattern: &str) -> Vec<String> {
     segments
 }
 
+/// (#1432 item 4) The finalized token/turn totals folded for one step from
+/// this mission's flow records. Mirrors the page's own
+/// `applyRecordToMetrics` FINAL branch (`assets/mission-graph.html`) so the
+/// server backfill and the live SSE channel agree on what "finalized" means.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct StepFinals {
+    pub tokens: Option<u64>,
+    pub turns: Option<u64>,
+    pub cloud: bool,
+}
+
+/// Which step id (if any) a flow record attributes to, using the SAME three
+/// correlation keys, in the SAME order, the page's `stepForRecord` uses:
+/// (1) `payload.step_id`; (2) a `session_id` of the `step-<id>` shape a
+/// `dispatch.internal` step defaults to; (3) `handle == <step id>`. Returns
+/// the id only when it is one of THIS mission's steps (`step_ids`), so a
+/// scan over a shared per-day flow file attributes nothing foreign.
+fn step_for_record<'a>(rec: &serde_json::Value, step_ids: &'a BTreeSet<String>) -> Option<&'a str> {
+    if let Some(sid) = rec.get("payload").and_then(|p| p.get("step_id")).and_then(|s| s.as_str()) {
+        if let Some(found) = step_ids.get(sid) {
+            return Some(found.as_str());
+        }
+    }
+    if let Some(session) = rec.get("session_id").and_then(|s| s.as_str()) {
+        if let Some(rest) = session.strip_prefix("step-") {
+            if let Some(found) = step_ids.get(rest) {
+                return Some(found.as_str());
+            }
+        }
+    }
+    if let Some(handle) = rec.get("handle").and_then(|s| s.as_str()) {
+        if let Some(found) = step_ids.get(handle) {
+            return Some(found.as_str());
+        }
+    }
+    None
+}
+
+/// Pure: fold a stream of flow records into per-step FINALIZED totals.
+/// Only TERMINAL totals are folded — `dispatch complete`/`dispatch.complete`
+/// (`total_tokens` + `total_turns`) and `step result` (`total_tokens`) —
+/// taking the max across records (a re-run's later complete wins). The
+/// per-turn RUNNING increments (`telemetry.tokens`, `dispatch.turn`) are
+/// deliberately NOT folded here: those stay the page's live SSE channel, so
+/// the backfill can never race ahead of or double-count the live meter. A
+/// record naming a hosted `payload.endpoint` marks its step `cloud`. Pure +
+/// iterator-driven so the correlation/fold logic is unit-testable without
+/// touching the filesystem.
+pub(crate) fn fold_step_finals<I>(records: I, step_ids: &BTreeSet<String>) -> BTreeMap<String, StepFinals>
+where
+    I: IntoIterator<Item = serde_json::Value>,
+{
+    let mut out: BTreeMap<String, StepFinals> = BTreeMap::new();
+    for rec in records {
+        let Some(sid) = step_for_record(&rec, step_ids) else {
+            continue;
+        };
+        let action = rec.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        let payload = rec.get("payload");
+        let total_tokens = payload.and_then(|p| p.get("total_tokens")).and_then(|v| v.as_u64());
+        let total_turns = payload.and_then(|p| p.get("total_turns")).and_then(|v| v.as_u64());
+        let endpoint = payload.and_then(|p| p.get("endpoint")).map(|v| !v.is_null()).unwrap_or(false);
+        let is_complete = action == "dispatch complete" || action == "dispatch.complete";
+        let is_step_result = action == "step result";
+        if !is_complete && !is_step_result {
+            // Still honor a cloud marker riding an otherwise-ignored record
+            // for this step, but only if we already fold something for it.
+            continue;
+        }
+        let entry = out.entry(sid.to_string()).or_default();
+        if let Some(t) = total_tokens {
+            entry.tokens = Some(entry.tokens.map_or(t, |cur| cur.max(t)));
+        }
+        if is_complete {
+            if let Some(n) = total_turns {
+                entry.turns = Some(entry.turns.map_or(n, |cur| cur.max(n)));
+            }
+        }
+        if endpoint {
+            entry.cloud = true;
+        }
+    }
+    out
+}
+
+/// Read every `.jsonl` day file in `flows_dir` once and fold this mission's
+/// steps' finalized totals out of them (#1432 item 4). Best-effort: a
+/// missing/unreadable directory or file yields an empty map (the graph then
+/// carries no backfill, honest "no data"). Scans ALL day files rather than
+/// the last two (`resolve_session`'s window) because a multi-day mission's
+/// earlier steps would otherwise lose their totals; the per-mission
+/// `step_ids` filter keeps each line's cost to a parse plus a few lookups.
+fn backfill_step_finals(flows_dir: &std::path::Path, step_ids: &BTreeSet<String>) -> BTreeMap<String, StepFinals> {
+    use std::io::BufRead;
+    if step_ids.is_empty() {
+        return BTreeMap::new();
+    }
+    let Ok(dir) = std::fs::read_dir(flows_dir) else {
+        return BTreeMap::new();
+    };
+    let mut day_files: Vec<std::path::PathBuf> = dir
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    day_files.sort();
+    let records = day_files.into_iter().flat_map(|path| {
+        let mut recs: Vec<serde_json::Value> = Vec::new();
+        if let Ok(file) = std::fs::File::open(&path) {
+            for line in std::io::BufReader::new(file).lines() {
+                let Ok(line) = line else { continue };
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    recs.push(v);
+                }
+            }
+        }
+        recs
+    });
+    fold_step_finals(records, step_ids)
+}
+
 /// Build the full node-link graph for one mission. `Ok(None)` when no
 /// mission with this id exists (the route answers 404).
+///
+/// `flows_dir` is scanned once (#1432 item 4) to backfill completed steps'
+/// finalized token/turn totals into their `StepRow`s — see
+/// [`backfill_step_finals`]. An empty/nonexistent `flows_dir` (e.g. a test
+/// router built with `PathBuf::new()`) simply yields no backfill.
 ///
 /// **Degradation granularity is per-DIRECTORY, not per-file.** Every
 /// filesystem read here is `unwrap_or_default`, but the underlying
@@ -586,7 +736,10 @@ fn split_on_placeholders(pattern: &str) -> Vec<String> {
 /// `config-snapshot.json` when available (#1402 — see
 /// [`kind_from_config_snapshot`]), falling back to the deep `"unknown"`
 /// chain only when no snapshot exists either.
-pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGraph>> {
+pub fn build_mission_graph(
+    mission_id: &str,
+    flows_dir: &std::path::Path,
+) -> anyhow::Result<Option<MissionGraph>> {
     let missions = darkmux_crew::loader::load_missions().unwrap_or_default();
     let Some(mission) = missions.into_iter().find(|m: &Mission| m.id == mission_id) else {
         return Ok(None);
@@ -631,6 +784,12 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
         steps_by_phase.insert(phase_id.clone(), steps);
     }
     let task_depth = layer_tasks_by_depth(&all_tasks);
+
+    // (#1432 item 4) Every step id this mission declares, across all phases —
+    // the correlation filter for the flow-record backfill below. Read once.
+    let all_step_ids: BTreeSet<String> =
+        all_tasks.iter().flat_map(|t| t.step_ids.iter().cloned()).collect();
+    let step_finals = backfill_step_finals(flows_dir, &all_step_ids);
 
     for (phase_index, phase_id) in mission.phase_ids.iter().enumerate() {
         let Some(phase) = phase_by_id.remove(phase_id) else {
@@ -686,25 +845,43 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
             let step_rows: Vec<StepRow> = task
                 .step_ids
                 .iter()
-                .map(|step_id| match steps.get(step_id) {
-                    Some(step) => StepRow {
-                        id: step.id.clone(),
-                        label: resolve_step_label(&step.kind, &step.id),
-                        kind: step.kind.clone(),
-                        status: node_status_str(step.status),
-                        started_ts: step.started_ts,
-                        completed_ts: step.completed_ts,
-                    },
-                    None => {
-                        let kind = kind_from_config_snapshot(mission_id, &task.id, step_id)
-                            .unwrap_or_default();
-                        StepRow {
-                            id: step_id.clone(),
-                            label: resolve_step_label(&kind, step_id),
-                            kind,
-                            status: node_status_str(NodeStatus::Planned),
-                            started_ts: None,
-                            completed_ts: None,
+                .map(|step_id| {
+                    // (#1432 item 4) Attach the backfilled finalized totals
+                    // (None everywhere the mission has no folded records for
+                    // this step — a never-dispatched or mixed-era step).
+                    let fin = step_finals.get(step_id);
+                    let tokens_final = fin.and_then(|f| f.tokens);
+                    let turns_final = fin.and_then(|f| f.turns);
+                    let cloud = match fin {
+                        Some(f) if f.cloud => Some(true),
+                        _ => None,
+                    };
+                    match steps.get(step_id) {
+                        Some(step) => StepRow {
+                            id: step.id.clone(),
+                            label: resolve_step_label(&step.kind, &step.id),
+                            kind: step.kind.clone(),
+                            status: node_status_str(step.status),
+                            started_ts: step.started_ts,
+                            completed_ts: step.completed_ts,
+                            tokens_final,
+                            turns_final,
+                            cloud,
+                        },
+                        None => {
+                            let kind = kind_from_config_snapshot(mission_id, &task.id, step_id)
+                                .unwrap_or_default();
+                            StepRow {
+                                id: step_id.clone(),
+                                label: resolve_step_label(&kind, step_id),
+                                kind,
+                                status: node_status_str(NodeStatus::Planned),
+                                started_ts: None,
+                                completed_ts: None,
+                                tokens_final,
+                                turns_final,
+                                cloud,
+                            }
                         }
                     }
                 })
@@ -788,6 +965,84 @@ mod tests {
             workdir: None,
             image: None,
         }
+    }
+
+    // ─── (#1432 item 4) flow-record backfill ───────────────────────────
+
+    fn ids(v: &[&str]) -> BTreeSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fold_finals_step_result_record_folds_total_tokens() {
+        let step_ids = ids(&["review-judge-step"]);
+        let rec = serde_json::json!({
+            "action": "step result",
+            "payload": { "step_id": "review-judge-step", "total_tokens": 4200 }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids);
+        assert_eq!(out["review-judge-step"].tokens, Some(4200));
+        assert_eq!(out["review-judge-step"].turns, None);
+        assert!(!out["review-judge-step"].cloud);
+    }
+
+    #[test]
+    fn fold_finals_dispatch_complete_folds_tokens_turns_via_session_id() {
+        // Correlation key 2: session_id `step-<id>` (the dispatch.internal default).
+        let step_ids = ids(&["s1"]);
+        let rec = serde_json::json!({
+            "action": "dispatch.complete",
+            "session_id": "step-s1",
+            "payload": { "total_tokens": 15200, "total_turns": 9 }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids);
+        assert_eq!(out["s1"].tokens, Some(15200));
+        assert_eq!(out["s1"].turns, Some(9));
+    }
+
+    #[test]
+    fn fold_finals_handle_key_and_max_across_records() {
+        // Correlation key 3 (handle == step id) + max wins across a re-run.
+        let step_ids = ids(&["s1"]);
+        let recs = vec![
+            serde_json::json!({ "action": "dispatch complete", "handle": "s1",
+                                "payload": { "total_tokens": 100, "total_turns": 2 } }),
+            serde_json::json!({ "action": "dispatch complete", "handle": "s1",
+                                "payload": { "total_tokens": 900, "total_turns": 5 } }),
+        ];
+        let out = fold_step_finals(recs, &step_ids);
+        assert_eq!(out["s1"].tokens, Some(900), "later/higher complete wins");
+        assert_eq!(out["s1"].turns, Some(5));
+    }
+
+    #[test]
+    fn fold_finals_endpoint_marks_cloud() {
+        let step_ids = ids(&["s1"]);
+        let rec = serde_json::json!({
+            "action": "step result",
+            "payload": { "step_id": "s1", "total_tokens": 50, "endpoint": "https://api.example/v1" }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids);
+        assert!(out["s1"].cloud);
+        assert_eq!(out["s1"].tokens, Some(50));
+    }
+
+    #[test]
+    fn fold_finals_ignores_foreign_steps_and_running_increments() {
+        let step_ids = ids(&["mine"]);
+        let recs = vec![
+            // Foreign step — not in this mission's set.
+            serde_json::json!({ "action": "step result",
+                                "payload": { "step_id": "someone-else", "total_tokens": 999 } }),
+            // A RUNNING per-turn increment for my step — NOT a finalized total,
+            // stays the SSE channel's job, must not fold here.
+            serde_json::json!({ "action": "telemetry.tokens", "handle": "mine",
+                                "payload": { "total_tokens": 7 } }),
+            serde_json::json!({ "action": "dispatch.turn", "handle": "mine" }),
+        ];
+        let out = fold_step_finals(recs, &step_ids);
+        assert!(out.get("mine").is_none(), "no finalized record -> no entry (honest absent)");
+        assert!(out.get("someone-else").is_none());
     }
 
     // ─── layer_tasks_by_depth ──────────────────────────────────────────
