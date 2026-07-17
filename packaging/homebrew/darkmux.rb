@@ -15,7 +15,7 @@
 # skill), #280 (related fleet primitive that simplifies post-formula).
 
 class Darkmux < Formula
-  desc "Profile multiplexer + lab for local LLM stacks (LMStudio, Ollama)"
+  desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
   # Stable release: v1.17.1 (the review-funnel release — prosecution/judgment PR review
   # contract + pr-reviewer-agentic role for tool-granting cloud review

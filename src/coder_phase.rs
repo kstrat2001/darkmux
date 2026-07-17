@@ -395,9 +395,9 @@ fn select_phase(
 fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> Result<()> {
     if wt_path.exists() {
         bail!(
-            "worktree already exists at {} — a previous `mission run` for this phase hasn't \
-             been shipped or torn down. Inspect it, run `darkmux mission ship` to finish, or \
-             `git worktree remove {}` to discard.",
+            "worktree already exists at {} — a previous `mission launch coder-phase` for this \
+             phase hasn't been shipped or torn down. Inspect it, run `darkmux mission ship` to \
+             finish, or `git worktree remove {}` to discard.",
             wt_path.display(),
             wt_path.display()
         );

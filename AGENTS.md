@@ -168,24 +168,17 @@ An engagement is operator-defined, never system-defined. The system doesn't impo
 
 # darkmux
 
-This project uses [darkmux](https://github.com/kstrat2001/darkmux) to multiplex local LLM stacks. Three reference profiles are available: `fast`, `balanced`, and `deep`.
-
-## When to swap stacks
-
-- **`fast`** — single-turn tasks (audits, TODO fills, short Q&A). Slim primary, no compactor.
-- **`balanced`** — mid-range tasks. Tuned compaction with a small companion compactor.
-- **`deep`** — long agentic tasks (multi-file refactors, exploratory test authoring). Maximum primary context for fewer compactions.
+This project uses [darkmux](https://github.com/kstrat2001/darkmux), a mission orchestrator and lab for local AI. You dispatch roles and launch missions to a crew of local-AI seats; each seat runs local (your own models, off the meter) or cloud (a hosted endpoint when a role needs frontier weights). darkmux keeps the right models resident at the right context under your RAM budget — you don't manage residency by hand.
 
 ## Available skills
 
 - `/darkmux-status` — what's currently loaded
 - `/darkmux-list-stacks` — see all available profiles
-- `/darkmux-swap-stack <name>` — switch to a profile
 - `/darkmux-list-workloads` / `/darkmux-lab-run` — execute lab workloads
 - `/darkmux-list-runs` / `/darkmux-analyze-run` / `/darkmux-compare-runs` — inspect run history
 
 ## Dispatch policy
 
-Before starting a long agentic task that may grow context past ~30K tokens, consider swapping to `deep`. Before doing a single-turn audit or short review, consider swapping to `fast` to skip the compactor's idle KV-cache cost. Use `/darkmux-status` to confirm before making the change — swapping is idempotent so a status-matched call is a no-op.
+Launch a config-defined mission with `darkmux mission launch <config>` and watch it run as a live task graph, gated on your sign-off; each run finalizes into a typed envelope. For a single turn, `darkmux dispatch <role> "<text>"` sends work to one seat. Before relying on a config, measure it with `darkmux lab run <workload>` (wall clock, compaction events, verify outcome) so your choices rest on numbers, not guesses.
 
 <!-- darkmux:integration:agents:end -->

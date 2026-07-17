@@ -291,8 +291,21 @@ jobs:
           # `darkmux init` (include_str!-embedded), and AGENTS.md is the
           # agent-facing repo doc — both carried retired identity text that
           # the doc-only set missed.
+          # (#1449) The scanned file set + the ONE corpus exclusion, shared by
+          # all three scans below so they can never drift apart. templates/ was
+          # added because it ships into the binary via include_str! (the SAME
+          # rationale that put skills/ in-set — a retired verb baked into a
+          # mission-config description reaches every user), and
+          # CLAUDE.md/ROADMAP.md/DISCLAIMER.md are agent/user-facing surfaces
+          # that each carried 2.0 identity drift a doc-only set missed.
+          # EXCLUSION: templates/builtin/lab-fixtures/pr-review-bench/ is LABELED
+          # benchmark corpus — adversarial PR diffs that intentionally quote
+          # retired verbs (e.g. `darkmux mission run` in a test case). Corpus is
+          # never reworded; its dir is excluded from every scan.
+          SCAN="README.md CONTRIBUTING.md DESIGN.md AGENTS.md CLAUDE.md ROADMAP.md DISCLAIMER.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/"
+          EXCL="--exclude-dir=pr-review-bench"
           PAT='admin[- ]agent|admin</code>'
-          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md AGENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ 2>/dev/null); then
+          if bad=$(grep -rniE $EXCL "$PAT" $SCAN 2>/dev/null); then
             echo "::error::Retired term in user-facing docs — use 'utility', not 'admin' (the role_family loader rejects 'admin'):"
             echo "$bad"
             exit 1
@@ -335,8 +348,28 @@ jobs:
           # — excluded by the -v filter; live prose never carries that
           # bold-version marker.
           VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|mission run)\b'
-          if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md AGENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
+          if bad=$(grep -rniE $EXCL "$VERBPAT" $SCAN 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
             echo "::error::Retired verb spelling in user-facing docs (#1426) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons); swap + recommendations retired:"
+            echo "$bad"
+            exit 1
+          fi
+          # (#1449) IDENTITY drift — the retired "profile multiplexer" self-image.
+          # VERBPAT anchors on `darkmux <verb>` and so guards ZERO identity
+          # language: the stale AGENTS.md block ("to multiplex local LLM stacks",
+          # "## When to swap stacks", "/darkmux-swap-stack") passed it clean.
+          # The 2.0 identity is "mission orchestrator and a lab". NOTE the pattern
+          # is deliberately NARROW: the 2.0 docs legitimately narrate the
+          # multiplexer HERITAGE ("the founding profile multiplexer, now
+          # internal"; "the name comes from the multiplexer core"), so a bare
+          # `multiplex` alternative would false-positive on honest history. It
+          # matches only the ACTIVE-PURPOSE drift forms that are never legitimate
+          # in 2.0 prose: `/darkmux-swap-stack` (a retired skill), `swap stack(s)`
+          # (the retired action phrase), and `to multiplex` (present-purpose
+          # framing — legit prose uses "profile multiplexer" as a noun with a
+          # founding/now-internal qualifier, never "to multiplex").
+          IDENTITYPAT='/darkmux-swap-stack|swap stacks?|to multiplex'
+          if bad=$(grep -rniE $EXCL "$IDENTITYPAT" $SCAN 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
+            echo "::error::Retired IDENTITY language in user-facing docs (#1449) — darkmux 2.0 is a mission orchestrator and a lab, NOT a profile multiplexer. Drop the swap-stack framing (residency is internal to gestalt now); reference the multiplexer only as founding/now-internal heritage:"
             echo "$bad"
             exit 1
           fi
