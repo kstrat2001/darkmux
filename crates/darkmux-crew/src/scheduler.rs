@@ -390,6 +390,16 @@ pub fn run_step_graph(
         // own sink, lab/fleet boundary already chosen by the caller) as they
         // are produced, not batched at wave-drain. The step never touches the
         // global flow sink directly; it emits THROUGH this seam.
+        //
+        // (#1451 gate) The channel is UNBOUNDED on purpose. The main thread
+        // drains it continuously (`rx.iter()` below) for the entire time the
+        // wave runs, so records do not accumulate without bound in practice.
+        // A BOUNDED channel would instead risk a worker thread BLOCKING on a
+        // full queue — a deadlock hazard here, because the SAME outer
+        // `thread::scope` both drains the receiver and joins the worker, so a
+        // producer stalled on backpressure could wedge the drain that would
+        // relieve it. `emit` is best-effort observability, never load-bearing
+        // control flow, so unbounded-with-continuous-drain is the right trade.
         let (tx, rx) = std::sync::mpsc::channel::<FlowRecord>();
         // Re-borrow immutably now that every ready step's status flip is
         // recorded — `gather_inputs` needs `&steps`/`&tasks` (completed
@@ -1009,6 +1019,70 @@ mod tests {
         assert_eq!(steps["independent-step"].status, NodeStatus::Complete);
         assert_eq!(report.errored, vec!["fails-step".to_string()]);
         assert!(report.completed.contains(&"independent-step".to_string()));
+    }
+
+    /// (#1452) A step kind that PANICS in `run` must leave its Step terminal
+    /// (`Error`) and error the run — never stranded `Running` in a run the
+    /// scheduler reports as success. This is the scheduler-facing half of the
+    /// `run_bounded` panic-reconcile fix: `run_bounded` now returns the
+    /// panicked job as a terminal `Err`, which this loop flips to `Error` and
+    /// persists, so the panic surfaces as an errored step + an errored run.
+    /// A sibling step in the same wave still completes.
+    #[test]
+    fn run_step_graph_panicking_step_persists_terminal_error_never_running() {
+        use crate::step_kinds::{StepKind, StepOutcome};
+
+        struct PanicKind;
+        impl StepKind for PanicKind {
+            fn id(&self) -> &'static str {
+                "test.panic"
+            }
+            fn run(
+                &self,
+                _step: &Step,
+                _task: &Task,
+                _input: &BTreeMap<String, String>,
+            ) -> Result<StepOutcome> {
+                panic!("test.panic: intentional panic in run");
+            }
+        }
+
+        let (task_p, mut step_p) = task_and_step("panics", &[]);
+        step_p.kind = "test.panic".to_string();
+        let (task_ind, step_ind) = task_and_step("independent", &[]);
+        let (tasks, mut steps) = graph(vec![(task_p, step_p), (task_ind, step_ind)]);
+
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(std::sync::Arc::new(PanicKind)).expect("register test.panic");
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+        )
+        .expect("the scheduler returns Ok even when a step panics — the panic is a per-step error");
+
+        assert_eq!(
+            steps["panics-step"].status,
+            NodeStatus::Error,
+            "a panicking step persists terminal Error, never a stranded Running"
+        );
+        assert!(
+            report.errored.contains(&"panics-step".to_string()),
+            "the run reports the panicked step as errored: {report:?}"
+        );
+        assert_eq!(
+            steps["independent-step"].status,
+            NodeStatus::Complete,
+            "an independent step still completes despite the sibling panic"
+        );
     }
 
     #[test]

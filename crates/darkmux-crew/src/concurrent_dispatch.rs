@@ -31,8 +31,12 @@
 //! borrow-checked concurrency for exactly this shape without pulling in an
 //! async runtime — see this repo's CLAUDE.md dependency-discipline
 //! convention ("a 10-line inline module beats a crate for small one-off
-//! needs"). A panicking job's panic propagates naturally when `scope`
-//! returns (the stdlib's own behavior) rather than being caught and hidden.
+//! needs"). A panicking job unwinds its wave's inner `thread::scope` (which
+//! re-panics on its own IMPLICIT join), which in turn unwinds the track
+//! thread; `run_bounded` joins that track EXPLICITLY and reconciles the
+//! panicked job into a terminal `Err` result for its index (#1452) rather
+//! than letting the panic vanish and strand the job's Step `Running` — see
+//! `run_bounded`'s reconcile step.
 //!
 //! # Local waves vs the remote batch
 //!
@@ -88,7 +92,7 @@ use darkmux_gestalt::{
     ModelHost, Placement, ResourceProbe, WaveMode, WaveSchedule,
 };
 use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// One job's completed outcome: its own value plus every flow record it
@@ -170,6 +174,12 @@ pub fn run_bounded<T: Send + 'static>(
     let mut placements: Vec<Placement> = Vec::new();
     let mut remote_jobs: Vec<(usize, DispatchJob<T>)> = Vec::new();
 
+    // (#1452) Every queued index, captured BEFORE `jobs` is partitioned and
+    // consumed below. A job whose body panics never pushes a result into
+    // `results`; after both tracks join we reconcile any index absent from
+    // `results` back to a terminal `Err` (see the join/reconcile block).
+    let all_indices: Vec<usize> = jobs.iter().map(|q| q.index).collect();
+
     for q in jobs {
         match q.residency {
             Residency::Local(mut placement) => {
@@ -195,10 +205,18 @@ pub fn run_bounded<T: Send + 'static>(
         let remote_track =
             (!remote_jobs.is_empty()).then(|| scope.spawn(|| run_remote_batches(remote_jobs, remote_cap.max(1), &results)));
 
-        // `thread::scope` re-panics once every spawned thread is joined if
-        // any of them panicked — explicit `.join()` here just makes that
-        // join point visible rather than relying on the implicit one at the
-        // end of the block (identical behavior either way).
+        // (#1452) Join each track EXPLICITLY. A track thread panics when one
+        // of its jobs panics — the job's own wave `thread::scope` re-panics
+        // on its IMPLICIT end-of-block join, unwinding the track. Crucially,
+        // an EXPLICIT `.join()` on a scoped handle does NOT re-propagate that
+        // panic the way the outer scope's own implicit join would, so here we
+        // deliberately absorb it (`let _ = h.join()`): a wave panic must not
+        // abort the WHOLE batch and lose the OTHER jobs' already-pushed
+        // terminal results. The panicked job left no result of its own, so we
+        // reconcile it to a terminal `Err` right after the scope (below) —
+        // the earlier code's claim that this join re-panicked "identical
+        // behavior either way" was factually wrong (#1452), which is exactly
+        // how a panicked job used to vanish and strand its Step `Running`.
         if let Some(h) = local_track {
             let _ = h.join();
         }
@@ -207,7 +225,33 @@ pub fn run_bounded<T: Send + 'static>(
         }
     });
 
-    Ok(results.into_inner().expect("no thread panicked while holding the results lock"))
+    let mut results = results.into_inner().expect("no thread panicked while holding the results lock");
+
+    // (#1452) Reconcile absent indices. On every NON-panic path each queued
+    // job pushes exactly one result (normal completion, a wave-load failure,
+    // or a co-residency refusal), so an index still missing here can only
+    // mean its job PANICKED before pushing. Synthesize a terminal `Err` for
+    // it: the caller (`scheduler::run_step_graph`) then flips that Step to
+    // `Error` and persists it terminal through its ordinary per-job error
+    // arm, so a job panic surfaces as an errored step AND an errored run
+    // (contract 2, dispatch liveness — a terminal record on every exit path),
+    // never a silent `Running` skip inside a run reported as success. Loud
+    // beats quiet; the thread's default panic hook already printed the panic
+    // payload to stderr.
+    let seen: HashSet<usize> = results.iter().map(|(i, _)| *i).collect();
+    for index in all_indices {
+        if !seen.contains(&index) {
+            results.push((
+                index,
+                Err(anyhow!(
+                    "darkmux: a dispatch job panicked mid-wave and produced no terminal \
+                     result (see stderr for the panic payload) — recorded as a step error so \
+                     the run fails loud rather than stranding the step Running (#1452)"
+                )),
+            ));
+        }
+    }
+    Ok(results)
 }
 
 /// The local track: walk `schedule.waves` in order, running every job in
@@ -494,6 +538,52 @@ mod tests {
         let mut indices: Vec<usize> = results.iter().map(|(i, _)| *i).collect();
         indices.sort_unstable();
         assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// (#1452) A REMOTE job whose body PANICS must not vanish. Before the
+    /// fix, the panicked job's wave scope re-panicked, its track thread
+    /// unwound, and the outer `let _ = h.join()` discarded the panic — so the
+    /// job's index came back ABSENT from `results`, which stranded its Step
+    /// `Running` in a run the scheduler reported as success. Now the absent
+    /// index is reconciled into a terminal `Err`, and a sibling job in the
+    /// same batch still completes.
+    #[test]
+    fn run_bounded_reconciles_a_panicking_remote_job_to_a_terminal_error() {
+        let est = FixedEstimator::default();
+        let facts = Facts::default();
+        let jobs: Vec<QueuedJob<()>> = vec![
+            QueuedJob { index: 0, residency: Residency::Remote, job: Box::new(|| panic!("boom in a remote job")) },
+            QueuedJob { index: 1, residency: Residency::Remote, job: Box::new(|| Ok(((), vec![]))) },
+        ];
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
+        assert_eq!(results.len(), 2, "both indices accounted for — the panicked one is not dropped");
+        let panicked = results.iter().find(|(i, _)| *i == 0).expect("index 0 present despite the panic");
+        assert!(panicked.1.is_err(), "the panicked job's index comes back as a terminal Err");
+        let survivor = results.iter().find(|(i, _)| *i == 1).expect("index 1 present");
+        assert!(survivor.1.is_ok(), "a sibling job in the same batch still completes");
+    }
+
+    /// (#1452) The LOCAL-track twin of the remote panic test — a wave job
+    /// unwinds through a different code path (the per-wave nested
+    /// `thread::scope` inside `run_local_waves`), so the reconcile is proven
+    /// on both tracks. The sibling local job in the same wave still completes.
+    #[test]
+    fn run_bounded_reconciles_a_panicking_local_job_to_a_terminal_error() {
+        let est = FixedEstimator::default();
+        let facts = Facts::default();
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs: Vec<QueuedJob<usize>> = vec![
+            QueuedJob {
+                index: 0,
+                residency: Residency::Local(placement("m", 8_000)),
+                job: Box::new(|| panic!("boom in a local wave job")),
+            },
+            QueuedJob { index: 1, residency: Residency::Local(placement("m2", 8_000)), job: ok_job(1, marker.clone()) },
+        ];
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
+        assert_eq!(results.len(), 2, "both local indices accounted for — the panicked one is not dropped");
+        let panicked = results.iter().find(|(i, _)| *i == 0).expect("index 0 present despite the panic");
+        assert!(panicked.1.is_err(), "the panicked local job's index comes back as a terminal Err");
     }
 
     /// A job's own `Err` return (not a panic) is carried through untouched
