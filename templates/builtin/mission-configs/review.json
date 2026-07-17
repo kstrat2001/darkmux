@@ -70,6 +70,11 @@
       "required": false
     },
     {
+      "name": "passes",
+      "description": "(#1266) The judge seat's consensus DEPTH (passes) — 1 single / 2 double-confirm / N unanimous. Governs the JUDGE seat only (the sole consumer; the probe/verify seats ignore it). Absent -> the resolver's default (2, double-confirm). Validated `>= 1` at resolution time (a zero-pass judge makes no ruling); lenient on read otherwise (contract 7). Threaded to the already-parameterized `multi_pass_confirm` pass count via `ResolvedSeatStaffing.passes`.",
+      "required": false
+    },
+    {
       "name": "envelope_out",
       "description": "Path to write the full review envelope (pretty JSON). Old flag: `--envelope-out`.",
       "required": false

@@ -127,6 +127,12 @@ pub struct ReviewResourcing {
     pub verify_model: Option<String>,
     /// Probe draws-per-seat override (`k`). `None` => [`DEFAULT_PROBE_K`].
     pub k: Option<u32>,
+    /// (#1266) Judge consensus DEPTH (`passes`) override. `None` =>
+    /// [`DEFAULT_JUDGE_PASSES`] (double-confirm). Governs the JUDGE seat only
+    /// (the sole consumer); the probe/verify seats ignore it. Sourced from the
+    /// `passes` launch input (see `review.json`), validated `>= 1` here at
+    /// resolution time (contract 7 — lenient on read, loud at resolution).
+    pub passes: Option<u32>,
     /// Whether confirmed findings render as a blocking `REQUEST_CHANGES`
     /// review. Defaults to `false` (advisory `COMMENT`).
     pub request_changes: bool,
@@ -226,6 +232,18 @@ pub fn resolve_review_resourcing(
     }
     let probe_k = ov.k.unwrap_or(DEFAULT_PROBE_K);
 
+    // (#1266) Judge consensus depth (`passes`), sourced from config, validated
+    // `>= 1` here — a zero-pass judge would run no judgment at all. Same
+    // surface-never-silently-clamp posture as `k` above (sovereignty #44).
+    if ov.passes == Some(0) {
+        bail!(
+            "darkmux: review resourcing: passes must be >= 1 (got 0) — a zero-pass judge \
+             makes no ruling. Omit passes for the default ({DEFAULT_JUDGE_PASSES}, \
+             double-confirm). (#1266)"
+        );
+    }
+    let judge_passes = ov.passes.unwrap_or(DEFAULT_JUDGE_PASSES);
+
     let mut seats: BTreeMap<String, Vec<ResolvedSeatStaffing>> = BTreeMap::new();
 
     // 3. Probe seat: explicit pins (one staffing each) or one scored staffing.
@@ -273,7 +291,7 @@ pub fn resolve_review_resourcing(
             name: profile_name.clone(),
             pm: judge_pm,
             k: 1,
-            passes: DEFAULT_JUDGE_PASSES,
+            passes: judge_passes,
             max_tokens: None,
             selector: None,
             provenance: Some(judge_prov),
@@ -483,6 +501,43 @@ mod tests {
         let err = resolve_review_resourcing(&reg, &ov).unwrap_err().to_string();
         assert!(err.contains("k must be >= 1"), "got: {err}");
         assert!(err.contains("degenerate"), "names the consequence: {err}");
+    }
+
+    /// (#1266) `passes` sources the judge's consensus depth from config, and
+    /// `passes: 0` is a loud resolution error — never a silent clamp (the same
+    /// surface-never-substitute posture as `k`, sovereignty #44).
+    #[serial_test::serial]
+    #[test]
+    fn passes_zero_errors_loudly_at_resolution() {
+        let _guard = CrewDirGuard::empty();
+        let reg = reg_with("deep", vec![model("a", 40000)]);
+        let ov = ReviewResourcing { passes: Some(0), ..Default::default() };
+        let err = resolve_review_resourcing(&reg, &ov).unwrap_err().to_string();
+        assert!(err.contains("passes must be >= 1"), "got: {err}");
+        assert!(err.contains("no ruling"), "names the consequence: {err}");
+    }
+
+    /// (#1266) An explicit `passes` reaches the JUDGE seat; absent falls back
+    /// to the double-confirm default (2). The probe/verify seats ignore it.
+    #[serial_test::serial]
+    #[test]
+    fn passes_sources_the_judge_consensus_depth_from_config() {
+        let _guard = CrewDirGuard::empty();
+        let reg = reg_with("deep", vec![model("a", 40000)]);
+
+        let three = ReviewResourcing { passes: Some(3), ..Default::default() };
+        let crew = resolve_review_resourcing(&reg, &three).unwrap();
+        assert_eq!(
+            crew.seats.get("review-judge").unwrap()[0].passes, 3,
+            "explicit passes reaches the judge seat"
+        );
+
+        let default = ReviewResourcing::default();
+        let crew = resolve_review_resourcing(&reg, &default).unwrap();
+        assert_eq!(
+            crew.seats.get("review-judge").unwrap()[0].passes, 2,
+            "absent passes falls back to the double-confirm default"
+        );
     }
 
     /// (#44) Every staffing carries its provenance stamp: a scored seat says
