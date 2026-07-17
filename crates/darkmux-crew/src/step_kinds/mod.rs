@@ -43,10 +43,11 @@ mod types;
 
 pub use builtins::{
     parse_failed_verifiers, resolve_local_placement, DispatchInternalStepKind,
-    DispatchSingleShotStepKind, FailedVerifier, ProceduralNoopStepKind, ProceduralShellStepKind,
+    DispatchMapStepKind, DispatchSingleShotStepKind, FailedVerifier, MapItemResult,
+    ProceduralNoopStepKind, ProceduralShellStepKind,
 };
 pub use registry::StepKindRegistry;
-pub use types::{StepKind, StepOutcome};
+pub use types::{MapRemoteBucket, StepKind, StepOutcome, StepRunCtx};
 
 /// Re-exported so callers OUTSIDE this crate (e.g. `darkmux`'s own
 /// `coder_phase` — the `run_step_graph`/`StepKind::residency` caller for

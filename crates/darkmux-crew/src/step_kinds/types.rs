@@ -4,6 +4,133 @@ use crate::types::{Step, Task};
 use anyhow::Result;
 use darkmux_flow::FlowRecord;
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+/// (#1442) One remote-token bucket metering the per-EXECUTION remote
+/// allowance (`DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`, where one
+/// execution = one pipeline stage). Local dispatches never touch it. A
+/// `budget` of 0 is exhausted from the FIRST item (`used (0) >= budget
+/// (0)`), so a zero allowance refuses every hosted call — the same hard
+/// opt-out `admit_remote_execution` gives a single hosted dispatch.
+///
+/// **The ceiling is SOFT (approximate), by construction (#1451 gate).**
+/// Admission is checked BEFORE a call ([`admit`](Self::admit)) and tokens
+/// are spent AFTER it ([`spend`](Self::spend)), so a stage can overshoot
+/// `budget` by at most ONE granted call — the per-item `max_tokens` is
+/// clamped to what the bucket has LEFT ([`remaining`](Self::remaining), gate
+/// C6), which bounds that overshoot to whatever the endpoint itself reports
+/// ABOVE its granted cap. This is deliberate: a per-execution allowance is a
+/// spend GUARDRAIL, not a hard byte gate, and a call's exact cost is
+/// unknowable until it runs.
+///
+/// **Bucket-group semantics (#1442 gate — the highest-stakes carry-forward
+/// of the ship-2b rewiring).** Where it once lived private in `builtins`,
+/// scoped to a SINGLE `dispatch.map` step, the bucket now lives here so the
+/// SCHEDULER can own a `group -> Arc<Mutex<MapRemoteBucket>>` map and hand
+/// the SAME bucket to every sibling step that names a `bucket_group` in its
+/// config (`run_step_graph`). That is what stops `seats x k` sibling
+/// `dispatch.map` probe steps from EACH minting a fresh full per-execution
+/// allowance (which would multiply the effective stage ceiling by the step
+/// count — the "allowance multiplication" the block's own doc named as the
+/// follow-on's obligation). The block stays Tier-1-pure: a `dispatch.map`
+/// step that names NO group still creates its own step-scoped bucket from
+/// the same budget, so grouped and ungrouped both read the one-execution
+/// contract; the caller's `Arc` never becomes a field of the kind itself,
+/// it arrives through the scheduler-supplied [`StepRunCtx`].
+#[derive(Debug)]
+pub struct MapRemoteBucket {
+    budget: u64,
+    used: u64,
+    skipped: u32,
+}
+
+impl MapRemoteBucket {
+    pub(crate) fn new(budget: u64) -> Self {
+        Self { budget, used: 0, skipped: 0 }
+    }
+    pub(crate) fn exhausted(&self) -> bool {
+        self.used >= self.budget
+    }
+    /// What is left to grant a single call (#1442 gate C6): per-item
+    /// `max_tokens` clamps to THIS, not the full budget, so one late item
+    /// cannot request more than the bucket has left.
+    pub(crate) fn remaining(&self) -> u64 {
+        self.budget.saturating_sub(self.used)
+    }
+    /// `false` ⇒ the bucket is exhausted and this item's call must not fire
+    /// (counted as skipped, for the item's named-reason result).
+    pub(crate) fn admit(&mut self) -> bool {
+        if self.exhausted() {
+            self.skipped += 1;
+            false
+        } else {
+            true
+        }
+    }
+    pub(crate) fn spend(&mut self, tokens: u64) {
+        self.used = self.used.saturating_add(tokens);
+    }
+    /// Count of calls refused because the bucket was exhausted — read by
+    /// tests asserting the skip path fired.
+    #[cfg(test)]
+    pub(crate) fn skipped(&self) -> u32 {
+        self.skipped
+    }
+}
+
+/// (#1442) The execution context the SCHEDULER supplies to each step's
+/// [`StepKind::run_streaming`] — two seams that must originate OUTSIDE the
+/// step (so the step kind holds no caller `Arc` of its own and stays
+/// tier-pure):
+///
+/// 1. **Live emitter (#1442 gate C3, "no blind runs").** A channel back to
+///    the scheduler's own emission seam. A step that produces per-item
+///    records mid-run sends them through [`StepRunCtx::emit`] so they reach
+///    the flow stream LIVE — before the step completes — instead of
+///    batching into [`StepOutcome::flow_records`] at wave-drain. The step
+///    NEVER touches the global flow sink directly: the scheduler owns the
+///    sink (and the lab/fleet boundary that picks WHICH sink), so routing
+///    through this channel preserves that boundary.
+/// 2. **Scheduler-supplied shared remote bucket (#1442).** When a step
+///    names a `bucket_group`, the scheduler resolves the group's shared
+///    [`MapRemoteBucket`] and hands it here; sibling steps of the same group
+///    meter one allowance BETWEEN them. `None` when the step named no group
+///    (the kind falls back to a step-scoped bucket).
+pub struct StepRunCtx {
+    emitter: Option<std::sync::mpsc::Sender<FlowRecord>>,
+    remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
+}
+
+impl StepRunCtx {
+    pub(crate) fn new(
+        emitter: Option<std::sync::mpsc::Sender<FlowRecord>>,
+        remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
+    ) -> Self {
+        Self { emitter, remote_bucket }
+    }
+
+    /// Emit one flow record LIVE through the scheduler's emission seam
+    /// (#1442 gate C3). A `None` emitter (a context with no streaming sink —
+    /// e.g. a step kind exercised in a unit test outside the scheduler)
+    /// silently drops it; the kind's batched [`StepOutcome::flow_records`]
+    /// remains the fallback path.
+    pub fn emit(&self, record: FlowRecord) {
+        if let Some(tx) = &self.emitter {
+            // A closed channel (the scheduler stopped draining, e.g. on an
+            // early return) is not a step-level error — the record is best-
+            // effort observability, never load-bearing control flow.
+            let _ = tx.send(record);
+        }
+    }
+
+    /// The scheduler-supplied shared remote-token bucket for this step's
+    /// `bucket_group`, if the step named one. A grouped `dispatch.map` uses
+    /// THIS across its whole collection loop; an ungrouped one gets `None`
+    /// here and creates its own step-scoped bucket.
+    pub fn remote_bucket(&self) -> Option<&Arc<Mutex<MapRemoteBucket>>> {
+        self.remote_bucket.as_ref()
+    }
+}
 
 /// One step kind's completed outcome. `output` becomes the Step's
 /// persisted `Step.output` on success, and is what downstream Steps
@@ -51,6 +178,28 @@ pub struct StepOutcome {
 pub trait StepKind: Send + Sync {
     fn id(&self) -> &'static str;
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome>;
+
+    /// (#1442) The scheduler's ACTUAL entry point — `run` with the
+    /// scheduler-supplied [`StepRunCtx`] (live emitter + shared remote
+    /// bucket) threaded in. Defaults to ignoring the context and delegating
+    /// to [`StepKind::run`], so every existing kind keeps its exact behavior
+    /// (records batched into [`StepOutcome::flow_records`], a step-scoped
+    /// bucket) with no change. A kind that wants LIVE per-item emission or a
+    /// scheduler-shared `bucket_group` (`dispatch.map`) overrides THIS and
+    /// leaves `run` as the ctx-free path unit tests still drive directly.
+    ///
+    /// The context is Arc/channel-backed and `Send` so it crosses the
+    /// `run_bounded` worker-thread boundary alongside the job closure.
+    fn run_streaming(
+        &self,
+        step: &Step,
+        task: &Task,
+        input: &BTreeMap<String, String>,
+        ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let _ = ctx;
+        self.run(step, task, input)
+    }
 
     /// (#1402) A short, human-facing name for this kind — the graph lens,
     /// the viewer's mission drill-down, and `mission status` all render

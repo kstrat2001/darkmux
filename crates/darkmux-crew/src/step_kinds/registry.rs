@@ -7,8 +7,8 @@
 //! doc on `step_kinds` for why.
 
 use super::builtins::{
-    DispatchInternalStepKind, DispatchSingleShotStepKind, ProceduralNoopStepKind,
-    ProceduralShellStepKind,
+    DispatchInternalStepKind, DispatchMapStepKind, DispatchSingleShotStepKind,
+    ProceduralNoopStepKind, ProceduralShellStepKind,
 };
 use super::types::StepKind;
 use anyhow::{anyhow, Result};
@@ -43,6 +43,11 @@ impl StepKindRegistry {
             .expect("built-in step kind ids are unique by construction");
         registry
             .register(Arc::new(ProceduralNoopStepKind))
+            .expect("built-in step kind ids are unique by construction");
+        // (#1442) The generic map block — one single-shot per item of a
+        // runtime collection. Tier 1: config-driven, no caller strategy.
+        registry
+            .register(Arc::new(DispatchMapStepKind))
             .expect("built-in step kind ids are unique by construction");
         registry
     }
@@ -202,11 +207,12 @@ mod tests {
     }
 
     #[test]
-    fn with_builtins_registers_all_four() {
+    fn with_builtins_registers_every_tier1_kind() {
         let registry = StepKindRegistry::with_builtins();
         for id in [
             "dispatch.internal",
             "dispatch.single_shot",
+            "dispatch.map",
             "procedural.shell",
             "procedural.noop",
         ] {
@@ -228,12 +234,13 @@ mod tests {
     }
 
     #[test]
-    fn with_builtins_ids_matches_the_four_known_tier_1_kinds() {
+    fn with_builtins_ids_matches_the_known_tier_1_kinds() {
         let registry = StepKindRegistry::with_builtins();
         assert_eq!(
             registry.ids(),
             vec![
                 "dispatch.internal".to_string(),
+                "dispatch.map".to_string(),
                 "dispatch.single_shot".to_string(),
                 "procedural.noop".to_string(),
                 "procedural.shell".to_string(),
