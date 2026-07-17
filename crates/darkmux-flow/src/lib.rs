@@ -2434,9 +2434,13 @@ mod tests {
         //           funnel.ruling. Minor + additive — older readers ignore
         //           the unknown actions; no struct/field change.
         //   (code-internal, no FLOW_SCHEMA_VERSION bump) — #1349: the above
-        //           three actions renamed review.task/review.step/review.ruling
-        //           (module renamed funnel -> review; see schema.rs's fuller
-        //           changelog entry). Action STRING only, same payload shapes.
+        //           three actions renamed to the review.{task,step,ruling}
+        //           family (module renamed funnel -> review; see schema.rs's
+        //           fuller changelog entry). Action STRING only, same payloads.
+        //   (code-internal, no FLOW_SCHEMA_VERSION bump) — #1434: that review
+        //           task/step/ruling vocabulary is RETIRED — both review paths
+        //           now emit only the generic `step result` companion. Records
+        //           are per-run-local/ephemeral, so no bump, no migration.
         assert_eq!(FLOW_SCHEMA_VERSION, "1.17.0");
     }
 

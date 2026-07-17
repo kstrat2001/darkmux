@@ -59,60 +59,49 @@
 //!
 //! ## Flow-record emission (#1247 Part 1)
 //!
-//! (#1355/#1357 update: this section describes the vocabulary
-//! [`run_judge_only`]/`finish_review` still emit via [`ReviewRunGuard`] — the
-//! `--charges-file` re-judge path. The graph path (`run_review_graph`) emits
-//! a DIFFERENT, simpler vocabulary — the scheduler's generic `step start`/
-//! `step complete`/`step error` records plus this module's own
-//! `emit_review_step_result` ("step result") records — never `review.task`/
-//! `review.step`/`review.ruling`; see `run_review_graph`'s own doc for why.)
+//! (#1434 update: the sequential `--charges-file` re-judge driver
+//! [`run_judge_only`]/`finish_review` now emits the SAME generic
+//! `step result` vocabulary the graph path (`run_review_graph`) emits — via
+//! [`emit_review_step_result`], through the run's [`ReviewObs`] helper. The
+//! bespoke per-run task/step/ruling `review.*` action vocabulary and the
+//! run-guard that emitted it were retired: exactly one record vocabulary now
+//! exists across BOTH review paths. Run-level liveness is the caller's
+//! `with_dispatch_bookends` `dispatch start`/`dispatch complete`/`dispatch
+//! error` wrap (`src/mission_launch_review.rs`, brackets both paths) — never
+//! a review-scoped task bookend from inside the driver, per contract 2 /
+//! #1349.)
 //!
-//! The driver (`run_judge_only`/`finish_review`) emits
-//! [`darkmux_flow::FlowRecord`]s through a
-//! caller-injected [`ReviewEmitter`] — same injection discipline as `chat`/
-//! `cycler` above, so a scripted test can assert the exact record SEQUENCE
-//! via a recording mock. The driver is deliberately SINK-AGNOSTIC: it never
-//! calls `darkmux_flow::record` itself and has no idea whether the records
-//! land on the real engagement-scoped flow stream or a per-run-local file —
-//! that choice belongs to the caller (`darkmux mission launch review` wires
-//! the real stream; `darkmux lab review-bench --review` wires a per-run-local JSONL
-//! file, per the lab-vs-fleet scope boundary — a bench's hundreds of
-//! per-flag ruling records must never spam an operator's engagement
-//! stream). Three action families, vocabulary aligned with #1230/#1240's
-//! Mission → Phase → Task → Step hierarchy so the records forward-port to
-//! the generic mission-flow graph view unchanged:
+//! The driver emits [`darkmux_flow::FlowRecord`]s through a caller-injected
+//! [`ReviewEmitter`] — same injection discipline as `chat`/`cycler` above,
+//! so a scripted test can assert the exact record SEQUENCE via a recording
+//! mock. The driver is deliberately SINK-AGNOSTIC: it has no idea whether
+//! the records land on the real engagement-scoped flow stream or a
+//! per-run-local file — that choice belongs to the caller (`darkmux mission
+//! launch review` wires the real stream via `FleetFlowEmitter`, per the
+//! lab-vs-fleet scope boundary — a bench's hundreds of per-flag ruling
+//! records must never spam an operator's engagement stream). One action
+//! family — the generic `step result` record ([`emit_review_step_result`],
+//! `action = "step result"`, `handle = step_id`, `session_id = case_id`),
+//! with a `kind` field distinguishing which review step produced it, aligned
+//! with #1230/#1240's Mission → Phase → Task → Step hierarchy so the records
+//! forward-port to the generic mission-flow graph view unchanged:
 //!
-//! - `review.task` — one review RUN's bookends (`payload.status` = `started`
-//!   | `finished` | `error`): case id, crew, exec mode, bundle count on
-//!   start; confirmed/needs_check/archived counts + `degenerate` reason
-//!   (when set) on finish. `error` is the [`ReviewRunGuard`]'s Drop-path
-//!   terminal record — emitted when the driver `?`-returns or panics after
-//!   `started`, so no consumer ever sees an orphaned, perpetually-in-flight
-//!   run (the same guarantee `darkmux-crew`'s `DispatchBookendGuard`, #717,
-//!   gives `dispatch.start`).
-//! - `review.step` — a step transition, payload shape matching #1230's
-//!   named substrate exactly: `{step_id, kind: "procedural"|"dispatch",
-//!   items_in, items_out, status: "started"|"finished", wall_ms}` (plus
-//!   `status: "error"` from the guard's Drop path, closing any step still
-//!   open at an abort — innermost-first, so start/terminal pairing holds on
-//!   every path).
-//!   `step_id` is `bundle` | `probe` | `probe:<staffing-name>` (one per
-//!   probe seat — a future graph engine renders these as PARALLEL sibling
-//!   steps under `probe`, #1230's parallel-step vision) | `dedup` |
-//!   `judge-pass1` | `judge-pass2`. Seat-level (`probe:*`) records carry
-//!   extra `model`/`draws_done`/`draws_total`/`tokens` fields. A `confirmed`
-//!   pass-1 gets its pass-2 ruling immediately, interleaved within the SAME
-//!   per-flag judge loop as pass-1 — so `judge-pass2`'s `started` record
-//!   opens the moment the FIRST pass-2 ruling actually fires (`items_in` is
-//!   the running count at that point, not the final docket size), rather
-//!   than waiting for the whole loop to finish. Opening it late let a live
-//!   observer see `review.ruling{pass:2}` records stream in while the
-//!   `judge-pass2` step still read "not started" — a real contradiction
-//!   caught live in the lab lens. `finished` closes once the loop
-//!   completes, carrying the real final docket size and elapsed `wall_ms`.
-//! - `review.ruling` — the live ticker: one record per judge ruling (every
-//!   pass-1, plus pass-2 when it ran) with `bundle_id`/`pass`/`ruling`/
-//!   `seconds`.
+//! - `kind = "review.bundle"` — the bundle step's completion (`items_out` =
+//!   the resolved bundle count).
+//! - `kind = "review.dedup"` — dedup completion (`items_in`/`items_out`/
+//!   `wall_ms`).
+//! - `kind = "review.judge"`, `step_id = "review-ruling"` — the live judge
+//!   ticker: one record per judge ruling (every pass-1, plus the decisive
+//!   later pass when it ran) with `bundle_id`/`pass`/`ruling`/`seconds`.
+//! - `kind = "review.judge"`, `step_id = "judge"` — the judge stage's single
+//!   completion record (`items_in`/`items_out`/`wall_ms`, plus
+//!   `pass1_wall_ms`/`pass2_wall_ms`/`model`/`tokens`/`calls`/
+//!   `dispatch_errors`/`served_model`), matching the graph judge kind's shape.
+//! - `kind = "review.verify"`, `step_id = "review-ruling"` — per-adjudication
+//!   verify ticker (`bundle_id`/`stage`/`ruling`/`seconds`).
+//! - `kind = "review.verify"`, `step_id = "verify"` — the verify stage's
+//!   single completion record (`items_in`/`items_out`/`wall_ms`/`model`/
+//!   `tokens`/`calls`/`remote`/`endpoint`/`served_model`).
 //!
 //! Emission happens ONLY in the driver — never inside the pure protocol
 //! functions (`dedup_flags`, `mechanism_family`, `parse_judge_ruling`,
@@ -123,9 +112,9 @@
 //! ## Host telemetry sampling (#1247 doctrine surface — "No blind runs")
 //!
 //! `run_review_graph`/`run_judge_only` also start a background host cpu/ram/gpu
-//! sampler for the run's whole lifetime — see [`ReviewRunGuard`] and
+//! sampler for the run's whole lifetime — see [`ReviewObs`] and
 //! [`HostTelemetrySampler`]. Samples emit as `telemetry.process` records
-//! through the SAME injected [`ReviewEmitter`] the `review.*` action family
+//! through the SAME injected [`ReviewEmitter`] the `step result` action family
 //! above uses (so a bench run's samples stay per-run-local and a
 //! `mission launch review`'s samples ride the fleet stream, same split), with the
 //! identical field shape `darkmux_crew::dispatch_internal`'s always-on
@@ -359,7 +348,7 @@ pub struct MemberRecord {
 /// One pipeline step's in/out counts + wall time — the issue #1230 bridge:
 /// a future flow-record consumer can render the review as a step timeline
 /// without re-deriving it from the envelope's nested arrays. Realized by
-/// the `review.step` flow record (#1247 Part 1, see the module doc) — the
+/// the `step result` flow record (#1247 Part 1, see the module doc) — the
 /// live-run counterpart of this end-of-run summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecord {
@@ -393,86 +382,6 @@ impl ReviewEmitter for NullEmitter {
     fn emit(&mut self, _record: darkmux_flow::FlowRecord) {}
 }
 
-const REVIEW_TASK_ACTION: &str = "review.task";
-const REVIEW_STEP_ACTION: &str = "review.step";
-const REVIEW_RULING_ACTION: &str = "review.ruling";
-
-/// Build one review observability record. `handle` = the crew name (this
-/// review's addressable identity, the role `handle` plays for `crew
-/// dispatch`'s per-role records); `session_id` = the case id (one review
-/// RUN's identity, the role `session_id` plays for a single dispatch).
-/// `source = "review"` distinguishes these from `crew_dispatch`/
-/// `phase_review` records that may share the same sink. `category = Work`
-/// / `tier = Local` / `stage = Dispatch` mirror `dispatch`'s own
-/// per-turn records (`dispatch.tool`, `dispatch.turn`) — the review is,
-/// mechanically, a multi-dispatch alternative shape of the same "produce a
-/// local review" job.
-fn review_flow_record(
-    case_id: &str,
-    crew_name: &str,
-    action: &str,
-    level: darkmux_flow::Level,
-    payload: serde_json::Value,
-) -> darkmux_flow::FlowRecord {
-    darkmux_flow::FlowRecord {
-        ts: darkmux_flow::ts_utc_now(),
-        level,
-        category: darkmux_flow::Category::Work,
-        tier: darkmux_flow::Tier::Local,
-        stage: darkmux_flow::Stage::Dispatch,
-        action: action.to_string(),
-        handle: crew_name.to_string(),
-        phase_id: None,
-        session_id: Some(case_id.to_string()),
-        source: Some("review".to_string()),
-        model: None,
-        reasoning: None,
-        mission_id: None,
-        machine_id: None,
-        machine_uid: None,
-        orchestrator: None,
-        prev_hash: None,
-        hash: None,
-        payload: Some(payload),
-        work_id: None,
-        attempt: None,
-    }
-}
-
-/// The `review.task` "finished" record's payload + level, shared by every
-/// return point (`run_review`'s two early degenerate returns,
-/// `run_judge_only`'s one, and `finish_review`'s normal end) so the shape
-/// can't drift between call sites. `Level::Warn` when `env.degenerate` is
-/// set — a degenerate run is a loud, scoreable outcome, never quietly
-/// `Info`.
-fn task_finished_record(env: &ReviewEnvelope) -> darkmux_flow::FlowRecord {
-    let mut payload = json!({
-        "status": "finished",
-        "case_id": env.case_id,
-        "crew": env.crew,
-        "confirmed": env.confirmed,
-        "needs_check": env.needs_check,
-        "archived": env.archived,
-    });
-    if let Some(reason) = &env.degenerate {
-        payload["degenerate"] = serde_json::Value::String(reason.clone());
-    }
-    // (#1260/#1186) Remote-seat tokens, carried separately so downstream
-    // savings surfaces can EXCLUDE them — cloud tokens are never counted
-    // "off the meter". Present iff any seat dispatched remotely.
-    if env.members.iter().any(|m| m.remote) {
-        let remote_tokens: u64 = env.members.iter().filter(|m| m.remote).map(|m| m.total_tokens).sum();
-        payload["remote_tokens"] = remote_tokens.into();
-    }
-    if !env.warnings.is_empty() {
-        payload["warnings"] = serde_json::Value::Array(
-            env.warnings.iter().map(|w| serde_json::Value::String(w.clone())).collect(),
-        );
-    }
-    let level = if env.degenerate.is_some() { darkmux_flow::Level::Warn } else { darkmux_flow::Level::Info };
-    review_flow_record(&env.case_id, &env.crew, REVIEW_TASK_ACTION, level, payload)
-}
-
 // ─── host telemetry sampling (#1247 doctrine surface) ────────────────────
 
 /// Production sample cadence — identical to `dispatch_internal`'s always-on
@@ -503,13 +412,13 @@ const REVIEW_TELEMETRY_POLL: Duration = Duration::from_millis(500);
 /// payload `{cpu, mem, gpu}`), so the run-monitor/viewer code that already
 /// renders `telemetry.process` records applies unchanged. `handle`/
 /// `session_id` carry the crew name / case id — the same identity fields
-/// `review_flow_record` stamps on the `review.*` action family, so a
+/// [`emit_review_step_result`] stamps on the `step result` action family, so a
 /// telemetry record for this run groups with its other records under the
 /// same `session_id`.
 ///
 /// The sampling FUNCTION is injected (`sample_fn`, a plain fn pointer
 /// defaulting to `sample_host` at every production call site — see
-/// [`ReviewRunGuard::new`]) so tests can drive the sampler with an
+/// [`ReviewObs::new`]) so tests can drive the sampler with an
 /// instant fake instead of racing real `top -l 1` subprocess latency
 /// (~600-900ms per call) against a scripted deadline on a shared CI
 /// runner — the same injection discipline as `chat`/`cycler`/`emitter`.
@@ -523,9 +432,10 @@ const REVIEW_TELEMETRY_POLL: Duration = Duration::from_millis(500);
 /// deliberately not wrapped in a `Mutex` (that would force every
 /// `ReviewEmitter` impl and every existing emission call site in this file
 /// through lock-guarded access for a feature this narrow). Instead,
-/// [`ReviewRunGuard`] drains the channel immediately before every
-/// record it already emits (`review.task`/`review.step`/`review.ruling`)
-/// and once more in its own `Drop`, so telemetry interleaves with the
+/// [`ReviewObs`] (the sequential `run_judge_only` path) drains the channel
+/// immediately before every `step result` record it emits, and
+/// `run_review_graph` drains it inside the scheduler's own emit closure,
+/// so telemetry interleaves with the
 /// run's other records close to when it was sampled — never batched at
 /// end-of-run, which is exactly the failure the doctrine calls out
 /// ("per-event records stream durably as they happen").
@@ -657,9 +567,10 @@ impl HostTelemetrySampler {
     }
 
     /// Signal the stop flag and join the thread. Called from `Drop` — the
-    /// RAII tie-in that guarantees no orphaned sampler thread outlives a
-    /// [`ReviewRunGuard`], on every exit path (clean finish, early
-    /// `?`-return, or panic).
+    /// RAII tie-in that guarantees no orphaned sampler thread outlives its
+    /// owner ([`ReviewObs`] on the sequential path, `run_review_graph`'s own
+    /// local sampler on the graph path), on every exit path (clean finish,
+    /// early `?`-return, or panic).
     fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
@@ -674,72 +585,38 @@ impl Drop for HostTelemetrySampler {
     }
 }
 
-/// Adapts a [`ReviewEmitter`] to `darkmux_flow`'s generic
-/// [`darkmux_flow::BookendSink`] (#1230 Packet 0) so [`ReviewRunGuard`]
-/// can wrap `darkmux_flow::BookendGuard` without `darkmux-flow` (a
-/// dependency LEAF) knowing this crate's own emitter trait exists. A local
-/// type implementing a foreign trait — no orphan-rule friction.
-struct EmitterSink<'a>(&'a mut dyn ReviewEmitter);
-
-impl darkmux_flow::BookendSink for EmitterSink<'_> {
-    fn emit(&mut self, record: darkmux_flow::FlowRecord) {
-        self.0.emit(record);
-    }
-}
-
-/// (#1247 review round, unified onto `darkmux_flow::BookendGuard` in #1230
-/// Packet 0) Bookend guard for the review's flow-record lifecycle — same
-/// class of problem `darkmux-crew`'s `DispatchBookendGuard` (#717) solves
-/// for `dispatch.start`: once `review.task started` is emitted, the driver
-/// can still `?`-return before the clean `finished` bookend (a probe
-/// dispatch error, a cycler load/release failure) — or panic. Without a
-/// terminal record that leaves an orphaned task (rendering as perpetually
-/// in-flight to any consumer) plus whatever step-`started` records were
-/// open at the abort point.
+/// (#1434) Run-observability helper for the sequential `run_judge_only`
+/// path (the `--charges-file` re-judge). Emits the SAME generic
+/// `step result` records `run_review_graph`'s step kinds emit (via
+/// [`emit_review_step_result`]) — but through the injected [`ReviewEmitter`]
+/// rather than the global `darkmux_flow::record`, so the sink-agnostic /
+/// lab-vs-fleet-boundary discipline the driver has always kept is preserved
+/// (a bench emitter suppresses; `FleetFlowEmitter` writes the real stream).
 ///
-/// All driver emission routes THROUGH this guard, which delegates the
-/// task/step open-stack bookkeeping to the shared `darkmux_flow::BookendGuard`
-/// (`inner`) — the task itself is pushed as one open unit (`kind == "task"`)
-/// and each step nests inside it as another (`kind` = the step's own kind,
-/// `"dispatch"`/`"procedural"`), so `inner`'s Drop pops every still-open
-/// unit innermost-first (steps before the task) and builds the right
-/// `review.step`- or `review.task`-shaped abort record via its `on_abort`
-/// closure — every `started` gets a matching terminal event, on every path.
-/// The clean finish (`task_finished`, which every success/degenerate return
-/// point calls) closes the task unit, disarming `inner` once the stack
-/// empties — a run that reached its own terminal record is never
-/// double-counted.
+/// It also owns the run's [`HostTelemetrySampler`] (#1247 "no blind runs")
+/// and interleaves its samples with the run's own records: [`Self::drain`]
+/// fires before every `step result` emission (and once more in `Drop`), so
+/// telemetry streams alongside the run rather than batching at the end. The
+/// sampler thread is torn down by [`HostTelemetrySampler`]'s own `Drop`
+/// (a field of this struct, run automatically after `ReviewObs::drop`
+/// returns), so it never outlives the run on any exit path.
 ///
-/// Emission on `Drop` is best-effort by construction — [`ReviewEmitter`]
-/// impls are already infallible (`emit` returns nothing), so a sink problem
-/// can't mask the original error propagating out.
-///
-/// Also owns the run's [`HostTelemetrySampler`] (#1247 doctrine surface):
-/// started in [`Self::new`]/[`Self::new_with_telemetry`] and
-/// stopped by its own `Drop` — which Rust runs automatically as a field of
-/// this struct, right after `ReviewRunGuard`'s own `Drop::drop` body
-/// returns, so the sampler thread never outlives the guard on any exit
-/// path. This telemetry-draining half is genuinely review-specific (it
-/// doesn't belong in `darkmux-flow`) — only the open/close stack moved.
-struct ReviewRunGuard<'a> {
+/// There is deliberately NO task-level liveness bookend here — the caller's
+/// `with_dispatch_bookends` wrap (`src/mission_launch_review.rs`) opens/closes
+/// the canonical `dispatch start`/`dispatch complete`/`dispatch error`
+/// record around the whole `run_judge_only` call (contract 2 / #1349), the
+/// same edge the graph path relies on. A second review-scoped bookend would
+/// be exactly the competing-vocabulary duplication #1349 retired.
+struct ReviewObs<'a> {
     case_id: String,
-    crew: String,
-    inner: darkmux_flow::BookendGuard<'a, EmitterSink<'a>>,
+    emitter: &'a mut dyn ReviewEmitter,
     telemetry: HostTelemetrySampler,
 }
 
-/// The fixed unit id/kind [`ReviewRunGuard::task_started`]/
-/// [`ReviewRunGuard::task_finished`] open/close under — the review has
-/// exactly one task per run, so this is a constant rather than something
-/// derived per-call. `inner`'s `on_abort` closure matches on `kind == this`
-/// to decide whether a still-open unit at Drop time needs a `review.task`-
-/// or `review.step`-shaped abort record.
-const REVIEW_TASK_UNIT_KIND: &str = "task";
-
-impl<'a> ReviewRunGuard<'a> {
-    fn new(sink: &'a mut EmitterSink<'a>, case_id: &str, crew: &str) -> Self {
+impl<'a> ReviewObs<'a> {
+    fn new(emitter: &'a mut dyn ReviewEmitter, case_id: &str, crew: &str) -> Self {
         Self::new_with_telemetry(
-            sink,
+            emitter,
             case_id,
             crew,
             REVIEW_TELEMETRY_INTERVAL,
@@ -749,8 +626,8 @@ impl<'a> ReviewRunGuard<'a> {
         )
     }
 
-    /// Same as [`Self::new`] but with a caller-chosen telemetry cadence
-    /// AND sampling functions — the test-only seam a scripted run uses to
+    /// Same as [`Self::new`] but with a caller-chosen telemetry cadence AND
+    /// sampling functions — the test-only seam a scripted run uses to
     /// observe deterministic samples without a multi-second sleep and
     /// without shelling to the real (macOS-only, ~600-900ms-per-call)
     /// `top`/`vm_stat`/`ioreg` commands, or to the real `lms` CLI.
@@ -758,7 +635,7 @@ impl<'a> ReviewRunGuard<'a> {
     /// [`REVIEW_TELEMETRY_INTERVAL`] and the samplers at the real
     /// `sample_host` / `darkmux_profiles::lms::list_loaded`.
     fn new_with_telemetry(
-        sink: &'a mut EmitterSink<'a>,
+        emitter: &'a mut dyn ReviewEmitter,
         case_id: &str,
         crew: &str,
         telemetry_interval: Duration,
@@ -766,32 +643,6 @@ impl<'a> ReviewRunGuard<'a> {
         sample_fn: fn() -> HostSample,
         lms_fn: fn() -> anyhow::Result<Vec<darkmux_types::LoadedModel>>,
     ) -> Self {
-        let case_id_owned = case_id.to_string();
-        let crew_owned = crew.to_string();
-        let on_abort = move |id: &str, kind: &str| -> darkmux_flow::FlowRecord {
-            if kind == REVIEW_TASK_UNIT_KIND {
-                review_flow_record(
-                    &case_id_owned,
-                    &crew_owned,
-                    REVIEW_TASK_ACTION,
-                    darkmux_flow::Level::Error,
-                    json!({
-                        "status": "error",
-                        "case_id": case_id_owned,
-                        "crew": crew_owned,
-                        "error": "review terminated before completion (early return or panic)",
-                    }),
-                )
-            } else {
-                review_flow_record(
-                    &case_id_owned,
-                    &crew_owned,
-                    REVIEW_STEP_ACTION,
-                    darkmux_flow::Level::Error,
-                    json!({ "step_id": id, "kind": kind, "status": "error" }),
-                )
-            }
-        };
         Self {
             telemetry: HostTelemetrySampler::start(
                 case_id.to_string(),
@@ -802,117 +653,43 @@ impl<'a> ReviewRunGuard<'a> {
                 lms_fn,
             ),
             case_id: case_id.to_string(),
-            crew: crew.to_string(),
-            inner: darkmux_flow::BookendGuard::new(sink, on_abort),
+            emitter,
         }
     }
 
     /// Drain every telemetry sample buffered since the last drain and emit
-    /// each through the same sink the driver's own records go through —
-    /// called immediately before every record this guard emits (see
-    /// [`Self::emit_now`]) so telemetry streams alongside the run rather
+    /// each through the injected emitter — called immediately before every
+    /// `step result` record so telemetry streams alongside the run rather
     /// than batching at the end.
-    fn drain_telemetry(&mut self) {
+    fn drain(&mut self) {
         let records: Vec<darkmux_flow::FlowRecord> = self.telemetry.rx.try_iter().collect();
         for record in records {
-            self.inner.emit_now(record);
+            self.emitter.emit(record);
         }
     }
 
-    /// Drain pending telemetry, then emit `record` with no open/close
-    /// bookend of its own. Every direct emission in this guard routes
-    /// through here so telemetry ordering stays close to wall-clock
-    /// without needing the sampler thread to touch the sink itself.
-    fn emit_now(&mut self, record: darkmux_flow::FlowRecord) {
-        self.drain_telemetry();
-        self.inner.emit_now(record);
-    }
-
-    /// Emit the `review.task started` bookend and ARM the guard — from here
-    /// until `task_finished`, an early return or panic fires the Drop path.
-    fn task_started(&mut self, payload: serde_json::Value) {
-        self.drain_telemetry();
-        let started = review_flow_record(
-            &self.case_id,
-            &self.crew,
-            REVIEW_TASK_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        );
-        self.inner.open(REVIEW_TASK_UNIT_KIND, REVIEW_TASK_UNIT_KIND, started);
-    }
-
-    /// Emit a `review.step` `status: "started"` record and track the step
-    /// as open until [`Self::step_finished`] closes it.
-    fn step_started(&mut self, step_id: &str, kind: &str, payload: serde_json::Value) {
-        self.drain_telemetry();
-        let started = review_flow_record(
-            &self.case_id,
-            &self.crew,
-            REVIEW_STEP_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        );
-        self.inner.open(step_id, kind, started);
-    }
-
-    /// Emit a `review.step` `status: "finished"` record and close the step.
-    /// Also the entry point for one-shot steps that emit `finished` with no
-    /// prior `started` (`bundle`, `dedup` — instantaneous procedural steps);
-    /// the close is then a no-op on the open-step stack.
-    fn step_finished(&mut self, step_id: &str, payload: serde_json::Value) {
-        self.drain_telemetry();
-        let finished = review_flow_record(
-            &self.case_id,
-            &self.crew,
-            REVIEW_STEP_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        );
-        self.inner.close(step_id, finished);
-    }
-
-    /// Emit a `review.ruling` ticker record (no open/close semantics).
-    fn ruling(&mut self, payload: serde_json::Value) {
-        self.emit_now(review_flow_record(
-            &self.case_id,
-            &self.crew,
-            REVIEW_RULING_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        ));
-    }
-
-    /// Emit the terminal `review.task` record for `env` (finished, or
-    /// degenerate-finished — see [`task_finished_record`]) and close the
-    /// task unit: this run reached its own terminal record, so `inner`
-    /// disarms once the stack empties (every real call site already closed
-    /// its own steps before calling this, so the stack is just `[task]`).
-    fn task_finished(&mut self, env: &ReviewEnvelope) {
-        self.drain_telemetry();
-        self.inner.close(REVIEW_TASK_UNIT_KIND, task_finished_record(env));
+    /// Drain pending telemetry, then emit one generic `step result` record —
+    /// the SAME shape [`emit_review_step_result`] builds for the graph path
+    /// (`action = "step result"`, `handle = step_id`, `session_id = case_id`,
+    /// a `kind` field), just routed through the injected emitter.
+    fn step_result(&mut self, kind: &str, step_id: &str, payload: serde_json::Value) {
+        self.drain();
+        self.emitter.emit(review_step_result_record(kind, step_id, &self.case_id, payload));
     }
 }
 
-impl Drop for ReviewRunGuard<'_> {
+impl Drop for ReviewObs<'_> {
     fn drop(&mut self) {
-        // Flush any sample the sampler produced since the last drain — even
-        // on the clean-finish path (`task_finished` already closed `inner`'s
-        // task unit), a sample can land in the brief window between that
-        // drain and this `Drop` running. `inner`'s own Drop (a field of this
-        // struct, run automatically right after this function returns) then
-        // emits abort records for any still-open units through the same
-        // sink if it's still armed. The sampler thread itself stops right
-        // after, via `HostTelemetrySampler`'s own `Drop` (also a field,
-        // torn down last), so it never outlives the guard on any exit path.
+        // Flush any sample the sampler produced since the last drain. The
+        // sampler thread itself stops right after, via
+        // `HostTelemetrySampler`'s own `Drop` (a field, torn down after this
+        // body returns), so it never outlives the run on any exit path.
         //
         // Known, accepted loss window: a sample the sampler thread sends
-        // AFTER this final drain but BEFORE the join in the sampler's
-        // `Drop` completes is dropped with the channel — at most one
-        // final-tick sample, consistent with the sampler's best-effort
-        // framing (telemetry never blocks or extends teardown to chase
-        // one more data point).
-        self.drain_telemetry();
+        // AFTER this final drain but BEFORE the join in the sampler's `Drop`
+        // completes is dropped with the channel — at most one final-tick
+        // sample, consistent with the sampler's best-effort framing.
+        self.drain();
     }
 }
 
@@ -961,7 +738,7 @@ pub struct ReviewEnvelope {
     /// `Option` (not a bare `Default`) so pre-#1247 envelopes deserialize
     /// as `None` rather than a misleadingly-empty snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub staffing: Option<CrewStaffingSnapshot>,
+    pub staffing: Option<StaffingSnapshot>,
     /// (#1260) Non-fatal run findings the operator should read — e.g. a
     /// remote probe seat failing after bounded retries (reduced coverage)
     /// or the probe stage's remote token budget exhausting. Empty on a
@@ -1094,7 +871,7 @@ fn seat_endpoint(pm: &ProfileModel) -> Option<&ModelEndpoint> {
 /// One seat staffing's resolved config, snapshotted as ACTUALLY used —
 /// see [`ReviewEnvelope::staffing`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StaffingSnapshot {
+pub struct SeatStaffingSnapshot {
     pub name: String,
     /// The darkmux-namespaced LMStudio identifier for a LOCAL seat; the
     /// profile's bare model id for a REMOTE one — the same form
@@ -1150,14 +927,14 @@ pub struct StaffingSnapshot {
 /// staffings) + `review-judge` (exactly one) + the optional `review-verify`
 /// seat (#1260). See [`ReviewEnvelope::staffing`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CrewStaffingSnapshot {
-    pub probes: Vec<StaffingSnapshot>,
-    pub judge: Option<StaffingSnapshot>,
+pub struct StaffingSnapshot {
+    pub probes: Vec<SeatStaffingSnapshot>,
+    pub judge: Option<SeatStaffingSnapshot>,
     /// (#1260) Present iff the crew declares the `review-verify` seat —
     /// absent (and never serialized) otherwise, so pre-#1260 snapshots
     /// round-trip unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify: Option<StaffingSnapshot>,
+    pub verify: Option<SeatStaffingSnapshot>,
     /// (#1302) The crew's resolved `request_changes` flag — snapshotted so the
     /// render path reads the run's own blocking-vs-advisory choice from its
     /// self-describing artifact, and a serialized envelope re-rendered later
@@ -1168,7 +945,7 @@ pub struct CrewStaffingSnapshot {
     pub request_changes: bool,
 }
 
-/// (#1266) Snapshot default for `StaffingSnapshot::passes` — 2 (double-
+/// (#1266) Snapshot default for `SeatStaffingSnapshot::passes` — 2 (double-
 /// confirm), so a pre-1.3 envelope missing the field reads as today's judge.
 fn default_snapshot_passes() -> u32 {
     2
@@ -1179,9 +956,9 @@ pub fn staffing_snapshot(
     judge: &ResolvedSeatStaffing,
     verify: Option<&ResolvedSeatStaffing>,
     request_changes: bool,
-) -> CrewStaffingSnapshot {
-    fn one(s: &ResolvedSeatStaffing) -> StaffingSnapshot {
-        StaffingSnapshot {
+) -> StaffingSnapshot {
+    fn one(s: &ResolvedSeatStaffing) -> SeatStaffingSnapshot {
+        SeatStaffingSnapshot {
             name: s.name.clone(),
             model: seat_identifier(&s.pm),
             remote: s.pm.is_remote(),
@@ -1195,12 +972,12 @@ pub fn staffing_snapshot(
             provenance: s.provenance.clone(),
         }
     }
-    CrewStaffingSnapshot {
+    StaffingSnapshot {
         probes: probes.iter().map(one).collect(),
         judge: Some(one(judge)),
         verify: verify.map(one),
         // (#1302) The run's blocking-vs-advisory choice, snapshotted for the
-        // render path (see `CrewStaffingSnapshot::request_changes`).
+        // render path (see `StaffingSnapshot::request_changes`).
         request_changes,
     }
 }
@@ -2367,53 +2144,12 @@ fn probe_user_message(prior: &str, bundle: &BundleInput) -> String {
     parts.join("\n")
 }
 
-/// One probe draw, retried once on empty content, then skipped (empty
-/// `content` in the return) — never recorded as a flag. A dispatch-level
-/// `Err` propagates immediately (the shared single-shot primitive already
-/// carries its own backoff/retry — a second-guessing retry here would be
-/// redundant AND would hide a real infra problem behind a "skipped" label).
-///
-/// (#1260) The `u64` is the tokens billed across EVERY attempt this draw
-/// made, returned regardless of whether the content came back empty. Hosted
-/// reasoning models legitimately burn the full completion budget thinking
-/// and return empty content (see `dispatch_internal`'s reasoning-guillotine
-/// lesson) — that spend is REAL and billed, so the caller must bill it into
-/// the remote bucket + member accounting even on the empty (`None`) outcome,
-/// exactly as the judge/verify retry paths bill both attempts (`t1 + t2`).
-fn probe_one_draw(
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-    model: &str,
-    system: &str,
-    user: &str,
-    max_tokens: u32,
-    endpoint: Option<&ModelEndpoint>,
-) -> Result<(Option<String>, u64, Option<String>)> {
-    let mut tokens = 0u64;
-    let mut served: Option<String> = None;
-    for _ in 0..2 {
-        let call = ChatCall {
-            model,
-            system,
-            user,
-            temperature: PROBE_TEMPERATURE,
-            max_tokens,
-            endpoint,
-        };
-        let reply = chat(&call)?;
-        tokens += reply.total_tokens.unwrap_or(0);
-        // (#1300 QA follow-up) LMStudio's response ALSO carries a `model`
-        // field (it's OpenAI-compatible) — gate on `endpoint.is_some()` so a
-        // local seat's `served_model` stays `None` by construction, never by
-        // coincidence of what LMStudio happens to echo back. `lms ps` is the
-        // only ground truth for local dispatch; the response body is not.
-        served = if endpoint.is_some() { reply.model.clone() } else { None };
-        let trimmed = reply.content.trim();
-        if !trimmed.is_empty() {
-            return Ok((Some(trimmed.to_string()), tokens, served));
-        }
-    }
-    Ok((None, tokens, served))
-}
+// (#1442 ship-2b) `probe_one_draw` retired: the probe stage's per-draw
+// dispatch + retry-on-empty loop now lives in the generic `dispatch.map`
+// block (`darkmux-crew`'s `map_local_item`/`map_hosted_item`, with
+// `retry_on_empty: 1` carrying the historical single retry). Its unit
+// coverage's successors are the `dispatch_map_retry_on_empty_*` suite in
+// `darkmux-crew::step_kinds::builtins`.
 
 // ─── judge phase (double-confirm) ─────────────────────────────────────────
 
@@ -2791,6 +2527,12 @@ fn judge_one_flag(
 /// failure is recorded as [`VerifyRuling::Error`] with the reason in the
 /// note, never propagated (one bad adjudication must not abort the run;
 /// the flag then keeps its manual-verification marker downstream).
+/// The returned `bool` is `content_empty` — whether the reply's trimmed
+/// content came back empty (the ONLY condition [`verify_pass_with_retry`]
+/// re-dispatches on, matching the graph path's `dispatch.map`
+/// `retry_on_empty`). A dispatch `Err` reports `content_empty = false`: an
+/// infra failure is isolated, never retried (the same policy `map_local_item`
+/// applies to a dispatch `Err`).
 fn run_verify_pass(
     model: &str,
     system: &str,
@@ -2798,7 +2540,7 @@ fn run_verify_pass(
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-) -> (VerifyRecord, u64, Option<String>) {
+) -> (VerifyRecord, u64, Option<String>, bool) {
     let t0 = Instant::now();
     let call = ChatCall {
         model,
@@ -2812,6 +2554,7 @@ fn run_verify_pass(
         Ok(reply) => {
             let seconds = t0.elapsed().as_secs_f64();
             let tokens = reply.total_tokens.unwrap_or(0);
+            let content_empty = reply.content.trim().is_empty();
             // (#1300 QA follow-up) Gated on `endpoint.is_some()` — see
             // `run_judge_pass`'s identical comment; LMStudio's response is
             // also OpenAI-compatible and carries a `model` field.
@@ -2821,6 +2564,7 @@ fn run_verify_pass(
                     VerifyRecord { ruling, decisive_evidence, note_for_author, seconds, model: model.to_string() },
                     tokens,
                     served,
+                    content_empty,
                 ),
                 None => (
                     VerifyRecord {
@@ -2832,6 +2576,7 @@ fn run_verify_pass(
                     },
                     tokens,
                     served,
+                    content_empty,
                 ),
             }
         }
@@ -2845,14 +2590,27 @@ fn run_verify_pass(
             },
             0,
             None,
+            false,
         ),
     }
 }
 
-/// One verify adjudication, retried ONCE on [`VerifyRuling::Unparsed`] —
-/// the same retry discipline as [`judge_pass_with_retry`]. Returns the
-/// surviving record plus token/call accounting for BOTH attempts, plus
-/// (#1300) the served model reported by whichever attempt survives.
+/// One verify adjudication, retried ONCE on an EMPTY-content reply — the SAME
+/// retry semantics the graph path's `dispatch.map` applies (`retry_on_empty:
+/// 1`, set in `build_review_graph`). Returns the surviving record plus
+/// token/call accounting for BOTH attempts, plus (#1300) the served model
+/// reported by whichever attempt survives.
+///
+/// (#1442) The historical unparsed-RETRY retired here: a non-empty but
+/// UNPARSEABLE reply is now recorded as [`VerifyRuling::Unparsed`] on the
+/// FIRST attempt (no re-dispatch), and its finding stays `Confirmed` with the
+/// manual-verification marker downstream. That aligns the sequential
+/// `--charges-file` path (`run_verify_stage` → here) with the graph path,
+/// which — since the probe/verify stages retired onto the generic
+/// `dispatch.map` block — only ever re-dispatches an EMPTY reply, never an
+/// unparseable non-empty one. Two verify paths that diverged on this is the
+/// #1373-class drift the shared-semantics discipline exists to prevent (an
+/// operator-decided alignment, operator-veto-flagged).
 fn verify_pass_with_retry(
     model: &str,
     system: &str,
@@ -2861,9 +2619,13 @@ fn verify_pass_with_retry(
     endpoint: Option<&ModelEndpoint>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
 ) -> (VerifyRecord, u64, u32, Option<String>) {
-    let (r1, t1, served1) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
-    if r1.ruling == VerifyRuling::Unparsed {
-        let (r2, t2, served2) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
+    let (r1, t1, served1, empty1) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
+    if empty1 {
+        // Empty reply — re-dispatch ONCE (retry_on_empty: 1 parity). The
+        // second attempt's record is kept regardless of what it returns
+        // (a second empty stays the honest inconclusive result), and tokens
+        // are billed across BOTH attempts.
+        let (r2, t2, served2, _empty2) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
         (r2, t1 + t2, 2, served2.or(served1))
     } else {
         (r1, t1, 1, served1)
@@ -2886,9 +2648,12 @@ fn verify_pass_with_retry(
 /// to today. Zero confirms ⇒ no stage at all (no dispatch, no records).
 /// The stage is its own EXECUTION for the remote token bucket; exhausting
 /// it is load-bearing (degraded run — see the caller in `finish_review`).
-/// Emits its own `review.step`/`review.ruling` records under `step_id =
-/// "verify"` through the same bookend guard (contract 2 — the stage runs
-/// inside the run's existing liveness envelope).
+/// Emits its own `step result` records (the graph verify kind's shape —
+/// `kind = "review.verify"`, per-adjudication `step_id = "review-ruling"`
+/// records plus one completion `step_id = "verify"`) through the run's
+/// [`ReviewObs`]. Run-level liveness is the caller's `with_dispatch_bookends`
+/// wrap (contract 2 — the stage runs inside the run's existing dispatch
+/// envelope), not a review-scoped bookend here.
 /// (#1373 gates a/c, verify half) The verify stage's remote-budget
 /// exhaustion warning + budget row — the SAME decision `run_verify_stage`
 /// (`finish_review`'s path, via `run_judge_only`) has always applied,
@@ -2932,7 +2697,7 @@ fn run_verify_stage(
     vstaff: &ResolvedSeatStaffing,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    guard: &mut ReviewRunGuard<'_>,
+    obs: &mut ReviewObs<'_>,
 ) -> Result<()> {
     let docket = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
     if docket == 0 {
@@ -2947,15 +2712,6 @@ fn run_verify_stage(
     if !vstaff.pm.is_remote() {
         cycler.ensure_loaded(&vstaff.pm)?;
     }
-    let mut started = json!({
-        "step_id": "verify", "kind": "dispatch", "status": "started",
-        "items_in": docket, "items_out": 0, "wall_ms": 0, "model": identifier,
-    });
-    if let Some(host) = &endpoint_host {
-        started["remote"] = true.into();
-        started["endpoint"] = host.clone().into();
-    }
-    guard.step_started("verify", "dispatch", started);
 
     let t0 = Instant::now();
     let mut calls = 0u32;
@@ -3004,10 +2760,14 @@ fn run_verify_stage(
         if served_model.is_none() {
             served_model = served;
         }
-        guard.ruling(json!({
-            "bundle_id": j.flag.bundle_id, "stage": "verify",
-            "ruling": record.ruling, "seconds": record.seconds,
-        }));
+        obs.step_result(
+            "review.verify",
+            "review-ruling",
+            json!({
+                "bundle_id": j.flag.bundle_id, "stage": "verify",
+                "ruling": record.ruling, "seconds": record.seconds,
+            }),
+        );
         if record.ruling == VerifyRuling::Refuted {
             j.tier = Tier::Archived;
             j.demoted_by_verify = true;
@@ -3027,7 +2787,7 @@ fn run_verify_stage(
         total_tokens: tokens,
         remote: endpoint.is_some(),
         endpoint: endpoint_host.clone(),
-        served_model,
+        served_model: served_model.clone(),
     });
     env.steps.push(StepRecord {
         step_id: "verify".to_string(),
@@ -3036,16 +2796,17 @@ fn run_verify_stage(
         items_out: docket,
         wall_ms,
     });
-    let mut finished = json!({
-        "step_id": "verify", "kind": "dispatch", "status": "finished",
-        "items_in": docket, "items_out": docket, "wall_ms": wall_ms,
-        "model": identifier, "tokens": tokens,
-    });
-    if let Some(host) = &endpoint_host {
-        finished["remote"] = true.into();
-        finished["endpoint"] = host.clone().into();
-    }
-    guard.step_finished("verify", finished);
+    // The verify stage's single completion record — the SAME shape the graph
+    // path's `ReviewVerifyStepKind` emits (#1434).
+    obs.step_result(
+        "review.verify",
+        "verify",
+        json!({
+            "items_in": docket, "items_out": docket, "wall_ms": wall_ms,
+            "model": identifier, "tokens": tokens, "calls": calls,
+            "remote": endpoint.is_some(), "endpoint": endpoint_host, "served_model": served_model,
+        }),
+    );
 
     // (#1373 gates a/c) Shared with the graph path's `ReviewVerifyStepKind`
     // — see `verify_budget_outcome`'s own doc. NEVER sets run-level
@@ -3167,7 +2928,7 @@ fn finish_review(
     verify: Option<&ResolvedSeatStaffing>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    guard: &mut ReviewRunGuard<'_>,
+    obs: &mut ReviewObs<'_>,
 ) -> Result<ReviewEnvelope> {
     env.raw_flags = raw_flags.len();
 
@@ -3181,12 +2942,10 @@ fn finish_review(
         items_out: deduped.len(),
         wall_ms: dedup_ms,
     });
-    guard.step_finished(
+    obs.step_result(
+        "review.dedup",
         "dedup",
-        json!({
-            "step_id": "dedup", "kind": "procedural", "status": "finished",
-            "items_in": env.raw_flags, "items_out": deduped.len(), "wall_ms": dedup_ms,
-        }),
+        json!({ "items_in": env.raw_flags, "items_out": deduped.len(), "wall_ms": dedup_ms }),
     );
     env.deduped_flags = deduped.len();
 
@@ -3204,14 +2963,6 @@ fn finish_review(
     if !judge.pm.is_remote() {
         cycler.ensure_loaded(&judge.pm)?;
     }
-    guard.step_started(
-        "judge-pass1",
-        "dispatch",
-        json!({
-            "step_id": "judge-pass1", "kind": "dispatch", "status": "started",
-            "items_in": deduped.len(), "items_out": 0, "wall_ms": 0,
-        }),
-    );
     let mut judged = Vec::with_capacity(deduped.len());
     let mut pass1_ms = 0u64;
     let mut pass2_ms = 0u64;
@@ -3250,43 +3001,31 @@ fn finish_review(
         }
         pass1_ms += outcome.pass1_ms;
         pass2_ms += outcome.pass2_ms;
-        // The per-ruling ticker (#1247 Part 1) — one record per judge
-        // dispatch outcome, emitted BEFORE `outcome`'s fields move into the
-        // `JudgedFlag` below.
-        guard.ruling(json!({
-            "bundle_id": flag.bundle_id, "pass": 1,
-            "ruling": outcome.pass1.ruling, "seconds": outcome.pass1.seconds,
-        }));
+        // The per-ruling ticker (#1247 Part 1) — one `step result` record per
+        // judge dispatch outcome (the graph judge kind's `step_id =
+        // "review-ruling"` shape, #1434), emitted BEFORE `outcome`'s fields
+        // move into the `JudgedFlag` below.
+        obs.step_result(
+            "review.judge",
+            "review-ruling",
+            json!({
+                "bundle_id": flag.bundle_id, "pass": 1,
+                "ruling": outcome.pass1.ruling, "seconds": outcome.pass1.seconds,
+            }),
+        );
         if let Some(p2) = &outcome.pass2 {
             pass2_flags += 1;
-            if pass2_flags == 1 {
-                // A `confirmed` pass-1 gets its pass-2 ruling immediately,
-                // interleaved within THIS per-flag loop (see the module
-                // doc) — so the `judge-pass2` step must open the moment the
-                // FIRST pass-2 ruling actually fires, not once the whole
-                // docket is known. Opening it only after the loop finishes
-                // (the prior behavior) let `review.ruling{pass:2}` records
-                // stream to a live observer while the `judge-pass2` step
-                // still read "not started" — a contradiction observed live
-                // in the lab lens. `items_in` here is the running count (1
-                // so far); `step_finished` below reports the real final
-                // docket size.
-                guard.step_started(
-                    "judge-pass2",
-                    "dispatch",
-                    json!({
-                        "step_id": "judge-pass2", "kind": "dispatch", "status": "started",
-                        "items_in": pass2_flags, "items_out": 0, "wall_ms": 0,
-                    }),
-                );
-            }
             // (#1266) The decisive later pass's REAL pass number — 2 under
             // the default double-confirm (byte-identical to before), or the
             // demoting/final pass under an N-pass consensus judge.
-            guard.ruling(json!({
-                "bundle_id": flag.bundle_id, "pass": p2.pass,
-                "ruling": p2.ruling, "seconds": p2.seconds,
-            }));
+            obs.step_result(
+                "review.judge",
+                "review-ruling",
+                json!({
+                    "bundle_id": flag.bundle_id, "pass": p2.pass,
+                    "ruling": p2.ruling, "seconds": p2.seconds,
+                }),
+            );
         }
         judged.push(JudgedFlag {
             flag: flag.clone(),
@@ -3303,7 +3042,7 @@ fn finish_review(
     }
 
     env.members.push(MemberRecord {
-        model: judge_identifier,
+        model: judge_identifier.clone(),
         seat: "review-judge".to_string(),
         // Actual dispatches, unparsed retries included — never fewer calls
         // than the operator paid for.
@@ -3312,7 +3051,7 @@ fn finish_review(
         total_tokens: judge_tokens,
         remote: judge.pm.is_remote(),
         endpoint: seat_endpoint_host(&judge.pm),
-        served_model: judge_served_model,
+        served_model: judge_served_model.clone(),
     });
     env.steps.push(StepRecord {
         step_id: "judge-pass1".to_string(),
@@ -3321,13 +3060,6 @@ fn finish_review(
         items_out: deduped.len(),
         wall_ms: pass1_ms,
     });
-    guard.step_finished(
-        "judge-pass1",
-        json!({
-            "step_id": "judge-pass1", "kind": "dispatch", "status": "finished",
-            "items_in": deduped.len(), "items_out": deduped.len(), "wall_ms": pass1_ms,
-        }),
-    );
     if pass2_flags > 0 {
         env.steps.push(StepRecord {
             step_id: "judge-pass2".to_string(),
@@ -3336,18 +3068,21 @@ fn finish_review(
             items_out: pass2_flags,
             wall_ms: pass2_ms,
         });
-        // `started` was already emitted above, in the per-flag loop, the
-        // moment the first pass-2 ruling fired — this only closes it, now
-        // that the loop has finished and the real final docket size +
-        // elapsed `wall_ms` are known.
-        guard.step_finished(
-            "judge-pass2",
-            json!({
-                "step_id": "judge-pass2", "kind": "dispatch", "status": "finished",
-                "items_in": pass2_flags, "items_out": pass2_flags, "wall_ms": pass2_ms,
-            }),
-        );
     }
+    // The judge stage's single completion record — the SAME shape the graph
+    // path's `ReviewJudgeStepKind` emits (#1434). This sequential driver runs
+    // one flag at a time, so `concurrency` is always 1.
+    obs.step_result(
+        "review.judge",
+        "judge",
+        json!({
+            "items_in": deduped.len(), "items_out": judged.len(), "wall_ms": pass1_ms + pass2_ms,
+            "pass1_wall_ms": pass1_ms, "pass2_wall_ms": pass2_ms,
+            "model": judge_identifier, "tokens": judge_tokens, "calls": judge_calls,
+            "dispatch_errors": judge_dispatch_errors, "concurrency": 1,
+            "served_model": judge_served_model,
+        }),
+    );
 
     // (#1260, revised #1329, extracted #1373) Judge-stage degeneracy is
     // decided BEFORE the optional verify stage so a run the judge already
@@ -3393,7 +3128,7 @@ fn finish_review(
     // on a doomed run).
     if let Some(vstaff) = verify {
         if env.degenerate.is_none() {
-            run_verify_stage(&mut env, &mut judged, bundles, inputs, vstaff, chat, cycler, guard)?;
+            run_verify_stage(&mut env, &mut judged, bundles, inputs, vstaff, chat, cycler, obs)?;
         }
     }
 
@@ -3411,7 +3146,6 @@ fn finish_review(
 
     env.flags = deduped;
     env.judged = judged;
-    guard.task_finished(&env);
     Ok(env)
 }
 
@@ -3451,14 +3185,12 @@ pub fn run_judge_only(
         staffing: Some(staffing_snapshot(probes, judge, verify, inputs.crew.request_changes)),
         ..Default::default()
     };
-    // Same guard discipline as `run_review` — see its comment at the
-    // matching site.
-    let mut sink = EmitterSink(emitter);
-    let mut guard = ReviewRunGuard::new(&mut sink, &inputs.case_id, &inputs.crew.name);
-    guard.task_started(json!({
-        "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
-        "exec_mode": mode_label(mode), "bundles": bundles.len(),
-    }));
+    // (#1434) Run observability rides the injected emitter via `ReviewObs`,
+    // which also owns the host-telemetry sampler for the run's lifetime. No
+    // task-level bookend here — the caller's `with_dispatch_bookends` wrap
+    // owns run liveness (contract 2). `obs` drops at function end (early
+    // `?`-return or clean), tearing down its sampler thread.
+    let mut obs = ReviewObs::new(emitter, &inputs.case_id, &inputs.crew.name);
     env.steps.push(StepRecord {
         step_id: "bundle".to_string(),
         kind: "procedural".to_string(),
@@ -3466,20 +3198,13 @@ pub fn run_judge_only(
         items_out: bundles.len(),
         wall_ms: bundle_ms,
     });
-    guard.step_finished(
-        "bundle",
-        json!({
-            "step_id": "bundle", "kind": "procedural", "status": "finished",
-            "items_in": 1, "items_out": bundles.len(), "wall_ms": bundle_ms,
-        }),
-    );
+    obs.step_result("review.bundle", "bundle", json!({ "items_out": bundles.len() }));
     if flags.is_empty() {
         env.degenerate = Some("--charges-file carried zero flags".to_string());
-        guard.task_finished(&env);
         return Ok(env);
     }
 
-    finish_review(env, flags, &bundles, inputs, judge, verify, &mut chat, cycler, &mut guard)
+    finish_review(env, flags, &bundles, inputs, judge, verify, &mut chat, cycler, &mut obs)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3525,18 +3250,21 @@ pub fn run_judge_only(
 // **The double-confirm judge protocol, dedup key, judge/verify prompts,
 // and tier synthesis are UNCHANGED** — every step kind below calls the
 // SAME preserved functions (`dedup_flags`, `judge_one_flag_with_passes`,
-// `verify_pass_with_retry`, `parse_judge_ruling`, `parse_verify_ruling`,
+// `parse_judge_ruling`, `parse_verify_ruling`,
 // `cluster_needs_check`, `mechanism_family`, `judge_prompt`,
 // `verify_prompt`) verbatim — only the ORCHESTRATION shape (six sequential
-// calls → one declared graph) and the telemetry plumbing (the guard-
-// coupled `ReviewRunGuard` can't cross a `run_bounded` worker-thread
+// calls → one declared graph) and the telemetry plumbing (the sequential
+// path's `ReviewObs` can't cross a `run_bounded` worker-thread
 // boundary — see `darkmux_crew::step_kinds::StepOutcome`'s doc — so
 // per-step telemetry now rides `StepOutcome.flow_records` / direct
 // `darkmux_flow::record()` calls instead) changed.
 
 use darkmux_crew::scheduler::run_step_graph;
 use darkmux_crew::single_shot::{single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest, SingleShotRequest};
-use darkmux_crew::step_kinds::{StepKind, StepKindRegistry, StepOutcome};
+use darkmux_crew::step_kinds::{
+    MapDispatchOverride, MapItemResult, OverrideDispatchCall, StepKind, StepKindRegistry,
+    StepOutcome, MAP_BUDGET_SKIP_ERROR,
+};
 use darkmux_crew::types::{Step, Task};
 use std::sync::Mutex as StdMutex;
 
@@ -3688,20 +3416,26 @@ fn review_token_telemetry_payload(reply: &SingleShotReply) -> Option<serde_json:
     }))
 }
 
-/// A "step result" companion flow record — the review's own equivalent of
-/// `coder_phase.rs`'s `emit_step_result` (#1230 Packet 4 sibling
-/// convention): one generic action, `kind` distinguishing which review step
-/// produced it, free-form `payload` for the rest. Called directly (not via
-/// `StepOutcome.flow_records`) so it's usable from inside a step's own
-/// internal concurrent loop (judge's bounded worker pool) — a plain
-/// `darkmux_flow::record()` call has no non-`Send` state, unlike
-/// `ReviewRunGuard` (see the module doc).
-fn emit_review_step_result(kind: &str, step_id: &str, case_id: &str, payload: serde_json::Value) {
+/// Build a "step result" companion flow record — the review's own
+/// equivalent of `coder_phase.rs`'s `emit_step_result` (#1230 Packet 4
+/// sibling convention): one generic action, `kind` distinguishing which
+/// review step produced it, free-form `payload` for the rest. Split from the
+/// emit so BOTH dispatch paths can share the exact record shape: the graph
+/// step kinds emit it globally via [`emit_review_step_result`] (they run in
+/// worker threads with no injected emitter to hold), and the sequential
+/// `run_judge_only` path emits it through its injected [`ReviewEmitter`] via
+/// [`ReviewObs::step_result`] (#1434 — one vocabulary across both paths).
+fn review_step_result_record(
+    kind: &str,
+    step_id: &str,
+    case_id: &str,
+    payload: serde_json::Value,
+) -> darkmux_flow::FlowRecord {
     let mut full = serde_json::json!({ "step_id": step_id, "kind": kind });
     if let (serde_json::Value::Object(extra), serde_json::Value::Object(base)) = (payload, &mut full) {
         base.extend(extra);
     }
-    let _ = darkmux_flow::record(darkmux_flow::FlowRecord {
+    darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
         category: darkmux_flow::Category::Work,
@@ -3723,7 +3457,15 @@ fn emit_review_step_result(kind: &str, step_id: &str, case_id: &str, payload: se
         payload: Some(full),
         work_id: None,
         attempt: None,
-    });
+    }
+}
+
+/// Emit a [`review_step_result_record`] to the GLOBAL flow sink
+/// (`darkmux_flow::record`). Used by the graph step kinds, which run inside
+/// the scheduler's `run_bounded` worker threads and so can't hold the
+/// caller-injected emitter (`ReviewObs` covers the sequential path instead).
+fn emit_review_step_result(kind: &str, step_id: &str, case_id: &str, payload: serde_json::Value) {
+    let _ = darkmux_flow::record(review_step_result_record(kind, step_id, case_id, payload));
 }
 
 // ─── investigate: bundle ────────────────────────────────────────────────
@@ -3764,209 +3506,227 @@ impl StepKind for ReviewBundleStepKind {
     }
 }
 
-// ─── investigate: probe (N steps, one per staffed seat) ────────────────
+// ─── investigate: probe reconstruction (seats x k dispatch.map fan-out) ─
 
-/// Phase "investigate", step 2 of N: ONE probe seat's whole draw loop
-/// (bundle × k draws) — genuinely valuable graph-level concurrency (the
-/// ONE stage where per-item fan-out is justified, per the redesign brief):
-/// different seats plausibly run different models, and gestalt's real wave
-/// planner (via `StepKind::residency`) decides which seats can co-reside.
-/// Reuses `probe_one_draw`/`probe_user_message`/`select_bundles_for_staffing`/
-/// `resolve_seat_max_tokens` VERBATIM — only the surrounding loop shape and
-/// telemetry are new.
+/// (#1442 ship-2b) One probe SEAT's mint-time spec — the key the dedup
+/// boundary uses to reconstruct the review's domain results (raw
+/// [`ProbeFlag`]s, per-seat [`MemberRecord`] accounting, reduced-coverage
+/// warnings, the probe stage's remote budget row) from the generic
+/// `dispatch.map` fan-out's per-item results. The probe stage is `seats x k`
+/// sibling `dispatch.map` steps (one per `(seat, draw)`, minted by
+/// `build_review_graph`'s `probe_seats` expansion, sharing one
+/// `bucket_group: "probe"` remote allowance); each spec records which draw
+/// TASK ids belong to this seat (index = draw) and which bundles its
+/// selector chose (in pre-rendered collection order), so reconstruction is
+/// pure data alignment — never re-derivation.
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeSeatSpec {
+    pub(crate) name: String,
+    /// The seat's dispatch identity (`seat_identifier` — namespaced for a
+    /// local seat, the bare profile id for a remote one). Also the wire
+    /// `model` the seat's map steps dispatch.
+    pub(crate) identifier: String,
+    pub(crate) remote: bool,
+    pub(crate) endpoint_host: Option<String>,
+    /// This seat's k sibling map TASK ids, indexed by draw — the dedup
+    /// step's `input` keys (`gather_inputs` keys a first-step input by
+    /// dependency TASK id, #1341).
+    pub(crate) draw_task_ids: Vec<String>,
+    /// The selected bundles, in the exact order the pre-rendered prompt
+    /// collection was minted: `(bundle_id, fact_family)` per item index.
+    pub(crate) bundles: Vec<(String, String)>,
+}
+
+/// Everything the dedup boundary reconstructs from the probe fan-out's raw
+/// per-item results, before dedup itself runs. Pure output of
+/// [`reconstruct_probe_stage`] — unit-testable without a graph.
+pub(crate) struct ProbeReconstruction {
+    /// Raw flags in the HISTORICAL probe order (seat → bundle → draw), so
+    /// dedup's first-survivor-wins semantics match the retired per-seat
+    /// probe loop exactly.
+    pub(crate) flags: Vec<ProbeFlag>,
+    pub(crate) members: Vec<MemberRecord>,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) budget_row: Option<RemoteBudgetRecord>,
+    /// `Some(reason)` when at least one draw fired and EVERY fired draw was
+    /// a dispatch error — the all-draws-failed honesty gate. (Previously a
+    /// LOCAL seat's dispatch error was a hard step `Err` that aborted the
+    /// graph; `dispatch.map`'s per-item isolation carries the stage
+    /// through instead, so the gate lands here as a NAMED degenerate
+    /// reason — loud, never a silent zero-flag "clean pass".)
+    pub(crate) all_draws_failed: Option<String>,
+}
+
+/// (#1442 ship-2b) Rebuild the probe stage's domain results from the
+/// `seats x k` map steps' serialized [`MapItemResult`] arrays.
 ///
-/// **Tier 3 audit finding (#1352).** #1352 asked whether this (and
-/// [`ReviewVerifyStepKind`] below) are really `dispatch.single_shot`
-/// (Tier 1) wearing bespoke wrapping, collapsible with richer config —
-/// e.g. a "shared rate-bucket by reference" option. Audited honestly: NO,
-/// not without changing `dispatch.single_shot`'s behavior/envelope, which
-/// the pure-refactor constraint on this packet forbids. Concretely, this
-/// step is a whole BUNDLE × K-DRAW LOOP around potentially many
-/// `single_shot_chat` calls — `dispatch.single_shot`'s Tier 1 kind wraps
-/// exactly ONE such call per `Step` invocation, driven by upstream
-/// `Step.output`/`gather_inputs`, with no notion of an internal loop, a
-/// SHARED remote-token bucket across sibling step instances (`bucket:
-/// Arc<StdMutex<RemoteBucket>>`, cloned across every probe seat — see the
-/// field doc), or per-draw `MemberRecord`/warning accumulation into a
-/// cross-step shared handle. A "shared-rate-bucket-by-reference" config
-/// option doesn't exist on `dispatch.single_shot` today, and adding one
-/// would mean `dispatch.single_shot` gaining new cross-step-instance state
-/// plumbing it has never needed — a real behavior/envelope change, not a
-/// config tweak. Left as a documented follow-up candidate, not forced here.
-pub struct ReviewProbeStepKind {
-    ctx: Arc<ReviewStepContext>,
-    staffing: ResolvedSeatStaffing,
-    /// Shared across every probe step in the run — the probe stage's remote
-    /// token bucket is ONE execution shared by every remote probe staffing
-    /// (unchanged semantics from `probe_phase`'s pre-graph design).
-    bucket: Arc<StdMutex<RemoteBucket>>,
-    /// Collects every probe seat's `MemberRecord` + any reduced-coverage
-    /// warning — read back by the dedup step (whose `depends_on` includes
-    /// every probe step, so it runs only after all seats finish) via this
-    /// SAME shared handle, avoiding a separate side-channel.
-    members: Arc<StdMutex<Vec<MemberRecord>>>,
-    warnings: Arc<StdMutex<Vec<String>>>,
-    /// `"review.probe:<staffing-name>"` — a distinct registered kind id per
-    /// probe seat (the registry maps one kind id to one `StepKind`
-    /// instance, and each seat has its own model/selector). `StepKind::id`
-    /// must return `&'static str`; this is leaked EXACTLY ONCE at
-    /// construction (`ReviewProbeStepKind::new`), never inside `id()`
-    /// itself, so a bounded, one-time-per-seat-per-process leak in a
-    /// short-lived CLI invocation — never a per-call leak. Fields are
-    /// private (construct via `new()`) precisely so `RemoteBucket` (a
-    /// crate-private type — see its own doc) never has to be re-exported
-    /// just to name this struct's shape.
-    kind_id: &'static str,
-}
+/// Accounting semantics preserved from the retired kind:
+/// - a **draw** = an item whose call actually FIRED (a first-attempt
+///   remote-budget skip — recognized by [`MAP_BUDGET_SKIP_ERROR`] — is a
+///   skip, never a draw);
+/// - `MemberRecord` per seat, summed across its k sibling steps
+///   (`draws`/`total_tokens`/`wall_ms`; `served_model` = the first
+///   endpoint-reported model, which stays `None` by construction on local
+///   seats — the [`MapItemResult`] contract);
+///   - (#1442) `wall_ms` SEMANTICS SHIFTED at the `dispatch.map` cutover:
+///     the retired bespoke probe kind recorded the seat's whole-step
+///     ELAPSED wall (`t0.elapsed()` around the seat's inner loop); this
+///     reconstruction SUMS each item's own per-dispatch wall
+///     (`item.wall_ms`). The new figure is more honest as a COST metric
+///     (it excludes per-step scheduling/idle overhead the old elapsed
+///     folded in), but it is NOT a timeline — under concurrent draws the
+///     per-item walls overlap in real time, so the sum can exceed the seat's
+///     wall-clock. Series comparisons ACROSS the cutover should read the
+///     probe `wall_ms` accordingly.
+/// - a seat with zero fired draws (empty selector match, or every attempt
+///   budget-skipped) records NO member — `member_summary()` must not
+///   credit work that never happened;
+/// - the probe stage's ONE remote budget row (`stage: "probe"`) and the
+///   exhaustion warning reconstruct from the same items.
+pub(crate) fn reconstruct_probe_stage(
+    specs: &[ProbeSeatSpec],
+    input: &std::collections::BTreeMap<String, String>,
+    budget: u64,
+) -> Result<ProbeReconstruction> {
+    let mut flags = Vec::new();
+    let mut members = Vec::new();
+    let mut warnings = Vec::new();
+    let mut remote_used = 0u64;
+    let mut remote_calls = 0u32;
+    let mut remote_skips = 0u32;
+    let mut any_remote_seat = false;
+    let mut total_fired = 0u32;
+    let mut total_errors = 0u32;
+    let mut first_error: Option<String> = None;
 
-impl ReviewProbeStepKind {
-    pub(crate) fn new(
-        ctx: Arc<ReviewStepContext>,
-        staffing: ResolvedSeatStaffing,
-        bucket: Arc<StdMutex<RemoteBucket>>,
-        members: Arc<StdMutex<Vec<MemberRecord>>>,
-        warnings: Arc<StdMutex<Vec<String>>>,
-    ) -> Self {
-        let kind_id: &'static str =
-            Box::leak(format!("review.probe:{}", staffing.name).into_boxed_str());
-        Self { ctx, staffing, bucket, members, warnings, kind_id }
-    }
-}
+    for spec in specs {
+        let mut per_draw: Vec<Vec<MapItemResult>> = Vec::with_capacity(spec.draw_task_ids.len());
+        for task_id in &spec.draw_task_ids {
+            let raw = input.get(task_id).map(String::as_str).unwrap_or("[]");
+            let results: Vec<MapItemResult> = serde_json::from_str(raw).with_context(|| {
+                format!(
+                    "deserializing probe map results from task `{task_id}` (seat `{}`)",
+                    spec.name
+                )
+            })?;
+            per_draw.push(results);
+        }
 
-impl StepKind for ReviewProbeStepKind {
-    fn id(&self) -> &'static str {
-        self.kind_id
-    }
-
-    fn display_name(&self) -> &'static str {
-        // (#1402) Deliberately the BASE label, not per-seat — every probe
-        // seat renders "Probe" regardless of `self.kind_id`'s
-        // `"review.probe:<seat-name>"` suffix (the seat name is dispatch
-        // routing detail, not a distinct kind for display purposes).
-        "Probe"
-    }
-
-    fn run(&self, step: &Step, _task: &Task, _input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
-        let s = &self.staffing;
-        let identifier = seat_identifier(&s.pm);
-        let endpoint = seat_endpoint(&s.pm);
-        let endpoint_host = seat_endpoint_host(&s.pm);
-        let max_tokens = resolve_seat_max_tokens(s, DEFAULT_PROBE_MAX_TOKENS);
-        let selected = select_bundles_for_staffing(&self.ctx.bundles, s.selector.as_ref());
-
-        let t0 = Instant::now();
-        let mut flags: Vec<ProbeFlag> = Vec::new();
-        let mut draws = 0u32;
-        let mut tokens = 0u64;
-        let mut served_model: Option<String> = None;
-        let mut chat = |call: &ChatCall| dispatch_chat(&self.ctx, call);
-
-        'staffing: for bundle in &selected {
-            let user = probe_user_message(&self.ctx.probe_system, bundle);
-            for draw in 0..s.k {
-                if endpoint.is_some() {
-                    let mut bucket = self.bucket.lock().expect("probe bucket mutex poisoned");
-                    if !bucket.admit() {
-                        continue;
-                    }
-                }
-                draws += 1;
-                match probe_one_draw(&mut chat, &identifier, "", &user, max_tokens, endpoint) {
-                    Ok((content, tok, served)) => {
-                        tokens += tok;
-                        if served_model.is_none() {
-                            served_model = served;
-                        }
-                        if endpoint.is_some() {
-                            self.bucket.lock().expect("probe bucket mutex poisoned").spend(tok, 1);
-                        }
-                        if let Some(text) = content {
-                            flags.push(ProbeFlag {
-                                bundle_id: bundle.id.clone(),
-                                fact_family: bundle.fact_family.clone(),
-                                member: identifier.clone(),
-                                draw,
-                                charge_text: text,
-                                anchor: None,
-                                also_flagged: Vec::new(),
-                            });
-                        }
-                    }
-                    Err(e) if endpoint.is_some() => {
-                        self.warnings.lock().expect("probe warnings mutex poisoned").push(format!(
-                            "remote probe seat \"{}\" ({identifier}) failed after bounded retries — \
-                             remaining draws skipped (reduced coverage): {e}",
-                            s.name
-                        ));
-                        break 'staffing;
-                    }
-                    Err(e) => return Err(e),
+        // Flags in the historical seat → bundle → draw order.
+        for (b_idx, (bundle_id, fact_family)) in spec.bundles.iter().enumerate() {
+            for (draw, results) in per_draw.iter().enumerate() {
+                let Some(item) = results.get(b_idx) else { continue };
+                if item.ok && !item.content.trim().is_empty() {
+                    flags.push(ProbeFlag {
+                        bundle_id: bundle_id.clone(),
+                        fact_family: fact_family.clone(),
+                        member: spec.identifier.clone(),
+                        draw: draw as u32,
+                        charge_text: item.content.trim().to_string(),
+                        anchor: None,
+                        also_flagged: Vec::new(),
+                    });
                 }
             }
         }
-        let wall_ms = t0.elapsed().as_millis() as u64;
 
-        // (#1355 follow-up) Only record a member when this seat actually
-        // dispatched at least once — a seat with zero selected bundles
-        // (e.g. a zero-bundle degenerate run) never called out, and
-        // `member_summary()`'s "probed by ..." attribution would otherwise
-        // credit it with work it didn't do.
+        // Per-seat accounting, summed across the seat's k sibling steps.
+        let mut draws = 0u32;
+        let mut skips = 0u32;
+        let mut errors = 0u32;
+        let mut seat_first_error: Option<String> = None;
+        let mut tokens = 0u64;
+        let mut wall_ms = 0u64;
+        let mut served_model: Option<String> = None;
+        for results in &per_draw {
+            for item in results {
+                if item.error.as_deref() == Some(MAP_BUDGET_SKIP_ERROR) {
+                    skips += 1;
+                    continue;
+                }
+                draws += 1;
+                tokens += item.total_tokens.unwrap_or(0);
+                wall_ms += item.wall_ms;
+                if served_model.is_none() {
+                    served_model = item.served_model.clone();
+                }
+                if !item.ok {
+                    errors += 1;
+                    if seat_first_error.is_none() {
+                        seat_first_error = item.error.clone();
+                    }
+                }
+            }
+        }
+        total_fired += draws;
+        total_errors += errors;
+        if first_error.is_none() {
+            first_error = seat_first_error.clone();
+        }
+        if spec.remote {
+            any_remote_seat = true;
+            remote_used += tokens;
+            remote_calls += draws;
+            remote_skips += skips;
+        }
+        if errors > 0 {
+            // The retired kind aborted a remote seat's remaining draws on
+            // the first failure; `dispatch.map` isolates per item and keeps
+            // going, so the warning names the per-draw failure count.
+            let scope = if spec.remote { "remote probe seat" } else { "probe seat" };
+            warnings.push(format!(
+                "{scope} \"{}\" ({}) dispatch failed on {errors} draw(s) — each failure \
+                 isolated per draw (reduced coverage): {}",
+                spec.name,
+                spec.identifier,
+                seat_first_error.unwrap_or_default()
+            ));
+        }
         if draws > 0 {
-            self.members.lock().expect("probe members mutex poisoned").push(MemberRecord {
-                model: identifier.clone(),
+            members.push(MemberRecord {
+                model: spec.identifier.clone(),
                 seat: "review-probe".to_string(),
                 draws,
                 wall_ms,
                 total_tokens: tokens,
-                remote: endpoint.is_some(),
-                endpoint: endpoint_host.clone(),
+                remote: spec.remote,
+                endpoint: spec.endpoint_host.clone(),
                 served_model,
             });
         }
-        emit_review_step_result(
-            "review.probe",
-            &step.id,
-            &self.ctx.case_id,
-            json!({
-                "staffing": s.name, "model": identifier, "items_in": selected.len(),
-                "items_out": flags.len(), "draws": draws, "wall_ms": wall_ms, "tokens": tokens,
-                "remote": endpoint.is_some(), "endpoint": endpoint_host,
-            }),
-        );
-
-        let output = serde_json::to_string(&flags).context("serializing probe flags")?;
-        Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 
-    fn residency(
-        &self,
-        _step: &Step,
-        _task: &Task,
-        _input: &std::collections::BTreeMap<String, String>,
-    ) -> Option<darkmux_gestalt::Placement> {
-        if self.staffing.pm.is_remote() {
-            return None;
-        }
-        // (#1360 follow-up) A seat whose selector matches zero of the
-        // review's bundles never dispatches at all (`run()`'s own
-        // `select_bundles_for_staffing` call would come back empty too) —
-        // declaring a residency need here would make `ensure_wave_loaded`
-        // load (or fail loud trying to load) a model this step will never
-        // actually use. Both inputs are already fully known before any step
-        // runs (`ctx.bundles` is fixed at graph-build time), so this mirrors
-        // `run()`'s own check rather than guessing.
-        if select_bundles_for_staffing(&self.ctx.bundles, self.staffing.selector.as_ref()).is_empty() {
-            return None;
-        }
-        let n_ctx = self.staffing.pm.n_ctx?;
-        let identifier = darkmux_gestalt::namespaced_identifier(&self.staffing.pm.id, self.staffing.pm.identifier.as_deref());
-        Some(darkmux_gestalt::Placement {
-            model_key: self.staffing.pm.id.clone(),
-            identifier,
-            min_ctx: n_ctx,
-            seat: format!("review-probe:{}", self.staffing.name),
-        })
+    let budget_row =
+        (any_remote_seat && (remote_calls > 0 || remote_skips > 0)).then(|| RemoteBudgetRecord {
+            stage: "probe".to_string(),
+            max_tokens: budget,
+            used_tokens: remote_used,
+            // (#1442 gate CONSIDER) `remote_used` SUMS the endpoint-REPORTED
+            // tokens, but the live `MapRemoteBucket` meters CONSERVATIVELY
+            // (it settles a usage-omitting reply at its granted cap). So a
+            // usage-omitting endpoint can exhaust the bucket — producing
+            // `remote_skips > 0` — while the summed reported total stays
+            // BELOW `budget`. `skipped_calls > 0` is itself proof the bucket
+            // exhausted (that is the only reason a draw is skipped), so it
+            // makes `exhausted` truthful regardless of what the endpoint
+            // reported.
+            exhausted: remote_skips > 0 || remote_used >= budget,
+            skipped_calls: remote_skips,
+        });
+    if remote_skips > 0 {
+        warnings.push(format!(
+            "remote probe token budget exhausted — {remote_skips} draw(s) skipped after the \
+             per-execution allowance ({budget} tokens) ran out; reduced coverage"
+        ));
     }
+    let all_draws_failed = (total_fired > 0 && total_errors == total_fired).then(|| {
+        format!(
+            "every probe draw errored — {total_errors} of {total_fired} dispatch(es) failed, \
+             zero probe signal (first error: {})",
+            first_error.unwrap_or_default()
+        )
+    });
+    Ok(ProbeReconstruction { flags, members, warnings, budget_row, all_draws_failed })
 }
 
 // ─── investigate: dedup (terminal step of the phase) ────────────────────
@@ -3993,7 +3753,27 @@ pub struct ReviewDedupStepKind {
     /// data judge/verify need to consume), so without this write it has no
     /// way to recover the true raw count — the field silently read the
     /// deduped count instead (`raw_flags == deduped_flags` always).
+    /// (#1442 ship-2b) This step ALSO pushes the probe stage's
+    /// reconstructed remote-budget row + all-draws-failed degenerate reason
+    /// here — the reconstruction boundary (see `probe_specs` below).
     pub env: SharedReviewEnvelope,
+    /// (#1442 ship-2b) The mint-time per-seat specs `build_review_graph`
+    /// computed alongside the `probe_seats` expansion — this step's `input`
+    /// map (keyed by probe TASK id) is raw `MapItemResult` arrays from the
+    /// generic `dispatch.map` fan-out, and [`reconstruct_probe_stage`]
+    /// aligns them back into domain results against these specs before the
+    /// (unchanged) dedup algorithm runs.
+    pub(crate) probe_specs: Vec<ProbeSeatSpec>,
+    /// The run-wide member/warning accumulators (the same handles the
+    /// judge/verify contributors use), merged into `shared_env` by
+    /// `run_review_graph` once `run_step_graph` returns.
+    pub(crate) members: Arc<StdMutex<Vec<MemberRecord>>>,
+    pub(crate) warnings: Arc<StdMutex<Vec<String>>>,
+    /// The probe stage's per-execution remote allowance
+    /// (`ReviewStepContext::remote_max_tokens_per_execution`) — the SAME
+    /// value stamped into every probe step's `bucket_budget` config, used
+    /// here to reconstruct the stage's budget row.
+    pub(crate) remote_budget: u64,
 }
 
 impl StepKind for ReviewDedupStepKind {
@@ -4007,16 +3787,31 @@ impl StepKind for ReviewDedupStepKind {
 
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
         let t0 = Instant::now();
-        let mut raw: Vec<ProbeFlag> = Vec::new();
-        for text in input.values() {
-            let flags: Vec<ProbeFlag> =
-                serde_json::from_str(text).context("deserializing a probe step's flags")?;
-            raw.extend(flags);
-        }
+        // (#1442 ship-2b) Reconstruction boundary: raw flags + per-seat
+        // member accounting + warnings + the probe budget row, rebuilt from
+        // the seats x k map steps' per-item results.
+        let recon = reconstruct_probe_stage(&self.probe_specs, input, self.remote_budget)?;
+        self.members
+            .lock()
+            .expect("probe members mutex poisoned")
+            .extend(recon.members);
+        self.warnings
+            .lock()
+            .expect("probe warnings mutex poisoned")
+            .extend(recon.warnings);
+        let raw = recon.flags;
         let raw_count = raw.len();
         {
             let mut env = self.env.lock().expect("shared review envelope mutex poisoned");
             env.raw_flags = env.raw_flags.max(raw_count);
+            if let Some(row) = recon.budget_row {
+                env.remote_budgets.push(row);
+            }
+            if env.degenerate.is_none() {
+                if let Some(reason) = recon.all_draws_failed {
+                    env.degenerate = Some(reason);
+                }
+            }
         }
         let (deduped, _stats) = dedup_flags(raw, &self.ctx.diff);
         let wall_ms = t0.elapsed().as_millis() as u64;
@@ -4341,275 +4136,228 @@ impl StepKind for ReviewJudgeStepKind {
     }
 }
 
-// ─── report: verify ──────────────────────────────────────────────────────
+// ─── report: verify (prompt render → generic dispatch.map → apply) ──────
 
-/// Phase "report", step 1: internally loops over judge-confirmed flags only
-/// — an empty confirmed set (judge came back degenerate, or every flag was
-/// needs-check/archived) means this loop runs zero times, a normal outcome
-/// of a for-each loop given an empty input, never a structural special case.
-/// This makes the historical "verify only runs when judge isn't degenerate"
-/// bug (a shared judge/verify graph previously let verify fire on
-/// judge-doomed runs) structurally impossible: verify's OWN `depends_on` is
-/// `judge`, and it only ever iterates `judge`'s CONFIRMED output — there is
-/// no separate "is the run degenerate" gate to forget. Reuses
-/// `verify_prompt`/`verify_pass_with_retry` VERBATIM.
+/// (#1442 ship-2b, the operator-recorded render-step decision on PR #1455)
+/// Phase "report", step 1 of the verify TASK: render one frozen
+/// [`verify_prompt`] per judge-CONFIRMED flag into a JSON string array —
+/// the collection the SAME task's second step (a generic `dispatch.map`)
+/// maps over with `user_template: "{item}"` (byte parity by construction —
+/// `{item}` substitutes verbatim). Procedural, zero dispatch.
 ///
-/// **Tier 3 audit finding (#1352).** Same audit as [`ReviewProbeStepKind`]
-/// — see its doc for the full reasoning. This step is a FOR-EACH LOOP over
-/// a runtime-determined, judge-confirmed docket, with per-item mutation of
-/// a SHARED `judged` list (`j.tier`/`j.demoted_by_verify`/`j.verify` set in
-/// place) and its own remote-token bucket — not one `dispatch.single_shot`
-/// call. Collapsing it into Tier 1 config would require
-/// `dispatch.single_shot` to grow a per-item loop concept and shared
-/// cross-step mutation it doesn't have today; left as a documented
-/// follow-up candidate, not forced here.
-/// (#1426 ship-2) Count the CONFIRMED flags in a verify step's gathered
-/// input (the judge task's serialized `Vec<JudgedFlag>` output). `Some(n)`
-/// when the input parses (an ABSENT/empty input is a real zero — the judge
-/// produced nothing); `None` when it is present but unparseable, so the
-/// caller can stay conservative rather than mask a malformed handoff that
-/// `run` must surface. Pure; shared by `ReviewVerifyStepKind::residency`
-/// (the pre-wave-loader short-circuit) and unit-testable directly.
-fn confirmed_count_in_judge_output(
-    input: &std::collections::BTreeMap<String, String>,
-) -> Option<usize> {
-    let judge_output = match input.values().next() {
-        None => return Some(0),
-        Some(s) if s.is_empty() => return Some(0),
-        Some(s) => s,
-    };
-    let judged: Vec<JudgedFlag> = serde_json::from_str(judge_output).ok()?;
-    Some(judged.iter().filter(|j| j.tier == Tier::Confirmed).count())
-}
-
-pub struct ReviewVerifyStepKind {
+/// The verify stage's three dispatch gates all collapse into "the rendered
+/// collection is EMPTY" (which makes the map step a completed no-op with
+/// `residency() == None` — zero model loads, the #1438 property, now held
+/// by the generic block):
+/// - no verify seat staffed (byte-identical passthrough to today);
+/// - the run is already degenerate (#1373 gate d — the judge task always
+///   completes before this one, so `env.degenerate` is authoritative here;
+///   no frontier spend on a doomed run);
+/// - zero confirmed findings (the empty-docket short-circuit).
+///
+/// **Tier 3 (#1352), on purpose.** Prompt rendering against this
+/// pipeline's own `JudgedFlag`/`BundleInput` types is genuinely
+/// review-specific; the judge stays on the generic `multi_pass_confirm`
+/// pattern and gains no domain rendering.
+pub struct ReviewVerifyRenderStepKind {
     pub ctx: Arc<ReviewStepContext>,
     pub verify: Option<ResolvedSeatStaffing>,
-    /// (#1354 follow-up) Same shared accumulator as `ReviewJudgeStepKind`'s
-    /// — see its doc.
-    pub members: Arc<StdMutex<Vec<MemberRecord>>>,
-    /// (#1373 gates a/c/d) Same shared handle as `ReviewJudgeStepKind`'s —
-    /// this step reads it FIRST to skip dispatching entirely when the
-    /// judge stage already doomed the run (gate d — no frontier spend on a
-    /// doomed run, CONSIDER g, mirroring `finish_review`'s `if env.
-    /// degenerate.is_none() { run_verify_stage(...) }` gate), and writes
-    /// its own remote-budget row + exhaustion warning into it (gates a/c).
     pub env: SharedReviewEnvelope,
 }
 
-impl StepKind for ReviewVerifyStepKind {
+impl StepKind for ReviewVerifyRenderStepKind {
     fn id(&self) -> &'static str {
-        "review.verify"
+        "review.verify-render"
     }
 
     fn display_name(&self) -> &'static str {
-        "Verify"
+        "Verify prompts"
     }
 
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
         let judge_output = input.values().next().cloned().unwrap_or_default();
-        let mut judged: Vec<JudgedFlag> = if judge_output.is_empty() {
+        let judged: Vec<JudgedFlag> = if judge_output.is_empty() {
             Vec::new()
         } else {
             serde_json::from_str(&judge_output).context("deserializing judged flags")?
         };
 
-        let Some(vstaff) = &self.verify else {
-            // Crew declares no `review-verify` seat — byte-identical to
-            // today: no dispatch, no records, judged flags pass through.
-            let output = serde_json::to_string(&judged).context("serializing judged flags")?;
-            return Ok(StepOutcome { output, flow_records: Vec::new() });
+        let confirmed: Vec<&JudgedFlag> = judged.iter().filter(|j| j.tier == Tier::Confirmed).collect();
+        let skip_reason: Option<&str> = if self.verify.is_none() {
+            Some("no verify seat staffed — judged flags pass through unchanged")
+        } else if self
+            .env
+            .lock()
+            .expect("shared review envelope mutex poisoned")
+            .degenerate
+            .is_some()
+        {
+            Some("run already degenerate — no verify dispatch on a doomed run")
+        } else if confirmed.is_empty() {
+            Some("zero confirmed findings — verify skipped before any model load")
+        } else {
+            None
         };
 
-        let docket_count = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
-        if docket_count == 0 {
-            // (#1426 ship-2 operator decision) The completed no-op half of
-            // the pre-wave short-circuit: `residency()` already returned
-            // `None` for this input (no model was loaded); here the step
-            // completes with the reason NAMED in its step-result record, so
-            // the run's observability answers "why did verify not dispatch"
-            // directly. Judged flags pass through untouched — the envelope
-            // is unaffected.
-            emit_review_step_result(
-                "review.verify",
-                &step.id,
-                &self.ctx.case_id,
-                json!({
-                    "items_in": 0, "items_out": 0, "wall_ms": 0,
-                    "short_circuit":
-                        "zero confirmed findings — verify skipped before any model load",
-                }),
-            );
-            let output = serde_json::to_string(&judged).context("serializing judged flags")?;
-            return Ok(StepOutcome { output, flow_records: Vec::new() });
+        let prompts: Vec<String> = if skip_reason.is_some() {
+            Vec::new()
+        } else {
+            confirmed
+                .iter()
+                .map(|j| {
+                    let bundle = self.ctx.bundles.iter().find(|b| b.id == j.flag.bundle_id);
+                    let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
+                    let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
+                    verify_prompt(&self.ctx.intent_title, &self.ctx.intent_body, code, facts, &j.flag.charge_text)
+                })
+                .collect()
+        };
+
+        let mut payload = json!({ "items_in": confirmed.len(), "items_out": prompts.len() });
+        if let Some(reason) = skip_reason {
+            payload["short_circuit"] = json!(reason);
         }
+        emit_review_step_result("review.verify-render", &step.id, &self.ctx.case_id, payload);
 
-        // (#1373 gate d) No frontier spend on a run the judge stage already
-        // doomed (CONSIDER g — the judge task always completes before this
-        // one, since `verify_task.depends_on == [judge_task]`, so
-        // `env.degenerate` already reflects `ReviewJudgeStepKind`'s own
-        // gate by the time this runs). Confirmed flags pass through
-        // untouched — no verify marker, no dispatch, byte-identical to a
-        // crew with no verify seat at all.
-        if self.env.lock().expect("shared review envelope mutex poisoned").degenerate.is_some() {
-            let output = serde_json::to_string(&judged).context("serializing judged flags")?;
-            return Ok(StepOutcome { output, flow_records: Vec::new() });
-        }
-
-        let identifier = seat_identifier(&vstaff.pm);
-        let endpoint = seat_endpoint(&vstaff.pm);
-        let endpoint_host = seat_endpoint_host(&vstaff.pm);
-        let max_tokens = resolve_seat_max_tokens(vstaff, DEFAULT_JUDGE_MAX_TOKENS);
-        let mut bucket = RemoteBucket::new("verify", self.ctx.remote_max_tokens_per_execution);
-        let mut chat = |call: &ChatCall| dispatch_chat(&self.ctx, call);
-
-        let t0 = Instant::now();
-        let mut calls = 0u32;
-        let mut tokens = 0u64;
-        let mut served_model: Option<String> = None;
-        for j in judged.iter_mut().filter(|j| j.tier == Tier::Confirmed) {
-            let (record, spent, made, served) = if endpoint.is_some() && !bucket.admit() {
-                (
-                    VerifyRecord {
-                        ruling: VerifyRuling::Error,
-                        decisive_evidence: String::new(),
-                        note_for_author:
-                            "remote token budget exhausted for this stage — call skipped".to_string(),
-                        seconds: 0.0,
-                        model: identifier.clone(),
-                    },
-                    0u64,
-                    0u32,
-                    None,
-                )
-            } else {
-                let bundle = self.ctx.bundles.iter().find(|b| b.id == j.flag.bundle_id);
-                let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
-                let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
-                let prompt =
-                    verify_prompt(&self.ctx.intent_title, &self.ctx.intent_body, code, facts, &j.flag.charge_text);
-                let out = verify_pass_with_retry(
-                    &identifier,
-                    &self.ctx.verify_system,
-                    &prompt,
-                    max_tokens,
-                    endpoint,
-                    &mut chat,
-                );
-                if endpoint.is_some() {
-                    bucket.spend(out.1, out.2);
-                }
-                out
-            };
-            tokens += spent;
-            calls += made;
-            if served_model.is_none() {
-                served_model = served;
-            }
-            emit_review_step_result(
-                "review.verify",
-                "review-ruling",
-                &self.ctx.case_id,
-                json!({ "bundle_id": j.flag.bundle_id, "stage": "verify", "ruling": record.ruling, "seconds": record.seconds }),
-            );
-            if record.ruling == VerifyRuling::Refuted {
-                j.tier = Tier::Archived;
-                j.demoted_by_verify = true;
-            }
-            j.verify = Some(record);
-        }
-        let wall_ms = t0.elapsed().as_millis() as u64;
-
-        emit_review_step_result(
-            "review.verify",
-            &step.id,
-            &self.ctx.case_id,
-            json!({
-                "items_in": docket_count, "items_out": docket_count, "wall_ms": wall_ms,
-                "model": identifier.clone(), "tokens": tokens, "calls": calls,
-                "remote": endpoint.is_some(), "endpoint": endpoint_host.clone(), "served_model": served_model.clone(),
-            }),
-        );
-
-        // (#1354 follow-up) Same gap as `ReviewJudgeStepKind` — this step
-        // computed its own real dispatch cost above but never recorded a
-        // `MemberRecord`, so a crew with a verify seat still reported no
-        // verify attribution in the posted review. (#1355 follow-up) Guarded
-        // on `calls > 0` — the two early returns above already skip the "no
-        // verify seat" / "zero confirmed docket" cases, but every item in
-        // the docket could still hit remote-budget exhaustion (`made: 0`
-        // each), leaving `calls == 0` despite a non-empty docket.
-        if calls > 0 {
-            self.members.lock().expect("members mutex poisoned").push(MemberRecord {
-                model: identifier,
-                seat: "review-verify".to_string(),
-                draws: calls,
-                wall_ms,
-                total_tokens: tokens,
-                remote: endpoint.is_some(),
-                endpoint: endpoint_host,
-                served_model,
-            });
-        }
-
-        // (#1373 gates a/c) Shared with `run_verify_stage` (`finish_review`'s
-        // path) via `verify_budget_outcome` — see its own doc. NEVER sets
-        // `env.degenerate` — verify-bucket exhaustion degrades the STAGE,
-        // not the run (findings already adjudicated `verified` still post).
-        let outcome = verify_budget_outcome(&bucket, docket_count);
-        if outcome.warning.is_some() || outcome.remote_budget_row.is_some() {
-            let mut env = self.env.lock().expect("shared review envelope mutex poisoned");
-            if let Some(w) = outcome.warning {
-                env.warnings.push(w);
-            }
-            if let Some(rec) = outcome.remote_budget_row {
-                env.remote_budgets.push(rec);
-            }
-        }
-
-        let output = serde_json::to_string(&judged).context("serializing verified flags")?;
+        let output = serde_json::to_string(&prompts).context("serializing verify prompts")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
+}
 
-    fn residency(
-        &self,
-        _step: &Step,
-        _task: &Task,
-        input: &std::collections::BTreeMap<String, String>,
-    ) -> Option<darkmux_gestalt::Placement> {
-        let vstaff = self.verify.as_ref()?;
-        if vstaff.pm.is_remote() {
-            return None;
+/// (#1442 ship-2b) What the verify-apply boundary contributes to the
+/// envelope beyond the in-place `judged` mutation: the seat's member row,
+/// the stage's exhaustion warning, and its remote budget row.
+pub(crate) struct VerifyApplyOutcome {
+    pub(crate) member: Option<MemberRecord>,
+    pub(crate) warning: Option<String>,
+    pub(crate) budget_row: Option<RemoteBudgetRecord>,
+}
+
+/// (#1442 ship-2b) Apply the verify map step's per-item results back onto
+/// the judged docket — the domain half of the retired `ReviewVerifyStepKind`
+/// loop, now running at the synthesis boundary. Item index i corresponds to
+/// the i-th CONFIRMED flag (the render step minted the collection in
+/// exactly that order — index alignment by construction).
+///
+/// State machine preserved verbatim: `verified` keeps `Confirmed` (marker
+/// dropped downstream), `refuted` demotes to `Archived` +
+/// `demoted_by_verify`, everything inconclusive (`uncertain`/`unparsed`/
+/// `error`/budget-skip) keeps `Confirmed` WITH the manual-verification
+/// marker. Verify-stage exhaustion degrades the STAGE, never the run.
+pub(crate) fn apply_verify_results(
+    judged: &mut [JudgedFlag],
+    results: &[MapItemResult],
+    vstaff: &ResolvedSeatStaffing,
+    budget: u64,
+    case_id: &str,
+) -> VerifyApplyOutcome {
+    let identifier = seat_identifier(&vstaff.pm);
+    let remote = vstaff.pm.is_remote();
+    let endpoint_host = seat_endpoint_host(&vstaff.pm);
+    let docket = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
+
+    let mut calls = 0u32;
+    let mut skipped = 0u32;
+    let mut tokens = 0u64;
+    let mut wall_ms = 0u64;
+    let mut served_model: Option<String> = None;
+
+    for (j, item) in judged.iter_mut().filter(|j| j.tier == Tier::Confirmed).zip(results.iter()) {
+        let record = if item.error.as_deref() == Some(MAP_BUDGET_SKIP_ERROR) {
+            skipped += 1;
+            VerifyRecord {
+                ruling: VerifyRuling::Error,
+                decisive_evidence: String::new(),
+                note_for_author:
+                    "remote token budget exhausted for this stage — call skipped".to_string(),
+                seconds: 0.0,
+                model: identifier.clone(),
+            }
+        } else {
+            calls += 1;
+            tokens += item.total_tokens.unwrap_or(0);
+            wall_ms += item.wall_ms;
+            if served_model.is_none() {
+                served_model = item.served_model.clone();
+            }
+            let seconds = item.wall_ms as f64 / 1000.0;
+            if !item.ok {
+                VerifyRecord {
+                    ruling: VerifyRuling::Error,
+                    decisive_evidence: String::new(),
+                    note_for_author: format!(
+                        "verify dispatch failed: {}",
+                        item.error.as_deref().unwrap_or_default()
+                    ),
+                    seconds,
+                    model: identifier.clone(),
+                }
+            } else {
+                match parse_verify_ruling(&item.content) {
+                    Some((ruling, decisive_evidence, note_for_author)) => VerifyRecord {
+                        ruling,
+                        decisive_evidence,
+                        note_for_author,
+                        seconds,
+                        model: identifier.clone(),
+                    },
+                    None => VerifyRecord {
+                        ruling: VerifyRuling::Unparsed,
+                        decisive_evidence: String::new(),
+                        note_for_author: String::new(),
+                        seconds,
+                        model: identifier.clone(),
+                    },
+                }
+            }
+        };
+        emit_review_step_result(
+            "review.verify",
+            "review-ruling",
+            case_id,
+            json!({ "bundle_id": j.flag.bundle_id, "stage": "verify", "ruling": record.ruling, "seconds": record.seconds }),
+        );
+        if record.ruling == VerifyRuling::Refuted {
+            j.tier = Tier::Archived;
+            j.demoted_by_verify = true;
         }
-        // (#1360 follow-up) Same reasoning as ReviewJudgeStepKind's own
-        // residency() — a truly empty bundle set means every upstream
-        // step's output is transitively guaranteed empty too, so verify is
-        // certain to have nothing confirmed to check.
-        if self.ctx.bundles.is_empty() {
-            return None;
-        }
-        // (#1426 ship-2 operator decision) DATA-DEPENDENT short-circuit,
-        // ahead of the wave loader: verify's docket is the judge output's
-        // CONFIRMED subset, and by the time this step is ready that output
-        // is real (`verify_task.depends_on == [judge_task]`), delivered in
-        // the same gathered `input` map `run` will receive. Zero confirmed
-        // findings means `run` is a guaranteed no-op — return `None` so the
-        // residency wave never loads the verify model for it. Conservative
-        // on unparseable input (fall through and keep the placement): `run`
-        // owns surfacing that error; residency stays a best-effort
-        // classification that must never mask it.
-        if confirmed_count_in_judge_output(input) == Some(0) {
-            return None;
-        }
-        let n_ctx = vstaff.pm.n_ctx?;
-        let identifier = darkmux_gestalt::namespaced_identifier(&vstaff.pm.id, vstaff.pm.identifier.as_deref());
-        Some(darkmux_gestalt::Placement {
-            model_key: vstaff.pm.id.clone(),
-            identifier,
-            min_ctx: n_ctx,
-            seat: "review-verify".to_string(),
-        })
+        j.verify = Some(record);
     }
+
+    let member = (calls > 0).then(|| MemberRecord {
+        model: identifier,
+        seat: "review-verify".to_string(),
+        draws: calls,
+        wall_ms,
+        total_tokens: tokens,
+        remote,
+        endpoint: endpoint_host,
+        served_model,
+    });
+    // Same wording as `verify_budget_outcome` (the sequential path's
+    // helper) — stage-degrading, loud, never run-degrading.
+    let warning = (skipped > 0).then(|| {
+        let adjudicated = docket.saturating_sub(skipped as usize);
+        format!(
+            "verify budget exhausted after {adjudicated} of {docket} adjudications — the \
+             remaining {skipped} confirmed finding(s) keep the manual-verification marker (the \
+             per-execution allowance of {budget} tokens ran out)"
+        )
+    });
+    let budget_row = (remote && (calls > 0 || skipped > 0)).then(|| RemoteBudgetRecord {
+        stage: "verify".to_string(),
+        max_tokens: budget,
+        used_tokens: tokens,
+        // (#1442 gate CONSIDER) `tokens` sums the endpoint-REPORTED usage
+        // while the live `MapRemoteBucket` meters conservatively — a
+        // usage-omitting endpoint can skip calls (`skipped > 0`) with the
+        // summed total still below `budget`. A skip is itself proof the
+        // bucket exhausted, so it keeps `exhausted` truthful. (Same corner as
+        // the probe reconstruction's budget row.)
+        exhausted: skipped > 0 || tokens >= budget,
+        skipped_calls: skipped,
+    });
+    VerifyApplyOutcome { member, warning, budget_row }
 }
 
 // ─── report: synthesis (terminal step) ──────────────────────────────────
@@ -4635,10 +4383,24 @@ pub struct ReviewSynthesisStepKind {
     pub env: SharedReviewEnvelope,
     /// (#1341) `gather_inputs` now keys a Step's `input` map by the
     /// DEPENDENCY TASK's id (dependency/data-flow lives at Task level) —
-    /// so this step reads its two upstream contributions by TASK id, not
+    /// so this step reads its upstream contributions by TASK id, not
     /// step id.
     pub dedup_task_id: String,
+    /// (#1442 ship-2b) The judge task's id — the judged docket arrives
+    /// directly from the judge now: the verify task's own output is the
+    /// generic `dispatch.map`'s per-item result array, not a judged list.
+    pub judge_task_id: String,
     pub verify_task_id: String,
+    /// (#1442 ship-2b) The verify seat's staffing (None = no seat) — this
+    /// step owns the verify-APPLY boundary: parsing the map results,
+    /// running the preserved verified/refuted/uncertain state machine over
+    /// the confirmed docket, and contributing the seat's member row +
+    /// budget row + exhaustion warning (see [`apply_verify_results`]).
+    pub(crate) verify: Option<ResolvedSeatStaffing>,
+    /// Same run-wide accumulator every dispatching contributor uses,
+    /// merged into `shared_env` by `run_review_graph` post-run.
+    pub(crate) members: Arc<StdMutex<Vec<MemberRecord>>>,
+    pub(crate) remote_budget: u64,
 }
 
 impl StepKind for ReviewSynthesisStepKind {
@@ -4653,17 +4415,53 @@ impl StepKind for ReviewSynthesisStepKind {
     fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
         let t0 = Instant::now();
         let dedup_output = input.get(&self.dedup_task_id).cloned().unwrap_or_default();
+        let judge_output = input.get(&self.judge_task_id).cloned().unwrap_or_default();
         let verify_output = input.get(&self.verify_task_id).cloned().unwrap_or_default();
         let flags: Vec<ProbeFlag> = if dedup_output.is_empty() {
             Vec::new()
         } else {
             serde_json::from_str(&dedup_output).context("deserializing deduped flags")?
         };
-        let judged: Vec<JudgedFlag> = if verify_output.is_empty() {
+        let mut judged: Vec<JudgedFlag> = if judge_output.is_empty() {
             Vec::new()
         } else {
-            serde_json::from_str(&verify_output).context("deserializing final judged flags")?
+            serde_json::from_str(&judge_output).context("deserializing judged flags")?
         };
+        let verify_results: Vec<MapItemResult> = if verify_output.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&verify_output).context("deserializing verify map results")?
+        };
+
+        // (#1442 ship-2b) Verify-APPLY boundary: fold the generic map's
+        // per-item results back onto the confirmed docket. An empty result
+        // set covers every no-dispatch path in one shape (no seat staffed /
+        // doomed run / zero confirmed — the render step emitted an empty
+        // collection, the map short-circuited): the docket passes through
+        // untouched, byte-identical to a crew with no verify seat.
+        if let Some(vstaff) = &self.verify {
+            if !verify_results.is_empty() {
+                let outcome = apply_verify_results(
+                    &mut judged,
+                    &verify_results,
+                    vstaff,
+                    self.remote_budget,
+                    &self.ctx.case_id,
+                );
+                if let Some(member) = outcome.member {
+                    self.members.lock().expect("members mutex poisoned").push(member);
+                }
+                if outcome.warning.is_some() || outcome.budget_row.is_some() {
+                    let mut env = self.env.lock().expect("shared review envelope mutex poisoned");
+                    if let Some(w) = outcome.warning {
+                        env.warnings.push(w);
+                    }
+                    if let Some(rec) = outcome.budget_row {
+                        env.remote_budgets.push(rec);
+                    }
+                }
+            }
+        }
 
         let mut env = self.env.lock().expect("shared review envelope mutex poisoned").clone();
         env.raw_flags = env.raw_flags.max(flags.len());
@@ -4780,7 +4578,6 @@ pub struct BuiltReviewGraph {
     /// actually written into them.
     probe_members: Arc<StdMutex<Vec<MemberRecord>>>,
     probe_warnings: Arc<StdMutex<Vec<String>>>,
-    probe_bucket: Arc<StdMutex<RemoteBucket>>,
 }
 
 /// (#1402) Pure kind-id → display-name lookup for review's six Tier 3
@@ -4800,11 +4597,19 @@ pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
     if kind == "review.bundle" {
         return Some("Bundle");
     }
+    // (#1442 ship-2b) `review.probe:<seat>` / `review.verify` kinds no
+    // longer mint (the probe/verify stages ride the generic `dispatch.map`
+    // block, whose display name resolves through the builtin registry) —
+    // these entries remain so PERSISTED steps from pre-rewiring missions
+    // still label correctly in the viewer's read path.
     if kind == "review.probe" || kind.starts_with("review.probe:") {
         return Some("Probe");
     }
     if kind == "review.dedup" {
         return Some("Dedup");
+    }
+    if kind == "review.verify-render" {
+        return Some("Verify prompts");
     }
     if kind == "review.judge" {
         return Some("Judge");
@@ -4877,8 +4682,19 @@ pub fn build_review_graph(
     phase_ids.insert("adjudicate".to_string(), adjudicate_phase_id.to_string());
     phase_ids.insert("report".to_string(), report_phase_id.to_string());
 
+    // (#1442 ship-2b) k is expansion FAN-OUT: the probe template expands
+    // into one task per (seat, draw) — both mint-time-known — so every draw
+    // is a visible graph node and the scheduler parallelizes draws. The
+    // item NAME feeds only the expanded task's description/display
+    // patterns; ids render from `{index}`.
+    let mut probe_expansion: Vec<String> = Vec::new();
+    for staffing in probes {
+        for draw in 0..staffing.k {
+            probe_expansion.push(format!("{}/draw-{draw}", staffing.name));
+        }
+    }
     let mut expansions = std::collections::BTreeMap::new();
-    expansions.insert("probe_seats".to_string(), probes.iter().map(|p| p.name.clone()).collect());
+    expansions.insert("probe_seats".to_string(), probe_expansion);
 
     // (#1284 Packet 3 worklist) `judge_concurrency` is ALWAYS an override,
     // never read back out of review.json's own static
@@ -4908,7 +4724,7 @@ pub fn build_review_graph(
     // expanded to zero probe tasks is named in the posted review, not just
     // caught by the (separate) zero-draws honesty gate in
     // `run_review_graph`'s post-run merge.
-    let (tasks, steps, interpret_warnings) = interpret(&loaded.config, &params).with_context(|| {
+    let (tasks, mut steps, interpret_warnings) = interpret(&loaded.config, &params).with_context(|| {
         format!(
             "interpreting mission config \"review\" (resolved from the {} tier at {})",
             loaded.source,
@@ -4937,49 +4753,150 @@ pub fn build_review_graph(
         ..Default::default()
     }));
 
-    let registry = StepKindRegistry::new();
+    // (#1442 ship-2b) The probe/verify stages ride the GENERIC
+    // `dispatch.map` builtin, so the registry starts from the Tier-1
+    // builtin set instead of empty.
+    let registry = StepKindRegistry::with_builtins();
 
     let bundle_kind = Arc::new(ReviewBundleStepKind { ctx: ctx.clone() });
     registry.register(bundle_kind.clone()).expect("review.bundle registered once");
     // (#1349) Legacy alias — a `Step.kind` persisted before the funnel->review
     // rename must still resolve if anything ever re-reads it back through a
     // fresh registry (see `StepKindRegistry::register_alias`'s doc).
+    // (#1442 ship-2b) The probe/verify legacy aliases (`funnel.probe:<seat>`,
+    // `funnel.verify`) retired WITH their kinds — there is no live
+    // implementation left to alias to (pre-1.0, no compat baggage); the
+    // read-path labeling of persisted historical steps lives in
+    // `review_step_kind_display_name` instead.
     registry
         .register_alias("funnel.bundle", bundle_kind)
         .expect("funnel.bundle legacy alias registered once");
 
-    let bucket = Arc::new(StdMutex::new(RemoteBucket::new("probe", ctx.remote_max_tokens_per_execution)));
-    // (#1354 follow-up) Named for its original probe-only scope, but now
-    // shared with the judge/verify step kinds below too — one accumulator
-    // for every dispatching step kind, merged into `shared_env` once
-    // `run_step_graph` returns.
+    // (#1354 follow-up) One accumulator for every dispatching contributor
+    // (probe reconstruction at dedup, judge, verify apply at synthesis),
+    // merged into `shared_env` once `run_step_graph` returns.
     let probe_members = Arc::new(StdMutex::new(Vec::new()));
     let probe_warnings = Arc::new(StdMutex::new(Vec::new()));
-    for staffing in probes {
-        let kind_id = format!("review.probe:{}", staffing.name);
-        // (#1284 review round 2, consider 3) Hard assert, matching the
-        // `.expect` posture of the dedup/verify/synthesis lookups below —
-        // a release build must not silently register a probe kind no
-        // interpreted step references.
-        assert!(
-            steps.values().any(|s| s.kind == kind_id),
-            "the interpreted graph must have expanded a `{kind_id}` step for every staffed probe seat"
-        );
-        let kind = Arc::new(ReviewProbeStepKind::new(
-            ctx.clone(),
-            staffing.clone(),
-            bucket.clone(),
-            probe_members.clone(),
-            probe_warnings.clone(),
-        ));
-        registry.register(kind.clone()).expect("each probe seat's kind id is unique per staffing name");
-        // (#1349) Legacy alias — see the bundle step's registration above.
-        registry
-            .register_alias(&format!("funnel.probe:{}", staffing.name), kind)
-            .expect("each probe seat's legacy funnel alias id is unique per staffing name");
+
+    // (#1442 ship-2b) Stamp each expanded (seat, draw) map step's FULL
+    // config — the pre-rendered `probe_user_message` collection (byte
+    // parity by construction: `user_template: "{item}"` substitutes each
+    // rendered prompt verbatim), the seat's dispatch identity, the shared
+    // `bucket_group: "probe"` allowance (+ its resolved budget, so the
+    // artifact is self-describing), `retry_on_empty: 1` (the historical
+    // single empty-content retry), and the residency hints for local
+    // seats. NOTE: a hosted seat's `endpoint` block carries only the URL /
+    // auth MECHANICS (Keychain item name / env-var NAME — never a secret
+    // value; see `EndpointAuth`), the same material `profiles.json`
+    // already persists on disk.
+    let remote_budget = ctx.remote_max_tokens_per_execution;
+    let mut probe_specs: Vec<ProbeSeatSpec> = Vec::new();
+    {
+        let mut flat_index = 0usize;
+        for staffing in probes {
+            let identifier = seat_identifier(&staffing.pm);
+            let endpoint = seat_endpoint(&staffing.pm);
+            let endpoint_host = seat_endpoint_host(&staffing.pm);
+            let max_tokens = resolve_seat_max_tokens(staffing, DEFAULT_PROBE_MAX_TOKENS);
+            let selected = select_bundles_for_staffing(&ctx.bundles, staffing.selector.as_ref());
+            let collection: Vec<String> =
+                selected.iter().map(|b| probe_user_message(&ctx.probe_system, b)).collect();
+            let bundles: Vec<(String, String)> =
+                selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
+            let mut draw_task_ids = Vec::with_capacity(staffing.k as usize);
+            for _draw in 0..staffing.k {
+                let task_id = format!("review-probe-{flat_index}-task");
+                let step_id = format!("review-probe-{flat_index}-step");
+                let step = steps.get_mut(&step_id).unwrap_or_else(|| {
+                    // (#1284 review round 2, consider 3) Hard assert posture
+                    // preserved: a release build must not silently mint a
+                    // spec no interpreted step backs.
+                    panic!(
+                        "the interpreted graph must have expanded `{step_id}` for every (seat, draw)"
+                    )
+                });
+                let mut config = json!({
+                    "model": identifier,
+                    "system": "",
+                    "user_template": "{item}",
+                    "collection": collection,
+                    "temperature": PROBE_TEMPERATURE,
+                    "max_tokens": max_tokens,
+                    "timeout_seconds": ctx.timeout_seconds,
+                    "retry_on_empty": 1,
+                    "bucket_group": "probe",
+                    "bucket_budget": remote_budget,
+                });
+                if let Some(ep) = endpoint {
+                    config["endpoint"] =
+                        serde_json::to_value(ep).context("serializing probe seat endpoint")?;
+                } else {
+                    // Residency hints: the wire `model` is the NAMESPACED
+                    // identifier; the loadable key is the bare profile id.
+                    config["model_key"] = json!(staffing.pm.id);
+                    config["identifier"] = json!(identifier);
+                    if let Some(n_ctx) = staffing.pm.n_ctx {
+                        config["n_ctx"] = json!(n_ctx);
+                    }
+                }
+                step.config = config;
+                draw_task_ids.push(task_id);
+                flat_index += 1;
+            }
+            probe_specs.push(ProbeSeatSpec {
+                name: staffing.name.clone(),
+                identifier,
+                remote: endpoint.is_some(),
+                endpoint_host,
+                draw_task_ids,
+                bundles,
+            });
+        }
     }
 
-    let dedup_kind = Arc::new(ReviewDedupStepKind { ctx: ctx.clone(), env: shared_env.clone() });
+    // (#1442 ship-2b) The verify map step's config — its COLLECTION arrives
+    // at runtime from the render step (the task's single upstream input),
+    // so only the dispatch parameters are stamped here. No verify seat ⇒
+    // config stays null: the render step emits an empty collection and the
+    // map short-circuits before any config key is required.
+    if let Some(vstaff) = &verify {
+        let identifier = seat_identifier(&vstaff.pm);
+        let endpoint = seat_endpoint(&vstaff.pm);
+        let max_tokens = resolve_seat_max_tokens(vstaff, DEFAULT_JUDGE_MAX_TOKENS);
+        let step = steps
+            .get_mut("review-verify-step")
+            .expect("interpreted \"review\" graph must have a review-verify-step");
+        let mut config = json!({
+            "model": identifier,
+            "system": ctx.verify_system,
+            "user_template": "{item}",
+            "temperature": JUDGE_TEMPERATURE,
+            "max_tokens": max_tokens,
+            "timeout_seconds": ctx.timeout_seconds,
+            "retry_on_empty": 1,
+            "bucket_budget": remote_budget,
+        });
+        if let Some(ep) = endpoint {
+            config["endpoint"] =
+                serde_json::to_value(ep).context("serializing verify seat endpoint")?;
+        } else {
+            config["model_key"] = json!(vstaff.pm.id);
+            config["identifier"] = json!(identifier);
+            if let Some(n_ctx) = vstaff.pm.n_ctx {
+                config["n_ctx"] = json!(n_ctx);
+            }
+        }
+        step.config = config;
+    }
+
+    let dedup_kind = Arc::new(ReviewDedupStepKind {
+        ctx: ctx.clone(),
+        env: shared_env.clone(),
+        probe_specs,
+        members: probe_members.clone(),
+        warnings: probe_warnings.clone(),
+        remote_budget,
+    });
     registry.register(dedup_kind.clone()).expect("review.dedup registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
     registry
@@ -4998,19 +4915,19 @@ pub fn build_review_graph(
         .register_alias("funnel.judge", judge_kind)
         .expect("funnel.judge legacy alias registered once");
 
-    let verify_kind = Arc::new(ReviewVerifyStepKind {
+    // (#1442 ship-2b) The render step — the Tier-3 half of the verify
+    // stage that stayed bespoke (frozen `verify_prompt` assembly against
+    // this pipeline's own types); the dispatch half is the generic map.
+    let verify_render_kind = Arc::new(ReviewVerifyRenderStepKind {
         ctx: ctx.clone(),
-        verify,
-        members: probe_members.clone(),
+        verify: verify.clone(),
         env: shared_env.clone(),
     });
-    registry.register(verify_kind.clone()).expect("review.verify registered once");
-    // (#1349) Legacy alias — see the bundle step's registration above.
     registry
-        .register_alias("funnel.verify", verify_kind)
-        .expect("funnel.verify legacy alias registered once");
+        .register(verify_render_kind)
+        .expect("review.verify-render registered once");
 
-    // The interpreted graph's fixed ids for the two upstream tasks
+    // The interpreted graph's fixed ids for the upstream tasks
     // `ReviewSynthesisStepKind` reads from — derived from the ACTUAL
     // interpreted `steps` map (never hardcoded) so a document/interpreter
     // drift surfaces as a clear panic here, not a silent mismatch.
@@ -5019,11 +4936,18 @@ pub fn build_review_graph(
         .find(|s| s.kind == "review.dedup")
         .map(|s| s.task_id.clone())
         .expect("interpreted \"review\" graph must have a review.dedup step");
-    let verify_task_id = steps
+    let judge_task_id = steps
         .values()
-        .find(|s| s.kind == "review.verify")
+        .find(|s| s.kind == "review.judge")
         .map(|s| s.task_id.clone())
-        .expect("interpreted \"review\" graph must have a review.verify step");
+        .expect("interpreted \"review\" graph must have a review.judge step");
+    // The verify map step's kind is the generic `dispatch.map`, so its task
+    // resolves by the document's FIXED step id (same fixed-ids contract as
+    // the kind-keyed lookups above).
+    let verify_task_id = steps
+        .get("review-verify-step")
+        .map(|s| s.task_id.clone())
+        .expect("interpreted \"review\" graph must have a review-verify-step");
     let synthesis_step_id = steps
         .values()
         .find(|s| s.kind == "review.synthesis")
@@ -5034,7 +4958,11 @@ pub fn build_review_graph(
         ctx: ctx.clone(),
         env: shared_env.clone(),
         dedup_task_id,
+        judge_task_id,
         verify_task_id,
+        verify,
+        members: probe_members.clone(),
+        remote_budget,
     });
     registry.register(synthesis_kind.clone()).expect("review.synthesis registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
@@ -5051,7 +4979,6 @@ pub fn build_review_graph(
         phase_id_of_step,
         probe_members,
         probe_warnings,
-        probe_bucket: bucket,
     })
 }
 
@@ -5065,14 +4992,16 @@ pub fn build_review_graph(
 /// canonical `dispatch start`/`dispatch complete`/`dispatch error` record
 /// (`darkmux_flow::bookend::BookendGuard`, #1230 Packet 0) around the whole
 /// call — the SAME liveness edge #1272 fixed the viewer's running-dispatch
-/// surfaces to key on. A second, review-scoped `review.task` bookend here
+/// surfaces to key on. A second, review-scoped task-level bookend here
 /// was pure duplication of that outer wrap, not an independent liveness
 /// fix, and its competing vocabulary is exactly the "bespoke top-level
 /// record instead of the generic mechanism" bug #1349 retires — see
-/// `with_dispatch_bookends`'s payload construction in `pr_review.rs` for
-/// where this function's former `review.task` payload fields (exec mode,
-/// bundle count, confirmed/needs_check/archived, degenerate reason) now
-/// ride instead, so no data is lost, only the redundant vocabulary.
+/// `with_dispatch_bookends`'s payload construction for where this function's
+/// former task-bookend payload fields (exec mode, bundle count,
+/// confirmed/needs_check/archived, degenerate reason) now ride instead, so
+/// no data is lost, only the redundant vocabulary. (#1434 extended the same
+/// retirement to the sequential `run_judge_only` path, so BOTH review paths
+/// now emit only the generic `step result` companion vocabulary.)
 /// Assembles the final [`ReviewEnvelope`] from the synthesis step's output
 /// merged with the shared cross-cutting state, and returns the COMPLETED
 /// `steps` map (status/output/timestamps all reflect the real run) so the
@@ -5095,13 +5024,34 @@ pub fn build_review_graph(
 /// valid `persist` for callers with no durable Step storage (every test in
 /// this module, and `darkmux lab review-bench`'s per-run-local bench path,
 /// which mints no real Mission — lab-vs-fleet boundary).
+/// (#1442 ship-2b) Adapt `ReviewStepContext::chat_override` (the review
+/// module's own test seam) into the generic scheduler-level
+/// [`MapDispatchOverride`] the probe/verify `dispatch.map` steps consult —
+/// `None` whenever the ctx carries no mock (every production call site),
+/// so production dispatch.map transport is untouched. The two call shapes
+/// are field-parallel by construction ([`ChatCall`] ↔
+/// [`OverrideDispatchCall`]).
+pub(crate) fn review_dispatch_override(ctx: &ReviewStepContext) -> Option<MapDispatchOverride> {
+    let chat = ctx.chat_override.clone()?;
+    Some(Arc::new(move |call: &OverrideDispatchCall| {
+        chat(&ChatCall {
+            model: call.model,
+            system: call.system,
+            user: call.user,
+            temperature: call.temperature,
+            max_tokens: call.max_tokens,
+            endpoint: call.endpoint,
+        })
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_review_graph(
     ctx: &ReviewStepContext,
     crew_name: &str,
     mode: ExecMode,
     fingerprint_val: serde_json::Value,
-    staffing: CrewStaffingSnapshot,
+    staffing: StaffingSnapshot,
     graph: BuiltReviewGraph,
     emitter: &mut dyn ReviewEmitter,
     persist: &mut dyn FnMut(&Step),
@@ -5114,7 +5064,6 @@ pub fn run_review_graph(
         synthesis_step_id,
         probe_members,
         probe_warnings,
-        probe_bucket,
         ..
     } = graph;
     let tasks_by_id: std::collections::BTreeMap<String, Task> =
@@ -5172,28 +5121,26 @@ pub fn run_review_graph(
             emitter.emit(record);
         },
         persist,
+        // (#1442 ship-2b) The ctx-mock adapter — `None` in production; a
+        // mocked test's probe/verify `dispatch.map` items dispatch through
+        // the same `chat_override` every bespoke review kind uses.
+        review_dispatch_override(ctx),
     );
 
     // Merge the probe stage's NOW-populated accumulators (every probe step
     // has run by the time `run_step_graph` returns, whether it errored or
     // not) into the shared envelope — this can only happen AFTER the run,
     // not at `build_review_graph` time when they were still empty.
+    // (#1442 ship-2b) The probe stage's budget row + exhaustion warning
+    // now reconstruct at the DEDUP boundary (`reconstruct_probe_stage`) and
+    // land in `shared_env` during the run; only the member/warning
+    // accumulators still merge here.
     {
         let mut env = shared_env.lock().expect("shared review envelope mutex poisoned");
         env.members
             .extend(probe_members.lock().expect("probe members mutex poisoned").iter().cloned());
         env.warnings
             .extend(probe_warnings.lock().expect("probe warnings mutex poisoned").iter().cloned());
-        if let Some(rec) = probe_bucket.lock().expect("probe bucket mutex poisoned").record() {
-            if rec.skipped_calls > 0 {
-                env.warnings.push(format!(
-                    "remote probe token budget exhausted — {} draw(s) skipped after the \
-                     per-execution allowance ({} tokens) ran out; reduced coverage",
-                    rec.skipped_calls, rec.max_tokens
-                ));
-            }
-            env.remote_budgets.push(rec);
-        }
     }
 
     let report = match report {

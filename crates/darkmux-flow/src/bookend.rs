@@ -3,9 +3,11 @@
 //! Three structurally-identical guards grew independently before this
 //! module existed: `darkmux-crew`'s `DispatchBookendGuard` (flat, one
 //! `dispatch start` → `dispatch complete`/`dispatch error`), `darkmux-lab`'s
-//! per-run driver guard (a stack — one task-level bookend nesting
-//! per-step ones; originally `funnel.rs`'s `FunnelBookendGuard`, renamed to
-//! `review.rs`'s `ReviewRunGuard` in #1349), and `src/pr_review.rs`'s
+//! per-run review driver guard (a stack — one task-level bookend nesting
+//! per-step ones; originally `funnel.rs`'s `FunnelBookendGuard`, later the
+//! review driver's run-guard — since RETIRED in #1434, when the review path
+//! folded onto one generic `step result` vocabulary and dropped its
+//! per-run bookend entirely), and `src/mission_launch_review.rs`'s
 //! `with_dispatch_bookends` (flat, bridging a review-pipeline run into the
 //! `dispatch *` vocabulary). Same shape every time: emit a `started`
 //! record, arm a guard, and guarantee a matching terminal record fires no
@@ -28,8 +30,8 @@
 //! This module intentionally knows nothing about `FlowRecord`'s domain
 //! meaning beyond its existence — callers build every `started`/`finished`/
 //! abort record themselves (via their own crate's record builders,
-//! `darkmux-crew::dispatch::build_dispatch_record_with_payload` or
-//! `darkmux-lab`'s `review_flow_record`) and hand the guard a fully-built
+//! `darkmux-crew::dispatch::build_dispatch_record_with_payload` or the
+//! binary crate's `review_bookend_record`) and hand the guard a fully-built
 //! [`FlowRecord`]. `darkmux-flow` is a dependency LEAF w.r.t. both
 //! `darkmux-crew` and `darkmux-lab` (neither of those crates' record
 //! builders can be called from here without introducing a cycle), so this
@@ -60,9 +62,8 @@ impl<F: FnMut(FlowRecord)> BookendSink for F {
 /// One open (started, not yet finished) unit on a [`BookendGuard`]'s stack.
 /// `kind` is opaque to the guard — callers use it purely to decide, inside
 /// their `on_abort` closure, which record shape to build for a given open
-/// unit (e.g. the review driver's `on_abort` builds a `review.task`-shaped
-/// abort record when `kind == "task"`, a `review.step`-shaped one
-/// otherwise).
+/// unit (e.g. `with_dispatch_bookends`'s `on_abort` builds a `dispatch
+/// error` record for its single `dispatch` unit).
 struct OpenUnit {
     id: String,
     kind: String,

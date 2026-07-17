@@ -304,8 +304,8 @@ fn crew_model_summary(crew: &ResolvedCrew) -> Option<String> {
 /// One review-run dispatch bookend record. Same builder + field shape
 /// `dispatch` uses, with ONE deliberate difference: `source` is
 /// overridden from the builder's hardcoded `"crew_dispatch"` to `"review"`
-/// — the SAME provenance tag every sibling `review.task/step/ruling` record
-/// in this session carries.
+/// — the SAME provenance tag every sibling `step result` record the review
+/// driver emits in this session carries.
 fn review_bookend_record(
     level: darkmux_flow::Level,
     action: &str,
@@ -621,6 +621,7 @@ pub(crate) fn launch(
                 "head_sha",
                 "bundler",
                 "k",
+                "passes",
             ] {
                 if collected.contains_key(key) {
                     ignored.push(key);
@@ -693,6 +694,10 @@ fn run_dispatch(
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         k: u32_input(collected, "k")?,
+        // (#1266) Judge consensus depth, sourced from the `passes` input;
+        // `None` => the resolver's double-confirm default. Validated `>= 1` in
+        // the resolver.
+        passes: u32_input(collected, "passes")?,
         request_changes: bool_input(collected, "request_changes"),
     };
     let crew = resolve_review_resourcing(&loaded.registry, &resourcing)?;
@@ -1087,15 +1092,18 @@ mod tests {
     fn with_dispatch_bookends_start_precedes_review_records_with_exactly_one_terminal_on_success() {
         let mut emitter = RecordingEmitter::default();
         let result = with_dispatch_bookends(&mut emitter, "case-1", "test-crew", Some("darkmux:judge-model"), json!({}), |em| {
-            em.emit(fake_review_record("review.task"));
-            em.emit(fake_review_record("review.step"));
-            em.emit(fake_review_record("review.ruling"));
+            // (#1434) The review driver emits the generic `step result`
+            // vocabulary; the bookend wrapper brackets whatever inner records
+            // it emits, so these stand in for a real run's step results.
+            em.emit(fake_review_record("step result"));
+            em.emit(fake_review_record("step result"));
+            em.emit(fake_review_record("step result"));
             Ok(ReviewEnvelope::default())
         });
         assert!(result.is_ok());
 
         let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
-        assert_eq!(actions, vec!["dispatch start", "review.task", "review.step", "review.ruling", "dispatch complete"]);
+        assert_eq!(actions, vec!["dispatch start", "step result", "step result", "step result", "dispatch complete"]);
 
         let terminals = actions.iter().filter(|a| **a == "dispatch complete" || **a == "dispatch error").count();
         assert_eq!(terminals, 1, "exactly one terminal dispatch record: {actions:?}");
@@ -1116,7 +1124,7 @@ mod tests {
     fn with_dispatch_bookends_error_path_emits_dispatch_error_terminal_with_the_real_message() {
         let mut emitter = RecordingEmitter::default();
         let result = with_dispatch_bookends(&mut emitter, "case-2", "test-crew", None, json!({}), |em| {
-            em.emit(fake_review_record("review.task"));
+            em.emit(fake_review_record("step result"));
             Err(anyhow!("probe dispatch failed: connection refused"))
         });
         assert!(result.is_err());
@@ -1156,7 +1164,7 @@ mod tests {
     fn with_dispatch_bookends_stamps_endpoint_and_remote_tokens_for_a_remote_member() {
         let mut emitter = RecordingEmitter::default();
         let result = with_dispatch_bookends(&mut emitter, "case-4", "test-crew", Some("darkmux:judge-model"), json!({}), |em| {
-            em.emit(fake_review_record("review.task"));
+            em.emit(fake_review_record("step result"));
             Ok(ReviewEnvelope {
                 members: vec![
                     MemberRecord {

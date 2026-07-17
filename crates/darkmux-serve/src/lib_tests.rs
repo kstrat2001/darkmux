@@ -2757,19 +2757,23 @@
         }]);
         fs::write(dir.join("funnels.json"), serde_json::to_vec_pretty(&funnels).unwrap()).unwrap();
 
+        // (#1434) The review path emits only the generic `step result`
+        // companion vocabulary now — these filler events mirror it. A
+        // finished run's headline meta comes from `funnels.json`/`scores.json`
+        // below, not from these records.
         let events = format!(
             "{}\n{}\n",
             serde_json::json!({
                 "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "review.task",
-                "handle": crew, "session_id": case_id, "source": "review",
-                "payload": {"case_id": case_id, "crew": crew, "exec_mode": "sequential", "status": "started", "bundles": 5}
+                "tier": "local", "stage": "dispatch", "action": "step result",
+                "handle": "bundle", "session_id": case_id, "source": "review",
+                "payload": {"step_id": "bundle", "kind": "review.bundle", "items_out": 5}
             }),
             serde_json::json!({
                 "ts": "2026-01-01T00:05:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "review.task",
-                "handle": crew, "session_id": case_id, "source": "review",
-                "payload": {"status": "finished", "confirmed": 2, "needs_check": 1, "archived": 3}
+                "tier": "local", "stage": "dispatch", "action": "step result",
+                "handle": "judge", "session_id": case_id, "source": "review",
+                "payload": {"step_id": "judge", "kind": "review.judge", "items_in": 6, "items_out": 6}
             }),
         );
         fs::write(dir.join("funnel-events.jsonl"), events).unwrap();
@@ -2793,15 +2797,19 @@
     }
 
     /// Write a LIVE synthetic run at `dir`: only `funnel-events.jsonl` with a
-    /// single "started" `funnel.task` record — no `funnels.json`/
-    /// `scores.json` yet, matching a run whose first case hasn't completed.
-    fn write_synthetic_live_run(dir: &StdPath, case_id: &str, crew: &str) {
+    /// single `step result` record — no `funnels.json`/`scores.json` yet,
+    /// matching a run whose first case hasn't completed. (#1434 — the review
+    /// path emits the generic `step result` companion vocabulary; `crew` is
+    /// retained in the signature for call-site parity but no longer carried in
+    /// the record, since the retired per-run task bookend was the only record
+    /// that carried case/crew-on-start meta.)
+    fn write_synthetic_live_run(dir: &StdPath, case_id: &str, _crew: &str) {
         fs::create_dir_all(dir).unwrap();
         let record = serde_json::json!({
             "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
-            "tier": "local", "stage": "dispatch", "action": "review.task",
-            "handle": crew, "session_id": case_id, "source": "review",
-            "payload": {"case_id": case_id, "crew": crew, "exec_mode": "parallel", "status": "started", "bundles": 12}
+            "tier": "local", "stage": "dispatch", "action": "step result",
+            "handle": "bundle", "session_id": case_id, "source": "review",
+            "payload": {"step_id": "bundle", "kind": "review.bundle", "items_out": 12}
         });
         fs::write(dir.join("funnel-events.jsonl"), format!("{record}\n")).unwrap();
     }
@@ -2889,17 +2897,26 @@
         assert_eq!(staffing.judge.as_ref().unwrap().model, "darkmux:demo-judge-model");
     }
 
+    /// (#1434 — successor of `scan_lab_runs_finds_a_live_run_via_events_
+    /// prefix_scan`.) A live run (events-only, no case completed yet) is
+    /// still DISCOVERED — `has_events` true, not finished, no envelope
+    /// snapshot yet. The former best-effort case_id/crew/exec_mode prefix
+    /// scan keyed on the retired per-run task-started record; that record no
+    /// longer exists, so those headline fields are now empty until the first
+    /// case completes and `funnels.json`/`scores.json` land (the deliberate,
+    /// named behavior change — the scan matched nothing in current output and
+    /// was removed rather than ported).
     #[test]
-    fn scan_lab_runs_finds_a_live_run_via_events_prefix_scan() {
+    fn scan_lab_runs_discovers_a_live_events_only_run_without_headline_meta() {
         let tmp = TempDir::new().unwrap();
         write_synthetic_live_run(&tmp.path().join("case-b/gate-1"), "demo-case-b", "demo-gate-crew");
         let runs = scan_lab_runs(tmp.path());
         assert_eq!(runs.len(), 1);
         let r = &runs[0];
         assert_eq!(r.dir, "case-b/gate-1");
-        assert_eq!(r.case_ids, vec!["demo-case-b".to_string()]);
-        assert_eq!(r.crew.as_deref(), Some("demo-gate-crew"));
-        assert_eq!(r.exec_mode.as_deref(), Some("parallel"));
+        assert!(r.case_ids.is_empty(), "no case has completed, so no case ids yet: {:?}", r.case_ids);
+        assert!(r.crew.is_none(), "crew meta lands only once a case completes");
+        assert!(r.exec_mode.is_none(), "exec_mode meta lands only once a case completes");
         assert!(!r.finished, "no scores.json yet => not finished");
         assert!(!r.has_funnels, "no case has completed yet");
         assert!(r.has_events);
@@ -3221,9 +3238,9 @@
             "{}",
             serde_json::json!({
                 "ts": "2026-01-01T00:01:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "review.step",
-                "handle": "demo-gate-crew", "session_id": "demo-case-b", "source": "review",
-                "payload": {"step_id": "bundle", "kind": "procedural", "status": "finished", "items_in": 1, "items_out": 12, "wall_ms": 0}
+                "tier": "local", "stage": "dispatch", "action": "step result",
+                "handle": "dedup", "session_id": "demo-case-b", "source": "review",
+                "payload": {"step_id": "dedup", "kind": "review.dedup", "items_in": 1, "items_out": 12, "wall_ms": 0}
             })
         )
         .unwrap();
@@ -3243,7 +3260,7 @@
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let lines = json["lines"].as_array().unwrap();
         assert_eq!(lines.len(), 1, "only the newly-appended record: {lines:?}");
-        assert_eq!(lines[0]["action"], "review.step");
+        assert_eq!(lines[0]["action"], "step result");
     }
 
     #[tokio::test]
@@ -3978,7 +3995,7 @@
     /// (item 7) Shape test against a REAL review-config-interpreted graph:
     /// loads the embedded `review` mission config, interprets it with a
     /// launcher supplying two probe seats (mirroring how `pr-review run`
-    /// would resolve `crew_staffing` at launch), persists the resulting
+    /// would resolve `staffing` at launch), persists the resulting
     /// Mission/Phase/Task/Step graph, and asserts the graph.json node
     /// counts match what `review.json`'s own shape (3 phases; investigate
     /// = bundle + N probe + dedup; adjudicate = judge; report = verify +
@@ -4036,33 +4053,37 @@
         let nodes = json["nodes"].as_array().unwrap();
         let count_kind = |kind: &str| nodes.iter().filter(|n| n["kind"] == kind).count();
         assert_eq!(count_kind("phase"), 3, "{nodes:?}");
-        assert_eq!(count_kind("task"), 7, "expected bundle+2 probes+dedup+judge+verify+synthesis: {nodes:?}");
+        // (#1442 ship-2b) The two expansion items here stand in for two
+        // (seat, draw) pairs — k is expansion fan-out, so the probe stage
+        // is one task per pair, each a generic dispatch.map step.
+        assert_eq!(count_kind("task"), 7, "expected bundle+2 probe maps+dedup+judge+verify+synthesis: {nodes:?}");
         // (#1401) No separate "step" node kind anymore — every task's
         // steps render as rows on ITS OWN node instead. Sum the `steps`
-        // array lengths across every task node: still 7 (every task in
-        // review.json is single-step), just no longer a separate node per
-        // step.
+        // array lengths across every task node: 8 (#1442 — the verify task
+        // is two sequential rows now: the frozen-prompt render, then the
+        // dispatch.map), no longer a separate node per step.
         assert_eq!(count_kind("step"), 0, "steps are rows now, not nodes (#1401): {nodes:?}");
         let total_step_rows: usize = nodes
             .iter()
             .filter(|n| n["kind"] == "task")
             .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
             .sum();
-        assert_eq!(total_step_rows, 7, "every task in review.json is single-step: {nodes:?}");
+        assert_eq!(total_step_rows, 8, "verify carries two rows (render + map): {nodes:?}");
         assert_eq!(tasks.len(), 7);
-        assert_eq!(steps.len(), 7);
+        assert_eq!(steps.len(), 8);
 
         // (#1402) Every row's label resolves through the real StepKind
-        // display-name fallback chain — a probe row (rendered per-seat
-        // kind id "review.probe:seat-a") still reads "Probe", the base
-        // label, not the raw suffixed id.
+        // display-name fallback chain — the probe/verify dispatch rows are
+        // generic `dispatch.map` steps (#1442) and read the BUILTIN
+        // registry's "Dispatch (map)" label; the bespoke review kinds keep
+        // their own labels.
         let all_labels: Vec<String> = nodes
             .iter()
             .filter(|n| n["kind"] == "task")
             .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
             .filter_map(|row| row["label"].as_str().map(String::from))
             .collect();
-        for expected in ["Bundle", "Probe", "Dedup", "Judge", "Verify", "Synthesis"] {
+        for expected in ["Bundle", "Dispatch (map)", "Dedup", "Judge", "Verify prompts", "Synthesis"] {
             assert!(
                 all_labels.iter().any(|l| l == expected),
                 "expected a \"{expected}\" row label among {all_labels:?}"

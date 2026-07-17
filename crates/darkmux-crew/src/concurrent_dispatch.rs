@@ -354,7 +354,29 @@ fn ensure_wave_loaded(
     let pools = MacProbe.pools().unwrap_or_default();
     let facts = Facts { residents, pools, ..Default::default() };
     let opts = AcquireOpts { intent: CallerIntent::Auto, scope: AcquireScope::Additive };
-    let plan = plan_acquire(placements, &facts, opts, est);
+    // (#1442 ship-2b, found live) A wave's placements are per-STEP, and the
+    // seats x k fan-out makes SAME-MODEL duplicates the norm (k sibling
+    // `dispatch.map` steps all place the same model, differing only in
+    // their `seat` provenance string). `plan_acquire` decides per
+    // placement against one facts snapshot, so a duplicated placement
+    // whose resident needs a stale-ctx reconcile would plan the SAME
+    // unload+load once PER DUPLICATE — the second unload then hard-fails
+    // with "not resident" and takes the whole wave down (reproduced live
+    // on the first seats x k validation run). The loader's job is per
+    // MODEL, not per step: collapse duplicates before planning, keeping
+    // the MAX `min_ctx` across the duplicates so every sibling's need is
+    // still satisfied by the one load.
+    let mut unique: Vec<Placement> = Vec::with_capacity(placements.len());
+    for p in placements {
+        match unique
+            .iter_mut()
+            .find(|u| u.model_key == p.model_key && u.identifier == p.identifier)
+        {
+            Some(u) => u.min_ctx = u.min_ctx.max(p.min_ctx),
+            None => unique.push(p.clone()),
+        }
+    }
+    let plan = plan_acquire(&unique, &facts, opts, est);
     let deadline = resolved_load_deadline();
     for planned in &plan.actions {
         match &planned.action {
@@ -436,6 +458,43 @@ mod tests {
             marker.fetch_add(1, Ordering::SeqCst);
             Ok((index, vec![]))
         })
+    }
+
+    /// (#1442 ship-2b, reproduced live on the first seats x k validation
+    /// run) A wave whose placements DUPLICATE one model (k sibling
+    /// `dispatch.map` steps, distinct `seat` strings) while that model is
+    /// resident at a STALE (too-small) ctx: the loader must reconcile the
+    /// model ONCE — one unload, one load at the duplicates' MAX `min_ctx` —
+    /// never once per duplicate (the second unload would hit the mock's
+    /// enforced #1279 NotResident error, exactly the live failure).
+    #[test]
+    fn ensure_wave_loaded_collapses_duplicate_placements_before_planning() {
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:m", "m", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![
+            Placement { model_key: "m".into(), identifier: "darkmux:m".into(), min_ctx: 68_000, seat: "step:probe-0".into() },
+            Placement { model_key: "m".into(), identifier: "darkmux:m".into(), min_ctx: 64_000, seat: "step:probe-1".into() },
+        ];
+        ensure_wave_loaded(&wave, &est, &mut host)
+            .expect("duplicate placements reconcile once, never a second NotResident unload");
+
+        let unloads: Vec<_> = host
+            .ops
+            .iter()
+            .filter(|op| matches!(op, darkmux_gestalt::mock::HostOp::Unload { .. }))
+            .collect();
+        assert_eq!(unloads.len(), 1, "one unload for the stale resident: {:?}", host.ops);
+        let loads: Vec<_> = host
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                darkmux_gestalt::mock::HostOp::Load { min_ctx, .. } => Some(*min_ctx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(loads, vec![68_000], "one load, at the duplicates' MAX min_ctx: {:?}", host.ops);
     }
 
     /// The plan sketch's headline test: `run_bounded` respects

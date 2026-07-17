@@ -1,12 +1,12 @@
 {
   "id": "review",
   "name": "PR Review",
-  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired from `darkmux pr-review run` in Packet 4b): investigate (resolve bundles from the diff, probe every staffed seat, dedup the flags) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of Packet 3, this document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config, resolves crew_staffing into the probe-template task's `expand` collection, and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
+  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired from `darkmux pr-review run` in Packet 4b): investigate (resolve bundles from the diff, probe every staffed seat as seats x k generic dispatch.map steps (#1442), dedup the flags with domain reconstruction at the dedup boundary) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of Packet 3, this document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config, resolves staffing into the probe-template task's `expand` collection, and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
   "schema_version": "1.2",
   "inputs": [
     {
       "name": "diff_file",
-      "description": "Path to the unified diff file under review. `mission_launch_review::launch` reads it into ReviewStepContext.diff and feeds it to every probe/judge/verify dispatch. Required unconditionally -- even a `from_envelope` synthesis-only launch needs it, to resolve each finding's quoted anchor back to a diff line. Old flag: `--diff`.",
+      "description": "Path to the unified diff file under review. `mission_launch_review::launch` reads it into ReviewStepContext.diff and feeds it to every probe/judge/verify dispatch. Required unconditionally -- even a `from_envelope` synthesis-only launch needs it, to resolve each finding's quoted anchor back to a diff line.",
       "required": true
     },
     {
@@ -16,27 +16,27 @@
     },
     {
       "name": "worktree",
-      "description": "Local checkout directory to bundle from. Alternative to `github` + `head_sha` (mutually exclusive; exactly one source is required unless `from_envelope`). Old flag: `--worktree`.",
+      "description": "Local checkout directory to bundle from. Alternative to `github` + `head_sha` (mutually exclusive; exactly one source is required unless `from_envelope`).",
       "required": false
     },
     {
       "name": "github",
-      "description": "GitHub source `owner/repo` -- bundles via the GitHub API, no local checkout. Requires `head_sha`. Old flag: `--github`.",
+      "description": "GitHub source `owner/repo` -- bundles via the GitHub API, no local checkout. Requires `head_sha`.",
       "required": false
     },
     {
       "name": "head_sha",
-      "description": "Commit SHA to read file content at (GitHub source only). Old flag: `--head-sha`.",
+      "description": "Commit SHA to read file content at (GitHub source only).",
       "required": false
     },
     {
       "name": "intent_file",
-      "description": "Path to a file carrying the author's stated intent for the change (PR title + description, one blob), fed into the JUDGE prompt only (ReviewStepContext.intent_body; intent_title stays empty -- matches the retired CLI). Absent -> \"(no description provided)\". Old flag: `--intent-file`.",
+      "description": "Path to a file carrying the author's stated intent for the change (PR title + description, one blob), fed into the JUDGE prompt only (ReviewStepContext.intent_body; intent_title stays empty -- matches the retired CLI). Absent -> \"(no description provided)\".",
       "required": false
     },
     {
       "name": "profile",
-      "description": "(#1426 ship-2) The ROSTER profile whose models the resourcing resolver scores per review seat (probe / judge / verify). Absent -> the registry's `default_profile`. Replaces the retired `crew` input: staffing is now DERIVED from the profile roster, not read from a `crews` map. Old flag: none (was `--crew` naming a crews entry).",
+      "description": "(#1426 ship-2) The ROSTER profile whose models the resourcing resolver scores per review seat (probe / judge / verify). Absent -> the registry's `default_profile`. Replaces the retired `crew` input: staffing is now DERIVED from the profile roster, not read from a `crews` map.",
       "required": false
     },
     {
@@ -61,47 +61,52 @@
     },
     {
       "name": "mode",
-      "description": "Model-cycling mode: sequential | parallel | auto (default auto). Old flag: `--mode`.",
+      "description": "Execution mode: sequential | parallel | auto (default auto). `auto` lets the gestalt wave planner decide co-residency from the resolved seats; the value is resolved via `resolve_mode` and recorded on the envelope as `mode` provenance, not a behavioral switch the operator normally sets.",
       "required": false
     },
     {
       "name": "k",
-      "description": "The probe seat's draw count (k) — draw BREADTH. Absent -> the resolver's default (3). Old flag: `--k`.",
+      "description": "The probe seat's draw count (k) — draw BREADTH. Absent -> the resolver's default (3).",
+      "required": false
+    },
+    {
+      "name": "passes",
+      "description": "(#1266) The judge seat's consensus DEPTH (passes) — 1 single / 2 double-confirm / N unanimous. Governs the JUDGE seat only (the sole consumer; the probe/verify seats ignore it). Absent -> the resolver's default (2, double-confirm). Validated `>= 1` at resolution time (a zero-pass judge makes no ruling); lenient on read otherwise (contract 7). Threaded to the already-parameterized `multi_pass_confirm` pass count via `ResolvedSeatStaffing.passes`.",
       "required": false
     },
     {
       "name": "envelope_out",
-      "description": "Path to write the full review envelope (pretty JSON). Old flag: `--envelope-out`.",
+      "description": "Path to write the full review envelope (pretty JSON).",
       "required": false
     },
     {
       "name": "emit",
-      "description": "Path to write the rendered `{mode, review, comment}` payload. `-` (or omitted) writes to stdout -- a CONTRACT the CI workflow parses byte-for-byte, so `mission launch` prints no decorative banner ahead of it for this config. Old flag: `--emit`.",
+      "description": "Path to write the rendered `{mode, review, comment}` payload. `-` (or omitted) writes to stdout -- a CONTRACT the CI workflow parses byte-for-byte, so `mission launch` prints no decorative banner ahead of it for this config.",
       "required": false
     },
     {
       "name": "profiles",
-      "description": "Override path for profiles.json (else DARKMUX_PROFILES / the default resolution). Old flag: `--profiles-file`.",
+      "description": "Override path for profiles.json (else DARKMUX_PROFILES / the default resolution).",
       "required": false
     },
     {
       "name": "attribution",
-      "description": "Attribution text for the posted footer (#1113) -- the default derives \"where the model ran\" from the envelope's own member records. Old flag: `--attribution`.",
+      "description": "Attribution text for the posted footer (#1113) -- the default derives \"where the model ran\" from the envelope's own member records.",
       "required": false
     },
     {
       "name": "bundler",
-      "description": "External bundler command (`<cmd> --worktree <dir> --diff <file>`), standing in for the built-in bundler. Old flag: `--bundler`.",
+      "description": "External bundler command (`<cmd> --worktree <dir> --diff <file>`), standing in for the built-in bundler.",
       "required": false
     },
     {
       "name": "charges_file",
-      "description": "Re-judge a previously-recorded flag list without re-running the probe (run_judge_only) -- the bundler still runs, since the judge needs the code each flag's bundle_id refers to. Mints NO mission (same as the retired CLI). Old flag: `--charges-file`.",
+      "description": "Re-judge a previously-recorded flag list without re-running the probe (run_judge_only) -- the bundler still runs, since the judge needs the code each flag's bundle_id refers to. Mints NO mission (same as the retired CLI).",
       "required": false
     },
     {
       "name": "from_envelope",
-      "description": "Synthesis-only: read a previously-written envelope_out and emit the rendered payload -- zero model calls, zero bundling, zero mission minted. The CI-testable path. Old flag: `--from-envelope`.",
+      "description": "Synthesis-only: read a previously-written envelope_out and emit the rendered payload -- zero model calls, zero bundling, zero mission minted. The CI-testable path.",
       "required": false
     },
     {
@@ -110,8 +115,8 @@
       "required": false
     },
     {
-      "name": "crew_staffing",
-      "description": "Resolved probe/judge/verify seat staffing (CrewStaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from the resourcing resolver (#1426 ship-2 -- roster profile scoring + seat pins), never a literal CLI input. Determines HOW MANY review.probe:<seat-name> tasks the investigate phase's probe-template task expands into at launch time -- see the 'review-probe-template' task's notes below.",
+      "name": "staffing",
+      "description": "Resolved probe/judge/verify seat staffing (StaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from the resourcing resolver (#1426 ship-2 -- roster profile scoring + seat pins), never a literal CLI input. Determines HOW MANY probe tasks the investigate phase's probe-template task expands into at launch time: one per (staffed seat, draw) -- seats x k (#1442, k as expansion fan-out). See the 'review-probe-template' task's notes below.",
       "required": false
     },
     {
@@ -142,14 +147,14 @@
         {
           "id": "review-probe-template-task",
           "display_name": "Probe",
-          "description": "TEMPLATE for the probe stage. build_review_graph builds ONE task/step PER STAFFED PROBE SEAT (kind `review.probe:<seat-name>`, ids `review-probe-{index}-task` / `review-probe-{index}-step`) -- a count and a set of names only known once `crew_staffing` (see inputs) resolves. The `expand` block below (#1284 Packet 3, schema 1.1) is the typed, interpretable primitive mission_config::interpret uses to turn this ONE template into N real tasks at launch -- the launcher resolves `probe_seats` from crew_staffing's staffed probe seats (in staffing order) and passes it as a LaunchParams.expansions entry.",
+          "description": "TEMPLATE for the probe stage. build_review_graph builds ONE task/step PER STAFFED PROBE SEAT (kind `review.probe:<seat-name>`, ids `review-probe-{index}-task` / `review-probe-{index}-step`) -- a count and a set of names only known once `staffing` (see inputs) resolves. The `expand` block below (#1284 Packet 3, schema 1.1) is the typed, interpretable primitive mission_config::interpret uses to turn this ONE template into N real tasks at launch -- the launcher resolves `probe_seats` from staffing's staffed probe seats (in staffing order) and passes it as a LaunchParams.expansions entry.",
           "depends_on": [
             "review-bundle-task"
           ],
           "steps": [
             {
               "id": "review-probe-template-step",
-              "kind": "review.probe",
+              "kind": "dispatch.map",
               "config": null
             }
           ],
@@ -157,9 +162,9 @@
             "over": "probe_seats",
             "task_id_pattern": "review-probe-{index}-task",
             "step_id_pattern": "review-probe-{index}-step",
-            "kind_pattern": "{kind}:{name}",
+            "kind_pattern": "{kind}",
             "description_pattern": "probe seat `{name}`",
-            "display_name_pattern": "Probe {index}"
+            "display_name_pattern": "Probe {name}"
           }
         },
         {
@@ -211,27 +216,34 @@
         {
           "id": "review-verify-task",
           "display_name": "Verify",
-          "description": "verify — adjudicate confirmed findings",
+          "description": "verify — render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
           "depends_on": [
             "review-judge-task"
           ],
           "steps": [
             {
+              "id": "review-verify-render-step",
+              "kind": "review.verify-render",
+              "config": null
+            },
+            {
               "id": "review-verify-step",
-              "kind": "review.verify",
+              "kind": "dispatch.map",
               "config": null
             }
           ],
           "notes": [
-            "always present in the graph even when no verify seat is staffed -- ReviewVerifyStepKind itself no-ops on an absent seat; this config does not (yet) express that conditionality."
+            "always present in the graph even when no verify seat is staffed -- the render step (review.verify-render) emits an EMPTY collection in that case (and on a judge-doomed run, and on a zero-confirmed docket), which makes the dispatch.map step a completed no-op with residency None: zero model loads, zero dispatches (#1442, the generic port of the empty-docket short-circuit).",
+            "the render step consumes the judge task's output and emits one frozen verify_prompt per CONFIRMED finding (byte parity with the #1256 golden by construction); build_review_graph stamps the map step's dispatch config (model/system/max_tokens/bucket_budget/...) only when a verify seat is staffed. The verify-APPLY boundary (state machine, member accounting, budget row) lives in the synthesis step."
           ]
         },
         {
           "id": "review-synthesis-task",
           "display_name": "Synthesis",
-          "description": "synthesis — finalize tier counts + needs-check clustering",
+          "description": "synthesis — apply verify adjudications, finalize tier counts + needs-check clustering",
           "depends_on": [
             "review-dedup-task",
+            "review-judge-task",
             "review-verify-task"
           ],
           "steps": [

@@ -57,18 +57,38 @@ impl MapRemoteBucket {
     pub(crate) fn remaining(&self) -> u64 {
         self.budget.saturating_sub(self.used)
     }
-    /// `false` ⇒ the bucket is exhausted and this item's call must not fire
-    /// (counted as skipped, for the item's named-reason result).
-    pub(crate) fn admit(&mut self) -> bool {
+    /// (#1442 fan-out) Admit one call and RESERVE its granted `max_tokens`
+    /// up front, returning the granted (clamped) cap — or `None` when the
+    /// bucket is already exhausted (counted as skipped, for the item's
+    /// named-reason result). The reserve-then-[`settle`](Self::settle) shape
+    /// replaces the old admit-then-spend-after pair because sibling
+    /// `dispatch.map` steps of one `bucket_group` (the probe stage's
+    /// `seats x k` fan-out) run CONCURRENTLY on `run_bounded` worker
+    /// threads: with spend-after accounting, every in-flight sibling could
+    /// admit against the same untouched balance and the stage would
+    /// overshoot by one call PER SIBLING. Reserving the granted cap at
+    /// admission bounds the whole group's overshoot to what an endpoint
+    /// itself reports ABOVE a granted cap — the same soft-ceiling reading as
+    /// before, now independent of sibling concurrency. In a sequential
+    /// per-item loop the observable behavior is identical to the old pair
+    /// (settle always lands before the next admit).
+    pub(crate) fn admit_reserve(&mut self, requested: u32) -> Option<u32> {
         if self.exhausted() {
             self.skipped += 1;
-            false
-        } else {
-            true
+            return None;
         }
+        let granted = u32::try_from(self.remaining()).unwrap_or(u32::MAX).min(requested);
+        self.used = self.used.saturating_add(u64::from(granted));
+        Some(granted)
     }
-    pub(crate) fn spend(&mut self, tokens: u64) {
-        self.used = self.used.saturating_add(tokens);
+    /// Settle a reserved call against its ACTUAL spend (the reply's reported
+    /// usage, or — conservatively — the granted cap when the endpoint omits
+    /// usage; see `conservative_hosted_spend`). Replaces the reservation
+    /// with the real number; an endpoint that reports above its granted cap
+    /// pushes the bucket over (the documented soft-ceiling overshoot), one
+    /// that reports under releases the difference back to its siblings.
+    pub(crate) fn settle(&mut self, granted: u32, actual: u64) {
+        self.used = self.used.saturating_sub(u64::from(granted)).saturating_add(actual);
     }
     /// Count of calls refused because the bucket was exhausted — read by
     /// tests asserting the skip path fired.
@@ -77,6 +97,44 @@ impl MapRemoteBucket {
         self.skipped
     }
 }
+
+/// (#1442, ship-2b probe/verify retirement) One dispatch a `dispatch.map`
+/// item is about to make, surfaced to the scheduler-supplied
+/// [`MapDispatchOverride`] test seam. Field-parallel to the union of the
+/// LOCAL ([`crate::single_shot::SingleShotRequest`]) and HOSTED
+/// ([`crate::single_shot::HostedSingleShotRequest`]) request shapes:
+/// `endpoint: Some` marks the HOSTED dialect (where `temperature` is
+/// meaningless and carried as `0.0` — the hosted wire request has no such
+/// field), `None` the LOCAL one.
+pub struct OverrideDispatchCall<'a> {
+    pub model: &'a str,
+    pub system: &'a str,
+    pub user: &'a str,
+    /// LOCAL dialect only — `0.0` on a hosted call (no wire field).
+    pub temperature: f32,
+    /// The granted (already bucket-clamped, on the hosted arm) completion
+    /// cap this call would send.
+    pub max_tokens: u32,
+    pub timeout_seconds: u32,
+    pub endpoint: Option<&'a darkmux_types::ModelEndpoint>,
+}
+
+/// (#1442, ship-2b — the operator-recorded seam decision on PR #1455) An
+/// optional dispatch interceptor for `dispatch.map` items, carried on
+/// [`StepRunCtx`] so it crosses the `run_bounded` WORKER-THREAD boundary —
+/// the same injection discipline as `darkmux-lab`'s
+/// `ReviewStepContext::chat_override` (an `Arc<dyn Fn + Send + Sync>`
+/// field, `None` at every production call site). A thread-local seam
+/// cannot serve here: the scheduler executes steps on spawned scoped
+/// threads (`concurrent_dispatch::run_remote_batches` /
+/// `run_local_waves`), where a test thread's thread-local is invisible.
+/// When present, `dispatch.map` routes every item's call through it INSTEAD
+/// of the real `single_shot_chat`/`single_shot_chat_hosted` transport —
+/// budget metering, retry semantics, telemetry, and per-item records all
+/// still apply exactly as on the real path (the override replaces the
+/// TRANSPORT, never the accounting).
+pub type MapDispatchOverride =
+    Arc<dyn for<'a> Fn(&OverrideDispatchCall<'a>) -> Result<crate::single_shot::SingleShotReply> + Send + Sync>;
 
 /// (#1442) The execution context the SCHEDULER supplies to each step's
 /// [`StepKind::run_streaming`] — two seams that must originate OUTSIDE the
@@ -99,14 +157,16 @@ impl MapRemoteBucket {
 pub struct StepRunCtx {
     emitter: Option<std::sync::mpsc::Sender<FlowRecord>>,
     remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
+    dispatch_override: Option<MapDispatchOverride>,
 }
 
 impl StepRunCtx {
     pub(crate) fn new(
         emitter: Option<std::sync::mpsc::Sender<FlowRecord>>,
         remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
+        dispatch_override: Option<MapDispatchOverride>,
     ) -> Self {
-        Self { emitter, remote_bucket }
+        Self { emitter, remote_bucket, dispatch_override }
     }
 
     /// Emit one flow record LIVE through the scheduler's emission seam
@@ -129,6 +189,12 @@ impl StepRunCtx {
     /// here and creates its own step-scoped bucket.
     pub fn remote_bucket(&self) -> Option<&Arc<Mutex<MapRemoteBucket>>> {
         self.remote_bucket.as_ref()
+    }
+
+    /// The caller-supplied dispatch interceptor for `dispatch.map` items —
+    /// `None` on every production path (see [`MapDispatchOverride`]).
+    pub fn dispatch_override(&self) -> Option<&MapDispatchOverride> {
+        self.dispatch_override.as_ref()
     }
 }
 

@@ -56,7 +56,7 @@
 //! `--input`/`--param` collection or its generic header banner — review's
 //! rendered payload is a stdout CONTRACT the CI workflow parses, so nothing
 //! decorative may precede it). `review.*` Tier 3 kinds need crew-staffing
-//! resolution (`crew_staffing`, `judge_concurrency` — see `templates/
+//! resolution (`staffing`, `judge_concurrency` — see `templates/
 //! builtin/mission-configs/review.json`'s own `inputs` doc) that
 //! `crates/darkmux-lab/src/lab/review.rs::build_review_graph` already knows
 //! how to do — `mission_launch_review::launch` is a NEW CALLER of that
@@ -101,8 +101,17 @@ const CODER_PHASE_TIER3_KINDS: &[&str] = &["mission.worktree", "mission.coder", 
 /// tiering fix's clothes"). Named here purely so `known_kinds`'s
 /// doctor-style `validate()` pass never warns "unknown kind" on review's own
 /// document.
-const REVIEW_TIER3_KINDS: &[&str] =
-    &["review.bundle", "review.probe", "review.dedup", "review.judge", "review.verify", "review.synthesis"];
+const REVIEW_TIER3_KINDS: &[&str] = &[
+    "review.bundle",
+    "review.dedup",
+    "review.judge",
+    // (#1442 ship-2b) `review.probe` / `review.verify` retired — the
+    // probe/verify stages ride the generic Tier-1 `dispatch.map` (already
+    // in the builtin known set); the verify task's bespoke half is the
+    // frozen-prompt render step.
+    "review.verify-render",
+    "review.synthesis",
+];
 
 /// `darkmux mission launch <config-id>` entry point. Returns the process
 /// exit code — the coder-phase rows mirror `coder_phase::run`'s own exit
@@ -443,6 +452,7 @@ pub fn launch(
                 );
             }
         },
+        None,
     );
 
     // (#1406, F4) A scheduler-level `Err` mid-run would otherwise `?`-return

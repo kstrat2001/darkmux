@@ -232,7 +232,7 @@ pub struct ExpansionSpec {
     /// Name of the launch-time collection [`interpret::LaunchParams::expansions`]
     /// resolves this task's copies from — e.g. `"probe_seats"`. The schema
     /// only records the NAME; the launcher decides what populates it (the
-    /// review launcher resolves it from `crew_staffing`'s staffed probe
+    /// review launcher resolves it from `staffing`'s staffed probe
     /// seats, in staffing order).
     pub over: String,
     /// Real Task-id pattern for one expanded copy, e.g.
@@ -915,7 +915,7 @@ mod tests {
         assert_eq!(cfg.schema_version.as_deref(), Some(MISSION_CONFIG_SCHEMA));
         assert!(!cfg.inputs.is_empty(), "review declares its runtime-only inputs");
         assert!(
-            cfg.inputs.iter().any(|i| i.name == "crew_staffing"),
+            cfg.inputs.iter().any(|i| i.name == "staffing"),
             "the dynamic-probe-count limitation must be named as a declared input"
         );
 
@@ -943,11 +943,19 @@ mod tests {
         let report = &cfg.phases[2];
         let report_task_ids: Vec<&str> = report.tasks.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(report_task_ids, vec!["review-verify-task", "review-synthesis-task"]);
-        // synthesis depends on BOTH dedup and verify — the cross-phase edge
-        // `build_review_graph` wires (see that function's doc).
+        // (#1442 ship-2b) The verify task is two sequential steps — the
+        // bespoke frozen-prompt render, then the GENERIC dispatch.map the
+        // stage's dispatches now ride.
+        let verify_step_kinds: Vec<&str> =
+            report.tasks[0].steps.iter().map(|s| s.kind.as_str()).collect();
+        assert_eq!(verify_step_kinds, vec!["review.verify-render", "dispatch.map"]);
+        // synthesis depends on dedup, judge (#1442 — the judged docket flows
+        // directly from the judge; verify's own output is the map's result
+        // array), and verify — the cross-phase edges `build_review_graph`
+        // wires (see that function's doc).
         assert_eq!(
             report.tasks[1].depends_on,
-            vec!["review-dedup-task", "review-verify-task"]
+            vec!["review-dedup-task", "review-judge-task", "review-verify-task"]
         );
 
         // (#1284 Packet 3) The probe-template task declares its dynamic
@@ -962,8 +970,11 @@ mod tests {
         assert_eq!(expand.over, "probe_seats");
         assert_eq!(expand.task_id_pattern, "review-probe-{index}-task");
         assert_eq!(expand.step_id_pattern, "review-probe-{index}-step");
-        assert_eq!(expand.kind_pattern, "{kind}:{name}");
-        assert_eq!(probe_template.steps[0].kind, "review.probe");
+        // (#1442 ship-2b) Every expanded (seat, draw) copy is the SAME
+        // generic kind — the seat identity lives in the stamped per-step
+        // config, not the kind id.
+        assert_eq!(expand.kind_pattern, "{kind}");
+        assert_eq!(probe_template.steps[0].kind, "dispatch.map");
         // after expansion, review-dedup-task's depends_on must resolve to
         // every EXPANDED probe task id, not just this template's id — see
         // `interpret::interpret`'s tests for that mechanics assertion.
