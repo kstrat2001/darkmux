@@ -639,7 +639,23 @@ fn resolve_map_collection(
 /// `max_tokens` (u32, default 4096), `temperature` (f32, default 0.7, LOCAL
 /// only), `timeout_seconds` (u32, default 120), `endpoint`
 /// (`darkmux_types::ModelEndpoint` JSON — presence selects the HOSTED
-/// dialect), `n_ctx`/`identifier` (residency hints — see [`Self::residency`]).
+/// dialect), `n_ctx`/`identifier` (residency hints — see [`Self::residency`]),
+/// `retry_on_empty` (u32, default 0 — see below).
+///
+/// **`retry_on_empty` (#1442, the generic port of the probe stage's
+/// retry-on-empty loop).** Default `0` (off) — a call whose trimmed content
+/// comes back empty is accepted as-is (`ok: true`, empty `content`). When set
+/// to `N > 0`, an empty-content reply is RE-DISPATCHED up to `N` additional
+/// times (so `N = 1` matches the review probe's historical single retry: up
+/// to 2 attempts total), stopping early the moment a non-empty reply lands.
+/// Tokens are accumulated across EVERY attempt (an empty reasoning-model reply
+/// still burns — and is billed — its whole completion budget), and the hosted
+/// arm draws from the remote bucket on each attempt (a retry is another
+/// billable call). A dispatch-level `Err` on any attempt is NOT retried (the
+/// single-shot primitive owns its own transport backoff — a second-guessing
+/// retry here would hide a real infra problem); it isolates as `ok: false`.
+/// The block stays Tier-1-pure and domain-blind: `retry_on_empty` is a plain
+/// config integer, not review-specific knowledge.
 ///
 /// **Templating boundary (by design, #1442).** `user_template` can reference
 /// ONLY `{item}` — never another dependency's output. A consumer that needs
@@ -801,8 +817,6 @@ impl DispatchMapStepKind {
         input: &BTreeMap<String, String>,
         ctx: Option<&StepRunCtx>,
     ) -> Result<StepOutcome> {
-        use crate::single_shot::{single_shot_chat, HostedSingleShotRequest, SingleShotRequest};
-
         let items = resolve_map_collection(step, input)?;
         let mut batched: Vec<darkmux_flow::FlowRecord> = Vec::new();
         // Emit LIVE through the scheduler's seam when a ctx is present
@@ -832,6 +846,11 @@ impl DispatchMapStepKind {
         let max_tokens = step.config.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096) as u32;
         let timeout_seconds =
             step.config.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(120) as u32;
+        // (#1442) The generic retry-on-empty budget (default 0/off) — see the
+        // struct doc. Read once for the whole collection loop.
+        let retry_on_empty =
+            u32::try_from(step.config.get("retry_on_empty").and_then(|v| v.as_u64()).unwrap_or(0))
+                .unwrap_or(u32::MAX);
         let endpoint: Option<darkmux_types::ModelEndpoint> = match step.config.get("endpoint") {
             Some(v) => Some(
                 serde_json::from_value(v.clone())
@@ -856,88 +875,20 @@ impl DispatchMapStepKind {
             }
         };
 
+        let temperature =
+            step.config.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
         let mut results: Vec<MapItemResult> = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
             let user = user_template.replace("{item}", &map_item_text(item));
-            let res = if let Some(ep) = &endpoint {
-                let admitted = bucket.lock().expect("map remote bucket mutex poisoned").admit();
-                if !admitted {
-                    MapItemResult {
-                        index,
-                        ok: false,
-                        content: String::new(),
-                        error: Some(
-                            "remote token budget exhausted for this step — call skipped".to_string(),
-                        ),
-                        total_tokens: None,
-                    }
-                } else {
-                    // (#1442 gate C6) Clamp to what the bucket has LEFT, not
-                    // the full budget — a late item must not be granted more
-                    // than the remaining allowance.
-                    let remaining = bucket.lock().expect("map remote bucket mutex poisoned").remaining();
-                    let clamped = clamp_hosted_max_tokens(max_tokens, remaining);
-                    let req = HostedSingleShotRequest {
-                        endpoint: ep,
-                        model,
-                        system,
-                        user: &user,
-                        max_tokens: clamped,
-                        timeout_seconds,
-                    };
-                    match map_hosted_dispatch(&req) {
-                        Ok(reply) => {
-                            bucket
-                                .lock()
-                                .expect("map remote bucket mutex poisoned")
-                                .spend(conservative_hosted_spend(reply.total_tokens, clamped));
-                            MapItemResult {
-                                index,
-                                ok: true,
-                                content: reply.content,
-                                error: None,
-                                total_tokens: reply.total_tokens,
-                            }
-                        }
-                        // Per-item error ISOLATION: capture, continue.
-                        Err(e) => MapItemResult {
-                            index,
-                            ok: false,
-                            content: String::new(),
-                            error: Some(format!("{e:#}")),
-                            total_tokens: None,
-                        },
-                    }
-                }
-            } else {
-                let temperature =
-                    step.config.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
-                let req = SingleShotRequest {
-                    base_url: None,
-                    model,
-                    system,
-                    user: &user,
-                    temperature,
-                    max_tokens,
-                    timeout_seconds,
-                };
-                match single_shot_chat(&req) {
-                    Ok(reply) => MapItemResult {
-                        index,
-                        ok: true,
-                        content: reply.content,
-                        error: None,
-                        total_tokens: reply.total_tokens,
-                    },
-                    // Per-item error ISOLATION: capture, continue.
-                    Err(e) => MapItemResult {
-                        index,
-                        ok: false,
-                        content: String::new(),
-                        error: Some(format!("{e:#}")),
-                        total_tokens: None,
-                    },
-                }
+            let res = match &endpoint {
+                Some(ep) => map_hosted_item(
+                    index, &bucket, ep, model, system, &user, max_tokens, timeout_seconds,
+                    retry_on_empty,
+                ),
+                None => map_local_item(
+                    index, model, system, &user, temperature, max_tokens, timeout_seconds,
+                    retry_on_empty,
+                ),
             };
             // (#1442 gate C3) LIVE per-item emission when streaming.
             push(Self::item_record(step, model, endpoint.is_some(), &res), &mut batched);
@@ -987,6 +938,176 @@ fn map_hosted_dispatch(
         }
     }
     crate::single_shot::single_shot_chat_hosted(req)
+}
+
+/// (#1442) `total_tokens` for a per-item result: the accumulated sum across
+/// every attempt, but only when at least one attempt actually reported usage.
+/// A run where no attempt sent `usage` stays honest `None` — never a
+/// fabricated `0` a run-level token sum would silently swallow (the same
+/// discipline `conservative_hosted_spend`/the aggregate record already keep).
+fn item_total_tokens(any_usage: bool, sum: u64) -> Option<u64> {
+    any_usage.then_some(sum)
+}
+
+/// (#1442) One LOCAL map item — dispatch, with the generic `retry_on_empty`
+/// loop (default 0/off). Tokens accumulate across every attempt; the loop
+/// stops early on the first non-empty reply; a dispatch `Err` isolates as
+/// `ok: false` and is never retried. See [`DispatchMapStepKind`]'s doc for the
+/// full `retry_on_empty` semantics.
+#[allow(clippy::too_many_arguments)]
+fn map_local_item(
+    index: usize,
+    model: &str,
+    system: &str,
+    user: &str,
+    temperature: f32,
+    max_tokens: u32,
+    timeout_seconds: u32,
+    retry_on_empty: u32,
+) -> MapItemResult {
+    use crate::single_shot::{single_shot_chat, SingleShotRequest};
+    let mut sum = 0u64;
+    let mut any_usage = false;
+    for _ in 0..=retry_on_empty {
+        let req = SingleShotRequest {
+            base_url: None,
+            model,
+            system,
+            user,
+            temperature,
+            max_tokens,
+            timeout_seconds,
+        };
+        match single_shot_chat(&req) {
+            Ok(reply) => {
+                if let Some(t) = reply.total_tokens {
+                    sum += t;
+                    any_usage = true;
+                }
+                if !reply.content.trim().is_empty() {
+                    return MapItemResult {
+                        index,
+                        ok: true,
+                        content: reply.content,
+                        error: None,
+                        total_tokens: item_total_tokens(any_usage, sum),
+                    };
+                }
+                // Empty content — retry (until the budget is spent).
+            }
+            // Per-item error ISOLATION: capture, continue (never retried).
+            Err(e) => {
+                return MapItemResult {
+                    index,
+                    ok: false,
+                    content: String::new(),
+                    error: Some(format!("{e:#}")),
+                    total_tokens: item_total_tokens(any_usage, sum),
+                }
+            }
+        }
+    }
+    // Every attempt came back empty — the item DISPATCHED (ok), produced no
+    // usable content, and its whole spend is billed (the reasoning-guillotine
+    // case the probe stage's retry loop already handled).
+    MapItemResult {
+        index,
+        ok: true,
+        content: String::new(),
+        error: None,
+        total_tokens: item_total_tokens(any_usage, sum),
+    }
+}
+
+/// (#1442) One HOSTED map item — the remote-bucketed sibling of
+/// [`map_local_item`]. Each attempt (including a `retry_on_empty` retry) draws
+/// from the SHARED per-execution bucket: it admits before the call, clamps
+/// `max_tokens` to what remains (#1442 gate C6), and spends the conservative
+/// cost after. A first-attempt exhaustion is the named skip (`ok: false`); a
+/// LATER-attempt exhaustion stops retrying and keeps the empty-but-dispatched
+/// result already earned (never a spurious skip for an item that did fire).
+#[allow(clippy::too_many_arguments)]
+fn map_hosted_item(
+    index: usize,
+    bucket: &Arc<Mutex<MapRemoteBucket>>,
+    endpoint: &darkmux_types::ModelEndpoint,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    timeout_seconds: u32,
+    retry_on_empty: u32,
+) -> MapItemResult {
+    use crate::single_shot::HostedSingleShotRequest;
+    let mut sum = 0u64;
+    let mut any_usage = false;
+    for attempt in 0..=retry_on_empty {
+        let admitted = bucket.lock().expect("map remote bucket mutex poisoned").admit();
+        if !admitted {
+            if attempt == 0 {
+                return MapItemResult {
+                    index,
+                    ok: false,
+                    content: String::new(),
+                    error: Some(
+                        "remote token budget exhausted for this step — call skipped".to_string(),
+                    ),
+                    total_tokens: None,
+                };
+            }
+            // A retry the bucket can no longer fund — stop, keep what fired.
+            break;
+        }
+        let remaining = bucket.lock().expect("map remote bucket mutex poisoned").remaining();
+        let clamped = clamp_hosted_max_tokens(max_tokens, remaining);
+        let req = HostedSingleShotRequest {
+            endpoint,
+            model,
+            system,
+            user,
+            max_tokens: clamped,
+            timeout_seconds,
+        };
+        match map_hosted_dispatch(&req) {
+            Ok(reply) => {
+                bucket
+                    .lock()
+                    .expect("map remote bucket mutex poisoned")
+                    .spend(conservative_hosted_spend(reply.total_tokens, clamped));
+                if let Some(t) = reply.total_tokens {
+                    sum += t;
+                    any_usage = true;
+                }
+                if !reply.content.trim().is_empty() {
+                    return MapItemResult {
+                        index,
+                        ok: true,
+                        content: reply.content,
+                        error: None,
+                        total_tokens: item_total_tokens(any_usage, sum),
+                    };
+                }
+                // Empty content — retry (if the bucket funds another attempt).
+            }
+            // Per-item error ISOLATION: capture, continue (never retried).
+            Err(e) => {
+                return MapItemResult {
+                    index,
+                    ok: false,
+                    content: String::new(),
+                    error: Some(format!("{e:#}")),
+                    total_tokens: item_total_tokens(any_usage, sum),
+                }
+            }
+        }
+    }
+    MapItemResult {
+        index,
+        ok: true,
+        content: String::new(),
+        error: None,
+        total_tokens: item_total_tokens(any_usage, sum),
+    }
 }
 
 impl StepKind for DispatchMapStepKind {
@@ -1785,6 +1906,133 @@ mod tests {
             results.iter().all(|r| r.total_tokens.is_none()),
             "no fabricated token count when the endpoint omitted usage"
         );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── (#1442) dispatch.map retry_on_empty ─────────────────────────────
+
+    /// Script a sequence of hosted replies (content, usage) — the closure
+    /// walks the script one entry per call, clamping to the last entry once
+    /// exhausted (so a longer-than-scripted run keeps returning the tail).
+    fn install_scripted_hosted(script: Vec<(&'static str, Option<u64>)>) {
+        let idx = std::cell::Cell::new(0usize);
+        let script = std::rc::Rc::new(script);
+        install_hosted_override(move |_req| {
+            let i = idx.get().min(script.len().saturating_sub(1));
+            idx.set(idx.get() + 1);
+            let (content, total) = script[i];
+            Ok(crate::single_shot::SingleShotReply {
+                content: content.to_string(),
+                total_tokens: total,
+                prompt_tokens: None,
+                completion_tokens: None,
+                model: Some("hosted".to_string()),
+            })
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_retry_on_empty_retries_then_succeeds() {
+        // First attempt returns empty (but bills 50), the retry returns real
+        // content (bills 70). retry_on_empty=1 → the item ends ok with the
+        // non-empty content and tokens SUMMED across both attempts.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        install_scripted_hosted(vec![("", Some(50)), ("flag", Some(70))]);
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "endpoint": { "url": "https://example.com" },
+            "retry_on_empty": 1,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok, "the retry produced usable content");
+        assert_eq!(results[0].content, "flag");
+        assert_eq!(results[0].total_tokens, Some(120), "tokens billed across BOTH attempts");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_retry_on_empty_gives_up_honestly() {
+        // Both attempts empty (bill 50 + 60). retry_on_empty=1 exhausts, and
+        // the item ends ok:true with EMPTY content (dispatched, no usable
+        // result) and the full spend billed — never a flag from nothing.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        install_scripted_hosted(vec![("", Some(50)), ("   ", Some(60))]);
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "endpoint": { "url": "https://example.com" },
+            "retry_on_empty": 1,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok, "it dispatched — the empty content is a real, honest zero");
+        assert!(results[0].content.is_empty(), "no usable content after the retries");
+        assert_eq!(results[0].total_tokens, Some(110), "every attempt's spend billed");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_retry_on_empty_default_off_accepts_the_first_empty_reply() {
+        // With no retry_on_empty configured (default 0), an empty reply is
+        // accepted as-is on the FIRST attempt — one call, tokens from it only.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        // Second entry would be non-empty — if a retry (wrongly) fired we'd
+        // see "would-be-retry" content and 90 total tokens instead.
+        install_scripted_hosted(vec![("", Some(40)), ("would-be-retry", Some(50))]);
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "endpoint": { "url": "https://example.com" },
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok);
+        assert!(results[0].content.is_empty(), "default off does not retry the empty reply");
+        assert_eq!(results[0].total_tokens, Some(40), "exactly one call was made");
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),
