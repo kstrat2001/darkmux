@@ -7,7 +7,7 @@
 //! Routes through the internal Docker-bounded runtime — the only dispatch
 //! path (#1405 removed the legacy openclaw shell-out runtime).
 
-use crate::crew::dispatch::{DispatchOpts, Runtime};
+use crate::crew::dispatch::DispatchOpts;
 use crate::lab::paths::{self, ResolveScope};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -27,9 +27,6 @@ pub struct DraftOptions {
     pub dry_run: bool,
     /// Override the machine id (overrides DARKMUX_MACHINE_ID env var).
     pub machine_override: Option<String>,
-    /// Which agent runtime to dispatch the drafting prompt through.
-    /// `Runtime::Internal` is the only value.
-    pub runtime: Runtime,
 }
 
 #[derive(Debug)]
@@ -105,13 +102,11 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
     );
 
     let entry_text = if opts.dry_run {
-        let Runtime::Internal = opts.runtime;
         format!(
             "[DRY RUN — would have dispatched the prompt below to internal runtime via role `{}`]\n\n{prompt}",
             opts.role
         )
     } else {
-        let Runtime::Internal = opts.runtime;
         dispatch_draft_via_internal(&opts.role, &prompt, &session_id)?
     };
 
@@ -164,7 +159,6 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
     let opts = DispatchOpts {
         role_id: role.to_string(),
         message: prompt.to_string(),
-        deliver: None,
         session_id: Some(session_id.to_string()),
         timeout_seconds: 1800,
         skip_preflight: false,
@@ -174,7 +168,6 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
         json: true,
         workdir: None,
         phase_id: None,
-        runtime: Runtime::Internal,
         machine: None,
         wait: true,
         // Notebook draft is single-shot prompt-style; compaction
@@ -694,7 +687,6 @@ mod tests {
             slug: Some("test-slug".to_string()),
             dry_run: true,
             machine_override: None,
-            runtime: Runtime::Internal,
         })
         .unwrap();
 
@@ -731,7 +723,6 @@ mod tests {
             slug: None,
             dry_run: true,
             machine_override: None,
-            runtime: Runtime::Internal,
         });
         env::set_current_dir(prev).unwrap();
         assert!(result.is_err());
@@ -840,7 +831,6 @@ mod tests {
             slug: None,
             dry_run: true,
             machine_override: Some("override-machine".into()),
-            runtime: Runtime::Internal,
         };
         assert_eq!(resolve_machine_id(&opts_with_override), "override-machine");
 
@@ -851,7 +841,6 @@ mod tests {
             slug: None,
             dry_run: true,
             machine_override: None,
-            runtime: Runtime::Internal,
         };
         assert_eq!(resolve_machine_id(&opts_no_override), "env-fingerprint");
 

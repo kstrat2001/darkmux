@@ -34,7 +34,6 @@ pub fn characterize(opts: &CharacterizeOpts) -> Result<CharacterizeReport> {
         quiet: true,
         // characterize() is an internal utility operation — uses default
         // runtime (internal, post-Phase-D).
-        runtime: darkmux_crew::dispatch::Runtime::Internal,
         // characterize() is not a loop-variation surface (#986).
         loop_override: None,
         // characterize() never injects engagement-context (#1004).

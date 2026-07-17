@@ -649,7 +649,7 @@ fn dispatch_case(
     profile: Option<&str>,
     opts: &ReviewBenchOpts,
 ) -> Result<String> {
-    use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts, Runtime};
+    use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts};
     let session_id = format!(
         "pr-review-bench-{}-{}",
         case_id,
@@ -661,7 +661,6 @@ fn dispatch_case(
     let d = DispatchOpts {
         role_id: role_id.to_string(),
         message: prompt.to_string(),
-        deliver: None,
         session_id: Some(session_id),
         timeout_seconds: opts.timeout_seconds,
         skip_preflight: false,
@@ -670,7 +669,6 @@ fn dispatch_case(
         // modes dispatch with no workdir (a fresh tempdir).
         workdir,
         phase_id: None,
-        runtime: Runtime::Internal,
         machine: None,
         wait: true,
         // pr-review is single-turn; no compaction to override.

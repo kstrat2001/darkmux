@@ -195,7 +195,7 @@ impl StepKind for DispatchInternalStepKind {
     }
 
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
-        use crate::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts, Runtime};
+        use crate::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts};
 
         let role_id = task_or_config_str(task.role_id.as_ref(), step, "role_id").ok_or_else(|| {
             anyhow!("step `{}`: `{}` requires task.role_id or config.role_id", step.id, self.id())
@@ -227,14 +227,12 @@ impl StepKind for DispatchInternalStepKind {
         let opts = DispatchOpts {
             role_id,
             message,
-            deliver: None,
             session_id: Some(session_id),
             timeout_seconds,
             skip_preflight: false,
             json: true,
             workdir,
             phase_id,
-            runtime: Runtime::Internal,
             machine: None,
             wait: true,
             compaction: CompactionDispatchArgs::default(),

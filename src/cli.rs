@@ -117,11 +117,6 @@ pub(crate) enum Cmd {
         /// lab-validated model that profile maps to.
         #[arg(long)]
         profile: Option<String>,
-        /// Optional delivery target in `<channel>:<target>` form
-        /// (e.g. `discord:1500166601909993503`). Reserved for a future
-        /// delivery integration — not consumed by the internal runtime today.
-        #[arg(long)]
-        deliver: Option<String>,
         /// Override the dispatch session id. Default: a fresh
         /// `crew-dispatch-<role>-<unix-micros>-<process-counter>` is
         /// generated per call, so consecutive dispatches don't share

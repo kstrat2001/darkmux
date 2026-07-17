@@ -94,7 +94,6 @@ mod tests {
             _: &Path,
             _: &Profile,
             _: &str,
-            _: darkmux_crew::dispatch::Runtime,
             _: Option<&str>,
             _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
         ) -> Result<RunResult> {

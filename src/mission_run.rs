@@ -1057,14 +1057,12 @@ pub fn run(
     let opts = crew::dispatch::DispatchOpts {
         role_id: role.to_string(),
         message: coder_brief(&phase, mission, &lessons, &prior_corrections, &detected_cautions),
-        deliver: None,
         session_id: Some(session_id.clone()),
         timeout_seconds,
         skip_preflight: false,
         json: true,
         workdir: Some(wt_path.clone()),
         phase_id: Some(phase.id.clone()),
-        runtime: crew::dispatch::Runtime::Internal,
         // `--machine` is not a `mission run` flag — always local. See
         // `MissionCoderStepKind`'s doc for why that means calling
         // `dispatch::dispatch` directly is behavior-identical to the old
