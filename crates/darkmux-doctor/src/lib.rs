@@ -1780,22 +1780,30 @@ fn loopback_http_body(host: &str, port: u16, path: &str) -> Option<String> {
     response.split_once("\r\n\r\n").map(|(_, b)| b.to_string())
 }
 
-/// Pull the running daemon's build identifier out of a `/health` body.
-///
-/// Prefers `build` (`darkmux_types::build_version()` — carries the git short
-/// SHA, so it distinguishes two daemons built from different commits at the
-/// same package version, which is the common dev-box case). Falls back to
-/// `darkmux_version` for a daemon that predates the `build` field: such a
-/// daemon is BY DEFINITION older than this binary, but the honest comparison is
-/// still the one we can actually make, and same-package-version is the weakest
-/// possible false negative here (every daemon built from this commit onward
-/// carries `build`).
-fn parse_daemon_build(health_body: &str) -> Option<String> {
+/// What a running daemon told us about itself on `/health`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonBuild {
+    /// The daemon reports its full build identity (`build`, #1461+): package
+    /// version PLUS git short SHA, so two daemons built from different commits
+    /// at the same package version are distinguishable — the dev-box case.
+    Build(String),
+    /// A daemon predating #1461 reports only `darkmux_version`. Comparing that
+    /// bare version against this binary's build-tagged one would not be an
+    /// apples-to-apples comparison — but no comparison is needed: a daemon
+    /// with no `build` field was necessarily compiled before this code existed,
+    /// so it is stale by construction.
+    Legacy(String),
+}
+
+/// Pull the running daemon's build identity out of a `/health` body.
+fn parse_daemon_build(health_body: &str) -> Option<DaemonBuild> {
     let v: serde_json::Value = serde_json::from_str(health_body).ok()?;
-    v.get("build")
+    if let Some(b) = v.get("build").and_then(|b| b.as_str()) {
+        return Some(DaemonBuild::Build(b.to_string()));
+    }
+    v.get("darkmux_version")
         .and_then(|b| b.as_str())
-        .or_else(|| v.get("darkmux_version").and_then(|b| b.as_str()))
-        .map(|s| s.to_string())
+        .map(|s| DaemonBuild::Legacy(s.to_string()))
 }
 
 fn check_daemon_freshness() -> Check {
@@ -1805,12 +1813,22 @@ fn check_daemon_freshness() -> Check {
     let running = loopback_http_body("127.0.0.1", 8765, "/health")
         .as_deref()
         .and_then(parse_daemon_build);
-    classify_daemon_freshness(running.as_deref(), &darkmux_types::build_version())
+    classify_daemon_freshness(running, &darkmux_types::build_version())
 }
 
-/// Pure classifier — `running` is the daemon's self-reported build (`None` when
-/// no daemon answered), `installed` is this binary's.
-fn classify_daemon_freshness(running: Option<&str>, installed: &str) -> Check {
+/// The fix for every stale-daemon verdict. Restart is the operator's to run —
+/// doctor never touches a running process (#44).
+fn restart_daemon_hint() -> Option<String> {
+    Some(
+        "restart it: stop the running `darkmux serve` (Ctrl-C in its terminal, or \
+         `pkill -f 'darkmux serve'`) and start it again"
+            .into(),
+    )
+}
+
+/// Pure classifier — `running` is the daemon's self-reported identity (`None`
+/// when no daemon answered), `installed` is this binary's `build_version()`.
+fn classify_daemon_freshness(running: Option<DaemonBuild>, installed: &str) -> Check {
     let Some(running) = running else {
         // No daemon is the common case — most users never run one. Silent.
         return not_applicable(
@@ -1818,27 +1836,33 @@ fn classify_daemon_freshness(running: Option<&str>, installed: &str) -> Check {
             "no darkmux serve daemon running on this machine",
         );
     };
-    if running == installed {
-        return Check {
+    match running {
+        DaemonBuild::Build(b) if b == installed => Check {
             name: DAEMON_FRESHNESS_CHECK_NAME.into(),
             status: Status::Pass,
             message: format!("running daemon matches this binary ({installed})"),
             hint: None,
-        };
-    }
-    Check {
-        name: DAEMON_FRESHNESS_CHECK_NAME.into(),
-        status: Status::Warn,
-        message: format!(
-            "a darkmux serve daemon is running an OLDER build ({running}) than this binary \
-             ({installed}) — it serves its in-memory code until restarted, so anything you \
-             verify against it is testing the old build"
-        ),
-        hint: Some(
-            "restart it: stop the running `darkmux serve` (Ctrl-C in its terminal, or \
-             `pkill -f 'darkmux serve'`) and start it again"
-                .into(),
-        ),
+        },
+        DaemonBuild::Build(b) => Check {
+            name: DAEMON_FRESHNESS_CHECK_NAME.into(),
+            status: Status::Warn,
+            message: format!(
+                "a darkmux serve daemon is running a DIFFERENT build ({b}) than this binary \
+                 ({installed}) — it serves its in-memory code until restarted, so anything you \
+                 verify against it is testing that build, not this one"
+            ),
+            hint: restart_daemon_hint(),
+        },
+        DaemonBuild::Legacy(v) => Check {
+            name: DAEMON_FRESHNESS_CHECK_NAME.into(),
+            status: Status::Warn,
+            message: format!(
+                "a darkmux serve daemon is running an OLDER build than this binary ({installed}) \
+                 — it reports darkmux {v} with no build id, which only a daemon started before \
+                 this check shipped does, so it cannot have your latest code"
+            ),
+            hint: restart_daemon_hint(),
+        },
     }
 }
 
@@ -3287,14 +3311,20 @@ mod tests {
 
     #[test]
     fn daemon_freshness_passes_when_builds_match() {
-        let c = classify_daemon_freshness(Some("2.0.0 (a1b2c3d)"), "2.0.0 (a1b2c3d)");
+        let c = classify_daemon_freshness(
+            Some(DaemonBuild::Build("2.0.0 (a1b2c3d)".into())),
+            "2.0.0 (a1b2c3d)",
+        );
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert!(c.hint.is_none());
     }
 
     #[test]
     fn daemon_freshness_warns_naming_both_builds_when_they_differ() {
-        let c = classify_daemon_freshness(Some("1.18.5 (0ldc0de)"), "2.0.0 (a1b2c3d)");
+        let c = classify_daemon_freshness(
+            Some(DaemonBuild::Build("1.18.5 (0ldc0de)".into())),
+            "2.0.0 (a1b2c3d)",
+        );
         assert_eq!(c.status, Status::Warn, "{}", c.message);
         // Provenance: the operator must see BOTH resolved values, not just that
         // "something is stale" (#44 — never wonder where a decision came from).
@@ -3302,6 +3332,21 @@ mod tests {
         assert!(c.message.contains("2.0.0 (a1b2c3d)"), "{}", c.message);
         let hint = c.hint.as_deref().unwrap();
         assert!(hint.contains("darkmux serve"), "restart fix: {hint}");
+    }
+
+    #[test]
+    fn daemon_freshness_warns_when_the_daemon_predates_the_build_field() {
+        // A daemon with no `build` field was compiled before this check shipped,
+        // so it is stale by construction — no version comparison needed (and
+        // none is made: a bare version vs a build-tagged one is not comparable).
+        let c = classify_daemon_freshness(
+            Some(DaemonBuild::Legacy("1.18.5".into())),
+            "2.0.0 (a1b2c3d)",
+        );
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("1.18.5"), "{}", c.message);
+        assert!(c.message.contains("2.0.0 (a1b2c3d)"), "{}", c.message);
+        assert!(c.hint.as_deref().unwrap().contains("darkmux serve"));
     }
 
     #[test]
@@ -3316,15 +3361,21 @@ mod tests {
     #[test]
     fn daemon_build_parses_build_field_in_preference_to_package_version() {
         let body = r#"{"darkmux_version":"2.0.0","build":"2.0.0 (a1b2c3d)"}"#;
-        assert_eq!(parse_daemon_build(body).as_deref(), Some("2.0.0 (a1b2c3d)"));
+        assert_eq!(
+            parse_daemon_build(body),
+            Some(DaemonBuild::Build("2.0.0 (a1b2c3d)".into()))
+        );
     }
 
     #[test]
-    fn daemon_build_falls_back_to_package_version_on_a_pre_build_field_daemon() {
-        // A daemon older than #1461 has no `build` field. The coarser comparison
-        // is still the honest one — it is all such a daemon reports.
+    fn daemon_build_reads_a_pre_build_field_daemon_as_legacy() {
+        // A daemon older than #1461 has no `build` field — classified as Legacy
+        // rather than silently compared against a build-tagged string.
         let body = r#"{"darkmux_version":"1.18.5","flow_schema_version":"1.4"}"#;
-        assert_eq!(parse_daemon_build(body).as_deref(), Some("1.18.5"));
+        assert_eq!(
+            parse_daemon_build(body),
+            Some(DaemonBuild::Legacy("1.18.5".into()))
+        );
     }
 
     #[test]
@@ -3478,7 +3529,8 @@ mod tests {
         // Sovereignty (#44): a deliberately-old daemon/image is a legitimate
         // operator choice. These checks surface; they never block.
         let all = [
-            classify_daemon_freshness(Some("old"), "new"),
+            classify_daemon_freshness(Some(DaemonBuild::Build("old".into())), "new"),
+            classify_daemon_freshness(Some(DaemonBuild::Legacy("1.18.5".into())), "new"),
             classify_binary_vs_source(Some("0ldc0de"), Some("a1b2c3d")),
             classify_runtime_image_freshness(RuntimeImageProbe::Labeled("1.0.0".into()), "2.0.0"),
         ];
