@@ -2527,6 +2527,12 @@ fn judge_one_flag(
 /// failure is recorded as [`VerifyRuling::Error`] with the reason in the
 /// note, never propagated (one bad adjudication must not abort the run;
 /// the flag then keeps its manual-verification marker downstream).
+/// The returned `bool` is `content_empty` — whether the reply's trimmed
+/// content came back empty (the ONLY condition [`verify_pass_with_retry`]
+/// re-dispatches on, matching the graph path's `dispatch.map`
+/// `retry_on_empty`). A dispatch `Err` reports `content_empty = false`: an
+/// infra failure is isolated, never retried (the same policy `map_local_item`
+/// applies to a dispatch `Err`).
 fn run_verify_pass(
     model: &str,
     system: &str,
@@ -2534,7 +2540,7 @@ fn run_verify_pass(
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-) -> (VerifyRecord, u64, Option<String>) {
+) -> (VerifyRecord, u64, Option<String>, bool) {
     let t0 = Instant::now();
     let call = ChatCall {
         model,
@@ -2548,6 +2554,7 @@ fn run_verify_pass(
         Ok(reply) => {
             let seconds = t0.elapsed().as_secs_f64();
             let tokens = reply.total_tokens.unwrap_or(0);
+            let content_empty = reply.content.trim().is_empty();
             // (#1300 QA follow-up) Gated on `endpoint.is_some()` — see
             // `run_judge_pass`'s identical comment; LMStudio's response is
             // also OpenAI-compatible and carries a `model` field.
@@ -2557,6 +2564,7 @@ fn run_verify_pass(
                     VerifyRecord { ruling, decisive_evidence, note_for_author, seconds, model: model.to_string() },
                     tokens,
                     served,
+                    content_empty,
                 ),
                 None => (
                     VerifyRecord {
@@ -2568,6 +2576,7 @@ fn run_verify_pass(
                     },
                     tokens,
                     served,
+                    content_empty,
                 ),
             }
         }
@@ -2581,14 +2590,27 @@ fn run_verify_pass(
             },
             0,
             None,
+            false,
         ),
     }
 }
 
-/// One verify adjudication, retried ONCE on [`VerifyRuling::Unparsed`] —
-/// the same retry discipline as [`judge_pass_with_retry`]. Returns the
-/// surviving record plus token/call accounting for BOTH attempts, plus
-/// (#1300) the served model reported by whichever attempt survives.
+/// One verify adjudication, retried ONCE on an EMPTY-content reply — the SAME
+/// retry semantics the graph path's `dispatch.map` applies (`retry_on_empty:
+/// 1`, set in `build_review_graph`). Returns the surviving record plus
+/// token/call accounting for BOTH attempts, plus (#1300) the served model
+/// reported by whichever attempt survives.
+///
+/// (#1442) The historical unparsed-RETRY retired here: a non-empty but
+/// UNPARSEABLE reply is now recorded as [`VerifyRuling::Unparsed`] on the
+/// FIRST attempt (no re-dispatch), and its finding stays `Confirmed` with the
+/// manual-verification marker downstream. That aligns the sequential
+/// `--charges-file` path (`run_verify_stage` → here) with the graph path,
+/// which — since the probe/verify stages retired onto the generic
+/// `dispatch.map` block — only ever re-dispatches an EMPTY reply, never an
+/// unparseable non-empty one. Two verify paths that diverged on this is the
+/// #1373-class drift the shared-semantics discipline exists to prevent (an
+/// operator-decided alignment, operator-veto-flagged).
 fn verify_pass_with_retry(
     model: &str,
     system: &str,
@@ -2597,9 +2619,13 @@ fn verify_pass_with_retry(
     endpoint: Option<&ModelEndpoint>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
 ) -> (VerifyRecord, u64, u32, Option<String>) {
-    let (r1, t1, served1) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
-    if r1.ruling == VerifyRuling::Unparsed {
-        let (r2, t2, served2) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
+    let (r1, t1, served1, empty1) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
+    if empty1 {
+        // Empty reply — re-dispatch ONCE (retry_on_empty: 1 parity). The
+        // second attempt's record is kept regardless of what it returns
+        // (a second empty stays the honest inconclusive result), and tokens
+        // are billed across BOTH attempts.
+        let (r2, t2, served2, _empty2) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
         (r2, t1 + t2, 2, served2.or(served1))
     } else {
         (r1, t1, 1, served1)
@@ -3224,7 +3250,7 @@ pub fn run_judge_only(
 // **The double-confirm judge protocol, dedup key, judge/verify prompts,
 // and tier synthesis are UNCHANGED** — every step kind below calls the
 // SAME preserved functions (`dedup_flags`, `judge_one_flag_with_passes`,
-// `verify_pass_with_retry`, `parse_judge_ruling`, `parse_verify_ruling`,
+// `parse_judge_ruling`, `parse_verify_ruling`,
 // `cluster_needs_check`, `mechanism_family`, `judge_prompt`,
 // `verify_prompt`) verbatim — only the ORCHESTRATION shape (six sequential
 // calls → one declared graph) and the telemetry plumbing (the sequential
@@ -3542,6 +3568,16 @@ pub(crate) struct ProbeReconstruction {
 ///   (`draws`/`total_tokens`/`wall_ms`; `served_model` = the first
 ///   endpoint-reported model, which stays `None` by construction on local
 ///   seats — the [`MapItemResult`] contract);
+///   - (#1442) `wall_ms` SEMANTICS SHIFTED at the `dispatch.map` cutover:
+///     the retired bespoke probe kind recorded the seat's whole-step
+///     ELAPSED wall (`t0.elapsed()` around the seat's inner loop); this
+///     reconstruction SUMS each item's own per-dispatch wall
+///     (`item.wall_ms`). The new figure is more honest as a COST metric
+///     (it excludes per-step scheduling/idle overhead the old elapsed
+///     folded in), but it is NOT a timeline — under concurrent draws the
+///     per-item walls overlap in real time, so the sum can exceed the seat's
+///     wall-clock. Series comparisons ACROSS the cutover should read the
+///     probe `wall_ms` accordingly.
 /// - a seat with zero fired draws (empty selector match, or every attempt
 ///   budget-skipped) records NO member — `member_summary()` must not
 ///   credit work that never happened;
@@ -3665,7 +3701,16 @@ pub(crate) fn reconstruct_probe_stage(
             stage: "probe".to_string(),
             max_tokens: budget,
             used_tokens: remote_used,
-            exhausted: remote_used >= budget,
+            // (#1442 gate CONSIDER) `remote_used` SUMS the endpoint-REPORTED
+            // tokens, but the live `MapRemoteBucket` meters CONSERVATIVELY
+            // (it settles a usage-omitting reply at its granted cap). So a
+            // usage-omitting endpoint can exhaust the bucket — producing
+            // `remote_skips > 0` — while the summed reported total stays
+            // BELOW `budget`. `skipped_calls > 0` is itself proof the bucket
+            // exhausted (that is the only reason a draw is skipped), so it
+            // makes `exhausted` truthful regardless of what the endpoint
+            // reported.
+            exhausted: remote_skips > 0 || remote_used >= budget,
             skipped_calls: remote_skips,
         });
     if remote_skips > 0 {
@@ -4303,7 +4348,13 @@ pub(crate) fn apply_verify_results(
         stage: "verify".to_string(),
         max_tokens: budget,
         used_tokens: tokens,
-        exhausted: tokens >= budget,
+        // (#1442 gate CONSIDER) `tokens` sums the endpoint-REPORTED usage
+        // while the live `MapRemoteBucket` meters conservatively — a
+        // usage-omitting endpoint can skip calls (`skipped > 0`) with the
+        // summed total still below `budget`. A skip is itself proof the
+        // bucket exhausted, so it keeps `exhausted` truthful. (Same corner as
+        // the probe reconstruction's budget row.)
+        exhausted: skipped > 0 || tokens >= budget,
         skipped_calls: skipped,
     });
     VerifyApplyOutcome { member, warning, budget_row }

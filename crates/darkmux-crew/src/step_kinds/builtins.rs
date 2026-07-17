@@ -896,10 +896,33 @@ impl DispatchMapStepKind {
         let timeout_seconds =
             step.config.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(120) as u32;
         // (#1442) The generic retry-on-empty budget (default 0/off) — see the
-        // struct doc. Read once for the whole collection loop.
-        let retry_on_empty =
-            u32::try_from(step.config.get("retry_on_empty").and_then(|v| v.as_u64()).unwrap_or(0))
-                .unwrap_or(u32::MAX);
+        // struct doc. Read once for the whole collection loop. ABSENT → 0
+        // (optional, off). A PRESENT-but-invalid value is a LOUD config error
+        // at step-run time (matching this block's `require_config_*`
+        // "missing/invalid key is loud" doctrine), never silently coerced —
+        // an out-of-u32-range `retry_on_empty` must NOT become ~4 billion
+        // re-dispatches (the prior `u32::try_from(...).unwrap_or(u32::MAX)`
+        // did exactly that; #1442 gate CONSIDER).
+        let retry_on_empty = match step.config.get("retry_on_empty") {
+            None => 0u32,
+            Some(v) => {
+                let n = v.as_u64().ok_or_else(|| {
+                    anyhow!(
+                        "step `{}`: `{}` config.retry_on_empty must be a non-negative integer",
+                        step.id,
+                        self.id()
+                    )
+                })?;
+                u32::try_from(n).map_err(|_| {
+                    anyhow!(
+                        "step `{}`: `{}` config.retry_on_empty ({n}) exceeds the maximum of {}",
+                        step.id,
+                        self.id(),
+                        u32::MAX
+                    )
+                })?
+            }
+        };
         let endpoint: Option<darkmux_types::ModelEndpoint> = match step.config.get("endpoint") {
             Some(v) => Some(
                 serde_json::from_value(v.clone())
@@ -2229,6 +2252,40 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn dispatch_map_retry_on_empty_out_of_range_is_a_loud_config_error() {
+        // (#1442 gate CONSIDER) A `retry_on_empty` beyond u32's range must be
+        // a LOUD config error at step-run time — never silently coerced into
+        // ~4 billion re-dispatches (the prior `unwrap_or(u32::MAX)` behavior).
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "retry_on_empty": u64::from(u32::MAX) + 1,
+        }));
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("retry_on_empty"), "{msg}");
+        assert!(msg.contains("exceeds the maximum"), "{msg}");
+    }
+
+    #[test]
+    fn dispatch_map_retry_on_empty_wrong_type_is_a_loud_config_error() {
+        // (#1442 gate CONSIDER) A present-but-non-integer `retry_on_empty`
+        // (here a string) is loud too — the same "invalid key is loud"
+        // doctrine, not a silent fall-through to the default 0.
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "retry_on_empty": "lots",
+        }));
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("retry_on_empty"), "{msg}");
+        assert!(msg.contains("non-negative integer"), "{msg}");
     }
 
     // ── (#1442) per-item served_model + wall_ms telemetry ───────────────

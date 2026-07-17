@@ -1188,6 +1188,120 @@
         assert!(kinds.iter().any(|k| k == "review.judge"), "judge step result present: {kinds:?}");
     }
 
+    /// (#1442) The sequential `--charges-file` verify path (`run_judge_only`
+    /// -> `finish_review` -> `run_verify_stage`) shares the graph path's
+    /// dispatch.map semantics: a non-empty UNPARSEABLE verify reply is
+    /// recorded as `Unparsed` on the FIRST attempt (NO re-dispatch), and the
+    /// finding stays `Confirmed` with the manual-verification marker. This
+    /// pins the retirement of the historical unparsed-RETRY, which had drifted
+    /// from the graph path (whose `retry_on_empty` re-dispatches EMPTY replies
+    /// only) — the #1373-class two-paths-diverge failure mode.
+    #[test]
+    fn sequential_verify_unparsed_reply_is_not_retried() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![staffing("frontier", "verify-model", 1)]),
+        ]);
+        let inputs = ReviewInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent_title: "add a feature",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 500_000,
+            bundles: None,
+        };
+        let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
+        let verify_calls = std::cell::RefCell::new(0u32);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.system == "verify sys" {
+                *verify_calls.borrow_mut() += 1;
+                Ok(reply("no verdict here")) // non-empty, unparseable
+            } else {
+                Ok(reply(CONFIRM_JSON))
+            }
+        };
+        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        assert_eq!(
+            *verify_calls.borrow(),
+            1,
+            "an unparseable non-empty reply is recorded on the first attempt, never re-dispatched"
+        );
+        assert_eq!(env.judged.len(), 1);
+        assert_eq!(
+            env.judged[0].tier,
+            Tier::Confirmed,
+            "an inconclusive adjudication keeps the confirmed tier (manual-verification marker downstream)"
+        );
+        assert_eq!(
+            env.judged[0].verify.as_ref().expect("verify record present").ruling,
+            VerifyRuling::Unparsed
+        );
+    }
+
+    /// (#1442) The empty-content retry the graph's dispatch.map keeps
+    /// (`retry_on_empty: 1`) IS preserved on the sequential path — an EMPTY
+    /// verify reply is re-dispatched ONCE. Here the retry lands a real
+    /// verdict, so the flag is `verified`.
+    #[test]
+    fn sequential_verify_empty_reply_retries_once() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![staffing("frontier", "verify-model", 1)]),
+        ]);
+        let inputs = ReviewInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent_title: "add a feature",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 500_000,
+            bundles: None,
+        };
+        let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
+        let verified_json =
+            "```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"real defect confirmed\", \"note_for_author\": \"n\"}\n```";
+        let verify_calls = std::cell::RefCell::new(0u32);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.system == "verify sys" {
+                let n = {
+                    let mut c = verify_calls.borrow_mut();
+                    *c += 1;
+                    *c
+                };
+                if n == 1 {
+                    Ok(reply("")) // empty content — must trigger exactly one retry
+                } else {
+                    Ok(reply(verified_json))
+                }
+            } else {
+                Ok(reply(CONFIRM_JSON))
+            }
+        };
+        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        assert_eq!(*verify_calls.borrow(), 2, "an empty reply is re-dispatched exactly once");
+        assert_eq!(env.judged.len(), 1);
+        assert_eq!(env.judged[0].tier, Tier::Confirmed);
+        assert_eq!(
+            env.judged[0].verify.as_ref().expect("verify record present").ruling,
+            VerifyRuling::Verified,
+            "the retry's real verdict is the recorded ruling"
+        );
+        assert_eq!(env.verified, 1, "the retry's verdict counts toward the verified tally");
+    }
+
     /// (#1355/#1357 review round) `finish_review`'s judge remote-budget
     /// honesty gates are STILL PRODUCTION CODE via the `--charges-file`
     /// path (`mission launch review --param charges_file=...` -> `run_judge_only` ->
@@ -3933,7 +4047,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         });
         let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
 
-        // CORRECT (preserved per-flag logic, `verify_pass_with_retry`): the
+        // CORRECT (preserved per-flag logic, `apply_verify_results`): the
         // run itself is never marked degenerate by verify exhaustion — the
         // pre-exhaustion adjudication still counts, and the skipped one
         // keeps its Confirmed tier with the reason named per-flag.
@@ -3959,6 +4073,62 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             env.remote_budgets.iter().any(|r| r.stage == "verify"),
             "the verify budget row must reach env.remote_budgets: {:?}",
             env.remote_budgets
+        );
+    }
+
+    /// (#1442 gate CONSIDER) A usage-OMITTING remote verify endpoint (a reply
+    /// with no `total_tokens`) still EXHAUSTS the conservatively-metered
+    /// `MapRemoteBucket` — the map settles each reply at its granted cap when
+    /// usage is absent — so a later confirmed flag's adjudication is SKIPPED.
+    /// The reconstructed verify budget row SUMS the endpoint-REPORTED usage
+    /// (here 0, all omitted), which would read `exhausted: false` under a bare
+    /// `used >= budget`; the `skipped_calls > 0` term keeps the row honest.
+    /// (A skip is itself proof the bucket exhausted.)
+    #[test]
+    fn graph_verify_budget_row_is_exhausted_when_a_usage_omitting_endpoint_skips() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![remote_staffing("frontier", "gpt-verify", 1)]),
+        ]);
+        let bundles = vec![bundle_input("a.ts"), bundle_input("b.ts")];
+        let ctx = step_ctx_with_chat_and_budget(&crew, bundles, 100, |call: &ChatCall| {
+            if call.endpoint.is_some() {
+                // The verify endpoint OMITS usage — the corner. Conservative
+                // metering still exhausts the 100-token bucket at the granted
+                // cap, so the second confirmed flag is skipped.
+                Ok(SingleShotReply {
+                    content: VERIFIED_JSON.to_string(),
+                    total_tokens: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: None,
+                })
+            } else if call.model == "darkmux:judge-model" {
+                Ok(reply(CONFIRM_JSON))
+            } else {
+                Ok(reply("a real defect"))
+            }
+        });
+        let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
+
+        let verify_row = env
+            .remote_budgets
+            .iter()
+            .find(|r| r.stage == "verify")
+            .expect("verify budget row present");
+        assert!(
+            verify_row.skipped_calls > 0,
+            "a confirmed flag's adjudication was skipped on the exhausted bucket"
+        );
+        assert_eq!(
+            verify_row.used_tokens, 0,
+            "the usage-omitting endpoint reports zero — the exact corner this guards"
+        );
+        assert!(
+            verify_row.exhausted,
+            "the row reports `exhausted` truthfully despite summing to {} reported tokens",
+            verify_row.used_tokens
         );
     }
 
