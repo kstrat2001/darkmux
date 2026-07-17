@@ -290,9 +290,9 @@ pub(crate) fn build_router_full(
         .route("/flow-mission/:id", get(flow_mission_handler))
         .route("/flow-session/:id", get(flow_session_handler))
         .route("/flow-status", get(flow_status_handler))
-        .route("/model/status", get(model_status_handler))
+        .route("/machine/status", get(machine_status_handler))
         .route("/machine/specs", get(machine_specs_handler))
-        .route("/machine/memory", get(machine_memory_handler))
+        .route("/machine/resources", get(machine_resources_handler))
         .route("/missions", get(missions_handler))
         .route("/phases", get(phases_handler))
         .route("/mission/:id/graph", get(mission_graph_html))
@@ -1218,10 +1218,12 @@ pub(crate) async fn worktree_summary_handler(
     .into_response()
 }
 
-/// GET /model/status — returns currently-loaded models (per `lms ps --json`)
-/// as JSON so the flow viewer's toolbar pill / modal can render them
-/// without parsing `lms` output client-side. See issue #87 for the
-/// operator-facing motivation.
+/// GET /machine/status — returns currently-loaded models (per `lms ps
+/// --json`) as JSON. (#1426 — renamed from `/model/status` alongside the
+/// `machine` CLI family; one route family, one name. Its consumer is the
+/// `darkmux machine status <id>` peer read — the viewer does not fetch this
+/// route; an earlier doc comment claiming a viewer toolbar-pill consumer,
+/// from #87, was stale.)
 ///
 /// Always returns 200 with a structured body. `lms_unreachable: true`
 /// signals the binary couldn't be invoked (operator hasn't installed
@@ -1942,7 +1944,7 @@ async fn flow_status_handler() -> axum::Json<serde_json::Value> {
     }
 }
 
-async fn model_status_handler() -> axum::Json<serde_json::Value> {
+async fn machine_status_handler() -> axum::Json<serde_json::Value> {
     let result = tokio::task::spawn_blocking(darkmux_profiles::lms::list_loaded).await;
     let (models, unreachable) = match result {
         Ok(Ok(m)) => (m, false),
@@ -1959,36 +1961,36 @@ async fn model_status_handler() -> axum::Json<serde_json::Value> {
     }))
 }
 
-/// (#1286) GET /machine/memory cache TTL. Computed on request with a short
+/// (#1286) GET /machine/resources cache TTL. Computed on request with a short
 /// in-process cache so a phone-viewer poll burst costs ONE gather; the TTL
 /// is recorded in the payload (`cache_ttl_ms`) per the observer-effect
 /// constraint — cadence is a visible knob, never adaptive-silent.
-const MACHINE_MEMORY_CACHE_TTL: Duration = Duration::from_secs(2);
-static MACHINE_MEMORY_CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>> =
+const MACHINE_RESOURCES_CACHE_TTL: Duration = Duration::from_secs(2);
+static MACHINE_RESOURCES_CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>> =
     std::sync::Mutex::new(None);
 
-/// Single-flight gate for the machine-memory gather (#1286): concurrent
+/// Single-flight gate for the machine-resources gather (#1286): concurrent
 /// cold-cache requests serialize on this async lock so a phone-viewer poll
 /// burst costs exactly ONE gather, not one per request (the shell-out gather
 /// is the observer-cost the ledger is built to keep negligible). See the
-/// double-checked flow in [`machine_memory_handler`].
-fn machine_memory_gather_lock() -> &'static tokio::sync::Mutex<()> {
+/// double-checked flow in [`machine_resources_handler`].
+fn machine_resources_gather_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Fresh cached machine-memory payload, or `None` when absent/stale. The std
+/// Fresh cached machine-resources payload, or `None` when absent/stale. The std
 /// mutex is held only for the clone — never across an `.await`.
-fn machine_memory_cached_fresh() -> Option<serde_json::Value> {
-    let guard = MACHINE_MEMORY_CACHE.lock().ok()?;
+fn machine_resources_cached_fresh() -> Option<serde_json::Value> {
+    let guard = MACHINE_RESOURCES_CACHE.lock().ok()?;
     let (at, v) = guard.as_ref()?;
-    (at.elapsed() < MACHINE_MEMORY_CACHE_TTL).then(|| v.clone())
+    (at.elapsed() < MACHINE_RESOURCES_CACHE_TTL).then(|| v.clone())
 }
 
-/// GET /machine/memory (#1286) — the live machine-scope memory ledger:
+/// GET /machine/resources (#1286) — the live machine-scope memory ledger:
 /// resident models with potential-vs-current + color state, pool/limit
 /// lines, and the unified-memory pressure rows (swap / compressor /
-/// memory-pressure free%). Exactly `darkmux model ledger --json`, served —
+/// memory-pressure free%). Exactly `darkmux machine resources --json`, served —
 /// ONE implementation (`darkmux_profiles::model_ledger`) feeds both.
 ///
 /// Data-source class note (#1286 boundary hygiene): this reads LIVE PROBES
@@ -2002,17 +2004,17 @@ fn machine_memory_cached_fresh() -> Option<serde_json::Value> {
 /// The gather shells out (bounded) — runs on the blocking pool. Best-effort
 /// contract like /machine/specs: probe failures degrade to `warnings` in
 /// the payload, never a 500.
-async fn machine_memory_handler() -> axum::Json<serde_json::Value> {
+async fn machine_resources_handler() -> axum::Json<serde_json::Value> {
     // Fast path: a fresh cache serves without touching the gather lock.
-    if let Some(v) = machine_memory_cached_fresh() {
+    if let Some(v) = machine_resources_cached_fresh() {
         return axum::Json(v);
     }
     // Single-flight (#1286): serialize cold-cache refreshers on the gather
     // lock, then RE-CHECK the cache under it — a request that waited behind an
     // in-flight gather returns that gather's fresh result instead of launching
     // a second one, so a poll burst costs one gather.
-    let _permit = machine_memory_gather_lock().lock().await;
-    if let Some(v) = machine_memory_cached_fresh() {
+    let _permit = machine_resources_gather_lock().lock().await;
+    if let Some(v) = machine_resources_cached_fresh() {
         return axum::Json(v);
     }
     let result = tokio::task::spawn_blocking(darkmux_profiles::model_ledger::gather).await;
@@ -2028,17 +2030,17 @@ async fn machine_memory_handler() -> axum::Json<serde_json::Value> {
         // Recorded cadence knob (#1286 observer constraint 4).
         obj.insert(
             "cache_ttl_ms".to_string(),
-            serde_json::json!(MACHINE_MEMORY_CACHE_TTL.as_millis() as u64),
+            serde_json::json!(MACHINE_RESOURCES_CACHE_TTL.as_millis() as u64),
         );
     }
-    if let Ok(mut guard) = MACHINE_MEMORY_CACHE.lock() {
+    if let Ok(mut guard) = MACHINE_RESOURCES_CACHE.lock() {
         *guard = Some((std::time::Instant::now(), value.clone()));
     }
     axum::Json(value)
 }
 
-/// GET /machine/specs — local-machine spec sheet for `darkmux fleet
-/// status --deep` aggregation. Composes:
+/// GET /machine/specs — local-machine spec sheet for `darkmux machine list
+/// --deep` aggregation. Composes:
 /// - identity (machine_id from env)
 /// - hardware (ram_total_bytes, ram_free_for_ai_bytes, cpu_brand, os)
 /// - software (darkmux_version, flow_schema_version)
@@ -2046,7 +2048,7 @@ async fn machine_memory_handler() -> axum::Json<serde_json::Value> {
 ///
 /// All fields are best-effort: a missing sysctl, an unreachable `lms`,
 /// or an unset env var degrades to `null` (or `[]` / `0` for typed
-/// fields) rather than 500-ing. This is the contract `fleet status
+/// fields) rather than 500-ing. This is the contract `machine list
 /// --deep` relies on — degraded state is a visible cell, not a failed
 /// command. (#275 PR-A)
 async fn machine_specs_handler() -> axum::Json<serde_json::Value> {

@@ -161,30 +161,21 @@ ${EDITOR:-vim} ~/.darkmux/profiles.json</code></pre>
     <h3>Verify the edits</h3>
     <pre><code>darkmux profile list              <span class="comment"># the profile should now list your model</span>
 darkmux doctor                    <span class="comment"># confirm "profile match" is green or close</span></code></pre>
-
-    <h3>The opinionated path: <code>swap recommended</code></h3>
-    <p>If you'd rather not author profile JSON by hand on a fresh install, darkmux ships a curated per-hardware-tier recommendation registry with the bake-off-validated models for your machine class:</p>
-    <pre><code>darkmux swap recommended --dry-run    <span class="comment"># resolves your tier → validated profile → pre-flight checks</span>
-darkmux model pull-recommended        <span class="comment"># downloads any missing models via `lms get`</span>
-darkmux swap recommended              <span class="comment"># load them for real</span></code></pre>
-    <p>On Apple Silicon 96+ GB (<code>m-series-128</code>), the validated recommendation pairs a 35B-A3B MoE primary with a 4B compactor (specific model ids in the registry). Other tiers carry a <code>pending-bake-off</code> status: the verb errors loudly with the rationale, surfacing the gap rather than silently picking. Doctor's <code>recommendation-drift</code> check warns when your loaded models don't match the registry's pick.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Your first swap</h2>
-    <p><code>darkmux swap &lt;profile&gt;</code> transitions LMStudio's loaded model set to match the named profile: it unloads anything that doesn't belong and loads what does. It writes nothing outside LMStudio. The internal runtime reads the loaded model directly.</p>
-    <pre><code>darkmux status                    <span class="comment"># what's loaded right now; which profile (if any) matches</span>
-darkmux swap fast                 <span class="comment"># load the "fast" profile</span>
-darkmux status                    <span class="comment"># confirm: should show "fast" as the active profile</span></code></pre>
+    <h2>Loading a profile's models</h2>
+    <p>You no longer load a profile by hand. A dispatch loads the models a named profile declares, under the resident RAM budget: it brings up what the profile needs and unloads to make room when the budget requires it. It writes nothing outside LMStudio. The internal runtime reads the loaded model directly.</p>
+    <pre><code>darkmux machine status            <span class="comment"># what's loaded right now; which profile (if any) matches</span></code></pre>
 
     <div class="callout good">
-      <strong>What just happened.</strong>
-      <p style="margin: 6px 0 0;">darkmux issued <code>lms load</code> for your profile's primary model with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), set the context length, and reported success. Nothing outside LMStudio was modified. The internal runtime resolves the loaded model directly.</p>
+      <strong>What happens on dispatch.</strong>
+      <p style="margin: 6px 0 0;">When a dispatch needs your profile's models, darkmux issues <code>lms load</code> for each with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), sets the context length, and reports success. Nothing outside LMStudio is modified. The internal runtime resolves the loaded model directly.</p>
     </div>
 
-    <p>If swap reports a warning about RAM headroom or a model not found in <code>lms ls</code>, that's doctor-style feedback at swap time, usually fixable by either trimming context length or downloading the model first via the LMStudio UI.</p>
+    <p>If a dispatch reports a warning about RAM headroom or a model not found in <code>lms ls</code>, that's doctor-style feedback at load time, usually fixable by either trimming context length or downloading the model first via the LMStudio UI.</p>
 
     <h3>The smoke test</h3>
     <pre><code>darkmux lab run quick-q           <span class="comment"># single-turn smoke prompt against the active profile</span>

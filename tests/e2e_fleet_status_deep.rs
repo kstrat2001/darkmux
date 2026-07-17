@@ -1,8 +1,8 @@
-//! TDD coverage for #275 PR-B — `darkmux fleet status --deep` fans
+//! TDD coverage for #275 PR-B — `darkmux machine list --deep` fans
 //! out to each reachable peer's `GET /machine/specs` endpoint
 //! (shipped in PR-A) and aggregates into one enriched table.
 //!
-//! Pre-fix: `fleet status` only reports reachability columns (id,
+//! Pre-fix: `machine list` only reports reachability columns (id,
 //! tier, address, probe_ms). `--deep` flag doesn't exist; passing it
 //! is rejected by clap.
 //!
@@ -27,20 +27,20 @@ fn redis_available() -> bool {
 }
 
 /// Populate node-a's roster with both spawned machines via the existing
-/// `fleet add` CLI verb. Returns nothing — exits the test on add failure.
+/// `machine add` CLI verb. Returns nothing — exits the test on add failure.
 fn populate_roster_via_cli(viewer: &e2e::harness::FleetNode, peers: &[&e2e::harness::FleetNode]) {
     for peer in peers {
         let out = viewer
             .cmd()
             .args([
-                "fleet", "add", &peer.machine_id,
+                "machine", "add", &peer.machine_id,
                 "--address", &format!("127.0.0.1:{}", peer.daemon_port),
             ])
             .output()
-            .expect("running `darkmux fleet add`");
+            .expect("running `darkmux machine add`");
         assert!(
             out.status.success(),
-            "fleet add of {} failed: stdout={}\nstderr={}",
+            "machine add of {} failed: stdout={}\nstderr={}",
             peer.machine_id,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
@@ -69,14 +69,14 @@ fn fleet_status_deep_aggregates_specs_from_reachable_peers() {
 
     let out = node_a
         .cmd()
-        .args(["fleet", "status", "--deep"])
+        .args(["machine", "list", "--deep"])
         .output()
-        .expect("running `darkmux fleet status --deep`");
+        .expect("running `darkmux machine list --deep`");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "fleet status --deep should succeed; stdout={stdout}\nstderr={stderr}"
+        "machine list --deep should succeed; stdout={stdout}\nstderr={stderr}"
     );
 
     // Both machine_ids should appear in the rendered table.
@@ -120,7 +120,7 @@ fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
     let add_unreachable = node_a
         .cmd()
         .args([
-            "fleet", "add", "ghost-machine",
+            "machine", "add", "ghost-machine",
             "--address", "127.0.0.1:1",
         ])
         .output()
@@ -133,21 +133,21 @@ fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
 
     let out = node_a
         .cmd()
-        .args(["fleet", "status", "--deep"])
+        .args(["machine", "list", "--deep"])
         .output()
-        .expect("running `darkmux fleet status --deep`");
+        .expect("running `darkmux machine list --deep`");
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     // The whole command MUST succeed even when one peer is unreachable.
     assert!(
         out.status.success(),
-        "fleet status --deep should not fail on an unreachable peer; stdout={stdout}\nstderr={}",
+        "machine list --deep should not fail on an unreachable peer; stdout={stdout}\nstderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
     // node-a's specs should be present (it's local + reachable).
     assert!(stdout.contains("node-a"), "node-a row missing: {stdout}");
     // ghost-machine should appear, with some indication it's unreachable
-    // (the existing `fleet status` already prints unreachability; --deep
+    // (the existing `machine list` already prints unreachability; --deep
     // must not regress that).
     assert!(
         stdout.contains("ghost-machine"),
@@ -169,9 +169,9 @@ fn fleet_status_default_unchanged_without_deep_flag() {
 
     let out = node_a
         .cmd()
-        .args(["fleet", "status"])
+        .args(["machine", "list"])
         .output()
-        .expect("running `darkmux fleet status`");
+        .expect("running `darkmux machine list`");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success());
 
@@ -180,6 +180,6 @@ fn fleet_status_default_unchanged_without_deep_flag() {
     let leaked_version = stdout.contains(env!("CARGO_PKG_VERSION"));
     assert!(
         !leaked_version,
-        "non-deep fleet status leaked spec data (version visible): {stdout}"
+        "non-deep machine list leaked spec data (version visible): {stdout}"
     );
 }

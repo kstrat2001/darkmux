@@ -1825,7 +1825,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             "model selection failed. Ensure `~/.darkmux/profiles.json` has \
              a profile with at least one model (the default model is \
              `default_model` or the first model in `models`), or load a model in \
-             LMStudio (darkmux swap <profile>) as the deprecated fallback."
+             LMStudio (`lms load <id>`) as a fallback."
         )?
     };
     // (#1187 follow-up) Raw label (no eprintln prefix) — this is also the value
@@ -3785,13 +3785,11 @@ fn resolve_dispatch_model_internal(
                 }
             }
             // (#450 review note / #408) Cross-check against actual
-            // LMStudio loaded models. `darkmux swap <name>` loads a
-            // profile's models in LMStudio but does NOT update
-            // `default_profile` in the registry — so after `swap fast`
-            // with default `balanced`, this path would happily select
-            // balanced's default model while LMStudio is loaded
-            // with fast's models. The dispatch would then fail at the
-            // LMStudio call
+            // LMStudio loaded models. Residents loaded for one profile (a
+            // prior dispatch, or a hand `lms load`) don't update
+            // `default_profile` in the registry — so this path could select
+            // `balanced`'s default model while LMStudio holds `fast`'s
+            // models. The dispatch would then fail at the LMStudio call
             // (or worse, silently route to a different model if the id
             // collides). Surfacing the mismatch here makes the
             // misconfiguration operator-visible at dispatch time, not at
@@ -3814,22 +3812,22 @@ fn resolve_dispatch_model_internal(
                             "darkmux dispatch: profile `{active_name}` selects \
                              `{id}`, but LMStudio has loaded [{loaded}] and \
                              DARKMUX_STRICT_SELECTION is set — refusing to dispatch \
-                             against an unselected model. Fix: `darkmux swap \
-                             {active_name}` to load the selected model, update \
-                             `default_profile` to match what's loaded, or unset \
-                             DARKMUX_STRICT_SELECTION to proceed anyway. (#408)"
+                             against an unselected model. Fix: `lms load {id}` to load \
+                             the selected model, update `default_profile` to match \
+                             what's loaded, or unset DARKMUX_STRICT_SELECTION to \
+                             proceed anyway. (#408)"
                         );
                     }
                     eprintln!(
                         "darkmux dispatch: WARNING — profile `{active_name}` \
                          selects `{id}`, but LMStudio has loaded [{loaded}]. \
-                         `darkmux swap` does not update `default_profile` in the \
-                         registry; if you swapped recently, your loaded model \
-                         won't match the selection. To fix: either `darkmux swap \
-                         {active_name}` to align LMStudio with the registry's \
-                         default, or update `default_profile` to match what's \
-                         loaded. Set DARKMUX_STRICT_SELECTION=1 to make this \
-                         mismatch fatal instead of a warning. (#450 review note, #408)"
+                         Residents loaded for another profile don't update \
+                         `default_profile` in the registry; your loaded model \
+                         won't match the selection. To fix: either `lms load {id}` \
+                         to align LMStudio with the registry's default, or update \
+                         `default_profile` to match what's loaded. Set \
+                         DARKMUX_STRICT_SELECTION=1 to make this mismatch fatal \
+                         instead of a warning. (#450 review note, #408)"
                     );
                 }
                 }
@@ -3950,7 +3948,7 @@ fn utility_preflight_warning(
             "darkmux dispatch: WARNING — utility model `{util_id}` \
              (internal.utility) is NOT loaded; compaction summons it mid-dispatch \
              and will fail if it isn't resident. Load it now (`lms load {util_id}`, \
-             or include it in the profile you `darkmux swap` to). (#590)"
+             or register it as `internal.utility` so a dispatch loads it). (#590)"
         ))
     }
 }

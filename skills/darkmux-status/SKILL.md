@@ -10,7 +10,7 @@ allowed-tools: "Bash(darkmux:*)"
 ## Step 1 — Run
 
 ```bash
-darkmux status
+darkmux machine status
 ```
 
 ## Step 2 — Interpret

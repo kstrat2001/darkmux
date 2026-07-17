@@ -19,7 +19,7 @@ The skill is **read-and-propose** throughout — operator runs every state-mutat
 
 Before walking through join, confirm the operator's mental model lines up with what's about to happen:
 
-- **Per-machine roster.** Each machine has its OWN `~/.darkmux/fleet.json`. Adding this new machine to the fleet means: (a) configure this machine's env vars + roster to know about its peers, AND (b) run `darkmux fleet add <this-machine-id>` on EACH of the operator's other existing machines so they see it too. Cross-machine roster replication is filed as [#280](https://github.com/kstrat2001/darkmux/issues/280) but not yet shipped — for now, the per-machine roster is the operator's hand-managed reality.
+- **Per-machine roster.** Each machine has its OWN `~/.darkmux/fleet.json`. Adding this new machine to the fleet means: (a) configure this machine's env vars + roster to know about its peers, AND (b) run `darkmux machine add <this-machine-id>` on EACH of the operator's other existing machines so they see it too. Cross-machine roster replication is filed as [#280](https://github.com/kstrat2001/darkmux/issues/280) but not yet shipped — for now, the per-machine roster is the operator's hand-managed reality.
 - **Tailnet trust boundary.** darkmux assumes everyone reachable on the same `DARKMUX_REDIS_URL` is the same operator. No per-machine auth beyond the mesh VPN (Tailscale, etc.). See [README — "Who darkmux is for"](https://github.com/kstrat2001/darkmux#who-darkmux-is-for).
 - **Single global work stream (#590).** All fleet work routes onto one stream (`darkmux:work`); the first available runner claims any job. There's no machine-capacity tier to declare — a `--machine <id>` hint is advisory only.
 
@@ -49,7 +49,7 @@ Need from the operator:
 
 - **Coordinator's reachable address** — usually a tailnet IP (`100.x.y.z`) or a Tailscale Magic DNS name (e.g. `studio.your-tailnet.ts.net`).
 - **Redis URL** — typically `redis://default:<password>@<coord-addr>:6379`. The operator should have this from their bootstrap on the coordinator; encourage them to use the existing value verbatim.
-- **Existing fleet machine ids** — so we can pick a non-colliding id for this new machine. Operator can run `darkmux fleet status` on their coordinator to print these; or if this skill has reachable Redis, `XRANGE darkmux:flow - + COUNT 1000` would show recent provenance fields.
+- **Existing fleet machine ids** — so we can pick a non-colliding id for this new machine. Operator can run `darkmux machine list` on their coordinator to print these; or if this skill has reachable Redis, `XRANGE darkmux:flow - + COUNT 1000` would show recent provenance fields.
 
 If the coordinator is reachable from this machine right now:
 
@@ -72,7 +72,7 @@ Ask the operator for their proposed id. Cross-check against the existing fleet:
 DARKMUX_REDIS_URL=<from-step-2> darkmux flow status 2>&1 | head -20
 ```
 
-(Or operator runs `darkmux fleet status` on their coordinator and reads the existing ids.)
+(Or operator runs `darkmux machine list` on their coordinator and reads the existing ids.)
 
 If the proposed id collides with an existing machine — pause; ask for a different one.
 
@@ -116,7 +116,7 @@ If `flow sink health` is `⚠` — re-check the Redis URL. The most common error
 ## Step 6 — Add this machine to the local roster
 
 ```bash
-darkmux fleet add <this-machine-id> --address 127.0.0.1:8765
+darkmux machine add <this-machine-id> --address 127.0.0.1:8765
 ```
 
 This registers the new machine in its OWN roster (the daemon on this machine listens on `:8765` by default; the address points at the local daemon).
@@ -124,7 +124,7 @@ This registers the new machine in its OWN roster (the daemon on this machine lis
 Verify:
 
 ```bash
-darkmux fleet status
+darkmux machine list
 ```
 
 Should show one entry — this machine.
@@ -134,14 +134,14 @@ Should show one entry — this machine.
 This is the hand-coordinated step the cross-machine state issue ([#280](https://github.com/kstrat2001/darkmux/issues/280)) will close. For now: on EACH of the operator's existing machines, run:
 
 ```bash
-darkmux fleet add <new-machine-id> --address <new-machine-tailnet-addr>:8765
+darkmux machine add <new-machine-id> --address <new-machine-tailnet-addr>:8765
 ```
 
 The `<new-machine-tailnet-addr>` is THIS machine's Tailscale IP / Magic DNS name (operator can find via `tailscale ip -4` on this machine).
 
 Surface this clearly to the operator:
 
-> Adding a peer to a fleet currently requires running `fleet add` on every existing fleet member's machine. Cross-machine roster replication is filed as #280 and will close that loop. For now, walk over to each of your other Macs and run `fleet add <this-id> --address <addr>:8765` once.
+> Adding a peer to a fleet currently requires running `machine add` on every existing fleet member's machine. Cross-machine roster replication is filed as #280 and will close that loop. For now, walk over to each of your other Macs and run `darkmux machine add <this-id> --address <addr>:8765` once.
 
 ## Step 8 — Smoke test: cross-fleet flow record
 

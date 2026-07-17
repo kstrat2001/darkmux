@@ -56,7 +56,7 @@ If you have more than one Mac, darkmux makes them work as a single development e
 Concretely, the capabilities the multi-machine substrate ships today:
 
 - **Single-stream fleet dispatch.** Every dispatch routes onto one global work stream (`darkmux:work`), and the first available runner claims any job, with no tier configuration to maintain. `darkmux dispatch coder --machine <id>` is an *advisory* hint when you want a specific machine; any runner may still claim it. Capability-based auto-routing (match work to the machine best suited to run it) is the planned successor, building on the [#590](https://github.com/kstrat2001/darkmux/issues/590) capability layer.
-- **Fleet status with specs.** `darkmux fleet status --deep` fans out across every reachable peer's `/machine/specs` endpoint (RAM-free, loaded models, OS, darkmux version, redacted Redis URL) in one table (#275).
+- **Fleet status with specs.** `darkmux machine list --deep` fans out across every reachable peer's `/machine/specs` endpoint (RAM-free, loaded models, OS, darkmux version, redacted Redis URL) in one table (#275).
 - **Decentralized flow UI.** The daemon hosts the observability viewer at its own origin: `http://localhost:8765/` on every machine running `darkmux serve`. The viewer pulls from the daemon's `/flow/<date>` endpoint which aggregates events from every machine writing to the shared `darkmux:flow` Redis stream, so you see the fleet, not just the host (#270 + #554).
 - **`/darkmux-add-machine` skill.** Walkthrough for joining a new Mac to an existing fleet: env vars, roster setup, smoke test. Run `darkmux init` to install all skills locally (#176).
 
@@ -85,8 +85,8 @@ The third one is opt-in (the daemon binds localhost by default for safety). To e
 | Required | Why | Install |
 |---|---|---|
 | **[LMStudio](https://lmstudio.ai/)** | Loads/unloads models. darkmux drives it via the `lms` CLI. | macOS / Windows / Linux installer |
-| **At least one model in LMStudio** | Nothing to swap to without one. | Download via the LMStudio UI; verify with `lms ls`. |
-| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime, the default for `darkmux dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the image from GHCR on demand (or `docker build -t darkmux-runtime:latest runtime/` from a source checkout). **Required only for that dispatch + lab path:** the `swap` / `status` / `profile` core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
+| **At least one model in LMStudio** | Nothing to dispatch to without one. | Download via the LMStudio UI; verify with `lms ls`. |
+| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime, the default for `darkmux dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the image from GHCR on demand (or `docker build -t darkmux-runtime:latest runtime/` from a source checkout). **Required only for that dispatch + lab path:** the `machine` / `profile` read core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
 
 > **`brew install` needs no toolchain.** Homebrew handles the build for you (and bottled binaries, once published, ship precompiled). The **Rust toolchain** is required only if you build from source (Option B below), which documents `rustup` at its first step.
 
@@ -117,7 +117,7 @@ brew services start darkmux
 
 The brew formula installs both the `darkmux` binary AND a keychain-aware wrapper script (`libexec/darkmux-serve-wrapped`) that resolves `DARKMUX_REDIS_URL` from macOS Keychain at process-start, so the Redis password never lives in the launchd plist. See [the always-on hub guide](docs/guide/always-on-hub.html) for the production-grade setup.
 
-**Scope of the brew install.** What you get: the `darkmux` CLI (swap, profile, status, doctor, fleet, flow, init), the `serve` daemon, the keychain wrapper, and the bundled skills. The `darkmux-runtime` Docker image that `darkmux dispatch` / `darkmux lab run` need is **not bundled in the formula** but you don't build it by hand: on the first dispatch with no local image, darkmux **pulls the version-pinned image from GHCR on demand** (`ghcr.io/kstrat2001/darkmux-runtime:<version>`, [#759](https://github.com/kstrat2001/darkmux/issues/759)). You just need Docker running. (A `runtime/` source checkout + `docker build` is the offline/dev alternative.) So the brew path is a complete install end to end: the `swap` / `status` / `profile` core, the hub posture (Redis + serve), **and** local dispatches.
+**Scope of the brew install.** What you get: the `darkmux` CLI (dispatch, mission, machine, profile, flow, doctor, init), the `serve` daemon, the keychain wrapper, and the bundled skills. The `darkmux-runtime` Docker image that `darkmux dispatch` / `darkmux lab run` need is **not bundled in the formula** but you don't build it by hand: on the first dispatch with no local image, darkmux **pulls the version-pinned image from GHCR on demand** (`ghcr.io/kstrat2001/darkmux-runtime:<version>`, [#759](https://github.com/kstrat2001/darkmux/issues/759)). You just need Docker running. (A `runtime/` source checkout + `docker build` is the offline/dev alternative.) So the brew path is a complete install end to end: the `machine` / `profile` core, the hub posture (Redis + serve), **and** local dispatches.
 
 **Option B: from source via cargo** (for dev work, contributors, or if you need the `darkmux-runtime` Docker image alongside the binary):
 
@@ -184,8 +184,7 @@ Optional integrations (Redis coordination, the audit log) are blocks you turn on
 
 ```bash
 darkmux profile list                  # list configured profiles
-darkmux status                        # what's loaded; which profile (if any) matches
-darkmux swap fast                     # swap to the "fast" profile (loads model into LMStudio)
+darkmux machine status                # what's loaded; which profile (if any) matches
 darkmux lab characterize              # one-command "QA my Mac": dispatch a smoke workload, get a verdict
 darkmux lab run quick-q               # the smoke workload directly
 darkmux lab runs --limit 5            # see your recent runs
@@ -195,7 +194,7 @@ darkmux mission propose --from-stdin   # AI-built-in: vague intent → a structu
 darkmux mission launch <id>            # mint + start a running mission instance from a config
 ```
 
-Using Claude Code? Run `darkmux init --with-claude-md ~/.claude/CLAUDE.md` to install the skills *and* teach Claude Code about darkmux at session start. Then run **`/darkmux-bootstrap`** in your Claude Code session: it walks through detecting your hardware tier, downloading the recommended models, registering profiles, and validating the end state. (The recommendation registry's picks are surfaced via `darkmux recommendations show`; the underlying methodology is bake-off: head-to-head comparison with evaluation criteria recorded before the runs.) Operator-sovereign: the skill reads + proposes; you run the commands.
+Using Claude Code? Run `darkmux init --with-claude-md ~/.claude/CLAUDE.md` to install the skills *and* teach Claude Code about darkmux at session start. Then run **`/darkmux-bootstrap`** in your Claude Code session: it walks through detecting your hardware tier, registering profiles, and validating the end state. Operator-sovereign: the skill reads + proposes; you run the commands.
 
 ### Updating darkmux
 
@@ -242,7 +241,7 @@ Bigger context wins long tasks. Slim config wins bounded tasks. **No static conf
 
 darkmux is a CLI binary, not an HTTP proxy. Your frontier session (Claude Code) invokes `darkmux` verbs directly to operate four substrates:
 
-1. **Profile multiplexing.** `darkmux swap <profile>` unloads + loads models in LMStudio according to a named profile in `~/.darkmux/profiles.json`. `darkmux swap recommended` resolves the active hardware tier to the bake-off-validated profile + pre-flight-checks the required models are downloaded. `~10s` wall to swap.
+1. **Profile multiplexing.** A dispatch loads the models a named profile in `~/.darkmux/profiles.json` declares, under the resident RAM budget (the multiplexer is now internal to gestalt). `~10s` wall to load.
 
 2. **Crew + mission + phase lifecycle.** `darkmux dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the in-house container-bounded runtime. `darkmux mission propose` + `darkmux phase estimate` are utility-AI verbs that turn vague intent into a structured mission config without the operator authoring it by hand; `darkmux mission launch <id>` mints the running mission instance from that config. Each dispatch emits a flow record carrying provenance: `machine_id`, `orchestrator`, role, model, mission, phase.
 
@@ -291,7 +290,7 @@ The `m-series-128` provider's rules are empirically validated against lab measur
 docker build -t darkmux-runtime:latest runtime/
 ```
 
-The `lab` subcommand mirrors `dispatch`'s contract — the internal runtime, no external agent runtime to install or configure. The `swap` / `status` / `profile` subcommands don't depend on any runtime at all. They orchestrate LMStudio directly.
+The `lab` subcommand mirrors `dispatch`'s contract — the internal runtime, no external agent runtime to install or configure. The `machine` / `profile` subcommands don't depend on any runtime at all. They read LMStudio and the registry directly.
 
 This means **darkmux's profile-multiplexing needs nothing beyond Docker + LMStudio**: `dispatch` ships with a self-contained internal runtime, so a new user never installs a second agent-runtime tool to get going. The empirical findings in the article series were measured against this runtime.
 
@@ -375,7 +374,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 **On the roadmap (active):**
 
 - 🚧 Topology view in the web viewer (live + replay diagram of fleet activity; #169)
-- 🚧 Fleet primitives (`darkmux fleet add/status`) and cross-machine coordination (Phase 5 of #162)
+- 🚧 Fleet primitives (`darkmux machine add`/`darkmux machine list`) and cross-machine coordination (Phase 5 of #162)
 - 🚧 Event-sourced mission state (Phase 8 of #162)
 - 🚧 Sibling bootstrap skill: `/darkmux-enable-redis` (#178). (`/darkmux-add-machine` and `/darkmux-enable-audit` shipped, in the skills bundle above.)
 - 🚧 Audit log management: `flow export`, `flow archive`, OS-level append-only flags for audit files

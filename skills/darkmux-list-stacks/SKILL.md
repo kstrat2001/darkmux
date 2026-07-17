@@ -1,6 +1,6 @@
 ---
 name: darkmux-list-stacks
-description: List the darkmux profiles (stacks) available in the registry — names, descriptions, model counts, context lengths. Use this to discover stack names before invoking 'darkmux-swap-stack'. The default stack is marked.
+description: List the darkmux profiles (stacks) available in the registry — names, descriptions, model counts, context lengths. Use this to discover the stack names available to run a dispatch against. The default stack is marked.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*)"
 ---
@@ -39,11 +39,11 @@ fast
 
 Surface the list to the user, then offer:
 
-- "Pass a stack name to `darkmux-swap-stack` to switch to it"
+- "Name a stack as the `--profile` for a dispatch to run against it"
 - "Run `darkmux-status` to see which stack is currently loaded"
 
 ## Notes
 
-- "(default)" marks the stack `darkmux swap` selects when no name is given. Set `default_profile:` in `~/.darkmux/profiles.json` to change it.
+- "(default)" marks the stack a dispatch uses when no profile is named. Set `default_profile:` in `~/.darkmux/profiles.json` to change it.
 - Custom stacks defined in `~/.darkmux/profiles.json` show alongside any reference profiles. The registry is single-file JSON — readable + editable by hand.
 - "no profile registry found" means there's no `profiles.json` yet. Suggest `cp <darkmux-repo>/profiles.example.json ~/.darkmux/profiles.json` and edit it.

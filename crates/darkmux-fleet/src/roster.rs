@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default reachability-probe timeout. Matches `serve::PROBE_TIMEOUT_MS`
-/// so a slow remote machine reads the same in `darkmux fleet status` as
+/// so a slow remote machine reads the same in `darkmux machine list` as
 /// it does in the every-dispatch nudge.
 const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
@@ -123,7 +123,7 @@ pub fn load_roster() -> Result<FleetRoster> {
 /// the whole load-modify-save cycle serialized by an exclusive
 /// `flock(2)` on a sentinel file at `<roster_path>.lock`. Wave-E.12
 /// (#255 / PR-B review): concurrent invocations (e.g. two operators
-/// each running `darkmux fleet add` on the same machine, or a CLI
+/// each running `darkmux machine add` on the same machine, or a CLI
 /// session racing with a background daemon update) previously dropped
 /// entries to a last-writer-wins race — load, modify, save with no
 /// serialization meant the second writer's `save_roster` clobbered the

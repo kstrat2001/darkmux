@@ -91,8 +91,9 @@ class Darkmux < Formula
       (ghcr.io/kstrat2001/darkmux-runtime:<version>, #759) — you just need
       Docker running. (`docker build -t darkmux-runtime:latest runtime/` from
       a source checkout is the offline/dev alternative.) So brew is a complete
-      install end to end: `swap` / `status` / `profile` / `fleet` / `flow` /
-      `serve` / `doctor`, the hub coordinator role, AND local dispatches.
+      install end to end: `dispatch` / `mission` / `machine` / `profile` /
+      `flow` / `serve` / `doctor`, the hub coordinator role, AND local
+      dispatches.
 
       For a single-machine CLI install (no daemon needed):
         # Already done. Run `darkmux --help` to explore.
@@ -139,7 +140,7 @@ class Darkmux < Formula
 
   test do
     assert_match "darkmux", shell_output("#{bin}/darkmux --version")
-    assert_match "fleet",   shell_output("#{bin}/darkmux fleet --help")
+    assert_match "machine", shell_output("#{bin}/darkmux machine --help")
     assert_match "doctor",  shell_output("#{bin}/darkmux --help")
     # Doctor should run end-to-end without panic; non-zero exit is fine
     # (it'll warn about most checks in a fresh install with no profile + no

@@ -64,7 +64,7 @@ fn fleet_roster_is_owner_only_mode() {
         // its roster path through the production code path.
         let bin = env!("CARGO_BIN_EXE_darkmux");
         let out = std::process::Command::new(bin)
-            .args(["fleet", "add", "test-node", "--address", "127.0.0.1:9999"])
+            .args(["machine", "add", "test-node", "--address", "127.0.0.1:9999"])
             .env("HOME", home)
             .env_remove("DARKMUX_HOME")
             .output()

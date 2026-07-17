@@ -6,7 +6,7 @@ This file is for any AI agent (Claude Code, Cursor, OpenClaw, etc.) that's helpi
 
 A pre-1.0 Rust CLI that does two things for users running local LLMs (LMStudio + Ollama + llama.cpp):
 
-1. **Profile multiplexer** — `darkmux swap <name>` switches the loaded model + context length + (optional) compaction settings to a named profile defined in `~/.darkmux/profiles.json`.
+1. **Profile multiplexer** — a dispatch loads the models a named profile declares (model + context length + optional compaction settings) from `~/.darkmux/profiles.json`, under the resident budget (the multiplexer is now internal to gestalt).
 2. **Lab harness** — `darkmux lab run <workload>` dispatches a workload against the internal Docker-bounded runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
 
 The CLI is the *engine*; the empirical findings in the Genesis series on Darkly Energized (<https://darklyenergized.substack.com>) are what it backs. The reproducibility story is the product story — users should be able to rerun a workload and get numbers comparable to the published claims.
@@ -191,7 +191,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | `600` | Per-dispatch inactivity budget. The host-side watchdog **hard-kills** the container at 100% if no proof-of-work signal lands. The runtime-side detector fires a **soft warning** at 75% (model-facing nudge to wrap up gracefully or escalate via `BLOCKED:`); both reset on the same proof-of-work signals (any tool.completed, any compaction). A productive dispatch never sees either; a stuck one gets the soft chance before the hard kill. Pathological tool patterns are caught by their dedicated detectors (cycle, cascade, edit-drift, reasoning loops) — the deadline trusts activity; the detectors catch struggle. (#457 + #464 + #466; renamed from `DARKMUX_RUNTIME_DEADLINE_SECONDS`) |
 | `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` | `600` | Bounded model-load/unload phase for gestalt host-port calls (#1276). The `LmsHost` adapter spawns `lms load`/`lms unload`, polls the child, and **hard-kills it at expiry**, returning a typed timeout naming the phase — a wrong model id (or a load waiting on anything interactive) can no longer hang a dispatch until the workflow's outer kill. Resolved into the mandatory `Deadline` every `ModelHost` mutation takes; distinct from the *inactivity* budget above (that one meters dispatch proof-of-work; this one meters a single host load/unload call). |
 | `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` | `500000` | (#1260/#1177) Per-EXECUTION remote token allowance for endpoint-staffed crew seats, where an execution = one pipeline stage. **Metered paths (1.18.0 scope):** the review funnel's remote seats (probe pass, each judge pass, the verify pass) AND the tool-less single-shot remote `dispatch` path. **NOT yet metered:** the AGENTIC-remote container path (#1187 — a tool-granting role on an endpoint profile, multi-call container loop); that follow-up is tracked separately. Only REMOTE (hosted-endpoint) calls draw from it — local seats are unmetered by it. When a stage exhausts its bucket, that stage's remaining remote calls stop with the reason named in the envelope: a load-bearing JUDGE stage exhausting is an honest DEGRADED run; a VERIFY stage exhausting degrades only the STAGE (findings already verified still post; skipped confirms keep the manual-verification marker; a loud warning names it); probe exhaustion is a reduced-coverage warning and the run continues. A remote-JUDGE dispatch FAILURE (surviving bounded retries) is likewise a degraded run. Setting it to `0` refuses all remote calls with a typed error (a hard opt-out). Tokens only, never currency. |
-| `DARKMUX_SERVE_TOKEN` | unset → loopback-only | The serve daemon's bearer token (a **secret** — env override; else the macOS Keychain item `darkmux-serve-token`, gated by `runtime.daemon_auth_enabled`). When a token is set the daemon may bind non-loopback and **remote reads + `/diff` require** `Authorization: Bearer <token>` (loopback stays open so the local viewer keeps working). When **unset**, a non-loopback `--bind` is **refused** (a loopback daemon needs no token). `fleet status --deep` sends this token to peers — use the **same shared token** on every machine in the fleet. (#881) |
+| `DARKMUX_SERVE_TOKEN` | unset → loopback-only | The serve daemon's bearer token (a **secret** — env override; else the macOS Keychain item `darkmux-serve-token`, gated by `runtime.daemon_auth_enabled`). When a token is set the daemon may bind non-loopback and **remote reads + `/diff` require** `Authorization: Bearer <token>` (loopback stays open so the local viewer keeps working). When **unset**, a non-loopback `--bind` is **refused** (a loopback daemon needs no token). `machine list --deep` sends this token to peers — use the **same shared token** on every machine in the fleet. (#881) |
 
 **env → `config.json` field** (the override-tier var → its durable config home):
 
@@ -228,7 +228,7 @@ src/
   main.rs                    CLI dispatch (clap)
   types.rs                   Profile / ProfileRegistry / ProfileModel
   profiles.rs                Registry loader + lookup
-  swap.rs / lms.rs           Stack swap orchestration + lms CLI wrapper
+  swap.rs / lms.rs           darkmux: namespace helpers + lms CLI wrapper
   init.rs / skills.rs        `darkmux init` + skill installer
   notebook.rs                Notebook draft generator
   lab/
@@ -270,7 +270,6 @@ templates/builtin/
   skills/                     Skill library embedded at compile time (work-shape descriptors with keyword routing; renamed from `capabilities/` in refactor 0 — see #448)
   workloads/                  Workload manifests embedded at compile time
   lab-fixtures/               Built-in lab fixtures (e.g. demo-tiny-py) registered via scripts/lab-init.sh
-  recommendations/            Tier-aware recommendation registry
   AUTONOMOUS_DISPATCH_PREAMBLE.md  Injected ahead of specialist-role dispatches (#427)
 scripts/lab-init.sh           Standalone fixture-registry bootstrapper (NOT a CLI verb; #487 phase 5)
 skills/darkmux-<name>/        Agent-invokable skill wrappers
@@ -367,7 +366,7 @@ If a user asks you to:
 ## Things to ASK before doing
 
 - Anything that mutates `~/.darkmux/profiles.json` — that's user state.
-- Anything that calls `darkmux swap` or runs a real lab dispatch — uses real LMStudio resources.
+- Anything that runs a real lab dispatch or a dispatch that loads models — uses real LMStudio resources.
 - Anything that does `git push` or `git commit --amend` — irreversible-ish.
 - Adding external runtime dependencies — has knock-on effects on install size and license surface.
 
@@ -383,7 +382,7 @@ Live findings from cross-machine testing (M1 Max Studio fresh-Claude session, 20
 
 - **Empirical defaults are load-bearing, not decorative.** When choosing compaction modes, context windows, or compactor pairings, the shipped profile defaults (`default` mode beats `safeguard` for local; small dedicated compactor at ~68K cuts wall-clock substantially) reflect measured configurations, not arbitrary picks. Don't deviate from a profile's settings without acknowledging the empirical reason — the operator has chosen them deliberately.
 
-- **Name the model-on-test when characterizing local-AI behavior.** darkmux uses a bake-off methodology to validate model hires per hardware tier — a documented head-to-head comparison with criteria written before the runs (tracked in the recommendation registry, [#159](https://github.com/kstrat2001/darkmux/issues/159)). But what's actually loaded in LMStudio at any moment may differ from the registry's pick — operators swap for reasons (debugging, A/B comparison, evaluating a new candidate, defensive escalation, or simply not having swapped back after a focused test). When you (the orchestrator) characterize behavior from a dispatch — *"the local layer's response was X"* — **know which model produced it**. `darkmux doctor` shows the active profile; `lms ps` shows the loaded models. If the loaded model differs from the recommended hire and the analysis is making generalizable claims about *the local layer*, name the model explicitly. Silent misattribution (analyzing dispatch outputs as if from the recommended model when they're actually from a reserve / candidate) inherits class-wide errors into every downstream claim. The architectural fixes are tracked as [#159](https://github.com/kstrat2001/darkmux/issues/159) (recommendation registry per hardware tier) and [#160](https://github.com/kstrat2001/darkmux/issues/160) (per-role `agent.model` pinning); this anti-pattern is the awareness layer until both ship. *Not restriction — operators have preferences and models evolve.* Just awareness, surfaced.
+- **Name the model-on-test when characterizing local-AI behavior.** darkmux uses a bake-off methodology to validate model hires per hardware tier — a documented head-to-head comparison with criteria written before the runs (documented in the lab + notebook; the static per-tier recommendation registry from [#159](https://github.com/kstrat2001/darkmux/issues/159) retired in #1426). But what's actually loaded in LMStudio at any moment may differ from the registry's pick — operators swap for reasons (debugging, A/B comparison, evaluating a new candidate, defensive escalation, or simply not having swapped back after a focused test). When you (the orchestrator) characterize behavior from a dispatch — *"the local layer's response was X"* — **know which model produced it**. `darkmux doctor` shows the active profile; `lms ps` shows the loaded models. If the loaded model differs from the recommended hire and the analysis is making generalizable claims about *the local layer*, name the model explicitly. Silent misattribution (analyzing dispatch outputs as if from the recommended model when they're actually from a reserve / candidate) inherits class-wide errors into every downstream claim. Per-role `agent.model` pinning is tracked as [#160](https://github.com/kstrat2001/darkmux/issues/160); this anti-pattern is the awareness layer until it ships. *Not restriction — operators have preferences and models evolve.* Just awareness, surfaced.
 
 ## Operator sovereignty (architectural principle)
 
@@ -424,7 +423,7 @@ When darkmux maintains state in a system other consumers also use — LMStudio l
 
 ### Why this matters
 
-Without the namespace, darkmux's operations have to fall back on heuristics or persistent state files to know "did I bring this up, or did the user?" Heuristics are fragile (the user might happen to use the same naming convention); state files go stale (user force-quits, LMStudio restarts, manual unloads). The namespace IS the state — durable, visible, self-describing. If `lms ps` shows `darkmux:qwen3.6-35b-a3b`, that's a darkmux load and `darkmux swap` can unload it. If it shows `qwen3.6-35b-a3b` with no prefix, that's user state and darkmux leaves it alone.
+Without the namespace, darkmux's operations have to fall back on heuristics or persistent state files to know "did I bring this up, or did the user?" Heuristics are fragile (the user might happen to use the same naming convention); state files go stale (user force-quits, LMStudio restarts, manual unloads). The namespace IS the state — durable, visible, self-describing. If `lms ps` shows `darkmux:qwen3.6-35b-a3b`, that's a darkmux load and `darkmux machine eject` can unload it. If it shows `qwen3.6-35b-a3b` with no prefix, that's user state and darkmux leaves it alone.
 
 ### Transparency at dispatch time
 
@@ -440,8 +439,8 @@ When writing a new feature that mutates LMStudio state on the operator's behalf:
 
 ### Operator-facing commands
 
-- `darkmux model status` — list `lms ps` results grouped by ownership (darkmux-managed vs user state). Read-only.
-- `darkmux model eject [--dry-run]` — unload everything in the `darkmux:` namespace; never touches user state. Use to release darkmux's RAM footprint without disturbing other tools.
+- `darkmux machine status` — list `lms ps` results grouped by ownership (darkmux-managed vs user state). Read-only.
+- `darkmux machine eject [--dry-run]` — unload everything in the `darkmux:` namespace; never touches user state. Use to release darkmux's RAM footprint without disturbing other tools.
 - `darkmux dispatch <role-id> <text>` — dispatch a single turn to the named role. Looks up the role manifest + `.md` system prompt, then runs the role through the **internal runtime** (per-dispatch `darkmux-runtime` Docker container, mounted workspace tempdir, in-house Rust agent loop with streamed flow records). Pass `--image <tag>` (#703) to dispatch into a specific environment: the default `darkmux-runtime:latest` is slim (python + node), but naming ANY Linux image (e.g. `rust:slim`, the operator's own CI image) makes darkmux **inject** its static runtime binary into that image (bind-mount + entrypoint override) so the coder runs in that environment and can `cargo check`/`test` in-sandbox — the inner verify loop. darkmux ships NO per-language images (it brings the agent; you bring the environment). The image needs `bash` + coreutils (debian/ubuntu-family work as-is; bare-alpine needs them added). **For Rust in-sandbox lint** (`cargo clippy`), name an image that includes the clippy component — `rust:latest` ships it; bare `rust:slim` may not, and a missing clippy slips lint to the frontier gate. The coder role makes one bounded `rustup component add clippy` attempt when cargo is present but clippy isn't (the single exception to its no-toolchain-setup rule), but the reliable fix is the operator's image choice — BYO-environment, so bring clippy if you want in-sandbox lint. Local dispatch only today (ignored on cross-machine `--machine`).
 
 (A previous entry here, `darkmux crew sync` — reconciling an openclaw agent registry with the crew role manifests — was removed along with the openclaw shell-out path in #1405; the internal runtime reads role manifests directly, so there is no registry left to sync.)

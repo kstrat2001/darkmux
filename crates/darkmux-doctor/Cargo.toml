@@ -17,7 +17,6 @@ darkmux-crew = { path = "../darkmux-crew" }
 darkmux-eureka = { path = "../darkmux-eureka" }
 darkmux-hardware = { path = "../darkmux-hardware" }
 darkmux-heuristics = { path = "../darkmux-heuristics" }
-darkmux-recommendations = { path = "../darkmux-recommendations" }
 anyhow = "1.0"
 serde_json = "1.0"
 dirs = "5.0"

@@ -16,7 +16,8 @@ darkmux-types = { path = "../darkmux-types" }
 darkmux-gestalt = { path = "../darkmux-gestalt" }
 anyhow = "1.0"
 # (#1286) Serialize derives for the memory-ledger payload (ONE struct feeds
-# both `darkmux model ledger --json` and the serve daemon's /machine/memory).
+# both `darkmux machine resources --json` and the serve daemon's
+# /machine/resources).
 # Already throughout the workspace dependency tree — not a new external dep.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

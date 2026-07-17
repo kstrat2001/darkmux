@@ -46,8 +46,7 @@ fn help_lists_subcommands() {
     cmd.arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("swap"))
-        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("machine"))
         .stdout(predicate::str::contains("profile"))
         .stdout(predicate::str::contains("lab"));
 }
@@ -155,59 +154,222 @@ fn retired_crew_dispatch_subverb_is_unknown() {
         ));
 }
 
+// (#1426 phase 3) `swap`, `status`, `model`, `fleet`, and `recommendations`
+// all retired as top-level verbs with NO compat alias (pre-2.0 clean removal).
+// `swap` (the second residency writer) is gone entirely; `status`/`model`/
+// `fleet` folded into the `machine` family.
 #[test]
-fn swap_dry_run_succeeds_without_real_lms() {
-    let tmp = TempDir::new().unwrap();
-    let p = tmp.path().join("profiles.json");
-    fs::write(&p, fixture_json()).unwrap();
+fn retired_top_level_swap_verb_is_unknown() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    // Force a non-functional `lms` binary. list_loaded falls back to text
-    // parsing on JSON failure and treats an empty result as "no models loaded."
-    // dry-run skips the actual unload/load calls, so the swap completes cleanly.
-    cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
-    cmd.args([
-        "swap",
-        "fast",
-        "--profiles-file",
-        p.to_str().unwrap(),
-        "--dry-run",
-        "--quiet",
-    ])
-    .assert()
-    .success();
+    cmd.arg("swap").assert().failure().stderr(
+        predicate::str::contains("unrecognized subcommand")
+            .or(predicate::str::contains("unexpected argument")),
+    );
 }
 
 #[test]
-fn swap_unknown_profile_errors() {
-    let tmp = TempDir::new().unwrap();
-    let p = tmp.path().join("profiles.json");
-    fs::write(&p, fixture_json()).unwrap();
+fn retired_top_level_status_verb_is_unknown() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
-    cmd.args([
-        "swap",
-        "nonexistent-profile",
-        "--profiles-file",
-        p.to_str().unwrap(),
-        "--dry-run",
-        "--quiet",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains("not found"));
+    cmd.arg("status").assert().failure().stderr(
+        predicate::str::contains("unrecognized subcommand")
+            .or(predicate::str::contains("unexpected argument")),
+    );
 }
 
 #[test]
-fn status_runs_with_explicit_profiles() {
+fn retired_top_level_model_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("model").assert().failure().stderr(
+        predicate::str::contains("unrecognized subcommand")
+            .or(predicate::str::contains("unexpected argument")),
+    );
+}
+
+#[test]
+fn retired_top_level_fleet_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("fleet").assert().failure().stderr(
+        predicate::str::contains("unrecognized subcommand")
+            .or(predicate::str::contains("unexpected argument")),
+    );
+}
+
+#[test]
+fn retired_top_level_recommendations_verb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("recommendations").assert().failure().stderr(
+        predicate::str::contains("unrecognized subcommand")
+            .or(predicate::str::contains("unexpected argument")),
+    );
+}
+
+// (#1426) The `machine` family is present. `machine status` (absorbs the
+// retired `status`) shows the matching-profile line; bare `machine` routes to
+// `machine status` (one code path, no separate overview render).
+#[test]
+fn machine_status_runs_with_explicit_profiles() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("profiles.json");
     fs::write(&p, fixture_json()).unwrap();
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
-    cmd.args(["status", "--profiles-file", p.to_str().unwrap()])
+    cmd.args(["machine", "status", "--profiles-file", p.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("registry:"));
+        .stdout(predicate::str::contains("darkmux-managed"))
+        .stdout(predicate::str::contains("matches"));
+}
+
+#[test]
+fn bare_machine_routes_to_status() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
+    cmd.arg("machine")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("darkmux-managed"));
+}
+
+/// (#1426) `machine status --json` emits the machine-readable shape the
+/// frontier orchestrator parses: ownership groups plus the absorbed `status`
+/// verb's `matching_profiles` + `registry` provenance keys.
+#[test]
+fn machine_status_json_carries_matching_profiles_and_registry_keys() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("profiles.json");
+    fs::write(&p, fixture_json()).unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args([
+            "machine",
+            "status",
+            "--json",
+            "--profiles-file",
+            p.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    for key in ["managed", "user_state", "matching_profiles", "registry"] {
+        assert!(json.get(key).is_some(), "missing `{key}` in: {json}");
+    }
+    assert!(json["matching_profiles"].is_array());
+}
+
+/// (#1426 gate fix) An EXPLICIT `--profiles-file` that doesn't load errors
+/// loudly — the retired `status` verb's behavior. Only the no-arg default
+/// degrades to residents-without-match.
+#[test]
+fn machine_status_explicit_bad_profiles_file_errors_loudly() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
+    cmd.args(["machine", "status", "--profiles-file", "/no/such/path.json"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("registry not found")
+                .or(predicate::str::contains("no profile registry"))
+                .or(predicate::str::contains("profiles-file")),
+        );
+}
+
+/// Serve `count` canned HTTP responses on an ephemeral loopback port,
+/// then stop. Returns the bound `host:port`.
+fn canned_http_peer(status_line: &'static str, body: &'static str, count: usize) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for _ in 0..count {
+            let Ok((mut stream, _)) = listener.accept() else { break };
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    addr
+}
+
+/// Register `id` at `addr` in a roster under a per-test DARKMUX_FLEET_FILE,
+/// via the real `machine add` verb. Returns the roster file path.
+fn roster_with_peer(tmp: &TempDir, id: &str, addr: &str) -> std::path::PathBuf {
+    let fleet_file = tmp.path().join("fleet.json");
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .args(["machine", "add", id, "--address", addr])
+        .assert()
+        .success();
+    fleet_file
+}
+
+/// (#1426 gate fix) A peer whose daemon answers but can't reach LMStudio
+/// (`lms_unreachable: true`) must NOT render as a healthy-empty machine —
+/// residents are UNKNOWN, not zero. Loud message, exit 2.
+#[test]
+fn machine_status_remote_degraded_peer_is_not_healthy_empty() {
+    let addr = canned_http_peer("200 OK", r#"{"models":[],"lms_unreachable":true,"generated_at_ms":1}"#, 1);
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .args(["machine", "status", "peer1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "degraded peer must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("UNKNOWN"), "must say residents unknown: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("exclusively darkmux's"),
+        "must NOT render the healthy-empty view: {stdout}"
+    );
+}
+
+/// (#1426) A healthy peer read renders its residents partitioned by
+/// ownership; `--json` carries the `machine_id` provenance key.
+#[test]
+fn machine_status_remote_happy_path_json_carries_machine_id() {
+    let body = r#"{"models":[{"identifier":"darkmux:qwen-x","model":"qwen-x","status":"loaded","size":"4 GB","context":32000}],"lms_unreachable":false,"generated_at_ms":1}"#;
+    let addr = canned_http_peer("200 OK", body, 1);
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .args(["machine", "status", "peer1", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["machine_id"], "peer1");
+    assert_eq!(json["managed"][0]["identifier"], "darkmux:qwen-x");
+}
+
+/// (#1426) A peer payload whose `models` doesn't parse (older/newer daemon
+/// shape) falls back to a raw JSON print — never a fabricated-empty render.
+#[test]
+fn machine_status_remote_shape_mismatch_prints_raw_json() {
+    let addr = canned_http_peer("200 OK", r#"{"future_shape":{"models_v2":[]}}"#, 1);
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .args(["machine", "status", "peer1"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("future_shape"), "raw payload passthrough: {stdout}");
+    assert!(!stdout.contains("darkmux-managed"), "no fabricated render: {stdout}");
 }
 
 #[test]
@@ -579,37 +741,6 @@ fn mission_migrate_apply_is_idempotent() {
         .success()
         .stdout(predicate::str::contains("nothing to do"));
 }
-
-/// Phase-F: `darkmux recommendations show <tier>` prints the registry
-/// entry for a known tier. This verb is referenced by the bootstrap
-/// skill to read the live primary + compactor model ids; if the verb
-/// regresses the skill breaks for every new operator.
-#[test]
-fn recommendations_show_known_tier_prints_validated_entry() {
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .args(["recommendations", "show", "m-series-128"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Tier:     m-series-128"))
-        .stdout(predicate::str::contains("Status:"))
-        .stdout(predicate::str::contains("Primary:"))
-        .stdout(predicate::str::contains("Compactor:"))
-        .stdout(predicate::str::contains("Rationale:"));
-}
-
-/// Phase-F: `recommendations show <unknown-tier>` errors clearly.
-/// The bootstrap skill's tier-resolution path depends on the verb
-/// bailing loud rather than silently returning an empty placeholder.
-#[test]
-fn recommendations_show_unknown_tier_errors() {
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .args(["recommendations", "show", "no-such-tier"])
-        .assert()
-        .failure();
-}
-
 
 /// Phase-H: `notebook draft --role <id>` is the new flag (renamed
 /// from `--agent` per Beat 36). The old `--agent` flag must NOT be
