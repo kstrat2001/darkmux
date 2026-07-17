@@ -13,6 +13,16 @@ use std::sync::{Arc, Mutex};
 /// (0)`), so a zero allowance refuses every hosted call — the same hard
 /// opt-out `admit_remote_execution` gives a single hosted dispatch.
 ///
+/// **The ceiling is SOFT (approximate), by construction (#1451 gate).**
+/// Admission is checked BEFORE a call ([`admit`](Self::admit)) and tokens
+/// are spent AFTER it ([`spend`](Self::spend)), so a stage can overshoot
+/// `budget` by at most ONE granted call — the per-item `max_tokens` is
+/// clamped to what the bucket has LEFT ([`remaining`](Self::remaining), gate
+/// C6), which bounds that overshoot to whatever the endpoint itself reports
+/// ABOVE its granted cap. This is deliberate: a per-execution allowance is a
+/// spend GUARDRAIL, not a hard byte gate, and a call's exact cost is
+/// unknowable until it runs.
+///
 /// **Bucket-group semantics (#1442 gate — the highest-stakes carry-forward
 /// of the ship-2b rewiring).** Where it once lived private in `builtins`,
 /// scoped to a SINGLE `dispatch.map` step, the bucket now lives here so the
@@ -119,18 +129,6 @@ impl StepRunCtx {
     /// here and creates its own step-scoped bucket.
     pub fn remote_bucket(&self) -> Option<&Arc<Mutex<MapRemoteBucket>>> {
         self.remote_bucket.as_ref()
-    }
-
-    /// Test-only constructor: an isolated context with a real channel whose
-    /// receiver the test drains, plus an optional shared bucket. Lets a step
-    /// kind be exercised for its streaming/bucket behavior without standing
-    /// up the whole scheduler.
-    #[cfg(test)]
-    pub fn for_test(
-        emitter: Option<std::sync::mpsc::Sender<FlowRecord>>,
-        remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
-    ) -> Self {
-        Self::new(emitter, remote_bucket)
     }
 }
 
