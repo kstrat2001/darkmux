@@ -833,43 +833,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(found, "the close nudge must emit a stage=debrief mission.debrief.prompt record");
     }
 
-    /// (#817) The note-trail scan finds a session-scoped orchestrator note in
-    /// the newest day files, and reads "no note" for other sessions, other
-    /// sources, and a missing dir. `#[serial_test::serial]` — mutates the
-    /// shared DARKMUX_FLOWS_DIR env (config_access reads it live per-access).
-    #[test]
-    #[serial_test::serial]
-    fn session_note_scan_matches_session_and_source() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("2026-06-12.jsonl"),
-            concat!(
-                r#"{"ts":"2026-06-12T10:00:00Z","action":"note","source":"orchestrator","session_id":"mission-run-m1-s1","handle":"adjudicated"}"#, "\n",
-                r#"{"ts":"2026-06-12T10:01:00Z","action":"note","source":"operator","session_id":"mission-run-m1-s2","handle":"not orchestrator"}"#, "\n",
-                r#"{"ts":"2026-06-12T10:02:00Z","action":"note","source":"adjudication","session_id":"mission-run-m1-s3","handle":"audit-trail channel"}"#, "\n",
-            ),
-        )
-        .unwrap();
-        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
-        // SAFETY: serialized via #[serial]; restored below.
-        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
-
-        let hit = session_has_orchestrator_note("mission-run-m1-s1");
-        let wrong_session = session_has_orchestrator_note("mission-run-m1-sX");
-        let wrong_source = session_has_orchestrator_note("mission-run-m1-s2");
-        let adjudication_tag = session_has_orchestrator_note("mission-run-m1-s3");
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
-                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
-            }
-        }
-        assert!(hit, "session-scoped orchestrator note must be found");
-        assert!(!wrong_session, "other sessions' notes must not match");
-        assert!(!wrong_source, "non-adjudication/orchestrator notes must not match");
-        assert!(adjudication_tag, "the adjudication audit-trail tag must satisfy the scan");
-    }
+    // (#1463) The `session_note_scan_matches_session_and_source` test retired
+    // with `session_has_orchestrator_note` — that scan only backed the retired
+    // `ship` verb's adjudication-note nudge.
 
     fn phase(id: &str, mission: &str, status: PhaseStatus) -> Phase {
         Phase {
@@ -1102,41 +1068,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
         }
     }
 
-    #[test]
-    fn commit_subject_takes_first_line() {
-        let s = phase("s1", "m1", PhaseStatus::Running);
-        // phase() sets description = "desc s1"
-        assert_eq!(commit_subject(&s), "desc s1");
-    }
-
-    #[test]
-    fn commit_subject_truncates_long_and_takes_only_first_line() {
-        let mut s = phase("s1", "m1", PhaseStatus::Running);
-        s.description = format!("{}\nsecond line ignored", "x".repeat(100));
-        let subj = commit_subject(&s);
-        assert!(subj.chars().count() <= 72, "len {}", subj.chars().count());
-        assert!(subj.ends_with("..."), "{subj}");
-        assert!(!subj.contains("second line"), "only first line: {subj}");
-    }
-
-    #[test]
-    fn commit_subject_falls_back_on_empty_description() {
-        let mut s = phase("s1", "m1", PhaseStatus::Running);
-        s.description = String::new();
-        assert_eq!(commit_subject(&s), "darkmux phase s1");
-    }
-
-    #[test]
-    fn pr_body_names_mission_and_phase_no_currency() {
-        let m = mission("m1", "ship the thing");
-        let s = phase("s1", "m1", PhaseStatus::Running);
-        let body = pr_body(&m, &s);
-        assert!(body.contains("`m1`"), "{body}");
-        assert!(body.contains("`s1`"), "{body}");
-        assert!(body.contains("mission ship"), "{body}");
-        // Tokens-only doctrine: no currency leaks into shipped PR copy.
-        assert!(!body.contains('$'), "no currency in PR body: {body}");
-    }
+    // (#1463) `commit_subject_*` and `pr_body_*` tests retired with the
+    // `commit_subject`/`pr_body` helpers — those only fed the retired `ship`
+    // verb's commit/PR authoring, now the frontier orchestrator's job.
 
     // (#799 part 2) parse_failed_verifiers — the verifier-fabrication backstop's
     // consumer-side parse. The governing discipline is FALSE-ALARM avoidance:
@@ -1192,50 +1126,11 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(got[0].command, "pytest");
     }
 
-    /// (#799 part 2) The ship-side reader round-trip — the run→ship handoff. The
-    /// load-bearing case is RESUMED-PHASE latest-wins: a clean re-run's empty
-    /// `mission.run.verification` record must OVERWRITE a prior dirty run's for
-    /// the same session, so the documented fix-and-retry actually clears the
-    /// hold. Also: a dirty-only session stays held, and other sessions don't
-    /// bleed in. `#[serial]` — mutates the shared DARKMUX_FLOWS_DIR (read live
-    /// per-access by config_access).
-    #[test]
-    #[serial_test::serial]
-    fn session_failed_verifiers_latest_run_wins() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("2026-06-21.jsonl"),
-            concat!(
-                // session A: dirty run #1, then a clean re-run #2 (later line wins).
-                r#"{"ts":"2026-06-21T10:00:00Z","action":"step result","session_id":"mission-run-mA-s1","payload":{"step_id":"s1-coder-step","kind":"mission.coder","failed_verifiers":[{"command":"cargo test","reason":"command not found (exit 127) — the verifier never ran"}],"count":1}}"#, "\n",
-                r#"{"ts":"2026-06-21T10:30:00Z","action":"step result","session_id":"mission-run-mA-s1","payload":{"step_id":"s1-coder-step","kind":"mission.coder","failed_verifiers":[],"count":0}}"#, "\n",
-                // session B: a single dirty run — stays held.
-                r#"{"ts":"2026-06-21T11:00:00Z","action":"step result","session_id":"mission-run-mB-s1","payload":{"step_id":"s1-coder-step","kind":"mission.coder","failed_verifiers":[{"command":"pytest","reason":"toolchain failed to load"}],"count":1}}"#, "\n",
-            ),
-        )
-        .unwrap();
-        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
-        // SAFETY: serialized via #[serial]; restored below.
-        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
-
-        let session_a = session_failed_verifiers("mission-run-mA-s1");
-        let session_b = session_failed_verifiers("mission-run-mB-s1");
-        let unknown = session_failed_verifiers("mission-run-mZ-s9");
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
-                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
-            }
-        }
-        assert!(
-            session_a.is_empty(),
-            "a clean re-run must clear a prior dirty record (latest-wins): {session_a:?}"
-        );
-        assert_eq!(session_b.len(), 1, "a dirty-only session stays held: {session_b:?}");
-        assert_eq!(session_b[0].command, "pytest");
-        assert!(unknown.is_empty(), "an unknown session reads as none");
-    }
+    // (#1463) `session_failed_verifiers_latest_run_wins` retired with
+    // `session_failed_verifiers` — that reader only served the retired `ship`
+    // verb's pre-merge verifier-fabrication hold. The producer-side parse
+    // (`parse_failed_verifiers`, tested above) survives: the coder-phase gate
+    // still surfaces failed verifiers via `print_unverified_banner`.
 
     // ─── (#1230 Packet 3) Task/Step graph migration ─────────────────────
 

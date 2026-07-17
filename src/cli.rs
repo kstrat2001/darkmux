@@ -247,14 +247,6 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: RoleCmd,
     },
-    /// Phase planning — pre-dispatch budget oracle.
-    /// `darkmux phase estimate <spec.json>` computes token consumption +
-    /// recommends a profile. `--narrate` adds a one-sentence operator-facing
-    /// wrap from the 4B compactor.
-    Phase {
-        #[command(subcommand)]
-        sub: PhaseCmd,
-    },
     /// Mission lifecycle — transition missions through their state machine.
     /// Mission status flows: Active ↔ Paused → Closed. All transitions are
     /// operator-explicit; nothing auto-decides a mission is paused or done.
@@ -340,50 +332,6 @@ pub(crate) enum RoleCmd {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum PhaseCmd {
-    /// Pre-dispatch budget oracle. Reads a workload-spec JSON, computes
-    /// predicted token consumption across planned turns, picks the
-    /// smallest adequate profile, emits structured JSON.
-    Estimate {
-        /// Path to the workload-spec JSON file.
-        spec: std::path::PathBuf,
-        /// Add a one-sentence operator-facing recommendation wrap from the
-        /// 4B compactor (`darkmux:qwen3-4b-instruct-2507`). Adds ~500ms
-        /// latency; gracefully degrades if the model isn't loaded.
-        #[arg(long)]
-        narrate: bool,
-    },
-    /// Run a code review on the current branch vs base.  Auto-detects
-    /// target, computes `git diff`, dispatches the `code-reviewer` role,
-    /// parses the QA-REVIEW-SIGNOFF block, and emits structured JSON.
-    Review {
-        /// Base branch to diff against. Defaults to `main`.
-        #[arg(long)]
-        base: Option<String>,
-        /// Exit nonzero if any BLOCK-severity findings.
-        #[arg(long)]
-        require_clean: bool,
-        /// Optional phase identifier passed through to flow records.
-        #[arg(long = "phase-id")]
-        phase_id: Option<String>,
-    },
-    /// Transition a phase to `Running`. From `Planned` (first start) or
-    /// `Abandoned` (restart — clears abandoned_ts). Stamps `started_ts=now()`.
-    Start {
-        /// Phase id (filename stem under ~/.darkmux/phases/).
-        id: String,
-    },
-    /// Transition a `Running` phase to `Complete` (terminal). Stamps
-    /// `completed_ts=now()`. Wall-clock duration = completed_ts - started_ts.
-    Complete { id: String },
-    /// Transition a `Planned` or `Running` phase to `Abandoned`. Operator-
-    /// sovereign: only the operator marks a phase dead; nothing auto-
-    /// abandons on staleness. A subsequent `phase start` clears the
-    /// abandonment (operator changed their mind).
-    Abandon { id: String },
-}
-
-#[derive(Subcommand)]
 pub(crate) enum MissionCmd {
     /// Global mission-control read (#829): the whole board — every mission
     /// grouped by status with phase progress, the inconsistencies that need
@@ -427,11 +375,19 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         reasoning: Option<String>,
     },
-    /// Transition a mission to `Closed` (terminal). From `Active` or `Paused`.
-    /// Stamps `closed_ts=now()`.
-    Close {
+    /// Finalize a mission — the SUCCESS terminal (#1463). Drives every
+    /// non-terminal phase to `Complete`, tears down each phase's worktree +
+    /// branch, and transitions the mission to `Closed` (stamps
+    /// `closed_ts=now()`). The frontier orchestrator does the git/gh work by
+    /// hand (commit/push/PR/merge — its native job), then calls this to close
+    /// out the darkmux-side state. The clear opposite of `abort` (which records
+    /// `Abandoned` instead of `Complete`); both clean up whatever exists. Named
+    /// to match the internal `finalize_mission` fn that graph/review runs call
+    /// to auto-close. (Renamed from `close` in #1463; the `ship` verb it
+    /// absorbs retired.)
+    Finalize {
         id: String,
-        /// Optional operator-supplied reasoning for closing the mission.
+        /// Optional operator-supplied reasoning for finalizing the mission.
         #[arg(long)]
         reasoning: Option<String>,
     },
@@ -514,8 +470,9 @@ pub(crate) enum MissionCmd {
     /// freeform/manual config) mints the instance and starts the mission
     /// but leaves every phase transition operator-driven. A coder-phase
     /// graph executes worktree → coder → QA and then STOPS at an operator
-    /// sign-off gate — the phase stays
-    /// Running and `mission ship`/`mission abort` finish the loop; launch
+    /// sign-off gate — the phase stays Running. The frontier orchestrator
+    /// ships the git work by hand (commit/push/PR/merge), then `mission
+    /// finalize` closes it out; `mission abort` tears it down (#1463). Launch
     /// never auto-closes past the gate. `review` (#1284 Packet 4b — the
     /// retired `pr-review run`) is dispatched through its OWN dedicated
     /// launcher instead: bundle → probe → dedup → judge → verify →
@@ -653,43 +610,22 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         no_wait: bool,
     },
-    /// Abort a gate-held coder-phase run cleanly: remove the phase's
-    /// worktree + branch and flip the phase to Abandoned. The explicit
-    /// teardown for a run the operator/frontier decides to back out of (vs.
-    /// leaving an orphan worktree). Operates on the run a `mission launch
-    /// coder-phase` left at its sign-off gate (#782, #1426 ship-4).
+    /// Abort a mission — the KILL terminal (#1463). By default the WHOLE
+    /// mission: removes every phase's worktree + branch, flips all non-terminal
+    /// phases to `Abandoned`, and closes the mission. The clear opposite of
+    /// `finalize` (which records `Complete`); both clean up whatever exists.
+    /// Ends a stuck mission in one command (the `doom-loop-m4` case that used to
+    /// need `phase abandon`×N + `close`). Pass `--phase <id>` to scope the
+    /// teardown to a SINGLE gate-held coder-phase run instead of the whole
+    /// mission. (Widened from single-phase in #1463; #782, #1426 ship-4.)
     Abort {
         /// Mission id.
         mission_id: String,
-        /// Phase to abort. Optional — when omitted, the single ready phase
-        /// is selected (pass `--phase` explicitly to abort a Running one).
+        /// Scope the teardown to one phase (the narrow single-run abort).
+        /// When omitted, the WHOLE mission is aborted: every non-terminal
+        /// phase torn down + Abandoned, the mission closed.
         #[arg(long, value_name = "ID")]
         phase: Option<String>,
-    },
-    /// Ship a gate-held coder-phase run's work: commit the worktree, push
-    /// the branch, and open (or reuse) the PR. By DEFAULT stops at the PR —
-    /// merging is the operator/frontier's explicit act (never auto-merge).
-    /// `--wait-ci` blocks on CI; `--merge` (opt-in, green-gated) squash-
-    /// merges, flips the phase to Complete, tears down the worktree, and
-    /// finalizes the mission when its last phase closes. (#782, #1426 ship-4)
-    Ship {
-        /// Mission id.
-        mission_id: String,
-        /// Phase to ship. Optional — when omitted the single ready phase
-        /// is selected (pass `--phase` explicitly for a Running phase).
-        #[arg(long, value_name = "ID")]
-        phase: Option<String>,
-        /// Base branch the PR targets. Default `main`.
-        #[arg(long, default_value = "main")]
-        base: String,
-        /// Block on CI checks until they finish, then report green/red.
-        #[arg(long)]
-        wait_ci: bool,
-        /// After CI is green, squash-merge the PR, mark the phase Complete,
-        /// and remove the worktree. Opt-in — refuses to merge if CI isn't
-        /// green. Without this flag, ship stops at the PR.
-        #[arg(long)]
-        merge: bool,
     },
 }
 

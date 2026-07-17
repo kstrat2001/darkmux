@@ -14,18 +14,20 @@
 //!
 //! plus the injected-context brief-building the coder step feeds on
 //! ([`coder_brief`] + the cautions/lessons/corrections allocation), and the
-//! two operator-facing lifecycle verbs that finish or back out a gate-held
-//! run: [`ship`] (commit → PR → CI → merge → teardown) and [`abort`]
-//! (worktree + branch teardown, phase Abandoned). [`debrief`] reports on how
-//! a mission's phases ended.
+//! two operator-facing whole-mission terminals (#1463): [`finalize`] (the
+//! SUCCESS terminal — non-terminal phases → Complete, worktrees torn down,
+//! mission Closed) and [`abort`] (the KILL terminal — the same teardown, phases
+//! → Abandoned; whole-mission by default, `--phase` for a single run). [`debrief`]
+//! reports on how a mission's phases ended.
 //!
 //! Why the pipeline stops at a gate: adjudicating the QA findings and
 //! deciding to merge are judgment steps that belong to the frontier
 //! orchestrator + operator, never to a CLI verb (operator sovereignty, #44;
 //! never-auto-merge). `mission launch coder-phase` tees everything up so
-//! sign-off is one follow-on step — `darkmux mission ship <id> --phase
-//! <phase-id>` does the commit → PR → CI → merge → teardown after the
-//! operator/frontier signs off (#782).
+//! sign-off is one follow-on step — the frontier orchestrator does the git/gh
+//! work by hand (commit → push → PR → merge, its native job — the re-implemented
+//! `ship` verb retired in #1463), then `darkmux mission finalize <id>` closes
+//! out the darkmux-side state.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -37,8 +39,8 @@ use crate::flow;
 use darkmux_types::style;
 
 /// Emit a mission-run lifecycle flow record for the mission-level events
-/// OUTSIDE the worktree→coder→verify Task/Step graph — `mission abort`'s
-/// teardown and `mission ship`'s commit→PR→merge sequence (#1230 Packet 4:
+/// OUTSIDE the worktree→coder→verify Task/Step graph — the `mission finalize` /
+/// `mission abort` whole-mission teardown (#1463) (#1230 Packet 4:
 /// the graph's own three steps retired their bespoke `mission.run.*`
 /// vocabulary in favor of the scheduler's generic step-lifecycle bookends
 /// plus [`emit_step_result`]'s companion payload — see that function's doc).
@@ -211,44 +213,6 @@ fn decode_git_path(raw: &str) -> PathBuf {
                 PathBuf::from(String::from_utf8_lossy(&e.into_bytes()).into_owned())
             }
         }
-    }
-}
-
-/// Authoritative answer to "did this PR merge?" vs. "couldn't tell". The
-/// `Unknown` arm is load-bearing: if the verifying `gh pr view` itself blips
-/// (5xx / expired token / network), collapsing that into "not merged" would
-/// let the caller assert a falsehood and re-create the exact #844 silent drift
-/// one step later. So the caller distinguishes the three.
-enum MergeState {
-    Merged,
-    NotMerged,
-    Unknown,
-}
-
-/// Whether the PR at `pr_url` merged on the remote. Distinguishes a real
-/// `gh pr merge` failure from gh's local post-merge sync failing under the
-/// mission worktree layout (#844): gh performs the squash-merge + remote-branch
-/// deletion via the API BEFORE its local git ops, so a non-zero exit can still
-/// mean "merged".
-///
-/// Takes the PR **URL** specifically (not a branch / number): `--delete-branch`
-/// removes the head branch, after which a branch selector is unresolvable and a
-/// bare number is sensitive to which repo `dir` points at — a URL pins the PR
-/// identity unambiguously. A gh error or empty state is reported as `Unknown`
-/// (could-not-reach), never silently as `NotMerged`.
-fn pr_merge_state(dir: &Path, pr_url: &str) -> MergeState {
-    let out = match Command::new("gh")
-        .current_dir(dir)
-        .args(["pr", "view", pr_url, "--json", "state", "-q", ".state"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return MergeState::Unknown,
-    };
-    match String::from_utf8_lossy(&out.stdout).trim() {
-        "MERGED" => MergeState::Merged,
-        "" => MergeState::Unknown,
-        _ => MergeState::NotMerged, // OPEN / CLOSED-unmerged
     }
 }
 
@@ -774,7 +738,6 @@ impl StepKind for MissionVerifyStepKind {
     }
 }
 
-
 /// (#1426 ship-4) Resolve the on-disk worktree of a gate-held coder-phase run
 /// for `mission ship`/`mission abort`. `mission launch coder-phase` sets the
 /// worktree from its operator-supplied `workdir` input and persists it on the
@@ -845,100 +808,132 @@ fn finalize_mission_if_complete(mission_id: &str) {
     crew::envelope::finalize_mission(&envelope);
 }
 
-/// `darkmux mission abort` — the explicit teardown half of the hybrid
-/// contract. Removes the gate-held coder-phase run's worktree + its branch and
-/// flips the phase `Running → Abandoned`, so a frontier/operator who decides
-/// mid-loop that the run is going nowhere can cleanly back it out (vs. leaving
-/// an orphan worktree). When abandoning the phase leaves EVERY phase terminal,
-/// the mission is finalized honestly too (#1426 ship-4). Idempotent-ish: a
-/// missing worktree/branch is reported, not fatal. Returns `0` on a clean
-/// teardown.
-pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
-    use crew::loader::{load_missions, load_phases};
+/// The recorded truth a whole-mission cleanup drives each surviving phase to
+/// (#1463). `mission finalize` records SUCCESS (`Complete`); `mission abort`
+/// records a KILL (`Abandoned`). Both tear down whatever worktrees + branches
+/// exist and then close the mission — they differ only in this terminal.
+#[derive(Clone, Copy, PartialEq)]
+enum MissionTerminal {
+    Finalize,
+    Abort,
+}
 
-    fleet::validate_identifier("mission_id", mission_id)?;
-    if let Some(s) = phase_id {
-        fleet::validate_identifier("--phase", s)?;
-    }
-
-    let missions = load_missions()?;
-    let mission = missions
-        .iter()
-        .find(|m| m.id == mission_id)
-        .ok_or_else(|| anyhow::anyhow!("mission `{mission_id}` not found"))?;
-    let phases = load_phases()?;
-    // Explicit `--phase` resolves by id (any status — a Running phase, the
-    // common abort case after a `run`, resolves); auto-path requires a ready
-    // Planned phase. So to abort a Running phase, pass `--phase`.
-    let phase = resolve_phase(&phases, &mission.phase_ids, mission_id, phase_id)?;
-
-    let root = repo_root()?;
-    // (#1426 ship-4) Target the ACTUAL launch worktree (Task.workdir), and
-    // delete the branch the worktree is actually on — a launch may have used a
-    // non-default workdir/branch. Fall back to the derived path/name when the
-    // worktree is already gone or a task didn't record one.
-    let wt_path = resolve_run_workdir(mission_id, &phase.id, &root);
-    let conv = crate::conventions::load(&root);
-    let branch =
-        worktree_branch(&wt_path).unwrap_or_else(|| conventions_branch(&phase, mission, conv.as_ref()));
-
-    println!(
-        "{}",
-        style::header(&format!(
-            "▶ mission abort — {} · phase {}",
-            mission_id, phase.id
-        ))
-    );
-
-    // Remove the worktree (force — it has uncommitted work by design).
-    if wt_path.exists() {
-        let out = Command::new("git")
-            .current_dir(&root)
-            .args(["worktree", "remove", "--force", &wt_path.to_string_lossy()])
-            .output()
-            .context("running `git worktree remove`")?;
-        if out.status.success() {
-            println!("{}", style::success(&format!("✓ removed worktree {}", wt_path.display())));
-        } else {
-            eprintln!(
-                "{}",
-                style::warn(&format!(
-                    "git worktree remove failed: {} — you may need `git worktree prune`.",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ))
-            );
+impl MissionTerminal {
+    /// The CLI verb (also the `mission.run.<verb>` flow-record action stem).
+    fn verb(self) -> &'static str {
+        match self {
+            MissionTerminal::Finalize => "finalize",
+            MissionTerminal::Abort => "abort",
         }
-    } else {
-        println!("{}", style::dim(&format!("worktree {} already gone", wt_path.display())));
+    }
+    /// The terminal phase status this drives each phase to.
+    fn phase_status_label(self) -> &'static str {
+        match self {
+            MissionTerminal::Finalize => "Complete",
+            MissionTerminal::Abort => "Abandoned",
+        }
+    }
+}
+
+/// Tear down one phase's worktree + branch (best-effort — a missing one is
+/// reported, never fatal) and drive the phase to `kind`'s terminal status.
+/// Shared by `mission finalize`, `mission abort` (whole-mission), and the
+/// narrow single-phase `--phase` abort (#1463). Emits a `mission.run.<verb>`
+/// flow record for the phase. `root` is the engagement repo's main working
+/// tree; `None` when finalize/abort runs outside any git repo (a pure-planning
+/// mission that never created a worktree) — the phase flip + close still happen,
+/// only the worktree/branch git teardown is skipped (there's nothing to remove).
+fn teardown_and_terminate_phase(
+    root: Option<&Path>,
+    mission: &crew::types::Mission,
+    phase: &crew::types::Phase,
+    conv: Option<&crate::conventions::Conventions>,
+    kind: MissionTerminal,
+) {
+    use crew::types::PhaseStatus;
+    let mission_id = &mission.id;
+
+    // Worktree/branch teardown only runs inside a git repo. A pure-planning
+    // mission (no worktrees) finalized from a non-git dir skips it entirely.
+    let mut branch: Option<String> = None;
+    let mut wt_display: Option<String> = None;
+    if let Some(root) = root {
+        // (#1426 ship-4) Target the ACTUAL launch worktree (Task.workdir), and
+        // delete the branch the worktree is actually on — a launch may have used
+        // a non-default workdir/branch. Fall back to the derived path/name when
+        // the worktree is already gone or a task didn't record one.
+        let wt_path = resolve_run_workdir(mission_id, &phase.id, root);
+        let b =
+            worktree_branch(&wt_path).unwrap_or_else(|| conventions_branch(phase, mission, conv));
+
+        // Remove the worktree (force — a gate-held run has uncommitted work by
+        // design). Best-effort: a missing worktree is reported, never fatal.
+        if wt_path.exists() {
+            match Command::new("git")
+                .current_dir(root)
+                .args(["worktree", "remove", "--force", &wt_path.to_string_lossy()])
+                .output()
+            {
+                Ok(o) if o.status.success() => {
+                    println!("{}", style::success(&format!("✓ removed worktree {}", wt_path.display())));
+                }
+                Ok(o) => eprintln!(
+                    "{}",
+                    style::warn(&format!(
+                        "git worktree remove failed: {} — you may need `git worktree prune`.",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    ))
+                ),
+                Err(e) => {
+                    eprintln!("{}", style::warn(&format!("git worktree remove errored: {e:#}")))
+                }
+            }
+        } else {
+            println!("{}", style::dim(&format!("worktree {} already gone", wt_path.display())));
+        }
+
+        // Delete the branch (best-effort — it may be checked out elsewhere or
+        // already gone).
+        match Command::new("git")
+            .current_dir(root)
+            .args(["branch", "-D", &b])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                println!("{}", style::success(&format!("✓ deleted branch {b}")));
+            }
+            _ => println!(
+                "{}",
+                style::dim(&format!("branch {b} not deleted — likely already gone"))
+            ),
+        }
+        wt_display = Some(wt_path.display().to_string());
+        branch = Some(b);
     }
 
-    // Delete the branch (best-effort — it may be checked out elsewhere or
-    // already gone).
-    let out = Command::new("git")
-        .current_dir(&root)
-        .args(["branch", "-D", &branch])
-        .output()
-        .context("running `git branch -D`")?;
-    if out.status.success() {
-        println!("{}", style::success(&format!("✓ deleted branch {branch}")));
-    } else {
-        println!(
+    // Drive the phase to the recorded terminal. `abort` → Abandoned (legal
+    // restart later); `finalize` → Complete. `phase_complete` only transitions
+    // from Running, so a never-started Planned phase is started first (#1463).
+    let flip = match kind {
+        MissionTerminal::Abort => crew::lifecycle::phase_abandon(&phase.id),
+        MissionTerminal::Finalize => match phase.status {
+            PhaseStatus::Planned => crew::lifecycle::phase_start(&phase.id)
+                .and_then(|_| crew::lifecycle::phase_complete(&phase.id)),
+            _ => crew::lifecycle::phase_complete(&phase.id),
+        },
+    };
+    match flip {
+        Ok(_) => println!(
             "{}",
-            style::dim(&format!(
-                "branch {branch} not deleted ({}) — likely already gone",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))
-        );
-    }
-
-    // Flip the phase Running/Planned → Abandoned (legal restart later).
-    match crew::lifecycle::phase_abandon(&phase.id) {
-        Ok(_) => println!("{}", style::success(&format!("✓ phase {} → Abandoned", phase.id))),
+            style::success(&format!("✓ phase {} → {}", phase.id, kind.phase_status_label()))
+        ),
         Err(e) => eprintln!(
             "{}",
             style::warn(&format!(
-                "phase_abandon({}) failed: {e:#} — reconcile with `darkmux phase` verbs.",
-                phase.id
+                "phase {} → {} failed: {e:#} — reconcile with `mission {}` / `mission status`.",
+                phase.id,
+                kind.phase_status_label(),
+                kind.verb()
             ))
         ),
     }
@@ -946,12 +941,147 @@ pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
     let session_id = darkmux_types::session_id::mission_run(mission_id, &phase.id);
     emit_run_record(
         flow::Level::Info,
-        "mission.run.abort",
+        &format!("mission.run.{}", kind.verb()),
         mission_id,
         &phase.id,
         &session_id,
-        serde_json::json!({ "branch": branch, "worktree": wt_path.display().to_string() }),
+        serde_json::json!({ "branch": branch, "worktree": wt_display }),
     );
+}
+
+/// Whole-mission terminal (#1463): tear down every NON-terminal phase's
+/// worktree + branch, drive each to `kind`'s terminal status, then close the
+/// mission (stamping `closed_ts`). Shared engine behind `mission finalize` (the
+/// success terminal — phases → Complete) and the default whole-mission `mission
+/// abort` (the kill terminal — phases → Abandoned). Both clean up whatever
+/// exists; only the recorded truth differs. Already-terminal phases are left
+/// untouched (their recorded outcome — a prior Complete or Abandoned — stays
+/// honest). Cues the debrief ceremony after finalize.
+fn terminate_mission(mission_id: &str, kind: MissionTerminal, reasoning: Option<&str>) -> Result<i32> {
+    use crew::loader::{load_missions, load_phases};
+    use crew::types::PhaseStatus;
+
+    fleet::validate_identifier("mission_id", mission_id)?;
+
+    let missions = load_missions()?;
+    let mission = missions
+        .iter()
+        .find(|m| m.id == mission_id)
+        .ok_or_else(|| anyhow::anyhow!("mission `{mission_id}` not found"))?
+        .clone();
+    let phases = load_phases()?;
+    let mut mine: Vec<crew::types::Phase> = phases
+        .into_iter()
+        .filter(|p| p.mission_id == mission_id)
+        .collect();
+    // Terminal in mission (phase_ids) order for a readable teardown log.
+    mine.sort_by_key(|p| {
+        mission
+            .phase_ids
+            .iter()
+            .position(|id| id == &p.id)
+            .unwrap_or(usize::MAX)
+    });
+
+    println!(
+        "{}",
+        style::header(&format!("▶ mission {} — {}", kind.verb(), mission_id))
+    );
+
+    // A pure-planning mission (no worktrees) can be finalized/aborted from a
+    // non-git dir — the old `mission close` worked anywhere. Degrade the
+    // worktree teardown gracefully when there's no repo (#1463): phases still
+    // flip, the mission still closes.
+    let root = repo_root().ok();
+    let conv = root.as_deref().and_then(crate::conventions::load);
+
+    let mut cleaned = 0usize;
+    for phase in &mine {
+        if matches!(phase.status, PhaseStatus::Complete | PhaseStatus::Abandoned) {
+            continue; // already terminal — its recorded outcome stays honest
+        }
+        teardown_and_terminate_phase(root.as_deref(), &mission, phase, conv.as_ref(), kind);
+        cleaned += 1;
+    }
+    if cleaned == 0 && !mine.is_empty() {
+        println!("{}", style::dim("all phases already terminal — nothing to tear down"));
+    }
+
+    // Close the mission. Best-effort against an already-Closed mission (a
+    // graph/review run may have auto-closed it) — surface, don't fail.
+    match crew::lifecycle::mission_close_with_reasoning(mission_id, reasoning) {
+        Ok(m) => {
+            let started = m.started_ts.unwrap_or(0);
+            let closed = m.closed_ts.unwrap_or(0);
+            let dur = closed.saturating_sub(started);
+            println!(
+                "{}",
+                style::success(&format!(
+                    "✓ mission {} → Closed  duration={}s  closed_ts={}",
+                    m.id, dur, closed
+                ))
+            );
+        }
+        Err(e) => eprintln!(
+            "{}",
+            style::warn(&format!("mission `{mission_id}` not closed: {e:#}"))
+        ),
+    }
+
+    // (#1000) A finalized mission is DONE — cue the debrief ceremony so its
+    // transient signal (cautions + corrections) becomes durable lessons for
+    // the next crew. An abort is a kill, not a success — no debrief cue.
+    if kind == MissionTerminal::Finalize {
+        nudge_mission_debrief(mission_id);
+    }
+    Ok(0)
+}
+
+/// `darkmux mission finalize` — the SUCCESS terminal (#1463). The frontier
+/// orchestrator does the git/gh work by hand (commit/push/PR/merge — its native
+/// job), then calls this to close out the darkmux-side state: every non-terminal
+/// phase → Complete, worktrees + branches torn down, mission → Closed. Absorbs
+/// the darkmux-half of the retired `ship` verb; the clear opposite of `abort`.
+pub fn finalize(mission_id: &str, reasoning: Option<&str>) -> Result<i32> {
+    terminate_mission(mission_id, MissionTerminal::Finalize, reasoning)
+}
+
+/// `darkmux mission abort` — the KILL terminal (#1463). Default: the WHOLE
+/// mission — every non-terminal phase torn down + Abandoned, mission Closed
+/// (ends a stuck mission in one command). Pass `--phase <id>` to scope the
+/// teardown to a SINGLE gate-held coder-phase run instead, flipping just that
+/// phase Abandoned and finalizing the mission only if that left every phase
+/// terminal (#1426 ship-4 behavior, preserved for the narrow case).
+pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
+    use crew::loader::{load_missions, load_phases};
+
+    fleet::validate_identifier("mission_id", mission_id)?;
+
+    // Whole-mission abort (no `--phase`) — the #1463 default.
+    let Some(phase_id) = phase_id else {
+        return terminate_mission(mission_id, MissionTerminal::Abort, None);
+    };
+
+    // Narrow single-phase teardown (`--phase <id>`).
+    fleet::validate_identifier("--phase", phase_id)?;
+    let missions = load_missions()?;
+    let mission = missions
+        .iter()
+        .find(|m| m.id == mission_id)
+        .ok_or_else(|| anyhow::anyhow!("mission `{mission_id}` not found"))?;
+    let phases = load_phases()?;
+    // Explicit `--phase` resolves by id (any status — a Running phase, the
+    // common abort case after a `run`, resolves).
+    let phase = resolve_phase(&phases, &mission.phase_ids, mission_id, Some(phase_id))?;
+
+    let root = repo_root()?;
+    let conv = crate::conventions::load(&root);
+
+    println!(
+        "{}",
+        style::header(&format!("▶ mission abort — {} · phase {}", mission_id, phase.id))
+    );
+    teardown_and_terminate_phase(Some(&root), mission, &phase, conv.as_ref(), MissionTerminal::Abort);
 
     // (#1426 ship-4 / #1433) Honest finalize: abandoning this phase may have
     // left every phase terminal — if so, close the mission with an honest
@@ -978,63 +1108,6 @@ fn resolve_phase(
             .ok_or_else(|| anyhow::anyhow!("phase `{id}` not found in mission `{mission_id}`")),
         None => select_phase(phases, mission_phase_ids, mission_id, None),
     }
-}
-
-/// Run a git subcommand in `dir`, returning its captured output. Thin wrapper
-/// so the ship/abort git calls read uniformly.
-fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
-    Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .with_context(|| format!("running `git {}`", args.join(" ")))
-}
-
-/// (#834) Commit under a declared bot identity, airtight against ambient env.
-/// Git resolves the author/committer from `GIT_*_NAME`/`GIT_*_EMAIL` env vars
-/// FIRST, then `-c user.name/email`, then config — so a shell that already
-/// exports `GIT_AUTHOR_*` would override a bare `-c`. Set BOTH the env vars
-/// (authoritative, both author + committer) AND the `-c` args (visible/belt),
-/// so the identity holds regardless of the inherited environment. Caller
-/// guarantees name/email are non-blank (via `config_args().is_some()`).
-fn commit_with_identity(
-    dir: &Path,
-    a: &crate::conventions::CommitAuthor,
-    msg: &str,
-) -> Result<std::process::Output> {
-    let (n, e) = (a.name.trim(), a.email.trim());
-    Command::new("git")
-        .current_dir(dir)
-        .args([
-            "-c",
-            &format!("user.name={n}"),
-            "-c",
-            &format!("user.email={e}"),
-            "commit",
-            "-m",
-            msg,
-        ])
-        .env("GIT_AUTHOR_NAME", n)
-        .env("GIT_AUTHOR_EMAIL", e)
-        .env("GIT_COMMITTER_NAME", n)
-        .env("GIT_COMMITTER_EMAIL", e)
-        .output()
-        .with_context(|| "running `git commit` under the declared commit_author".to_string())
-}
-
-/// (#834) The identity git would commit under in `dir` (local→global config),
-/// formatted `Name <email>` for the soft-guard message. Best-effort: missing
-/// pieces render as `(unset)` so the guard still reads sensibly.
-fn resolved_git_identity(dir: &Path) -> String {
-    let g = |k: &str| {
-        git_in(dir, &["config", k])
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "(unset)".to_string())
-    };
-    format!("{} <{}>", g("user.name"), g("user.email"))
 }
 
 /// Commit subject for a shipped phase: the phase description's first line,
@@ -1996,58 +2069,6 @@ pub fn nudge_mission_debrief(mission_id: &str) {
     );
 }
 
-/// (#817) Does the run's flow trail carry an adjudication note? Scans the
-/// TWO lexicographically-newest day files (UTC-rollover safe, same pattern
-/// as the /diff endpoint's resolution) for `action=note` matching the
-/// session id, with source `adjudication` (the audit-trail channel) OR
-/// `orchestrator` (the dashboard channel — accepted so a session-scoped
-/// dashboard note also satisfies the nudge). Best-effort: any IO/parse
-/// problem reads as "no note" — this only feeds a soft nudge, never a gate.
-fn session_has_orchestrator_note(session_id: &str) -> bool {
-    let flows_dir = darkmux_types::config_access::flows_dir();
-    let Ok(entries) = std::fs::read_dir(&flows_dir) else {
-        return false;
-    };
-    let mut days: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .collect();
-    days.sort();
-    for day in days.iter().rev().take(2) {
-        let Ok(raw) = std::fs::read_to_string(day) else { continue };
-        for line in raw.lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            let src = r.get("source").and_then(|v| v.as_str());
-            if r.get("action").and_then(|v| v.as_str()) == Some("note")
-                && (src == Some("adjudication") || src == Some("orchestrator"))
-                && r.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// (#817) Soft nudge printed at ship time when a gated phase is shipping
-/// with zero adjudication notes in its trail — the gate is where judgment
-/// calls happen, and without a note darkmux's own record of the mission has
-/// a hole where the reasoning should be. Prints, never blocks (nudges, not
-/// gates — operator sovereignty).
-fn nudge_missing_adjudication_note(session_id: &str) {
-    if session_has_orchestrator_note(session_id) {
-        return;
-    }
-    println!(
-        "{}",
-        style::dim(&format!(
-            "  no adjudication note in this run's trail — capture it:  darkmux flow note \
-             --session-id {session_id} --text \"<verdict · what you overrode · why>\" \
-             --source adjudication",
-        ))
-    );
-}
-
 /// (#799) A bash verifier command the runtime classified as FAILED TO RUN —
 /// the binary was missing (exit 127), not executable (exit 126), or its
 /// toolchain failed to load — so it never actually verified anything. A
@@ -2099,101 +2120,6 @@ pub(crate) fn print_unverified_banner(failed: &[FailedVerifier]) {
     );
 }
 
-/// (#799) The verifier commands the LATEST run's coder FAILED TO RUN, read
-/// back from the flow trail by the run's deterministic session id
-/// (`mission-run-<mission>-<phase>`). The coder step emits a `"step
-/// result"` record (`payload.kind: "mission.coder"`,
-/// `payload.failed_verifiers: [{command, reason}]`) on EVERY run — empty on
-/// an honest run — so `ship` reads the latest run's status and HOLDs an
-/// auto-merge only when that run had failures (#1230 Packet 4: migrated
-/// off the retired `mission.run.verification` action — see
-/// [`emit_step_result`]'s doc). The run is a separate process, so the flow
-/// trail is the durable handoff (the runtime's out-dir is an ephemeral
-/// per-dispatch tempdir ship can't reconstruct). Scans the last 2 days
-/// oldest→newest and OVERWRITES `latest` on each match, so a clean re-run's
-/// empty record correctly clears a prior dirty run's (latest-wins on a
-/// resumed phase). Best effort: any IO/parse problem, or no record in the
-/// recent window, reads as "none" — this soft backstop fails OPEN (the
-/// run-time banner is the primary surface). Mirrors
-/// `session_has_orchestrator_note`.
-fn session_failed_verifiers(session_id: &str) -> Vec<FailedVerifier> {
-    let flows_dir = darkmux_types::config_access::flows_dir();
-    let Ok(entries) = std::fs::read_dir(&flows_dir) else {
-        return Vec::new();
-    };
-    let mut days: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .collect();
-    days.sort();
-    // Last 2 days, iterated oldest→newest, so a later record overwrites an
-    // earlier one and the most recent coder `"step result"` for this
-    // session wins.
-    let recent: Vec<PathBuf> = days.iter().rev().take(2).rev().cloned().collect();
-    let mut latest: Vec<FailedVerifier> = Vec::new();
-    for day in &recent {
-        let Ok(raw) = std::fs::read_to_string(day) else {
-            continue;
-        };
-        for line in raw.lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let payload = r.get("payload");
-            let kind = payload.and_then(|p| p.get("kind")).and_then(|k| k.as_str());
-            if r.get("action").and_then(|v| v.as_str()) == Some("step result")
-                && kind == Some("mission.coder")
-                && r.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
-            {
-                if let Some(arr) = payload
-                    .and_then(|p| p.get("failed_verifiers"))
-                    .and_then(|f| f.as_array())
-                {
-                    latest = arr
-                        .iter()
-                        .filter_map(|e| serde_json::from_value::<FailedVerifier>(e.clone()).ok())
-                        .collect();
-                }
-            }
-        }
-    }
-    latest
-}
-
-fn commit_subject(phase: &crew::types::Phase) -> String {
-    let first = phase.description.lines().next().unwrap_or("").trim();
-    let s = if first.is_empty() {
-        format!("darkmux phase {}", phase.id)
-    } else {
-        first.to_string()
-    };
-    if s.chars().count() > 72 {
-        let truncated: String = s.chars().take(69).collect();
-        format!("{truncated}...")
-    } else {
-        s
-    }
-}
-
-/// PR body — phase + mission provenance. Authored by the LOCAL coder via
-/// `mission run`; the body says so (no frontier/Claude co-author claim — this
-/// is local-AI work shipped through darkmux's loop).
-fn pr_body(mission: &crew::types::Mission, phase: &crew::types::Phase) -> String {
-    format!(
-        "## {phase_desc}\n\n\
-         Shipped via `darkmux mission ship` — the local dispatch-to-PR loop.\n\n\
-         - **Mission:** `{mission_id}` — {mission_desc}\n\
-         - **Phase:** `{phase_id}`\n\n\
-         The implementation was produced by the local-AI coder under \
-         `darkmux mission launch coder-phase` and reviewed by the local \
-         `code-reviewer` before sign-off. The frontier/operator adjudicated the QA findings at the gate.",
-        phase_desc = phase.description.lines().next().unwrap_or("").trim(),
-        mission_id = mission.id,
-        mission_desc = mission.description.lines().next().unwrap_or("").trim(),
-        phase_id = phase.id,
-    )
-}
-
 /// (#816) The branch a worktree is actually on (`git rev-parse
 /// --abbrev-ref HEAD`). None when the worktree is missing/unreadable or
 /// detached — callers fall back to the conventions-computed name.
@@ -2208,595 +2134,6 @@ fn worktree_branch(wt_path: &Path) -> Option<String> {
     }
     let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if b.is_empty() || b == "HEAD" { None } else { Some(b) }
-}
-
-/// (#816) Apply a conventions template to the default-computed subject.
-/// `what` names the item in the fallback warning. Falls back to the
-/// default subject when there's no template, the template needs a ticket
-/// the mission doesn't have, or it expands empty.
-fn conventioned(
-    template: Option<&str>,
-    phase: &crew::types::Phase,
-    mission: &crew::types::Mission,
-    what: &str,
-) -> String {
-    let default = commit_subject(phase);
-    let Some(t) = template else { return default };
-    let vars = crate::conventions::Vars {
-        ticket: mission.ticket.as_deref(),
-        phase: &phase.id,
-        mission: &mission.id,
-        subject: &default,
-    };
-    match crate::conventions::expand(t, &vars) {
-        Some(out) if !out.trim().is_empty() => out,
-        _ => {
-            eprintln!(
-                "darkmux: warning — conventions {what} template couldn't expand for mission `{}` (missing ticket or empty result); using the default",
-                mission.id
-            );
-            default
-        }
-    }
-}
-
-/// (#816) PR body honoring the repo's `pr_body_template` (repo-relative
-/// path): the file's content with `{summary}` replaced by the generated
-/// darkmux summary, or the summary appended when the placeholder is
-/// absent. Missing/unreadable template file warns + falls back.
-fn conventioned_pr_body(
-    mission: &crew::types::Mission,
-    phase: &crew::types::Phase,
-    conv: Option<&crate::conventions::Conventions>,
-    repo_root: &Path,
-) -> String {
-    let summary = pr_body(mission, phase);
-    let Some(rel) = conv.and_then(|c| c.pr_body_template.as_deref()) else {
-        return summary;
-    };
-    let path = repo_root.join(rel);
-    match std::fs::read_to_string(&path) {
-        Ok(tpl) if tpl.contains("{summary}") => tpl.replace("{summary}", &summary),
-        Ok(tpl) => format!("{tpl}\n\n{summary}"),
-        Err(e) => {
-            eprintln!(
-                "darkmux: warning — conventions pr_body_template {} unreadable ({e}); using the generated body",
-                path.display()
-            );
-            summary
-        }
-    }
-}
-
-/// The **OPEN** PR's URL for `branch`, or `None` when there's no open PR.
-///
-/// `gh pr view <branch>` falls back to the most-recent CLOSED/MERGED PR when no
-/// OPEN one exists. On a deterministic, reusable branch name
-/// (`darkmux/<phase-id>`) that could hand back a STALE merged PR; the ship
-/// path would then skip `gh pr create` and later verify merge-state against
-/// that stale URL (#844), wrongly OK-ing a teardown of un-merged work. The
-/// `select(.state=="OPEN")` jq filter closes that seam: a recycled branch whose
-/// only PR is merged/closed yields `None`, so ship falls through to
-/// `gh pr create` and gets a FRESH PR identity to verify against.
-fn existing_pr_url(dir: &Path, branch: &str) -> Option<String> {
-    let out = Command::new("gh")
-        .current_dir(dir)
-        .args([
-            "pr", "view", branch, "--json", "url,state", "-q",
-            "select(.state==\"OPEN\") | .url",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if url.is_empty() { None } else { Some(url) }
-}
-
-/// Verify the branch's CI is GREEN — every check `conclusion == SUCCESS`, not
-/// merely completed (per the merge-gate discipline). `--watch` blocks until
-/// checks finish; we then re-read the rollup and require all-SUCCESS.
-///
-/// Two deliberate behaviors: (1) `gh pr checks --watch` has no timeout — a
-/// hung check blocks `ship` until it resolves or the operator interrupts
-/// (Ctrl-C leaves the PR open, nothing merged). (2) an EMPTY rollup (no checks
-/// configured) is treated as NOT green — a merge gate shouldn't wave work
-/// through just because a repo has no CI. So `--merge` requires CI to be both
-/// configured AND passing.
-fn ci_is_green(dir: &Path, branch: &str) -> Result<bool> {
-    // Block until checks complete (ignore the exit code — a red check makes
-    // `gh pr checks --watch` exit non-zero; we judge from the rollup below).
-    let _ = Command::new("gh")
-        .current_dir(dir)
-        .args(["pr", "checks", branch, "--watch", "--interval", "30"])
-        .status();
-    let out = Command::new("gh")
-        .current_dir(dir)
-        .args([
-            "pr",
-            "view",
-            branch,
-            "--json",
-            "statusCheckRollup",
-            "-q",
-            ".statusCheckRollup[].conclusion",
-        ])
-        .output()
-        .context("reading CI rollup via gh")?;
-    if !out.status.success() {
-        bail!(
-            "could not read CI status: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let conclusions: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    // All checks must be SUCCESS. An empty list (no checks configured) is
-    // treated as NOT green — refuse to claim green when nothing ran.
-    Ok(!conclusions.is_empty() && conclusions.iter().all(|c| c == "SUCCESS"))
-}
-
-/// `darkmux mission ship` — the post-sign-off completion of the dispatch-to-PR
-/// loop. Commits the worktree's work, pushes the branch, opens (or reuses) the
-/// PR, and STOPS at the PR by default. `--wait-ci` blocks on CI; `--merge`
-/// (opt-in, green-gated) squash-merges, flips the phase to Complete, and
-/// tears the worktree down. **Never auto-merges** — `--merge` is the operator/
-/// frontier's explicit sign-off act. Returns `0` on success, `1` on a refused
-/// merge (CI not green), `2` when the PR merged but the phase couldn't be
-/// marked Complete (inconsistent state — needs manual reconcile), `3` when
-/// `--merge` is HELD because the run had verifier commands that failed to run
-/// (#799 — review the SIGNOFF, then merge manually or re-run after fixing).
-pub fn ship(
-    mission_id: &str,
-    phase_id: Option<&str>,
-    base: &str,
-    wait_ci: bool,
-    merge: bool,
-) -> Result<i32> {
-    use crew::loader::{load_missions, load_phases};
-
-    fleet::validate_identifier("mission_id", mission_id)?;
-    if let Some(s) = phase_id {
-        fleet::validate_identifier("--phase", s)?;
-    }
-
-    let missions = load_missions()?;
-    let mission = missions
-        .iter()
-        .find(|m| m.id == mission_id)
-        .ok_or_else(|| anyhow::anyhow!("mission `{mission_id}` not found"))?
-        .clone();
-    let phases = load_phases()?;
-    let phase = resolve_phase(&phases, &mission.phase_ids, mission_id, phase_id)?;
-
-    // A Complete phase is terminal — a prior `--merge` already shipped it
-    // (and tore down its worktree). Re-shipping would duplicate-PR or churn;
-    // refuse rather than confuse.
-    if matches!(phase.status, crew::types::PhaseStatus::Complete) {
-        bail!(
-            "phase `{}` is already Complete (terminal) — nothing to ship.",
-            phase.id
-        );
-    }
-
-    let root = repo_root()?;
-    // (#1426 ship-4) Target the ACTUAL launch worktree (Task.workdir), falling
-    // back to the derived path for an old on-disk run.
-    let wt_path = resolve_run_workdir(mission_id, &phase.id, &root);
-    let conv = crate::conventions::load(&root);
-    // (#816) Ship pushes the branch the worktree is ACTUALLY on — created at
-    // launch time — not a recomputation. If conventions.json changed
-    // between launch and ship, recomputing would target a branch that doesn't
-    // exist (QA drift finding). The computed name is only the fallback for
-    // a worktree whose HEAD can't be read.
-    let branch = worktree_branch(&wt_path)
-        .unwrap_or_else(|| conventions_branch(&phase, &mission, conv.as_ref()));
-    let session_id = darkmux_types::session_id::mission_run(mission_id, &phase.id);
-
-    if !wt_path.exists() {
-        bail!(
-            "no worktree at {} — run `darkmux mission launch coder-phase` for this phase \
-             first (phase `{}`).",
-            wt_path.display(),
-            phase.id
-        );
-    }
-
-    println!(
-        "{}",
-        style::header(&format!("▶ mission ship — {} · phase {}", mission_id, phase.id))
-    );
-
-    // 1. Commit the worktree's work (the coder's changes + any operator edits
-    //    made while resolving findings). Stage everything, commit only if
-    //    there's something staged; if nothing's staged but the branch is
-    //    already ahead of base, proceed to push the existing commits.
-    git_in(&wt_path, &["add", "-A"])?;
-    let nothing_staged = git_in(&wt_path, &["diff", "--cached", "--quiet"])?
-        .status
-        .success();
-    let ahead = git_in(&wt_path, &["rev-list", "--count", &format!("{base}..HEAD")])?;
-    let commits_ahead: u32 = String::from_utf8_lossy(&ahead.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
-    if nothing_staged && commits_ahead == 0 {
-        bail!(
-            "nothing to ship — worktree at {} has no changes vs `{base}` and no commits ahead.",
-            wt_path.display()
-        );
-    }
-    if !nothing_staged {
-        let subject = conventioned(
-        conv.as_ref().and_then(|c| c.commit_subject_template.as_deref()),
-        &phase, &mission, "commit subject",
-    );
-        let msg = format!(
-            "{subject}\n\nAuthored via `darkmux mission launch coder-phase` (local-AI coder, phase {}).",
-            phase.id
-        );
-        // (#834) Commit under the declared bot identity when the repo's
-        // conventions name one (sets author AND committer). Without it, a repo
-        // lacking a local git identity commits under the operator's GLOBAL
-        // name — silently breaking bot-authorship/SoD. When the repo IS managed
-        // (a conventions FILE exists, parse or not) but no identity resolves,
-        // surface what the commit will land under + how to pin it. Surface,
-        // never block (operator-sovereignty).
-        let author = conv
-            .as_ref()
-            .and_then(|c| c.commit_author.as_ref())
-            .filter(|a| a.config_args().is_some());
-        let out = if let Some(a) = author {
-            commit_with_identity(&wt_path, a, &msg)?
-        } else {
-            if crate::conventions::file_present(&root) {
-                println!(
-                    "{}",
-                    style::dim(&format!(
-                        "  committing as {} — declare commit_author in .darkmux/conventions.json \
-                         if this repo needs a bot identity",
-                        resolved_git_identity(&wt_path)
-                    ))
-                );
-            }
-            git_in(&wt_path, &["commit", "-m", &msg])?
-        };
-        if !out.status.success() {
-            bail!("git commit failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-        }
-        let as_who = author.map(|a| format!(" as {}", a.name.trim())).unwrap_or_default();
-        println!("{}", style::success(&format!("✓ committed{as_who}: {subject}")));
-    } else {
-        println!(
-            "{}",
-            style::dim(&format!("{commits_ahead} commit(s) already ahead of {base} — nothing new to commit"))
-        );
-    }
-
-    // 2. Push the branch (sets upstream).
-    let out = git_in(&wt_path, &["push", "-u", "origin", &branch])?;
-    if !out.status.success() {
-        bail!(
-            "git push failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    println!("{}", style::success(&format!("✓ pushed {branch}")));
-
-    // 3. Open (or reuse) the PR.
-    let pr_url = match existing_pr_url(&wt_path, &branch) {
-        Some(url) => {
-            println!("{}", style::dim(&format!("PR already open: {url}")));
-            url
-        }
-        None => {
-            let title = conventioned(
-                conv.as_ref().and_then(|c| c.pr_title_template.as_deref()),
-                &phase, &mission, "PR title",
-            );
-            let body = conventioned_pr_body(&mission, &phase, conv.as_ref(), &root);
-            let mut args: Vec<&str> = vec![
-                "pr", "create", "--base", base, "--head", &branch, "--title", &title,
-                "--body", &body,
-            ];
-            // (#816) Repo-declared labels — each must exist in the repo
-            // (gh errors otherwise; surfaced verbatim below).
-            let labels: Vec<&str> = conv
-                .as_ref()
-                .map(|c| c.pr_labels.iter().map(String::as_str).collect())
-                .unwrap_or_default();
-            for l in &labels {
-                // (#1111) Argument-injection guard on the gh subprocess: a label
-                // that's empty or starts with `-` would be parsed by gh as a flag
-                // (e.g. `--label --config` injecting a gh option). Branch names are
-                // already validated; labels were the gap. Skip + warn rather than
-                // fail the whole dispatch over a bad label.
-                if !crate::conventions::valid_label(l) {
-                    eprintln!(
-                        "darkmux mission ship: skipping unsafe pr label {l:?} \
-                         (empty or starts with `-` — would parse as a gh flag)"
-                    );
-                    continue;
-                }
-                args.push("--label");
-                args.push(l);
-            }
-            let out = Command::new("gh")
-                .current_dir(&wt_path)
-                .args(&args)
-                .output()
-                .context("running `gh pr create` — is `gh` on PATH?")?;
-            if !out.status.success() {
-                bail!(
-                    "`gh pr create` failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
-            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            println!("{}", style::success(&format!("✓ opened PR: {url}")));
-            url
-        }
-    };
-
-    emit_run_record(
-        flow::Level::Info,
-        "mission.run.ship",
-        mission_id,
-        &phase.id,
-        &session_id,
-        serde_json::json!({ "branch": branch, "pr_url": pr_url, "base": base }),
-    );
-
-    // (#799 part 2) Verifier-fabrication backstop — checked BEFORE the CI gate
-    // so a held merge doesn't first sit through `ci_is_green`'s blocking watch.
-    // If the run's coder had bash verifier commands that FAILED TO RUN, a
-    // SIGNOFF's "tests pass" claim may rest on a command that never executed.
-    // HOLD the auto-merge for human review: don't merge, don't tear down, never
-    // auto-fail (operator sovereignty #44). The PR is already open and the
-    // worktree intact — nothing is discarded; the operator reviews + merges
-    // manually after confirming verification, or re-runs once the toolchain is
-    // fixed. Soft by design: `--merge` is the ONLY path this gates (a default
-    // stop-at-PR `ship` is untouched), and the run-time banner surfaced it once
-    // already.
-    if merge {
-        let unverified = session_failed_verifiers(&session_id);
-        if !unverified.is_empty() {
-            eprintln!(
-                "{}",
-                style::error(&format!(
-                    "✗ holding the auto-merge of {branch} — {} verifier command(s) FAILED TO RUN \
-                     during the run, so the coder's SIGNOFF may claim verification that never \
-                     happened:",
-                    unverified.len()
-                ))
-            );
-            for f in &unverified {
-                eprintln!(
-                    "    {} {}",
-                    style::accent(&f.command),
-                    style::dim(&format!("— {}", f.reason))
-                );
-            }
-            eprintln!(
-                "{}",
-                style::warn(&format!(
-                    "  the PR is open ({pr_url}) and the worktree is intact — nothing was \
-                     discarded. Review the diff + SIGNOFF; if verification really is sound, merge \
-                     manually (`gh pr merge {branch} --squash`). If the toolchain was broken, fix \
-                     it and relaunch the phase (`darkmux mission launch coder-phase`, phase `{}`).",
-                    phase.id
-                ))
-            );
-            emit_run_record(
-                flow::Level::Warn,
-                "mission.run.ship.held",
-                mission_id,
-                &phase.id,
-                &session_id,
-                serde_json::json!({
-                    "reason": "verification-unproven",
-                    "failed": unverified,
-                    "count": unverified.len(),
-                    "pr_url": pr_url,
-                }),
-            );
-            return Ok(3);
-        }
-    }
-
-    // 4. CI gate (for --wait-ci or --merge).
-    let mut green = false;
-    if wait_ci || merge {
-        println!("\n{}", style::header("▶ watching CI…"));
-        green = ci_is_green(&wt_path, &branch)?;
-        if green {
-            println!("{}", style::success("✓ CI green"));
-        } else {
-            eprintln!("{}", style::warn("⚠ CI is not green (or no checks ran)"));
-        }
-    }
-
-    // 5. Merge — opt-in, green-gated. NEVER automatic.
-    if merge {
-        if !green {
-            // `green` is false both when a check failed AND when no checks
-            // ran at all (ci_is_green treats empty as not-green — the safe
-            // default for a merge gate). Name both so the operator knows
-            // which it is.
-            eprintln!(
-                "{}",
-                style::error(&format!(
-                    "✗ refusing to merge {branch} — CI is not green (a check failed, or no \
-                     checks ran; `--merge` requires configured + passing CI). Resolve, re-push, \
-                     then re-run `darkmux mission ship {mission_id} --phase {} --merge`.",
-                    phase.id
-                ))
-            );
-            return Ok(1);
-        }
-        let out = Command::new("gh")
-            .current_dir(&wt_path)
-            .args(["pr", "merge", &branch, "--squash", "--delete-branch"])
-            .output()
-            .context("running `gh pr merge`")?;
-        if !out.status.success() {
-            // gh performs the squash-merge + remote-branch deletion via the API
-            // FIRST, then runs local post-merge git ops (checkout base + delete
-            // the local branch). In a mission worktree the base (`main`) is
-            // checked out in the primary worktree, so gh's local `git checkout
-            // main` fatals — and gh exits non-zero even though the REMOTE merge
-            // already landed (#844). Treating that as a total failure used to
-            // skip phase-complete + teardown → silent drift (merged PR, phase
-            // stuck Running, orphaned worktree). So verify the PR's ACTUAL
-            // state: only bail if it truly didn't merge.
-            match pr_merge_state(&root, &pr_url) {
-                MergeState::Merged => {
-                    eprintln!(
-                        "{}",
-                        style::warn(&format!(
-                            "gh exited non-zero after merging, but the PR is merged on the remote — \
-                             gh's local post-merge sync conflicts with the worktree layout (harmless; \
-                             continuing teardown). gh stderr: {}",
-                            String::from_utf8_lossy(&out.stderr).trim()
-                        ))
-                    );
-                }
-                MergeState::NotMerged => {
-                    bail!(
-                        "`gh pr merge` failed and the PR is not merged: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                }
-                MergeState::Unknown => {
-                    // The merge MAY have landed (the worktree-layout local-sync
-                    // failure looks identical to this), but the verifying view
-                    // couldn't confirm it. Don't assert "not merged" — point the
-                    // operator at the PR and the one-command reconcile (#844).
-                    bail!(
-                        "`gh pr merge` exited non-zero and the PR's merge state could not be \
-                         confirmed — check {pr_url}. If it DID merge, reconcile with \
-                         `darkmux phase complete {}` and `git worktree remove --force {}`. \
-                         gh stderr: {}",
-                        phase.id,
-                        wt_path.display(),
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                }
-            }
-        }
-        println!("{}", style::success(&format!("✓ merged {branch} (squash)")));
-
-        // Flip the phase Complete + tear down the worktree. The merge is
-        // already irreversible, so a phase_complete failure can't roll it
-        // back — but it leaves merged-PR-but-Running-phase, so we must NOT
-        // claim a clean "loop closed". Track the outcome and exit non-zero
-        // with a reconcile pointer if completion didn't take.
-        let complete_ok = match crew::lifecycle::phase_complete(&phase.id) {
-            Ok(_) => {
-                println!("{}", style::success(&format!("✓ phase {} → Complete", phase.id)));
-                true
-            }
-            Err(e) => {
-                eprintln!(
-                    "{}",
-                    style::error(&format!("✗ phase_complete({}) failed: {e:#}", phase.id))
-                );
-                false
-            }
-        };
-        // The branch was deleted by --delete-branch; remove the now-orphaned
-        // worktree (force — its branch ref is gone). Warn on failure so
-        // orphaned files don't linger silently.
-        match git_in(&root, &["worktree", "remove", "--force", &wt_path.to_string_lossy()]) {
-            Ok(o) if o.status.success() => {
-                println!("{}", style::dim(&format!("worktree {} removed", wt_path.display())))
-            }
-            Ok(o) => eprintln!(
-                "{}",
-                style::warn(&format!(
-                    "worktree removal failed ({}) — run `git worktree prune` / remove {} manually.",
-                    String::from_utf8_lossy(&o.stderr).trim(),
-                    wt_path.display()
-                ))
-            ),
-            Err(e) => eprintln!(
-                "{}",
-                style::warn(&format!("worktree removal errored: {e:#} — remove {} manually.", wt_path.display()))
-            ),
-        }
-        // gh's `--delete-branch` removed the REMOTE branch via API, but its
-        // local-branch deletion rode the same post-merge sync that fails under
-        // the worktree layout (#844). With the worktree (which pinned the
-        // branch) now gone, reap the local branch ourselves so shipped phases
-        // don't accrete dead `darkmux/<phase>` refs. Safe unconditionally:
-        // if gh already deleted it, `-D` exits 1 (swallowed); if the worktree
-        // removal above FAILED, the branch is still pinned and git `-D` refuses
-        // outright — so this never orphan-kills a branch holding live work.
-        let _ = git_in(&root, &["branch", "-D", &branch]);
-
-        emit_run_record(
-            flow::Level::Info,
-            "mission.run.ship.merged",
-            mission_id,
-            &phase.id,
-            &session_id,
-            serde_json::json!({ "pr_url": pr_url, "phase_completed": complete_ok }),
-        );
-        if !complete_ok {
-            eprintln!(
-                "{}",
-                style::error(&format!(
-                    "PR was MERGED but phase `{}` could not be marked Complete — state is \
-                     inconsistent. Reconcile with `darkmux phase complete {}`.",
-                    phase.id, phase.id
-                ))
-            );
-            return Ok(2);
-        }
-        println!("\n{}", style::success("✓ phase shipped + merged. Loop closed."));
-        // (#1426 ship-4 / #1433) Honest finalize: completing this phase may have
-        // left every phase terminal — if so, close the mission with an honest
-        // envelope instead of stranding it Active with a shipped-out phase.
-        finalize_mission_if_complete(mission_id);
-        // (#807/#817) The arc just concluded — soft-nudge if the run's trail
-        // has no adjudication note (session-id pre-filled scaffold), then cue
-        // the DASHBOARD note: the operator-facing card line. The placeholder
-        // is the style brief — positive, plain-language, easy to digest
-        // (operator-specified voice; this is encouragement infrastructure,
-        // not a changelog).
-        nudge_missing_adjudication_note(&session_id);
-        println!(
-            "{}",
-            style::dim(
-                "  then a line for the operator's dashboard:  darkmux flow note \
-                 --text \"<1-2 upbeat plain-language lines: what the crew got done + \
-                 keep-going energy. no jargon, no file paths>\" --source orchestrator",
-            )
-        );
-        return Ok(0);
-    }
-
-    // Default: stop at the PR. Merge stays the operator/frontier's explicit act.
-    println!(
-        "\n{}",
-        style::success(&format!("✓ PR ready: {pr_url}"))
-    );
-    println!(
-        "  {}",
-        style::dim(&format!(
-            "review CI, then merge. To finish via darkmux after green: \
-             darkmux mission ship {mission_id} --phase {} --merge",
-            phase.id
-        ))
-    );
-    // (#817) Stop-at-PR exit gets the same soft nudge as the merge exit —
-    // the adjudication happened at the gate either way.
-    nudge_missing_adjudication_note(&session_id);
-    Ok(0)
 }
 
 /// One-line tokens-off-meter readout. Tokens only — the operator multiplies

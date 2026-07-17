@@ -37,13 +37,13 @@
 //! **Gate semantics (#1284 review round 1, must-fix 1).** The coder-phase
 //! path deliberately does NOT finalize the mission. It stops at the "gate —
 //! awaiting frontier/operator sign-off" banner with the phase left
-//! `Running`, so the operator adjudicates and `mission ship` finishes the
-//! loop (the outcome map the retired `mission run` also produced — same gate
+//! `Running`, so the operator adjudicates and — after shipping the git work by
+//! hand — `mission finalize` finishes the loop (`mission ship` retired in
+//! #1463; the outcome map the retired `mission run` also produced — same gate
 //! banners, same exit codes, same Running end state;
 //! see [`coder_phase_gate_outcome`]). Auto-closing past that gate was an
 //! operator-sovereignty violation (#44) at precisely the decision point the
-//! gate reserves, and it broke `mission ship` (which refuses a
-//! terminal-Complete phase). Generic `finalize_mission` stays reserved for
+//! gate reserves. Generic `finalize_mission` stays reserved for
 //! graphs with NO gate semantics (a Tier-1-only graph); a freeform config
 //! mints + starts and finalizes nothing.
 //!
@@ -116,7 +116,7 @@ const REVIEW_TIER3_KINDS: &[&str] = &[
 /// exit code — the coder-phase rows mirror `coder_phase::run`'s own exit
 /// map exactly (#1284 review round 1, must-fix 1):
 ///   `0` — freeform mint; or coder ran and QA came back clean/flags-only
-///         (gate banner printed, phase left Running for `mission ship`);
+///         (gate banner printed, phase left Running for `mission finalize`);
 ///         or a gate-less generic graph finished Clean/Degraded.
 ///   `1` — coder dispatch error (phase stays Running, worktree kept for
 ///         inspection); or a gate-less generic graph ended Error.
@@ -302,8 +302,10 @@ pub fn launch(
     }
 
     if tasks.is_empty() {
-        // Freeform/manual mission (every phase has zero tasks) — mint +
-        // start, leave every phase transition operator-driven.
+        // Freeform/manual mission (every phase has zero tasks) — mint + start.
+        // (#1463) The per-phase `phase start/complete/abandon` bookkeeping
+        // retired; the operator does the work by hand, then `mission finalize`
+        // (success) or `mission abort` (kill) closes the mission out.
         let verb = if reused { "reopened" } else { "minted" };
         println!(
             "{}",
@@ -312,14 +314,21 @@ pub fn launch(
                 config.phases.len()
             ))
         );
-        println!("  {}", style::dim("no automated graph; drive phases by hand:"));
+        println!("  {}", style::dim("no automated graph; the phases to work by hand:"));
         for phase in &config.phases {
             println!(
-                "    darkmux phase start {}   {}",
-                real_phase_ids[&phase.id],
+                "    {}   {}",
+                style::accent(&real_phase_ids[&phase.id]),
                 style::dim(&format!("— {}", phase.description.as_deref().unwrap_or(&phase.id)))
             );
         }
+        println!(
+            "  {}",
+            style::dim(&format!(
+                "when done:  darkmux mission finalize {mission_id}   (or abort: \
+                 darkmux mission abort {mission_id})"
+            ))
+        );
         return Ok(0);
     }
 
@@ -477,8 +486,8 @@ pub fn launch(
 
     // (#1284 review round 1, must-fix 1) A coder-phase graph has GATE
     // semantics: stop at the operator sign-off gate — phase stays Running,
-    // mission stays Active, NO finalize_mission. `mission ship` finishes the
-    // loop from here. See [`gate_outcome_reached_no_gate`] for the one
+    // mission stays Active, NO finalize_mission. `mission finalize` finishes
+    // the loop from here (#1463). See [`gate_outcome_reached_no_gate`] for the one
     // exception class (failure exits that never reached a reviewable gate).
     if let Some(handles) = &coder_handles {
         let outcome = coder_phase_gate_outcome(&mission_id, handles, &steps);
@@ -901,7 +910,7 @@ fn precheck_coder_phase_inputs(
 
 /// The dispatch session id for a config-launched coder-phase execution.
 /// The canonical coder-phase id (#1436) — the SAME `mission-run-` prefix the
-/// retired `mission run` stamped and that `mission ship`/`mission abort`
+/// retired `mission run` stamped and that `mission finalize`/`mission abort`
 /// reconstruct: the viewer's mission lens keys its per-run session grouping
 /// on that prefix, and this path emits the identical record vocabulary, so
 /// launched runs stay visible to the lens and legacy archives keep joining.
@@ -1058,8 +1067,8 @@ fn register_coder_phase_kinds(
 /// scheduler-error path reconciles. The gate exits PROPER — `Ok(0)` clean,
 /// `Ok(2)` QA found blockers, `Ok(3)` QA unavailable — must return `false`:
 /// they deliberately hold the phase `Running` at the sign-off gate so
-/// `mission ship`/`mission abort` finish or tear down the loop (finalizing
-/// `Ok(2)` would close the mission under QA-blockers and lock out `ship`).
+/// `mission finalize`/`mission abort` finish or tear down the loop (finalizing
+/// `Ok(2)` would close the mission under QA-blockers before sign-off).
 fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
     matches!(outcome, Err(_) | Ok(1))
 }
@@ -1077,8 +1086,8 @@ fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
 /// | clean / flags-only           | "gate — awaiting sign-off" banner      | 0    |
 ///
 /// Never transitions the phase or the mission: the phase stays `Running`
-/// and `mission ship <mission-id> --phase <phase-id>` (or `mission abort`)
-/// is the operator's next move, exactly as after a `mission run`.
+/// and `mission finalize <mission-id>` (or `mission abort <mission-id>`)
+/// is the operator's next move, after the frontier ships the git work by hand.
 fn coder_phase_gate_outcome(
     mission_id: &str,
     handles: &CoderPhaseHandles,
@@ -1149,8 +1158,9 @@ fn coder_phase_gate_outcome(
         println!(
             "\n{}",
             style::warn(&format!(
-                "review the diff manually, then:  darkmux mission ship {mission_id} --phase \
-                 {phase_id} (or abort: darkmux mission abort {mission_id} --phase {phase_id})"
+                "review the diff manually, ship the git work by hand (commit/push/PR), then \
+                 finalize:  darkmux mission finalize {mission_id}   (or tear it down: \
+                 darkmux mission abort {mission_id})"
             ))
         );
         return Ok(3);
@@ -1167,7 +1177,8 @@ fn coder_phase_gate_outcome(
         _ => bail!("internal error: mission.verify step completed without a review result"),
     };
 
-    // Stop at the gate. Tee up the ship step; never commit/PR/merge here.
+    // Stop at the gate. The frontier ships the git work by hand, then
+    // `mission finalize` closes out; never commit/PR/merge here (#1463).
     println!("\n{}", style::header("▶ gate — awaiting frontier/operator sign-off"));
     println!("  {} {}", style::dim("worktree:"), handles.workdir.display());
     println!("  {} {}", style::dim("branch:  "), style::accent(&handles.branch));
@@ -1184,13 +1195,15 @@ fn coder_phase_gate_outcome(
         );
         println!(
             "  {}",
-            style::dim("re-run QA after fixing: darkmux phase review (in the worktree)")
+            style::dim(&format!(
+                "re-run QA after fixing:  darkmux mission launch review --param worktree={} \
+                 --param diff_file=<diff>",
+                handles.workdir.display()
+            ))
         );
         println!(
             "  {}",
-            style::dim(&format!(
-                "or abandon this run: darkmux mission abort {mission_id} --phase {phase_id}"
-            ))
+            style::dim(&format!("or tear this mission down: darkmux mission abort {mission_id}"))
         );
         coder_phase::emit_step_result(
             flow::Level::Warn,
@@ -1212,7 +1225,8 @@ fn coder_phase_gate_outcome(
     println!(
         "\n{}",
         style::success(&format!(
-            "✓ ready for sign-off. After review:  darkmux mission ship {mission_id} --phase {phase_id}"
+            "✓ ready for sign-off. Ship the git work by hand (commit/push/PR), then:  \
+             darkmux mission finalize {mission_id}"
         ))
     );
     println!(
@@ -1280,9 +1294,9 @@ pub(crate) fn load_phase_for_brief(mission_id: &str, phase_id: &str) -> Result<P
 /// `Abandoned` starts it; `Running` (a relaunch of a gated run mid-flight)
 /// and `Complete` (a relaunch past a terminal phase — logged separately by
 /// the caller's own preflight pass) are left alone. Failure to start is a
-/// loud dim warning, never a hard error — the same "continue, state can be
-/// reconciled with `darkmux phase` verbs" posture the pre-#1400 eager loop
-/// used.
+/// loud dim warning, never a hard error — the same "continue, the whole-mission
+/// terminal (`mission finalize` / `mission abort`) reconciles phase state"
+/// posture the pre-#1400 eager loop used (#1463).
 pub(crate) fn lazy_start_phase_for_step(
     mission_id: &str,
     phase_id: &str,
@@ -1304,8 +1318,9 @@ pub(crate) fn lazy_start_phase_for_step(
             eprintln!(
                 "{}",
                 style::dim(&format!(
-                    "mission launch: phase_start({phase_id}) failed: {e:#} — continuing; state \
-                     can be reconciled with `darkmux phase` verbs."
+                    "mission launch: phase_start({phase_id}) failed: {e:#} — continuing; the \
+                     whole-mission terminal (`mission finalize` / `mission abort`) reconciles \
+                     phase state."
                 ))
             );
         }
@@ -1937,7 +1952,7 @@ mod tests {
         assert_eq!(
             phase_status_on_disk("gate-test-mission", phase_id),
             PhaseStatus::Running,
-            "even a clean run stops at the gate — `mission ship` completes the phase, not launch"
+            "even a clean run stops at the gate — `mission finalize` completes the phase, not launch"
         );
         assert_eq!(mission_status_on_disk("gate-test-mission"), MissionStatus::Active);
         assert!(
@@ -2025,10 +2040,10 @@ mod tests {
         assert!(gate_outcome_reached_no_gate(&Ok(1)), "coder dispatch error finalizes");
         // Gate exits PROPER must NOT finalize. Ok(2) is the load-bearing pin:
         // a regression to `Err(_) | Ok(1) | Ok(2)` would close the mission
-        // under QA-blockers and lock out `mission ship` — this line is what
+        // under QA-blockers before sign-off (#1463) — this line is what
         // fails on that regression.
-        assert!(!gate_outcome_reached_no_gate(&Ok(0)), "clean gate holds for ship");
-        assert!(!gate_outcome_reached_no_gate(&Ok(2)), "QA-blockers gate holds for fix + ship, never finalizes");
+        assert!(!gate_outcome_reached_no_gate(&Ok(0)), "clean gate holds for sign-off");
+        assert!(!gate_outcome_reached_no_gate(&Ok(2)), "QA-blockers gate holds for fix, never finalizes");
         assert!(!gate_outcome_reached_no_gate(&Ok(3)), "QA-unavailable gate holds for manual review");
     }
 

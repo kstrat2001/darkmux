@@ -169,23 +169,22 @@ A phase is one unit of work within a mission. Its fields
 - timestamps: `created_ts`, `started_ts`, `completed_ts`, `abandoned_ts`
 
 There is **no `estimate`, `assignee`, or `burn-down` field** on a phase.
-Estimation is a *pre-dispatch verb* (`darkmux phase estimate`, §4), not a stored
-phase attribute; burn-down/remaining-work tracking is
-[planned](#8-planned--not-yet-shipped).
+Burn-down/remaining-work tracking is [planned](#8-planned--not-yet-shipped).
 
 ### Lifecycle state machines
 
-Both lifecycles are implemented (`src/main.rs:1321-1392` — phase verbs at
-`1321-1349`, mission verbs at `1355-1392`):
-
-- **Mission:** `Active ⇄ Paused → Closed` (terminal). Verbs: `start`, `pause`,
-  `resume`, `close`, each persisted with operator reasoning.
-- **Phase:** `Planned → Running → Complete | Abandoned`. Verbs: `start`,
-  `complete`, `abandon`.
+- **Mission:** `Active ⇄ Paused → Closed` (terminal). Operator verbs: `start`,
+  `pause`, `resume`, and the two terminals — `finalize` (success: drive
+  non-terminal phases → Complete, tear down worktrees, mission → Closed) and
+  `abort` (kill: the same teardown, phases → Abandoned). Each persisted with
+  operator reasoning.
+- **Phase:** `Planned → Running → Complete | Abandoned`. Phase status is
+  **derived by the mission graph** and reconciled by `mission finalize` /
+  `mission abort` (#1463 retired the manual `phase start/complete/abandon`
+  verbs — the graph, not the operator, drives per-phase transitions now).
 
 `darkmux mission add-phase` inserts a phase with cross-reference validation
-(mission exists, `depends_on` ids resolve, no id collision)
-(`src/main.rs:584-611`).
+(mission exists, `depends_on` ids resolve, no id collision).
 
 ---
 
@@ -197,9 +196,8 @@ All of the following are **shipped**:
 | Verb | What it does | Where |
 |---|---|---|
 | `darkmux mission propose` | Reads unstructured intent → dispatches the **mission-compiler** utility role → renders a Mission + Phases proposal → **mandatory operator approve/edit/reject/regenerate gate** → persists a mission CONFIG draft to `~/.darkmux/mission-configs/<id>.json` only on approval; `darkmux mission launch <id>` then mints the running instance (#1284 Packet 4a). | `src/mission_propose.rs`; `src/mission_launch.rs` |
-| `darkmux phase estimate` | Reads a `WorkloadSpec` → deterministic per-turn token math → recommends the smallest adequate profile → optional 4B narration. | `src/phase_cli.rs:233-310, 500-514`; `src/main.rs:459-471` |
-| `darkmux phase review` | Auto-detects base branch → computes the git diff → dispatches the **code-reviewer** role → parses the `QA-REVIEW-SIGNOFF` block (`BLOCK`/`FLAG`/`NIT`) → emits a verdict (`clean` / `flags-only` / `blockers`, or `indeterminate` when the reviewer output doesn't match the expected format). | `src/phase_cli.rs:683-970`; `src/main.rs:472-485` |
-| `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, fans out its ready phases (`depends_on == []`) as work jobs onto the single global fleet work queue (`darkmux:work`); waits or returns session ids. | `src/main.rs:642-662`, `1453-1721` |
+| `darkmux mission launch review` | The standalone code-review path (the funnel): bundle → probe → dedup → judge → verify → synthesis over a diff, dispatching the **code-reviewer**/judge roles and rendering a verdict. Replaces the retired `phase review` verb (#1463); the coder-phase pipeline still runs its own in-gate `code-reviewer` QA pass (`src/coder_phase.rs`). | `src/mission_launch_review.rs`; `crates/darkmux-lab/src/lab/review.rs` |
+| `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, fans out its ready phases (`depends_on == []`) as work jobs onto the single global fleet work queue (`darkmux:work`); waits or returns session ids. | `src/main.rs` |
 | `darkmux dispatch <role>` | Single-turn dispatch to a named role through the internal runtime. | see `CLAUDE.md` → operator-facing commands |
 
 The **operator-approval gate on `mission propose`** is the sovereignty contract

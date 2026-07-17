@@ -54,7 +54,7 @@
     <p>This guide intentionally ships without static screenshots: the viewer is iterating fast in this phase. Open it next to a real dispatch to see the live shape. Each card shows:</p>
     <ul>
       <li><strong>Tier stripe</strong>: the colored bar on the left. Cyan = operator (manual mission/phase actions), violet = frontier (orchestrator narrative), green = local (model work).</li>
-      <li><strong>Action + handle</strong>: what happened ("dispatch start", "phase complete", "verdict: clean") and which entity it acted on (the role id, phase id, or mission id).</li>
+      <li><strong>Action + handle</strong>: what happened ("dispatch start", "dispatch complete", "verdict: clean") and which entity it acted on (the role id, phase id, or mission id).</li>
       <li><strong>Meta pills</strong>: category, tier, stage, source, model (if known), phase, session id. The <code>model</code> pill on dispatch cards shows which LMStudio model handled the work.</li>
       <li><strong>Wall-clock graphic</strong>: for dispatch records, an SVG ring shows the duration, sweeping while the dispatch is mid-flight and frozen at the final duration once complete.</li>
     </ul>
@@ -66,12 +66,11 @@
   <div class="wrap">
     <h2>Reading a live dispatch</h2>
     <p>Run something that emits records and watch them land:</p>
-    <pre><code>darkmux mission start &lt;your-mission-id&gt;    <span class="comment"># cyan: mission start record</span>
-darkmux phase start &lt;your-phase-id&gt;      <span class="comment"># cyan: phase start record</span>
-darkmux dispatch coder "..."<span class="comment"># green: dispatch start + (later) dispatch complete</span>
-darkmux phase complete &lt;your-phase-id&gt;   <span class="comment"># cyan: phase complete + duration arc</span></code></pre>
+    <pre><code>darkmux mission launch &lt;your-config&gt;         <span class="comment"># cyan: mission launch record (mints + starts the mission)</span>
+darkmux dispatch coder "..."                <span class="comment"># green: dispatch start + (later) dispatch complete</span>
+darkmux mission finalize &lt;your-mission-id&gt;   <span class="comment"># cyan: mission finalize + duration arc</span></code></pre>
 
-    <p>With the viewer open as you run those commands, the records appear in order: two cyan operator-tier records bracketing a green local-tier dispatch pair (with the model pill visible on each green card), followed by the cyan phase-complete with its duration arc.</p>
+    <p>With the viewer open as you run those commands, the records appear in order: a cyan operator-tier launch record, then a green local-tier dispatch pair (with the model pill visible on each green card), followed by the cyan mission-finalize record with its duration arc.</p>
 
     <p>The records pair via <code>session_id</code>: dispatch start and dispatch complete share the same session id, which is how the wall-clock graphic computes duration. The viewer joins them automatically.</p>
   </div>
@@ -124,7 +123,7 @@ darkmux serve --port 9000 --bind 127.0.0.1   <span class="comment"># override th
 <section>
   <div class="wrap">
     <h2>The pre-dispatch nudge</h2>
-    <p>When you run <code>darkmux dispatch</code> or <code>darkmux phase review</code> while the daemon is off, darkmux prints a one-line stderr nudge: the daemon isn't reachable, your flow records still write to disk, and you won't see them live until you start it (<code>brew services start darkmux</code> on Homebrew, or <code>darkmux serve</code> from source).</p>
+    <p>When you run <code>darkmux dispatch</code> or <code>darkmux mission launch review</code> while the daemon is off, darkmux prints a one-line stderr nudge: the daemon isn't reachable, your flow records still write to disk, and you won't see them live until you start it (<code>brew services start darkmux</code> on Homebrew, or <code>darkmux serve</code> from source).</p>
     <p>The dispatch proceeds either way: this is situational awareness, not consent-gating. You won't commit to a multi-minute dispatch only to realize the viewer would have been empty.</p>
     <p>If you started the daemon mid-dispatch, the records that landed before you started it are still visible. The viewer fetches the whole day's file first, then opens an SSE stream for new records. No data lost.</p>
   </div>

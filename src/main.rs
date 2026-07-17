@@ -133,7 +133,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             cli::MemoryCmd::Correction { sub } => cmd_correction(sub),
         },
         Cmd::Role { sub } => cmd_role(sub),
-        Cmd::Phase { sub } => cmd_phase(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
         Cmd::Flow { sub } => {
             flow_cli::run(sub)?;
@@ -787,49 +786,6 @@ fn cmd_role(sub: RoleCmd) -> Result<i32> {
     }
 }
 
-fn cmd_phase(sub: PhaseCmd) -> Result<i32> {
-    match sub {
-        PhaseCmd::Estimate { spec, narrate } => phase_cli::estimate(&spec, narrate),
-        PhaseCmd::Review {
-            base,
-            require_clean,
-            phase_id,
-        } => {
-            let sid = phase_id.as_deref();
-            phase_cli::phase_review(base.as_deref(), require_clean, sid)
-        }
-        PhaseCmd::Start { id } => {
-            let s = crew::lifecycle::phase_start(&id)?;
-            println!(
-                "phase `{}` → Running  started_ts={}",
-                s.id,
-                s.started_ts.unwrap_or(0)
-            );
-            Ok(0)
-        }
-        PhaseCmd::Complete { id } => {
-            let s = crew::lifecycle::phase_complete(&id)?;
-            let started = s.started_ts.unwrap_or(0);
-            let completed = s.completed_ts.unwrap_or(0);
-            let dur = completed.saturating_sub(started);
-            println!(
-                "phase `{}` → Complete  duration={}s  completed_ts={}",
-                s.id, dur, completed
-            );
-            Ok(0)
-        }
-        PhaseCmd::Abandon { id } => {
-            let s = crew::lifecycle::phase_abandon(&id)?;
-            println!(
-                "phase `{}` → Abandoned  abandoned_ts={}",
-                s.id,
-                s.abandoned_ts.unwrap_or(0)
-            );
-            Ok(0)
-        }
-    }
-}
-
 fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
         MissionCmd::Status { json } => mission_status::run(json),
@@ -843,20 +799,8 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             );
             Ok(0)
         }
-        MissionCmd::Close { id, reasoning } => {
-            let m = crew::lifecycle::mission_close_with_reasoning(&id, reasoning.as_deref())?;
-            let started = m.started_ts.unwrap_or(0);
-            let closed = m.closed_ts.unwrap_or(0);
-            let dur = closed.saturating_sub(started);
-            println!(
-                "mission `{}` → Closed  duration={}s  closed_ts={}",
-                m.id, dur, closed
-            );
-            // (#1000) The mission's done — prompt the debrief ceremony so its
-            // transient signal (cautions + corrections) becomes durable lessons
-            // for the next crew. Emits Stage::Debrief; never blocks the close.
-            coder_phase::nudge_mission_debrief(&m.id);
-            Ok(0)
+        MissionCmd::Finalize { id, reasoning } => {
+            coder_phase::finalize(&id, reasoning.as_deref())
         }
         MissionCmd::Pause { id, reasoning } => {
             let m = crew::lifecycle::mission_pause_with_reasoning(&id, reasoning.as_deref())?;
@@ -941,13 +885,6 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             mission_id,
             phase,
         } => coder_phase::abort(&mission_id, phase.as_deref()),
-        MissionCmd::Ship {
-            mission_id,
-            phase,
-            base,
-            wait_ci,
-            merge,
-        } => coder_phase::ship(&mission_id, phase.as_deref(), &base, wait_ci, merge),
     }
 }
 
