@@ -91,8 +91,9 @@ class Darkmux < Formula
       (ghcr.io/kstrat2001/darkmux-runtime:<version>, #759) — you just need
       Docker running. (`docker build -t darkmux-runtime:latest runtime/` from
       a source checkout is the offline/dev alternative.) So brew is a complete
-      install end to end: `swap` / `status` / `profile` / `fleet` / `flow` /
-      `serve` / `doctor`, the hub coordinator role, AND local dispatches.
+      install end to end: `dispatch` / `mission` / `machine` / `profile` /
+      `flow` / `serve` / `doctor`, the hub coordinator role, AND local
+      dispatches.
 
       For a single-machine CLI install (no daemon needed):
         # Already done. Run `darkmux --help` to explore.

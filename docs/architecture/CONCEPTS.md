@@ -360,7 +360,7 @@ optional fields are minor bumps that older viewers safely ignore (the
 
 ```
 /health   /flow/:date   /flow/:date/stream   /flow-status
-/model/status   /machine/specs   /missions   /phases
+/machine/status /machine/specs   /missions   /phases
 ```
 
 - `/flow/:date` aggregates fleet-wide records from Redis (`XRANGE`) with a

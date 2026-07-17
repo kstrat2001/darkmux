@@ -1,0 +1,4 @@
+cargo:rustc-env=DARKMUX_BUILD_TAG=ad89c2f✱
+cargo:rerun-if-env-changed=DARKMUX_RELEASE
+cargo:rerun-if-changed=../../.git/HEAD
+cargo:rerun-if-changed=../../.git/index

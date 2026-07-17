@@ -1463,41 +1463,88 @@ fn cmd_machine_resources(id: Option<&str>, json: bool) -> Result<i32> {
 /// a remote read.
 fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Result<i32> {
     if let Some(id) = id {
-        // Remote read: the peer's /model/status returns a flat resident list;
+        // Remote read: the peer's /machine/status returns a flat resident list;
         // partition by ownership here so a remote read renders like a local
         // one. No profile-match — that reads this host's registry.
-        let value = fleet_cli::fetch_peer_json(id, "/model/status")?;
-        let models: Vec<types::LoadedModel> = value
+        let value = fleet_cli::fetch_peer_json(id, "/machine/status")?;
+        // (#1426 gate fix) A degraded peer must NOT render as healthy-empty:
+        // `lms_unreachable: true` means the peer's daemon could not query
+        // LMStudio — its residents are UNKNOWN, not zero. Surface it loudly
+        // and exit 2 instead of printing an all-clear empty view.
+        let lms_unreachable = value
+            .get("lms_unreachable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Shape mismatch (an older/newer daemon whose payload doesn't parse):
+        // fall back to a raw JSON print — the same fallback
+        // `cmd_machine_resources` uses — never a fabricated-empty render.
+        let models: Vec<types::LoadedModel> = match value
             .get("models")
-            .and_then(|m| serde_json::from_value(m.clone()).ok())
-            .unwrap_or_default();
-        return render_residents(&models, None, json, Some(id));
+            .map(|m| serde_json::from_value(m.clone()))
+        {
+            Some(Ok(models)) => models,
+            _ => {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(0);
+            }
+        };
+        if lms_unreachable {
+            if json {
+                let out = serde_json::json!({
+                    "machine_id": id,
+                    "lms_unreachable": true,
+                    "managed": [],
+                    "user_state": [],
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                eprintln!(
+                    "machine `{id}`: the peer's daemon could not reach LMStudio (`lms ps` \
+                     failed there) — residents UNKNOWN, not empty. Check LMStudio + the \
+                     `lms` CLI on `{id}`."
+                );
+            }
+            return Ok(2);
+        }
+        return render_residents(&models, None, None, json, Some(id));
     }
     let loaded = lms::list_loaded()?;
     // Which registered profile(s) does the loaded set match? (The retired
     // top-level `status` verb's one unique dimension.)
-    let matches: Option<Vec<String>> = match profiles::load_registry(config) {
-        Ok(loaded_reg) => Some(
-            loaded_reg
-                .registry
-                .profiles
-                .iter()
-                .filter(|(_, p)| profile_matches(p, &loaded))
-                .map(|(k, _)| k.clone())
-                .collect(),
-        ),
-        // No registry (fresh machine / bad path) — still show residents, just
-        // without the profile-match line rather than failing the read.
-        Err(_) => None,
-    };
-    render_residents(&loaded, matches.as_deref(), json, None)
+    let (matches, registry_path): (Option<Vec<String>>, Option<String>) =
+        match profiles::load_registry(config) {
+            Ok(loaded_reg) => (
+                Some(
+                    loaded_reg
+                        .registry
+                        .profiles
+                        .iter()
+                        .filter(|(_, p)| profile_matches(p, &loaded))
+                        .map(|(k, _)| k.clone())
+                        .collect(),
+                ),
+                Some(loaded_reg.path.display().to_string()),
+            ),
+            // (#1426 gate fix) An EXPLICIT --profiles-file that doesn't load
+            // errors loudly (the retired `status` verb's behavior) — an
+            // operator-named path is never silently swallowed. Only the
+            // no-arg default degrades gracefully (fresh machine, no registry
+            // yet: still show residents, without the profile-match line).
+            Err(e) if config.is_some() => {
+                return Err(e.context("reading --profiles-file for the profile-match column"))
+            }
+            Err(_) => (None, None),
+        };
+    render_residents(&loaded, matches.as_deref(), registry_path.as_deref(), json, None)
 }
 
 /// Shared renderer for `machine status` (local + remote): residents grouped
-/// by ownership, and — for a local read — the matching-profile line. (#1426)
+/// by ownership, and — for a local read — the registry provenance +
+/// matching-profile lines. (#1426)
 fn render_residents(
     loaded: &[types::LoadedModel],
     matches: Option<&[String]>,
+    registry_path: Option<&str>,
     json: bool,
     remote_id: Option<&str>,
 ) -> Result<i32> {
@@ -1513,6 +1560,9 @@ fn render_residents(
         if let Some(m) = matches {
             out["matching_profiles"] = serde_json::json!(m);
         }
+        if let Some(p) = registry_path {
+            out["registry"] = serde_json::json!(p);
+        }
         if let Some(id) = remote_id {
             out["machine_id"] = serde_json::json!(id);
         }
@@ -1523,12 +1573,24 @@ fn render_residents(
         println!("{}", darkmux_types::style::header(&format!("machine `{id}` (remote):")));
         println!();
     }
+    // Registry provenance (absorbed from the retired `status` verb) — the
+    // operator never has to wonder which registry the match line read.
+    if let Some(p) = registry_path {
+        println!("registry: {p}");
+        println!();
+    }
     println!("{}", darkmux_types::style::header(&format!("darkmux-managed ({}):", managed.len())));
     if managed.is_empty() {
         println!("  (none — a dispatch loads what its staffing needs)");
     } else {
         for m in &managed {
-            println!("  {} ctx={:<8} {}", darkmux_types::style::accent(&format!("{:<46}", m.identifier)), m.context, m.size);
+            println!(
+                "  {} ctx={:<8} {:<10} {}",
+                darkmux_types::style::accent(&format!("{:<46}", m.identifier)),
+                m.context,
+                m.size,
+                darkmux_types::style::dim(&m.status)
+            );
         }
     }
     println!();
@@ -1537,7 +1599,13 @@ fn render_residents(
         println!("  (none — LMStudio is exclusively darkmux's right now)");
     } else {
         for m in &user {
-            println!("  {} ctx={:<8} {}", darkmux_types::style::dim(&format!("{:<46}", m.identifier)), m.context, m.size);
+            println!(
+                "  {} ctx={:<8} {:<10} {}",
+                darkmux_types::style::dim(&format!("{:<46}", m.identifier)),
+                m.context,
+                m.size,
+                darkmux_types::style::dim(&m.status)
+            );
         }
         println!();
         println!("note: darkmux will never unload entries under `user state` — they're");

@@ -1,5 +1,5 @@
 // Headless e2e smoke for the #1286 machine memory lens — the live
-// potential-vs-current ledger fed by the daemon's /machine/memory. The
+// potential-vs-current ledger fed by the daemon's /machine/resources. The
 // static harness has no daemon behind it, so these specs route-mock the
 // endpoint (the catalog.spec pattern) with a real-shaped ledger payload
 // whose every string field carries the standard XSS payloads — the machine
@@ -10,7 +10,7 @@ const { test, expect } = require('@playwright/test');
 
 const XSS = `<img src=x onerror=window.__xss=1>`;
 
-// Real-shaped /machine/memory payload (the ModelLedger JSON of
+// Real-shaped /machine/resources payload (the ModelLedger JSON of
 // crates/darkmux-profiles/src/model_ledger.rs) with hostile strings in every
 // field the lens interpolates into HTML.
 const LEDGER = {
@@ -69,7 +69,7 @@ const LEDGER = {
 };
 
 function mockMachineMemory(page, body) {
-  return page.route('**/machine/memory*', (r) =>
+  return page.route('**/machine/resources*', (r) =>
     r.fulfill({ contentType: 'application/json', body: JSON.stringify(body ?? LEDGER) })
   );
 }
@@ -139,7 +139,7 @@ test('unreachable daemon shows the no-daemon notice, then a stale banner once da
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
 
-  // No route mock: the static harness 404s /machine/memory → the lens must
+  // No route mock: the static harness 404s /machine/resources → the lens must
   // say so instead of rendering nothing.
   await page.goto('/index.html#lens=machine');
   await expect(page.locator('#lens-machine')).toHaveClass(/\bon\b/);
@@ -151,7 +151,7 @@ test('unreachable daemon shows the no-daemon notice, then a stale banner once da
 
   // Daemon goes away again: the cached snapshot stays BUT is labeled stale —
   // a silently frozen gauge is the failure mode this banner prevents.
-  await page.unroute('**/machine/memory*');
+  await page.unroute('**/machine/resources*');
   await expect(page.locator('.memwarn').first()).toContainText('stale', { timeout: 10_000 });
   await expect(page.locator('.memcard .memname').first()).toHaveText('machine total');
 

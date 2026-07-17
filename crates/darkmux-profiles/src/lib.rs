@@ -1,9 +1,10 @@
-//! darkmux-profiles — profile registry + LMStudio stack-swap orchestration.
+//! darkmux-profiles — profile registry + LMStudio state helpers.
 //!
 //! Extracted from the binary in #463 (PR2). Holds the profile loader/lookup
-//! (`profiles`), the stack-swap orchestrator (`swap`), and the `lms` CLI
-//! wrapper. Internal `crate::{lms,swap}` paths keep resolving as sibling
-//! modules. `gestalt_host` (#1274 packet 2b) adds the gestalt port adapters
+//! (`profiles`), the `darkmux:` namespace helpers (`swap` — the stack-swap
+//! orchestrator it once held retired with the `swap` verb, #1426), and the
+//! `lms` CLI wrapper. Internal `crate::{lms,swap}` paths keep resolving as
+//! sibling modules. `gestalt_host` (#1274 packet 2b) adds the gestalt port adapters
 //! (`LmsHost`/`MacProbe`/`ArchFactsReader`), which pull in `darkmux-gestalt`
 //! for the port traits — no cycle (gestalt depends only on darkmux-types).
 //! `model_ledger` (#1286) composes those adapters into the potential-vs-

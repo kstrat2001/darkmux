@@ -290,7 +290,7 @@ pub(crate) fn build_router_full(
         .route("/flow-mission/:id", get(flow_mission_handler))
         .route("/flow-session/:id", get(flow_session_handler))
         .route("/flow-status", get(flow_status_handler))
-        .route("/model/status", get(model_status_handler))
+        .route("/machine/status", get(machine_status_handler))
         .route("/machine/specs", get(machine_specs_handler))
         .route("/machine/resources", get(machine_resources_handler))
         .route("/missions", get(missions_handler))
@@ -1218,10 +1218,12 @@ pub(crate) async fn worktree_summary_handler(
     .into_response()
 }
 
-/// GET /model/status — returns currently-loaded models (per `lms ps --json`)
-/// as JSON so the flow viewer's toolbar pill / modal can render them
-/// without parsing `lms` output client-side. See issue #87 for the
-/// operator-facing motivation.
+/// GET /machine/status — returns currently-loaded models (per `lms ps
+/// --json`) as JSON. (#1426 — renamed from `/model/status` alongside the
+/// `machine` CLI family; one route family, one name. Its consumer is the
+/// `darkmux machine status <id>` peer read — the viewer does not fetch this
+/// route; an earlier doc comment claiming a viewer toolbar-pill consumer,
+/// from #87, was stale.)
 ///
 /// Always returns 200 with a structured body. `lms_unreachable: true`
 /// signals the binary couldn't be invoked (operator hasn't installed
@@ -1942,7 +1944,7 @@ async fn flow_status_handler() -> axum::Json<serde_json::Value> {
     }
 }
 
-async fn model_status_handler() -> axum::Json<serde_json::Value> {
+async fn machine_status_handler() -> axum::Json<serde_json::Value> {
     let result = tokio::task::spawn_blocking(darkmux_profiles::lms::list_loaded).await;
     let (models, unreachable) = match result {
         Ok(Ok(m)) => (m, false),

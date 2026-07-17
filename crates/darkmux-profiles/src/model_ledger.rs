@@ -964,7 +964,7 @@ fn truncate_ident(s: &str, max: usize) -> String {
 /// The `darkmux machine resources` table + machine rows + gather-cost line.
 pub fn render_human(ledger: &ModelLedger) -> String {
     let mut out = String::new();
-    out.push_str("model ledger — potential vs current (#1286)\n\n");
+    out.push_str("machine resources — potential vs current (#1286)\n\n");
     out.push_str(&format!(
         "{:<46} {:<8} {:>8} {:>10} {:>10} {:>10} {:>10}  {}\n",
         "MODEL", "OWNER", "CTX", "WEIGHTS", "KV@CTX", "POTENTIAL", "CURRENT", "STATE"

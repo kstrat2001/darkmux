@@ -230,6 +230,148 @@ fn bare_machine_routes_to_status() {
         .stdout(predicate::str::contains("darkmux-managed"));
 }
 
+/// (#1426) `machine status --json` emits the machine-readable shape the
+/// frontier orchestrator parses: ownership groups plus the absorbed `status`
+/// verb's `matching_profiles` + `registry` provenance keys.
+#[test]
+fn machine_status_json_carries_matching_profiles_and_registry_keys() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("profiles.json");
+    fs::write(&p, fixture_json()).unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args([
+            "machine",
+            "status",
+            "--json",
+            "--profiles-file",
+            p.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    for key in ["managed", "user_state", "matching_profiles", "registry"] {
+        assert!(json.get(key).is_some(), "missing `{key}` in: {json}");
+    }
+    assert!(json["matching_profiles"].is_array());
+}
+
+/// (#1426 gate fix) An EXPLICIT `--profiles-file` that doesn't load errors
+/// loudly — the retired `status` verb's behavior. Only the no-arg default
+/// degrades to residents-without-match.
+#[test]
+fn machine_status_explicit_bad_profiles_file_errors_loudly() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
+    cmd.args(["machine", "status", "--profiles-file", "/no/such/path.json"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("registry not found")
+                .or(predicate::str::contains("no profile registry"))
+                .or(predicate::str::contains("profiles-file")),
+        );
+}
+
+/// Serve `count` canned HTTP responses on an ephemeral loopback port,
+/// then stop. Returns the bound `host:port`.
+fn canned_http_peer(status_line: &'static str, body: &'static str, count: usize) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for _ in 0..count {
+            let Ok((mut stream, _)) = listener.accept() else { break };
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    addr
+}
+
+/// Register `id` at `addr` in a roster under a per-test DARKMUX_FLEET_FILE,
+/// via the real `machine add` verb. Returns the roster file path.
+fn roster_with_peer(tmp: &TempDir, id: &str, addr: &str) -> std::path::PathBuf {
+    let fleet_file = tmp.path().join("fleet.json");
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .args(["machine", "add", id, "--address", addr])
+        .assert()
+        .success();
+    fleet_file
+}
+
+/// (#1426 gate fix) A peer whose daemon answers but can't reach LMStudio
+/// (`lms_unreachable: true`) must NOT render as a healthy-empty machine —
+/// residents are UNKNOWN, not zero. Loud message, exit 2.
+#[test]
+fn machine_status_remote_degraded_peer_is_not_healthy_empty() {
+    let addr = canned_http_peer("200 OK", r#"{"models":[],"lms_unreachable":true,"generated_at_ms":1}"#, 1);
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .args(["machine", "status", "peer1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "degraded peer must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("UNKNOWN"), "must say residents unknown: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("exclusively darkmux's"),
+        "must NOT render the healthy-empty view: {stdout}"
+    );
+}
+
+/// (#1426) A healthy peer read renders its residents partitioned by
+/// ownership; `--json` carries the `machine_id` provenance key.
+#[test]
+fn machine_status_remote_happy_path_json_carries_machine_id() {
+    let body = r#"{"models":[{"identifier":"darkmux:qwen-x","model":"qwen-x","status":"loaded","size":"4 GB","context":32000}],"lms_unreachable":false,"generated_at_ms":1}"#;
+    let addr = canned_http_peer("200 OK", body, 1);
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .args(["machine", "status", "peer1", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["machine_id"], "peer1");
+    assert_eq!(json["managed"][0]["identifier"], "darkmux:qwen-x");
+}
+
+/// (#1426) A peer payload whose `models` doesn't parse (older/newer daemon
+/// shape) falls back to a raw JSON print — never a fabricated-empty render.
+#[test]
+fn machine_status_remote_shape_mismatch_prints_raw_json() {
+    let addr = canned_http_peer("200 OK", r#"{"future_shape":{"models_v2":[]}}"#, 1);
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .args(["machine", "status", "peer1"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("future_shape"), "raw payload passthrough: {stdout}");
+    assert!(!stdout.contains("darkmux-managed"), "no fabricated render: {stdout}");
+}
+
 #[test]
 fn unknown_command_exits_nonzero() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();

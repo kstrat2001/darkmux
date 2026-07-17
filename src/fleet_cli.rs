@@ -76,6 +76,12 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
             "peer `{id}` requires a bearer token this machine isn't sending. Set DARKMUX_SERVE_TOKEN \
              (or the darkmux-serve-token Keychain item) to the shared fleet token."
         ),
+        // A 404 means the peer IS reachable — its daemon just doesn't serve
+        // this route. "Could not reach" would be the wrong vocabulary.
+        Err(ureq::Error::Status(404, _)) => anyhow::bail!(
+            "peer `{id}` answered but has no `{path}` route — it may be running an older \
+             darkmux (route not found). Upgrade darkmux on `{id}` and retry."
+        ),
         Err(e) => anyhow::bail!("could not reach `{id}` ({url}): {e}"),
     }
 }
@@ -353,4 +359,142 @@ fn fetch_machine_specs(address: &str, token: Option<&str>) -> SpecsProbe {
 fn human_gb(bytes: u64) -> String {
     let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     format!("{:.0} GB", gb.round())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── normalize_daemon_base (#1426) — the three roster address forms ──
+
+    #[test]
+    fn normalize_daemon_base_passes_through_full_urls_sans_trailing_slash() {
+        assert_eq!(
+            normalize_daemon_base("http://studio.tailnet:9000/"),
+            "http://studio.tailnet:9000"
+        );
+        assert_eq!(
+            normalize_daemon_base("https://hub.example:8765"),
+            "https://hub.example:8765"
+        );
+    }
+
+    #[test]
+    fn normalize_daemon_base_prefixes_host_port_forms() {
+        assert_eq!(
+            normalize_daemon_base("100.74.208.36:8765"),
+            "http://100.74.208.36:8765"
+        );
+    }
+
+    #[test]
+    fn normalize_daemon_base_appends_default_port_to_bare_hosts() {
+        assert_eq!(
+            normalize_daemon_base("100.74.208.36"),
+            format!("http://100.74.208.36:{}", crate::serve::DEFAULT_DAEMON_PORT)
+        );
+    }
+
+    // ── fetch_peer_json error shapes (#1426) ────────────────────────────
+    //
+    // Each test isolates the roster via DARKMUX_FLEET_FILE (read live per
+    // access by config_access) and, where a peer is needed, serves canned
+    // HTTP from a one-shot std TcpListener on a loopback ephemeral port.
+    // Env-mutating, so #[serial_test::serial].
+
+    /// Point the roster at a fresh tempfile and register `entries`.
+    /// Returns the TempDir guard (dropping it removes the roster).
+    fn isolated_roster(entries: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("fleet.json");
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &file) };
+        for (id, addr) in entries {
+            fleet::mutate_roster(|roster| {
+                fleet::add_machine(roster, id, addr, None)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        tmp
+    }
+
+    /// One-shot HTTP responder: accepts a single connection on an ephemeral
+    /// loopback port and answers with `status_line` + `body`. Returns the
+    /// bound address.
+    fn one_shot_http(status_line: &'static str, body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf); // consume request
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        addr
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_unknown_roster_id_names_machine_add() {
+        let _tmp = isolated_roster(&[]);
+        let err = fetch_peer_json("no-such-machine", "/machine/status").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no machine `no-such-machine` in roster"), "{msg}");
+        assert!(msg.contains("darkmux machine add"), "hint names the fix: {msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_401_names_the_shared_fleet_token() {
+        let addr = one_shot_http("401 Unauthorized", "{}");
+        let _tmp = isolated_roster(&[("peer1", addr.as_str())]);
+        let err = fetch_peer_json("peer1", "/machine/status").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bearer token"), "{msg}");
+        assert!(msg.contains("DARKMUX_SERVE_TOKEN"), "{msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_404_says_older_darkmux_not_unreachable() {
+        let addr = one_shot_http("404 Not Found", "{}");
+        let _tmp = isolated_roster(&[("peer1", addr.as_str())]);
+        let err = fetch_peer_json("peer1", "/machine/resources").unwrap_err();
+        let msg = err.to_string();
+        // The peer answered — "could not reach" is the wrong vocabulary.
+        assert!(msg.contains("older"), "names the likely cause: {msg}");
+        assert!(msg.contains("route not found"), "{msg}");
+        assert!(!msg.contains("could not reach"), "{msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_unreachable_peer_says_could_not_reach() {
+        // Port 1 on loopback has no listener (and connecting is refused fast).
+        let _tmp = isolated_roster(&[("ghost", "127.0.0.1:1")]);
+        let err = fetch_peer_json("ghost", "/machine/status").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("could not reach `ghost`"), "{msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_non_json_200_reports_a_parse_error() {
+        let addr = one_shot_http("200 OK", "this is not json");
+        let _tmp = isolated_roster(&[("peer1", addr.as_str())]);
+        let err = fetch_peer_json("peer1", "/machine/status").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("parsing JSON from `peer1`"), "{msg}");
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
 }

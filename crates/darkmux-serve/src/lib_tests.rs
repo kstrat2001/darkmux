@@ -504,17 +504,18 @@
     }
 
     #[tokio::test]
-    async fn model_status_returns_200_with_structured_body() {
+    async fn machine_status_returns_200_with_structured_body() {
         // The handler calls into `lms::list_loaded()`, which shells out to
         // the `lms` binary. CI runners don't have it on PATH, so we expect
         // `lms_unreachable: true` and `models: []` rather than a 500. This
-        // is the contract the viewer's pill relies on — degraded state
-        // shows up as a UI hint, not as a fetch error.
+        // is the contract the `darkmux machine status <id>` peer read relies
+        // on — degraded state shows up as a visible signal, not as a fetch
+        // error. (#1426 — route renamed from /model/status.)
         let app = build_router(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/model/status")
+                    .uri("/machine/status")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -101,7 +101,7 @@ A single app over the one stream:
   of something that already happened."
 
 Because live has exactly **one** source, the cross-tab desync and two-source race concerns dissolve
-by construction. The metadata endpoints (`/machine/specs`, `/missions`, `/model/status`) are
+by construction. The metadata endpoints (`/machine/specs`, `/missions`, `/machine/status`) are
 lookups that enrich a node, not a second sequence — nothing to interleave.
 
 Retire `docs/{topology,flow,lab,viewer}/index.html` as separate pages.
