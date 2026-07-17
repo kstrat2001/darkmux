@@ -140,30 +140,10 @@ pub(crate) fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Which agent runtime services a dispatch. As of 2.0 (#1405) the
-/// in-house container-bounded Rust runtime (see `runtime/` and
-/// `dispatch_internal.rs`) is the ONLY dispatch path — the legacy
-/// `openclaw` shell-out runtime and its `--runtime` opt-in flag were
-/// removed. The enum survives as a single-variant type because
-/// `DispatchOpts.runtime` and the fleet `WorkJob.runtime` field are
-/// serialized/round-tripped across the queue boundary; collapsing it
-/// further would touch that schema for no behavioral gain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Runtime {
-    #[default]
-    Internal,
-}
-
 #[derive(Debug)]
 pub struct DispatchOpts {
     pub role_id: String,
     pub message: String,
-    /// Optional delivery target in `<channel>:<target>` form
-    /// (e.g. `discord:1500166601909993503`). Not consumed by the
-    /// internal runtime today — reserved for a future delivery
-    /// integration.
-    pub deliver: Option<String>,
     pub session_id: Option<String>,
     pub timeout_seconds: u32,
     /// Skip the pre-flight checks. Use only when explicitly debugging.
@@ -189,9 +169,6 @@ pub struct DispatchOpts {
     /// `coder_brief()` is the mechanism that carries context between
     /// phases now). When `None`, records carry no mission/phase fields.
     pub phase_id: Option<String>,
-    /// Which agent runtime to dispatch through. See [`Runtime`].
-    /// The in-house container-bounded runtime is the only value.
-    pub runtime: Runtime,
     /// Target machine for the dispatch (#246 PR-C.3). When `Some(<id>)`
     /// and `<id>` differs from the local `DARKMUX_MACHINE_ID`, the
     /// dispatch is published to the single global `darkmux:work` stream

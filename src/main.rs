@@ -49,7 +49,7 @@ mod config_cmd;
 mod conventions;
 mod mission_propose;
 mod mission_status;
-mod mission_run;
+mod coder_phase;
 mod mission_launch;
 mod mission_launch_review;
 mod notebook;
@@ -96,7 +96,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             message,
             message_from_file,
             profile,
-            deliver,
             session_id,
             timeout,
             workdir,
@@ -112,7 +111,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             message,
             message_from_file,
             profile,
-            deliver,
             session_id,
             timeout,
             workdir,
@@ -414,7 +412,6 @@ pub(crate) fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
                 slug,
                 dry_run,
                 machine_override: machine,
-                runtime: crew::dispatch::Runtime::Internal,
             })?;
             println!("source run: {}", report.run_dir.display());
             println!("entry path: {}", report.entry_path.display());
@@ -747,7 +744,7 @@ fn cmd_phase(sub: PhaseCmd) -> Result<i32> {
 fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
         MissionCmd::Status { json } => mission_status::run(json),
-        MissionCmd::Debrief { id, json } => mission_run::debrief(&id, json),
+        MissionCmd::Debrief { id, json } => coder_phase::debrief(&id, json),
         MissionCmd::Start { id, reasoning } => {
             let m = crew::lifecycle::mission_start_with_reasoning(&id, reasoning.as_deref())?;
             println!(
@@ -769,7 +766,7 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             // (#1000) The mission's done — prompt the debrief ceremony so its
             // transient signal (cautions + corrections) becomes durable lessons
             // for the next crew. Emits Stage::Debrief; never blocks the close.
-            mission_run::nudge_mission_debrief(&m.id);
+            coder_phase::nudge_mission_debrief(&m.id);
             Ok(0)
         }
         MissionCmd::Pause { id, reasoning } => {
@@ -851,32 +848,17 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             timeout,
             no_wait,
         } => cmd_mission_dispatch(&mission_id, &role, machine.as_deref(), timeout, !no_wait),
-        MissionCmd::Run {
-            mission_id,
-            phase,
-            role,
-            image,
-            base,
-            timeout,
-        } => mission_run::run(
-            &mission_id,
-            phase.as_deref(),
-            &role,
-            image.as_deref(),
-            &base,
-            timeout,
-        ),
         MissionCmd::Abort {
             mission_id,
             phase,
-        } => mission_run::abort(&mission_id, phase.as_deref()),
+        } => coder_phase::abort(&mission_id, phase.as_deref()),
         MissionCmd::Ship {
             mission_id,
             phase,
             base,
             wait_ci,
             merge,
-        } => mission_run::ship(&mission_id, phase.as_deref(), &base, wait_ci, merge),
+        } => coder_phase::ship(&mission_id, phase.as_deref(), &base, wait_ci, merge),
     }
 }
 
@@ -1018,23 +1000,15 @@ fn cmd_mission_dispatch(
         .unwrap_or(0);
     let mut jobs: Vec<(String, String, fleet::WorkJob)> = Vec::new(); // (phase_id, session_id, job)
     for (idx, phase) in started.iter().enumerate() {
-        let session_id = format!(
-            "mission-{}-phase-{}-{}-{}",
-            mission_id, phase.id, dispatch_micros, idx
-        );
+        let session_id =
+            darkmux_types::session_id::mission_phase_dispatch(mission_id, &phase.id, dispatch_micros, idx);
         let job = fleet::build_work_job(
             machine.map(String::from),
             role_id.to_string(),
             phase.description.clone(),
             session_id.clone(),
             None,
-            None,
             Some(phase.id.clone()),
-            // Mission dispatch publishes work jobs to peers; the runner
-            // on the receiving machine runs the role through the
-            // internal Docker-bounded runtime — the only dispatch path
-            // (#1405).
-            crate::crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4) — mission dispatch uses the runner's default
             timeout_seconds,
             local_machine.clone(),
@@ -1250,7 +1224,6 @@ struct DispatchInvocation {
     message: Option<String>,
     message_from_file: Option<std::path::PathBuf>,
     profile: Option<String>,
-    deliver: Option<String>,
     session_id: Option<String>,
     timeout: u32,
     workdir: Option<std::path::PathBuf>,
@@ -1274,7 +1247,6 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         message,
         message_from_file,
         profile,
-        deliver,
         session_id,
         timeout,
         workdir,
@@ -1340,14 +1312,12 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     let opts = crew::dispatch::DispatchOpts {
         role_id: role,
         message,
-        deliver,
         session_id,
         timeout_seconds: timeout,
         skip_preflight,
         json,
         workdir,
         phase_id,
-        runtime: crew::dispatch::Runtime::Internal,
         machine,
         wait: !no_wait,
         // A bare `dispatch` carries no profile-derived compaction config here;

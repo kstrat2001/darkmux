@@ -4,9 +4,9 @@
 
 darkmux is an **AI-first orchestrator for local LLMs**. It does three things, and the notes below trace how each one earned its place:
 
-1. **Profile multiplexer.** A dispatch loads the models a named profile declares (model + context window + compaction settings), under the resident budget (the multiplexer is now internal to gestalt). The original capability, and still the floor everything else stands on.
-2. **Dispatch-to-PR loop.** `darkmux dispatch` / `mission run` run a coder in a container-bounded runtime, review it in a fresh context, gate it on operator sign-off, and ship a PR. The defining capability today.
-3. **Unified observability stream.** Every dispatch emits a typed flow record; one daemon (`darkmux serve`) serves the stream, a drill-down viewer, and per-machine introspection, across a fleet.
+1. **Mission orchestrator (the dispatch-to-PR loop).** `darkmux dispatch` / `mission launch coder-phase` run a coder in a container-bounded runtime, review it in a fresh context, gate it on operator sign-off, and ship a PR. The defining capability today, and the headline of the 2.0 identity: config-defined missions that run as a live task graph.
+2. **Lab + unified observability.** `darkmux lab run` measures how a workload runs on your own hardware; every dispatch emits a typed flow record, and one daemon (`darkmux serve`) serves the stream, a drill-down viewer, and per-machine introspection across a fleet. The empirical half that grounds the config choices behind the missions.
+3. **Model residency (internal).** A dispatch loads the models a named profile declares (model + context window + compaction settings) under the resident budget. darkmux *began* as this capability, the profile multiplexer, a manual `swap` tool; in 2.0 it moved inside gestalt and the `swap` verb retired. It is the floor the loop stands on, but it is no longer a verb the operator drives by hand.
 
 The through-line is the doctrine in [`CLAUDE.md`](CLAUDE.md): *optimization, not replacement; the harness before the model; the operator always in the loop with full provenance.* darkmux uses local AI to manage your local AI.
 
@@ -51,7 +51,7 @@ Early dispatch shelled out to an external agent runtime (openclaw). darkmux now 
 Owning the runtime turned darkmux from a configuration tool into a **work** tool. The loop:
 
 ```
-mission run → coder → fresh-context review → fix → frontier/operator sign-off (gate) → PR
+mission launch coder-phase → coder → fresh-context review → fix → frontier/operator sign-off (gate) → PR
 ```
 
 This is what the [M4 roadmap charter](docs/roadmap/M4.md) hardens, and it's grounded in both research and dogfood: failures we *measured*, then found the literature that explained them.

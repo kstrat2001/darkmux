@@ -164,6 +164,70 @@ fn retired_crew_family_is_unknown_entirely() {
     }
 }
 
+/// (#1426 ship-4) `mission run` retired — the coder pipeline runs through
+/// `mission launch coder-phase`. `mission` survives (launch/ship/abort/…), so
+/// the error is an unknown SUB-verb WITHIN the surviving family. No compat
+/// alias (pre-2.0 clean removal).
+#[test]
+fn retired_mission_run_subverb_is_unknown() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.args(["mission", "run", "some-mission"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand").or(
+            predicate::str::contains("unexpected argument"),
+        ));
+}
+
+/// (#1426 ship-4) VERBPAT drift guard: the `mission` family exposes NO `run`
+/// subcommand after the collapse, but DOES keep `launch`. Anchored on the exact
+/// command-column token so it never false-matches `mission launch` (the
+/// two-word `mission run` anchor the ship-4 coverage directive names). Re-adding
+/// `MissionCmd::Run` would list `run` in the help and fail this.
+#[test]
+fn mission_run_verb_absent_from_help_but_launch_present() {
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["mission", "--help"])
+        .output()
+        .expect("mission --help runs");
+    let help = String::from_utf8_lossy(&out.stdout);
+    // Collect the command-name column under the "Commands:" section — the
+    // verb token sits at a shallow (<=3 space) indent; wrapped description
+    // lines sit deeper and are skipped, so we never read a description word.
+    let mut in_commands = false;
+    let mut verbs: Vec<String> = Vec::new();
+    for line in help.lines() {
+        if line.trim_start().starts_with("Commands:") {
+            in_commands = true;
+            continue;
+        }
+        if !in_commands {
+            continue;
+        }
+        if line.trim().is_empty() || line.starts_with("Options:") {
+            break;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 || indent > 3 {
+            continue; // section header or a wrapped description line
+        }
+        if let Some(tok) = line.split_whitespace().next() {
+            if tok.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+                verbs.push(tok.to_string());
+            }
+        }
+    }
+    assert!(
+        verbs.iter().any(|v| v == "launch"),
+        "mission help must list `launch`; parsed verbs: {verbs:?}"
+    );
+    assert!(
+        !verbs.iter().any(|v| v == "run"),
+        "the `mission run` verb must stay retired (#1426 ship-4); parsed verbs: {verbs:?}"
+    );
+}
+
 // (#1426 phase 3) `swap`, `status`, `model`, `fleet`, and `recommendations`
 // all retired as top-level verbs with NO compat alias (pre-2.0 clean removal).
 // `swap` (the second residency writer) is gone entirely; `status`/`model`/

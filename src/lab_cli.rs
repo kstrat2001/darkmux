@@ -8,7 +8,6 @@
 use anyhow::Result;
 
 use crate::cli::LabCmd;
-use crate::crew;
 use crate::lab;
 use crate::workloads;
 
@@ -38,7 +37,6 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 runs,
                 config_path: profiles,
                 quiet,
-                runtime: crew::dispatch::Runtime::Internal,
                 loop_override: None,
                 inject_context: None,
             })?;
@@ -404,7 +402,6 @@ fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
             runs: 1,
             config_path: args.profiles.clone(),
             quiet: args.json,
-            runtime: crew::dispatch::Runtime::Internal,
             // When no compaction flag was set, pass `None` so the dispatch takes
             // the exact `lab run` compaction path (caps still apply via env).
             loop_override: if loop_override.is_empty() {
@@ -438,7 +435,7 @@ fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
     // ── (#1004) engagement-context A/B ───────────────────────────────
     if args.ab {
         let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let ctx = crate::mission_run::injected_context_for_lab(
+        let ctx = crate::coder_phase::injected_context_for_lab(
             args.inject_from_mission.as_deref(),
             &ws,
             args.profile.as_deref(),

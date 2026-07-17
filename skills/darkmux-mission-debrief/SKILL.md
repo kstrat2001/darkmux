@@ -109,7 +109,7 @@ darkmux lessons list
 
 The banked lessons surface to the next coder dispatch in this repo as a `<lessons>` block at the top of the brief (authoritative — followed, not just suggested). The dispatch logs "carrying N engagement lesson(s) into the brief." Two ways to see the effect:
 
-- Run a `darkmux mission run` dispatch in this repo and watch the brief carry the lessons.
+- Run a `darkmux mission launch coder-phase` dispatch in this repo and watch the brief carry the lessons.
 - For a measured A/B, use the loop lab to compare a dispatch's verdict with vs without the lessons — the empirical test of whether a given lesson actually changed behavior. That's how you learn which lessons are worth keeping and how to phrase the why.
 
 ## Notes

@@ -58,10 +58,6 @@ pub struct WorkJob {
     /// records carry the same value the publisher's poll loop is watching.
     pub session_id: String,
 
-    /// Optional delivery target (`<channel>:<target>`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deliver: Option<String>,
-
     /// Optional `--workdir` override (resolved to a string for transport;
     /// re-parsed to PathBuf on the runner side).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,15 +67,14 @@ pub struct WorkJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase_id: Option<String>,
 
-    /// Which runtime the runner should use. `Internal` is the only
-    /// variant (#1405 removed the legacy openclaw shell-out runtime).
-    /// Wave-E.14 lifted this from `String` to the `Runtime` enum: a
-    /// mistyped runtime is rejected at JSON-parse time by serde rather
-    /// than at `validate()`, eliminating a class of "publisher snuck
-    /// through validate, runner crashed" bugs.
-    #[serde(default)]
-    pub runtime: darkmux_crew::dispatch::Runtime,
-
+    // (#1426 ship-3) The `deliver` (reserved-never-consumed) and `runtime`
+    // (single-variant enum after #1405/#1409) fields retired here in the
+    // coordinated `WORK_JOB_SCHEMA_VERSION` "3" to "4" bump. Because
+    // `#[serde(deny_unknown_fields)]` is set on this struct, dropping the
+    // fields is a real WIRE break, not a silent edit. A job carrying either
+    // key from a pre-4 peer is rejected at parse time, which is exactly why
+    // the removal rides a deliberate schema bump (see the doctrine on
+    // `WORK_JOB_SCHEMA_VERSION` below) rather than shipping unversioned.
     /// (#703 Slice 4) Docker image the runner should dispatch into. When
     /// set, the runner injects darkmux's runtime binary into this image so
     /// the coder can compile/test the job in-sandbox. `None` → the runner's
@@ -164,11 +159,6 @@ impl WorkJob {
     /// - `image` (optional) — non-empty, ≤ `MAX_WORK_IMAGE_BYTES`, no
     ///   leading `-` (prevents docker-flag injection, #838), and every
     ///   char in the conservative image-ref charset.
-    ///
-    /// `runtime` is not checked here — the field is the `Runtime` enum,
-    /// so an unknown variant is rejected at JSON deserialization
-    /// (Wave-E.14 #255). A new runtime requires a deliberate variant
-    /// add to `Runtime`.
     pub fn validate(&self) -> Result<()> {
         if let Some(m) = &self.target_machine {
             validate_work_identifier("target_machine", m)?;
@@ -326,13 +316,13 @@ pub(crate) enum ClaimOutcome {
 /// Returns the auto-assigned entry ID (the canonical `work_id`).
 ///
 /// XADD fields:
-/// - `schema`: `WORK_JOB_SCHEMA_VERSION` ("3") — a wire-version PROVENANCE
-///   tag, NOT a compat gate: the consumer never reads it (#882). Cross-version
-///   compatibility is enforced by serde SHAPE — `#[serde(deny_unknown_fields)]`
-///   plus required-field deserialization of `record` — per the
-///   `WORK_JOB_SCHEMA_VERSION` doc below. (A serde-compatible-but-semantically-
-///   different change would still need a real read-the-tag gate; deferred until
-///   a major bump actually requires it, rather than half-claimed here.)
+/// - `schema`: `WORK_JOB_SCHEMA_VERSION` ("4"), a wire-version gate. Since
+///   #1426 ship-3 the consumer READS this tag on claim (see
+///   [`parse_xreadgroup_response`]) and rejects a mismatched version FIRST,
+///   before touching `record`, so the operator gets a version-naming reason
+///   rather than a generic `deny_unknown_fields` parse error. Serde SHAPE
+///   (`#[serde(deny_unknown_fields)]` + required-field deserialization) is
+///   the second line of defense for a same-version-tag-but-wrong-shape job.
 /// - `record`: the JSON-serialized WorkJob
 ///
 /// Capped at `WORK_STREAM_MAXLEN` via `MAXLEN ~ N` so a stuck runner
@@ -374,19 +364,57 @@ pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
     Ok(id)
 }
 
-/// Wire-schema version tag carried alongside each job. Bumped when
-/// `WorkJob` shape changes in a way old runners can't safely parse.
-/// Bumped "1" → "2" in #590 (single-stream collapse: `target_tier`
-/// removed from `WorkJob`). Bumped "2" → "3" in #703 Slice 4 (added the
-/// optional `image` field so cross-machine dispatch carries `--image`).
-/// `deny_unknown_fields` means a job carrying `image` from a "3"-era
-/// publisher is rejected by a "2"-era runner — a clean pre-1.0 wire break.
-/// The break is **asymmetric**: `image` is `skip_serializing_if = None`, so a
-/// "3" job with no image serializes byte-identical to a "2" job and old
-/// runners still parse it; only image-bearing jobs require all runners on "3".
-/// Safe rule of thumb: restart all fleet daemons together after upgrading.
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (runner loop) + PR-C.3 (client push)
-pub(crate) const WORK_JOB_SCHEMA_VERSION: &str = "3";
+/// Wire-schema version tag carried alongside each job (the XADD `schema`
+/// field). Bumped when `WorkJob` shape changes in a way old runners can't
+/// safely parse.
+///
+/// History:
+/// - "1" to "2" in #590 (single-stream collapse: `target_tier` removed).
+/// - "2" to "3" in #703 Slice 4 (added the optional `image` field).
+/// - "3" to "4" in #1426 ship-3 (coordinated wire break: the dead `deliver`
+///   and single-variant `runtime` fields retired from `WorkJob`). Because
+///   the struct carries `#[serde(deny_unknown_fields)]`, removing either
+///   field is a genuine wire break: a pre-4 peer's job carries those keys
+///   and a v4 runner's `serde_json::from_str` rejects them. The removal
+///   rides this deliberate bump rather than shipping unversioned (see the
+///   #1426 comment: field removal is a schema-version bump, never silent).
+///
+/// **Version-first mismatch semantics (#1426 ship-3).** [`claim_job`] /
+/// [`parse_xreadgroup_response`] read this `schema` tag on the claimed
+/// entry BEFORE deserializing the `record`. A tag that isn't
+/// `WORK_JOB_SCHEMA_VERSION` routes the entry to [`ClaimOutcome::Malformed`]
+/// with a reason that NAMES the version cause ("job schema v<old> from an
+/// older or newer peer; upgrade + restart all fleet daemons"), so the
+/// operator sees the real cause instead of a generic unknown-field parse
+/// error. The runner XACKs the poison out of its PEL and keeps looping.
+///
+/// **The v3 -> v4 wire break is ASYMMETRIC.** The two retired fields were
+/// BOTH `#[serde(default)]` on the v3 struct (`deliver` optional-skipped,
+/// `runtime` a defaulted enum), and a v4 job is a strict SUBSET of v3's
+/// keys. So the two mismatch directions do NOT behave the same:
+/// - **New runner (v4), old job (v3 tag) in the stream:** the version-first
+///   gate reads the `schema` tag, sees v3, and routes to `Malformed` with
+///   the version-naming reason; the runner XACKs it. It is NOT retried (a
+///   v3 record also carries the retired keys, which a v4 runner's
+///   `deny_unknown_fields` rejects anyway; the gate just reports the real
+///   cause first). This direction breaks loudly, by design.
+/// - **Old runner (v3), new job (v4 tag) in the stream:** the old runner
+///   predates this gate, so it ignores the `schema` tag and parses the
+///   record directly. A v4 job OMITS `deliver`/`runtime`, and their absence
+///   is fine because v3 declared both `#[serde(default)]`; nothing unknown
+///   is present for `deny_unknown_fields` to reject. So the old runner
+///   parses and RUNS the v4 job transparently, harmlessly (both removed
+///   fields were dead: `deliver` was never consumed, `runtime` had one
+///   variant). This direction does NOT break for THIS bump.
+///
+/// **Operational contract: restart all fleet daemons together on upgrade.**
+/// Both machines are the operator's; a version bump is a fleet-wide event.
+/// The restart-together rule is the safe general discipline (a FUTURE bump
+/// may not be so lucky about default-valued removals), not a claim that a
+/// pre-4 runner chokes on v4 jobs. For this specific bump the only failure
+/// direction is new-runner-claims-old-job, and it is caught loudly by the
+/// version gate rather than left to a confusing unknown-field parse error.
+pub(crate) const WORK_JOB_SCHEMA_VERSION: &str = "4";
 
 /// Ensure the consumer group exists on the single global stream.
 /// Idempotent — returns `Ok(())` whether the group was just created OR
@@ -524,6 +552,29 @@ pub(crate) fn parse_xreadgroup_response(value: &redis::Value) -> Result<ClaimOut
             })
         }
     };
+    // (#1426 ship-3) Version-first gate. Read the `schema` tag BEFORE
+    // deserializing `record` so a version mismatch is reported with its
+    // REAL cause. Without this ordering a pre-v4 peer's job (carrying the
+    // retired `deliver` / `runtime` keys) would fail `deny_unknown_fields`
+    // parsing with a generic "unknown field `deliver`" error that hides the
+    // actual problem: a fleet running mixed schema versions. A tag that
+    // isn't ours routes to Malformed (XACK-able poison), never a runner
+    // crash, with a reason the operator can act on. An ABSENT `schema` tag
+    // (a hypothetical pre-versioning job) is NOT version-rejected here; it
+    // falls through to the record parse, which handles it honestly (parses
+    // if shape-compatible, else Malformed via the invalid-JSON path).
+    if let Some(schema) = extract_field(fields, "schema") {
+        if schema != WORK_JOB_SCHEMA_VERSION {
+            return Ok(ClaimOutcome::Malformed {
+                work_id,
+                reason: format!(
+                    "job schema v{schema} from an older or newer fleet peer \
+                     (this runner speaks v{WORK_JOB_SCHEMA_VERSION}); \
+                     upgrade + restart all fleet daemons together"
+                ),
+            });
+        }
+    }
     let Some(record_json) = extract_field(fields, "record") else {
         // (#903) Claimed but no `record` field — poison. Hand the work_id
         // back so the runner can XACK it out of the pending-entries list.
@@ -606,10 +657,8 @@ mod tests {
             role_id: "test-role".to_string(),
             message: "hello".to_string(),
             session_id: "sess-1".to_string(),
-            deliver: None,
             workdir: None,
             phase_id: None,
-            runtime: darkmux_crew::dispatch::Runtime::Internal,
             image: None,
             timeout_seconds: 60,
             published_at_unix_ms: 1_700_000_000_000,
@@ -629,6 +678,7 @@ mod tests {
     /// CI without a Redis passes). Run locally with e.g.
     /// `DARKMUX_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test -p darkmux-fleet`.
     #[test]
+    #[serial_test::serial]
     fn publish_ensures_group_so_a_job_published_first_is_delivered() {
         let Ok(url) = std::env::var("DARKMUX_TEST_REDIS_URL") else {
             eprintln!("skipping publish_ensures_group_*: DARKMUX_TEST_REDIS_URL unset");
@@ -667,6 +717,144 @@ mod tests {
             !matches!(reply, redis::Value::Nil),
             "job {id} published before the group existed was not delivered (lost work)"
         );
+    }
+
+    /// (#1426 ship-3) Real-redis publish then claim round-trip of the v4 shape,
+    /// end-to-end through `publish_job` (which XADDs the schema="4" tag) and
+    /// `claim_job` (which reads it via the version-first gate). A same-version
+    /// happy path: the job comes back as `ClaimOutcome::Job`, byte-equal to
+    /// what was published. Gated on `DARKMUX_TEST_REDIS_URL`.
+    #[test]
+    #[serial_test::serial]
+    fn e2e_publish_then_claim_round_trips_v4_shape() {
+        let Ok(url) = std::env::var("DARKMUX_TEST_REDIS_URL") else {
+            eprintln!("skipping e2e_publish_then_claim_*: DARKMUX_TEST_REDIS_URL unset");
+            return;
+        };
+        let group = crate::runner::RUNNER_CONSUMER_GROUP;
+        let client = redis::Client::open(url).expect("open test redis");
+        let mut conn = client.get_connection().expect("test redis connection");
+        let _: () = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn).unwrap();
+
+        let job = make_valid_job();
+        let work_id = publish_job(&client, &job).expect("publish");
+
+        let outcome = claim_job(&client, group, "e2e-consumer", 2000).expect("claim");
+        // Clean up before asserting so a failure doesn't leak stream state.
+        let _: () = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn).unwrap();
+
+        let ClaimOutcome::Job(claimed) = outcome else {
+            panic!("expected ClaimOutcome::Job for a same-version v4 job, got {outcome:?}");
+        };
+        assert_eq!(claimed.work_id, work_id);
+        assert_eq!(claimed.job, job, "the claimed job must round-trip byte-equal");
+    }
+
+    /// (#1426 ship-3) Real-redis version-mismatch e2e: an older peer XADDs a
+    /// pre-4 job (schema="3" tag, record still carrying the retired `deliver`
+    /// / `runtime` keys). A v4 runner's `claim_job` must route it to
+    /// `ClaimOutcome::Malformed` with the version-naming reason (never a
+    /// runner crash, never a generic unknown-field parse error). This is the
+    /// operational contract exercised over a real socket, not just the pure
+    /// parser. Gated on `DARKMUX_TEST_REDIS_URL`.
+    #[test]
+    #[serial_test::serial]
+    fn e2e_claim_of_old_schema_job_is_version_mismatch_malformed() {
+        let Ok(url) = std::env::var("DARKMUX_TEST_REDIS_URL") else {
+            eprintln!("skipping e2e_claim_of_old_schema_*: DARKMUX_TEST_REDIS_URL unset");
+            return;
+        };
+        let group = crate::runner::RUNNER_CONSUMER_GROUP;
+        let client = redis::Client::open(url).expect("open test redis");
+        let mut conn = client.get_connection().expect("test redis connection");
+        let _: () = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn).unwrap();
+
+        // The runner must have created the group before it can claim.
+        init_consumer_group(&client, group).expect("init group");
+
+        // Simulate an older peer: XADD with a pre-4 schema tag and a record
+        // that still carries the retired fields.
+        let old_record = r#"{
+            "role_id": "coder",
+            "message": "hi",
+            "session_id": "s-old",
+            "deliver": "discord:123",
+            "runtime": "openclaw",
+            "timeout_seconds": 300,
+            "published_at_unix_ms": 0,
+            "attempt": 1
+        }"#;
+        let _: String = redis::cmd("XADD")
+            .arg(WORK_STREAM)
+            .arg("*")
+            .arg("schema")
+            .arg("3")
+            .arg("record")
+            .arg(old_record)
+            .query(&mut conn)
+            .expect("XADD old-shape job");
+
+        let outcome = claim_job(&client, group, "e2e-consumer", 2000).expect("claim");
+        let _: () = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn).unwrap();
+
+        let ClaimOutcome::Malformed { reason, .. } = outcome else {
+            panic!("expected ClaimOutcome::Malformed for a version-mismatched job, got {outcome:?}");
+        };
+        assert!(reason.contains("schema v3"), "reason must name the version: {reason}");
+        assert!(
+            reason.contains("restart all fleet daemons"),
+            "reason must name the operational fix: {reason}"
+        );
+    }
+
+    /// (#1426 ship-3) The claim loop SURVIVES a poison/version-mismatched
+    /// entry: after the runner XACKs the malformed job out of its PEL (the
+    /// #903 pattern), a subsequent well-formed v4 job still claims cleanly.
+    /// This proves version skew degrades one entry, never the consumer.
+    /// Gated on `DARKMUX_TEST_REDIS_URL`.
+    #[test]
+    #[serial_test::serial]
+    fn e2e_runner_survives_malformed_then_claims_next_good_job() {
+        let Ok(url) = std::env::var("DARKMUX_TEST_REDIS_URL") else {
+            eprintln!("skipping e2e_runner_survives_malformed_*: DARKMUX_TEST_REDIS_URL unset");
+            return;
+        };
+        let group = crate::runner::RUNNER_CONSUMER_GROUP;
+        let client = redis::Client::open(url).expect("open test redis");
+        let mut conn = client.get_connection().expect("test redis connection");
+        let _: () = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn).unwrap();
+        init_consumer_group(&client, group).expect("init group");
+
+        // Poison first: an old-schema entry.
+        let _: String = redis::cmd("XADD")
+            .arg(WORK_STREAM)
+            .arg("*")
+            .arg("schema")
+            .arg("3")
+            .arg("record")
+            .arg(r#"{"role_id":"coder","message":"x","session_id":"s","runtime":"openclaw","timeout_seconds":300,"published_at_unix_ms":0,"attempt":1}"#)
+            .query(&mut conn)
+            .expect("XADD poison");
+
+        // The runner claims it, sees Malformed, and XACKs it (loop's #903 path).
+        let poison = claim_job(&client, group, "e2e-consumer", 2000).expect("claim poison");
+        let ClaimOutcome::Malformed { work_id, .. } = poison else {
+            let _: () = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn).unwrap();
+            panic!("expected Malformed for the poison entry, got {poison:?}");
+        };
+        ack_job(&client, group, &work_id).expect("XACK the poison");
+
+        // A well-formed v4 job published next must still be claimable; the
+        // consumer group survived the poison.
+        let good = make_valid_job();
+        publish_job(&client, &good).expect("publish good job");
+        let outcome = claim_job(&client, group, "e2e-consumer", 2000).expect("claim good");
+        let _: () = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn).unwrap();
+
+        let ClaimOutcome::Job(claimed) = outcome else {
+            panic!("consumer must keep working after poison, got {outcome:?}");
+        };
+        assert_eq!(claimed.job, good);
     }
 
     // ---- validate_identifier tests ----

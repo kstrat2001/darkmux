@@ -205,10 +205,8 @@ pub fn build_work_job(
     role_id: String,
     message: String,
     session_id: String,
-    deliver: Option<String>,
     workdir: Option<String>,
     phase_id: Option<String>,
-    runtime: darkmux_crew::dispatch::Runtime,
     image: Option<String>,
     timeout_seconds: u32,
     published_by_machine: Option<String>,
@@ -229,10 +227,8 @@ pub fn build_work_job(
         role_id,
         message,
         session_id,
-        deliver,
         workdir,
         phase_id,
-        runtime,
         image,
         timeout_seconds,
         published_at_unix_ms,
@@ -374,10 +370,8 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
         opts.role_id.clone(),
         opts.message.clone(),
         session_id.clone(),
-        opts.deliver.clone(),
         opts.workdir.as_ref().map(|p| p.display().to_string()),
         opts.phase_id.clone(),
-        opts.runtime,
         opts.image.clone(),
         opts.timeout_seconds,
         darkmux_flow::resolve_machine_id(),
@@ -476,11 +470,10 @@ pub(crate) fn completion_to_dispatch_result(c: CompletionResult) -> DispatchResu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkmux_crew::dispatch::Runtime;
 
     // (#842) `build_work_job` is the single constructor for every WorkJob that
     // crosses the fleet wire, and had ZERO tests. A field-swap (workdir landing
-    // in deliver), or `attempt` defaulting to something other than 1 (which the
+    // in image), or `attempt` defaulting to something other than 1 (which the
     // re-publish logic relies on, PR-C.1), corrupts every cross-machine dispatch
     // and passes green CI.
 
@@ -491,10 +484,8 @@ mod tests {
             "coder".to_string(),               // role_id
             "do the thing".to_string(),        // message
             "sess-42".to_string(),             // session_id
-            Some("discord:123".to_string()),   // deliver
             Some("/work/repo".to_string()),    // workdir
             Some("phase-7".to_string()),      // phase_id
-            Runtime::Internal,                  // runtime
             Some("rust:slim".to_string()),     // image
             900,                                // timeout_seconds
             Some("laptop".to_string()),        // published_by_machine
@@ -516,10 +507,8 @@ mod tests {
         assert_eq!(j.role_id, "coder");
         assert_eq!(j.message, "do the thing");
         assert_eq!(j.session_id, "sess-42");
-        assert_eq!(j.deliver.as_deref(), Some("discord:123"));
         assert_eq!(j.workdir.as_deref(), Some("/work/repo"));
         assert_eq!(j.phase_id.as_deref(), Some("phase-7"));
-        assert_eq!(j.runtime, Runtime::Internal);
         assert_eq!(j.image.as_deref(), Some("rust:slim"));
         assert_eq!(j.timeout_seconds, 900);
         assert_eq!(j.published_by_machine.as_deref(), Some("laptop"));
@@ -538,14 +527,11 @@ mod tests {
             None,
             None,
             None,
-            Runtime::Internal,
-            None,
             60,
             None,
             None,
         );
         assert!(j.target_machine.is_none());
-        assert!(j.deliver.is_none());
         assert!(j.workdir.is_none());
         assert!(j.phase_id.is_none());
         assert!(j.image.is_none());

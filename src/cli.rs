@@ -63,7 +63,7 @@ fn build_version_static() -> &'static str {
 }
 
 #[derive(Parser)]
-#[command(name = "darkmux", version = build_version_static(), about = "Lab and multiplexer for local LLM configurations")]
+#[command(name = "darkmux", version = build_version_static(), about = "Mission orchestrator and lab for local AI")]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Cmd,
@@ -117,11 +117,6 @@ pub(crate) enum Cmd {
         /// lab-validated model that profile maps to.
         #[arg(long)]
         profile: Option<String>,
-        /// Optional delivery target in `<channel>:<target>` form
-        /// (e.g. `discord:1500166601909993503`). Reserved for a future
-        /// delivery integration — not consumed by the internal runtime today.
-        #[arg(long)]
-        deliver: Option<String>,
         /// Override the dispatch session id. Default: a fresh
         /// `crew-dispatch-<role>-<unix-micros>-<process-counter>` is
         /// generated per call, so consecutive dispatches don't share
@@ -274,7 +269,7 @@ pub(crate) enum Cmd {
     },
     /// Read/write `~/.darkmux/config.json` settings (#937). `set` validates the
     /// key + coerces the value; secrets stay in the Keychain. Distinct from
-    /// `profile` (the swap-profiles registry).
+    /// `profile` (the profiles registry).
     Config {
         #[command(subcommand)]
         sub: crate::config_cmd::ConfigCmd,
@@ -517,8 +512,8 @@ pub(crate) enum MissionCmd {
     /// config alongside the instance. A graph with no tasks anywhere (a
     /// freeform/manual config) mints the instance and starts the mission
     /// but leaves every phase transition operator-driven. A coder-phase
-    /// graph executes worktree → coder → QA and then STOPS at the same
-    /// operator sign-off gate `mission run` stops at — the phase stays
+    /// graph executes worktree → coder → QA and then STOPS at an operator
+    /// sign-off gate — the phase stays
     /// Running and `mission ship`/`mission abort` finish the loop; launch
     /// never auto-closes past the gate. `review` (#1284 Packet 4b — the
     /// retired `pr-review run`) is dispatched through its OWN dedicated
@@ -657,47 +652,11 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         no_wait: bool,
     },
-    /// Run one phase's dispatch-to-PR loop LOCALLY, up to the sign-off
-    /// gate. Unlike `dispatch` (which fans phases onto the fleet work
-    /// queue), `run` is synchronous and single-phase on this machine:
-    /// it creates an isolated git worktree, dispatches the coder into it,
-    /// runs the local `code-reviewer` QA against the diff, surfaces the
-    /// result + tokens-off-meter + findings, then STOPS — nothing is
-    /// committed, PR'd, or merged. Adjudicating findings and merging are
-    /// gate steps for the operator/frontier (never auto-merge). After
-    /// sign-off, `darkmux mission ship <id> --phase <phase-id>` finishes
-    /// the loop. (#782)
-    Run {
-        /// Mission id to run a phase from.
-        mission_id: String,
-        /// Phase to run. Optional — when omitted, the single ready phase
-        /// (Planned, no unmet dependencies) is auto-selected; 0 or >1 ready
-        /// phases is ambiguous and bails asking for an explicit `--phase`.
-        #[arg(long, value_name = "ID")]
-        phase: Option<String>,
-        /// Role to dispatch the phase under. Default `coder`.
-        #[arg(long, default_value = "coder")]
-        role: String,
-        /// Dispatch image. The default slim runtime image is used when
-        /// omitted; naming a language image (e.g. `rust:latest`) makes
-        /// darkmux inject its runtime binary so the coder can build/test
-        /// in-sandbox (#703). For Rust in-sandbox lint, pick an image with
-        /// the clippy component (`rust:latest` has it; bare `rust:slim`
-        /// may not) — darkmux ships no per-language image.
-        #[arg(long, value_name = "IMG")]
-        image: Option<String>,
-        /// Base ref the worktree branches off (and the QA diff compares
-        /// against). Default `main`.
-        #[arg(long, default_value = "main")]
-        base: String,
-        /// Coder dispatch timeout (seconds). Default 600.
-        #[arg(long, default_value = "600")]
-        timeout: u32,
-    },
-    /// Abort a `mission run` cleanly: remove the phase's worktree + branch
-    /// and flip the phase to Abandoned. The explicit teardown for a run
-    /// the operator/frontier decides to back out of (vs. leaving an orphan
-    /// worktree). (#782)
+    /// Abort a gate-held coder-phase run cleanly: remove the phase's
+    /// worktree + branch and flip the phase to Abandoned. The explicit
+    /// teardown for a run the operator/frontier decides to back out of (vs.
+    /// leaving an orphan worktree). Operates on the run a `mission launch
+    /// coder-phase` left at its sign-off gate (#782, #1426 ship-4).
     Abort {
         /// Mission id.
         mission_id: String,
@@ -706,11 +665,12 @@ pub(crate) enum MissionCmd {
         #[arg(long, value_name = "ID")]
         phase: Option<String>,
     },
-    /// Ship a `mission run`'s work: commit the worktree, push the branch,
-    /// and open (or reuse) the PR. By DEFAULT stops at the PR — merging is
-    /// the operator/frontier's explicit act (never auto-merge). `--wait-ci`
-    /// blocks on CI; `--merge` (opt-in, green-gated) squash-merges, flips the
-    /// phase to Complete, and tears down the worktree. (#782)
+    /// Ship a gate-held coder-phase run's work: commit the worktree, push
+    /// the branch, and open (or reuse) the PR. By DEFAULT stops at the PR —
+    /// merging is the operator/frontier's explicit act (never auto-merge).
+    /// `--wait-ci` blocks on CI; `--merge` (opt-in, green-gated) squash-
+    /// merges, flips the phase to Complete, tears down the worktree, and
+    /// finalizes the mission when its last phase closes. (#782, #1426 ship-4)
     Ship {
         /// Mission id.
         mission_id: String,

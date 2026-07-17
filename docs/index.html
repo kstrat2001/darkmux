@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>darkmux — AI-first local-AI orchestrator for Apple Silicon</title>
-<meta name="description" content="AI-first local-AI orchestrator. Uses local-AI internally to manage your local-AI workflows: profile multiplexing, utility-agent verbs, live observability, mission/phase lifecycle. Built on real benchmarks.">
+<meta name="description" content="AI-first local-AI orchestrator: config-defined missions that run as a live task graph, plus a lab that measures how your hardware runs a workload. Uses local-AI internally to manage your local-AI. Built on real benchmarks.">
 <meta property="og:title" content="Own your AI workforce. Local AI, no API bill.">
 <meta property="og:description" content="Open-source orchestrator for Apple Silicon. Local models handle the routine work so your frontier agent saves its tokens for the hard problems.">
 <meta property="og:url" content="https://darkmux.com">
@@ -274,9 +274,9 @@
 
 <section>
   <div class="wrap">
-    <h2>Swap the loadout</h2>
+    <h2>Declare the loadout</h2>
     <h3>The right loaded model, context length, and compaction profile for each task: named, not remembered.</h3>
-    <p>You shouldn't have to remember whether your fast bounded-task stack is loaded right now, or whether the deep-agentic profile got swapped out an hour ago when you ran a different test. darkmux makes the loadout an explicit, named thing.</p>
+    <p>You shouldn't have to remember whether your fast bounded-task stack is loaded right now, or whether the deep-agentic profile got unloaded an hour ago when you ran a different test. darkmux makes the loadout an explicit, named thing that a dispatch loads on demand (the founding <code>swap</code> verb is gone; residency is managed for you now).</p>
     <ul class="plain">
       <li><code>darkmux profile list</code> — list named stacks (combinations of LMStudio models at specified context lengths)</li>
       <li><code>darkmux machine status</code> — show what's loaded and which profile (if any) it matches</li>
@@ -318,12 +318,12 @@
 
 <section>
   <div class="wrap">
-    <h2>Advanced: missions, phases, crew</h2>
-    <h3>Structured agentic work, for operators using darkmux as the local-AI tier of an orchestrator workflow.</h3>
-    <p>Beyond the swap/lab CLI surface, darkmux ships a <em>crew</em> abstraction: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts, plus a <em>mission/phase</em> lifecycle that tracks multi-step plans as JSON files the operator owns. Optional: none of this is required to use darkmux as a CLI.</p>
+    <h2>Missions, phases, and crews</h2>
+    <h3>Structured agentic work: the headline of darkmux, driven from your orchestrator.</h3>
+    <p>On top of the profile and lab substrate, darkmux runs config-defined <em>missions</em> as a live task graph: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts form a <em>crew</em> that works the mission's <em>phases</em>, every dispatch gated on operator sign-off, tracked as JSON the operator owns. The profile and lab CLI works standalone if that's all you want, but launching a mission and watching the graph is what darkmux is for.</p>
     <ul class="plain">
       <li><code>darkmux dispatch coder "..."</code> — invoke a named role; emits flow records</li>
-      <li><code>darkmux mission run</code> / <code>ship</code> — the automated dispatch-to-PR loop: worktree, coder, QA review, operator sign-off gate, PR</li>
+      <li><code>darkmux mission launch coder-phase</code> / <code>mission ship</code> — the automated dispatch-to-PR loop: worktree, coder, QA review, operator sign-off gate, PR</li>
       <li><code>darkmux phase review</code> — QA pass against the current branch's diff; dispatches code-reviewer, parses the SIGNOFF block</li>
       <li><code>darkmux mission start/close/pause/resume</code> + <code>phase start/complete/abandon</code> — drive lifecycle state</li>
       <li><code>darkmux mission add-phase --after &lt;s&gt;</code> — insert scope mid-mission without restructuring</li>
@@ -341,7 +341,7 @@
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux init</span><button class="copy-btn" data-copy="darkmux init" aria-label="Copy command">Copy</button></div>
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux doctor</span><button class="copy-btn" data-copy="darkmux doctor" aria-label="Copy command">Copy</button></div>
     </div>
-    <p class="muted">Prefer source? <code>cargo install --git https://github.com/kstrat2001/darkmux</code> works too. Then edit <code>~/.darkmux/profiles.json</code> to point at your downloaded LMStudio models. The <a href="guide/getting-started.html">getting-started page of the user guide</a> walks through this end-to-end, including verifying with doctor and running your first swap.</p>
+    <p class="muted">Prefer source? <code>cargo install --git https://github.com/kstrat2001/darkmux</code> works too. Then edit <code>~/.darkmux/profiles.json</code> to point at your downloaded LMStudio models. The <a href="guide/getting-started.html">getting-started page of the user guide</a> walks through this end-to-end, including verifying with doctor and launching your first mission.</p>
 
     <div class="warn">
       <strong>Results will vary based on your frontier configuration.</strong> The frontier models you use as the orchestrator (Claude Code, Cursor, etc.) need proper guidance to make the most out of darkmux. The user guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals. See <a href="https://github.com/kstrat2001/darkmux/issues/112">issue #112</a> for the architectural reasoning.
