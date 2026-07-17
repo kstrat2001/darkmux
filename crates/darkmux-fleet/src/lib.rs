@@ -21,7 +21,7 @@ mod tests {
     // Module-private helpers under test, reached explicitly across the
     // post-#508 submodule split (they are pub(crate), not part of the
     // crate's public re-export surface).
-    use crate::queue::{extract_field, parse_xreadgroup_response};
+    use crate::queue::{extract_field, parse_xreadgroup_response, WORK_JOB_SCHEMA_VERSION};
     use crate::roster::parse_address;
     use crate::routing::{
         completion_to_dispatch_result, match_completion, scan_flow_entries_for_completion,
@@ -340,10 +340,8 @@ mod tests {
             "coder".to_string(),
             "implement the feature".to_string(),
             "session-2026-05-20-abc".to_string(),
-            None,
             Some("/tmp/workspace".to_string()),
             None,
-            darkmux_crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4)
             600,
             Some("studio".to_string()),
@@ -354,6 +352,9 @@ mod tests {
         assert_eq!(parsed, job);
         assert_eq!(parsed.attempt, 1, "new jobs publish with attempt=1");
         assert!(parsed.published_at_unix_ms > 0);
+        // (#1426 ship-3) The retired fields never appear on the v4 wire form.
+        assert!(!json.contains("deliver"), "deliver retired in v4: {json}");
+        assert!(!json.contains("runtime"), "runtime retired in v4: {json}");
     }
 
     #[test]
@@ -366,10 +367,8 @@ mod tests {
             "scribe".to_string(),
             "draft a note".to_string(),
             "s-1".to_string(),
-            None, // deliver None
             None, // workdir None
             None, // phase_id None
-            darkmux_crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4)
             300,
             None, // published_by_machine None
@@ -379,10 +378,6 @@ mod tests {
         assert!(
             !json.contains("target_machine"),
             "None target_machine must be omitted: {json}"
-        );
-        assert!(
-            !json.contains("deliver"),
-            "None deliver must be omitted: {json}"
         );
         assert!(
             !json.contains("workdir"),
@@ -402,11 +397,12 @@ mod tests {
         );
     }
 
-    /// `Internal` is the only `Runtime` variant (#1405 removed the legacy
-    /// openclaw shell-out runtime). A WorkJob with no `runtime` field
-    /// deserializes against the Runtime enum's `#[default]` annotation.
+    /// (#1426 ship-3) A v4 `WorkJob` round-trips through serde with the
+    /// retired fields gone. This is the current-shape happy path that the
+    /// old `work_job_default_runtime_is_internal` / `runtime_enum_serdes_*`
+    /// tests (removed with the `Runtime` enum) used to cover in fragments.
     #[test]
-    fn work_job_default_runtime_is_internal() {
+    fn work_job_v4_shape_round_trips_without_retired_fields() {
         let json = r#"{
             "role_id": "scribe",
             "message": "hi",
@@ -416,22 +412,27 @@ mod tests {
             "attempt": 1
         }"#;
         let parsed: WorkJob = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.runtime, darkmux_crew::dispatch::Runtime::Internal);
+        let reser = serde_json::to_string(&parsed).unwrap();
+        // deny_unknown_fields tolerates the ABSENCE of the retired keys (they
+        // are simply gone), and the re-serialized form never re-introduces
+        // them.
+        assert!(!reser.contains("deliver"), "no deliver in v4: {reser}");
+        assert!(!reser.contains("runtime"), "no runtime in v4: {reser}");
+        assert_eq!(parsed.role_id, "scribe");
     }
 
-    /// Wave-E.14: lifting `runtime` from String to enum moves the
-    /// "unknown runtime" check from `validate()` to JSON-parse time. A
-    /// publisher that XADD's a job with `"runtime": "nuclear"` is
-    /// rejected before the job ever enters the runner's WorkJob in-memory
-    /// shape — the consumer's `serde_json::from_str` fails loud rather
-    /// than going through validate.
+    /// (#1426 ship-3) The retired `deliver` key on an old-peer record is a
+    /// deny_unknown_fields wire break at the pure-serde boundary, the
+    /// second line of defense behind the version-first claim gate (which is
+    /// exercised in `parse_xreadgroup_response_*` below). A v4 runner will
+    /// not silently accept a pre-4 job that still carries it.
     #[test]
-    fn work_job_unknown_runtime_rejected_at_deserialize() {
+    fn work_job_retired_deliver_key_rejected_at_deserialize() {
         let json = r#"{
             "role_id": "scribe",
             "message": "hi",
             "session_id": "s-1",
-            "runtime": "nuclear",
+            "deliver": "discord:123",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
             "attempt": 1
@@ -440,21 +441,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("variant") || err.contains("runtime") || err.contains("nuclear"),
-            "expected serde to name the unknown variant; got: {err}"
+            err.contains("deliver") || err.contains("unknown field"),
+            "expected deny_unknown_fields to name `deliver`; got: {err}"
         );
     }
 
-    /// Round-trip parity: Runtime::Internal serializes as "internal"
-    /// (lowercase), matching the pre-enum String values so older
-    /// JSON-on-disk records keep loading.
+    /// (#1426 ship-3) Same for the retired `runtime` key, the single-variant
+    /// enum removed in this bump. A pre-4 peer's `"runtime": "internal"`
+    /// (or the even-older `"openclaw"`) is now an unknown field.
     #[test]
-    fn runtime_enum_serdes_as_lowercase_string() {
-        use darkmux_crew::dispatch::Runtime;
-        let ic = serde_json::to_string(&Runtime::Internal).unwrap();
-        assert_eq!(ic, "\"internal\"");
-        let ic_back: Runtime = serde_json::from_str("\"internal\"").unwrap();
-        assert_eq!(ic_back, Runtime::Internal);
+    fn work_job_retired_runtime_key_rejected_at_deserialize() {
+        let json = r#"{
+            "role_id": "scribe",
+            "message": "hi",
+            "session_id": "s-1",
+            "runtime": "internal",
+            "timeout_seconds": 300,
+            "published_at_unix_ms": 0,
+            "attempt": 1
+        }"#;
+        let err = serde_json::from_str::<WorkJob>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("runtime") || err.contains("unknown field"),
+            "expected deny_unknown_fields to name `runtime`; got: {err}"
+        );
     }
 
     #[test]
@@ -483,8 +495,6 @@ mod tests {
             "s-test".to_string(),
             None,
             None,
-            None,
-            darkmux_crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4)
             600,
             None,
@@ -492,13 +502,15 @@ mod tests {
         );
         let job_json = serde_json::to_string(&job).unwrap();
         let entry_id = "1716192000000-0";
+        // (#1426 ship-3) The `schema` tag must match the runner's version or
+        // the version-first gate rejects the entry, a same-version happy path.
         let response = V::Array(vec![V::Array(vec![
             V::BulkString(b"darkmux:work".to_vec()),
             V::Array(vec![V::Array(vec![
                 V::BulkString(entry_id.as_bytes().to_vec()),
                 V::Array(vec![
                     V::BulkString(b"schema".to_vec()),
-                    V::BulkString(b"1".to_vec()),
+                    V::BulkString(WORK_JOB_SCHEMA_VERSION.as_bytes().to_vec()),
                     V::BulkString(b"record".to_vec()),
                     V::BulkString(job_json.as_bytes().to_vec()),
                 ]),
@@ -516,13 +528,15 @@ mod tests {
     fn parse_xreadgroup_malformed_on_missing_record_field() {
         use redis::Value as V;
         // Entry has fields but no `record` key — claimed but unparseable.
+        // Uses a CURRENT `schema` tag so the version-first gate (#1426 ship-3)
+        // passes and we exercise the missing-record branch, not the version arm.
         let response = V::Array(vec![V::Array(vec![
             V::BulkString(b"darkmux:work".to_vec()),
             V::Array(vec![V::Array(vec![
                 V::BulkString(b"1716192000000-0".to_vec()),
                 V::Array(vec![
                     V::BulkString(b"schema".to_vec()),
-                    V::BulkString(b"2".to_vec()),
+                    V::BulkString(WORK_JOB_SCHEMA_VERSION.as_bytes().to_vec()),
                     // record field absent
                 ]),
             ])]),
@@ -563,19 +577,23 @@ mod tests {
         assert!(reason.contains("invalid WorkJob JSON"));
     }
 
+    /// (#1426 ship-3) Version-first mismatch, one direction: a NEW runner
+    /// (v4) claims an OLD peer's job (`schema` tag v3, and the record still
+    /// carries the retired `deliver` / `runtime` keys). The version gate
+    /// reads the `schema` tag FIRST and routes to Malformed with a reason
+    /// that NAMES the version cause, so the operator sees the real problem
+    /// (a fleet on mixed schema versions) instead of a generic
+    /// deny_unknown_fields "unknown field `deliver`" parse error. The runner
+    /// XACKs it out of the PEL; it is never retried.
     #[test]
-    fn parse_xreadgroup_malformed_on_retired_openclaw_runtime() {
+    fn parse_xreadgroup_version_mismatch_old_peer_job_names_the_version() {
         use redis::Value as V;
-        // (#1405) Wire-compat pin: a fleet peer on a pre-2.0 release can
-        // still publish a WorkJob with the retired `"runtime": "openclaw"`.
-        // The record is otherwise fully valid, but the variant no longer
-        // exists — the claim boundary must route it to Malformed (work_id
-        // surfaced so the runner XACKs it), never Err or a panic. Pins the
-        // lenient old-peer boundary the openclaw removal created.
+        // A pre-4 peer's record: retired keys present, tagged schema v3.
         let record = br#"{
             "role_id": "coder",
             "message": "hi",
             "session_id": "s-1",
+            "deliver": "discord:123",
             "runtime": "openclaw",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
@@ -586,6 +604,8 @@ mod tests {
             V::Array(vec![V::Array(vec![
                 V::BulkString(b"1716192000000-8".to_vec()),
                 V::Array(vec![
+                    V::BulkString(b"schema".to_vec()),
+                    V::BulkString(b"3".to_vec()),
                     V::BulkString(b"record".to_vec()),
                     V::BulkString(record.to_vec()),
                 ]),
@@ -594,11 +614,79 @@ mod tests {
         let ClaimOutcome::Malformed { work_id, reason } =
             parse_xreadgroup_response(&response).unwrap()
         else {
-            panic!("expected ClaimOutcome::Malformed for a retired-runtime job");
+            panic!("expected ClaimOutcome::Malformed for a version-mismatched job");
         };
         assert_eq!(work_id, "1716192000000-8");
+        // The reason NAMES the version cause (v3) and the fix, not a generic
+        // unknown-field parse error.
+        assert!(reason.contains("schema v3"), "reason must name the version: {reason}");
+        assert!(
+            reason.contains("restart all fleet daemons"),
+            "reason must name the operational fix: {reason}"
+        );
+        assert!(
+            !reason.contains("unknown field"),
+            "version cause must WIN over the deny_unknown_fields parse error: {reason}"
+        );
+    }
+
+    /// (#1426 ship-3) Version-first also fires for a NEWER-than-us tag (an
+    /// old runner is not the only mismatch shape). Same Malformed routing,
+    /// same version-naming reason, the gate is a `!=`, not a `<`.
+    #[test]
+    fn parse_xreadgroup_version_mismatch_newer_peer_tag_also_rejected() {
+        use redis::Value as V;
+        let response = V::Array(vec![V::Array(vec![
+            V::BulkString(b"darkmux:work".to_vec()),
+            V::Array(vec![V::Array(vec![
+                V::BulkString(b"1716192000000-11".to_vec()),
+                V::Array(vec![
+                    V::BulkString(b"schema".to_vec()),
+                    V::BulkString(b"99".to_vec()),
+                    V::BulkString(b"record".to_vec()),
+                    V::BulkString(b"{}".to_vec()),
+                ]),
+            ])]),
+        ])]);
+        let ClaimOutcome::Malformed { work_id, reason } =
+            parse_xreadgroup_response(&response).unwrap()
+        else {
+            panic!("expected ClaimOutcome::Malformed for a newer-tag job");
+        };
+        assert_eq!(work_id, "1716192000000-11");
+        assert!(reason.contains("schema v99"), "reason must name the version: {reason}");
+    }
+
+    /// (#1426 ship-3) An ABSENT `schema` tag (a hypothetical pre-versioning
+    /// job, no such shape ever shipped, but be defensive) is NOT
+    /// version-rejected. It falls through to the record parse and is handled
+    /// honestly there, here the record is invalid JSON, so it lands in
+    /// Malformed via the invalid-JSON arm, not the version arm.
+    #[test]
+    fn parse_xreadgroup_absent_schema_tag_falls_through_to_record_parse() {
+        use redis::Value as V;
+        let response = V::Array(vec![V::Array(vec![
+            V::BulkString(b"darkmux:work".to_vec()),
+            V::Array(vec![V::Array(vec![
+                V::BulkString(b"1716192000000-12".to_vec()),
+                V::Array(vec![
+                    // no schema field at all
+                    V::BulkString(b"record".to_vec()),
+                    V::BulkString(b"{ not valid json".to_vec()),
+                ]),
+            ])]),
+        ])]);
+        let ClaimOutcome::Malformed { work_id, reason } =
+            parse_xreadgroup_response(&response).unwrap()
+        else {
+            panic!("expected ClaimOutcome::Malformed");
+        };
+        assert_eq!(work_id, "1716192000000-12");
         assert!(reason.contains("invalid WorkJob JSON"), "{reason}");
-        assert!(reason.contains("openclaw"), "reason should name the offending variant: {reason}");
+        assert!(
+            !reason.contains("schema v"),
+            "absent tag must NOT trigger the version arm: {reason}"
+        );
     }
 
     #[test]
@@ -661,8 +749,6 @@ mod tests {
             "s-1".to_string(),
             None,
             None,
-            None,
-            darkmux_crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4)
             600,
             None,
@@ -698,11 +784,11 @@ mod tests {
         assert!(err.contains("exceeds") && err.contains("role_id"));
     }
 
-    // Wave-E.14 (#255): `validate_rejects_unknown_runtime` /
-    // `validate_rejects_empty_runtime` removed — `runtime` is now a
-    // `Runtime` enum, so unknown/empty values are rejected at
-    // `serde::Deserialize` time before the WorkJob exists. See
-    // `work_job_unknown_runtime_rejected_at_deserialize` above.
+    // (#1426 ship-3) The `runtime` field (a single-variant enum after
+    // #1405/#1409) retired entirely in the WORK_JOB_SCHEMA_VERSION 3 to 4
+    // bump. A pre-4 peer's `runtime` key is now an unknown field, see
+    // `work_job_retired_runtime_key_rejected_at_deserialize` and the
+    // version-first claim gate tested in `parse_xreadgroup_version_mismatch_*`.
 
     #[test]
     fn validate_rejects_oversize_message() {
@@ -913,7 +999,6 @@ mod tests {
             "role_id": "coder",
             "message": "hi",
             "session_id": "s-1",
-            "runtime": "internal",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
             "attempt": 1,
@@ -939,7 +1024,6 @@ mod tests {
             "role_id": "coder",
             "message": "hi",
             "session_id": "s-1",
-            "runtime": "internal",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
             "attempt": 1
@@ -963,7 +1047,6 @@ mod tests {
             "role_id": "coder",
             "message": "hi",
             "session_id": "s-1",
-            "runtime": "internal",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
             "attempt": 1

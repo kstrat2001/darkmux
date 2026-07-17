@@ -63,7 +63,7 @@ fn build_version_static() -> &'static str {
 }
 
 #[derive(Parser)]
-#[command(name = "darkmux", version = build_version_static(), about = "Lab and multiplexer for local LLM configurations")]
+#[command(name = "darkmux", version = build_version_static(), about = "Mission orchestrator and lab for local AI")]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Cmd,
@@ -117,11 +117,6 @@ pub(crate) enum Cmd {
         /// lab-validated model that profile maps to.
         #[arg(long)]
         profile: Option<String>,
-        /// Optional delivery target in `<channel>:<target>` form
-        /// (e.g. `discord:1500166601909993503`). Reserved for a future
-        /// delivery integration — not consumed by the internal runtime today.
-        #[arg(long)]
-        deliver: Option<String>,
         /// Override the dispatch session id. Default: a fresh
         /// `crew-dispatch-<role>-<unix-micros>-<process-counter>` is
         /// generated per call, so consecutive dispatches don't share
@@ -276,7 +271,7 @@ pub(crate) enum Cmd {
     },
     /// Read/write `~/.darkmux/config.json` settings (#937). `set` validates the
     /// key + coerces the value; secrets stay in the Keychain. Distinct from
-    /// `profile` (the swap-profiles registry).
+    /// `profile` (the profiles registry).
     Config {
         #[command(subcommand)]
         sub: crate::config_cmd::ConfigCmd,

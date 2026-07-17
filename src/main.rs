@@ -96,7 +96,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             message,
             message_from_file,
             profile,
-            deliver,
             session_id,
             timeout,
             workdir,
@@ -112,7 +111,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             message,
             message_from_file,
             profile,
-            deliver,
             session_id,
             timeout,
             workdir,
@@ -415,7 +413,6 @@ pub(crate) fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
                 slug,
                 dry_run,
                 machine_override: machine,
-                runtime: crew::dispatch::Runtime::Internal,
             })?;
             println!("source run: {}", report.run_dir.display());
             println!("entry path: {}", report.entry_path.display());
@@ -1012,13 +1009,7 @@ fn cmd_mission_dispatch(
             phase.description.clone(),
             session_id.clone(),
             None,
-            None,
             Some(phase.id.clone()),
-            // Mission dispatch publishes work jobs to peers; the runner
-            // on the receiving machine runs the role through the
-            // internal Docker-bounded runtime — the only dispatch path
-            // (#1405).
-            crate::crew::dispatch::Runtime::Internal,
             None, // image (#703 Slice 4) — mission dispatch uses the runner's default
             timeout_seconds,
             local_machine.clone(),
@@ -1245,7 +1236,6 @@ struct DispatchInvocation {
     message: Option<String>,
     message_from_file: Option<std::path::PathBuf>,
     profile: Option<String>,
-    deliver: Option<String>,
     session_id: Option<String>,
     timeout: u32,
     workdir: Option<std::path::PathBuf>,
@@ -1269,7 +1259,6 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         message,
         message_from_file,
         profile,
-        deliver,
         session_id,
         timeout,
         workdir,
@@ -1335,14 +1324,12 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     let opts = crew::dispatch::DispatchOpts {
         role_id: role,
         message,
-        deliver,
         session_id,
         timeout_seconds: timeout,
         skip_preflight,
         json,
         workdir,
         phase_id,
-        runtime: crew::dispatch::Runtime::Internal,
         machine,
         wait: !no_wait,
         // A bare `dispatch` carries no profile-derived compaction config here;

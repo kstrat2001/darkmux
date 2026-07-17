@@ -696,14 +696,9 @@ impl WorkloadProvider for ToolBenchProvider {
         sandbox_dir: &Path,
         profile: &Profile,
         profile_name: &str,
-        runtime: darkmux_crew::dispatch::Runtime,
         config_path: Option<&str>,
         _loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
     ) -> Result<RunResult> {
-        // `Runtime` has a single variant post-#1405 (the legacy `openclaw`
-        // shell-out runtime, which tool-bench's provenance scoring never
-        // supported, was removed).
-        let darkmux_crew::dispatch::Runtime::Internal = runtime;
         let wl = &loaded.manifest.workload;
         let extras_u64 = |key: &str| wl.extras.get(key).and_then(|v| v.as_u64());
         let trials_per_task = extras_u64("trials").unwrap_or(1).clamp(1, 20) as u32;
@@ -1017,18 +1012,16 @@ fn dispatch_task(
     config_path: Option<&str>,
     timeout: u32,
 ) -> Result<(String, String, bool, Option<PathBuf>)> {
-    use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
+    use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
         role_id: role_id.to_string(),
         message: prompt.to_string(),
-        deliver: None,
         session_id: Some(session_id.to_string()),
         timeout_seconds: timeout,
         skip_preflight: false,
         json: true,
         workdir: Some(workdir),
         phase_id: None,
-        runtime: Runtime::Internal,
         machine: None,
         wait: true,
         compaction,
