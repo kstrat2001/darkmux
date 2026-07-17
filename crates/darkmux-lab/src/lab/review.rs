@@ -11,7 +11,7 @@
 //! ```
 //!
 //! This module is the DRIVER: given a resolved crew (packet 1's
-//! `darkmux_profiles::crews::resolve_crew`), a diff, and an intent, it runs
+//! the resourcing resolver `darkmux_crew::resourcing`), a diff, and an intent, it runs
 //! the whole pipeline and returns a [`ReviewEnvelope`]. Dispatch itself goes
 //! through a caller-injected `chat` closure (the container-free single-shot
 //! primitive from packet 2, `darkmux_crew::single_shot::single_shot_chat`,
@@ -142,7 +142,7 @@ use darkmux_crew::telemetry_sampler::{sample_host, HostSample};
 // adapters (their first production call site) — see the "model cycling"
 // section below.
 use darkmux_gestalt::{AcquireOpts, AcquireScope, Action, CallerIntent, Facts, ModelHost, Placement, ResourceProbe, V1Estimator};
-use darkmux_profiles::crews::{ResolvedCrew, ResolvedSeatStaffing};
+use darkmux_crew::resourcing::{ResolvedCrew, ResolvedSeatStaffing};
 use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
 use darkmux_profiles::swap;
 use darkmux_types::{BundleSelector, ModelEndpoint, ProfileModel};

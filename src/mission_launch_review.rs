@@ -96,7 +96,7 @@ use darkmux_lab::lab::review::{
     staffing_snapshot, validate_review_crew, BundleInput, ChatCall, ExecMode, LmsCycler,
     ProbeFlag, ReviewEmitter, ReviewEnvelope, ReviewInputs, ReviewStepContext,
 };
-use darkmux_profiles::crews::{resolve_crew, ResolvedCrew};
+use darkmux_crew::resourcing::{resolve_review_resourcing, ResolvedCrew, ReviewResourcing};
 use darkmux_profiles::profiles::load_registry;
 use darkmux_profiles::swap;
 use darkmux_types::dispatch_liveness::{liveness, liveness_case, liveness_detail};
@@ -114,6 +114,35 @@ fn str_input<'a>(collected: &'a BTreeMap<String, Value>, key: &str) -> Option<&'
 
 fn path_input(collected: &BTreeMap<String, Value>, key: &str) -> Option<PathBuf> {
     str_input(collected, key).map(PathBuf::from)
+}
+
+/// (#1426 ship-2) Parse a comma-separated `--param key=a,b,c` into a `Vec` of
+/// trimmed, non-empty items — the launch-param shape for `probe_models` (one
+/// probe staffing per listed model id). Absent/blank => empty.
+fn csv_input(collected: &BTreeMap<String, Value>, key: &str) -> Vec<String> {
+    str_input(collected, key)
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// (#1426 ship-2) Parse a boolean `--param key=true` — truthy on
+/// `true`/`1`/`yes`/`on` (case-insensitive), a real JSON `true`, or a nonzero
+/// number. Absent/anything else => `false`.
+fn bool_input(collected: &BTreeMap<String, Value>, key: &str) -> bool {
+    match collected.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+        }
+        Some(Value::Number(n)) => n.as_u64().map(|v| v != 0).unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// Tolerates both a real JSON number (an `--input <file>`) and a numeric
@@ -582,7 +611,17 @@ pub(crate) fn launch(
             // shape. Warn (don't error) — operator sovereignty: surface,
             // never silently ignore.
             let mut ignored: Vec<&str> = Vec::new();
-            for key in ["crew", "worktree", "github", "head_sha", "bundler", "k"] {
+            for key in [
+                "profile",
+                "probe_models",
+                "judge_model",
+                "verify_model",
+                "worktree",
+                "github",
+                "head_sha",
+                "bundler",
+                "k",
+            ] {
                 if collected.contains_key(key) {
                     ignored.push(key);
                 }
@@ -631,32 +670,32 @@ fn run_dispatch(
     timeout_seconds: u32,
 ) -> Result<ReviewEnvelope> {
     let case = derive_case_id(collected);
-    let crew_name = match str_input(collected, "crew").map(str::trim).filter(|s| !s.is_empty()) {
-        Some(c) => c.to_string(),
-        None => {
-            let available = load_registry(str_input(collected, "profiles"))
-                .map(|l| l.registry.crews.keys().map(String::as_str).collect::<Vec<_>>().join(", "))
-                .unwrap_or_default();
-            bail!(
-                "mission launch review: input `crew` is required (unless `from_envelope`) — name \
-                 a crew from your profiles.json's \"crews\" map via --param crew=<name>. \
-                 Available: {}",
-                if available.is_empty() { "(none)".to_string() } else { available }
-            );
-        }
-    };
 
     let source = resolve_source(collected)?;
     liveness_detail("config-resolved", &case, &config_detail());
     let loaded = load_registry(str_input(collected, "profiles"))?;
-    let mut crew = resolve_crew(&loaded.registry, &crew_name)?;
-    if let Some(k) = u32_input(collected, "k")? {
-        if let Some(staffings) = crew.seats.get_mut("review-probe") {
-            for s in staffings.iter_mut() {
-                s.k = k;
-            }
-        }
-    }
+    // (#1426 ship-2) The crews map retired: review staffing is DERIVED by the
+    // resourcing resolver from the active profile's models (per-seat
+    // `select_model` scoring) plus launch-param seat pins. `profile` names the
+    // roster (else `default_profile`); `probe_models`/`judge_model`/
+    // `verify_model` pin a seat to an explicit model id; `k` is the probe draw
+    // breadth. System proposes, operator overrides, the envelope snapshot
+    // records what resolved (operator sovereignty #44).
+    let resourcing = ReviewResourcing {
+        profile: str_input(collected, "profile").map(str::to_string),
+        probe_models: csv_input(collected, "probe_models"),
+        judge_model: str_input(collected, "judge_model")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        verify_model: str_input(collected, "verify_model")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        k: u32_input(collected, "k")?,
+        request_changes: bool_input(collected, "request_changes"),
+    };
+    let crew = resolve_review_resourcing(&loaded.registry, &resourcing)?;
     liveness_detail("crew-resolved", &case, &crew_detail(&crew));
 
     liveness_case("bundling-start", &case);
@@ -995,7 +1034,7 @@ fn run_dispatch(
 mod tests {
     use super::*;
     use darkmux_lab::lab::review::MemberRecord;
-    use darkmux_profiles::crews::ResolvedSeatStaffing;
+    use darkmux_crew::resourcing::ResolvedSeatStaffing;
     use darkmux_types::ProfileModel;
 
     // ── #1272-equivalent: dispatch.start/terminal bookends around a

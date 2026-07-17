@@ -1,5 +1,5 @@
 {
-  "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-pipeline-dedicated profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_crews_comment` below) that staff the `review-deep` crew, plus one hosted endpoint example (hosted-frontier). A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models (#1282). Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
+  "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-pipeline-dedicated profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_review_staffing_comment` below) whose models the review resourcing resolver scores per seat, plus one hosted endpoint example (hosted-frontier). A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models (#1282). Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
 
   "schema_version": "1.5",
 
@@ -73,19 +73,5 @@
     "utility": "qwen/qwen3-4b-instruct-2507"
   },
 
-  "_crews_comment": "crews[] (#1222) — saved crew assignments: which models staff which crew-role seats, for multi-seat pipelines (e.g. a review pipeline's probe + judge seats). `seats` is keyed by crew role id (crates/darkmux-crew's role vocabulary). Each seat's value is a list of staffings — a profile + optional explicit model id (absent = that profile's default model), draws-per-item `k` (default 3), and an optional bundle_selector scoping which fact families a staffing draws from. The judge seat also takes `passes` (#1266) — its consensus depth: 1 = single pass (pass-1's ruling is the tier; the frontier cost lever), 2 = double-confirm (default, shown here), N = unanimous consensus over N passes with early-exit. `k` is probe breadth, `passes` is judge depth — distinct axes. Local-only in v1: a staffing naming a model with a remote endpoint fails validation.",
-  "crews": {
-    "review-deep": {
-      "description": "Deep review lineup, three distinct models: two probe staffings (one plain, one bundle-scoped) on their own dense wide-instruct profiles, plus a judge staffing on its own MoE-reasoner profile. Mirrors the runner example in .github/DARKMUX_REVIEW_RUNNER.md.",
-      "seats": {
-        "review-probe": [
-          { "profile": "devstral", "k": 3 },
-          { "profile": "qwen3.6-27b-review", "k": 1, "bundle_selector": { "fact_families": ["security", "correctness"] } }
-        ],
-        "review-judge": [
-          { "profile": "judge-35b-moe", "passes": 2 }
-        ]
-      }
-    }
-  }
+  "_review_staffing_comment": "Review staffing is DERIVED, not declared (#1426 ship-2 — the `crews` map retired). `darkmux mission launch review` resources each seat (probe / judge / verify) from the active profile's models via capability scoring, with optional per-seat pins as launch params: `--param profile=<roster>` picks which profile is the roster (else `default_profile`), `--param probe_models=id,id` staffs one probe drawer per listed model id, `--param judge_model=<id>` / `--param verify_model=<id>` pin those seats, and `--param k=<n>` sets the probe draw breadth. Give the roster profile the review models you want scored (e.g. the devstral / qwen3.6-27b-review / judge-35b-moe entries above), and the resolver staffs the seats. A leftover `crews` key from a pre-2.0 file is harmless residue (`darkmux doctor` notes it)."
 }

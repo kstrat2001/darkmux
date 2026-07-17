@@ -1275,7 +1275,6 @@ mod tests {
             profiles,
             default_profile: None,
             internal: None,
-            crews: Default::default(),
             quarantined: Default::default(),
         }
     }

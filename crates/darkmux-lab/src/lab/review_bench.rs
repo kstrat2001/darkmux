@@ -695,7 +695,7 @@ fn dispatch_case(
 /// [`resolve_funnel_ctx`] before the per-case loop (fail loud before any
 /// dispatch spends a token, same discipline as the `--workdirs` preflight).
 struct FunnelCtx {
-    crew: darkmux_profiles::crews::ResolvedCrew,
+    crew: darkmux_crew::resourcing::ResolvedCrew,
     exec_mode: super::review::ExecMode,
     probe_system: String,
     judge_system: String,
@@ -720,37 +720,35 @@ fn parse_exec_mode(s: Option<&str>) -> Result<super::review::ExecMode> {
     }
 }
 
-/// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, resolve
-/// `--crew` against it (`darkmux_profiles::crews::resolve_crew` — the same
-/// validation `dispatch` would apply), validate it carries the
-/// funnel's own seat requirements (`review::validate_review_crew` — the
-/// SAME check `run_review` runs internally, called here too so a
-/// misconfigured crew fails at bench START, not at the first case's
-/// dispatch), apply `--k` as an override on every `review-probe` staffing's
-/// draw count, parse `--exec-mode`, and resolve the `review-probe`/
-/// `review-judge` seat system prompts. Every failure here is loud and
-/// happens BEFORE any dispatch — a misconfigured crew or a missing seat
-/// prompt must never silently corrupt a bench run.
+/// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, DERIVE the
+/// review staffing from the roster via the resourcing resolver
+/// (`darkmux_crew::resourcing::resolve_review_resourcing` — #1426 ship-2, which
+/// scores a model per seat against the active profile), validate it carries the
+/// funnel's own seat requirements (`review::validate_review_crew` — the SAME
+/// check `run_review` runs internally, called here too so a misconfigured
+/// roster fails at bench START, not at the first case's dispatch), apply `--k`
+/// as the probe draw count, parse `--exec-mode`, and resolve the seat system
+/// prompts. Every failure here is loud and happens BEFORE any dispatch.
+///
+/// (#1426 ship-2) `--crew` no longer names a `crews.<name>` entry (the map
+/// retired) — it names the ROSTER PROFILE the seats are resourced from; absent,
+/// the bench's `--profile` (else the registry's `default_profile`) is the
+/// roster.
 fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
-    let crew_name = opts.crew.as_deref().ok_or_else(|| {
-        anyhow!(
-            "--funnel requires --crew <name> (the crews.<name> entry naming the \
-             review-probe/review-judge seat staffing)"
-        )
-    })?;
     let loaded = darkmux_profiles::profiles::load_registry(opts.config_path.as_deref())
         .context("loading profile registry for --funnel")?;
-    let mut crew = darkmux_profiles::crews::resolve_crew(&loaded.registry, crew_name)
-        .with_context(|| format!("resolving crew \"{crew_name}\" for --funnel"))?;
-    super::review::validate_review_crew(&crew)
-        .with_context(|| format!("crew \"{crew_name}\" for --funnel"))?;
-    if let Some(k) = opts.k_override {
-        if let Some(staffings) = crew.seats.get_mut("review-probe") {
-            for s in staffings.iter_mut() {
-                s.k = k;
-            }
-        }
-    }
+    let roster = opts
+        .crew
+        .clone()
+        .or_else(|| opts.profile_name.clone());
+    let resourcing = darkmux_crew::resourcing::ReviewResourcing {
+        profile: roster,
+        k: opts.k_override,
+        ..Default::default()
+    };
+    let crew = darkmux_crew::resourcing::resolve_review_resourcing(&loaded.registry, &resourcing)
+        .context("resolving review staffing for --funnel")?;
+    super::review::validate_review_crew(&crew).context("review staffing for --funnel")?;
     let exec_mode = parse_exec_mode(opts.exec_mode.as_deref())?;
     let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
         anyhow!("darkmux: role \"review-probe\" has no system prompt (missing review-probe.md)")
