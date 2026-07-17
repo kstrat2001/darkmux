@@ -115,6 +115,31 @@ pub struct StepRow {
     pub started_ts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_ts: Option<u64>,
+    /// (#1432 item 4) FINALIZED token/turn totals folded from this
+    /// mission's flow records at page-load time, so a completed step whose
+    /// dispatch ran BEFORE the page opened shows its real total immediately
+    /// (the page's SSE channel is tail-from-now, so without this a page
+    /// opened after a step finished renders its meter blank). Absent (None)
+    /// for a step that never dispatched or whose records aren't on disk (a
+    /// mixed-era mission) — the page then shows the idle placeholder, an
+    /// honest "no data" rather than a wrong zero. MIXED-ERA also includes
+    /// records from before the #1436 session-id rename: a colon-era
+    /// `step:<id>` session id matches none of the fold's correlation keys
+    /// (which read the current `step-<id>` shape), so pre-rename steps stay
+    /// honest-absent rather than mis-folding — pinned by
+    /// `fold_finals_colon_era_session_ids_do_not_fold`. The SSE stream stays
+    /// the LIVE-increment channel; these are only the terminal totals.
+    /// Additive camelCase (`tokensFinal`/`turnsFinal`/`cloud`); pre-#1432
+    /// consumers ignore them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_final: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns_final: Option<u64>,
+    /// `Some(true)` when any folded record for this step carried a hosted
+    /// endpoint (a remote/cloud call) — the page colors the backfilled total
+    /// the same "cloud" hue the live meter uses. Absent when local-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<bool>,
 }
 
 /// One edge in the rendered graph. Same `camelCase` wire contract as
@@ -561,8 +586,244 @@ fn split_on_placeholders(pattern: &str) -> Vec<String> {
     segments
 }
 
+/// (#1432 item 4) The finalized token/turn totals folded for one step from
+/// this mission's flow records. Mirrors the page's own
+/// `applyRecordToMetrics` FINAL branch (`assets/mission-graph.html`) so the
+/// server backfill and the live SSE channel agree on what "finalized" means.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct StepFinals {
+    pub tokens: Option<u64>,
+    pub turns: Option<u64>,
+    pub cloud: bool,
+}
+
+/// Which step id (if any) a flow record attributes to, using the SAME three
+/// correlation keys, in the SAME order, the page's `stepForRecord` uses:
+/// (1) `payload.step_id`; (2) a `session_id` of the `step-<id>` shape a
+/// `dispatch.internal` step defaults to; (3) `handle == <step id>`. Returns
+/// the id only when it is one of THIS mission's steps (`step_ids`), so a
+/// scan over a shared per-day flow file attributes nothing foreign.
+fn step_for_record<'a>(rec: &serde_json::Value, step_ids: &'a BTreeSet<String>) -> Option<&'a str> {
+    if let Some(sid) = rec.get("payload").and_then(|p| p.get("step_id")).and_then(|s| s.as_str()) {
+        if let Some(found) = step_ids.get(sid) {
+            return Some(found.as_str());
+        }
+    }
+    if let Some(session) = rec.get("session_id").and_then(|s| s.as_str()) {
+        if let Some(rest) = session.strip_prefix("step-") {
+            if let Some(found) = step_ids.get(rest) {
+                return Some(found.as_str());
+            }
+        }
+    }
+    if let Some(handle) = rec.get("handle").and_then(|s| s.as_str()) {
+        if let Some(found) = step_ids.get(handle) {
+            return Some(found.as_str());
+        }
+    }
+    None
+}
+
+/// Pure: fold a stream of flow records into per-step FINALIZED totals.
+/// Only TERMINAL totals are folded — `dispatch complete`/`dispatch.complete`
+/// (`total_tokens` + `total_turns`) and `step result` — taking the max
+/// across records (a re-run's later complete wins). A `step result`'s token
+/// total reads `payload.total_tokens` first, falling back to `payload.tokens`
+/// (#1445 gate: the review vocabulary's probe/judge/verify step results carry
+/// `tokens`, never `total_tokens` — without the fallback the most-viewed
+/// mission kind folds nothing). Same precedence as the page's own
+/// `applyRecordToMetrics`. The per-turn RUNNING increments
+/// (`telemetry.tokens`, `dispatch.turn`) are deliberately NOT folded here:
+/// those stay the page's live SSE channel, so the backfill can never race
+/// ahead of or double-count the live meter. ANY matched record naming a
+/// hosted `payload.endpoint` marks its step `cloud` — terminal or not,
+/// mirroring the JS fold (which flags cloud before its action branches).
+/// Pure + iterator-driven so the correlation/fold logic is unit-testable
+/// without touching the filesystem.
+pub(crate) fn fold_step_finals<I>(records: I, step_ids: &BTreeSet<String>) -> BTreeMap<String, StepFinals>
+where
+    I: IntoIterator<Item = serde_json::Value>,
+{
+    let mut out: BTreeMap<String, StepFinals> = BTreeMap::new();
+    for rec in records {
+        let Some(sid) = step_for_record(&rec, step_ids) else {
+            continue;
+        };
+        let action = rec.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        let payload = rec.get("payload");
+        let endpoint = payload.and_then(|p| p.get("endpoint")).map(|v| !v.is_null()).unwrap_or(false);
+        let is_complete = action == "dispatch complete" || action == "dispatch.complete";
+        let is_step_result = action == "step result";
+        if !endpoint && !is_complete && !is_step_result {
+            continue;
+        }
+        let entry = out.entry(sid.to_string()).or_default();
+        if endpoint {
+            entry.cloud = true;
+        }
+        if !is_complete && !is_step_result {
+            continue;
+        }
+        // (#1445 gate) `total_tokens` wins when both are present; `tokens` is
+        // the review-vocabulary fallback. Same precedence as the JS fold.
+        let total_tokens = payload
+            .and_then(|p| p.get("total_tokens"))
+            .and_then(|v| v.as_u64())
+            .or_else(|| payload.and_then(|p| p.get("tokens")).and_then(|v| v.as_u64()));
+        let total_turns = payload.and_then(|p| p.get("total_turns")).and_then(|v| v.as_u64());
+        if let Some(t) = total_tokens {
+            entry.tokens = Some(entry.tokens.map_or(t, |cur| cur.max(t)));
+        }
+        if is_complete {
+            if let Some(n) = total_turns {
+                entry.turns = Some(entry.turns.map_or(n, |cur| cur.max(n)));
+            }
+        }
+    }
+    out
+}
+
+/// Days since the Unix epoch for a civil calendar date (Howard Hinnant's
+/// `days_from_civil`) — lets the backfill compare a flow day file's
+/// `YYYY-MM-DD` stem against a mission's `created_ts` without a date crate.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (i64::from(m) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Parse a flow day-file stem (`YYYY-MM-DD`) into days since the epoch.
+/// `None` for anything that isn't a well-formed date stem — which also
+/// excludes non-day `.jsonl` files from the backfill scan, matching
+/// `resolve_session`'s own `is_valid_date` filter.
+fn day_stem_to_epoch_days(stem: &str) -> Option<i64> {
+    let b = stem.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y: i64 = stem[0..4].parse().ok()?;
+    let m: u32 = stem[5..7].parse().ok()?;
+    let d: u32 = stem[8..10].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// The inverse of [`days_from_civil`] (Hinnant's `civil_from_days`), as a
+/// `YYYY-MM-DD` stem. Test-only: lets tests name a flow day file for "today"
+/// without a date crate, so the route-level backfill tests aren't pinned to
+/// the date they were written on.
+#[cfg(test)]
+pub(crate) fn epoch_days_to_stem(days: i64) -> String {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// One day of margin below `date(mission.created_ts)` on the backfill's
+/// day-file window — absorbs timezone/rollover skew between the clock that
+/// stamped `created_ts` and the UTC day the flow sink named its file after.
+const BACKFILL_DAY_MARGIN_DAYS: i64 = 1;
+
+/// Hard cap on flow records parsed per backfill (#1445 gate) — a pathological
+/// long-lived mission (months of day files inside its window) stops folding
+/// here instead of parsing unboundedly on a 20s-polled endpoint. Generous:
+/// the measured busy corpus was ~100K records across 60 days, and the window
+/// filter already drops everything before the mission existed. When the cap
+/// trips, whatever folded so far is kept (files scan oldest-first, so the
+/// kept prefix is deterministic).
+pub(crate) const MAX_BACKFILL_RECORDS: usize = 100_000;
+
+/// Fold this mission's steps' finalized totals from the flow day files
+/// (#1432 item 4), scanning ONLY files inside the mission's lifetime window:
+/// a day file is read iff its `YYYY-MM-DD` stem is on or after
+/// `date(mission_created_ts) - BACKFILL_DAY_MARGIN_DAYS` (#1445 gate —
+/// `resolve_session`'s bounded-window pattern generalized to the mission's
+/// lifetime; a record older than the mission cannot belong to its steps).
+/// Best-effort: a missing/unreadable directory or file, or a malformed line,
+/// is skipped (the graph then carries less backfill, honest "no data").
+fn backfill_step_finals(
+    flows_dir: &std::path::Path,
+    step_ids: &BTreeSet<String>,
+    mission_created_ts: u64,
+) -> BTreeMap<String, StepFinals> {
+    backfill_step_finals_bounded(flows_dir, step_ids, mission_created_ts, MAX_BACKFILL_RECORDS)
+}
+
+/// [`backfill_step_finals`] with the record cap injectable for tests.
+fn backfill_step_finals_bounded(
+    flows_dir: &std::path::Path,
+    step_ids: &BTreeSet<String>,
+    mission_created_ts: u64,
+    max_records: usize,
+) -> BTreeMap<String, StepFinals> {
+    use std::io::BufRead;
+    if step_ids.is_empty() || max_records == 0 {
+        return BTreeMap::new();
+    }
+    let Ok(dir) = std::fs::read_dir(flows_dir) else {
+        return BTreeMap::new();
+    };
+    let min_day = (mission_created_ts / 86400) as i64 - BACKFILL_DAY_MARGIN_DAYS;
+    let mut day_files: Vec<std::path::PathBuf> = dir
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                return false;
+            }
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(day_stem_to_epoch_days)
+                .is_some_and(|days| days >= min_day)
+        })
+        .collect();
+    day_files.sort();
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    'files: for path in day_files {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file).lines() {
+            let Ok(line) = line else { continue };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // A malformed line is skipped, never fatal — pinned by
+            // `backfill_skips_malformed_lines`.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                records.push(v);
+                if records.len() >= max_records {
+                    break 'files;
+                }
+            }
+        }
+    }
+    fold_step_finals(records, step_ids)
+}
+
 /// Build the full node-link graph for one mission. `Ok(None)` when no
 /// mission with this id exists (the route answers 404).
+///
+/// `flows_dir` is scanned once (#1432 item 4) to backfill completed steps'
+/// finalized token/turn totals into their `StepRow`s — bounded to day files
+/// inside the mission's lifetime window (#1445 gate), see
+/// [`backfill_step_finals`]. An empty/nonexistent `flows_dir` (e.g. a test
+/// router built with `PathBuf::new()`) simply yields no backfill.
 ///
 /// **Degradation granularity is per-DIRECTORY, not per-file.** Every
 /// filesystem read here is `unwrap_or_default`, but the underlying
@@ -586,7 +847,10 @@ fn split_on_placeholders(pattern: &str) -> Vec<String> {
 /// `config-snapshot.json` when available (#1402 — see
 /// [`kind_from_config_snapshot`]), falling back to the deep `"unknown"`
 /// chain only when no snapshot exists either.
-pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGraph>> {
+pub fn build_mission_graph(
+    mission_id: &str,
+    flows_dir: &std::path::Path,
+) -> anyhow::Result<Option<MissionGraph>> {
     let missions = darkmux_crew::loader::load_missions().unwrap_or_default();
     let Some(mission) = missions.into_iter().find(|m: &Mission| m.id == mission_id) else {
         return Ok(None);
@@ -631,6 +895,13 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
         steps_by_phase.insert(phase_id.clone(), steps);
     }
     let task_depth = layer_tasks_by_depth(&all_tasks);
+
+    // (#1432 item 4) Every step id this mission declares, across all phases —
+    // the correlation filter for the flow-record backfill below. Read once,
+    // bounded to the mission's lifetime window (#1445 gate).
+    let all_step_ids: BTreeSet<String> =
+        all_tasks.iter().flat_map(|t| t.step_ids.iter().cloned()).collect();
+    let step_finals = backfill_step_finals(flows_dir, &all_step_ids, mission.created_ts);
 
     for (phase_index, phase_id) in mission.phase_ids.iter().enumerate() {
         let Some(phase) = phase_by_id.remove(phase_id) else {
@@ -686,25 +957,43 @@ pub fn build_mission_graph(mission_id: &str) -> anyhow::Result<Option<MissionGra
             let step_rows: Vec<StepRow> = task
                 .step_ids
                 .iter()
-                .map(|step_id| match steps.get(step_id) {
-                    Some(step) => StepRow {
-                        id: step.id.clone(),
-                        label: resolve_step_label(&step.kind, &step.id),
-                        kind: step.kind.clone(),
-                        status: node_status_str(step.status),
-                        started_ts: step.started_ts,
-                        completed_ts: step.completed_ts,
-                    },
-                    None => {
-                        let kind = kind_from_config_snapshot(mission_id, &task.id, step_id)
-                            .unwrap_or_default();
-                        StepRow {
-                            id: step_id.clone(),
-                            label: resolve_step_label(&kind, step_id),
-                            kind,
-                            status: node_status_str(NodeStatus::Planned),
-                            started_ts: None,
-                            completed_ts: None,
+                .map(|step_id| {
+                    // (#1432 item 4) Attach the backfilled finalized totals
+                    // (None everywhere the mission has no folded records for
+                    // this step — a never-dispatched or mixed-era step).
+                    let fin = step_finals.get(step_id);
+                    let tokens_final = fin.and_then(|f| f.tokens);
+                    let turns_final = fin.and_then(|f| f.turns);
+                    let cloud = match fin {
+                        Some(f) if f.cloud => Some(true),
+                        _ => None,
+                    };
+                    match steps.get(step_id) {
+                        Some(step) => StepRow {
+                            id: step.id.clone(),
+                            label: resolve_step_label(&step.kind, &step.id),
+                            kind: step.kind.clone(),
+                            status: node_status_str(step.status),
+                            started_ts: step.started_ts,
+                            completed_ts: step.completed_ts,
+                            tokens_final,
+                            turns_final,
+                            cloud,
+                        },
+                        None => {
+                            let kind = kind_from_config_snapshot(mission_id, &task.id, step_id)
+                                .unwrap_or_default();
+                            StepRow {
+                                id: step_id.clone(),
+                                label: resolve_step_label(&kind, step_id),
+                                kind,
+                                status: node_status_str(NodeStatus::Planned),
+                                started_ts: None,
+                                completed_ts: None,
+                                tokens_final,
+                                turns_final,
+                                cloud,
+                            }
                         }
                     }
                 })
@@ -788,6 +1077,221 @@ mod tests {
             workdir: None,
             image: None,
         }
+    }
+
+    // ─── (#1432 item 4) flow-record backfill ───────────────────────────
+
+    fn ids(v: &[&str]) -> BTreeSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fold_finals_step_result_record_folds_total_tokens() {
+        let step_ids = ids(&["review-judge-step"]);
+        let rec = serde_json::json!({
+            "action": "step result",
+            "payload": { "step_id": "review-judge-step", "total_tokens": 4200 }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids);
+        assert_eq!(out["review-judge-step"].tokens, Some(4200));
+        assert_eq!(out["review-judge-step"].turns, None);
+        assert!(!out["review-judge-step"].cloud);
+    }
+
+    #[test]
+    fn fold_finals_dispatch_complete_folds_tokens_turns_via_session_id() {
+        // Correlation key 2: session_id `step-<id>` (the dispatch.internal default).
+        let step_ids = ids(&["s1"]);
+        let rec = serde_json::json!({
+            "action": "dispatch.complete",
+            "session_id": "step-s1",
+            "payload": { "total_tokens": 15200, "total_turns": 9 }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids);
+        assert_eq!(out["s1"].tokens, Some(15200));
+        assert_eq!(out["s1"].turns, Some(9));
+    }
+
+    #[test]
+    fn fold_finals_handle_key_and_max_across_records() {
+        // Correlation key 3 (handle == step id) + max wins across a re-run.
+        let step_ids = ids(&["s1"]);
+        let recs = vec![
+            serde_json::json!({ "action": "dispatch complete", "handle": "s1",
+                                "payload": { "total_tokens": 100, "total_turns": 2 } }),
+            serde_json::json!({ "action": "dispatch complete", "handle": "s1",
+                                "payload": { "total_tokens": 900, "total_turns": 5 } }),
+        ];
+        let out = fold_step_finals(recs, &step_ids);
+        assert_eq!(out["s1"].tokens, Some(900), "later/higher complete wins");
+        assert_eq!(out["s1"].turns, Some(5));
+    }
+
+    #[test]
+    fn fold_finals_endpoint_marks_cloud() {
+        let step_ids = ids(&["s1"]);
+        let rec = serde_json::json!({
+            "action": "step result",
+            "payload": { "step_id": "s1", "total_tokens": 50, "endpoint": "https://api.example/v1" }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids);
+        assert!(out["s1"].cloud);
+        assert_eq!(out["s1"].tokens, Some(50));
+    }
+
+    #[test]
+    fn fold_finals_ignores_foreign_steps_and_running_increments() {
+        let step_ids = ids(&["mine"]);
+        let recs = vec![
+            // Foreign step — not in this mission's set.
+            serde_json::json!({ "action": "step result",
+                                "payload": { "step_id": "someone-else", "total_tokens": 999 } }),
+            // A RUNNING per-turn increment for my step — NOT a finalized total,
+            // stays the SSE channel's job, must not fold here.
+            serde_json::json!({ "action": "telemetry.tokens", "handle": "mine",
+                                "payload": { "total_tokens": 7 } }),
+            serde_json::json!({ "action": "dispatch.turn", "handle": "mine" }),
+        ];
+        let out = fold_step_finals(recs, &step_ids);
+        assert!(!out.contains_key("mine"), "no finalized record -> no entry (honest absent)");
+        assert!(!out.contains_key("someone-else"));
+    }
+
+    /// (#1445 gate should-fix) The review vocabulary's step results carry
+    /// `payload.tokens`, never `total_tokens` — the fold reads the fallback
+    /// so review probe/judge/verify rows backfill (item 4's stated purpose
+    /// on the most-viewed mission kind).
+    #[test]
+    fn fold_finals_review_vocabulary_tokens_payload_folds() {
+        let step_ids = ids(&["review-judge-step"]);
+        let rec = serde_json::json!({
+            "action": "step result",
+            "payload": { "step_id": "review-judge-step", "kind": "review.judge", "tokens": 4200 }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids);
+        assert_eq!(out["review-judge-step"].tokens, Some(4200), "review `tokens` payload folds");
+    }
+
+    /// (#1445 gate should-fix) `total_tokens` wins when both keys are
+    /// present — the same precedence the JS fold applies.
+    #[test]
+    fn fold_finals_total_tokens_wins_over_tokens_fallback() {
+        let step_ids = ids(&["s1"]);
+        let rec = serde_json::json!({
+            "action": "step result",
+            "payload": { "step_id": "s1", "total_tokens": 900, "tokens": 100 }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids);
+        assert_eq!(out["s1"].tokens, Some(900));
+    }
+
+    /// (#1445 gate consider 1) Cloud parity with the JS fold: ANY matched
+    /// record naming a hosted endpoint marks its step cloud, even a
+    /// non-terminal one (the JS flags cloud before its action branches).
+    /// Totals stay absent — only the cloud marker folds.
+    #[test]
+    fn fold_finals_cloud_marker_on_nonterminal_matched_record() {
+        let step_ids = ids(&["s1"]);
+        let rec = serde_json::json!({
+            "action": "telemetry.tokens", "handle": "s1",
+            "payload": { "total_tokens": 7, "endpoint": "https://api.example/v1" }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids);
+        assert!(out["s1"].cloud, "non-terminal endpoint record still marks cloud (JS parity)");
+        assert_eq!(out["s1"].tokens, None, "running increment still never folds a total");
+        assert_eq!(out["s1"].turns, None);
+    }
+
+    /// (#1445 gate consider 4) Colon-era session ids (`step:<id>`, retired in
+    /// #1436) match none of the correlation keys — a mixed-era mission's
+    /// pre-rename steps stay honest-absent rather than mis-folding.
+    #[test]
+    fn fold_finals_colon_era_session_ids_do_not_fold() {
+        let step_ids = ids(&["s1"]);
+        let rec = serde_json::json!({
+            "action": "dispatch.complete",
+            "session_id": "step:s1",
+            "payload": { "total_tokens": 500, "total_turns": 3 }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids);
+        assert!(!out.contains_key("s1"), "colon-era session id must not correlate");
+    }
+
+    // ─── (#1445 gate must-fix) bounded backfill scan ────────────────────
+
+    fn write_day_file(dir: &std::path::Path, stem: &str, lines: &[serde_json::Value]) {
+        let body: String =
+            lines.iter().map(|v| format!("{}\n", serde_json::to_string(v).unwrap())).collect();
+        std::fs::write(dir.join(format!("{stem}.jsonl")), body).unwrap();
+    }
+
+    fn complete_rec(step: &str, tokens: u64) -> serde_json::Value {
+        serde_json::json!({ "action": "dispatch complete", "handle": step,
+                            "payload": { "total_tokens": tokens } })
+    }
+
+    #[test]
+    fn backfill_ignores_day_files_outside_the_mission_window() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let step_ids = ids(&["s1"]);
+        // Mission created on 2026-07-17; margin admits 2026-07-16.
+        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        // OUT of window: a matching record that must NOT fold.
+        write_day_file(tmp.path(), "2020-01-01", &[complete_rec("s1", 999_999)]);
+        // Margin day (created minus one): folds.
+        write_day_file(tmp.path(), "2026-07-16", &[complete_rec("s1", 100)]);
+        // Mission-lifetime day: folds (max wins).
+        write_day_file(tmp.path(), "2026-07-18", &[complete_rec("s1", 200)]);
+        let out = backfill_step_finals(tmp.path(), &step_ids, created_ts);
+        assert_eq!(
+            out["s1"].tokens,
+            Some(200),
+            "only in-window files fold — the 2020 file's 999999 must never be read"
+        );
+    }
+
+    #[test]
+    fn backfill_caps_total_records_parsed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let step_ids = ids(&["s1"]);
+        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        // Three finalized records, ascending; a cap of 1 keeps only the first.
+        write_day_file(
+            tmp.path(),
+            "2026-07-17",
+            &[complete_rec("s1", 100), complete_rec("s1", 900), complete_rec("s1", 950)],
+        );
+        let out = backfill_step_finals_bounded(tmp.path(), &step_ids, created_ts, 1);
+        assert_eq!(out["s1"].tokens, Some(100), "cap stops parsing after the first record");
+        // The production cap folds all three.
+        let out_full = backfill_step_finals(tmp.path(), &step_ids, created_ts);
+        assert_eq!(out_full["s1"].tokens, Some(950));
+    }
+
+    #[test]
+    fn backfill_skips_malformed_lines() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let step_ids = ids(&["s1"]);
+        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        let good = serde_json::to_string(&complete_rec("s1", 4200)).unwrap();
+        std::fs::write(
+            tmp.path().join("2026-07-17.jsonl"),
+            format!("this is not json\n{{\"truncated\": \n{good}\n"),
+        )
+        .unwrap();
+        let out = backfill_step_finals(tmp.path(), &step_ids, created_ts);
+        assert_eq!(out["s1"].tokens, Some(4200), "malformed lines skip; the good record folds");
+    }
+
+    #[test]
+    fn day_stem_round_trips_through_epoch_days() {
+        for stem in ["2020-01-01", "2026-07-17", "1999-12-31", "2026-02-28"] {
+            let days = day_stem_to_epoch_days(stem).unwrap();
+            assert_eq!(epoch_days_to_stem(days), stem);
+        }
+        assert!(day_stem_to_epoch_days("not-a-date").is_none());
+        assert!(day_stem_to_epoch_days("2026-13-01").is_none());
+        assert!(day_stem_to_epoch_days("20260717").is_none());
     }
 
     // ─── layer_tasks_by_depth ──────────────────────────────────────────

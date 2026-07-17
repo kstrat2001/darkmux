@@ -75,7 +75,7 @@ darkmux config set machine_id mini-1              <span class="comment"># operat
 
 <span class="comment"># 3. Verify it reaches the hub.</span>
 darkmux doctor</code></pre>
-    <p><code>darkmux doctor</code> should read <code>✓</code> on <strong>flow sink health</strong> (a Redis-backed sink reaching the hub) and <strong>machine_id</strong>, and the verdict banner should land on <code>● ok</code> (a <code>⚠</code> on out-of-scope checks like "no profile swapped yet" is fine). Then prove the end-to-end write:</p>
+    <p><code>darkmux doctor</code> should read <code>✓</code> on <strong>flow sink health</strong> (a Redis-backed sink reaching the hub) and <strong>machine_id</strong>, and the verdict banner should land on <code>● ok</code> (a <code>⚠</code> on out-of-scope checks like "no profile loaded yet" is fine). Then prove the end-to-end write:</p>
     <pre><code>darkmux flow note --text "hello from mini-1"</code></pre>
     <p>Open the hub's live viewer (the hub itself, or <code>https://&lt;hub&gt;.&lt;tailnet&gt;.ts.net/</code> if you set up <a href="always-on-hub.html#viewer">Tailscale Serve</a>). The note appears, tagged with this machine's id. That's the peer participating: its records flow to the hub, you see the whole fleet in one place.</p>
     <div class="callout">

@@ -3507,10 +3507,17 @@
             status: "running",
             started_ts: None,
             completed_ts: None,
+            tokens_final: None,
+            turns_final: None,
+            cloud: None,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["kind"], "dispatch.internal");
         assert_eq!(v["label"], "Dispatch");
+        // (#1432 item 4) Backfill fields are absent when None (lenient wire).
+        assert!(v.get("tokensFinal").is_none());
+        assert!(v.get("turnsFinal").is_none());
+        assert!(v.get("cloud").is_none());
     }
 
     /// (#881 parity) The graph.json route must ride the SAME remote-only
@@ -4061,4 +4068,161 @@
                 "expected a \"{expected}\" row label among {all_labels:?}"
             );
         }
+    }
+
+    /// (#1432 item 4) graph.json backfills a COMPLETED step's finalized
+    /// token/turn totals from the daemon's flow records at page load — so a
+    /// page opened after the dispatch ran shows the real total, not the idle
+    /// "· tok" placeholder (the SSE stream being tail-from-now). A step with
+    /// NO folded record stays absent (honest "no data", never a wrong zero).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_backfills_completed_step_totals_from_flow_records() {
+        use darkmux_crew::types::{NodeStatus, Step, Task};
+        let _guard = CrewDirGuard::new();
+        let mission_id = "backfill-mission";
+        let phase_id = "p1";
+        save_test_mission(&minimal_mission(mission_id, vec![phase_id.to_string()]));
+        save_test_phase(&minimal_phase(phase_id, mission_id));
+
+        // Two steps: one that ran (has a flow record), one that never did.
+        let mk_task = |id: &str, step: &str| Task {
+            id: id.to_string(),
+            phase_id: phase_id.to_string(),
+            description: format!("task {id}"),
+            display_name: None,
+            step_ids: vec![step.to_string()],
+            depends_on: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let mk_step = |id: &str, status: NodeStatus| Step {
+            id: id.to_string(),
+            task_id: format!("{id}-task"),
+            kind: "dispatch.internal".to_string(),
+            status,
+            config: serde_json::Value::Null,
+            started_ts: Some(now_unix()),
+            completed_ts: if status == NodeStatus::Complete { Some(now_unix()) } else { None },
+            output: None,
+        };
+        darkmux_crew::lifecycle::save_task(mission_id, &mk_task("ran-task", "ran-step")).unwrap();
+        darkmux_crew::lifecycle::save_task(mission_id, &mk_task("idle-task", "idle-step")).unwrap();
+        darkmux_crew::lifecycle::save_step(mission_id, phase_id, &mk_step("ran-step", NodeStatus::Complete)).unwrap();
+        darkmux_crew::lifecycle::save_step(mission_id, phase_id, &mk_step("idle-step", NodeStatus::Planned)).unwrap();
+
+        // A flows_dir carrying a dispatch-complete record for the ran step
+        // only. Named for TODAY's day stem (#1445 gate): the backfill scans
+        // only day files inside the mission's lifetime window, and this
+        // mission was just minted with created_ts = now — a hardcoded date
+        // would silently fall out of the window when run later.
+        let flows = TempDir::new().unwrap();
+        let rec = serde_json::json!({
+            "action": "dispatch complete",
+            "session_id": "step-ran-step",
+            "payload": { "total_tokens": 12345, "total_turns": 7 }
+        });
+        let today = crate::mission_graph::epoch_days_to_stem((now_unix() / 86400) as i64);
+        std::fs::write(
+            flows.path().join(format!("{today}.jsonl")),
+            format!("{}\n", serde_json::to_string(&rec).unwrap()),
+        )
+        .unwrap();
+
+        let app = build_router(flows.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mission/{mission_id}/graph.json"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let rows: Vec<serde_json::Value> = json["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["kind"] == "task")
+            .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
+            .collect();
+        let ran = rows.iter().find(|r| r["id"] == "ran-step").expect("ran-step row");
+        assert_eq!(ran["tokensFinal"], 12345, "completed step backfilled from flow records");
+        assert_eq!(ran["turnsFinal"], 7);
+        let idle = rows.iter().find(|r| r["id"] == "idle-step").expect("idle-step row");
+        assert!(idle.get("tokensFinal").is_none(), "never-ran step has no backfill (honest absent)");
+        assert!(idle.get("turnsFinal").is_none());
+    }
+
+    /// (#1432 item 4) A mixed-era mission (steps ran, but the daemon has NO
+    /// flow files on disk — e.g. rotated away, or a fresh checkout) backfills
+    /// nothing rather than erroring or inventing zeros. Same code path, empty
+    /// flows_dir.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_backfill_absent_when_no_flow_records() {
+        use darkmux_crew::types::{NodeStatus, Step, Task};
+        let _guard = CrewDirGuard::new();
+        let mission_id = "no-records-mission";
+        let phase_id = "p1";
+        save_test_mission(&minimal_mission(mission_id, vec![phase_id.to_string()]));
+        save_test_phase(&minimal_phase(phase_id, mission_id));
+        let task = Task {
+            id: "t1".to_string(),
+            phase_id: phase_id.to_string(),
+            description: "t1".to_string(),
+            display_name: None,
+            step_ids: vec!["s1".to_string()],
+            depends_on: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
+        darkmux_crew::lifecycle::save_step(
+            mission_id,
+            phase_id,
+            &Step {
+                id: "s1".to_string(),
+                task_id: "t1".to_string(),
+                kind: "dispatch.internal".to_string(),
+                status: NodeStatus::Complete,
+                config: serde_json::Value::Null,
+                started_ts: Some(now_unix()),
+                completed_ts: Some(now_unix()),
+                output: None,
+            },
+        )
+        .unwrap();
+
+        // Empty flows_dir (like the test router's own PathBuf::new()).
+        let empty = TempDir::new().unwrap();
+        let app = build_router(empty.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mission/{mission_id}/graph.json"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let row = json["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["kind"] == "task")
+            .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
+            .find(|r| r["id"] == "s1")
+            .expect("s1 row");
+        assert!(row.get("tokensFinal").is_none(), "no flow records -> no backfill");
     }
