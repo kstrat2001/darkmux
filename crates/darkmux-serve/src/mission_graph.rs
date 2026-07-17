@@ -1041,8 +1041,8 @@ mod tests {
             serde_json::json!({ "action": "dispatch.turn", "handle": "mine" }),
         ];
         let out = fold_step_finals(recs, &step_ids);
-        assert!(out.get("mine").is_none(), "no finalized record -> no entry (honest absent)");
-        assert!(out.get("someone-else").is_none());
+        assert!(!out.contains_key("mine"), "no finalized record -> no entry (honest absent)");
+        assert!(!out.contains_key("someone-else"));
     }
 
     // ─── layer_tasks_by_depth ──────────────────────────────────────────
