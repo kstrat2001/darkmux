@@ -273,7 +273,7 @@ runtime/                      Internal-runtime crate (built into the darkmux-run
 templates/builtin/
   roles/                      Role library (manifest + .md) embedded at compile time
   mission-configs/            Built-in mission configs (coder-phase, review, …) embedded at compile time
-  skills/                     Skill library embedded at compile time (work-shape descriptors with keyword routing; renamed from `capabilities/` in refactor 0 — see #448)
+  skills/                     Skill library embedded at compile time (work-shape descriptors with keyword routing; renamed from `capabilities/` in refactor 0, see #448)
   workloads/                  Workload manifests embedded at compile time
   lab-fixtures/               Built-in lab fixtures (e.g. demo-tiny-py) registered via scripts/lab-init.sh
   AUTONOMOUS_DISPATCH_PREAMBLE.md  Injected ahead of specialist-role dispatches (#427)

@@ -187,7 +187,7 @@ darkmux doctor                    <span class="comment"># confirm "profile match
     <p>A dispatch is the task-grain execution entry point: hand one local-AI role a single message and let it run in the container-bounded runtime. The message is positional, so nothing but the role and the text is required:</p>
     <pre><code>darkmux dispatch code-reviewer "Summarize the risk in this change." <span class="comment"># role + message, positional</span>
 git diff | darkmux dispatch pr-reviewer                             <span class="comment"># or pipe the message in on stdin</span></code></pre>
-    <p>darkmux loads the profile's model if it isn't resident, runs the role's tool loop, and prints the result. Every dispatch emits a flow record you can watch live (next section).</p>
+    <p>darkmux loads the profile's model if it isn't resident, runs the role's tool loop, and prints the result. Every dispatch emits a flow record you can watch live in the viewer (below).</p>
     <div class="callout">
       <strong>Verified at release rehearsal.</strong>
       <p style="margin: 6px 0 0;">This step calls a real model, so its output depends on your hardware and loaded model and isn't reproduced here. It is exercised live against a loaded model as part of the pre-release dogfood, per darkmux's release gate. Run it yourself once a model is loaded; that is the canonical reference for what your setup produces.</p>
@@ -208,7 +208,7 @@ darkmux mission launch coder-phase \
   --param base=main \
   --param branch=darkmux/first-mission \
   --param mission_id=first-mission</code></pre>
-    <p class="muted">Those four <code>--param</code> values are <code>coder-phase</code>'s declared inputs (worktree path, base branch, new branch name, mission id); launch bails with a copy-pasteable example if one is missing. In practice your frontier orchestrator fills these in for you, this is what it runs under the hood.</p>
+    <p class="muted">Those four <code>--param</code> values are <code>coder-phase</code>'s declared inputs (worktree path, base branch, new branch name, mission id); launch bails with a copy-pasteable example if one is missing. In practice your frontier orchestrator fills these in for you. This is what it runs under the hood.</p>
     <p>Open <code>http://127.0.0.1:8765/</code> and you see the mission graph come alive: phases light up as the crew works them, each dispatch streaming its tokens and detectors into the timeline. The run stops at the sign-off gate; <code>darkmux mission ship &lt;id&gt;</code> commits + pushes + opens the PR, or <code>darkmux mission abort &lt;id&gt;</code> tears the worktree down. <strong>Watching that graph is the first-wow moment: this is what darkmux is for.</strong></p>
     <div class="callout">
       <strong>Verified at release rehearsal.</strong>

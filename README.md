@@ -181,7 +181,7 @@ Optional integrations (Redis coordination, the audit log) are blocks you turn on
 
 **Secrets stay out of the file.** A Redis password is never written to `config.json`. It lives in the macOS Keychain (store it once: `security add-generic-password -a "$USER" -s darkmux-redis -w`), read at runtime and never logged. On non-macOS, pass a full `DARKMUX_REDIS_URL` instead.
 
-> `config.json` (darkmux's settings) is a separate file from `profiles.json` (your swap profiles). Point at a non-default profiles registry with `--profiles-file <path>` or `DARKMUX_PROFILES`.
+> `config.json` (darkmux's settings) is a separate file from `profiles.json` (your profile registry). Point at a non-default profiles registry with `--profiles-file <path>` or `DARKMUX_PROFILES`.
 
 ### First useful commands
 
@@ -295,7 +295,7 @@ docker build -t darkmux-runtime:latest runtime/
 
 The `lab` subcommand mirrors `dispatch`'s contract — the internal runtime, no external agent runtime to install or configure. The `machine` / `profile` subcommands don't depend on any runtime at all. They read LMStudio and the registry directly.
 
-This means **darkmux's profile-multiplexing needs nothing beyond Docker + LMStudio**: `dispatch` ships with a self-contained internal runtime, so a new user never installs a second agent-runtime tool to get going. The empirical findings in the article series were measured against this runtime.
+This means **darkmux's dispatch path needs nothing beyond Docker + LMStudio**: `dispatch` ships with a self-contained internal runtime, so a new user never installs a second agent-runtime tool to get going. The empirical findings in the article series were measured against this runtime.
 
 ### Internal-runtime safety net + model-facing telemetry
 
@@ -361,15 +361,13 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 **Shipped:**
 
-- ✅ Profile registry + `swap`/`status`/`profile list`/`profile scan` CLI
+- ✅ Profile registry + `profile list`/`profile scan`/`profile draft` CLI, with `machine status` for the loaded-state read (the founding `swap` verb retired in 2.0; gestalt manages residency)
 - ✅ Lab subcommands (`run`/`inspect`/`compare`/`characterize`/`tune`/`runs`), `WorkloadProvider` trait, embedded smoke workloads, always-on cross-layer flow telemetry (#557)
 - ✅ Lab reproducibility (#487): per-run copy-on-write sandbox isolation (source never mutated), `baseline_hash` + `final_hash` content hashing in the run manifest, a fixture registry with `lab register`/`unregister`/`fixtures`/`doctor` verbs, workload `requires_fixture` resolution, and `scripts/lab-init.sh` + the built-in `demo-tiny-py` fixture
 - ✅ Lab notebook (`lab notebook draft`/`list`), cross-machine via `DARKMUX_NOTEBOOK_DIR`
 - ✅ Agent-invocable skills bundle (12 skills including `/darkmux-bootstrap`)
 - ✅ Crew + Role + Mission + Phase schema with SQLite-backed index; `mission propose` + `phase estimate` utility-AI verbs; mission configs + `mission launch` as the config-launched instance-creation path
-- ✅ Per-role `agent.model` pinning (#160) with bake-off-derived defaults; doctor surfaces drift
-- ✅ Recommendation registry per hardware tier (#159) with `swap recommended` + `model pull-recommended`; doctor surfaces drift
-- ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
+- ✅ Per-role `agent.model` pinning (#160) with bake-off-derived defaults; doctor surfaces drift- ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
 - ✅ `darkmux flow status` + `darkmux flow integrity-check` diagnostic verbs
 - ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers
 - ✅ Doctor: 30+ pre-flight checks with actionable hints, plus a legacy-extras warning that flags profiles still carrying pre-#380 compaction keys (`mode`, `maxHistoryShare`, …)
