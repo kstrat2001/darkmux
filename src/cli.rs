@@ -271,7 +271,7 @@ pub(crate) enum Cmd {
     },
     /// Read/write `~/.darkmux/config.json` settings (#937). `set` validates the
     /// key + coerces the value; secrets stay in the Keychain. Distinct from
-    /// `profile` (the swap-profiles registry).
+    /// `profile` (the profiles registry).
     Config {
         #[command(subcommand)]
         sub: crate::config_cmd::ConfigCmd,

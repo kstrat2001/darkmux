@@ -285,8 +285,13 @@ jobs:
           # brew formula's caveats are printed to every installing user, and a
           # retired-verb spelling slipped through there once precisely because
           # packaging/ was outside this set (#1426 phase-2 gate finding).
+          # AGENTS.md and skills/ added for the same reason (#1449 gate
+          # finding): skills/ ships into users' ~/.claude/skills/ via
+          # `darkmux init` (include_str!-embedded), and AGENTS.md is the
+          # agent-facing repo doc — both carried retired identity text that
+          # the doc-only set missed.
           PAT='admin[- ]agent|admin</code>'
-          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null); then
+          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md AGENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ 2>/dev/null); then
             echo "::error::Retired term in user-facing docs — use 'utility', not 'admin' (the role_family loader rejects 'admin'):"
             echo "$bad"
             exit 1
@@ -318,7 +323,7 @@ jobs:
           # old verbs — excluded by the -v filter; live prose never carries
           # that bold-version marker.
           VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew dispatch|status|swap|model|fleet|recommendations)\b'
-          if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ packaging/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
+          if bad=$(grep -rniE "$VERBPAT" README.md CONTRIBUTING.md DESIGN.md AGENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ 2>/dev/null | grep -v '\*\*v[0-9]*\.'); then
             echo "::error::Retired verb spelling in user-facing docs (#1426) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch) / init (not skills); swap + recommendations retired:"
             echo "$bad"
             exit 1

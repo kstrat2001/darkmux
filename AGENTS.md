@@ -6,7 +6,7 @@ This file is for any AI agent (Antigravity, Claude Code, Cursor, etc.) that's he
 
 A pre-1.0 Rust CLI that does two things for users running local LLMs (LMStudio + Ollama + llama.cpp):
 
-1. **Profile multiplexer** — `darkmux swap <name>` switches the loaded model + context length + (optional) compaction settings to a named profile defined in `~/.darkmux/profiles.json`.
+1. **Mission orchestrator** — `darkmux mission launch <config>` runs a config-defined mission as a live task graph: a crew of local-AI roles works the phases, every dispatch is gated on the user's sign-off, and each run finalizes into a typed envelope. Model residency (the right models at the right context under the RAM budget, per `~/.darkmux/profiles.json`) is managed internally.
 2. **Lab harness** — `darkmux lab run <workload>` dispatches a workload against the internal Docker-bounded runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
 
 The CLI is the *engine*; the empirical findings in the Genesis series on Darkly Energized (<https://darklyenergized.substack.com>) are what it backs. The reproducibility story is the product story — users should be able to rerun a workload and get numbers comparable to the published claims.
@@ -122,7 +122,7 @@ Refer to the "Common tasks for an agent" section in `CLAUDE.md` for CLI command 
 ## Things to ASK before doing
 
 - Anything that mutates `~/.darkmux/profiles.json` — that's user state.
-- Anything that calls `darkmux swap` or runs a real lab dispatch — uses real LMStudio resources.
+- Anything that runs a real dispatch or lab run (loads models) — uses real LMStudio resources.
 - Anything that does `git push` or `git commit --amend` — irreversible-ish.
 - Adding external runtime dependencies — has knock-on effects on install size and license surface.
 
