@@ -524,7 +524,7 @@ fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
         action: action.to_string(),
         handle: step.id.clone(),
         phase_id: None,
-        session_id: Some(format!("task:{}", step.task_id)),
+        session_id: Some(darkmux_types::session_id::task(&step.task_id)),
         source: Some("scheduler".to_string()),
         model: None,
         reasoning: None,

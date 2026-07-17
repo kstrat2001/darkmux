@@ -369,7 +369,7 @@ fn parse_proposal(response: &str) -> Result<Proposal> {
 /// would otherwise escape the crew dir — a controlled `.json`/`mission.json`
 /// write-primitive from untrusted local-model output. `validate_identifier`
 /// rejects anything outside `[a-z0-9_-]`, so `.`/`/` (hence `..`) can't pass;
-/// this mirrors the guard `mission_run.rs:316` / `main.rs:1645` already apply
+/// this mirrors the guard `coder_phase.rs:316` / `main.rs:1645` already apply
 /// to operator-supplied ids. Shared by `validate_proposal_invariants` (early /
 /// UX rejection) and `persist` (the write boundary) so the two never drift.
 fn validate_proposal_ids(p: &Proposal) -> Result<()> {

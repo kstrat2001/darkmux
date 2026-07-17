@@ -24,7 +24,7 @@
 //!
 //! **Scope boundary (read before extending).** This packet wires exactly
 //! ONE mission type all the way through to real dispatch: `coder-phase`,
-//! reusing `mission_run.rs`'s own `MissionWorktreeStepKind` /
+//! reusing `coder_phase.rs`'s own `MissionWorktreeStepKind` /
 //! `MissionCoderStepKind` / `MissionVerifyStepKind` Tier 3 kinds verbatim
 //! (elevated to `pub(crate)` for this module — see their doc comments) so
 //! the `mission.worktree`/`mission.coder`/`mission.verify` flow-record
@@ -74,7 +74,7 @@
 use crate::crew;
 use crate::fleet;
 use crate::flow;
-use crate::mission_run;
+use crate::coder_phase;
 use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::{self, FindingSeverity, LaunchParams, MissionConfig, TaskOverride};
 use crew::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus};
@@ -83,7 +83,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// The three Tier 3 step kinds `mission_run.rs` defines for `coder-phase`'s
+/// The three Tier 3 step kinds `coder_phase.rs` defines for `coder-phase`'s
 /// graph (#1352) — the only Tier 3 kinds this launcher knows how to
 /// construct in Packet 4a. See the module doc's scope boundary.
 const CODER_PHASE_TIER3_KINDS: &[&str] = &["mission.worktree", "mission.coder", "mission.verify"];
@@ -105,7 +105,7 @@ const REVIEW_TIER3_KINDS: &[&str] =
     &["review.bundle", "review.probe", "review.dedup", "review.judge", "review.verify", "review.synthesis"];
 
 /// `darkmux mission launch <config-id>` entry point. Returns the process
-/// exit code — the coder-phase rows mirror `mission_run::run`'s own exit
+/// exit code — the coder-phase rows mirror `coder_phase::run`'s own exit
 /// map exactly (#1284 review round 1, must-fix 1):
 ///   `0` — freeform mint; or coder ran and QA came back clean/flags-only
 ///         (gate banner printed, phase left Running for `mission ship`);
@@ -249,14 +249,36 @@ pub fn launch(
         );
     }
 
+    // (#1433 follow-up) The mission is now minted (Active, Planned phases) on
+    // disk. Every fallible step from here to the scheduler is a strand window:
+    // a bare `?` would leave the instance permanently Active with no envelope,
+    // the exact drift #1421 closed for the review launcher. This path can't
+    // reorder these before the mint (they read/write the minted instance), so
+    // each reconciles the just-minted mission to an honest terminal Error
+    // status before propagating the failure — same `reconcile_and_finalize_on_
+    // error` the scheduler-error path uses, with whatever tasks exist so far
+    // (none for a pre-interpret failure → the phases abandon-on-close).
+    //
     // config-snapshot.json — ALWAYS written (fresh mint or relaunch
     // overwrite), regardless of whether the graph turns out executable.
-    crew::lifecycle::save_config_snapshot(&mission_id, config)
-        .context("persisting config-snapshot.json")?;
+    if let Err(e) = crew::lifecycle::save_config_snapshot(&mission_id, config)
+        .context("persisting config-snapshot.json")
+    {
+        let mut no_steps = BTreeMap::new();
+        reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &[], &mut no_steps, &e);
+        return Err(e);
+    }
 
     let params = build_launch_params(config, &real_phase_ids, &collected);
     let (tasks, mut steps, interpret_warnings) =
-        mission_config::interpret(config, &params).context("interpreting mission config graph")?;
+        match mission_config::interpret(config, &params).context("interpreting mission config graph") {
+            Ok(v) => v,
+            Err(e) => {
+                let mut no_steps = BTreeMap::new();
+                reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &[], &mut no_steps, &e);
+                return Err(e);
+            }
+        };
     // (#1418) An absent `expand.over` key (typo'd collection name in a
     // user-tier config override, most likely) used to expand silently to
     // zero real copies; now named here so the operator sees it instead of
@@ -333,14 +355,24 @@ pub fn launch(
     let registry = crew::step_kinds::StepKindRegistry::with_builtins();
     let uses_coder_phase_kinds = steps.values().any(|s| CODER_PHASE_TIER3_KINDS.contains(&s.kind.as_str()));
     let coder_handles = if uses_coder_phase_kinds {
-        Some(register_coder_phase_kinds(
+        // (#1433 follow-up) Still inside the strand window — a registration
+        // failure (a missing input, a mission/phase read error) reconciles the
+        // minted mission before propagating, so the graph's tasks abandon
+        // honestly rather than leaving the instance stranded Active.
+        match register_coder_phase_kinds(
             &registry,
             &mission_id,
             config,
             &real_phase_ids,
             &collected,
             timeout_seconds,
-        )?)
+        ) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e);
+                return Err(e);
+            }
+        }
     } else {
         None
     };
@@ -437,10 +469,27 @@ pub fn launch(
     // (#1284 review round 1, must-fix 1) A coder-phase graph has GATE
     // semantics: stop at the operator sign-off gate exactly as `mission
     // run` does — phase stays Running, mission stays Active, NO
-    // finalize_mission, and the exit code mirrors `mission_run::run`'s own
+    // finalize_mission, and the exit code mirrors `coder_phase::run`'s own
     // outcome map. `mission ship` finishes the loop from here.
     if let Some(handles) = &coder_handles {
-        return coder_phase_gate_outcome(&mission_id, handles, &steps);
+        let outcome = coder_phase_gate_outcome(&mission_id, handles, &steps);
+        // (#1433 follow-up) The gate arm's FAILURE exits — a worktree-creation
+        // bail (`Err`) or a coder dispatch error (`Ok(1)`) — reach no reviewable
+        // gate, so leaving the phase `Running` and the mission `Active` is the
+        // same stranded drift the scheduler-error path reconciles. Reconcile
+        // those to an honest terminal Error state. The gate exits PROPER
+        // (`Ok(0)` clean, `Ok(2)` blockers, `Ok(3)` QA-unavailable) deliberately
+        // keep the phase `Running` — `mission ship`/`mission abort` finish or
+        // tear down the loop from there and finalize the mission themselves.
+        let failed = matches!(&outcome, Err(_) | Ok(1));
+        if failed {
+            let e = match &outcome {
+                Err(e) => anyhow!("{e:#}"),
+                _ => anyhow!("coder dispatch failed before a reviewable gate (exit 1)"),
+            };
+            reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e);
+        }
+        return outcome;
     }
 
     // Gate-less generic graph (Tier-1-only kinds) — the standard
@@ -851,13 +900,13 @@ fn precheck_coder_phase_inputs(
 }
 
 /// The dispatch session id for a config-launched coder-phase execution.
-/// Deliberately the SAME `mission-run-` prefix `mission_run::run` stamps
-/// (#1284 review round 1, must-fix 4): the viewer's mission lens keys its
-/// per-run session grouping on that prefix, and this path emits the
-/// identical record vocabulary — a `mission-launch-` prefix would make
-/// launched runs invisible to the lens for no benefit.
+/// The canonical coder-phase id (#1436) — the SAME `mission-run-` prefix the
+/// retired `mission run` stamped and that `mission ship`/`mission abort`
+/// reconstruct: the viewer's mission lens keys its per-run session grouping
+/// on that prefix, and this path emits the identical record vocabulary, so
+/// launched runs stay visible to the lens and legacy archives keep joining.
 fn launch_session_id(mission_id: &str, real_phase_id: &str) -> String {
-    format!("mission-run-{mission_id}-{real_phase_id}")
+    darkmux_types::session_id::mission_run(mission_id, real_phase_id)
 }
 
 /// Handles `register_coder_phase_kinds` keeps back for the post-scheduler
@@ -866,7 +915,7 @@ fn launch_session_id(mission_id: &str, real_phase_id: &str) -> String {
 /// contract can't carry the rich verdict/verifier detail), plus the
 /// launch-resolved identifiers the gate banners print.
 pub(crate) struct CoderPhaseHandles {
-    coder_slot: Arc<Mutex<Option<mission_run::CoderStepResult>>>,
+    coder_slot: Arc<Mutex<Option<coder_phase::CoderStepResult>>>,
     verify_slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>,
     workdir: std::path::PathBuf,
     branch: String,
@@ -874,7 +923,7 @@ pub(crate) struct CoderPhaseHandles {
     session_id: String,
 }
 
-/// Register `mission_run.rs`'s three `coder-phase` Tier 3 kinds against
+/// Register `coder_phase.rs`'s three `coder-phase` Tier 3 kinds against
 /// `registry`, using the operator-collected `workdir`/`branch`/`base`/
 /// `role`/`image` inputs plus a launcher-resolved `repo_root`. Bails loud
 /// (naming the missing input) rather than constructing a kind with an
@@ -925,14 +974,14 @@ fn register_coder_phase_kinds(
     let mission = load_mission_for_brief(mission_id)?;
     let phase = load_phase_for_brief(mission_id, &real_phase_id)?;
 
-    let coder_slot: Arc<Mutex<Option<mission_run::CoderStepResult>>> = Arc::new(Mutex::new(None));
+    let coder_slot: Arc<Mutex<Option<coder_phase::CoderStepResult>>> = Arc::new(Mutex::new(None));
     let verify_slot: Arc<
         Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>,
     > = Arc::new(Mutex::new(None));
 
-    let repo_root = mission_run::repo_root()?;
+    let repo_root = coder_phase::repo_root()?;
     registry
-        .register(Arc::new(mission_run::MissionWorktreeStepKind {
+        .register(Arc::new(coder_phase::MissionWorktreeStepKind {
             repo_root,
             wt_path: workdir.clone(),
             branch: branch.clone(),
@@ -946,7 +995,15 @@ fn register_coder_phase_kinds(
 
     let opts = crew::dispatch::DispatchOpts {
         role_id: role.clone(),
-        message: mission_run::coder_brief(&phase, &mission, &[], &[], &[]),
+        // (#1426 ship-4) The coder brief carries the same injected context the
+        // retired `mission run` gathered — prior adjudication corrections
+        // (#849), detector cautions (#994), engagement lessons — ranked and
+        // budgeted (#1011), with the operator-facing provenance lines. The
+        // collapse makes launch the only coder path, so this is where the
+        // doom-loop fix now lives.
+        message: coder_phase::coder_brief_with_injected_context(
+            mission_id, &mission, &phase, &workdir,
+        )?,
         deliver: None,
         session_id: Some(session_id.clone()),
         timeout_seconds,
@@ -966,7 +1023,7 @@ fn register_coder_phase_kinds(
         model_base_url_override: None,
     };
     registry
-        .register(Arc::new(mission_run::MissionCoderStepKind {
+        .register(Arc::new(coder_phase::MissionCoderStepKind {
             opts: Mutex::new(Some(opts)),
             wt_path: workdir.clone(),
             mission_id: mission_id.to_string(),
@@ -978,7 +1035,7 @@ fn register_coder_phase_kinds(
         .map_err(|e| anyhow!("registering mission.coder: {e}"))?;
 
     registry
-        .register(Arc::new(mission_run::MissionVerifyStepKind {
+        .register(Arc::new(coder_phase::MissionVerifyStepKind {
             wt_path: workdir.clone(),
             base,
             phase_id: real_phase_id.clone(),
@@ -997,7 +1054,7 @@ fn register_coder_phase_kinds(
 }
 
 /// The post-scheduler gate decision for a coder-phase graph — a faithful
-/// mirror of `mission_run::run`'s own post-graph sequence (#1284 review
+/// mirror of `coder_phase::run`'s own post-graph sequence (#1284 review
 /// round 1, must-fix 1), same outcome map, same banners, same records:
 ///
 /// | condition                    | outcome                                | exit |
@@ -1065,7 +1122,7 @@ fn coder_phase_gate_outcome(
             Some(Err(msg)) => msg,
             _ => "QA dispatch failed".to_string(),
         };
-        mission_run::emit_step_result(
+        coder_phase::emit_step_result(
             flow::Level::Warn,
             "mission.verify",
             &verify_step_id,
@@ -1075,7 +1132,7 @@ fn coder_phase_gate_outcome(
             serde_json::json!({ "error": err_text, "total_tokens": tokens_total }),
         );
         println!("\n{}", style::header("▶ gate — QA unavailable, manual review required"));
-        mission_run::print_unverified_banner(&failed_verifiers);
+        coder_phase::print_unverified_banner(&failed_verifiers);
         println!("  {} {}", style::dim("worktree:"), handles.workdir.display());
         println!("  {} {}", style::dim("branch:  "), style::accent(&handles.branch));
         println!(
@@ -1095,7 +1152,7 @@ fn coder_phase_gate_outcome(
         .take()
     {
         Some(Ok(review)) => review,
-        // Unreachable in practice — see `mission_run::run`'s identical arm.
+        // Unreachable in practice — see `coder_phase::run`'s identical arm.
         _ => bail!("internal error: mission.verify step completed without a review result"),
     };
 
@@ -1103,7 +1160,7 @@ fn coder_phase_gate_outcome(
     println!("\n{}", style::header("▶ gate — awaiting frontier/operator sign-off"));
     println!("  {} {}", style::dim("worktree:"), handles.workdir.display());
     println!("  {} {}", style::dim("branch:  "), style::accent(&handles.branch));
-    mission_run::print_unverified_banner(&failed_verifiers);
+    coder_phase::print_unverified_banner(&failed_verifiers);
 
     if review.by_severity.block > 0 {
         println!(
@@ -1124,7 +1181,7 @@ fn coder_phase_gate_outcome(
                 "or abandon this run: darkmux mission abort {mission_id} --phase {phase_id}"
             ))
         );
-        mission_run::emit_step_result(
+        coder_phase::emit_step_result(
             flow::Level::Warn,
             "mission.verify",
             &verify_step_id,
@@ -1155,7 +1212,7 @@ fn coder_phase_gate_outcome(
              --text \"<verdict · what you overrode · why>\" --source adjudication",
         ))
     );
-    mission_run::emit_step_result(
+    coder_phase::emit_step_result(
         flow::Level::Info,
         "mission.verify",
         &verify_step_id,
@@ -1713,7 +1770,7 @@ mod tests {
     }
 
     // ── Gate outcome map (#1284 review round 1, must-fix 1) — mirrors ──
-    // mission_run::run's own post-graph decision, pinned per condition.
+    // coder_phase::run's own post-graph decision, pinned per condition.
     // Slots + step statuses are scripted (mocked dispatches only); the
     // load-bearing assertions are the exit code AND the phase staying
     // Running (ship-able), never auto-finalized past the sign-off gate.
@@ -1738,7 +1795,7 @@ mod tests {
         verify: NodeStatus,
     ) -> (CoderPhaseHandles, BTreeMap<String, crew::types::Step>) {
         let handles = CoderPhaseHandles {
-            coder_slot: Arc::new(Mutex::new(Some(mission_run::CoderStepResult {
+            coder_slot: Arc::new(Mutex::new(Some(coder_phase::CoderStepResult {
                 failed_verifiers: Vec::new(),
                 tokens_total: 123,
             }))),
@@ -2274,6 +2331,94 @@ mod tests {
         assert_eq!(env.status, MissionOutcomeStatus::Clean);
         assert_eq!(env.phases.len(), 3);
         assert!(env.phases.iter().all(|p| p.outcome == PhaseOutcomeKind::Complete), "every phase completes on a clean run");
+    }
+
+    #[test]
+    fn phase_finalization_rule4_two_step_phase_mixed_complete_and_planned_abandons() {
+        // (#1433 gate coverage) One phase, TWO steps in its task: one Complete,
+        // one Planned. Not all-complete, none errored, at least one started →
+        // phase_finalization's rule 4 (the non-terminal-leftover branch):
+        // Abandoned with the "did not complete" reason, NOT Complete.
+        let config: MissionConfig =
+            serde_json::from_str(r#"{"id":"r4","name":"r4","phases":[{"id":"p1"}]}"#).unwrap();
+        let mid = "r4";
+        let real = derive_phase_ids(mid, &config);
+        let rp1 = real["p1"].clone();
+        let mut task = task_with_step(&rp1, "p1-s1");
+        task.step_ids.push("p1-s2".to_string());
+        let tasks = vec![task];
+        let mut steps = BTreeMap::new();
+        steps.insert("p1-s1".to_string(), scripted_step("p1-s1", NodeStatus::Complete));
+        steps.insert("p1-s2".to_string(), scripted_step("p1-s2", NodeStatus::Planned));
+
+        let outcomes = derive_phase_outcomes(&config, &real, &tasks, &steps);
+        use crew::envelope::PhaseOutcomeKind;
+        let o = outcomes.iter().find(|o| o.phase_id == rp1).expect("phase p1 present");
+        assert_eq!(o.outcome, PhaseOutcomeKind::Abandoned, "a phase with a leftover non-terminal step abandons");
+        assert_eq!(
+            o.reason.as_deref(),
+            Some("phase did not complete (steps left non-terminal)"),
+            "rule 4 (non-terminal leftover), distinct from the errored / never-started reasons"
+        );
+    }
+
+    #[test]
+    fn build_envelope_omits_task_less_phases_in_a_mixed_config() {
+        // (#1433 gate coverage) A mixed config: p1 has a task (executed), p2 has
+        // NONE (a freeform phase this launcher never drives). Only the executed
+        // phase appears in the envelope's per-phase outcomes; the task-less
+        // phase is omitted, never stamped with a finalize outcome it didn't run.
+        let config: MissionConfig =
+            serde_json::from_str(r#"{"id":"z0","name":"z0","phases":[{"id":"p1"},{"id":"p2"}]}"#).unwrap();
+        let mid = "z0";
+        let real = derive_phase_ids(mid, &config);
+        let (rp1, rp2) = (real["p1"].clone(), real["p2"].clone());
+        let tasks = vec![task_with_step(&rp1, "p1-s1")]; // no task for p2
+        let mut steps = BTreeMap::new();
+        steps.insert("p1-s1".to_string(), scripted_step("p1-s1", NodeStatus::Complete));
+
+        let env = build_envelope(mid, &config, &real, &tasks, &steps);
+        use crew::envelope::MissionOutcomeStatus;
+        assert_eq!(env.status, MissionOutcomeStatus::Clean, "the one executed step completed → Clean");
+        assert!(env.phases.iter().any(|p| p.phase_id == rp1), "executed phase p1 is finalized");
+        assert!(
+            !env.phases.iter().any(|p| p.phase_id == rp2),
+            "task-less phase p2 is omitted, not finalized"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconcile_with_no_tasks_closes_mission_leaving_planned_phases() {
+        // (#1433 follow-up) The pre-graph strand window: a `?` before interpret
+        // ever produced tasks (a config-snapshot write fault, an interpret
+        // fault). Reconcile runs with EMPTY tasks/steps — nothing to flip, no
+        // per-phase outcomes to derive — so the mission is driven Closed while
+        // its phases stay Planned. That Closed-with-Planned shape is the honest,
+        // surfaced outcome (no stranded Active mission); `mission status` flags
+        // the phase drift for the operator to reconcile.
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
+        let mid = "gen3strand";
+        let real = derive_phase_ids(mid, &config);
+        let (rp1, rp2, rp3) = (real["p1"].clone(), real["p2"].clone(), real["p3"].clone());
+        seed_mission_with_phases(
+            mid,
+            &[(&rp1, PhaseStatus::Planned), (&rp2, PhaseStatus::Planned), (&rp3, PhaseStatus::Planned)],
+        );
+
+        let err = anyhow::anyhow!("persisting config-snapshot.json: disk full");
+        let mut no_steps = BTreeMap::new();
+        reconcile_and_finalize_on_error(mid, &config, &real, &[], &mut no_steps, &err);
+
+        assert_eq!(mission_status_on_disk(mid), MissionStatus::Closed, "no stranded Active mission");
+        for rp in [&rp1, &rp2, &rp3] {
+            assert_eq!(
+                phase_status_on_disk(mid, rp),
+                PhaseStatus::Planned,
+                "with no tasks, phases have no derived outcome and stay Planned (the surfaced drift shape)"
+            );
+        }
     }
 
     #[test]

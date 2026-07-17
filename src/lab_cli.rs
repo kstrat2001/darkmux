@@ -438,7 +438,7 @@ fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
     // ── (#1004) engagement-context A/B ───────────────────────────────
     if args.ab {
         let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let ctx = crate::mission_run::injected_context_for_lab(
+        let ctx = crate::coder_phase::injected_context_for_lab(
             args.inject_from_mission.as_deref(),
             &ws,
             args.profile.as_deref(),

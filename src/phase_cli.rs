@@ -477,12 +477,8 @@ fn narrate_via_4b(output_so_far: &EstimateOutput) -> Result<Value> {
     let payload_str = serde_json::to_string(&payload)?;
     let url = lmstudio_chat_url();
 
-    let session_id = format!(
-        "phase-estimate-narrate-{}",
-        std::time::UNIX_EPOCH
-            .elapsed()
-            .unwrap_or_default()
-            .as_micros()
+    let session_id = darkmux_types::session_id::phase_estimate_narrate(
+        std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_micros(),
     );
 
     let mut sink = |r: crate::flow::FlowRecord| {
@@ -917,12 +913,8 @@ pub(crate) fn phase_review_output_at(
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let session_id = format!(
-        "phase-review-{}",
-        std::time::UNIX_EPOCH
-            .elapsed()
-            .unwrap_or_default()
-            .as_secs()
+    let session_id = darkmux_types::session_id::phase_review(
+        std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs(),
     );
 
     // (#1413) `phase review begin` / `verdict: ...` used to be plain paired

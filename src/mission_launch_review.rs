@@ -940,7 +940,7 @@ fn run_dispatch(
                         );
                         // (F2, gate remediation) Warn, never silently
                         // swallow — same dim-warning parity as
-                        // `mission_launch.rs`/`mission_run.rs`'s persist
+                        // `mission_launch.rs`/`coder_phase.rs`'s persist
                         // closures: a disk-full mid-review would otherwise
                         // freeze the graph page with zero operator signal.
                         if let Err(e) = crew::lifecycle::save_step(&mission_id_for_persist, phase_id, step) {

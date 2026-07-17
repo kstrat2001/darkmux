@@ -217,7 +217,7 @@ impl StepKind for DispatchInternalStepKind {
         let phase_id = config_str(step, "phase_id").map(str::to_string);
         let session_id = config_str(step, "session_id")
             .map(str::to_string)
-            .unwrap_or_else(|| format!("step:{}", step.id));
+            .unwrap_or_else(|| darkmux_types::session_id::step(&step.id));
         let parse_verifiers = step
             .config
             .get("parse_verifiers")
@@ -270,7 +270,7 @@ impl StepKind for DispatchInternalStepKind {
                     action: "step result".to_string(),
                     handle: step.id.clone(),
                     phase_id: None,
-                    session_id: Some(format!("task:{}", step.task_id)),
+                    session_id: Some(darkmux_types::session_id::task(&step.task_id)),
                     source: Some("scheduler".to_string()),
                     model: None,
                     reasoning: None,
@@ -423,7 +423,7 @@ impl StepKind for DispatchSingleShotStepKind {
                 action: "step result".to_string(),
                 handle: step.id.clone(),
                 phase_id: None,
-                session_id: Some(format!("task:{}", step.task_id)),
+                session_id: Some(darkmux_types::session_id::task(&step.task_id)),
                 source: Some("scheduler".to_string()),
                 model: Some(model.to_string()),
                 reasoning: None,

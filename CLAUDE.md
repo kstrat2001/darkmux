@@ -319,7 +319,7 @@ crates/darkmux-crew/src/step_kinds/
     registry.rs   — StepKindRegistry.
 ```
 
-Tier 3 — genuinely bespoke, single-purpose kinds — **never lives in `darkmux-crew` at all.** It stays physically co-located with the mission module that owns it: the PR-review pipeline's bundle/probe/dedup/judge/verify/synthesis kinds live in `crates/darkmux-lab/src/lab/review.rs`; `mission run`'s worktree/coder/verify kinds live in `src/mission_run.rs`. This is reserved for when a second plausible use case genuinely isn't visible yet — revisit if one shows up, same as any other "not yet, but named" call.
+Tier 3 — genuinely bespoke, single-purpose kinds — **never lives in `darkmux-crew` at all.** It stays physically co-located with the mission module that owns it: the PR-review pipeline's bundle/probe/dedup/judge/verify/synthesis kinds live in `crates/darkmux-lab/src/lab/review.rs`; the coder-phase pipeline's worktree/coder/verify kinds live in `src/coder_phase.rs` (the launch-owned module — `mission run` retired in #1426, ship-4). This is reserved for when a second plausible use case genuinely isn't visible yet — revisit if one shows up, same as any other "not yet, but named" call.
 
 **The physical location IS the enforceable test.** Is this in `step_kinds/builtins.rs`? Config it. Is it in `step_kinds/patterns/`? Reuse it, plug in your own strategy. Is it inside a mission's own module? It's bespoke on purpose — don't look here for shared infrastructure. A fresh agent session asking "where does my new Step behavior go" answers the question by reading the directory, not by re-deriving the decision procedure from a comment that may have drifted.
 
