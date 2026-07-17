@@ -47,7 +47,7 @@ pub use builtins::{
     ProceduralNoopStepKind, ProceduralShellStepKind,
 };
 pub use registry::StepKindRegistry;
-pub use types::{StepKind, StepOutcome};
+pub use types::{MapRemoteBucket, StepKind, StepOutcome, StepRunCtx};
 
 /// Re-exported so callers OUTSIDE this crate (e.g. `darkmux`'s own
 /// `mission_run` — the `run_step_graph`/`StepKind::residency` caller for
