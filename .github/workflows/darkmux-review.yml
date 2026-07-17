@@ -50,6 +50,23 @@ on:
         required: false
         default: ""
         type: string
+      judge_model:
+        description: >-
+          Optional model id that PINS the judge seat. Default: the repo variable
+          DARKMUX_REVIEW_JUDGE_MODEL; empty => the seat resolves to the roster
+          profile's default model (capability scoring until models declare
+          vectors). Pin deliberately for measured runs.
+        required: false
+        default: ""
+        type: string
+      verify_model:
+        description: >-
+          Optional model id that PINS the verify seat. Default: the repo variable
+          DARKMUX_REVIEW_VERIFY_MODEL; empty => the seat resolves to the roster
+          profile's default model, same convention as judge_model.
+        required: false
+        default: ""
+        type: string
       mode:
         description: "Review dispatch mode: sequential (one seat model loaded at a time — the 32GB-tier default), parallel (multiple seat models resident at once), or auto (darkmux picks)."
         required: false
@@ -79,6 +96,8 @@ jobs:
       REPO: ${{ github.repository }}
       PROFILE: ${{ inputs.profile || vars.DARKMUX_REVIEW_PROFILE || 'review-deep' }}
       PROBE_MODELS: ${{ inputs.probe_models || vars.DARKMUX_REVIEW_PROBE_MODELS || '' }}
+      JUDGE_MODEL: ${{ inputs.judge_model || vars.DARKMUX_REVIEW_JUDGE_MODEL || '' }}
+      VERIFY_MODEL: ${{ inputs.verify_model || vars.DARKMUX_REVIEW_VERIFY_MODEL || '' }}
       MODE: ${{ inputs.mode }}
       K: ${{ inputs.k }}
     steps:
@@ -218,7 +237,13 @@ jobs:
           # commas.
           case "$PROFILE" in ''|*[!a-zA-Z0-9_.-]*) echo "profile input must match [a-zA-Z0-9_.-]"; exit 1 ;; esac
           if [ -n "$PROBE_MODELS" ]; then
-            case "$PROBE_MODELS" in *[!a-zA-Z0-9_.,-]*) echo "probe_models must match [a-zA-Z0-9_.,-]"; exit 1 ;; esac
+            case "$PROBE_MODELS" in *[!a-zA-Z0-9_.,/-]*) echo "probe_models must match [a-zA-Z0-9_.,/-]"; exit 1 ;; esac
+          fi
+          if [ -n "$JUDGE_MODEL" ]; then
+            case "$JUDGE_MODEL" in *[!a-zA-Z0-9_./-]*) echo "judge_model must match [a-zA-Z0-9_./-]"; exit 1 ;; esac
+          fi
+          if [ -n "$VERIFY_MODEL" ]; then
+            case "$VERIFY_MODEL" in *[!a-zA-Z0-9_./-]*) echo "verify_model must match [a-zA-Z0-9_./-]"; exit 1 ;; esac
           fi
           case "$MODE" in sequential|parallel|auto) ;; *) echo "mode input must be one of: sequential, parallel, auto"; exit 1 ;; esac
           if [ -n "$K" ]; then
@@ -231,7 +256,13 @@ jobs:
           # resourcing resolver scores each seat against. Optional `probe_models`
           # pins explicit probe drawers (from DARKMUX_REVIEW_PROBE_MODELS) to
           # keep a multi-model probe — still sourced from repo config, never
-          # named in this file. This workflow never hardcodes a model.
+          # named in this file. `judge_model`/`verify_model` pin those seats
+          # the same way (DARKMUX_REVIEW_JUDGE_MODEL / _VERIFY_MODEL repo
+          # vars). CONVENTION: an UNPINNED seat resolves to the roster
+          # profile's DEFAULT model (capability scoring is a no-op until
+          # models declare vectors) — a measured/parity run should staff
+          # every seat deliberately via the pins. This workflow never
+          # hardcodes a model.
           #
           # Resilient: a hiccup leaves no/empty envelope; the review dispatch's own
           # degraded-mode handling (below) turns that into a loud comment plus
@@ -261,6 +292,8 @@ jobs:
             --param "intent_file=$RUNNER_TEMP/qa/intent.txt" \
             --param "profile=$PROFILE" \
             ${PROBE_MODELS:+--param "probe_models=$PROBE_MODELS"} \
+            ${JUDGE_MODEL:+--param "judge_model=$JUDGE_MODEL"} \
+            ${VERIFY_MODEL:+--param "verify_model=$VERIFY_MODEL"} \
             --param "mode=$MODE" \
             --param "bundler=$BUNDLER_RUST_BIN" \
             ${K:+--param "k=$K"} \

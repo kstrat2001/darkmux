@@ -41,17 +41,17 @@
     },
     {
       "name": "probe_models",
-      "description": "(#1426 ship-2) Comma-separated model ids (each in the roster profile) that PIN the probe seat to explicit drawers, one staffing per id (`--param probe_models=id1,id2`). Absent -> one probe drawer chosen by capability scoring against the roster.",
+      "description": "(#1426 ship-2) Comma-separated model ids (each in the roster profile) that PIN the probe seat to explicit drawers, one staffing per id (`--param probe_models=id1,id2`). Absent -> one probe drawer chosen by capability scoring against the roster (the roster profile's DEFAULT model until models declare `capabilities` vectors).",
       "required": false
     },
     {
       "name": "judge_model",
-      "description": "(#1426 ship-2) Model id (in the roster profile) that PINS the judge seat (`--param judge_model=<id>`). Absent -> the capability-scored pick for the review-judge role.",
+      "description": "(#1426 ship-2) Model id (in the roster profile) that PINS the judge seat (`--param judge_model=<id>`). Absent -> capability scoring for the review-judge role, which resolves to the roster profile's DEFAULT model until models declare `capabilities` vectors -- pin deliberately for measured runs.",
       "required": false
     },
     {
       "name": "verify_model",
-      "description": "(#1426 ship-2) Model id (in the roster profile) that PINS the verify seat (`--param verify_model=<id>`). Absent -> the capability-scored pick for the review-verify role.",
+      "description": "(#1426 ship-2) Model id (in the roster profile) that PINS the verify seat (`--param verify_model=<id>`). Absent -> capability scoring for the review-verify role (the roster profile's DEFAULT model until models declare `capabilities` vectors).",
       "required": false
     },
     {

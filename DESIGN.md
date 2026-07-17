@@ -107,7 +107,7 @@ Single-operator multi-machine is the design target. The operator owns a couple o
 
 ## History: the openclaw shell-out path (removed in 2.0)
 
-Through the 0.x line, darkmux ran dispatches through either its own internal container-bounded runtime (the default) or an opt-in shell-out to a separately-installed openclaw process (`--runtime openclaw`), with a `darkmux crew sync` verb keeping openclaw's `agents.list[]` aligned with darkmux's role manifests. The two paths were deliberately schema-isolated — darkmux never translated its profile fields into openclaw's config shape, and vice versa — so an upstream openclaw schema change had zero impact on darkmux.
+Through the 0.x line, darkmux ran dispatches through either its own internal container-bounded runtime (the default) or an opt-in shell-out to a separately-installed openclaw process (`--runtime openclaw`), with a `crew sync` verb keeping openclaw's `agents.list[]` aligned with darkmux's role manifests. The two paths were deliberately schema-isolated — darkmux never translated its profile fields into openclaw's config shape, and vice versa — so an upstream openclaw schema change had zero impact on darkmux.
 
 The openclaw path was removed on the 2.0 track ([#1405](https://github.com/kstrat2001/darkmux/issues/1405), operator decision on [#1386](https://github.com/kstrat2001/darkmux/issues/1386) theme 5) to keep the build and test surface small: the internal runtime is now the only dispatch path, and the schema-isolation doctrine below continues to apply to it on its own terms.
 

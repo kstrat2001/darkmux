@@ -1064,8 +1064,9 @@ pub(crate) enum LabCmd {
         /// single reviewer or the dialectic pipeline — the release-guard
         /// validation mode: recall/precision scored EXACTLY like every other
         /// mode. Requires --workdirs (the probe/judge seats read the case's
-        /// repo tree, like --agentic/--dialectic) and --crew (the resolved
-        /// review-probe/review-judge seat staffing).
+        /// repo tree, like --agentic/--dialectic); seat staffing is derived
+        /// from the roster profile (--crew, else --profile, else the
+        /// registry's default_profile) by the resourcing resolver (#1426).
         #[arg(long, conflicts_with_all = ["freeform", "agentic", "dialectic"])]
         funnel: bool,
         /// Evidence root for --agentic / --dialectic / --funnel: one
@@ -1085,9 +1086,11 @@ pub(crate) enum LabCmd {
         /// denser local or remote-endpoint profile while the advocates stay.
         #[arg(long = "judge-profile", requires = "dialectic")]
         judge_profile: Option<String>,
-        /// (#1222 Phase B packet 7) Crew name (`crews.<name>` in the profile
-        /// registry) naming the review-probe/review-judge seat staffing.
-        /// Required with --funnel.
+        /// (#1426 ship-2) The ROSTER profile the resourcing resolver staffs
+        /// the review seats (probe / judge / verify) from — capability
+        /// scoring per seat against the profile's models[]. Falls back to
+        /// --profile, else the registry's `default_profile`. (The crews map
+        /// retired; this no longer names a `crews.<name>` entry.)
         #[arg(long, requires = "funnel")]
         crew: Option<String>,
         /// (#1222) Funnel model-cycling mode: "sequential" | "parallel" |
@@ -1095,11 +1098,10 @@ pub(crate) enum LabCmd {
         /// hardware tier).
         #[arg(long = "exec-mode", requires = "funnel")]
         exec_mode: Option<String>,
-        /// (#1222) Override every review-probe staffing's draw count `k` for
-        /// this run (the crew registry's per-staffing `k` otherwise applies
-        /// unchanged). Must be >= 1 — a 0 draw count guarantees a degenerate
-        /// run (zero probe flags), same floor `resolve_crew` enforces on a
-        /// crew's own `k`.
+        /// (#1426 ship-2) The probe seat's draw count `k` for this run (the
+        /// resourcing resolver's default of 3 otherwise applies). Must be at
+        /// least 1 — a 0 draw count guarantees a degenerate run (zero probe
+        /// flags).
         #[arg(long, requires = "funnel", value_parser = clap::value_parser!(u32).range(1..))]
         k: Option<u32>,
         /// (#1222) Run an external bundler

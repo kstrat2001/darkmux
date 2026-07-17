@@ -1223,6 +1223,7 @@ mod tests {
             passes: 2,
             max_tokens: None,
             selector: None,
+            provenance: None,
         }
     }
 

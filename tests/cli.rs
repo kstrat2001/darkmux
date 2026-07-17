@@ -139,19 +139,29 @@ fn retired_top_level_skills_verb_is_unknown() {
         ));
 }
 
-/// (#1426 phase 2) `dispatch` promoted to a top-level verb, so `crew dispatch`
-/// retired from the crew family. `crew` survives (list/show/index), so the
-/// error is an unknown SUB-verb WITHIN the surviving family — not an unknown
-/// top-level verb.
+/// (#1426 ship-2) The `crew` family retired ENTIRELY: phase 2 promoted
+/// `dispatch` to a top-level verb, and the crew REGISTRY dissolved (a crew is
+/// a derived view of a mission's resourcing), taking the registry-read verbs
+/// (`crew list`/`show`/`index`) with it. Every crew spelling — the bare family
+/// and each old sub-verb — is now an unknown TOP-LEVEL verb with no compat
+/// alias (pre-2.0 clean removal).
 #[test]
-fn retired_crew_dispatch_subverb_is_unknown() {
-    let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["crew", "dispatch", "code-reviewer"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unrecognized subcommand").or(
-            predicate::str::contains("unexpected argument"),
-        ));
+fn retired_crew_family_is_unknown_entirely() {
+    for args in [
+        vec!["crew"],
+        vec!["crew", "dispatch", "code-reviewer"],
+        vec!["crew", "list"],
+        vec!["crew", "show", "review-deep"],
+        vec!["crew", "index", "status"],
+    ] {
+        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        cmd.args(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unrecognized subcommand").or(
+                predicate::str::contains("unexpected argument"),
+            ));
+    }
 }
 
 // (#1426 phase 3) `swap`, `status`, `model`, `fleet`, and `recommendations`

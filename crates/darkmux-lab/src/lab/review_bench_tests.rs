@@ -717,6 +717,65 @@
         assert_eq!(detail["clean_cases"].as_u64(), Some(2));
     }
 
+    /// (#1210 gate coverage) `is_infra_failure`'s three arms, the `None`
+    /// tokens arm explicitly: only POSITIVE zero-token evidence reclassifies.
+    /// The runtime envelope always emits numeric token fields (see the fn
+    /// doc), so `None` means "no parseable envelope" — kept capability-side
+    /// deliberately, never guessed into infra.
+    #[test]
+    fn is_infra_failure_requires_degenerate_and_positive_zero_token_evidence() {
+        let degen = CaseScore { degenerate: true, ..Default::default() };
+        let ran_fine = CaseScore { correct: true, ..Default::default() };
+        let zero = EnvelopeMeta { model: None, total_tokens: Some(0) };
+        let served = EnvelopeMeta { model: None, total_tokens: Some(250) };
+        let unknown = EnvelopeMeta::default(); // total_tokens: None
+
+        assert!(is_infra_failure(&degen, Some(&zero)), "degenerate + zero tokens = infra");
+        assert!(!is_infra_failure(&degen, Some(&served)), "model ran = capability degenerate");
+        assert!(!is_infra_failure(&degen, Some(&unknown)), "None tokens is NOT infra evidence");
+        assert!(!is_infra_failure(&degen, None), "missing meta row is NOT infra evidence");
+        assert!(!is_infra_failure(&ran_fine, Some(&zero)), "non-degenerate never reclassifies");
+    }
+
+    /// (#1210 gate coverage) `print_summary`'s partition: infra cases leave
+    /// the capability set and are counted separately — via the shared pure
+    /// `infra_partition` helper.
+    #[test]
+    fn infra_partition_splits_capability_from_infra() {
+        let mk_case = |id: &str| Case {
+            id: id.into(),
+            label: Label {
+                kind: "clean".into(),
+                intent_title: "t".into(),
+                intent_body: String::new(),
+                expect_verdict: String::new(),
+                bug_class: None,
+                anchor_contains: None,
+                expected: vec![],
+                notes: None,
+            },
+            diff: String::new(),
+        };
+        let c1 = mk_case("c1");
+        let c2 = mk_case("c2");
+        let c3 = mk_case("c3");
+        let scored: Vec<(&Case, CaseScore)> = vec![
+            (&c1, CaseScore { correct: true, ..Default::default() }),
+            (&c2, CaseScore { degenerate: true, ..Default::default() }), // 429: zero tokens
+            (&c3, CaseScore { degenerate: true, ..Default::default() }), // ran, unparseable
+        ];
+        let meta = vec![
+            EnvelopeMeta { model: None, total_tokens: Some(500) },
+            EnvelopeMeta { model: None, total_tokens: Some(0) },
+            EnvelopeMeta { model: None, total_tokens: Some(120) },
+        ];
+        let (capability, infra) = infra_partition(&scored, &meta);
+        assert_eq!(infra, 1, "exactly the zero-token case");
+        assert_eq!(capability.len(), 2);
+        assert!(capability.iter().any(|(c, _)| c.id == "c1"));
+        assert!(capability.iter().any(|(c, _)| c.id == "c3"), "capability-degenerate stays");
+    }
+
     #[test]
     fn build_score_rows_emits_multi_schema_aggregates() {
         use crate::lab::scores::ArtifactKey;
@@ -1318,6 +1377,7 @@
                 passes: 2,
                 max_tokens: None,
                 selector: None,
+                provenance: None,
             }],
         );
         seats.insert(
@@ -1329,6 +1389,7 @@
                 passes: 2,
                 max_tokens: None,
                 selector: None,
+                provenance: None,
             }],
         );
         darkmux_crew::resourcing::ResolvedCrew { name: "test-crew".into(), seats, request_changes: false }

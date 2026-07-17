@@ -37,9 +37,43 @@ const DEFAULT_PROBE_K: u32 = 3;
 /// `SeatStaffing` default `passes`).
 const DEFAULT_JUDGE_PASSES: u32 = 2;
 
+/// (#1426 ship-2 / #44) How a seat's model was chosen. The resolver stamps
+/// this on every staffing so the envelope's staffing snapshot answers "where
+/// did this decision come from" directly — the operator never has to wonder
+/// whether a seat was scored or pinned (operator sovereignty #44: system
+/// proposes, operator overrides, record shows truth AND why).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StaffingProvenance {
+    /// `"scored"` (capability scoring against the roster profile) or
+    /// `"pinned"` (an explicit launch-param model id). A plain string, not an
+    /// enum, so snapshot consumers stay lenient to future kinds.
+    pub kind: String,
+    /// Scored: what it was scored against (role + roster profile). Pinned:
+    /// which launch param pinned it.
+    pub detail: String,
+}
+
+impl StaffingProvenance {
+    fn scored(role_id: &str, roster: &str) -> Self {
+        StaffingProvenance {
+            kind: "scored".to_string(),
+            detail: format!(
+                "select_model capability scoring for role \"{role_id}\" against roster \
+                 profile \"{roster}\""
+            ),
+        }
+    }
+    fn pinned(param: &str, model_id: &str) -> Self {
+        StaffingProvenance {
+            kind: "pinned".to_string(),
+            detail: format!("pinned by launch param {param}={model_id}"),
+        }
+    }
+}
+
 /// A seat staffing resolved to a concrete model — the resolver's per-seat
-/// output. (Migrated verbatim from the retired `darkmux_profiles::crews`; the
-/// review driver consumes it unchanged.)
+/// output. (Migrated verbatim from the retired `darkmux_profiles::crews`,
+/// plus the #44 `provenance` stamp; the review driver consumes it unchanged.)
 #[derive(Debug, Clone)]
 pub struct ResolvedSeatStaffing {
     /// The roster [`Profile`](darkmux_types::Profile) name this staffing
@@ -54,6 +88,9 @@ pub struct ResolvedSeatStaffing {
     pub passes: u32,
     pub max_tokens: Option<u32>,
     pub selector: Option<BundleSelector>,
+    /// (#1426 ship-2 / #44) Scored-vs-pinned, stamped by the resolver; `None`
+    /// only for hand-built staffings (tests, synthetic paths).
+    pub provenance: Option<StaffingProvenance>,
 }
 
 /// A fully-resolved review crew: every seat bound to a concrete model, keyed
@@ -175,11 +212,24 @@ pub fn resolve_review_resourcing(
         pm_for(&id, seat)
     };
 
-    let probe_k = ov.k.unwrap_or(DEFAULT_PROBE_K).max(1);
+    // (#1426 ship-2 gate CONSIDER) `k=0` is a loud error, never a silent
+    // clamp: a zero draw count guarantees a degenerate run (zero probe
+    // flags), and clamping it to 1 would hide the misconfiguration from the
+    // operator (sovereignty #44 — surface, never silently substitute).
+    // review-bench's clap layer already rejects 0; this covers the
+    // `mission launch review --param k=0` path.
+    if ov.k == Some(0) {
+        bail!(
+            "darkmux: review resourcing: k must be >= 1 (got 0) — a zero probe draw count \
+             guarantees a degenerate run. Omit k for the default ({DEFAULT_PROBE_K}). (#1426 ship-2)"
+        );
+    }
+    let probe_k = ov.k.unwrap_or(DEFAULT_PROBE_K);
 
     let mut seats: BTreeMap<String, Vec<ResolvedSeatStaffing>> = BTreeMap::new();
 
     // 3. Probe seat: explicit pins (one staffing each) or one scored staffing.
+    //    Every staffing carries its #44 provenance stamp (scored vs pinned).
     let probes: Vec<ResolvedSeatStaffing> = if ov.probe_models.is_empty() {
         vec![ResolvedSeatStaffing {
             name: profile_name.clone(),
@@ -188,6 +238,7 @@ pub fn resolve_review_resourcing(
             passes: DEFAULT_JUDGE_PASSES,
             max_tokens: None,
             selector: None,
+            provenance: Some(StaffingProvenance::scored(REVIEW_PROBE_ROLE, &profile_name)),
         }]
     } else {
         ov.probe_models
@@ -200,6 +251,7 @@ pub fn resolve_review_resourcing(
                     passes: DEFAULT_JUDGE_PASSES,
                     max_tokens: None,
                     selector: None,
+                    provenance: Some(StaffingProvenance::pinned("probe_models", id)),
                 })
             })
             .collect::<Result<Vec<_>>>()?
@@ -207,10 +259,14 @@ pub fn resolve_review_resourcing(
     seats.insert(REVIEW_PROBE_ROLE.to_string(), probes);
 
     // 4. Judge seat (exactly one). Draws once; carries the consensus depth.
-    let judge_pm = match ov.judge_model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(id) => pm_for(id, "review-judge")?,
-        None => scored_pm(REVIEW_JUDGE_ROLE, "review-judge")?,
-    };
+    let (judge_pm, judge_prov) =
+        match ov.judge_model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => (pm_for(id, "review-judge")?, StaffingProvenance::pinned("judge_model", id)),
+            None => (
+                scored_pm(REVIEW_JUDGE_ROLE, "review-judge")?,
+                StaffingProvenance::scored(REVIEW_JUDGE_ROLE, &profile_name),
+            ),
+        };
     seats.insert(
         REVIEW_JUDGE_ROLE.to_string(),
         vec![ResolvedSeatStaffing {
@@ -220,15 +276,22 @@ pub fn resolve_review_resourcing(
             passes: DEFAULT_JUDGE_PASSES,
             max_tokens: None,
             selector: None,
+            provenance: Some(judge_prov),
         }],
     );
 
     // 5. Verify seat (exactly one). Adjudicates each double-confirmed finding
     //    once; a single-pass seat, scored by default or pinned.
-    let verify_pm = match ov.verify_model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(id) => pm_for(id, "review-verify")?,
-        None => scored_pm(REVIEW_VERIFY_ROLE, "review-verify")?,
-    };
+    let (verify_pm, verify_prov) =
+        match ov.verify_model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => {
+                (pm_for(id, "review-verify")?, StaffingProvenance::pinned("verify_model", id))
+            }
+            None => (
+                scored_pm(REVIEW_VERIFY_ROLE, "review-verify")?,
+                StaffingProvenance::scored(REVIEW_VERIFY_ROLE, &profile_name),
+            ),
+        };
     seats.insert(
         REVIEW_VERIFY_ROLE.to_string(),
         vec![ResolvedSeatStaffing {
@@ -238,6 +301,7 @@ pub fn resolve_review_resourcing(
             passes: 1,
             max_tokens: None,
             selector: None,
+            provenance: Some(verify_prov),
         }],
     );
 
@@ -252,6 +316,45 @@ pub fn resolve_review_resourcing(
 mod tests {
     use super::*;
     use darkmux_types::{ModelEndpoint, Profile, ProfileModel};
+    use tempfile::TempDir;
+
+    /// RAII guard pointing `DARKMUX_CREW_DIR` at a TempDir for the test's
+    /// duration (gate CONSIDER on ship-2): the resolver calls the REAL
+    /// `load_roles`/`load_skills`, so without isolation these tests become
+    /// environment-sensitive the day the operator's user role manifests carry
+    /// capability vectors. Same pattern as `loader_tests::CrewDirGuard`;
+    /// every test here is `#[serial_test::serial]` (env mutation).
+    struct CrewDirGuard {
+        prev: Option<String>,
+        _tmp: TempDir,
+    }
+
+    impl CrewDirGuard {
+        fn empty() -> Self {
+            Self::new(TempDir::new().expect("tempdir"))
+        }
+        fn new(tmp: TempDir) -> Self {
+            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            // SAFETY: serialized via #[serial_test::serial] on every caller.
+            unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+            Self { prev, _tmp: tmp }
+        }
+        fn path(&self) -> &std::path::Path {
+            self._tmp.path()
+        }
+    }
+
+    impl Drop for CrewDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized via #[serial_test::serial] on every caller.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                }
+            }
+        }
+    }
 
     fn model(id: &str, n_ctx: u32) -> ProfileModel {
         ProfileModel { id: id.to_string(), n_ctx: Some(n_ctx), ..Default::default() }
@@ -279,8 +382,10 @@ mod tests {
         }
     }
 
+    #[serial_test::serial]
     #[test]
     fn scores_all_three_seats_from_the_default_profile() {
+        let _guard = CrewDirGuard::empty();
         let reg = reg_with("deep", vec![model("a", 40000)]);
         let crew = resolve_review_resourcing(&reg, &ReviewResourcing::default()).unwrap();
         assert_eq!(crew.name, "deep", "the derived crew's identity is its roster profile");
@@ -294,8 +399,10 @@ mod tests {
         assert!(!crew.request_changes);
     }
 
+    #[serial_test::serial]
     #[test]
     fn k_override_applies_to_probe_only() {
+        let _guard = CrewDirGuard::empty();
         let reg = reg_with("deep", vec![model("a", 40000)]);
         let ov = ReviewResourcing { k: Some(5), ..Default::default() };
         let crew = resolve_review_resourcing(&reg, &ov).unwrap();
@@ -303,8 +410,10 @@ mod tests {
         assert_eq!(crew.seats.get("review-judge").unwrap()[0].k, 1);
     }
 
+    #[serial_test::serial]
     #[test]
     fn explicit_pins_win_and_multiple_probe_drawers_staff() {
+        let _guard = CrewDirGuard::empty();
         let reg = reg_with(
             "deep",
             vec![model("small", 32000), model("big", 200000), remote("cloud")],
@@ -326,8 +435,10 @@ mod tests {
         assert!(verify.pm.is_remote(), "a remote pin needs no n_ctx");
     }
 
+    #[serial_test::serial]
     #[test]
     fn pinning_a_missing_model_names_the_seat_and_the_model() {
+        let _guard = CrewDirGuard::empty();
         let reg = reg_with("deep", vec![model("a", 40000)]);
         let ov = ReviewResourcing { judge_model: Some("ghost".into()), ..Default::default() };
         let err = resolve_review_resourcing(&reg, &ov).unwrap_err().to_string();
@@ -335,8 +446,10 @@ mod tests {
         assert!(err.contains("ghost"), "names the model: {err}");
     }
 
+    #[serial_test::serial]
     #[test]
     fn a_local_pin_without_n_ctx_fails_at_resolution() {
+        let _guard = CrewDirGuard::empty();
         let reg = reg_with(
             "deep",
             vec![ProfileModel { id: "local-a".into(), ..Default::default() }],
@@ -347,12 +460,124 @@ mod tests {
         assert!(err.contains("n_ctx"), "names the field: {err}");
     }
 
+    #[serial_test::serial]
     #[test]
     fn no_roster_profile_is_a_named_error() {
+        let _guard = CrewDirGuard::empty();
         let reg = ProfileRegistry { profiles: BTreeMap::new(), ..Default::default() };
         let err = resolve_review_resourcing(&reg, &ReviewResourcing::default())
             .unwrap_err()
             .to_string();
         assert!(err.contains("roster profile"), "got: {err}");
+    }
+
+    /// (#1426 ship-2 gate CONSIDER) `k=0` is a loud error, never a silent
+    /// clamp to 1 — the mission-launch path has no clap range guard, so the
+    /// resolver is the floor.
+    #[serial_test::serial]
+    #[test]
+    fn k_zero_errors_loudly_instead_of_clamping() {
+        let _guard = CrewDirGuard::empty();
+        let reg = reg_with("deep", vec![model("a", 40000)]);
+        let ov = ReviewResourcing { k: Some(0), ..Default::default() };
+        let err = resolve_review_resourcing(&reg, &ov).unwrap_err().to_string();
+        assert!(err.contains("k must be >= 1"), "got: {err}");
+        assert!(err.contains("degenerate"), "names the consequence: {err}");
+    }
+
+    /// (#44) Every staffing carries its provenance stamp: a scored seat says
+    /// so (naming the role + roster it was scored against), a pinned seat
+    /// names the launch param that pinned it.
+    #[serial_test::serial]
+    #[test]
+    fn provenance_records_scored_vs_pinned_per_seat() {
+        let _guard = CrewDirGuard::empty();
+        let reg = reg_with("deep", vec![model("a", 40000), model("b", 40000)]);
+        let ov = ReviewResourcing { judge_model: Some("b".into()), ..Default::default() };
+        let crew = resolve_review_resourcing(&reg, &ov).unwrap();
+
+        let probe_prov = crew.seats.get("review-probe").unwrap()[0].provenance.as_ref().unwrap();
+        assert_eq!(probe_prov.kind, "scored");
+        assert!(probe_prov.detail.contains("review-probe"), "{}", probe_prov.detail);
+        assert!(probe_prov.detail.contains("deep"), "names the roster: {}", probe_prov.detail);
+
+        let judge_prov = crew.seats.get("review-judge").unwrap()[0].provenance.as_ref().unwrap();
+        assert_eq!(judge_prov.kind, "pinned");
+        assert!(judge_prov.detail.contains("judge_model=b"), "{}", judge_prov.detail);
+
+        let verify_prov = crew.seats.get("review-verify").unwrap()[0].provenance.as_ref().unwrap();
+        assert_eq!(verify_prov.kind, "scored");
+    }
+
+    /// (gate coverage 13) A roster profile with an EMPTY `models[]` fails
+    /// through `scored_pm` with the seat named — never a panic, never a
+    /// silent empty staffing. (Normally unreachable via `load_registry`,
+    /// which validates non-empty `models[]`, but the resolver takes any
+    /// registry.)
+    #[serial_test::serial]
+    #[test]
+    fn empty_models_roster_fails_scored_pm_with_the_seat_named() {
+        let _guard = CrewDirGuard::empty();
+        let reg = reg_with("empty", vec![]);
+        // `{:#}` renders the full anyhow chain — the seat is the outer
+        // context, the no-models cause is inner.
+        let err = format!("{:#}", resolve_review_resourcing(&reg, &ReviewResourcing::default()).unwrap_err());
+        assert!(err.contains("review-probe"), "names the first seat scored: {err}");
+        assert!(
+            err.contains("no models") || err.contains("no default model"),
+            "names the actual problem: {err}"
+        );
+    }
+
+    /// (gate coverage 9 — the resolver's headline) With a MIXED roster whose
+    /// models declare capability vectors, and user role manifests whose
+    /// skills request DIFFERENT capabilities per seat, probe and judge
+    /// resolve to DIFFERENT models via real `select_model` scoring — not the
+    /// shared default. Uses the guarded `DARKMUX_CREW_DIR` to install a
+    /// synthetic role + skill fixture (user roles override built-ins by id).
+    #[serial_test::serial]
+    #[test]
+    fn differentiated_staffing_probe_and_judge_score_to_different_models() {
+        let guard = CrewDirGuard::empty();
+        let roles_dir = guard.path().join("roles");
+        let skills_dir = guard.path().join("skills");
+        std::fs::create_dir_all(&roles_dir).unwrap();
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        // Two skills demanding orthogonal capabilities.
+        std::fs::write(
+            skills_dir.join("code-heavy.json"),
+            r#"{"id":"code-heavy","description":"code work","capabilities":{"code":1.0}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skills_dir.join("judgment-heavy.json"),
+            r#"{"id":"judgment-heavy","description":"judgment work","capabilities":{"reasoning":1.0}}"#,
+        )
+        .unwrap();
+        // User overrides for the review seats routing to those skills.
+        let role = |id: &str, skill: &str| {
+            format!(
+                r#"{{"id":"{id}","role_family":"specialist","description":"t","skills":["{skill}"],
+                    "tool_palette":{{"allow":[],"deny":[]}},"escalation_contract":"bail-with-explanation"}}"#
+            )
+        };
+        std::fs::write(roles_dir.join("review-probe.json"), role("review-probe", "code-heavy")).unwrap();
+        std::fs::write(roles_dir.join("review-judge.json"), role("review-judge", "judgment-heavy")).unwrap();
+        std::fs::write(roles_dir.join("review-verify.json"), role("review-verify", "judgment-heavy")).unwrap();
+
+        // A mixed roster: a coder-shaped model and a reasoner-shaped model.
+        let mut coder = model("coder-model", 40000);
+        coder.capabilities = [(darkmux_types::Capability::Code, 1.0f32)].into_iter().collect();
+        let mut reasoner = model("reasoner-model", 40000);
+        reasoner.capabilities =
+            [(darkmux_types::Capability::Reasoning, 1.0f32)].into_iter().collect();
+        let reg = reg_with("mixed", vec![coder, reasoner]);
+
+        let crew = resolve_review_resourcing(&reg, &ReviewResourcing::default()).unwrap();
+        let probe_model = &crew.seats.get("review-probe").unwrap()[0].pm.id;
+        let judge_model = &crew.seats.get("review-judge").unwrap()[0].pm.id;
+        assert_eq!(probe_model, "coder-model", "the code-demanding probe scores the coder");
+        assert_eq!(judge_model, "reasoner-model", "the judgment-demanding judge scores the reasoner");
+        assert_ne!(probe_model, judge_model, "a mixed roster differentiates the seats");
     }
 }

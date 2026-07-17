@@ -1754,12 +1754,18 @@ fn check_crews_residue() -> Check {
     if registry.registry.extras.contains_key("crews") {
         Check {
             name: "crews residue".into(),
-            status: Status::Pass,
-            message: "a legacy `crews` map is present but ignored".into(),
+            // WARN, not Pass-with-hint (gate CONSIDER): a config block that no
+            // longer does anything merits the warn tier — the operator should
+            // learn their declared crews stopped being read, not skim past it.
+            status: Status::Warn,
+            message: "a legacy `crews` map is present and DOES NOTHING — it stopped being read \
+                      in 2.0"
+                .into(),
             hint: Some(
                 "the `crews` map retired in 2.0 (#1426) — review staffing is now derived from \
-                 the active profile plus launch-param seat pins. The key is harmless residue; \
-                 delete it from ~/.darkmux/profiles.json when convenient."
+                 the roster profile plus launch-param seat pins (probe_models / judge_model / \
+                 verify_model / k). The key is harmless residue; delete it from \
+                 ~/.darkmux/profiles.json."
                     .into(),
             ),
         }
@@ -3872,11 +3878,13 @@ mod tests {
     }
 
     /// A pre-2.0 profiles.json still carrying a `crews` map parses fine (the
-    /// key overflows into `extras`) and is NOTED as ignorable residue — a
-    /// Pass with a delete-when-convenient hint, never a warning or an error.
+    /// key overflows into `extras`) and surfaces as a WARN — a config block
+    /// that no longer does anything merits the warn tier, so the operator
+    /// learns their declared crews stopped being read. Never an error (the
+    /// residue is harmless to every code path).
     #[serial_test::serial]
     #[test]
-    fn check_crews_residue_notes_legacy_crews_key_as_ignorable() {
+    fn check_crews_residue_warns_on_legacy_crews_key() {
         let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
         std::fs::write(
             &config_path,
@@ -3886,8 +3894,8 @@ mod tests {
         .unwrap();
 
         let check = check_crews_residue();
-        assert_eq!(check.status, Status::Pass);
-        assert!(check.message.contains("ignored"));
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("DOES NOTHING"), "got: {}", check.message);
         assert!(check.hint.as_deref().unwrap().contains("retired in 2.0"));
     }
 

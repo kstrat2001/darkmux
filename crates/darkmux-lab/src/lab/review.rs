@@ -1135,6 +1135,15 @@ pub struct StaffingSnapshot {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<BundleSelector>,
+    /// (#1426 ship-2 / #44) HOW this seat's model was chosen — `scored`
+    /// (capability scoring against the roster profile, with what it scored
+    /// against) or `pinned` (which launch param pinned it). The snapshot
+    /// already recorded WHAT resolved; this records WHY, so the operator
+    /// never wonders where the staffing decision came from. `Option` +
+    /// `#[serde(default)]` — a pre-ship-2 snapshot (field absent)
+    /// deserializes as `None`, the module's standard schema-lenience.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<darkmux_crew::resourcing::StaffingProvenance>,
 }
 
 /// Per-seat resolved staffing snapshot — `review-probe` (one or more
@@ -1182,6 +1191,8 @@ pub fn staffing_snapshot(
             n_ctx: s.pm.n_ctx,
             max_tokens: s.max_tokens,
             selector: s.selector.clone(),
+            // (#44) Scored-vs-pinned, carried verbatim from the resolver.
+            provenance: s.provenance.clone(),
         }
     }
     CrewStaffingSnapshot {
@@ -1485,22 +1496,24 @@ pub fn validate_review_crew(crew: &ResolvedCrew) -> Result<ReviewSeats<'_>> {
         .filter(|v| !v.is_empty())
         .ok_or_else(|| {
             anyhow!(
-                "darkmux: crew \"{}\" is missing seat \"review-probe\" (the review \
-                 review needs >= 1 staffing) — add one under crews.\"{}\".seats.\"review-probe\"",
-                crew.name,
+                "darkmux: review staffing \"{}\" is missing the \"review-probe\" seat (the \
+                 review needs >= 1 probe staffing) — the resourcing resolver staffs it from \
+                 the roster profile; pin drawers explicitly with `--param probe_models=<id,...>` \
+                 (#1426 ship-2)",
                 crew.name
             )
         })?;
     let judges = crew.seats.get("review-judge").ok_or_else(|| {
         anyhow!(
-            "darkmux: crew \"{}\" is missing seat \"review-judge\" (the review \
-             review needs exactly 1 staffing)",
+            "darkmux: review staffing \"{}\" is missing the \"review-judge\" seat (the \
+             review needs exactly 1 judge staffing) — the resourcing resolver staffs it from \
+             the roster profile; pin it explicitly with `--param judge_model=<id>` (#1426 ship-2)",
             crew.name
         )
     })?;
     if judges.len() != 1 {
         bail!(
-            "darkmux: crew \"{}\" seat \"review-judge\" must have EXACTLY 1 staffing \
+            "darkmux: review staffing \"{}\" seat \"review-judge\" must have EXACTLY 1 staffing \
              (got {}) — the double-confirm judge is a single seat, unlike \"review-probe\"",
             crew.name,
             judges.len()
@@ -1510,7 +1523,7 @@ pub fn validate_review_crew(crew: &ResolvedCrew) -> Result<ReviewSeats<'_>> {
         None => None,
         Some(v) if v.len() == 1 => Some(&v[0]),
         Some(v) => bail!(
-            "darkmux: crew \"{}\" seat \"review-verify\" must have EXACTLY 1 staffing \
+            "darkmux: review staffing \"{}\" seat \"review-verify\" must have EXACTLY 1 staffing \
              when declared (got {}) — the adjudication seat is single, like \"review-judge\" \
              (#1260)",
             crew.name,

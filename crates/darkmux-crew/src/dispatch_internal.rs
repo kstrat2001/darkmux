@@ -2100,21 +2100,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // runs); skipped for the mock-model harness (no real LMStudio to load into,
     // same gate as the dispatch model's residency).
     if opts.model_base_url_override.is_none() {
-        if let Some(util_id) = compaction.compactor_model.as_deref() {
-            if let Some(window) = compaction.context_window {
-                let util_pm = darkmux_types::ProfileModel {
-                    id: util_id.to_string(),
-                    n_ctx: Some(window),
-                    ..Default::default()
-                };
-                if let Err(e) = ensure_model_loaded_at_ctx(&util_pm) {
-                    eprintln!(
-                        "darkmux dispatch: WARNING — utility/compactor model `{util_id}` \
-                         could not be ensured resident at n_ctx={window}: {e:#}. Compaction may \
-                         JIT-load it at the model default and truncate its summaries. (#1280)"
-                    );
-                }
-            }
+        if let Some(warning) = ensure_utility_resident(
+            compaction.compactor_model.as_deref(),
+            compaction.context_window,
+            ensure_model_loaded_at_ctx,
+        ) {
+            eprintln!("{warning}");
         }
     }
 
@@ -3956,6 +3947,44 @@ fn ensure_context_window(
 // context (namespaced) via `ensure_model_loaded_at_ctx` at dispatch start, the
 // same guard the dispatch model gets — not merely warned about.
 
+/// (#1280) Build the utility/compactor model's residency spec (the compaction
+/// CONTEXT WINDOW is its required `n_ctx` — a compaction payload is sized to
+/// that window, so the model must be loaded at least that large). Pure; the
+/// wiring's unit-test seam.
+fn utility_residency_pm(util_id: &str, context_window: u32) -> darkmux_types::ProfileModel {
+    darkmux_types::ProfileModel {
+        id: util_id.to_string(),
+        n_ctx: Some(context_window),
+        ..Default::default()
+    }
+}
+
+/// (#1280) Ensure the utility/compactor model is resident at the compaction
+/// context window via `load` (production: `ensure_model_loaded_at_ctx`, which
+/// loads under the `darkmux:` namespace with the bounded #1139 machinery).
+/// Returns `Some(warning)` on a load failure — WARN, never abort: a
+/// compaction-less short dispatch still runs; the warning names the risk
+/// (JIT-load at the model default, truncated summaries). `None` when there is
+/// no compactor, no window, or the load succeeded. Pure over the injected
+/// `load` so the warn-not-abort contract is unit-testable without LMStudio.
+fn ensure_utility_resident(
+    compactor_model: Option<&str>,
+    context_window: Option<u32>,
+    load: impl Fn(&darkmux_types::ProfileModel) -> Result<()>,
+) -> Option<String> {
+    let util_id = compactor_model?;
+    let window = context_window?;
+    let util_pm = utility_residency_pm(util_id, window);
+    match load(&util_pm) {
+        Ok(()) => None,
+        Err(e) => Some(format!(
+            "darkmux dispatch: WARNING — utility/compactor model `{util_id}` could not be \
+             ensured resident at n_ctx={window}: {e:#}. Compaction may JIT-load it at the \
+             model default and truncate its summaries. (#1280)"
+        )),
+    }
+}
+
 /// (#408) Whether a selected-vs-loaded model mismatch should be fatal.
 ///
 /// Opt-in via `DARKMUX_STRICT_SELECTION` (truthy: `1` / `true` / `yes` /
@@ -4063,7 +4092,7 @@ fn map_load_result(
         Err(HostError::InsufficientResources { detail }) => bail!(
             "darkmux: model `{model_key}` could not load at n_ctx={n_ctx} — insufficient RAM \
              ({detail}). Free resources, lower the profile's n_ctx, or evict a resident \
-             darkmux model (`darkmux model eject`), then retry. (#1139)"
+             darkmux model (`darkmux machine eject`), then retry. (#1139)"
         ),
         Err(HostError::Timeout { phase, waited }) => bail!(
             "darkmux: model `{model_key}` load did not finish within the bounded {phase} \

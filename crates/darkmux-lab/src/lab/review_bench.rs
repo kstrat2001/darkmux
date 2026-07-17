@@ -260,10 +260,11 @@ pub struct ReviewBenchOpts {
     pub prosecutor_profile: Option<String>,
     pub defender_profile: Option<String>,
     pub judge_profile: Option<String>,
-    /// (#1222 Phase B packet 7) `Funnel` mode's crew name — `crews.<name>`
-    /// in the profile registry, naming the `review-probe`/`review-judge`
-    /// seat staffing `lab::review::validate_review_crew` requires. Required
-    /// when `mode == Funnel` (checked at bench start, before any dispatch).
+    /// (#1426 ship-2) `Funnel` mode's ROSTER profile — the profile whose
+    /// `models[]` the resourcing resolver scores each review seat (probe /
+    /// judge / verify) against. Falls back to `profile_name`, else the
+    /// registry's `default_profile`. (The crews map retired; this no longer
+    /// names a `crews.<name>` entry.)
     pub crew: Option<String>,
     /// (#1222) `Funnel` mode's model-cycling mode override —
     /// `"sequential"` | `"parallel"` | `"auto"` (default: `auto`, resolved
@@ -1340,21 +1341,31 @@ fn yn(b: bool) -> &'static str {
     }
 }
 
+/// (#1210) Split `scored` into (capability cases, infra-fail count): a
+/// zero-token dispatch never ran the model, so it belongs to neither the
+/// capability tallies nor the degenerate count. Pure — shared by
+/// `print_summary`; `build_score_rows` applies the same predicate per row.
+pub(crate) fn infra_partition<'a>(
+    scored: &'a [(&'a Case, CaseScore)],
+    meta: &[EnvelopeMeta],
+) -> (Vec<&'a (&'a Case, CaseScore)>, usize) {
+    let mut capability = Vec::with_capacity(scored.len());
+    let mut infra = 0usize;
+    for (i, cs) in scored.iter().enumerate() {
+        if is_infra_failure(&cs.1, meta.get(i)) {
+            infra += 1;
+        } else {
+            capability.push(cs);
+        }
+    }
+    (capability, infra)
+}
+
 fn print_summary(scored: &[(&Case, CaseScore)], meta: &[EnvelopeMeta], opts: &ReviewBenchOpts) {
     // (#1210) Partition off infra failures (zero-token dispatches) FIRST — they
     // never ran the model, so they belong to neither the capability tallies nor
     // the degenerate count; they get their own named line.
-    let infra: usize = scored
-        .iter()
-        .enumerate()
-        .filter(|(i, (_, s))| is_infra_failure(s, meta.get(*i)))
-        .count();
-    let capability: Vec<&(&Case, CaseScore)> = scored
-        .iter()
-        .enumerate()
-        .filter(|(i, (_, s))| !is_infra_failure(s, meta.get(*i)))
-        .map(|(_, cs)| cs)
-        .collect();
+    let (capability, infra) = infra_partition(scored, meta);
     let clean: Vec<&CaseScore> = capability
         .iter()
         .filter(|(c, _)| c.label.kind == "clean")
@@ -1521,6 +1532,19 @@ pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
 /// `degenerate` (#1050); only a zero-token dispatch is reclassified. `None`
 /// tokens (metrics absent/unparsed) is deliberately NOT treated as infra —
 /// we reclassify only on POSITIVE evidence of zero tokens served.
+///
+/// The `Some(0)` discriminator matches the REAL quota-failure shape (verified
+/// against the runtime, 2026-07-17): the container runtime's `--json` envelope
+/// ALWAYS emits numeric `prompt_tokens`/`completion_tokens` — the success path
+/// carries the loop's totals, and the error path calls
+/// `build_json_envelope("error", ..., 0, 0, ...)` (`runtime/src/main.rs`) with
+/// literal zeros — so a quota-dead dispatch parses as `Some(0)`, never `None`.
+/// `None` only arises when stdout carried NO parseable envelope at all (a
+/// crash before envelope emission), which `dispatch_case` surfaces as a bench
+/// error rather than a scored row — the None-conservative arm is correct, not
+/// a coverage gap. (The 2026-07-05 junk rows themselves were operator-cleaned
+/// from the corpus, per #1210 — the runtime envelope contract above is the
+/// citable evidence.)
 pub(crate) fn is_infra_failure(s: &CaseScore, m: Option<&EnvelopeMeta>) -> bool {
     s.degenerate && matches!(m.and_then(|m| m.total_tokens), Some(0))
 }
