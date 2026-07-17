@@ -24,25 +24,88 @@
       "task_id": "review-judge-task"
     },
     "review-probe-0-step": {
-      "config": null,
+      "config": {
+        "bucket_budget": 500000,
+        "bucket_group": "probe",
+        "collection": [],
+        "identifier": "darkmux:probe-model-a",
+        "max_tokens": 4000,
+        "model": "darkmux:probe-model-a",
+        "model_key": "probe-model-a",
+        "n_ctx": 32000,
+        "retry_on_empty": 1,
+        "system": "",
+        "temperature": 0.20000000298023224,
+        "timeout_seconds": 30,
+        "user_template": "{item}"
+      },
       "id": "review-probe-0-step",
-      "kind": "review.probe:alpha",
+      "kind": "dispatch.map",
       "status": "planned",
       "task_id": "review-probe-0-task"
     },
     "review-probe-1-step": {
-      "config": null,
+      "config": {
+        "bucket_budget": 500000,
+        "bucket_group": "probe",
+        "collection": [],
+        "identifier": "darkmux:probe-model-b",
+        "max_tokens": 4000,
+        "model": "darkmux:probe-model-b",
+        "model_key": "probe-model-b",
+        "n_ctx": 32000,
+        "retry_on_empty": 1,
+        "system": "",
+        "temperature": 0.20000000298023224,
+        "timeout_seconds": 30,
+        "user_template": "{item}"
+      },
       "id": "review-probe-1-step",
-      "kind": "review.probe:bravo",
+      "kind": "dispatch.map",
       "status": "planned",
       "task_id": "review-probe-1-task"
     },
     "review-probe-2-step": {
-      "config": null,
+      "config": {
+        "bucket_budget": 500000,
+        "bucket_group": "probe",
+        "collection": [],
+        "identifier": "darkmux:probe-model-b",
+        "max_tokens": 4000,
+        "model": "darkmux:probe-model-b",
+        "model_key": "probe-model-b",
+        "n_ctx": 32000,
+        "retry_on_empty": 1,
+        "system": "",
+        "temperature": 0.20000000298023224,
+        "timeout_seconds": 30,
+        "user_template": "{item}"
+      },
       "id": "review-probe-2-step",
-      "kind": "review.probe:charlie",
+      "kind": "dispatch.map",
       "status": "planned",
       "task_id": "review-probe-2-task"
+    },
+    "review-probe-3-step": {
+      "config": {
+        "bucket_budget": 500000,
+        "bucket_group": "probe",
+        "collection": [],
+        "identifier": "darkmux:probe-model-c",
+        "max_tokens": 4000,
+        "model": "darkmux:probe-model-c",
+        "model_key": "probe-model-c",
+        "n_ctx": 32000,
+        "retry_on_empty": 1,
+        "system": "",
+        "temperature": 0.20000000298023224,
+        "timeout_seconds": 30,
+        "user_template": "{item}"
+      },
+      "id": "review-probe-3-step",
+      "kind": "dispatch.map",
+      "status": "planned",
+      "task_id": "review-probe-3-task"
     },
     "review-synthesis-step": {
       "config": null,
@@ -51,10 +114,17 @@
       "status": "planned",
       "task_id": "review-synthesis-task"
     },
+    "review-verify-render-step": {
+      "config": null,
+      "id": "review-verify-render-step",
+      "kind": "review.verify-render",
+      "status": "planned",
+      "task_id": "review-verify-task"
+    },
     "review-verify-step": {
       "config": null,
       "id": "review-verify-step",
-      "kind": "review.verify",
+      "kind": "dispatch.map",
       "status": "planned",
       "task_id": "review-verify-task"
     }
@@ -67,95 +137,105 @@
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-bundle-step"
-      ],
-      "display_name": "Bundle"
+      ]
     },
     {
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe seat `alpha`",
+      "description": "probe seat `alpha/draw-0`",
+      "display_name": "Probe alpha/draw-0",
       "id": "review-probe-0-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-probe-0-step"
-      ],
-      "display_name": "Probe 0"
+      ]
     },
     {
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe seat `bravo`",
+      "description": "probe seat `bravo/draw-0`",
+      "display_name": "Probe bravo/draw-0",
       "id": "review-probe-1-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-probe-1-step"
-      ],
-      "display_name": "Probe 1"
+      ]
     },
     {
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe seat `charlie`",
+      "description": "probe seat `bravo/draw-1`",
+      "display_name": "Probe bravo/draw-1",
       "id": "review-probe-2-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-probe-2-step"
+      ]
+    },
+    {
+      "depends_on": [
+        "review-bundle-task"
       ],
-      "display_name": "Probe 2"
+      "description": "probe seat `charlie/draw-0`",
+      "display_name": "Probe charlie/draw-0",
+      "id": "review-probe-3-task",
+      "phase_id": "pr-review-golden-investigate",
+      "step_ids": [
+        "review-probe-3-step"
+      ]
     },
     {
       "depends_on": [
         "review-probe-0-task",
         "review-probe-1-task",
-        "review-probe-2-task"
+        "review-probe-2-task",
+        "review-probe-3-task"
       ],
-      "description": "dedup probe flags \u2014 mechanism-family keying + anchor matching",
+      "description": "dedup probe flags — mechanism-family keying + anchor matching",
       "id": "review-dedup-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-dedup-step"
-      ],
-      "display_name": "Dedup"
+      ]
     },
     {
       "depends_on": [
         "review-dedup-task"
       ],
-      "description": "double-confirm judge \u2014 internal pass1/pass2 loop over deduped flags",
+      "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
       "id": "review-judge-task",
       "phase_id": "pr-review-golden-adjudicate",
       "step_ids": [
         "review-judge-step"
-      ],
-      "display_name": "Judge"
+      ]
     },
     {
       "depends_on": [
         "review-judge-task"
       ],
-      "description": "verify \u2014 adjudicate confirmed findings",
+      "description": "verify — render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
       "id": "review-verify-task",
       "phase_id": "pr-review-golden-report",
       "step_ids": [
+        "review-verify-render-step",
         "review-verify-step"
-      ],
-      "display_name": "Verify"
+      ]
     },
     {
       "depends_on": [
         "review-dedup-task",
+        "review-judge-task",
         "review-verify-task"
       ],
-      "description": "synthesis \u2014 finalize tier counts + needs-check clustering",
+      "description": "synthesis — apply verify adjudications, finalize tier counts + needs-check clustering",
       "id": "review-synthesis-task",
       "phase_id": "pr-review-golden-report",
       "step_ids": [
         "review-synthesis-step"
-      ],
-      "display_name": "Synthesis"
+      ]
     }
   ]
 }

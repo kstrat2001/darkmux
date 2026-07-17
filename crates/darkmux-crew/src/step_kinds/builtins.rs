@@ -16,11 +16,24 @@
 //! CONFIG on one of these four kinds. See `step_kinds::patterns`'s module
 //! doc for the full three-tier picture.
 
-use super::types::{MapRemoteBucket, StepKind, StepOutcome, StepRunCtx};
+use super::types::{
+    MapDispatchOverride, MapRemoteBucket, OverrideDispatchCall, StepKind, StepOutcome, StepRunCtx,
+};
 use crate::types::{Step, Task};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+
+/// (#1442) The named per-item reason a `dispatch.map` hosted item records
+/// when the remote per-execution bucket refuses its FIRST attempt. Public
+/// (and `const`) because downstream reconstruction — the review pipeline's
+/// dedup boundary rebuilding per-seat member accounting from
+/// [`MapItemResult`]s — must distinguish a budget SKIP (call never fired;
+/// not a draw) from a dispatch ERROR (call fired and failed; a real draw),
+/// and matching this one canonical string is how it does so without the
+/// generic block growing a domain-shaped result field.
+pub const MAP_BUDGET_SKIP_ERROR: &str =
+    "remote token budget exhausted for this step — call skipped";
 
 /// Compose a step kind's base prompt/message with the gathered output of
 /// its already-`Complete` dependencies. Shared by `dispatch.internal` and
@@ -510,6 +523,26 @@ fn conservative_hosted_spend(total_tokens: Option<u64>, granted_max_tokens: u32)
 /// failing the whole step; `error` names the failure (a dispatch error, or a
 /// remote-budget skip). `content` is the reply text on success (empty on a
 /// skip/error).
+///
+/// **Per-item telemetry (#1442, probe-reconstruction envelope honesty).** Two
+/// fields carry the per-item observability the probe rewiring's reconstruction
+/// needs:
+/// - `served_model` — the model the ENDPOINT reported it actually served, for a
+///   HOSTED item only (from the reply body's `model` field, mirroring how
+///   [`crate::single_shot::SingleShotReply::model`] surfaces it and how the
+///   review pipeline's member records capture it). A LOCAL item sets it `None`
+///   by construction — `lms ps` is the only ground truth for a local dispatch,
+///   never what LMStudio happens to echo back — matching the established
+///   `served_model = if endpoint.is_some() { reply.model } else { None }`
+///   semantics in `darkmux-lab`'s `review.rs`. A missing served model is `None`,
+///   NEVER an empty string and NEVER the requested model echoed back as if
+///   served.
+/// - `wall_ms` — the CUMULATIVE wall-clock spent dispatching this item,
+///   accumulated across every attempt (the same accounting shape `total_tokens`
+///   already uses: a `retry_on_empty` retry adds its own call's elapsed on top,
+///   just as it adds its own tokens). An item skipped before any call fired (a
+///   first-attempt remote-budget exhaustion) measures the honest near-zero of
+///   the skip — a real measured `0`-ish duration, not a fabricated value.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MapItemResult {
     pub index: usize,
@@ -520,6 +553,10 @@ pub struct MapItemResult {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
+    #[serde(default)]
+    pub wall_ms: u64,
 }
 
 /// The text a `{item}` placeholder in `dispatch.map`'s `user_template` is
@@ -718,6 +755,12 @@ impl DispatchMapStepKind {
                 "ok": res.ok,
                 "remote": remote,
                 "total_tokens": res.total_tokens,
+                // (#1442) Per-item telemetry: the endpoint-reported served
+                // model (HOSTED only; `None` for a local item, by
+                // construction) and this item's cumulative dispatch wall-clock
+                // across every attempt.
+                "served_model": res.served_model,
+                "wall_ms": res.wall_ms,
                 "error": res.error,
             })),
             work_id: None,
@@ -739,6 +782,11 @@ impl DispatchMapStepKind {
         let ok_count = results.iter().filter(|r| r.ok).count();
         let failed_count = results.len() - ok_count;
         let total_tokens: u64 = results.iter().filter_map(|r| r.total_tokens).sum();
+        // (#1442) Summed per-item dispatch wall-clock — trivially additive
+        // beside the summed tokens, so the aggregate stays self-describing for
+        // "how long did the whole map spend dispatching" without a consumer
+        // re-folding the per-item records.
+        let total_wall_ms: u64 = results.iter().map(|r| r.wall_ms).sum();
         darkmux_flow::FlowRecord {
             ts: darkmux_flow::ts_utc_now(),
             level: if failed_count == 0 { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
@@ -766,6 +814,7 @@ impl DispatchMapStepKind {
                 "failed_count": failed_count,
                 "remote": remote,
                 "total_tokens": total_tokens,
+                "total_wall_ms": total_wall_ms,
             })),
             work_id: None,
             attempt: None,
@@ -848,10 +897,33 @@ impl DispatchMapStepKind {
         let timeout_seconds =
             step.config.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(120) as u32;
         // (#1442) The generic retry-on-empty budget (default 0/off) — see the
-        // struct doc. Read once for the whole collection loop.
-        let retry_on_empty =
-            u32::try_from(step.config.get("retry_on_empty").and_then(|v| v.as_u64()).unwrap_or(0))
-                .unwrap_or(u32::MAX);
+        // struct doc. Read once for the whole collection loop. ABSENT → 0
+        // (optional, off). A PRESENT-but-invalid value is a LOUD config error
+        // at step-run time (matching this block's `require_config_*`
+        // "missing/invalid key is loud" doctrine), never silently coerced —
+        // an out-of-u32-range `retry_on_empty` must NOT become ~4 billion
+        // re-dispatches (the prior `u32::try_from(...).unwrap_or(u32::MAX)`
+        // did exactly that; #1442 gate CONSIDER).
+        let retry_on_empty = match step.config.get("retry_on_empty") {
+            None => 0u32,
+            Some(v) => {
+                let n = v.as_u64().ok_or_else(|| {
+                    anyhow!(
+                        "step `{}`: `{}` config.retry_on_empty must be a non-negative integer",
+                        step.id,
+                        self.id()
+                    )
+                })?;
+                u32::try_from(n).map_err(|_| {
+                    anyhow!(
+                        "step `{}`: `{}` config.retry_on_empty ({n}) exceeds the maximum of {}",
+                        step.id,
+                        self.id(),
+                        u32::MAX
+                    )
+                })?
+            }
+        };
         let endpoint: Option<darkmux_types::ModelEndpoint> = match step.config.get("endpoint") {
             Some(v) => Some(
                 serde_json::from_value(v.clone())
@@ -867,14 +939,26 @@ impl DispatchMapStepKind {
         // (#1442, the allowance-multiplication fix). Ungrouped (or ctx-free)
         // steps get their own step-scoped bucket from the same budget, so
         // the one-execution contract reads identically either way. Local
-        // items never draw from it.
+        // items never draw from it. `bucket_budget` (u64, optional) lets a
+        // LAUNCHER stamp its already-resolved per-execution allowance into
+        // the step's own config — self-describing config, and the same
+        // value the scheduler honors when it creates a group bucket —
+        // instead of this block re-reading the environment at run time;
+        // absent, the `config_access` resolution applies as before.
         let bucket: Arc<Mutex<MapRemoteBucket>> = match ctx.and_then(|c| c.remote_bucket()) {
             Some(shared) => shared.clone(),
             None => {
-                let budget = darkmux_types::config_access::remote_max_tokens_per_execution();
+                let budget = step
+                    .config
+                    .get("bucket_budget")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_else(darkmux_types::config_access::remote_max_tokens_per_execution);
                 Arc::new(Mutex::new(MapRemoteBucket::new(budget)))
             }
         };
+        // (#1442 ship-2b) The scheduler-supplied dispatch override, if any —
+        // threaded into every item's arm; `None` on all production paths.
+        let ovr = ctx.and_then(|c| c.dispatch_override());
 
         let temperature =
             step.config.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
@@ -884,15 +968,41 @@ impl DispatchMapStepKind {
             let res = match &endpoint {
                 Some(ep) => map_hosted_item(
                     index, &bucket, ep, model, system, &user, max_tokens, timeout_seconds,
-                    retry_on_empty,
+                    retry_on_empty, ovr,
                 ),
                 None => map_local_item(
                     index, model, system, &user, temperature, max_tokens, timeout_seconds,
-                    retry_on_empty,
+                    retry_on_empty, ovr,
                 ),
             };
             // (#1442 gate C3) LIVE per-item emission when streaming.
             push(Self::item_record(step, model, endpoint.is_some(), &res), &mut batched);
+            // (#1442 ship-2b, #1361 continuity) One `telemetry.tokens`
+            // record per item that actually reported usage, so the fleet
+            // dashboard's off-meter token sum (`category: telemetry,
+            // source: tokens` records ONLY) stays sighted on map-dispatched
+            // work — the review pipeline's probe/verify stages ride this
+            // block now, and their per-call telemetry emission retired with
+            // their bespoke kinds. Only the honestly-known field is carried
+            // (the accumulated `total_tokens`); the per-reply prompt/
+            // completion split is not surfaced by [`MapItemResult`] and is
+            // NEVER fabricated here.
+            if let Some(total) = res.total_tokens {
+                push(
+                    crate::dispatch::build_telemetry_record(
+                        darkmux_flow::Level::Info,
+                        "telemetry.tokens",
+                        "tokens",
+                        &step.id,
+                        &format!("task:{}", step.task_id),
+                        Some(model),
+                        None,
+                        None,
+                        serde_json::json!({ "total_tokens": total }),
+                    ),
+                    &mut batched,
+                );
+            }
             results.push(res);
         }
 
@@ -965,10 +1075,17 @@ fn map_local_item(
     max_tokens: u32,
     timeout_seconds: u32,
     retry_on_empty: u32,
+    ovr: Option<&MapDispatchOverride>,
 ) -> MapItemResult {
     use crate::single_shot::{single_shot_chat, SingleShotRequest};
     let mut sum = 0u64;
     let mut any_usage = false;
+    // (#1442) Cumulative dispatch wall-clock across every attempt — the same
+    // per-attempt accumulation `sum` (tokens) uses. A LOCAL item's
+    // `served_model` is ALWAYS `None` by construction (see [`MapItemResult`]'s
+    // doc): the response body's echoed `model` is not ground truth for a local
+    // dispatch, so this arm never reads it.
+    let mut wall_ms = 0u64;
     for _ in 0..=retry_on_empty {
         let req = SingleShotRequest {
             base_url: None,
@@ -979,7 +1096,24 @@ fn map_local_item(
             max_tokens,
             timeout_seconds,
         };
-        match single_shot_chat(&req) {
+        let t0 = std::time::Instant::now();
+        // (#1442 ship-2b) The scheduler-supplied override replaces the
+        // TRANSPORT only — retry semantics and token accounting are
+        // identical on both paths (see [`MapDispatchOverride`]).
+        let dispatch = match ovr {
+            Some(f) => f(&OverrideDispatchCall {
+                model,
+                system,
+                user,
+                temperature,
+                max_tokens,
+                timeout_seconds,
+                endpoint: None,
+            }),
+            None => single_shot_chat(&req),
+        };
+        wall_ms += t0.elapsed().as_millis() as u64;
+        match dispatch {
             Ok(reply) => {
                 if let Some(t) = reply.total_tokens {
                     sum += t;
@@ -992,6 +1126,8 @@ fn map_local_item(
                         content: reply.content,
                         error: None,
                         total_tokens: item_total_tokens(any_usage, sum),
+                        served_model: None,
+                        wall_ms,
                     };
                 }
                 // Empty content — retry (until the budget is spent).
@@ -1004,6 +1140,8 @@ fn map_local_item(
                     content: String::new(),
                     error: Some(format!("{e:#}")),
                     total_tokens: item_total_tokens(any_usage, sum),
+                    served_model: None,
+                    wall_ms,
                 }
             }
         }
@@ -1017,6 +1155,8 @@ fn map_local_item(
         content: String::new(),
         error: None,
         total_tokens: item_total_tokens(any_usage, sum),
+        served_model: None,
+        wall_ms,
     }
 }
 
@@ -1038,29 +1178,43 @@ fn map_hosted_item(
     max_tokens: u32,
     timeout_seconds: u32,
     retry_on_empty: u32,
+    ovr: Option<&MapDispatchOverride>,
 ) -> MapItemResult {
     use crate::single_shot::HostedSingleShotRequest;
     let mut sum = 0u64;
     let mut any_usage = false;
+    // (#1442) Cumulative dispatch wall-clock across every attempt (the same
+    // shape as `sum`), and the ENDPOINT-reported served model — captured from
+    // the reply body's `model` field (last non-`None` across attempts wins, so
+    // a later usage-less reply never erases a served model an earlier attempt
+    // reported). A first-attempt budget skip fires no call, so both stay at
+    // their honest zero/`None`.
+    let mut wall_ms = 0u64;
+    let mut served_model: Option<String> = None;
     for attempt in 0..=retry_on_empty {
-        let admitted = bucket.lock().expect("map remote bucket mutex poisoned").admit();
-        if !admitted {
+        // (#1442 fan-out) admit_reserve grants — and RESERVES — the clamped
+        // completion cap in one locked operation, so concurrent sibling
+        // steps sharing this bucket (`bucket_group`) cannot all admit
+        // against the same untouched balance; see the method's own doc.
+        let granted = bucket
+            .lock()
+            .expect("map remote bucket mutex poisoned")
+            .admit_reserve(max_tokens);
+        let Some(clamped) = granted else {
             if attempt == 0 {
                 return MapItemResult {
                     index,
                     ok: false,
                     content: String::new(),
-                    error: Some(
-                        "remote token budget exhausted for this step — call skipped".to_string(),
-                    ),
+                    error: Some(MAP_BUDGET_SKIP_ERROR.to_string()),
                     total_tokens: None,
+                    served_model: None,
+                    wall_ms,
                 };
             }
             // A retry the bucket can no longer fund — stop, keep what fired.
             break;
-        }
-        let remaining = bucket.lock().expect("map remote bucket mutex poisoned").remaining();
-        let clamped = clamp_hosted_max_tokens(max_tokens, remaining);
+        };
         let req = HostedSingleShotRequest {
             endpoint,
             model,
@@ -1069,15 +1223,34 @@ fn map_hosted_item(
             max_tokens: clamped,
             timeout_seconds,
         };
-        match map_hosted_dispatch(&req) {
+        let t0 = std::time::Instant::now();
+        // (#1442 ship-2b) Scheduler-supplied override replaces the TRANSPORT
+        // only — the reserve/settle metering around it is identical.
+        let dispatch = match ovr {
+            Some(f) => f(&OverrideDispatchCall {
+                model,
+                system,
+                user,
+                temperature: 0.0,
+                max_tokens: clamped,
+                timeout_seconds,
+                endpoint: Some(endpoint),
+            }),
+            None => map_hosted_dispatch(&req),
+        };
+        wall_ms += t0.elapsed().as_millis() as u64;
+        match dispatch {
             Ok(reply) => {
                 bucket
                     .lock()
                     .expect("map remote bucket mutex poisoned")
-                    .spend(conservative_hosted_spend(reply.total_tokens, clamped));
+                    .settle(clamped, conservative_hosted_spend(reply.total_tokens, clamped));
                 if let Some(t) = reply.total_tokens {
                     sum += t;
                     any_usage = true;
+                }
+                if reply.model.is_some() {
+                    served_model = reply.model.clone();
                 }
                 if !reply.content.trim().is_empty() {
                     return MapItemResult {
@@ -1086,18 +1259,25 @@ fn map_hosted_item(
                         content: reply.content,
                         error: None,
                         total_tokens: item_total_tokens(any_usage, sum),
+                        served_model,
+                        wall_ms,
                     };
                 }
                 // Empty content — retry (if the bucket funds another attempt).
             }
             // Per-item error ISOLATION: capture, continue (never retried).
             Err(e) => {
+                // Release the reservation — a dispatch-level error spent
+                // nothing (the pre-reserve accounting billed 0 here too).
+                bucket.lock().expect("map remote bucket mutex poisoned").settle(clamped, 0);
                 return MapItemResult {
                     index,
                     ok: false,
                     content: String::new(),
                     error: Some(format!("{e:#}")),
                     total_tokens: item_total_tokens(any_usage, sum),
+                    served_model,
+                    wall_ms,
                 }
             }
         }
@@ -1108,6 +1288,8 @@ fn map_hosted_item(
         content: String::new(),
         error: None,
         total_tokens: item_total_tokens(any_usage, sum),
+        served_model,
+        wall_ms,
     }
 }
 
@@ -1174,8 +1356,15 @@ impl StepKind for DispatchMapStepKind {
         let identifier = config_str(step, "identifier")
             .map(str::to_string)
             .unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(model, None));
+        // (#1442 ship-2b) `model_key` — the LOADABLE model key when it
+        // differs from the wire `model` id. A local seat dispatches against
+        // its darkmux-NAMESPACED identifier (`darkmux:<id>` as the wire
+        // `model`), but the wave loader's `lms load` needs the bare model
+        // key; without this override the loader would try to load the
+        // namespaced string as if it were a model key.
+        let model_key = config_str(step, "model_key").unwrap_or(model);
         Some(darkmux_gestalt::Placement {
-            model_key: model.to_string(),
+            model_key: model_key.to_string(),
             identifier,
             min_ctx,
             // (#1442 gate C7) "step:<id>", consistent with the placement
@@ -1627,12 +1816,35 @@ mod tests {
     #[test]
     fn map_remote_bucket_admits_until_exhausted_then_skips() {
         let mut b = MapRemoteBucket::new(100);
-        assert!(b.admit(), "fresh bucket admits");
-        b.spend(60);
-        assert!(b.admit(), "still under budget");
-        b.spend(60); // now 120 >= 100
-        assert!(!b.admit(), "over budget -> skip");
+        let g1 = b.admit_reserve(60).expect("fresh bucket admits");
+        b.settle(g1, 60);
+        let g2 = b.admit_reserve(60).expect("still under budget");
+        b.settle(g2, 60); // now 120 >= 100 (the endpoint reported above its grant)
+        assert!(b.admit_reserve(60).is_none(), "over budget -> skip");
         assert_eq!(b.skipped(), 1);
+    }
+
+    #[test]
+    fn map_remote_bucket_reservation_holds_the_grant_until_settled() {
+        // (#1442 fan-out) The reserve-then-settle shape: a granted call's cap
+        // is held against the budget WHILE the call is in flight, so a
+        // concurrent sibling admitting mid-flight sees the reservation —
+        // never the untouched balance (the allowance-multiplication race a
+        // spend-after pair reintroduces under `seats x k` sibling
+        // concurrency).
+        let mut b = MapRemoteBucket::new(100);
+        let granted = b.admit_reserve(4096).expect("admits");
+        assert_eq!(granted, 100, "the grant clamps to what remains");
+        assert!(b.admit_reserve(10).is_none(), "an in-flight reservation blocks siblings");
+        assert_eq!(b.skipped(), 1);
+        // Settling with the real (higher) usage keeps the overshoot honest…
+        b.settle(granted, 600);
+        assert!(b.exhausted());
+        // …and settling an ERRORED call with 0 releases the whole grant.
+        let mut b2 = MapRemoteBucket::new(100);
+        let g = b2.admit_reserve(4096).expect("admits");
+        b2.settle(g, 0);
+        assert_eq!(b2.remaining(), 100, "an errored call spends nothing");
     }
 
     #[test]
@@ -1640,7 +1852,7 @@ mod tests {
         // The hard opt-out: a 0 allowance refuses every hosted call, the same
         // as `admit_remote_execution` refuses a single hosted dispatch.
         let mut b = MapRemoteBucket::new(0);
-        assert!(!b.admit(), "zero budget admits nothing");
+        assert!(b.admit_reserve(10).is_none(), "zero budget admits nothing");
         assert!(b.exhausted());
     }
 
@@ -1650,14 +1862,15 @@ mod tests {
         // full budget — a late item must not be granted more than remains.
         let mut b = MapRemoteBucket::new(100);
         assert_eq!(b.remaining(), 100);
-        b.spend(70);
+        let g = b.admit_reserve(70).expect("admits");
+        b.settle(g, 70);
         assert_eq!(b.remaining(), 30, "a later item's grant clamps to 30, not 100");
         assert_eq!(
-            clamp_hosted_max_tokens(4096, b.remaining()),
+            b.admit_reserve(4096).expect("still admits"),
             30,
-            "the clamp reads the remaining allowance"
+            "the grant reads the remaining allowance"
         );
-        b.spend(60); // overshoot: used 130 > budget 100
+        b.settle(30, 60); // overshoot: the endpoint reported above its grant
         assert_eq!(b.remaining(), 0, "saturating, never an underflow wrap");
     }
 
@@ -1678,9 +1891,9 @@ mod tests {
         // mission graph's max-fold token meter reads as the step's true
         // spend (any per-item value is <= the sum).
         let results = vec![
-            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100) },
-            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None },
-            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250) },
+            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), served_model: None, wall_ms: 0 },
+            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, served_model: None, wall_ms: 0 },
+            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), served_model: None, wall_ms: 0 },
         ];
         let s = map_step(json!({}));
         let rec = DispatchMapStepKind::aggregate_record(&s, "m", true, &results);
@@ -1696,7 +1909,7 @@ mod tests {
             "any failed item raises the level"
         );
 
-        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5) }];
+        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), served_model: None, wall_ms: 0 }];
         let rec = DispatchMapStepKind::aggregate_record(&s, "m", false, &clean);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
         assert_eq!(rec.payload.as_ref().unwrap()["remote"], false);
@@ -2034,6 +2247,246 @@ mod tests {
         assert!(results[0].ok);
         assert!(results[0].content.is_empty(), "default off does not retry the empty reply");
         assert_eq!(results[0].total_tokens, Some(40), "exactly one call was made");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_map_retry_on_empty_out_of_range_is_a_loud_config_error() {
+        // (#1442 gate CONSIDER) A `retry_on_empty` beyond u32's range must be
+        // a LOUD config error at step-run time — never silently coerced into
+        // ~4 billion re-dispatches (the prior `unwrap_or(u32::MAX)` behavior).
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "retry_on_empty": u64::from(u32::MAX) + 1,
+        }));
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("retry_on_empty"), "{msg}");
+        assert!(msg.contains("exceeds the maximum"), "{msg}");
+    }
+
+    #[test]
+    fn dispatch_map_retry_on_empty_wrong_type_is_a_loud_config_error() {
+        // (#1442 gate CONSIDER) A present-but-non-integer `retry_on_empty`
+        // (here a string) is loud too — the same "invalid key is loud"
+        // doctrine, not a silent fall-through to the default 0.
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "retry_on_empty": "lots",
+        }));
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("retry_on_empty"), "{msg}");
+        assert!(msg.contains("non-negative integer"), "{msg}");
+    }
+
+    // ── (#1442) per-item served_model + wall_ms telemetry ───────────────
+
+    /// A hosted reply that pauses `delay_ms` before returning — the test seam
+    /// for a per-item `wall_ms` a real dispatch would earn. `served` names the
+    /// endpoint-reported model (`None` reproduces an endpoint that omits it).
+    fn install_hosted_delayed(delay_ms: u64, served: Option<&'static str>, total: Option<u64>) {
+        install_hosted_override(move |_req| {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            Ok(crate::single_shot::SingleShotReply {
+                content: "flag".to_string(),
+                total_tokens: total,
+                prompt_tokens: None,
+                completion_tokens: None,
+                model: served.map(str::to_string),
+            })
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_hosted_item_surfaces_served_model_and_nonzero_wall_ms() {
+        // The endpoint reports it served "served-model-x" and the call takes a
+        // real (seam-controlled) ~15ms — the HOSTED item must surface BOTH the
+        // served model verbatim and a nonzero cumulative wall, in its result,
+        // its per-item flow record, AND (wall) the step aggregate's sum.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        install_hosted_delayed(15, Some("served-model-x"), Some(10));
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "endpoint": { "url": "https://example.com" },
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].served_model.as_deref(),
+            Some("served-model-x"),
+            "the endpoint-reported served model passes through verbatim"
+        );
+        assert!(
+            results[0].wall_ms >= 1,
+            "a real ~15ms dispatch earns a nonzero wall_ms, got {}",
+            results[0].wall_ms
+        );
+        // Per-item flow record (index 0) carries the same telemetry; the
+        // aggregate (last) carries the SUMMED wall.
+        let item_payload = out.flow_records[0].payload.as_ref().unwrap();
+        assert_eq!(item_payload["served_model"], "served-model-x");
+        assert!(item_payload["wall_ms"].as_u64().unwrap() >= 1);
+        let agg = out.flow_records.last().unwrap().payload.as_ref().unwrap();
+        assert_eq!(
+            agg["total_wall_ms"].as_u64().unwrap(),
+            results[0].wall_ms,
+            "the aggregate's total_wall_ms is the sum of the per-item walls"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_hosted_item_served_model_is_none_when_the_endpoint_omits_it() {
+        // An endpoint that omits `model` yields an honest `None` served_model —
+        // never a fabricated empty string and never the requested model echoed
+        // back as if served.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        install_hosted_delayed(0, None, Some(10));
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "endpoint": { "url": "https://example.com" },
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok, "it dispatched");
+        assert_eq!(
+            results[0].served_model, None,
+            "an omitting endpoint yields honest None — never a fabricated or echoed value"
+        );
+        assert_ne!(
+            results[0].served_model.as_deref(),
+            Some("gpt-5.1"),
+            "the requested model is never echoed into served_model"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_local_item_served_model_is_none_by_construction() {
+        // The LOCAL arm never reads the response's echoed `model` — `lms ps` is
+        // the only ground truth for a local dispatch — so `served_model` is
+        // `None` by construction. Point the local dialect at an unroutable
+        // endpoint so each item errors; the error path still carries the
+        // measured wall and a `None` served model.
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, "http://127.0.0.1:1");
+        }
+        let s = map_step(json!({
+            "model": "m",
+            "user_template": "check {item}",
+            "collection": ["a", "b"],
+            "timeout_seconds": 1,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|r| r.served_model.is_none()),
+            "a local item never surfaces a served model, even one the response echoed"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_retry_accumulates_wall_across_attempts() {
+        // Two attempts each pause a seam-controlled 20ms (empty, then content),
+        // retry_on_empty=1 → BOTH fire. `total_tokens` Some(120) independently
+        // proves two calls ran; `wall_ms` is their CUMULATIVE sum (>= the 40ms
+        // floor of two 20ms sleeps, minus <2ms of millis truncation) — the same
+        // per-attempt accumulation `total_tokens` already uses.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        // A scripted seam that also sleeps 20ms per call: empty (bills 50),
+        // then content (bills 70).
+        {
+            let idx = std::cell::Cell::new(0usize);
+            let script: std::rc::Rc<Vec<(&'static str, Option<u64>)>> =
+                std::rc::Rc::new(vec![("", Some(50)), ("flag", Some(70))]);
+            install_hosted_override(move |_req| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let i = idx.get().min(script.len().saturating_sub(1));
+                idx.set(idx.get() + 1);
+                let (content, total) = script[i];
+                Ok(crate::single_shot::SingleShotReply {
+                    content: content.to_string(),
+                    total_tokens: total,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: Some("served-r".to_string()),
+                })
+            });
+        }
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "endpoint": { "url": "https://example.com" },
+            "retry_on_empty": 1,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].total_tokens, Some(120), "both attempts fired (tokens summed)");
+        assert!(
+            results[0].wall_ms >= 30,
+            "wall accumulated across BOTH 20ms attempts (>= 30ms), got {}",
+            results[0].wall_ms
+        );
+        assert_eq!(results[0].served_model.as_deref(), Some("served-r"));
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),
