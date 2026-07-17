@@ -12,7 +12,6 @@
 //!   crew::loader — read JSON manifests from `~/.darkmux/crew/<entity>/`
 //!                  with binary-embedded built-ins as fallback
 
-pub mod cli;
 // (#1230 Packet 1) Bounded concurrent-dispatch executor over gestalt's
 // `plan_waves` — see the module doc. No production caller in this packet;
 // Packet 2's `run_step_graph` scheduler is the intended first consumer.

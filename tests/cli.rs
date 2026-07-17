@@ -1548,14 +1548,23 @@ fn pr_review_run_github_without_head_sha_rejected() {
         .stderr(predicate::str::contains("head_sha"));
 }
 
-/// A real (non `from_envelope`) run with no `crew` input fails loud, naming
-/// the requirement, before any bundling/dispatch happens.
+/// (#1426 ship-2) A real (non `from_envelope`) run whose registry has no
+/// resolvable roster (no `default_profile`, and no `profile` param naming one)
+/// fails loud at the resourcing resolver, naming the missing roster, before any
+/// bundling/dispatch happens.
 #[test]
-fn pr_review_run_missing_crew_errors_loudly() {
+fn pr_review_run_no_roster_profile_errors_loudly() {
     let tmp = TempDir::new().unwrap();
     let diff_path = tmp.path().join("pr.diff");
     fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let missing_profiles = tmp.path().join("no-such-profiles.json");
+    let profiles = tmp.path().join("profiles.json");
+    // A valid registry with a profile but NO default_profile — and the run
+    // names no `profile` param, so the resolver has no roster to score against.
+    fs::write(
+        &profiles,
+        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}}}"#,
+    )
+    .unwrap();
 
     Command::cargo_bin("darkmux")
         .unwrap()
@@ -1568,11 +1577,11 @@ fn pr_review_run_missing_crew_errors_loudly() {
             "--param",
             &format!("diff_file={}", diff_path.to_str().unwrap()),
             "--param",
-            &format!("profiles={}", missing_profiles.to_str().unwrap()),
+            &format!("profiles={}", profiles.to_str().unwrap()),
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("input `crew` is required"));
+        .stderr(predicate::str::contains("roster profile"));
 }
 
 // ─── review-bench --funnel flag plumbing (#1222 Phase B packet 7) ─────────
@@ -1651,12 +1660,13 @@ fn review_bench_funnel_requires_workdirs() {
 }
 
 #[test]
-fn review_bench_funnel_requires_crew() {
-    // --funnel + --workdirs (with a satisfied repo-tree preflight) but no
-    // --crew: the funnel-context preflight (resolve_funnel_ctx) fails loud
-    // before any dispatch spends a token. Uses a minimal one-case fixture so
-    // the --workdirs tree-existence check (which runs first) passes and the
-    // funnel-context check is the one under test.
+fn review_bench_funnel_no_resolvable_roster_fails_preflight() {
+    // (#1426 ship-2) --funnel + --workdirs but no --crew/--profile AND a
+    // registry with no default_profile: the funnel-context preflight
+    // (resolve_funnel_ctx → the resourcing resolver) fails loud before any
+    // dispatch spends a token, naming the missing roster. Uses a minimal
+    // one-case fixture so the --workdirs tree-existence check (which runs
+    // first) passes and the resourcing check is the one under test.
     let tmp = TempDir::new().unwrap();
     let cases_dir = tmp.path().join("cases");
     fs::create_dir_all(&cases_dir).unwrap();
@@ -1668,6 +1678,12 @@ fn review_bench_funnel_requires_crew() {
     fs::write(cases_dir.join("c1.diff"), "diff --git a b\n").unwrap();
     let workdirs = tmp.path().join("workdirs");
     fs::create_dir_all(workdirs.join("c1")).unwrap();
+    let profiles = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles,
+        r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}}}"#,
+    )
+    .unwrap();
 
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.args([
@@ -1676,12 +1692,14 @@ fn review_bench_funnel_requires_crew() {
         "--cases-dir",
         cases_dir.to_str().unwrap(),
         "--funnel",
+        "--profiles-file",
+        profiles.to_str().unwrap(),
         "--workdirs",
         workdirs.to_str().unwrap(),
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("--funnel requires --crew"));
+    .stderr(predicate::str::contains("roster profile"));
 }
 
 #[test]
@@ -1707,12 +1725,11 @@ fn review_bench_funnel_k_zero_rejected_at_cli_layer() {
 }
 
 #[test]
-fn review_bench_funnel_preflight_validates_seat_requirements_before_dispatch() {
-    // A crew that resolves fine at the schema layer (resolve_crew doesn't
-    // know about funnel-specific seat names) but is missing "review-judge"
-    // must fail at PREFLIGHT (resolve_funnel_ctx calling
-    // funnel::validate_funnel_crew), not at the first case's dispatch — the
-    // per-case table header must never print.
+fn review_bench_funnel_roster_local_model_without_n_ctx_fails_loud() {
+    // (#1426 ship-2) The registry LOADS fine, but the named ROSTER profile's
+    // local model omits `n_ctx` (#1282) — a LOCAL review seat is loaded at its
+    // declared context, so the resourcing resolver fails loud at that seat,
+    // BEFORE the per-case table header prints, naming the seat and the field.
     let tmp = TempDir::new().unwrap();
     let cases_dir = tmp.path().join("cases");
     fs::create_dir_all(&cases_dir).unwrap();
@@ -1730,86 +1747,11 @@ fn review_bench_funnel_preflight_validates_seat_requirements_before_dispatch() {
         &profiles_path,
         r#"{
             "profiles": {
-                "fast": {
-                    "description": "test",
-                    "models": [{"id": "model-a", "n_ctx": 32000, "role": "primary"}]
-                }
-            },
-            "default_profile": "fast",
-            "crews": {
-                "no-judge": {
-                    "seats": {
-                        "review-probe": [{"profile": "fast", "k": 2}]
-                    }
-                }
-            }
-        }"#,
-    )
-    .unwrap();
-
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "lab",
-            "review-bench",
-            "--cases-dir",
-            cases_dir.to_str().unwrap(),
-            "--funnel",
-            "--workdirs",
-            workdirs.to_str().unwrap(),
-            "--crew",
-            "no-judge",
-            "--profiles-file",
-            profiles_path.to_str().unwrap(),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("review-judge"))
-        .stdout(predicate::str::contains("outcome").not());
-}
-
-#[test]
-fn review_bench_funnel_preflight_fails_loud_on_crew_own_resolve_crew_error() {
-    // (#1269) The registry LOADS fine (a bad crew no longer fails load), but
-    // this specific crew fails at `resolve_crew` itself (a LOCAL staffing
-    // whose model omits `n_ctx`, #1282 — not a funnel-specific seat-shape
-    // gap like the sibling test above; the original remote-endpoint fixture
-    // became a LEGAL crew when #1260 lifted the local-only fence). The
-    // funnel preflight must still fail loud, BEFORE the per-case table
-    // header prints, naming the specific resolve_crew error.
-    let tmp = TempDir::new().unwrap();
-    let cases_dir = tmp.path().join("cases");
-    fs::create_dir_all(&cases_dir).unwrap();
-    fs::write(
-        cases_dir.join("c1.label.json"),
-        r#"{"kind":"clean","intent_title":"t","expect_verdict":"pass"}"#,
-    )
-    .unwrap();
-    fs::write(cases_dir.join("c1.diff"), "diff --git a b\n").unwrap();
-    let workdirs = tmp.path().join("workdirs");
-    fs::create_dir_all(workdirs.join("c1")).unwrap();
-
-    let profiles_path = tmp.path().join("profiles.json");
-    fs::write(
-        &profiles_path,
-        r#"{
-            "profiles": {
-                "fast": {
-                    "models": [{"id": "model-a", "n_ctx": 32000}]
-                },
                 "ctxless": {
                     "models": [{"id": "local-b"}]
                 }
             },
-            "default_profile": "fast",
-            "crews": {
-                "broken-crew": {
-                    "seats": {
-                        "review-probe": [{"profile": "ctxless", "k": 2}],
-                        "review-judge": [{"profile": "fast"}]
-                    }
-                }
-            }
+            "default_profile": "ctxless"
         }"#,
     )
     .unwrap();
@@ -1825,7 +1767,7 @@ fn review_bench_funnel_preflight_fails_loud_on_crew_own_resolve_crew_error() {
             "--workdirs",
             workdirs.to_str().unwrap(),
             "--crew",
-            "broken-crew",
+            "ctxless",
             "--profiles-file",
             profiles_path.to_str().unwrap(),
         ])
@@ -1845,30 +1787,21 @@ fn review_bench_funnel_preflight_fails_loud_on_crew_own_resolve_crew_error() {
 // role-prompt resolution), the per-case funnel branch, the console line,
 // and the scores.json/funnels.json artifact pair.
 
-/// A profiles registry carrying a crews block that satisfies
-/// `validate_funnel_crew` (>= 1 review-probe staffing, exactly 1
-/// review-judge staffing). `resolve_funnel_ctx`'s own preflight call to
-/// `resolve_crew` resolves every staffing against `profiles` — no LMStudio
-/// involved.
+/// (#1426 ship-2) A profiles registry whose `review-funnel` ROSTER profile the
+/// resourcing resolver scores each review seat against — the crews map retired,
+/// so `--crew review-funnel` now names this profile, not a crews entry. The
+/// resolver staffs probe/judge/verify from its models; no LMStudio involved.
 fn funnel_registry_json() -> &'static str {
     r#"{
         "profiles": {
-            "fast": {
-                "description": "bounded tasks",
+            "review-funnel": {
+                "description": "review roster",
                 "models": [
                     {"id": "model-a", "n_ctx": 32000}
                 ]
             }
         },
-        "crews": {
-            "review-funnel": {
-                "seats": {
-                    "review-probe": [{"profile": "fast", "k": 2}],
-                    "review-judge": [{"profile": "fast", "k": 1}]
-                }
-            }
-        },
-        "default_profile": "fast"
+        "default_profile": "review-funnel"
     }"#
 }
 
@@ -1896,12 +1829,11 @@ fn write_funnel_fixture(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBu
 }
 
 #[test]
-fn review_bench_funnel_nonexistent_crew_fails_preflight_listing_available() {
-    // --crew names a crew the registry doesn't have: resolve_funnel_ctx's
-    // preflight fails loud BEFORE any dispatch, and the error names both the
-    // missing crew and the crews that DO exist (resolve_crew's "Available:"
-    // listing) — the operator never has to open profiles.json to find the
-    // right name.
+fn review_bench_funnel_nonexistent_roster_fails_preflight_listing_available() {
+    // (#1426 ship-2) --crew names a ROSTER profile the registry doesn't have:
+    // the resourcing resolver fails loud BEFORE any dispatch, and the error
+    // names both the missing profile and the profiles that DO exist (get_profile's
+    // "Available:" listing) — the operator never has to open profiles.json.
     let tmp = TempDir::new().unwrap();
     let (cases_dir, workdirs, registry) = write_funnel_fixture(&tmp);
 
@@ -1922,7 +1854,7 @@ fn review_bench_funnel_nonexistent_crew_fails_preflight_listing_available() {
     .assert()
     .failure()
     .stderr(
-        predicate::str::contains(r#"resolving crew "ghost" for --funnel"#)
+        predicate::str::contains("ghost")
             .and(predicate::str::contains("not found"))
             .and(predicate::str::contains("review-funnel")),
     );
@@ -2151,14 +2083,7 @@ fn pr_review_run_malformed_charges_file_errors_loudly() {
         &profiles_path,
         r#"{
             "profiles": { "fast": { "models": [{"id": "test-model", "n_ctx": 8000}] } },
-            "crews": {
-                "test-crew": {
-                    "seats": {
-                        "review-probe": [{"profile": "fast", "k": 1}],
-                        "review-judge": [{"profile": "fast", "k": 1}]
-                    }
-                }
-            }
+            "default_profile": "fast"
         }"#,
     )
     .unwrap();
@@ -2197,7 +2122,7 @@ fn pr_review_run_malformed_charges_file_errors_loudly() {
             "--param",
             &format!("diff_file={}", diff_path.to_str().unwrap()),
             "--param",
-            "crew=test-crew",
+            "profile=fast",
             "--param",
             &format!("profiles={}", profiles_path.to_str().unwrap()),
             "--param",

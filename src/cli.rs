@@ -231,13 +231,11 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: Option<MachineCmd>,
     },
-    /// Crew registry reads — list/show/index the crews declared in the
-    /// profiles registry. (#1426 relocated single-role dispatch to the
-    /// top-level `darkmux dispatch` verb.)
-    Crew {
-        #[command(subcommand)]
-        sub: CrewCmd,
-    },
+    // (#1426 ship-2) The `crew` family retired ENTIRELY: phase 2 promoted
+    // single-role dispatch to the top-level `darkmux dispatch` verb, and the
+    // crew REGISTRY dissolved with the crews map — a crew is now a DERIVED
+    // VIEW of a mission's resourcing (`darkmux_crew::resourcing`), never a
+    // declared entity, so the registry-read verbs (list/show/index) go too.
     /// Engagement-context lessons — operator-authored conventions,
     /// constraints, and decisions (with the reasoning behind them) that surface
     /// to coder dispatches as a `<lessons>` block. Stored in a durable,
@@ -327,35 +325,6 @@ pub(crate) enum Cmd {
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum CrewCmd {
-    /// List every crew in the index.
-    List,
-    /// Show full details for a single crew.
-    Show {
-        /// Crew id to show.
-        id: String,
-    },
-    /// SQLite-backed derived index over crew manifests (Phase B of #45).
-    /// The index is derived state — JSON manifests under the crew root are
-    /// the source of truth — and the `role`/`crew` read-verbs rebuild it on
-    /// demand, so an explicit `rebuild` is rarely needed.
-    Index {
-        #[command(subcommand)]
-        sub: CrewIndexCmd,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum CrewIndexCmd {
-    /// Rebuild the index from manifests on disk. Drops + recreates the
-    /// derived tables, then repopulates — idempotent and self-healing across
-    /// schema changes.
-    Rebuild,
-    /// Report index status: last-rebuild timestamp, source counts, drift.
-    Status,
 }
 
 #[derive(Subcommand)]
