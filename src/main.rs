@@ -127,7 +127,11 @@ fn run(cmd: Cmd) -> Result<i32> {
         // (#1426) Bare `machine` routes to `machine status` (no id) — one
         // code path, no separate overview render.
         Cmd::Machine { sub } => cmd_machine(sub),
-        Cmd::Lessons { sub } => cmd_lessons(sub),
+        // (#1426, decision 17) One verb per KIND of thing darkmux knows.
+        Cmd::Memory { sub } => match sub {
+            cli::MemoryCmd::Lesson { sub } => cmd_lessons(sub),
+            cli::MemoryCmd::Correction { sub } => cmd_correction(sub),
+        },
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Phase { sub } => cmd_phase(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
@@ -210,7 +214,7 @@ fn cmd_lessons(sub: LessonsCmd) -> Result<i32> {
                 println!(
                     "{}",
                     darkmux_types::style::dim(
-                        "no lessons recorded yet — darkmux lessons add --title <t> --body <b>"
+                        "no lessons recorded yet — darkmux memory lesson add --title <t> --body <b>"
                     )
                 );
                 return Ok(0);
@@ -371,6 +375,86 @@ fn lessons_tier(global: bool) -> (std::path::PathBuf, &'static str) {
         (lessons::global_db_path(), "global")
     } else {
         (lessons::repo_db_path(), "repo")
+    }
+}
+
+/// (#1426, decision 17) `memory correction list` — the first verb #849's
+/// persisted adjudication corrections have ever had. Read-only: corrections are
+/// recorded by the review path as flow notes, never authored here.
+///
+/// Reads through `crew::corrections::scan`, the SAME definition the coder-brief
+/// injection reads, so `--mission` shows precisely the set that mission's next
+/// brief would carry — the verb can't drift from the behavior it reports on.
+fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
+    match sub {
+        CorrectionCmd::List {
+            mission,
+            session,
+            days,
+            json: cli::JsonFlagPlain { json },
+        } => {
+            // Resolve the scope. `None` = every session in the window; a
+            // mission resolves to its EXACT dispatch session ids (the same
+            // construction the brief uses — never a prefix, which would bleed a
+            // sibling mission whose id is a hyphen-extension, #849).
+            let scope: Option<std::collections::HashSet<String>> = match (&mission, &session) {
+                (Some(mid), _) => {
+                    fleet::validate_identifier("mission", mid)?;
+                    let missions = crew::loader::load_missions()?;
+                    let m = missions.iter().find(|m| &m.id == mid).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mission `{mid}` not found (check `darkmux mission status`)"
+                        )
+                    })?;
+                    Some(
+                        m.phase_ids
+                            .iter()
+                            .map(|pid| darkmux_types::session_id::mission_run(mid, pid))
+                            .collect(),
+                    )
+                }
+                (None, Some(sid)) => Some(std::iter::once(sid.clone()).collect()),
+                (None, None) => None,
+            };
+
+            let found = crew::corrections::scan(days, scope.as_ref());
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&found)?);
+                return Ok(0);
+            }
+            if found.is_empty() {
+                let scoped = match (&mission, &session) {
+                    (Some(m), _) => format!(" for mission `{m}`"),
+                    (None, Some(s)) => format!(" for session `{s}`"),
+                    (None, None) => String::new(),
+                };
+                println!(
+                    "{}",
+                    darkmux_types::style::dim(&format!(
+                        "no adjudication corrections recorded{scoped} in the last {days} day(s) \
+                         — your reviewer records them with darkmux flow note --session-id <sid> \
+                         --text \"<verdict · what you overrode · why>\" --source adjudication"
+                    ))
+                );
+                return Ok(0);
+            }
+            println!(
+                "{}",
+                darkmux_types::style::header(&format!(
+                    "adjudication corrections (last {days} day(s))"
+                ))
+            );
+            for c in &found {
+                println!(
+                    "  {} {}",
+                    darkmux_types::style::accent(&c.ts),
+                    darkmux_types::style::dim(&format!("[{}]", c.session_id))
+                );
+                println!("    {}", c.text);
+            }
+            Ok(0)
+        }
     }
 }
 

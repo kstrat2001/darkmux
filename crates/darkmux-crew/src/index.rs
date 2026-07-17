@@ -71,7 +71,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// for the #95 mission/phase transition-timestamp columns (#914); to 4 for
 /// the #994 engagement-context `cautions` table (derived from the flow stream);
 /// to 5 (#999) when the scaffolded `knowledge` table was dropped — authored
-/// lessons live in their own durable `lessons.db` store now (`darkmux lessons`),
+/// lessons live in their own durable `lessons.db` store now (`darkmux memory lesson`),
 /// not in this derived crew index. Two independent mechanisms in [`init_schema`]
 /// keep an on-disk DB current: (1) version-gated migration blocks drop legacy
 /// artifacts (the `< 2` capability-rename tables; the `< 5` vestigial
@@ -258,7 +258,7 @@ CREATE INDEX IF NOT EXISTS idx_cautions_file ON cautions(file);
 
 -- (#999) The operator-authored engagement context (conventions, constraints,
 -- decisions + the "why") lives in its own durable `lessons.db` store now
--- (`darkmux lessons`), NOT in this derived crew index. The scaffolded
+-- (`darkmux memory lesson`), NOT in this derived crew index. The scaffolded
 -- `knowledge` table that briefly lived here (#998) is dropped by the `< 5`
 -- migration in `init_schema`.
 "#;
@@ -891,7 +891,7 @@ fn status_at(path: &Path) -> Result<StatusReport> {
     }
 
     // (#994) Derived caution count. (Authored *lessons* live in their own
-    // durable `lessons.db` store — surfaced by `darkmux lessons list`, not the
+    // durable `lessons.db` store — surfaced by `darkmux memory lesson list`, not the
     // crew index; the scaffolded index.db `knowledge` table was dropped in #999.)
     report.caution_count = conn
         .query_row("SELECT COUNT(*) FROM cautions", [], |r| r.get(0))
@@ -996,7 +996,7 @@ pub fn status() -> Result<()> {
     }
     println!();
     // (#994) Derived cautions in the index. Authored lessons are a separate
-    // durable store (`darkmux lessons list`), not part of the crew index.
+    // durable store (`darkmux memory lesson list`), not part of the crew index.
     println!("engagement context:");
     println!("  {:12} {} (derived from the flow stream)", "cautions", report.caution_count);
     println!();
