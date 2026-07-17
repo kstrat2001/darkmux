@@ -11,6 +11,7 @@ pub mod dispatch_liveness;
 #[cfg(unix)]
 pub mod flock;
 pub mod paths;
+pub mod session_id;
 pub mod size;
 pub mod style;
 pub mod workdir;
