@@ -260,6 +260,18 @@
   html.timeline-mode #root{height:auto;min-height:100vh}
   html.timeline-mode .top{position:sticky;top:0;z-index:40}
   html.timeline-mode .timeline{overflow:visible}
+  /* (#1432·1 consider) With the document scrolling, a flex-child events
+     panel would scroll away with the page — pin the open panel to the
+     viewport as a fixed bottom sheet instead (it already IS a bottom sheet
+     below the breakpoint; this keeps it one at any width while the timeline
+     renders). The timeline's tall bottom padding keeps the last card
+     reachable above it. */
+  html.timeline-mode .evpanel{position:fixed;left:0;right:0;bottom:0;z-index:45;
+    max-height:45vh;border-left:none;border-top:1px solid var(--line)}
+  /* Only pad the list past the sheet while the sheet is actually open
+     (`:has` — degrades to the base 40px padding on engines without it,
+     where the open sheet may cover the last card until closed). */
+  html.timeline-mode .body:has(.evpanel) .timeline{padding-bottom:48vh}
 
   @media (max-width:700px){
     html,body{overflow:hidden}
@@ -364,9 +376,10 @@ function computeLayout(nodes){
 }
 
 // ─── node component ─────────────────────────────────────────────────────
-// (#1401) A task node renders its OWN steps as rows — kind display label
-// (server-resolved via the fallback chain — #1402) + a status dot; a
-// running row's dot pulses via the `.mn-step-row.s-running` CSS rule. A
+// (#1401) A task node renders its OWN steps as rows — kind lead label
+// (server-resolved via the fallback chain — #1402) + a hollow status ring;
+// a running row's ring pulses via the shared `.steprow.s-running` CSS rule
+// (#1432 item 6 — the old `.mn-step-row` dot styling retired with it). A
 // phase node has no `steps` array (empty), so `mnSteps` is a no-op for it.
 // (#1403) A per-step token/turn meter element from the step's precomputed
 // `_meter` (attached in `toRfNodes`). Shared by the canvas node and — via the
@@ -634,13 +647,19 @@ function applyRecordToMetrics(metrics, rec, idx){
   var isComplete = action === "dispatch complete" || action === "dispatch.complete";
   var isStepResult = action === "step result";
   if (p.endpoint) next.cloud = true;
+  // (#1445 gate) Finalized token totals read `total_tokens` first, falling
+  // back to `tokens` — the review vocabulary's probe/judge/verify step
+  // results carry `tokens`, never `total_tokens`, and without the fallback
+  // the most-viewed mission kind's meters never fill. Same precedence as
+  // the server-side fold (`mission_graph.rs::fold_step_finals`).
+  var finalTok = p.total_tokens || p.tokens || 0;
   if (isTok) { next.tokRun += (p.total_tokens || 0); }
   else if (isTurn) { next.turnRun += 1; }
   else if (isComplete) {
-    if (p.total_tokens) next.tokFinal = Math.max(next.tokFinal, p.total_tokens);
+    if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
     if (p.total_turns) next.turnFinal = Math.max(next.turnFinal, p.total_turns);
   } else if (isStepResult) {
-    if (p.total_tokens) next.tokFinal = Math.max(next.tokFinal, p.total_tokens);
+    if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
   }
   if (next.tokRun === cur.tokRun && next.tokFinal === cur.tokFinal
       && next.turnRun === cur.turnRun && next.turnFinal === cur.turnFinal
@@ -724,6 +743,13 @@ var EVENTS_CAP = 250;
 // would show the mobile header chrome with the desktop canvas at 700px even.
 function isNarrowViewport(){
   return typeof window !== "undefined" && window.innerWidth <= 700;
+}
+// (#1404/#1432) THE renderer decision, in one place: the timeline renders
+// when manually selected, or in "auto" below the breakpoint. Both the
+// render branch and the timeline-mode <html> class effect call this — the
+// two must never drift (the CSS overflow escape keys on the class).
+function timelineActive(viewMode, isMobile){
+  return viewMode === "timeline" || (viewMode === "auto" && isMobile);
 }
 
 // ─── (#1404) Mobile vertical-timeline renderer (plain DOM, no React Flow) ──
@@ -906,7 +932,7 @@ function App(){
   // the document to scroll — the canvas branch keeps the lock). Mirrors the
   // `useTimeline` decision the render below makes.
   React.useEffect(function(){
-    var timeline = viewMode === "timeline" || (viewMode === "auto" && isMobile);
+    var timeline = timelineActive(viewMode, isMobile);
     var root = document.documentElement;
     if (root) root.classList.toggle("timeline-mode", timeline);
     return function(){ if (root) root.classList.remove("timeline-mode"); };
@@ -1035,7 +1061,7 @@ function App(){
   var g = state.graph;
   // (#1404) One data source, two renderers. Timeline is the narrow-viewport
   // default (viewMode "auto" + mobile) and available anywhere via the toggle.
-  var useTimeline = viewMode === "timeline" || (viewMode === "auto" && isMobile);
+  var useTimeline = timelineActive(viewMode, isMobile);
   var tot = missionTotals(metrics);
 
   var body;
@@ -1103,6 +1129,7 @@ root.render(h(App));
 // the browser console during manual verification (not a formal test hook).
 window.__missionGraphComputeLayout = computeLayout;
 window.__missionGraphMergeGraphs = mergeGraphs;
+window.__missionGraphSeedMetricsFromGraph = seedMetricsFromGraph;
 })();
 </script>
 </body>

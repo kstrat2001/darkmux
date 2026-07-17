@@ -4113,15 +4113,20 @@
         darkmux_crew::lifecycle::save_step(mission_id, phase_id, &mk_step("ran-step", NodeStatus::Complete)).unwrap();
         darkmux_crew::lifecycle::save_step(mission_id, phase_id, &mk_step("idle-step", NodeStatus::Planned)).unwrap();
 
-        // A flows_dir carrying a dispatch-complete record for the ran step only.
+        // A flows_dir carrying a dispatch-complete record for the ran step
+        // only. Named for TODAY's day stem (#1445 gate): the backfill scans
+        // only day files inside the mission's lifetime window, and this
+        // mission was just minted with created_ts = now — a hardcoded date
+        // would silently fall out of the window when run later.
         let flows = TempDir::new().unwrap();
         let rec = serde_json::json!({
             "action": "dispatch complete",
             "session_id": "step-ran-step",
             "payload": { "total_tokens": 12345, "total_turns": 7 }
         });
+        let today = crate::mission_graph::epoch_days_to_stem((now_unix() / 86400) as i64);
         std::fs::write(
-            flows.path().join("2026-07-17.jsonl"),
+            flows.path().join(format!("{today}.jsonl")),
             format!("{}\n", serde_json::to_string(&rec).unwrap()),
         )
         .unwrap();
