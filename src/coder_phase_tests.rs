@@ -1462,3 +1462,238 @@ edit loop detected on src/widget.rs in an earlier dispatch
             "falls back to the derived worktree path"
         );
     }
+
+    // ── (#1463) whole-mission finalize/abort state machine ──────────────────
+    //
+    // These pin `terminate_mission` (the engine behind `mission finalize` and
+    // the default whole-mission `mission abort`). They run from a NON-git temp
+    // cwd so `repo_root()` returns Err → the teardown runs with `root = None`
+    // (the pure state-machine path, no git side effects against the real repo).
+    // That is also exactly the "finalized/aborted from a non-git dir" case a
+    // pure-planning mission hits. Every one MUST be `#[serial]` — both env vars
+    // and the process cwd are global.
+
+    /// Chdir into a fresh NON-git temp dir; restore the previous cwd on drop.
+    struct NonGitCwdGuard {
+        _dir: tempfile::TempDir,
+        prev: std::path::PathBuf,
+    }
+    impl NonGitCwdGuard {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir.path()).unwrap();
+            // Sanity: a temp dir must NOT resolve to a git repo, or the tests
+            // below would touch the real repo. `repo_root()` failing is the
+            // contract these tests depend on.
+            assert!(repo_root().is_err(), "temp cwd must not be inside a git repo");
+            Self { _dir: dir, prev }
+        }
+    }
+    impl Drop for NonGitCwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    fn phase_status_now(pid: &str) -> PhaseStatus {
+        crew::loader::load_phases()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == pid)
+            .expect("phase on disk")
+            .status
+    }
+
+    fn every_phase_terminal(mid: &str) -> bool {
+        crew::loader::load_phases()
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.mission_id == mid)
+            .all(|p| matches!(p.status, PhaseStatus::Complete | PhaseStatus::Abandoned))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn finalize_drives_planned_and_running_phases_to_complete_then_closes() {
+        let _g = CrewEnvGuard::new();
+        let _cwd = NonGitCwdGuard::new();
+        let mid = "fin-planned-running";
+        seed_finalize_mission(
+            mid,
+            &[("p1", PhaseStatus::Planned), ("p2", PhaseStatus::Running)],
+        );
+
+        assert_eq!(finalize(mid, None).unwrap(), 0);
+
+        // The Planned phase must reach Complete — this is the two-step
+        // `phase_start`→`phase_complete` path (#1463). A regression to a bare
+        // `phase_complete` would bail from Planned, warn-swallow, and leave p1
+        // Planned; this assertion is what fails if that ever happens.
+        assert_eq!(phase_status_now("p1"), PhaseStatus::Complete, "Planned → Complete via the two-step");
+        assert_eq!(phase_status_now("p2"), PhaseStatus::Complete, "Running → Complete");
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn abort_drives_planned_and_running_phases_to_abandoned_then_closes() {
+        let _g = CrewEnvGuard::new();
+        let _cwd = NonGitCwdGuard::new();
+        let mid = "abort-planned-running";
+        seed_finalize_mission(
+            mid,
+            &[("p1", PhaseStatus::Planned), ("p2", PhaseStatus::Running)],
+        );
+
+        assert_eq!(abort(mid, None).unwrap(), 0);
+
+        assert_eq!(phase_status_now("p1"), PhaseStatus::Abandoned, "Planned → Abandoned");
+        assert_eq!(phase_status_now("p2"), PhaseStatus::Abandoned, "Running → Abandoned");
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn finalize_and_abort_leave_already_terminal_phases_untouched() {
+        let _g = CrewEnvGuard::new();
+        let _cwd = NonGitCwdGuard::new();
+
+        // finalize must NOT re-stamp an already-Abandoned phase to Complete —
+        // its recorded outcome stays honest.
+        let fin = "fin-terminal-untouched";
+        seed_finalize_mission(
+            fin,
+            &[("f1", PhaseStatus::Complete), ("f2", PhaseStatus::Abandoned)],
+        );
+        assert_eq!(finalize(fin, None).unwrap(), 0);
+        assert_eq!(phase_status_now("f1"), PhaseStatus::Complete, "Complete stays Complete");
+        assert_eq!(phase_status_now("f2"), PhaseStatus::Abandoned, "Abandoned is left as-is, never flipped to Complete");
+        assert_eq!(mission_status_now(fin), crew::types::MissionStatus::Closed);
+
+        // abort must NOT re-stamp an already-Complete phase to Abandoned.
+        let ab = "abort-terminal-untouched";
+        seed_finalize_mission(
+            ab,
+            &[("a1", PhaseStatus::Complete), ("a2", PhaseStatus::Abandoned)],
+        );
+        assert_eq!(abort(ab, None).unwrap(), 0);
+        assert_eq!(phase_status_now("a1"), PhaseStatus::Complete, "Complete is left as-is, never flipped to Abandoned");
+        assert_eq!(phase_status_now("a2"), PhaseStatus::Abandoned, "Abandoned stays Abandoned");
+        assert_eq!(mission_status_now(ab), crew::types::MissionStatus::Closed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn terminate_mission_degrades_gracefully_without_a_git_repo() {
+        // The `root = None` path explicitly: a pure-planning mission finalized
+        // from a non-git dir flips its phases + closes with no panic and no git
+        // teardown (there is nothing to remove).
+        let _g = CrewEnvGuard::new();
+        let _cwd = NonGitCwdGuard::new();
+        let mid = "fin-no-git";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Planned)]);
+
+        assert_eq!(finalize(mid, None).unwrap(), 0, "no panic without a git repo");
+        assert_eq!(phase_status_now("p1"), PhaseStatus::Complete);
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn finalize_leaves_no_phase_non_terminal_impossibility_pin() {
+        // (#1463) The invariant the removed "Closed + non-terminal phase" drift
+        // detector used to guard: after finalize, NO phase is left non-terminal.
+        let _g = CrewEnvGuard::new();
+        let _cwd = NonGitCwdGuard::new();
+        let mid = "fin-impossibility";
+        seed_finalize_mission(
+            mid,
+            &[
+                ("p1", PhaseStatus::Complete),
+                ("p2", PhaseStatus::Planned),
+                ("p3", PhaseStatus::Running),
+            ],
+        );
+
+        assert_eq!(finalize(mid, None).unwrap(), 0);
+        assert!(every_phase_terminal(mid), "finalize must leave EVERY phase terminal");
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn abort_leaves_no_phase_non_terminal_impossibility_pin() {
+        // (#1463) Same invariant for the kill terminal: after abort, NO phase is
+        // left non-terminal. A Closed mission can no longer strand a Planned or
+        // Running phase — the impossibility the removed detector arm asserted.
+        let _g = CrewEnvGuard::new();
+        let _cwd = NonGitCwdGuard::new();
+        let mid = "abort-impossibility";
+        seed_finalize_mission(
+            mid,
+            &[
+                ("p1", PhaseStatus::Complete),
+                ("p2", PhaseStatus::Planned),
+                ("p3", PhaseStatus::Running),
+            ],
+        );
+
+        assert_eq!(abort(mid, None).unwrap(), 0);
+        assert!(every_phase_terminal(mid), "abort must leave EVERY phase terminal");
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+    }
+
+    // ── (#1463 CONSIDER 6) branch force-delete guard (pure) ──────────────────
+
+    #[test]
+    fn should_force_delete_branch_only_for_real_worktrees() {
+        // A branch reported by a LIVE worktree, or one whose worktree exists on
+        // disk, is real → deletable. A never-launched phase's DERIVED name (no
+        // live branch, no worktree) is NOT force-deleted.
+        assert!(should_force_delete_branch(true, true), "live branch + worktree present");
+        assert!(should_force_delete_branch(true, false), "a live worktree reported the branch");
+        assert!(should_force_delete_branch(false, true), "the worktree existed on disk");
+        assert!(
+            !should_force_delete_branch(false, false),
+            "derived name, no worktree ever → never force-delete"
+        );
+    }
+
+    // ── (#1463 CONSIDER 3) unsaved-work guard (real temp git repo) ───────────
+
+    #[test]
+    fn worktree_has_unsaved_work_detects_dirty_and_unpushed() {
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+
+        let repo = tempfile::TempDir::new().unwrap();
+        let rp = repo.path();
+        git(rp, &["init", "-q"]);
+        git(rp, &["config", "user.email", "t@t.t"]);
+        git(rp, &["config", "user.name", "t"]);
+        git(rp, &["commit", "--allow-empty", "-q", "-m", "root"]);
+
+        // 1. A committed-but-never-pushed HEAD = unsaved (unpushed).
+        std::fs::write(rp.join("f.txt"), "one").unwrap();
+        git(rp, &["add", "."]);
+        git(rp, &["commit", "-q", "-m", "work"]);
+        assert!(worktree_has_unsaved_work(rp), "committed but unpushed → unsaved");
+
+        // 2. Push to a bare remote → nothing unpushed, clean tree → saved.
+        let remote = tempfile::TempDir::new().unwrap();
+        git(remote.path(), &["init", "-q", "--bare"]);
+        git(rp, &["remote", "add", "origin", &remote.path().to_string_lossy()]);
+        git(rp, &["push", "-q", "origin", "HEAD"]);
+        assert!(!worktree_has_unsaved_work(rp), "clean tree, everything pushed → saved");
+
+        // 3. Uncommitted change → unsaved (dirty tree), even when pushed.
+        std::fs::write(rp.join("f.txt"), "two").unwrap();
+        assert!(worktree_has_unsaved_work(rp), "uncommitted changes → unsaved");
+    }

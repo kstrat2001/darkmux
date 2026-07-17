@@ -77,9 +77,10 @@ fn emit_run_record(
 /// free-form `payload` object distinguishing WHICH step and WHAT happened,
 /// mirroring the review module's own `step result` (kind-tagged)
 /// generic-action-plus-payload convention. Consumers: the viewer's
-/// `cycleStage()`, `darkmux-serve`'s `resolve_session` (the `/diff`
-/// endpoint), and `session_failed_verifiers` below all filter on `kind`
-/// rather than a per-purpose action string now.
+/// `cycleStage()` and `darkmux-serve`'s `resolve_session` (the `/diff`
+/// endpoint) filter on `kind` rather than a per-purpose action string now.
+/// (#1463 — the former `session_failed_verifiers` consumer retired with the
+/// `ship`-verb verifier-fabrication hold.)
 // (#1284 Packet 4a) `pub(crate)` — `mission_launch.rs` reuses this exact
 // helper for the SAME `"step result"` flow-record shape when it runs the
 // coder-phase graph through the config-launched path, rather than
@@ -114,18 +115,18 @@ pub(crate) fn emit_step_result(
 /// The MAIN working tree of the current repository, resolved identically
 /// whether invoked from the main checkout or from inside a linked worktree.
 ///
-/// `mission run` creates the phase worktree off this repo and `mission ship`
-/// recomputes that worktree's path from `(repo-name, phase)` — both must
-/// agree on the repo name. `git rev-parse --show-toplevel` returns the
-/// *current* working tree, which inside a mission's linked worktree is the
-/// phase dir (basename = phase id, NOT the repo name); using it made
-/// `mission ship` from inside a worktree recompute a different (wrong) path
-/// than `mission run` created (#846). The first `worktree` entry of
-/// `git worktree list --porcelain` is always the main working tree, so it
-/// yields the stable repo name AND a valid dir to run worktree teardown from
+/// `mission launch coder-phase` creates the phase worktree off this repo and
+/// `mission finalize`/`mission abort` recompute that worktree's path from
+/// `(repo-name, phase)` to tear it down — both must agree on the repo name.
+/// `git rev-parse --show-toplevel` returns the *current* working tree, which
+/// inside a mission's linked worktree is the phase dir (basename = phase id,
+/// NOT the repo name); using it made teardown from inside a worktree recompute
+/// a different (wrong) path than launch created (#846). The first `worktree`
+/// entry of `git worktree list --porcelain` is always the main working tree, so
+/// it yields the stable repo name AND a valid dir to run worktree teardown from
 /// (git refuses to remove the worktree you are standing in).
 // (#1284 Packet 4a) `pub(crate)` — `mission_launch.rs`'s coder-phase
-// execution path resolves the SAME repo root `mission run` does.
+// execution path resolves the SAME repo root the teardown verbs do.
 pub(crate) fn repo_root() -> Result<PathBuf> {
     let out = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
@@ -159,9 +160,10 @@ fn parse_main_worktree(porcelain: &str) -> Option<PathBuf> {
 /// `\`) and `core.quotePath` is on (the default), git wraps the path in
 /// double-quotes with C-style escapes (`\t`, `\n`, `\r`, `\"`, `\\`, and octal
 /// `\NNN` for raw bytes). An unquoted path is returned verbatim, preserving
-/// any legitimate trailing whitespace. Without this, `mission run`/`ship`/
-/// `abort` would point at the literal quoted string for repos at non-ASCII or
-/// special-char paths (fails loudly, no corruption — but breaks the verb).
+/// any legitimate trailing whitespace. Without this, `mission launch`/
+/// `finalize`/`abort` would point at the literal quoted string for repos at
+/// non-ASCII or special-char paths (fails loudly, no corruption — but breaks
+/// the verb).
 fn decode_git_path(raw: &str) -> PathBuf {
     if raw.len() < 2 || !raw.starts_with('"') || !raw.ends_with('"') {
         return PathBuf::from(raw);
@@ -217,11 +219,11 @@ fn decode_git_path(raw: &str) -> PathBuf {
 }
 
 /// Deterministic worktree path for a phase: `<base>/<repo-name>/<phase-id>`.
-/// Recomputable by `mission ship` from the same (repo, phase) inputs. The
-/// base (`darkmux_types::workdir::worktrees_base_dir`) is outside the main
-/// working tree by design — git refuses a worktree nested inside another,
-/// and a stable, discoverable location lets `mission ship` recompute the
-/// path without recording it in mission state.
+/// Recomputable by `mission finalize`/`mission abort` from the same (repo,
+/// phase) inputs. The base (`darkmux_types::workdir::worktrees_base_dir`) is
+/// outside the main working tree by design — git refuses a worktree nested
+/// inside another, and a stable, discoverable location lets the teardown verbs
+/// recompute the path without recording it in mission state.
 fn worktree_path(repo_root: &Path, phase_id: &str) -> PathBuf {
     let repo_name = repo_root
         .file_name()
@@ -242,10 +244,10 @@ fn branch_name(phase_id: &str) -> String {
 
 /// (#816) Conventions-aware branch name: the repo's `branch_template`
 /// (expanded + validated as a safe git ref) when present, else the
-/// darkmux default. ALL THREE verbs (run / abort / ship) must resolve the
-/// branch through this one fn so they always agree on the name. A
-/// template that can't expand (ticketless mission) or expands to an
-/// invalid ref falls back loudly-but-softly to the default.
+/// darkmux default. Both the coder-phase launch and the finalize/abort
+/// teardown must resolve the branch through this one fn so they always agree
+/// on the name. A template that can't expand (ticketless mission) or expands
+/// to an invalid ref falls back loudly-but-softly to the default.
 fn conventions_branch(
     phase: &crew::types::Phase,
     mission: &crew::types::Mission,
@@ -343,7 +345,7 @@ fn select_phase(
             let ids: Vec<&str> = many.iter().map(|s| s.id.as_str()).collect();
             bail!(
                 "mission `{mission_id}` has {} ready phases ({}) — unexpected for a strictly \
-                 linear mission (hand-edited JSON?). `mission run` does one phase at a time — \
+                 linear mission (hand-edited JSON?). This resolves one phase at a time — \
                  pass `--phase <id>` to choose.",
                 many.len(),
                 ids.join(", ")
@@ -353,15 +355,19 @@ fn select_phase(
 }
 
 /// Create the git worktree for this phase, branching off `base`. If the
-/// worktree path already exists (a prior `mission run` for the same phase
-/// that wasn't shipped/torn down), bail with a pointer rather than clobbering
-/// — the operator decides whether to resume, ship, or `git worktree remove`.
+/// worktree path already exists (a prior coder-phase launch for the same phase
+/// that wasn't finalized or torn down), bail with a pointer rather than
+/// clobbering — the operator decides whether to resume, finalize, or
+/// `git worktree remove`. (#1463 — `mission ship` retired; the launch-owned
+/// finalize path tears the worktree down.)
 fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> Result<()> {
     if wt_path.exists() {
         bail!(
             "worktree already exists at {} — a previous `mission launch coder-phase` for this \
-             phase hasn't been shipped or torn down. Inspect it, run `darkmux mission ship` to \
-             finish, or `git worktree remove {}` to discard.",
+             phase hasn't been finalized or torn down. Inspect it, run \
+             `darkmux mission finalize <mission>` once its work is merged (tears the worktree \
+             down), `darkmux mission abort <mission>` to discard the mission, or \
+             `git worktree remove {}` to discard just this worktree.",
             wt_path.display(),
             wt_path.display()
         );
@@ -514,8 +520,8 @@ pub(crate) struct CoderStepResult {
 
 /// Wraps the coder-dispatch half of the old hand-written sequence
 /// (`fleet::dispatch_routed` → token tally → exit-code branch → verifier
-/// parsing). `opts.machine` is always `None` for `mission run` (no
-/// `--machine` flag on this verb), and `fleet::dispatch_routed` with
+/// parsing). `opts.machine` is always `None` on the coder-phase launch path
+/// (no `--machine` flag), and `fleet::dispatch_routed` with
 /// `machine: None` falls straight through to `crew::dispatch::dispatch` —
 /// so calling `dispatch::dispatch` directly here is behavior-identical and
 /// avoids a `darkmux-crew` → `darkmux-fleet` dependency cycle (fleet
@@ -594,9 +600,9 @@ impl StepKind for MissionCoderStepKind {
                 "{}",
                 style::error(&format!(
                     "✗ coder dispatch exited {exit_code} — see stderr above. The phase stays \
-                     Running and the worktree is left at {} for inspection. Re-running `darkmux \
-                     mission run` will refuse until you tear it down: `darkmux mission abort {} \
-                     --phase {}`.",
+                     Running and the worktree is left at {} for inspection. Re-launching \
+                     `darkmux mission launch coder-phase` will refuse until you tear it down: \
+                     `darkmux mission abort {} --phase {}`.",
                     self.wt_path.display(),
                     self.mission_id,
                     self.phase_id,
@@ -667,12 +673,12 @@ impl StepKind for MissionCoderStepKind {
 /// Wraps the mechanical-verify half of the old hand-written sequence
 /// (`phase_cli::phase_review_output_at` against the worktree diff). Its
 /// `run()` role is ALWAYS `"code-reviewer"` — that's hardcoded inside
-/// `phase_review_output_at` itself (mirrors the standalone `darkmux
-/// phase review` verb), not something `mission run` overrides.
+/// `phase_review_output_at` itself (the coder-phase QA gate), not something
+/// the caller overrides.
 ///
 /// **Tier 3 (#1352), on purpose.** Wraps the whole `phase_cli`
 /// mechanical-review pipeline (a multi-step process of its own, not a
-/// single dispatch), with a hardcoded role and mission-run-specific
+/// single dispatch), with a hardcoded role and coder-phase-specific
 /// CLI/result-slot plumbing. No second consumer visible today — stays
 /// physically co-located with the mission module that owns it.
 // (#1284 Packet 4a) `pub(crate)` — see `MissionWorktreeStepKind`'s doc.
@@ -738,14 +744,15 @@ impl StepKind for MissionVerifyStepKind {
     }
 }
 
-/// (#1426 ship-4) Resolve the on-disk worktree of a gate-held coder-phase run
-/// for `mission ship`/`mission abort`. `mission launch coder-phase` sets the
-/// worktree from its operator-supplied `workdir` input and persists it on the
-/// phase's tasks (`Task.workdir`); read it back so ship/abort target the ACTUAL
-/// worktree even when the operator launched into a non-default location. Falls
-/// back to the derived `worktree_path(root, phase_id)` (the retired `mission
-/// run`'s own convention) when no task records a workdir — an old on-disk run,
-/// or a phase whose task records predate the workdir plumbing.
+/// (#1426 ship-4 / #1463) Resolve the on-disk worktree of a gate-held
+/// coder-phase run for `mission finalize`/`mission abort`. `mission launch
+/// coder-phase` sets the worktree from its operator-supplied `workdir` input
+/// and persists it on the phase's tasks (`Task.workdir`); read it back so
+/// finalize/abort target the ACTUAL worktree even when the operator launched
+/// into a non-default location. Falls back to the derived
+/// `worktree_path(root, phase_id)` (the retired `mission run`'s own convention)
+/// when no task records a workdir — an old on-disk run, or a phase whose task
+/// records predate the workdir plumbing.
 fn resolve_run_workdir(mission_id: &str, phase_id: &str, root: &Path) -> PathBuf {
     crew::lifecycle::load_tasks_for_phase(mission_id, phase_id)
         .ok()
@@ -755,15 +762,16 @@ fn resolve_run_workdir(mission_id: &str, phase_id: &str, root: &Path) -> PathBuf
         .unwrap_or_else(|| worktree_path(root, phase_id))
 }
 
-/// (#1426 ship-4 / #1433) After `ship`/`abort` drives a phase to a terminal
-/// status, bring the MISSION to an honest terminal state too — but only when
-/// EVERY phase is terminal (Complete/Abandoned). A mission with a still-open
-/// phase elsewhere stays Active so the operator finishes the remaining phases.
-/// The envelope's per-phase outcomes come from each phase's ACTUAL on-disk
-/// status (#1433's honest-finalize discipline — never a uniform status stamped
-/// across phases): a phase `ship` completed reads `Complete`, one `abort`
-/// abandoned reads `Abandoned`. Best-effort — a load hiccup leaves the mission
-/// as-is (reconcilable via `darkmux mission close`), never fails ship/abort.
+/// (#1426 ship-4 / #1433) After the narrow single-phase `abort --phase` drives
+/// a phase to a terminal status, bring the MISSION to an honest terminal state
+/// too — but only when EVERY phase is terminal (Complete/Abandoned). A mission
+/// with a still-open phase elsewhere stays Active so the operator finishes the
+/// remaining phases. The envelope's per-phase outcomes come from each phase's
+/// ACTUAL on-disk status (#1433's honest-finalize discipline — never a uniform
+/// status stamped across phases): a Complete phase reads `Complete`, an
+/// abandoned one reads `Abandoned`. Best-effort — a load hiccup leaves the
+/// mission as-is (reconcilable via `darkmux mission finalize`), never fails the
+/// abort.
 fn finalize_mission_if_complete(mission_id: &str) {
     use crew::envelope::{MissionEnvelope, MissionOutcomeStatus, PhaseOutcome, PhaseOutcomeKind};
     use crew::types::PhaseStatus;
@@ -863,49 +871,97 @@ fn teardown_and_terminate_phase(
         // a non-default workdir/branch. Fall back to the derived path/name when
         // the worktree is already gone or a task didn't record one.
         let wt_path = resolve_run_workdir(mission_id, &phase.id, root);
-        let b =
-            worktree_branch(&wt_path).unwrap_or_else(|| conventions_branch(phase, mission, conv));
+        let wt_exists = wt_path.exists();
+        // `Some` here means the branch came from a LIVE worktree — a REAL ref.
+        // The conventions fallback is only a DERIVED guess for a phase whose
+        // worktree is already gone (or was never launched at all).
+        let live_branch = worktree_branch(&wt_path);
+        let b = live_branch
+            .clone()
+            .unwrap_or_else(|| conventions_branch(phase, mission, conv));
 
-        // Remove the worktree (force — a gate-held run has uncommitted work by
-        // design). Best-effort: a missing worktree is reported, never fatal.
-        if wt_path.exists() {
-            match Command::new("git")
-                .current_dir(root)
-                .args(["worktree", "remove", "--force", &wt_path.to_string_lossy()])
-                .output()
-            {
-                Ok(o) if o.status.success() => {
-                    println!("{}", style::success(&format!("✓ removed worktree {}", wt_path.display())));
-                }
-                Ok(o) => eprintln!(
-                    "{}",
-                    style::warn(&format!(
-                        "git worktree remove failed: {} — you may need `git worktree prune`.",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ))
-                ),
-                Err(e) => {
-                    eprintln!("{}", style::warn(&format!("git worktree remove errored: {e:#}")))
-                }
-            }
-        } else {
-            println!("{}", style::dim(&format!("worktree {} already gone", wt_path.display())));
-        }
+        // (#1463) SUCCESS-path data-loss guard. `mission finalize` runs AFTER
+        // the frontier orchestrator has committed + pushed the work by hand —
+        // the retired `ship` did the git itself; finalize does not. If the
+        // worktree still holds uncommitted changes or unpushed commits, the
+        // operator has NOT saved it, so destroying it here would lose the
+        // coder's implementation. Skip THIS phase's git teardown, warn loudly
+        // naming the path, and still flip the phase Complete + close the mission
+        // (surface-don't-block, #44). Only finalize (the SUCCESS terminal) is
+        // guarded; `abort` is destroy-by-intent and tears down regardless.
+        let unsaved = kind == MissionTerminal::Finalize
+            && wt_exists
+            && worktree_has_unsaved_work(&wt_path);
 
-        // Delete the branch (best-effort — it may be checked out elsewhere or
-        // already gone).
-        match Command::new("git")
-            .current_dir(root)
-            .args(["branch", "-D", &b])
-            .output()
-        {
-            Ok(o) if o.status.success() => {
-                println!("{}", style::success(&format!("✓ deleted branch {b}")));
-            }
-            _ => println!(
+        if unsaved {
+            eprintln!(
                 "{}",
-                style::dim(&format!("branch {b} not deleted — likely already gone"))
-            ),
+                style::warn(&format!(
+                    "worktree {} has uncommitted or unpushed work — SKIPPING its git teardown so \
+                     nothing is lost. Push/merge it, then remove it by hand: `git worktree remove \
+                     {}` + `git branch -D {}`. The phase still completes and the mission still \
+                     closes.",
+                    wt_path.display(),
+                    wt_path.display(),
+                    b
+                ))
+            );
+        } else {
+            // Remove the worktree (force — a gate-held run has uncommitted work
+            // by design; on `abort` that's intentional, and on `finalize` the
+            // guard above already spared any UNSAVED tree). Best-effort: a
+            // missing worktree is reported, never fatal.
+            if wt_exists {
+                match Command::new("git")
+                    .current_dir(root)
+                    .args(["worktree", "remove", "--force", &wt_path.to_string_lossy()])
+                    .output()
+                {
+                    Ok(o) if o.status.success() => {
+                        println!("{}", style::success(&format!("✓ removed worktree {}", wt_path.display())));
+                    }
+                    Ok(o) => eprintln!(
+                        "{}",
+                        style::warn(&format!(
+                            "git worktree remove failed: {} — you may need `git worktree prune`.",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        ))
+                    ),
+                    Err(e) => {
+                        eprintln!("{}", style::warn(&format!("git worktree remove errored: {e:#}")))
+                    }
+                }
+            } else {
+                println!("{}", style::dim(&format!("worktree {} already gone", wt_path.display())));
+            }
+
+            // (#1463) Only force-delete a branch we KNOW is real — one a live
+            // worktree reported, or one whose worktree still exists. A
+            // never-launched Planned phase has only a DERIVED conventions name;
+            // force-deleting that could blow away an unrelated branch that
+            // merely matches the template, so it's left untouched.
+            if should_force_delete_branch(live_branch.is_some(), wt_exists) {
+                match Command::new("git")
+                    .current_dir(root)
+                    .args(["branch", "-D", &b])
+                    .output()
+                {
+                    Ok(o) if o.status.success() => {
+                        println!("{}", style::success(&format!("✓ deleted branch {b}")));
+                    }
+                    _ => println!(
+                        "{}",
+                        style::dim(&format!("branch {b} not deleted — likely already gone"))
+                    ),
+                }
+            } else {
+                println!(
+                    "{}",
+                    style::dim(&format!(
+                        "branch {b} not deleted — never had a worktree (derived name), left untouched"
+                    ))
+                );
+            }
         }
         wt_display = Some(wt_path.display().to_string());
         branch = Some(b);
@@ -1090,10 +1146,10 @@ pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
-/// Resolve the phase a post-run verb (`ship` / `abort`) targets. An explicit
-/// `--phase` is looked up by id directly (no status filter — so a Running
-/// phase, the common post-`run` case, resolves); otherwise fall back to
-/// `select_phase`'s ready-Planned auto-pick.
+/// Resolve the phase the narrow single-phase `mission abort --phase` targets.
+/// An explicit `--phase` is looked up by id directly (no status filter — so a
+/// Running phase, the common post-launch case, resolves); otherwise fall back
+/// to `select_phase`'s ready-Planned auto-pick.
 fn resolve_phase(
     phases: &[crew::types::Phase],
     mission_phase_ids: &[String],
@@ -2084,11 +2140,13 @@ pub fn nudge_mission_debrief(mission_id: &str) {
 use crew::step_kinds::{parse_failed_verifiers, FailedVerifier};
 
 /// (#799) Prominent gate banner naming the verifier commands that FAILED TO
-/// RUN. No-op on an honest run (empty list). Soft — it informs the adjudicator
-/// at the gate; it never blocks `mission run` (operator sovereignty #44). The
-/// list is what lets the operator cross-check the coder's SIGNOFF: a "tests
-/// pass" claim sitting next to "the test command never ran" is the
-/// contradiction this exists to surface.
+/// RUN. No-op on an honest run (empty list). Soft — it informs the frontier
+/// orchestrator at the coder-phase gate; it blocks nothing (operator
+/// sovereignty #44), and with `mission ship` retired (#1463) there is no longer
+/// any automated hold behind it — this banner is the only surviving surface of
+/// the #799 backstop. The list is what lets the operator cross-check the
+/// coder's SIGNOFF: a "tests pass" claim sitting next to "the test command
+/// never ran" is the contradiction this exists to surface.
 // (#1284 Packet 4a) `pub(crate)` — `mission_launch.rs`'s coder-phase gate
 // prints the SAME banner at the same decision point.
 pub(crate) fn print_unverified_banner(failed: &[FailedVerifier]) {
@@ -2114,10 +2172,58 @@ pub(crate) fn print_unverified_banner(failed: &[FailedVerifier]) {
     println!(
         "  {}",
         style::dim(
-            "confirm verification independently before shipping — re-run once the toolchain is \
-             fixed, or verify by hand. `mission ship --merge` will HOLD on this until you do."
+            "CONFIRM verification independently before you merge — re-run once the toolchain is \
+             fixed, or verify by hand. Nothing downstream holds on this: `mission ship` retired \
+             (#1463), and with it the automated verifier-fabrication hold (#799). The frontier \
+             orchestrator now does the merge itself — this banner is the only remaining backstop, \
+             so treat an unproven SIGNOFF as unverified until you have checked it yourself."
         )
     );
+}
+
+/// (#1463) Whether a whole-mission teardown may force-delete a phase's branch.
+/// YES only when the name is backed by a real worktree — one a live worktree
+/// reported (`live_branch_present`), or one whose worktree still exists on disk
+/// (`wt_exists`). A never-launched Planned phase has only a DERIVED conventions
+/// name; force-deleting that could blow away an unrelated branch that merely
+/// matches the template, so the caller leaves it untouched. Pure, for testing.
+fn should_force_delete_branch(live_branch_present: bool, wt_exists: bool) -> bool {
+    live_branch_present || wt_exists
+}
+
+/// (#1463) True when a worktree holds work the operator has not saved yet:
+/// uncommitted changes in the working tree, OR commits reachable from HEAD that
+/// no remote-tracking ref contains (never pushed). The SUCCESS-path teardown
+/// (`mission finalize`) uses this to spare an unsaved worktree from destruction
+/// — the frontier orchestrator commits + pushes by hand before finalize, and a
+/// finalize that raced ahead of that push would otherwise lose the work.
+/// Best-effort: any git error falls through to `false` (proceed with teardown),
+/// since the reliable signal (`status --porcelain`) rarely fails on a live
+/// worktree; the guard errs toward acting only on a POSITIVE unsaved reading.
+fn worktree_has_unsaved_work(wt_path: &Path) -> bool {
+    let git = |args: &[&str]| -> Option<String> {
+        Command::new("git")
+            .current_dir(wt_path)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    // Uncommitted changes (staged, unstaged, or untracked).
+    if let Some(out) = git(&["status", "--porcelain"]) {
+        if !out.is_empty() {
+            return true;
+        }
+    }
+    // Any commit reachable from HEAD but on NO remote-tracking branch = never
+    // pushed. Empty output = everything HEAD points at is already on a remote.
+    if let Some(out) = git(&["rev-list", "--max-count=1", "HEAD", "--not", "--remotes"]) {
+        if !out.is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 /// (#816) The branch a worktree is actually on (`git rev-parse

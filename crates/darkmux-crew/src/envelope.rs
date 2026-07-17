@@ -306,7 +306,7 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
             if classify_phase_refusal(phase.outcome, current) == FinalizeRefusal::Drift {
                 eprintln!(
                     "warning: mission `{}` finalize could not drive phase `{}` to {:?}: {e:#}; \
-                     phase left as-is, reconcile with `darkmux phase` verbs (#1406)",
+                     phase left as-is, reconcile with `darkmux mission finalize` / `darkmux mission abort` (#1463)",
                     envelope.mission_id, phase.phase_id, phase.outcome
                 );
             }
@@ -325,7 +325,7 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
         if classify_mission_close_refusal(current) == FinalizeRefusal::Drift {
             eprintln!(
                 "warning: mission `{}` finalize could not close it: {e:#}; mission left as-is, \
-                 reconcile with `darkmux mission close` (#1433)",
+                 reconcile with `darkmux mission finalize` (#1463)",
                 envelope.mission_id
             );
         }

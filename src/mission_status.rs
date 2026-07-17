@@ -144,9 +144,12 @@ fn unreachable_phase_drifts(m: &Mission, phases: &[&Phase]) -> Vec<Drift> {
                     phase.id
                 ),
                 suggest: vec![format!(
-                    "darkmux mission abort {}   # a phase is permanently blocked by an \
-                     earlier abandoned phase — tear the mission down",
-                    m.id
+                    "darkmux mission abort {mid} --phase {pid}   # abandon just this \
+                     permanently-blocked phase (a bare `mission abort {mid}` would abandon \
+                     every healthy phase too); the mission closes on its own once that \
+                     leaves every phase terminal",
+                    mid = m.id,
+                    pid = phase.id
                 )],
             });
         }
@@ -461,9 +464,12 @@ mod tests {
         m.phase_ids = vec!["dead".to_string(), "blocked".to_string()];
 
         let d = detect_drift(&m, &[&dead, &blocked], 0, 14);
+        // (#1463 CONSIDER 5) The suggestion must scope the teardown to the ONE
+        // blocked phase (`--phase blocked`), not a bare whole-mission abort that
+        // would abandon every healthy phase too.
         assert!(d.iter().any(|dr| dr.kind == "unreachable-phase"
             && dr.detail.contains("blocked")
-            && dr.suggest.iter().any(|c| c.contains("mission abort m1"))));
+            && dr.suggest.iter().any(|c| c.contains("mission abort m1 --phase blocked"))));
     }
 
     #[test]

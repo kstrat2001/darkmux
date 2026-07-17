@@ -708,8 +708,8 @@ pub fn phase_complete(id: &str) -> Result<Phase> {
     let mut phase = load_phase_by_id(id)?;
     match phase.status {
         PhaseStatus::Running => {}
-        PhaseStatus::Planned => bail!("phase `{id}` is Planned — must `phase start` first"),
-        PhaseStatus::Abandoned => bail!("phase `{id}` is Abandoned — `phase start` to restart, then complete"),
+        PhaseStatus::Planned => bail!("phase `{id}` is Planned — it must be Running before it can complete (#1463)"),
+        PhaseStatus::Abandoned => bail!("phase `{id}` is Abandoned — restart it to Running before completing (#1463)"),
         PhaseStatus::Complete => bail!("phase `{id}` is already Complete"),
     }
     phase.status = PhaseStatus::Complete;

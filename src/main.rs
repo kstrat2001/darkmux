@@ -973,9 +973,11 @@ fn cmd_mission_dispatch(
         eprintln!(
             "darkmux mission dispatch: no runnable phase in mission `{mission_id}` — either \
              every phase is already Running/Complete/Abandoned, or the next Planned phase is \
-             blocked on an incomplete predecessor. Nothing to fan out. (Running phases from a \
-             previous dispatch must be `darkmux phase complete` or `phase abandon` before \
-             they're eligible again.)"
+             blocked on an incomplete predecessor. Nothing to fan out. (A Running phase from a \
+             previous dispatch becomes eligible again only once it reaches a terminal outcome — \
+             its launched run finalizing into the mission graph, or the whole mission driven \
+             terminal with `darkmux mission finalize` / `darkmux mission abort`, both of which \
+             reconcile the mission's phases. #1463)"
         );
         return Ok(2);
     }
