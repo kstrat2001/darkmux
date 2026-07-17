@@ -3938,7 +3938,12 @@ impl StepKind for ReviewProbeStepKind {
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 
-    fn residency(&self, _step: &Step, _task: &Task) -> Option<darkmux_gestalt::Placement> {
+    fn residency(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Option<darkmux_gestalt::Placement> {
         if self.staffing.pm.is_remote() {
             return None;
         }
@@ -4305,7 +4310,12 @@ impl StepKind for ReviewJudgeStepKind {
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 
-    fn residency(&self, _step: &Step, _task: &Task) -> Option<darkmux_gestalt::Placement> {
+    fn residency(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Option<darkmux_gestalt::Placement> {
         if self.judge.pm.is_remote() {
             return None;
         }
@@ -4353,6 +4363,25 @@ impl StepKind for ReviewJudgeStepKind {
 /// `dispatch.single_shot` to grow a per-item loop concept and shared
 /// cross-step mutation it doesn't have today; left as a documented
 /// follow-up candidate, not forced here.
+/// (#1426 ship-2) Count the CONFIRMED flags in a verify step's gathered
+/// input (the judge task's serialized `Vec<JudgedFlag>` output). `Some(n)`
+/// when the input parses (an ABSENT/empty input is a real zero — the judge
+/// produced nothing); `None` when it is present but unparseable, so the
+/// caller can stay conservative rather than mask a malformed handoff that
+/// `run` must surface. Pure; shared by `ReviewVerifyStepKind::residency`
+/// (the pre-wave-loader short-circuit) and unit-testable directly.
+fn confirmed_count_in_judge_output(
+    input: &std::collections::BTreeMap<String, String>,
+) -> Option<usize> {
+    let judge_output = match input.values().next() {
+        None => return Some(0),
+        Some(s) if s.is_empty() => return Some(0),
+        Some(s) => s,
+    };
+    let judged: Vec<JudgedFlag> = serde_json::from_str(judge_output).ok()?;
+    Some(judged.iter().filter(|j| j.tier == Tier::Confirmed).count())
+}
+
 pub struct ReviewVerifyStepKind {
     pub ctx: Arc<ReviewStepContext>,
     pub verify: Option<ResolvedSeatStaffing>,
@@ -4394,6 +4423,23 @@ impl StepKind for ReviewVerifyStepKind {
 
         let docket_count = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
         if docket_count == 0 {
+            // (#1426 ship-2 operator decision) The completed no-op half of
+            // the pre-wave short-circuit: `residency()` already returned
+            // `None` for this input (no model was loaded); here the step
+            // completes with the reason NAMED in its step-result record, so
+            // the run's observability answers "why did verify not dispatch"
+            // directly. Judged flags pass through untouched — the envelope
+            // is unaffected.
+            emit_review_step_result(
+                "review.verify",
+                &step.id,
+                &self.ctx.case_id,
+                json!({
+                    "items_in": 0, "items_out": 0, "wall_ms": 0,
+                    "short_circuit":
+                        "zero confirmed findings — verify skipped before any model load",
+                }),
+            );
             let output = serde_json::to_string(&judged).context("serializing judged flags")?;
             return Ok(StepOutcome { output, flow_records: Vec::new() });
         }
@@ -4525,7 +4571,12 @@ impl StepKind for ReviewVerifyStepKind {
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 
-    fn residency(&self, _step: &Step, _task: &Task) -> Option<darkmux_gestalt::Placement> {
+    fn residency(
+        &self,
+        _step: &Step,
+        _task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+    ) -> Option<darkmux_gestalt::Placement> {
         let vstaff = self.verify.as_ref()?;
         if vstaff.pm.is_remote() {
             return None;
@@ -4535,6 +4586,19 @@ impl StepKind for ReviewVerifyStepKind {
         // step's output is transitively guaranteed empty too, so verify is
         // certain to have nothing confirmed to check.
         if self.ctx.bundles.is_empty() {
+            return None;
+        }
+        // (#1426 ship-2 operator decision) DATA-DEPENDENT short-circuit,
+        // ahead of the wave loader: verify's docket is the judge output's
+        // CONFIRMED subset, and by the time this step is ready that output
+        // is real (`verify_task.depends_on == [judge_task]`), delivered in
+        // the same gathered `input` map `run` will receive. Zero confirmed
+        // findings means `run` is a guaranteed no-op — return `None` so the
+        // residency wave never loads the verify model for it. Conservative
+        // on unparseable input (fall through and keep the placement): `run`
+        // owns surfacing that error; residency stays a best-effort
+        // classification that must never mask it.
+        if confirmed_count_in_judge_output(input) == Some(0) {
             return None;
         }
         let n_ctx = vstaff.pm.n_ctx?;

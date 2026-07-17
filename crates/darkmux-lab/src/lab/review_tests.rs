@@ -2857,6 +2857,185 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     // in this module — were CHARACTERIZATION tests of the gap; they now
     // pin the FIXED (positive) behavior instead.
 
+    // ─── #1426 ship-2 operator decision: verify pre-wave short-circuit ───
+
+    /// Recording `ModelHost` for the scheduler's `host_factory` seam — every
+    /// `load` lands in a shared list so a test can assert exactly which
+    /// models the residency wave loaded (or that it loaded none).
+    struct RecordingHost {
+        loads: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl darkmux_gestalt::ModelHost for RecordingHost {
+        fn list_resident(
+            &mut self,
+        ) -> std::result::Result<Vec<darkmux_gestalt::ResidentFact>, darkmux_gestalt::HostError>
+        {
+            Ok(Vec::new())
+        }
+        fn list_catalog(
+            &mut self,
+        ) -> std::result::Result<Vec<darkmux_gestalt::CatalogFact>, darkmux_gestalt::HostError>
+        {
+            Ok(Vec::new())
+        }
+        fn load(
+            &mut self,
+            _model_key: &str,
+            identifier: &str,
+            _min_ctx: u32,
+            _deadline: darkmux_gestalt::Deadline,
+        ) -> std::result::Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+            self.loads.lock().unwrap().push(identifier.to_string());
+            Ok(darkmux_gestalt::LoadReport::default())
+        }
+        fn unload(
+            &mut self,
+            _target: &darkmux_gestalt::OwnedTarget,
+            _deadline: darkmux_gestalt::Deadline,
+        ) -> std::result::Result<(), darkmux_gestalt::HostError> {
+            Ok(())
+        }
+    }
+
+    /// Build + run the review graph through the scheduler DIRECTLY, with a
+    /// recording `host_factory` — the mock seam `run_review_graph` itself
+    /// does not expose (it hardcodes the real `lms_host_factory`). Returns
+    /// the recorded load identifiers plus the final step map, so tests can
+    /// assert both the wave loader's behavior and each step's outcome.
+    fn run_graph_recording_loads(
+        ctx: &Arc<ReviewStepContext>,
+        verify: ResolvedSeatStaffing,
+    ) -> (Vec<String>, BTreeMap<String, Step>) {
+        let seats = validate_review_crew(&ctx.crew).expect("valid crew");
+        let judge = seats.judge.clone();
+        let probes: Vec<_> = seats.probes.clone();
+        let graph = build_review_graph(
+            ctx.clone(),
+            judge,
+            Some(verify.clone()),
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
+        let BuiltReviewGraph { tasks, mut steps, registry, .. } = graph;
+        let tasks_by_id: BTreeMap<String, Task> =
+            tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
+        let loads: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let loads_for_factory = loads.clone();
+        let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> {
+            Box::new(RecordingHost { loads: loads_for_factory.clone() })
+        };
+        // The verify model's estimate is small and fixed so the planner's
+        // Load decision is deterministic on any test machine.
+        let est = darkmux_gestalt::FixedEstimator(
+            [(verify.pm.id.clone(), 1_000_000_000u64)].into_iter().collect(),
+        );
+        darkmux_crew::scheduler::run_step_graph(
+            &mut steps,
+            &tasks_by_id,
+            &registry,
+            &darkmux_gestalt::Facts::default(),
+            &est,
+            8,
+            &host_factory,
+            &mut |_record| {},
+            &mut |_step| {},
+        )
+        .expect("graph run completes");
+        let recorded = loads.lock().unwrap().clone();
+        (recorded, steps)
+    }
+
+    /// (#1426 ship-2 operator decision) ZERO confirmed findings + a pinned,
+    /// DISTINCT local verify model: the verify step completes as a no-op and
+    /// the residency wave loads NO model at all — `residency()` returns
+    /// `None` from the confirmed-count check BEFORE the wave loader runs.
+    #[test]
+    fn verify_short_circuits_before_model_load_when_zero_confirmed_findings() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        // Pinned distinct verify model, LOCAL with a declared n_ctx — the
+        // exact shape whose placement the wave loader WOULD load absent the
+        // short-circuit (probe/judge stay n_ctx-less → Remote track).
+        let verify = staffing("fast", "verify-model", 1);
+        let needs_check_json = "```json\n{\"ruling\": \"needs_check\", \"decisive_evidence\": \"cannot tell\", \"note_for_author\": \"check manually\"}\n```";
+        let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), move |call: &ChatCall| {
+            assert_ne!(
+                call.system, "verify persona",
+                "verify must never dispatch on a zero-confirmed run"
+            );
+            if call.system == "probe prior" {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                // Judge pass-1 rules needs_check → confirmed docket is 0.
+                Ok(reply(needs_check_json))
+            }
+        });
+
+        let (loads, steps) = run_graph_recording_loads(&ctx, verify);
+
+        assert!(loads.is_empty(), "no model load may be issued: {loads:?}");
+        let verify_step = steps
+            .values()
+            .find(|s| s.kind == "review.verify")
+            .expect("verify step exists");
+        assert_eq!(verify_step.status, NodeStatus::Complete, "completed no-op");
+        // Judged flags pass through untouched: still NeedsCheck, no verify
+        // record — the envelope is unaffected.
+        let judged: Vec<JudgedFlag> =
+            serde_json::from_str(verify_step.output.as_deref().unwrap()).expect("output parses");
+        assert_eq!(judged.len(), 1);
+        assert_eq!(judged[0].tier, Tier::NeedsCheck);
+        assert!(judged[0].verify.is_none());
+    }
+
+    /// The normal path is unaffected: a NONZERO confirmed docket loads the
+    /// pinned verify model through the residency wave and dispatches the
+    /// verify pass exactly as before.
+    #[test]
+    fn verify_dispatches_normally_with_confirmed_findings() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let verify = staffing("fast", "verify-model", 1);
+        let verified_json = "```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"confirmed on the code\", \"note_for_author\": \"real\"}\n```";
+        let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), move |call: &ChatCall| {
+            if call.system == "probe prior" {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else if call.system == "verify persona" {
+                Ok(reply(verified_json))
+            } else {
+                Ok(reply(CONFIRM_JSON))
+            }
+        });
+
+        let (loads, steps) = run_graph_recording_loads(&ctx, verify);
+
+        assert_eq!(
+            loads,
+            vec!["darkmux:verify-model".to_string()],
+            "the residency wave loads exactly the pinned verify model"
+        );
+        let verify_step = steps
+            .values()
+            .find(|s| s.kind == "review.verify")
+            .expect("verify step exists");
+        assert_eq!(verify_step.status, NodeStatus::Complete);
+        let judged: Vec<JudgedFlag> =
+            serde_json::from_str(verify_step.output.as_deref().unwrap()).expect("output parses");
+        assert_eq!(judged.len(), 1);
+        assert_eq!(judged[0].tier, Tier::Confirmed);
+        let vrec = judged[0].verify.as_ref().expect("verify record present — the pass dispatched");
+        assert_eq!(vrec.ruling, VerifyRuling::Verified);
+    }
+
     /// (#1374 gate coverage) The judge's per-flag global index is
     /// deterministic UNDER PERMUTED COMPLETION ORDER: with `concurrency: 2`
     /// and a chat stub that makes each chunk's FIRST flag finish LAST, the
