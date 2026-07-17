@@ -1044,7 +1044,9 @@ pub(crate) enum LabCmd {
     /// `lab compare` leaves, folded into the `run` kind-family). `run` takes
     /// EITHER a workload positional OR a sub-verb — `args_conflicts_with_
     /// subcommands` keeps the two forms from mixing, and a token that is not a
-    /// known sub-verb fills the workload positional.
+    /// known sub-verb fills the workload positional. A user workload whose id
+    /// collides with a sub-verb (`list`/`inspect`/`compare`) is still reachable
+    /// as a workload via the `--` escape: `lab run -- <id>` (#1465).
     #[command(args_conflicts_with_subcommands = true)]
     Run {
         /// Workload id to dispatch (omit when using a run sub-verb).

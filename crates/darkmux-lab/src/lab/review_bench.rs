@@ -299,6 +299,26 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
             opts.cases_dir.display()
         ));
     }
+    // (#1465/#1469) The experimental condition modes dispatch fixed
+    // `pr-reviewer`-variant roles / pipelines and IGNORE the `role` positional
+    // (a follow-up moves them behind per-role config). Naming a role AND an
+    // experimental mode would silently run a DIFFERENT role than the operator
+    // asked for, with nothing in the artifact revealing it — so bail LOUD here,
+    // before any dispatch spends a token (same "fail loud before spending
+    // tokens" discipline as the workdirs preflight below). `pr-reviewer` + any
+    // mode still works; any role + `Strict` still works.
+    if opts.mode != BenchMode::Strict && opts.role != "pr-reviewer" {
+        return Err(anyhow!(
+            "the --{} mode is pr-reviewer-specific and ignores the `{}` role positional \
+             (it dispatches fixed pr-reviewer-variant roles / pipelines) — drop the role \
+             positional to run `pr-reviewer` in {} mode, or use `--strict` (the default) to \
+             evaluate `{}`. Per-role config for the experimental modes is a tracked follow-up (#1465).",
+            opts.mode.label(),
+            opts.role,
+            opts.mode.label(),
+            opts.role,
+        ));
+    }
     // Agentic mode's preflight: every case must have its evidence tree BEFORE
     // any dispatch spends tokens — a half-agentic run corrupts comparability.
     let workdir_for = |case_id: &str| -> Option<PathBuf> {
@@ -357,8 +377,12 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     // (#1247 Part 1) Funnel mode's per-run-local flow-event sink — see
     // `LocalJsonlEmitter`'s doc for why this is NOT the fleet flow stream.
     let mut funnel_emitter = LocalJsonlEmitter::new(scores_path.with_file_name("funnel-events.jsonl"));
+    // (#1465) Operator-facing console line reads `lab eval` (the current verb);
+    // the internal run_id / run-dir (`review-bench-<ts>`) + scores `bench` key
+    // stay `review-bench` — self-consistent internal identifiers, a declared
+    // non-goal to rename.
     eprintln!(
-        "pr-review-bench: {} cases · profile={} · profiles-file={} · mode={}",
+        "lab eval: {} cases · profile={} · profiles-file={} · mode={}",
         cases.len(),
         opts.profile_name.as_deref().unwrap_or("(default)"),
         opts.config_path.as_deref().unwrap_or("(registry)"),
@@ -1735,6 +1759,14 @@ fn write_scores_artifact(
     doc.extras.insert(
         "mode".to_string(),
         serde_json::Value::String(opts.mode.label().to_string()),
+    );
+    // (#1465) `role` is now an operator knob (was a `pr-reviewer` constant
+    // pre-#1465), so the artifact snapshots it — otherwise `lab eval coder` and
+    // `lab eval pr-reviewer` emit indistinguishable scores.json. Satisfies the
+    // no-blind-runs doctrine: every run self-describes its knobs.
+    doc.extras.insert(
+        "role".to_string(),
+        serde_json::Value::String(opts.role.clone()),
     );
     // (#1222 Phase B packet 7) Funnel-mode provenance: roster profile +
     // resolved exec mode + k override — the cell-identity fields a future

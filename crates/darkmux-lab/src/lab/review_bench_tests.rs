@@ -1357,6 +1357,132 @@
         assert_eq!(doc["k"], serde_json::json!("(profile default)"));
     }
 
+    // (#1465) `role` is now an operator knob (was a `pr-reviewer` constant),
+    // so the artifact must snapshot it — otherwise `lab eval coder` and
+    // `lab eval pr-reviewer` emit indistinguishable scores.json. No-blind-runs
+    // doctrine: every run self-describes its knobs.
+    #[test]
+    fn write_scores_artifact_extras_record_the_role_knob() {
+        let label = multi_lbl("bug", vec![ef("start.plus(30)", false)]);
+        let r = super::Review {
+            verdict: "block".into(),
+            parsed: true,
+            ..Default::default()
+        };
+        let s = score(&label, &r);
+        let case = funnel_case();
+        let scored: Vec<(&Case, CaseScore)> = vec![(&case, s)];
+        let meta = vec![EnvelopeMeta::default()];
+        let debates: Vec<super::super::dialectic::DebateEnvelope> = Vec::new();
+        let funnels: Vec<super::super::review::ReviewEnvelope> = Vec::new();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scores_out = tmp.path().join("scores.json");
+        // A Strict-mode run of a NON-default role — the case `role` was
+        // silently absent from the artifact before #1465.
+        let opts = ReviewBenchOpts {
+            cases_dir: PathBuf::from("."),
+            role: "coder".into(),
+            profile_name: Some("test-profile".into()),
+            config_path: None,
+            timeout_seconds: 60,
+            scores_out: Some(scores_out.clone()),
+            mode: BenchMode::Strict,
+            workdirs: None,
+            prosecutor_profile: None,
+            defender_profile: None,
+            judge_profile: None,
+            roster_profile: None,
+            exec_mode: None,
+            k_override: None,
+            bundler_cmd: None,
+        };
+
+        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_out, 0).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(doc["role"], serde_json::json!("coder"), "the operator's role knob must ride in the artifact");
+        assert_eq!(doc["mode"], serde_json::json!("strict"));
+    }
+
+    // (#1465/#1469) The experimental condition modes ignore the `role`
+    // positional (they dispatch fixed pr-reviewer-variant roles). Naming a
+    // role AND an experimental mode must bail LOUD before any dispatch — a
+    // silent wrong-role run is the failure mode #1469 guards against.
+    #[test]
+    fn run_review_bench_bails_when_a_role_is_named_with_an_experimental_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path();
+        fs::write(
+            d.join("c.label.json"),
+            r#"{"kind":"clean","intent_title":"t","expect_verdict":"pass"}"#,
+        )
+        .unwrap();
+        fs::write(d.join("c.diff"), "diff --git a b\n").unwrap();
+
+        let opts = ReviewBenchOpts {
+            cases_dir: d.to_path_buf(),
+            role: "coder".into(),
+            profile_name: None,
+            config_path: None,
+            timeout_seconds: 30,
+            scores_out: None,
+            mode: BenchMode::FreeForm,
+            workdirs: None,
+            prosecutor_profile: None,
+            defender_profile: None,
+            judge_profile: None,
+            roster_profile: None,
+            exec_mode: None,
+            k_override: None,
+            bundler_cmd: None,
+        };
+        let err = run_review_bench(opts).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pr-reviewer-specific"), "the bail must name why: {msg}");
+        assert!(msg.contains("coder"), "the bail must echo the offending role: {msg}");
+        assert!(msg.contains("freeform"), "the bail must name the mode: {msg}");
+    }
+
+    // `pr-reviewer` + any experimental mode still resolves past the guard —
+    // no currently-valid invocation changed behavior (#1465). We only assert
+    // the guard doesn't fire; the run itself needs live dispatch, out of scope
+    // here, so we stop at the workdirs preflight (the NEXT loud failure).
+    #[test]
+    fn run_review_bench_default_role_passes_the_experimental_mode_guard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path();
+        fs::write(
+            d.join("c.label.json"),
+            r#"{"kind":"clean","intent_title":"t","expect_verdict":"pass"}"#,
+        )
+        .unwrap();
+        fs::write(d.join("c.diff"), "diff --git a b\n").unwrap();
+
+        let opts = ReviewBenchOpts {
+            cases_dir: d.to_path_buf(),
+            role: "pr-reviewer".into(),
+            profile_name: None,
+            config_path: None,
+            timeout_seconds: 30,
+            scores_out: None,
+            mode: BenchMode::Agentic,
+            workdirs: None, // agentic requires this — the NEXT preflight bails here
+            prosecutor_profile: None,
+            defender_profile: None,
+            judge_profile: None,
+            roster_profile: None,
+            exec_mode: None,
+            k_override: None,
+            bundler_cmd: None,
+        };
+        let err = run_review_bench(opts).unwrap_err();
+        let msg = format!("{err:#}");
+        // NOT the role guard — the run got PAST it to the workdirs preflight.
+        assert!(!msg.contains("pr-reviewer-specific"), "default role must pass the role guard: {msg}");
+        assert!(msg.contains("requires --workdirs"), "should reach the workdirs preflight: {msg}");
+    }
+
     // ── run_funnel_case: the real pipeline, offline-testable ───────────
     //
     // `run_funnel_case`'s `chat` closure is hardcoded to the real
@@ -1533,9 +1659,9 @@
 
     // ── resolve_funnel_ctx: roster resolution + --k / --exec-mode plumbing ───
     // (#1426 ship-2) The crews map retired — the funnel derives its staffing
-    // from the roster profile (the `--crew`/`--profile` name, else
-    // default_profile) via the resourcing resolver. `--crew` now names the
-    // roster profile, not a `crews.<name>` entry.
+    // from the roster profile (the `--roster-profile`/`--profile` name, else
+    // default_profile) via the resourcing resolver. `--roster-profile` (#1465,
+    // renamed from `--crew`) names the roster profile, not a `crews.<name>` entry.
 
     fn write_test_registry(dir: &Path, roster: &str) -> PathBuf {
         use std::collections::BTreeMap;
