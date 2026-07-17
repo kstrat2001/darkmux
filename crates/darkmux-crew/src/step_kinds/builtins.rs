@@ -18,7 +18,7 @@
 
 use super::types::{StepKind, StepOutcome};
 use crate::types::{Step, Task};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 
 /// Compose a step kind's base prompt/message with the gathered output of
@@ -480,6 +480,409 @@ impl StepKind for DispatchSingleShotStepKind {
     }
 }
 
+// ─── dispatch.map (#1442) ───────────────────────────────────────────────
+
+/// (#1442) One remote-token bucket scoped to a SINGLE `dispatch.map` step's
+/// whole collection loop — the step-local analog of the review pipeline's
+/// per-stage `RemoteBucket` (`darkmux-lab`'s `review`), which cannot be
+/// reused here because `darkmux-lab` depends on `darkmux-crew`, not the
+/// reverse (the same dependency-direction note `admit_remote_execution`
+/// carries). Local items never touch it. A `budget` of 0 is exhausted from
+/// the FIRST item (`used (0) >= budget (0)`), so a zero allowance refuses
+/// every hosted call in the collection — the same hard opt-out
+/// `admit_remote_execution` gives a single hosted dispatch. Cross-STEP
+/// sharing (one bucket across sibling `dispatch.map` steps of the same
+/// stage) is the SAME deferred concern `DispatchSingleShotStepKind`'s own
+/// doc names (#1414): a Tier 1 config-driven kind holds no caller-supplied
+/// `Arc`, so the bucket is step-scoped here — enough to bound one step's
+/// whole collection, which is what "bucket exhaustion mid-collection" means.
+struct MapRemoteBucket {
+    budget: u64,
+    used: u64,
+    skipped: u32,
+}
+
+impl MapRemoteBucket {
+    fn new(budget: u64) -> Self {
+        Self { budget, used: 0, skipped: 0 }
+    }
+    fn exhausted(&self) -> bool {
+        self.used >= self.budget
+    }
+    /// `false` ⇒ the bucket is exhausted and this item's call must not fire
+    /// (counted as skipped, for the item's named-reason result).
+    fn admit(&mut self) -> bool {
+        if self.exhausted() {
+            self.skipped += 1;
+            false
+        } else {
+            true
+        }
+    }
+    fn spend(&mut self, tokens: u64) {
+        self.used = self.used.saturating_add(tokens);
+    }
+}
+
+/// (#1442) One `dispatch.map` item's outcome, serialized (in input-collection
+/// order) into the step's `output` JSON array. A downstream step reads this
+/// array back. `ok == false` marks an ISOLATED per-item failure — the loop
+/// CONTINUED past it (see [`DispatchMapStepKind`]'s error policy) rather than
+/// failing the whole step; `error` names the failure (a dispatch error, or a
+/// remote-budget skip). `content` is the reply text on success (empty on a
+/// skip/error).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MapItemResult {
+    pub index: usize,
+    pub ok: bool,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+}
+
+/// The text a `{item}` placeholder in `dispatch.map`'s `user_template` is
+/// replaced with: a JSON-string item substitutes verbatim (no surrounding
+/// quotes); any other JSON value substitutes its compact serialization. Zero
+/// domain knowledge — the collection is data, the substitution is mechanical.
+fn map_item_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// Resolve a `dispatch.map` step's collection. Precedence: an explicit
+/// `config.collection` JSON array wins; otherwise the collection is a RUNTIME
+/// INPUT — the dependency output named by `config.collection_input`, or (when
+/// the step has exactly one dependency) that one input. An absent/empty
+/// source is an empty collection (a real zero — the upstream produced
+/// nothing), not an error. A present-but-non-array source is a loud `Err`
+/// (`run` surfaces it; `residency` stays best-effort and swallows it) — a
+/// malformed handoff must never masquerade as an empty collection.
+fn resolve_map_collection(
+    step: &Step,
+    input: &BTreeMap<String, String>,
+) -> Result<Vec<serde_json::Value>> {
+    if let Some(arr) = step.config.get("collection").and_then(|v| v.as_array()) {
+        return Ok(arr.clone());
+    }
+    let source: Option<&String> = match config_str(step, "collection_input") {
+        Some(key) => input.get(key),
+        None if input.len() == 1 => input.values().next(),
+        None => None,
+    };
+    let Some(source) = source else {
+        return Ok(Vec::new());
+    };
+    let source = source.trim();
+    if source.is_empty() {
+        return Ok(Vec::new());
+    }
+    let val: serde_json::Value = serde_json::from_str(source).with_context(|| {
+        format!("step `{}`: `dispatch.map` collection input is not valid JSON", step.id)
+    })?;
+    match val {
+        serde_json::Value::Array(items) => Ok(items),
+        _ => bail!(
+            "step `{}`: `dispatch.map` collection input must be a JSON array",
+            step.id
+        ),
+    }
+}
+
+/// (#1442) `dispatch.map` — ONE single-shot dispatch PER ITEM of a runtime
+/// input collection. The generic building block the review pipeline's
+/// probe/verify stages restructure onto (#1442): where
+/// [`DispatchSingleShotStepKind`] wraps exactly ONE chat-completions call
+/// driven by upstream `Step.output`, `dispatch.map` wraps a whole FOR-EACH
+/// loop over a runtime-derived collection — a count not known at graph-build
+/// time (a diff's bundle count, a judge's confirmed-finding count). Static
+/// per-item graph tasks are therefore impossible; runtime-count iteration
+/// inside ONE step is exactly what the #1352 tiering doctrine permits.
+///
+/// **Tier 1, config-driven, zero domain knowledge (#1352).** Every parameter
+/// reads from `Step.config`; the collection is DATA, not code; there is no
+/// caller-supplied strategy (which is what would make it a Tier 2 pattern).
+/// It is [`DispatchSingleShotStepKind`]'s sibling that ITERATES — the same
+/// LOCAL/HOSTED dialect split, the same per-item `max_tokens` clamp, the same
+/// per-item record shape — with a per-item loop and a step-scoped remote
+/// bucket ([`MapRemoteBucket`]) added on top. That there is no genuinely-new
+/// *pluggable algorithm* (only a new outer loop shape over existing
+/// primitives) is why it lands in `builtins` and not `patterns/`.
+///
+/// Required `Step.config`: `model` (string), `user_template` (string — its
+/// `{item}` placeholder is replaced per item by [`map_item_text`]). Optional:
+/// `collection` (JSON array — items inline; else the runtime input, see
+/// [`resolve_map_collection`]), `collection_input` (string — which dependency
+/// input carries the collection), `system` (string, default empty),
+/// `max_tokens` (u32, default 4096), `temperature` (f32, default 0.7, LOCAL
+/// only), `timeout_seconds` (u32, default 120), `endpoint`
+/// (`darkmux_types::ModelEndpoint` JSON — presence selects the HOSTED
+/// dialect), `n_ctx`/`identifier` (residency hints — see [`Self::residency`]).
+///
+/// **Per-item error isolation (the defined policy).** A dispatch error for
+/// ONE item is captured into that item's [`MapItemResult`] (`ok: false`,
+/// `error` set) and the loop CONTINUES — one bad item never kills its
+/// siblings, and the step returns `Ok` with an array recording each outcome.
+/// This mirrors the probe stage's "aggregate, never discard" contract (a
+/// failed draw must not lose the other draws' findings); a caller wanting
+/// fail-fast inspects the `ok: false` entries. (Contrast
+/// [`DispatchInternalStepKind`], where a non-zero agentic dispatch exit is a
+/// step-level `Err` — that's a single-dispatch step with downstream
+/// `depends_on` to protect; a map's whole point is surviving partial failure.)
+///
+/// **Empty-collection short-circuit.** An empty collection is a completed
+/// no-op: [`Self::residency`] returns `None` (so the wave loader never loads
+/// a model the step won't use — the #1442 property ported generically from
+/// the review verify seat's empty-docket short-circuit), and `run` returns
+/// `Ok` with an empty `[]` output and a named short-circuit record before any
+/// dispatch. This makes the short-circuit a property of the BLOCK.
+pub struct DispatchMapStepKind;
+
+impl DispatchMapStepKind {
+    /// One per-item flow record, field-aligned with
+    /// [`DispatchSingleShotStepKind`]'s hosted "step result" record so a
+    /// graph/parity consumer reads a map's per-item records the same way it
+    /// reads a single-shot's.
+    fn item_record(step: &Step, model: &str, remote: bool, res: &MapItemResult) -> darkmux_flow::FlowRecord {
+        darkmux_flow::FlowRecord {
+            ts: darkmux_flow::ts_utc_now(),
+            level: if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
+            category: darkmux_flow::Category::Work,
+            tier: darkmux_flow::Tier::Local,
+            stage: darkmux_flow::Stage::Dispatch,
+            action: "step result".to_string(),
+            handle: step.id.clone(),
+            phase_id: None,
+            session_id: Some(format!("task:{}", step.task_id)),
+            source: Some("scheduler".to_string()),
+            model: Some(model.to_string()),
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            machine_uid: None,
+            orchestrator: None,
+            prev_hash: None,
+            hash: None,
+            payload: Some(serde_json::json!({
+                "step_id": step.id,
+                "kind": "dispatch.map",
+                "index": res.index,
+                "ok": res.ok,
+                "remote": remote,
+                "total_tokens": res.total_tokens,
+                "error": res.error,
+            })),
+            work_id: None,
+            attempt: None,
+        }
+    }
+}
+
+impl StepKind for DispatchMapStepKind {
+    fn id(&self) -> &'static str {
+        "dispatch.map"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Dispatch (map)"
+    }
+
+    fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+        use crate::single_shot::{
+            single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest, SingleShotRequest,
+        };
+
+        let items = resolve_map_collection(step, input)?;
+        let mut flow_records = Vec::new();
+
+        if items.is_empty() {
+            // Empty-collection short-circuit (#1442): no dispatch, empty
+            // output, a NAMED reason so the run's observability answers "why
+            // did this map not dispatch" directly. `residency` already
+            // returned `None` for this input, so no model was loaded. Runs
+            // BEFORE the `model`/`user_template` requirements — a degenerate
+            // upstream that produced nothing is a clean completed no-op, not
+            // a config error (mirrors the review verify seat's empty-docket
+            // short-circuit, which likewise never touches its dispatch config).
+            flow_records.push(darkmux_flow::FlowRecord {
+                ts: darkmux_flow::ts_utc_now(),
+                level: darkmux_flow::Level::Info,
+                category: darkmux_flow::Category::Work,
+                tier: darkmux_flow::Tier::Local,
+                stage: darkmux_flow::Stage::Dispatch,
+                action: "step result".to_string(),
+                handle: step.id.clone(),
+                phase_id: None,
+                session_id: Some(format!("task:{}", step.task_id)),
+                source: Some("scheduler".to_string()),
+                model: config_str(step, "model").map(str::to_string),
+                reasoning: None,
+                mission_id: None,
+                machine_id: None,
+                machine_uid: None,
+                orchestrator: None,
+                prev_hash: None,
+                hash: None,
+                payload: Some(serde_json::json!({
+                    "step_id": step.id,
+                    "kind": "dispatch.map",
+                    "items_in": 0,
+                    "items_out": 0,
+                    "short_circuit": "empty collection — dispatch.map skipped before any model load",
+                })),
+                work_id: None,
+                attempt: None,
+            });
+            return Ok(StepOutcome { output: "[]".to_string(), flow_records });
+        }
+
+        let model = require_config_str(step, self.id(), "model")?;
+        let user_template = require_config_str(step, self.id(), "user_template")?;
+        let system = config_str(step, "system").unwrap_or("");
+        let max_tokens = step.config.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096) as u32;
+        let timeout_seconds =
+            step.config.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(120) as u32;
+        let endpoint: Option<darkmux_types::ModelEndpoint> = match step.config.get("endpoint") {
+            Some(v) => Some(
+                serde_json::from_value(v.clone())
+                    .with_context(|| format!("step `{}`: config.endpoint", step.id))?,
+            ),
+            None => None,
+        };
+
+        // Per-EXECUTION remote allowance, shared across THIS step's whole
+        // collection loop (the metered concept `DARKMUX_REMOTE_MAX_TOKENS_PER_
+        // EXECUTION` governs — one execution = one pipeline stage/step). Local
+        // items never draw from it.
+        let budget = darkmux_types::config_access::remote_max_tokens_per_execution();
+        let mut bucket = MapRemoteBucket::new(budget);
+
+        let mut results: Vec<MapItemResult> = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            let user = user_template.replace("{item}", &map_item_text(item));
+            let res = if let Some(ep) = &endpoint {
+                if !bucket.admit() {
+                    MapItemResult {
+                        index,
+                        ok: false,
+                        content: String::new(),
+                        error: Some(
+                            "remote token budget exhausted for this step — call skipped".to_string(),
+                        ),
+                        total_tokens: None,
+                    }
+                } else {
+                    let clamped = clamp_hosted_max_tokens(max_tokens, budget);
+                    let req = HostedSingleShotRequest {
+                        endpoint: ep,
+                        model,
+                        system,
+                        user: &user,
+                        max_tokens: clamped,
+                        timeout_seconds,
+                    };
+                    match single_shot_chat_hosted(&req) {
+                        Ok(reply) => {
+                            bucket.spend(reply.total_tokens.unwrap_or(0));
+                            MapItemResult {
+                                index,
+                                ok: true,
+                                content: reply.content,
+                                error: None,
+                                total_tokens: reply.total_tokens,
+                            }
+                        }
+                        // Per-item error ISOLATION: capture, continue.
+                        Err(e) => MapItemResult {
+                            index,
+                            ok: false,
+                            content: String::new(),
+                            error: Some(format!("{e:#}")),
+                            total_tokens: None,
+                        },
+                    }
+                }
+            } else {
+                let temperature =
+                    step.config.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
+                let req = SingleShotRequest {
+                    base_url: None,
+                    model,
+                    system,
+                    user: &user,
+                    temperature,
+                    max_tokens,
+                    timeout_seconds,
+                };
+                match single_shot_chat(&req) {
+                    Ok(reply) => MapItemResult {
+                        index,
+                        ok: true,
+                        content: reply.content,
+                        error: None,
+                        total_tokens: reply.total_tokens,
+                    },
+                    // Per-item error ISOLATION: capture, continue.
+                    Err(e) => MapItemResult {
+                        index,
+                        ok: false,
+                        content: String::new(),
+                        error: Some(format!("{e:#}")),
+                        total_tokens: None,
+                    },
+                }
+            };
+            flow_records.push(Self::item_record(step, model, endpoint.is_some(), &res));
+            results.push(res);
+        }
+
+        let output = serde_json::to_string(&results).context("serializing dispatch.map results")?;
+        Ok(StepOutcome { output, flow_records })
+    }
+
+    /// (#1442) LOCAL residency hint. Returns `None` — no wave load — when:
+    /// the step is HOSTED (`endpoint` present, nothing local to load); the
+    /// collection is EMPTY (the short-circuit: a guaranteed no-op needs no
+    /// model, ported generically from the review verify seat, #1442); or the
+    /// residency hints (`n_ctx`) are absent (fail-open, like
+    /// `resolve_local_placement` — a missed RAM-safety optimization, never a
+    /// hard failure). The empty-collection `None` is the mechanism by which
+    /// an empty map performs ZERO model loads — the property the block-level
+    /// short-circuit guarantees.
+    fn residency(
+        &self,
+        step: &Step,
+        _task: &Task,
+        input: &BTreeMap<String, String>,
+    ) -> Option<darkmux_gestalt::Placement> {
+        if step.config.get("endpoint").is_some() {
+            return None;
+        }
+        match resolve_map_collection(step, input) {
+            Ok(items) if items.is_empty() => return None,
+            Ok(_) => {}
+            // `run` owns surfacing a malformed collection; residency stays a
+            // best-effort classification that must never mask it.
+            Err(_) => return None,
+        }
+        let model = config_str(step, "model")?;
+        let min_ctx = u32::try_from(step.config.get("n_ctx").and_then(|v| v.as_u64())?).ok()?;
+        let identifier = config_str(step, "identifier")
+            .map(str::to_string)
+            .unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(model, None));
+        Some(darkmux_gestalt::Placement {
+            model_key: model.to_string(),
+            identifier,
+            min_ctx,
+            seat: format!("map:{}", step.id),
+        })
+    }
+}
+
 /// Runs a shell command from `Step.config`. Required: `command`
 /// (string, passed to `sh -c`). Optional: `cwd` (string). Every
 /// dependency's output is exposed as an env var
@@ -717,8 +1120,281 @@ mod tests {
     fn tier1_display_names_match_the_spec() {
         assert_eq!(DispatchInternalStepKind.display_name(), "Dispatch");
         assert_eq!(DispatchSingleShotStepKind.display_name(), "Dispatch (single-shot)");
+        assert_eq!(DispatchMapStepKind.display_name(), "Dispatch (map)");
         assert_eq!(ProceduralShellStepKind.display_name(), "Shell");
         assert_eq!(ProceduralNoopStepKind.display_name(), "No-op");
+    }
+
+    // ── (#1442) dispatch.map — the generic per-item map block ────────────
+
+    fn map_step(config: serde_json::Value) -> Step {
+        step("m1", "dispatch.map", config)
+    }
+
+    #[test]
+    fn dispatch_map_requires_model() {
+        // A non-empty collection reaches the model check; an empty one
+        // short-circuits BEFORE it (tested separately), so give one item.
+        let s = map_step(json!({ "user_template": "check {item}", "collection": ["a"] }));
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("config.model"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_map_requires_user_template_once_the_collection_is_non_empty() {
+        let s = map_step(json!({ "model": "m", "collection": ["a"] }));
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("config.user_template"), "{err}");
+    }
+
+    #[test]
+    fn map_item_text_substitutes_strings_verbatim_and_json_compactly() {
+        assert_eq!(map_item_text(&json!("hello")), "hello");
+        assert_eq!(map_item_text(&json!({ "id": "b1" })), r#"{"id":"b1"}"#);
+        assert_eq!(map_item_text(&json!(42)), "42");
+    }
+
+    #[test]
+    fn resolve_map_collection_prefers_config_collection() {
+        let s = map_step(json!({ "collection": ["a", "b", "c"] }));
+        let out = resolve_map_collection(&s, &BTreeMap::new()).unwrap();
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn resolve_map_collection_reads_the_single_dependency_input_as_a_json_array() {
+        let s = map_step(json!({}));
+        let mut input = BTreeMap::new();
+        input.insert("upstream".to_string(), r#"["x","y"]"#.to_string());
+        let out = resolve_map_collection(&s, &input).unwrap();
+        assert_eq!(out, vec![json!("x"), json!("y")]);
+    }
+
+    #[test]
+    fn resolve_map_collection_reads_the_named_collection_input() {
+        let s = map_step(json!({ "collection_input": "bundles" }));
+        let mut input = BTreeMap::new();
+        input.insert("bundles".to_string(), r#"["only-this"]"#.to_string());
+        input.insert("other".to_string(), r#"["ignored"]"#.to_string());
+        let out = resolve_map_collection(&s, &input).unwrap();
+        assert_eq!(out, vec![json!("only-this")]);
+    }
+
+    #[test]
+    fn resolve_map_collection_absent_or_empty_source_is_an_empty_collection() {
+        // No config.collection, no inputs.
+        let s = map_step(json!({}));
+        assert!(resolve_map_collection(&s, &BTreeMap::new()).unwrap().is_empty());
+        // A present-but-blank input string is a real zero, not an error.
+        let mut input = BTreeMap::new();
+        input.insert("u".to_string(), "   ".to_string());
+        assert!(resolve_map_collection(&s, &input).unwrap().is_empty());
+        // Ambiguous (two inputs, no collection_input) resolves to empty
+        // rather than guessing which is the collection.
+        let mut two = BTreeMap::new();
+        two.insert("a".to_string(), r#"["x"]"#.to_string());
+        two.insert("b".to_string(), r#"["y"]"#.to_string());
+        assert!(resolve_map_collection(&s, &two).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_map_collection_non_array_source_is_a_loud_error() {
+        let s = map_step(json!({}));
+        let mut input = BTreeMap::new();
+        input.insert("u".to_string(), r#"{"not":"an array"}"#.to_string());
+        let err = resolve_map_collection(&s, &input).unwrap_err();
+        assert!(err.to_string().contains("must be a JSON array"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_map_empty_collection_short_circuits_without_dispatch() {
+        // The block-level short-circuit (#1442): an empty collection returns
+        // an empty `[]` output with a named short-circuit record, and NEVER
+        // reaches the model/user_template requirements or any dispatch — so a
+        // config missing `model` still succeeds here (nothing to dispatch).
+        let s = map_step(json!({ "collection": [] }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        assert_eq!(out.output, "[]");
+        assert_eq!(out.flow_records.len(), 1, "one short-circuit record");
+        let payload = out.flow_records[0].payload.as_ref().unwrap();
+        assert!(payload["short_circuit"].as_str().unwrap().contains("empty collection"));
+    }
+
+    #[test]
+    fn dispatch_map_empty_collection_residency_is_none_so_no_model_loads() {
+        // The no-load property: even with a full local residency config
+        // (model + n_ctx present), an EMPTY collection makes residency return
+        // None, so the wave loader is never asked to load a model the map
+        // won't use. This is the #1442 empty-docket short-circuit, generic.
+        let s = map_step(json!({
+            "model": "some-local-model",
+            "user_template": "check {item}",
+            "n_ctx": 8192,
+            "collection": [],
+        }));
+        assert!(
+            DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new()).is_none(),
+            "an empty collection must declare no residency need (no load)"
+        );
+    }
+
+    #[test]
+    fn dispatch_map_local_residency_resolves_a_placement_for_a_non_empty_collection() {
+        let s = map_step(json!({
+            "model": "qwen3.6-35b-a3b",
+            "user_template": "check {item}",
+            "n_ctx": 8192,
+            "collection": ["a"],
+        }));
+        let placement = DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        assert_eq!(placement.model_key, "qwen3.6-35b-a3b");
+        assert_eq!(placement.min_ctx, 8192);
+        assert!(placement.identifier.starts_with("darkmux:"), "default identifier is namespaced: {}", placement.identifier);
+    }
+
+    #[test]
+    fn dispatch_map_hosted_residency_is_none() {
+        // An endpoint-bearing (remote) map loads nothing locally.
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "n_ctx": 8192,
+            "collection": ["a"],
+            "endpoint": { "url": "https://example.com" },
+        }));
+        assert!(DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn dispatch_map_residency_none_without_n_ctx_fails_open() {
+        let s = map_step(json!({ "model": "m", "user_template": "u {item}", "collection": ["a"] }));
+        assert!(
+            DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new()).is_none(),
+            "no n_ctx hint -> None (fail open to Remote scheduling), never a hard failure"
+        );
+    }
+
+    #[test]
+    fn map_remote_bucket_admits_until_exhausted_then_skips() {
+        let mut b = MapRemoteBucket::new(100);
+        assert!(b.admit(), "fresh bucket admits");
+        b.spend(60);
+        assert!(b.admit(), "still under budget");
+        b.spend(60); // now 120 >= 100
+        assert!(!b.admit(), "over budget -> skip");
+        assert_eq!(b.skipped, 1);
+    }
+
+    #[test]
+    fn map_remote_bucket_zero_budget_is_exhausted_from_the_first_item() {
+        // The hard opt-out: a 0 allowance refuses every hosted call, the same
+        // as `admit_remote_execution` refuses a single hosted dispatch.
+        let mut b = MapRemoteBucket::new(0);
+        assert!(!b.admit(), "zero budget admits nothing");
+        assert!(b.exhausted());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_local_per_item_error_isolation_continues_past_a_failure() {
+        // Point the local dialect at an unroutable endpoint (port 1 refuses
+        // immediately, 1s timeout) so EVERY item's dispatch errors — the
+        // policy under test is that each failure is CAPTURED into that item's
+        // result and the loop CONTINUES to the next, rather than the first
+        // error aborting the whole step. Three items in -> three ok:false
+        // results out, step still Ok.
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, "http://127.0.0.1:1");
+        }
+        let s = map_step(json!({
+            "model": "m",
+            "user_template": "check {item}",
+            "collection": ["a", "b", "c"],
+            "timeout_seconds": 1,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 3, "every item produced a result despite each failing");
+        assert!(results.iter().all(|r| !r.ok), "each item's dispatch failed and was isolated");
+        assert!(results.iter().all(|r| r.error.is_some()), "each failure named");
+        assert_eq!(results[0].index, 0);
+        assert_eq!(results[2].index, 2);
+        // A per-item flow record was emitted for every item.
+        assert_eq!(out.flow_records.len(), 3);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_single_item_degenerate_case_still_produces_one_result() {
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, "http://127.0.0.1:1");
+        }
+        let s = map_step(json!({
+            "model": "m",
+            "user_template": "check {item}",
+            "collection": ["only"],
+            "timeout_seconds": 1,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].index, 0);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_hosted_bucket_exhaustion_mid_collection_skips_remaining_items() {
+        // Budget 0 (the hard opt-out) exhausts from the first item, so every
+        // hosted item is SKIPPED with the named budget reason — no HTTP call
+        // fires (proven by the distinct skip message, not a connect error).
+        // This exercises the mid-collection exhaustion policy at its edge: the
+        // whole collection is skipped, each item recording the same reason.
+        let budget_key = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(budget_key).ok();
+        unsafe {
+            std::env::set_var(budget_key, "0");
+        }
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a", "b", "c"],
+            "endpoint": { "url": "http://127.0.0.1:1" },
+            "timeout_seconds": 1,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| !r.ok));
+        for r in &results {
+            let msg = r.error.as_deref().unwrap();
+            assert!(msg.contains("remote token budget exhausted"), "budget skip named: {msg}");
+            assert!(
+                !msg.to_lowercase().contains("connect") && !msg.to_lowercase().contains("curl"),
+                "no HTTP call was attempted (skipped before the network): {msg}"
+            );
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(budget_key, v),
+                None => std::env::remove_var(budget_key),
+            }
+        }
     }
 
     // ── (#1412) dispatch.single_shot hosted-arm metering ────────────────
