@@ -173,7 +173,7 @@ pub fn run() -> DoctorReport {
 }
 
 /// Name of the installed-skills freshness check (#1426).
-const SKILLS_FRESHNESS_CHECK_NAME: &str = "darkmux skills freshness";
+const SKILLS_FRESHNESS_CHECK_NAME: &str = "darkmux skills freshness"; // drift-guard:allow darkmux skills — noun (the installed skills), the doctor-check name, not the retired verb (#1469)
 
 /// (#1426) Compare the installed `darkmux-*` skill directories against the
 /// binary's embedded copies and warn when they drift, so an operator who
