@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-serve"
-version = "1.18.5"
+version = "2.0.0"
 edition = "2021"
 description = "darkmux serve — the flow-observability HTTP/SSE daemon"
 license = "MIT"
