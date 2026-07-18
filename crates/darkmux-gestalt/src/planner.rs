@@ -54,11 +54,41 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Acquisition options. Deliberately NO `Default` impl: every caller chooses
 /// its intent and scope explicitly — a defaulted intent would silently pick
 /// which side of the #1243 budget behavior (evict vs warn-and-proceed) a
-/// call site gets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// call site gets. [`AcquireOpts::new`] is the ergonomic constructor for the
+/// still-required `intent`/`scope` pair, with `pinned` defaulted empty; a
+/// caller that needs to pin extends the value via struct-update syntax
+/// (`AcquireOpts { pinned: leases, ..AcquireOpts::new(intent, scope) }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcquireOpts {
     pub intent: CallerIntent,
     pub scope: AcquireScope,
+    /// Namespaced (`darkmux:*`) identifiers a CONCURRENT darkmux command is
+    /// actively dispatching to (#1487 PR1 — the reconcile-to-need
+    /// concurrency-safety input). Seeded into the same `claimed` set that
+    /// already shields a reused/reconciled resident: never pass-1
+    /// `Unload(NoLongerDesired)`-ed, never an eviction candidate in the
+    /// #1243 budget or #1140 pool-headroom passes, even when absent from
+    /// `desired`. Because a pinned resident is therefore never removed from
+    /// residency, it stays counted as occupied bytes in both passes — a
+    /// desired load that cannot co-fit with the pinned set is refused
+    /// honestly (the existing named `Block`), never satisfied by evicting
+    /// the pinned model. A pinned identifier that is not `is_darkmux_owned`
+    /// or not actually present in `facts.residents` is a no-op: this call
+    /// plans on residency, never fabricates occupancy for a lease naming a
+    /// model that has since left (the lease ∩ `lms ps` intersection is the
+    /// caller's job before calling in — see the #1487 design doc). Empty by
+    /// default via [`AcquireOpts::new`] — every caller that predates #1487
+    /// gets an identical plan.
+    pub pinned: Vec<String>,
+}
+
+impl AcquireOpts {
+    /// Explicit intent + scope, `pinned` empty (#1487 PR1's backward-
+    /// compatible default — see struct docs for why `intent`/`scope` stay
+    /// required rather than folding into a whole-struct `Default`).
+    pub fn new(intent: CallerIntent, scope: AcquireScope) -> Self {
+        Self { intent, scope, pinned: Vec::new() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +134,23 @@ pub fn plan_acquire(
     // unloaded, never eviction candidates (a claimed resident is targeted
     // at most once).
     let mut claimed: BTreeSet<String> = BTreeSet::new();
+    // (#1487 PR1) Pinned externals — identifiers a CONCURRENT darkmux
+    // command is actively dispatching to, seeded into `claimed` up front so
+    // every check below that already skips a claimed resident (pass-1,
+    // the #1243 budget eviction loop, the #1140 pool-headroom eviction
+    // loop) protects the pin too, with zero new branching. Because a
+    // pinned-but-claimed resident is therefore never added to `removed`,
+    // it stays counted as occupied in `resident_base`/`single_pool_headroom`
+    // — the occupancy half of the contract falls out of the SAME mechanism,
+    // not a second one. Only actually-resident, darkmux-owned pins count: a
+    // lease naming a model that has since left residency (or a caller that
+    // passed a non-namespaced identifier) is a no-op, never fabricated
+    // occupancy — `facts.residents` (i.e. `lms ps`) is always the truth.
+    for id in &opts.pinned {
+        if is_darkmux_owned(id) && facts.residents.iter().any(|r| r.identifier == *id) {
+            claimed.insert(id.clone());
+        }
+    }
     // Reconcile unload-halves, committed after the refusal passes (see
     // ReconcileFree).
     let mut reconcile_frees: Vec<ReconcileFree> = Vec::new();
@@ -790,7 +837,16 @@ mod tests {
     }
 
     fn opts(intent: CallerIntent, scope: AcquireScope) -> AcquireOpts {
-        AcquireOpts { intent, scope }
+        AcquireOpts::new(intent, scope)
+    }
+
+    /// (#1487 PR1) Same as `opts`, with a pinned set attached via
+    /// struct-update syntax — the pattern PR 2's chokepoint wiring uses.
+    fn opts_pinned(intent: CallerIntent, scope: AcquireScope, pinned: &[&str]) -> AcquireOpts {
+        AcquireOpts {
+            pinned: pinned.iter().map(|s| s.to_string()).collect(),
+            ..AcquireOpts::new(intent, scope)
+        }
     }
 
     fn additive_auto() -> AcquireOpts {
@@ -1291,6 +1347,149 @@ mod tests {
             &plan.actions[0],
             PlannedAction { reason: Reason::BudgetEvict { .. }, .. }
         ));
+    }
+
+    // ── #1487 pinned-externals rows ─────────────────────────────────────
+    //
+    // The reconcile-to-need concurrency-safety input (design doc, PR 1):
+    // an identifier a CONCURRENT darkmux command is actively dispatching
+    // to must never be unloaded or evicted by THIS call's plan, and must
+    // stay counted as occupying real bytes. Each row asserts the delta
+    // against the identical unpinned fixture — the pin is the only
+    // variable changing.
+
+    #[test]
+    fn pinned_resident_survives_exclusive_pass1_1487() {
+        // WITHOUT a pin, an Exclusive-scope resident absent from `desired`
+        // unloads in pass 1 (`exclusive_scope_pass1_unloads` covers the
+        // same shape) — WITH the identical resident pinned, this call must
+        // never touch it: another darkmux command is mid-dispatch on it.
+        let f = facts(vec![resident("darkmux:busy", "busy", 8_000, None)]);
+        let excl = opts(CallerIntent::OperatorExplicit, AcquireScope::Exclusive);
+
+        let unpinned = plan_acquire(&[placement("new", 8_000)], &f, excl.clone(), &no_est());
+        assert!(
+            unpinned.actions.iter().any(|a| matches!(
+                &a.action,
+                Action::Unload { target } if target.identifier() == "darkmux:busy"
+            )),
+            "sanity: without a pin the orphan unloads — got {:?}",
+            unpinned.actions
+        );
+
+        let pinned = opts_pinned(
+            CallerIntent::OperatorExplicit,
+            AcquireScope::Exclusive,
+            &["darkmux:busy"],
+        );
+        let plan = plan_acquire(&[placement("new", 8_000)], &f, pinned, &no_est());
+        assert_eq!(
+            plan.actions,
+            vec![load_action("new", 8_000)],
+            "a pinned resident must never be pass-1 unloaded"
+        );
+    }
+
+    #[test]
+    fn pinned_non_resident_identifier_is_noop_1487() {
+        // A lease naming a model that has already left residency (operator
+        // manually unloaded, TTL fired, LMStudio restarted) is never
+        // protected and never fabricates occupancy — `facts.residents`
+        // (i.e. `lms ps`) is always the truth, never the lease.
+        let f = Facts::default();
+        let pinned = opts_pinned(CallerIntent::Auto, AcquireScope::Exclusive, &["darkmux:ghost"]);
+        let plan = plan_acquire(&[placement("m", 8_000)], &f, pinned, &no_est());
+        assert_eq!(plan.actions, vec![load_action("m", 8_000)]);
+        assert!(plan.user_state_respected.is_empty());
+    }
+
+    #[test]
+    fn pinned_resident_blocks_budget_load_never_evicted_1487() {
+        // WITHOUT the pin, the identical 20GB idle resident is evicted and
+        // the load proceeds (`budget_auto_evicts_before_load_1243` covers
+        // that shape) — WITH it pinned, the resident must count as
+        // occupied AND never be an eviction candidate: the load Blocks
+        // honestly (the existing named `BudgetRefuse`) instead of evicting
+        // a model a concurrent command is using.
+        let f = Facts {
+            residents: vec![resident("darkmux:busy", "busy", 8_000, Some(20 * GB))],
+            budget: Budget { max_darkmux_bytes: Some(30 * GB) },
+            ..Default::default()
+        };
+
+        let unpinned = plan_acquire(
+            &[placement("m", 8_000)],
+            &f,
+            additive_auto(),
+            &est_map(&[("m", 15 * GB)]),
+        );
+        assert!(
+            matches!(unpinned.actions[0].action, Action::Unload { .. }),
+            "sanity: without a pin the idle resident evicts and the load fits — got {:?}",
+            unpinned.actions
+        );
+
+        let pinned = opts_pinned(CallerIntent::Auto, AcquireScope::Additive, &["darkmux:busy"]);
+        let plan = plan_acquire(&[placement("m", 8_000)], &f, pinned, &est_map(&[("m", 15 * GB)]));
+        assert_eq!(
+            plan.actions,
+            vec![PlannedAction {
+                action: Action::Block { model_key: "m".into(), resident_identifier: None },
+                reason: Reason::BudgetRefuse { est_bytes: 15 * GB, budget_bytes: 30 * GB },
+                precondition: Precondition::None,
+            }],
+            "the pinned resident must count as occupied, refusing the load honestly"
+        );
+        assert!(
+            plan.actions.iter().all(|a| !matches!(
+                &a.action,
+                Action::Unload { target } if target.identifier() == "darkmux:busy"
+            )),
+            "the pinned model must never be the evicted one"
+        );
+    }
+
+    #[test]
+    fn empty_pinned_is_byte_identical_to_pre_1487() {
+        // Regression guard: `pinned` defaulting empty via `AcquireOpts::new`
+        // must reproduce the EXACT plan every pre-#1487 caller got — the
+        // same budget-eviction fixture as `budget_auto_evicts_before_load_1243`,
+        // asserted byte-for-byte.
+        let f = Facts {
+            residents: vec![resident("darkmux:idle", "idle", 8_000, Some(20 * GB))],
+            budget: Budget { max_darkmux_bytes: Some(30 * GB) },
+            ..Default::default()
+        };
+        let plan = plan_acquire(
+            &[placement("m", 8_000)],
+            &f,
+            AcquireOpts::new(CallerIntent::Auto, AcquireScope::Additive),
+            &est_map(&[("m", 15 * GB)]),
+        );
+        assert_eq!(
+            plan,
+            Plan {
+                actions: vec![
+                    PlannedAction {
+                        action: Action::Unload {
+                            target: OwnedTarget::claim("darkmux:idle", None).unwrap(),
+                        },
+                        reason: Reason::BudgetEvict {
+                            freeing_bytes: 20 * GB,
+                            need_bytes: 15 * GB,
+                            budget_bytes: 30 * GB,
+                            eviction_order: EvictionOrder::HostReported,
+                        },
+                        precondition: Precondition::ResidentPresent {
+                            identifier: "darkmux:idle".into(),
+                            at_ctx: Some(8_000),
+                        },
+                    },
+                    load_action("m", 8_000),
+                ],
+                ..Default::default()
+            }
+        );
     }
 
     // ── #1243 budget rows ────────────────────────────────────────────────
