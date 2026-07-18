@@ -205,6 +205,10 @@ pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profi
 /// `default_profile` (the fresh-user single-model floor). Lets a caller (and
 /// `darkmux doctor`) tell a deliberate binding from the default fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// (#1475 packet 4) a third `Overridden` variant lands here when the launch
+// override does — kept out now to avoid a dead-code variant; the pure
+// `resolve_role_profile_with`'s `Option<&str>` mapped arg is already the
+// override seam.
 pub enum RoleProfileSource {
     /// The role was bound to this profile by the `role_profiles` map.
     Mapped,

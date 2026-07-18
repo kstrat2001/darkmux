@@ -845,10 +845,28 @@ fn check_role_profiles() -> Check {
     let map = darkmux_types::config_access::role_profiles();
     // Only load the registry when there's a binding to verify.
     if map.is_empty() {
-        return role_profiles_status(&map, &std::collections::BTreeMap::new());
+        return role_profiles_status(
+            &map,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
+        );
     }
     match profiles::load_registry(None) {
-        Ok(l) => role_profiles_status(&map, &l.registry.profiles),
+        Ok(l) => {
+            // A binding can be off-target for two DIFFERENT reasons that need
+            // different fixes: the profile is genuinely absent (add it), or it
+            // IS in profiles.json but its entry failed to parse and was
+            // quarantined (fix the entry). The full load result holds both, so
+            // pass the quarantined profile names through. (#1475)
+            let quarantined: std::collections::BTreeSet<String> = l
+                .registry
+                .quarantined
+                .iter()
+                .filter(|q| q.kind == darkmux_types::QuarantinedEntryKind::Profile)
+                .map(|q| q.name.clone())
+                .collect();
+            role_profiles_status(&map, &l.registry.profiles, &quarantined)
+        }
         Err(e) => Check {
             name: "role profiles".into(),
             status: Status::Warn,
@@ -860,11 +878,15 @@ fn check_role_profiles() -> Check {
 
 /// Pure decision for `check_role_profiles`, split out so every arm is
 /// unit-testable without a real config.json / registry. `known_profiles` is the
-/// registry's defined profiles (a quarantined/absent name is simply not a key,
-/// so a binding to it reads as dangling).
+/// registry's DEFINED profiles; `quarantined` is the set of profile names whose
+/// entry failed to parse (#1282 — absent from `known_profiles` but present in
+/// profiles.json). An off-target binding is split by WHY: a quarantined target
+/// gets a "fix the entry" hint (the profile IS there, just broken); a genuinely
+/// absent target keeps the "add it / re-point it" hint. (#1475)
 fn role_profiles_status(
     map: &std::collections::BTreeMap<String, String>,
     known_profiles: &std::collections::BTreeMap<String, darkmux_types::Profile>,
+    quarantined: &std::collections::BTreeSet<String>,
 ) -> Check {
     let name = "role profiles".to_string();
     if map.is_empty() {
@@ -877,13 +899,22 @@ fn role_profiles_status(
             ),
         };
     }
-    // Dangling = a binding whose profile name the registry doesn't define.
-    let dangling: Vec<(&String, &String)> = map
-        .iter()
-        .filter(|(_role, profile)| !known_profiles.contains_key(profile.as_str()))
-        .collect();
-    if dangling.is_empty() {
-        Check {
+    // An off-target binding names a profile the registry doesn't DEFINE. Split
+    // by why: quarantined (in profiles.json but broken) vs genuinely undefined.
+    let mut quarantined_pairs: Vec<(&String, &String)> = Vec::new();
+    let mut undefined_pairs: Vec<(&String, &String)> = Vec::new();
+    for (role, profile) in map.iter() {
+        if known_profiles.contains_key(profile.as_str()) {
+            continue; // defined + healthy
+        }
+        if quarantined.contains(profile.as_str()) {
+            quarantined_pairs.push((role, profile));
+        } else {
+            undefined_pairs.push((role, profile));
+        }
+    }
+    if quarantined_pairs.is_empty() && undefined_pairs.is_empty() {
+        return Check {
             name,
             status: Status::Pass,
             message: format!(
@@ -892,24 +923,48 @@ fn role_profiles_status(
                 if map.len() == 1 { "" } else { "s" }
             ),
             hint: None,
-        }
-    } else {
-        let pairs = dangling
+        };
+    }
+    let fmt_pairs = |pairs: &[(&String, &String)]| {
+        pairs
             .iter()
             .map(|(role, profile)| format!("{role} -> {profile}"))
             .collect::<Vec<_>>()
-            .join(", ");
-        Check {
-            name,
-            status: Status::Warn,
-            message: format!(
-                "role->profile binding{} to an undefined profile: {pairs}",
-                if dangling.len() == 1 { "" } else { "s" }
-            ),
-            hint: Some(
-                "Point each binding at a profile in `darkmux profile list`, or add the profile to profiles.json — `darkmux config set role_profiles.<role> <profile>`. Until fixed, resolving that role errors (it does NOT silently fall back to default_profile). (#1475)".into(),
-            ),
-        }
+            .join(", ")
+    };
+    // Compose message + hint over whichever kinds are present. The undefined
+    // wording (and its "add the profile" hint) is preserved verbatim for
+    // genuinely-absent targets; quarantined targets get their own flavor.
+    let mut msg_parts: Vec<String> = Vec::new();
+    let mut hint_parts: Vec<String> = Vec::new();
+    if !undefined_pairs.is_empty() {
+        msg_parts.push(format!(
+            "binding{} to an undefined profile: {}",
+            if undefined_pairs.len() == 1 { "" } else { "s" },
+            fmt_pairs(&undefined_pairs)
+        ));
+        hint_parts.push(
+            "Point each undefined binding at a profile in `darkmux profile list`, or add the profile to profiles.json — `darkmux config set role_profiles.<role> <profile>`.".into(),
+        );
+    }
+    if !quarantined_pairs.is_empty() {
+        msg_parts.push(format!(
+            "binding{} to a quarantined profile: {}",
+            if quarantined_pairs.len() == 1 { "" } else { "s" },
+            fmt_pairs(&quarantined_pairs)
+        ));
+        hint_parts.push(
+            "A quarantined target IS in profiles.json but its entry failed to parse — fix the profile entry (see the profile-registry check), don't re-point the binding.".into(),
+        );
+    }
+    hint_parts.push(
+        "Until fixed, resolving that role errors (it does NOT silently fall back to default_profile). (#1475)".into(),
+    );
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!("role->profile {}", msg_parts.join("; ")),
+        hint: Some(hint_parts.join(" ")),
     }
 }
 
@@ -4437,10 +4492,13 @@ mod tests {
     fn bindings(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
         pairs.iter().map(|(r, p)| (r.to_string(), p.to_string())).collect()
     }
+    fn quarantined(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
 
     #[test]
     fn role_profiles_empty_map_passes() {
-        let c = super::role_profiles_status(&bindings(&[]), &known(&["qwen35b"]));
+        let c = super::role_profiles_status(&bindings(&[]), &known(&["qwen35b"]), &quarantined(&[]));
         assert_eq!(c.status, Status::Pass);
         assert!(c.message.contains("no role->profile bindings"));
     }
@@ -4448,7 +4506,7 @@ mod tests {
     #[test]
     fn role_profiles_all_defined_passes() {
         let map = bindings(&[("judge", "qwen35b"), ("verify", "qwen35b"), ("probe-low", "qwen4b")]);
-        let c = super::role_profiles_status(&map, &known(&["qwen35b", "qwen4b"]));
+        let c = super::role_profiles_status(&map, &known(&["qwen35b", "qwen4b"]), &quarantined(&[]));
         assert_eq!(c.status, Status::Pass);
         assert!(c.message.contains("3 role->profile bindings"), "got: {}", c.message);
         assert!(c.message.contains("all name a defined profile"));
@@ -4457,13 +4515,56 @@ mod tests {
     #[test]
     fn role_profiles_dangling_binding_warns_and_names_the_pair() {
         let map = bindings(&[("judge", "qwen35b"), ("probe-high", "ghost27b")]);
-        let c = super::role_profiles_status(&map, &known(&["qwen35b", "qwen4b"]));
+        let c = super::role_profiles_status(&map, &known(&["qwen35b", "qwen4b"]), &quarantined(&[]));
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("probe-high -> ghost27b"), "names the dangling pair: {}", c.message);
+        assert!(c.message.contains("undefined profile"), "genuinely-absent target reads as undefined: {}", c.message);
         assert!(!c.message.contains("judge -> qwen35b"), "the resolving binding is not flagged: {}", c.message);
         let hint = c.hint.unwrap();
         assert!(hint.contains("config set role_profiles"), "hint names the fix: {hint}");
         assert!(hint.contains("does NOT silently fall back"), "hint states the loud-resolution contract: {hint}");
+    }
+
+    #[test]
+    fn role_profiles_quarantined_binding_warns_with_quarantine_hint() {
+        // (#1475) A binding to a QUARANTINED profile (present in profiles.json but
+        // its entry failed to parse) must NOT read as "undefined — add it": the
+        // profile IS there. Doctor names it quarantined and points at fixing the
+        // entry, not adding a new profile.
+        let map = bindings(&[("judge", "qwen35b"), ("verify", "broken")]);
+        let c = super::role_profiles_status(
+            &map,
+            &known(&["qwen35b"]),
+            &quarantined(&["broken"]),
+        );
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("verify -> broken"), "names the quarantined pair: {}", c.message);
+        assert!(c.message.contains("quarantined profile"), "flavored quarantined, not undefined: {}", c.message);
+        assert!(!c.message.contains("undefined profile"), "not the add-it wording: {}", c.message);
+        let hint = c.hint.unwrap();
+        assert!(hint.contains("fix the profile entry"), "hint says fix the entry: {hint}");
+        assert!(hint.contains("profile-registry check"), "hint points at the registry check: {hint}");
+        assert!(!hint.contains("add the profile"), "hint does NOT say add it: {hint}");
+        assert!(hint.contains("does NOT silently fall back"), "hint keeps the loud-resolution contract: {hint}");
+    }
+
+    #[test]
+    fn role_profiles_mixed_undefined_and_quarantined_names_both() {
+        // Both kinds present: each gets its own message segment + hint.
+        let map = bindings(&[("judge", "ghost27b"), ("verify", "broken")]);
+        let c = super::role_profiles_status(
+            &map,
+            &known(&["qwen35b"]),
+            &quarantined(&["broken"]),
+        );
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("judge -> ghost27b"), "names the undefined pair: {}", c.message);
+        assert!(c.message.contains("verify -> broken"), "names the quarantined pair: {}", c.message);
+        assert!(c.message.contains("undefined profile"), "undefined segment present: {}", c.message);
+        assert!(c.message.contains("quarantined profile"), "quarantined segment present: {}", c.message);
+        let hint = c.hint.unwrap();
+        assert!(hint.contains("add the profile"), "undefined hint present: {hint}");
+        assert!(hint.contains("fix the profile entry"), "quarantined hint present: {hint}");
     }
 
     // ─── parse_semver / classify_version_vs_latest (issue #13) ───────────
