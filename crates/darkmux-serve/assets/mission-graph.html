@@ -769,8 +769,20 @@ function applyRecordToMetrics(metrics, rec, idx){
   // the most-viewed mission kind's meters never fill. Same precedence as
   // the server-side fold (`mission_graph.rs::fold_step_finals`).
   var finalTok = p.total_tokens || p.tokens || 0;
-  if (isTok) { next.tokRun += (p.total_tokens || 0); }
-  else if (isTurn) { next.turnRun += 1; }
+  // (#1481 Bug 4) Only fold a LIVE token/turn record into a step that has
+  // actually STARTED — one whose start bookend we've already seen
+  // (`startTs > 0`, set by an `isStart` record above or on a prior fold). A
+  // `telemetry.tokens`/`dispatch.turn` record that resolves (via the
+  // session->step map) to a step that hasn't dispatched yet — e.g. the deep-
+  // model judge's tokens colliding onto a not-yet-started verify seat that
+  // shares that model's session — must NOT pre-load a phantom live meter on a
+  // `planned` node. A step with no start bookend shows no tokens and no clock;
+  // its real meter fills once its OWN dispatch opens. Finalized totals
+  // (isComplete/isStepResult) are terminal and imply the step ran, so they are
+  // not gated here.
+  var started = next.startTs > 0;
+  if (isTok && started) { next.tokRun += (p.total_tokens || 0); }
+  else if (isTurn && started) { next.turnRun += 1; }
   else if (isComplete) {
     if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
     if (p.total_turns) next.turnFinal = Math.max(next.turnFinal, p.total_turns);
@@ -794,6 +806,15 @@ function applyRecordToMetrics(metrics, rec, idx){
 // already climbing is never regressed, and a reconcile re-applying the same
 // backfill is idempotent. Returns the SAME object when nothing changed, so it
 // never churns React state.
+//
+// (#1481 Bug 4) Also seeds each step's own `startTs` from the snapshot's
+// `startedTs`. This is the authoritative "has this step STARTED?" signal the
+// live token/turn fold gates on (`applyRecordToMetrics`): a planned step
+// carries no `startedTs`, a running/finished one does (the scheduler stamps it
+// on the running flip). Seeding it here means a page opened MID-dispatch —
+// whose start bookend predates the tail-from-now SSE — still has `startTs`
+// known, so the gate never drops a legitimately-running step's live tokens,
+// while a not-yet-dispatched step stays gated (its phantom leak dropped).
 function seedMetricsFromGraph(metrics, g){
   var out = metrics;
   (g && g.nodes || []).forEach(function(n){
@@ -801,14 +822,19 @@ function seedMetricsFromGraph(metrics, g){
       var tf = (typeof s.tokensFinal === "number") ? s.tokensFinal : 0;
       var nf = (typeof s.turnsFinal === "number") ? s.turnsFinal : 0;
       var cl = !!s.cloud;
-      if (!tf && !nf && !cl) return;
-      var cur = out[s.id] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, cloud:false };
+      var st = tsToMs(s.startedTs);
+      if (!tf && !nf && !cl && !st) return;
+      var cur = out[s.id] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, cloud:false, startTs:0 };
       var ntf = Math.max(cur.tokFinal, tf);
       var nnf = Math.max(cur.turnFinal, nf);
       var ncl = cur.cloud || cl;
-      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncl === cur.cloud) return;
+      // Keep the EARLIEST known start; 0 means unknown, so a real `st` always
+      // wins over 0 (and a live start bookend already set wins by min).
+      var curSt = cur.startTs || 0;
+      var nst = curSt ? (st ? Math.min(curSt, st) : curSt) : st;
+      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncl === cur.cloud && nst === curSt) return;
       if (out === metrics) out = Object.assign({}, metrics);
-      out[s.id] = Object.assign({}, cur, { tokFinal:ntf, turnFinal:nnf, cloud:ncl });
+      out[s.id] = Object.assign({}, cur, { tokFinal:ntf, turnFinal:nnf, cloud:ncl, startTs:nst });
     });
   });
   return out;
@@ -863,11 +889,16 @@ function fmtModel(m){
   var slash = s.lastIndexOf("/");
   return slash >= 0 ? s.slice(slash + 1) : s;
 }
-// (#1483) Parse a flow-record `ts` (ISO string) or a server epoch-ms number to
-// epoch ms; 0 when unparseable (treated as "no start known").
+// (#1483 Bug 1) Parse a flow-record `ts` (ISO string) or an epoch NUMBER to
+// epoch ms; 0 when unparseable (treated as "no start known"). The server stamps
+// a step's `started_ts` in SECONDS (a ~10-digit epoch), while the SSE metrics
+// bookend is already ms — so a bare number is unit-ambiguous. Detect the unit:
+// a value below 1e12 is a seconds epoch (seconds since 1970 stay < 1e12 until
+// the year ~33658) and gets scaled to ms; a value >= 1e12 is already ms. Without
+// this, `now(ms) - started_ts(seconds)` formatted a nonsense elapsed clock.
 function tsToMs(ts){
   if (ts == null) return 0;
-  if (typeof ts === "number") return ts;
+  if (typeof ts === "number") return ts < 1e12 ? ts * 1000 : ts;
   var t = Date.parse(ts);
   return isNaN(t) ? 0 : t;
 }
