@@ -51,13 +51,36 @@
     --good:#5af0a3; --warn:#ffb86b; --bad:#ff6b85; --run:#ffd166;
   }
   *{box-sizing:border-box}
-  html,body{margin:0;height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 'Inter',-apple-system,system-ui,sans-serif;overflow:hidden}
-  #root{height:100vh;display:flex;flex-direction:column}
+  /* (mobile-nav fix) `100vh` is a known trap on iOS Safari — it resolves to
+     the LARGE viewport (address bar hidden), can exceed the ACTUAL visible
+     screen while the address bar is showing, and does not react live as the
+     browser chrome collapses/expands. Real-device repro: the canvas-mode
+     graph pushed `.top` almost entirely off-screen, only a sliver peeking
+     out under the status bar, with no way back to the nav (#1403 — this is
+     a chromeless home-screen shortcut; there is no browser back). `100dvh`
+     (dynamic viewport height) tracks the ACTUAL visible viewport live;
+     layered on as a second declaration so an engine without `dvh` support
+     silently keeps the `100vh` fallback (plain CSS cascade, no
+     `@supports` needed) — desktop and older engines are unchanged.
+     `overscroll-behavior:none` additionally stops the page from entering
+     the rubber-band/bounce state a touch-drag on the React Flow canvas can
+     trigger — that bounce is a well-documented way `overflow:hidden` alone
+     fails to keep an iOS Safari document pinned at y=0. */
+  html,body{margin:0;height:100vh;height:100dvh;background:var(--bg);color:var(--text);font:14px/1.4 'Inter',-apple-system,system-ui,sans-serif;overflow:hidden;overscroll-behavior:none}
+  #root{height:100vh;height:100dvh;display:flex;flex-direction:column}
   /* min-height (not a fixed 46px) + safe-area padding so the bar clears the
      notch/status bar when the page runs as a standalone home-screen PWA
      (#1403, viewport-fit=cover). env() resolves to 0 in a normal browser tab,
-     so desktop is unchanged. */
-  .top{position:relative;min-height:46px;flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:env(safe-area-inset-top,0px) calc(16px + env(safe-area-inset-right,0px)) 0 calc(16px + env(safe-area-inset-left,0px));border-bottom:1px solid var(--line);background:var(--bg2)}
+     so desktop is unchanged.
+     (mobile-nav fix) `position:sticky;top:0` is the belt to the `100dvh`
+     suspenders above: EVEN IF something (the iOS bounce, a stray scroll)
+     shifts the document, sticky re-anchors `.top` to the visible viewport's
+     own top edge instead of trusting the flex layout alone — the nav (back
+     button + tabs) is the ONLY way out of this page, so it stays reachable
+     unconditionally, not just "reachable when the layout math is perfect".
+     Previously only the timeline branch had this (`html.timeline-mode .top`
+     below); the canvas branch — where the real bug was observed — had none. */
+  .top{position:sticky;top:0;z-index:50;min-height:46px;flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:env(safe-area-inset-top,0px) calc(16px + env(safe-area-inset-right,0px)) 0 calc(16px + env(safe-area-inset-left,0px));border-bottom:1px solid var(--line);background:var(--bg2)}
   .brand{font-weight:700;letter-spacing:.04em}
   .brand a{color:inherit;text-decoration:none}
   .brand b{color:var(--amber)}
@@ -80,7 +103,12 @@
   }
   .legend{margin-left:auto;display:flex;gap:12px;align-items:center;font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle}
-  .canvas{flex:1 1 auto;position:relative}
+  /* min-height:0 (not the flex-item default `auto`) so the canvas can
+     actually SHRINK to the remaining space below `.top` rather than being
+     floored at its own content's intrinsic size — belt-and-suspenders
+     alongside the `100dvh`/sticky-nav fix above for "the canvas fills only
+     the REMAINING height", never pushing the nav out. */
+  .canvas{flex:1 1 auto;min-height:0;position:relative}
   .note{position:absolute;top:12px;left:12px;z-index:20;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 12px;font:12px/1.4 'Inter',sans-serif;color:var(--muted);max-width:420px}
   .msg{padding:40px;color:var(--muted);font:13px 'JetBrains Mono',monospace}
   /* React Flow node chrome — the base package supplies layout/interaction
@@ -396,7 +424,17 @@ function missionIdFromPath(){
 // as rows INSIDE their owning task's card (see `MissionNode`), so the
 // per-task vertical pitch just needs to grow with the task's OWN step
 // count instead of laying out a separate node per step. ──────────────────
-var COL_W = 260, TASK_MIN_PITCH = 70, TASK_HEADER_H = 40, STEP_ROW_H = 20,
+// (mobile fan-in fix) `COL_W` doubles as BOTH a node's own max render width
+// (`.mnode{max-width:260px}`) AND, pre-fix, the column-to-column PITCH — so
+// a card rendered at its full width sat with its right edge FLUSH against
+// the very next depth column's left edge, zero px of routing room between
+// them. Every `depends_on` edge crossing that boundary (not just dedup's
+// 3-way probe fan-in — Verify -> Synthesis, and any single fan-in/fan-out,
+// generalized graph-wide per operator report) had nowhere to route and
+// rendered hidden behind/under the node column (#1230 lineage). `COL_GAP`
+// is genuine breathing room ON TOP of `COL_W`, applied uniformly to every
+// column step so no depth transition anywhere in the graph can jam.
+var COL_W = 260, COL_GAP = 80, TASK_MIN_PITCH = 70, TASK_HEADER_H = 40, STEP_ROW_H = 20,
     TASK_GAP = 16, PHASE_LABEL_W = 40, BAND_GAP = 40, BAND_PAD = 56;
 
 // Vertical space one task's CARD occupies, header + its own row stack —
@@ -431,7 +469,13 @@ function computeLayout(nodes){
     var maxColumnHeight = 0;
     for (var d = 0; d <= maxDepth; d++){
       var atDepth = byDepth[d] || [];
-      var x = PHASE_LABEL_W + COL_W + d * COL_W;
+      // Column pitch is `COL_W + COL_GAP` (card width + routing room), so
+      // every depth step gets the same breathing room regardless of how
+      // many predecessors converge into it. `d===0` is unaffected (no `d *`
+      // term applies yet), so single-column missions and the first task
+      // column keep their existing position — this only widens spacing
+      // BETWEEN columns, at depth >= 1.
+      var x = PHASE_LABEL_W + COL_W + d * (COL_W + COL_GAP);
       var yCursor = bandTop + BAND_PAD;
       atDepth.forEach(function(t){
         positions[t.id] = {x: x, y: yCursor};
