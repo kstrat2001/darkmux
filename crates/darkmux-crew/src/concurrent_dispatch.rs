@@ -88,12 +88,15 @@
 use anyhow::{anyhow, bail, Result};
 use darkmux_flow::FlowRecord;
 use darkmux_gestalt::{
-    plan_acquire, Action, AcquireOpts, AcquireScope, CallerIntent, Facts, FootprintEstimator,
-    ModelHost, Placement, ResourceProbe, WaveMode, WaveSchedule,
+    plan_acquire, Action, AcquireOpts, AcquireScope, CallerIntent, Deadline, Facts,
+    FootprintEstimator, HostError, ModelHost, Placement, Plan, ResourceProbe, WaveMode,
+    WaveSchedule,
 };
 use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
+use darkmux_types::residency_lease;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// One job's completed outcome: its own value plus every flow record it
 /// produced (see the module doc's "Flow-record ordering" section).
@@ -279,6 +282,16 @@ fn run_local_waves<T: Send + 'static>(
     // so a single mutable host handles every `ensure_wave_loaded` call
     // safely without needing to reconstruct one per wave.
     let mut host = host_factory();
+    // (#1487 PR2) Held for this WHOLE local track's lifetime — a normal
+    // return or a panic-unwind through this function both run `Drop`,
+    // removing this process's residency lease so a concurrent darkmux
+    // command's own reconcile no longer sees anything pinned here. Only a
+    // hard crash (SIGKILL) skips `Drop`, leaving the lease for the
+    // pid-liveness sweep in `residency_lease::live_leased_models` to
+    // reclaim. `ensure_wave_loaded` itself refreshes the LEASE CONTENT
+    // (`write_lease`) once per wave; this guard only owns the file's
+    // lifetime, not its contents.
+    let _lease_guard = residency_lease::LeaseGuard::acquire();
     for refusal in &schedule.refusals {
         if let Some((index, _job)) = by_seat.remove(&refusal.placement.seat) {
             results.lock().expect("results mutex poisoned").push((
@@ -315,6 +328,67 @@ fn run_local_waves<T: Send + 'static>(
     }
 }
 
+/// (#1487 PR2) Bounded retry-hold for a wave blocked ONLY by a CONCURRENT
+/// darkmux command's pinned (leased) resident — the addendum's
+/// "hold-not-fail" feasibility contract, deliberately kept simple for v1
+/// (see [`ensure_wave_loaded`]'s doc). This is NOT a scheduler: it is a
+/// few short, bounded attempts so a same-machine overlap that is about to
+/// free RAM (the other command finishing its own dispatch) has a real
+/// chance to clear before this wave gives up. The full hold/serialize
+/// admission scheduler (wait indefinitely, or admit other ready work
+/// meanwhile) is deferred to a follow-up (named PR 3 in the #1487 arc).
+const BLOCKED_BY_HOLDER_RETRY_ATTEMPTS: u32 = 3;
+const BLOCKED_BY_HOLDER_RETRY_DELAY: Duration = Duration::from_millis(300);
+
+/// One attempt's outcome from dispatching `plan.actions` to a real host —
+/// distinguishes a planning-level refusal (never transient — see
+/// [`ensure_wave_loaded`]) from a live host-call failure (POSSIBLY
+/// transient when it is a resource shortfall a concurrent lease-holder
+/// explains).
+enum PlanExecOutcome {
+    Loaded,
+    Blocked { model_key: String, reason: String },
+    HostFailed { detail: String, host_error: HostError },
+}
+
+/// Dispatch every action in `plan` to `host`, in order (the plan's own
+/// free-then-load ordering contract — every Unload precedes every Load).
+/// Stops at the first failure; a partially-executed plan on failure is the
+/// same behavior `ensure_wave_loaded` always had (the caller's fresh-facts
+/// re-plan on the next attempt/wave is the recovery path, not a rollback).
+fn execute_plan(plan: &Plan, host: &mut dyn ModelHost, deadline: Deadline) -> PlanExecOutcome {
+    for planned in &plan.actions {
+        match &planned.action {
+            Action::Reuse { .. } => {}
+            Action::Unload { target } => {
+                if let Err(host_error) = host.unload(target, deadline) {
+                    return PlanExecOutcome::HostFailed {
+                        detail: format!("unload failed for \"{}\": {host_error}", target.identifier()),
+                        host_error,
+                    };
+                }
+            }
+            Action::Load { model_key, identifier, min_ctx } => {
+                if let Err(host_error) = host.load(model_key, identifier, *min_ctx, deadline) {
+                    return PlanExecOutcome::HostFailed {
+                        detail: format!(
+                            "load failed for \"{model_key}\" (\"{identifier}\"): {host_error}"
+                        ),
+                        host_error,
+                    };
+                }
+            }
+            Action::Block { model_key, .. } => {
+                return PlanExecOutcome::Blocked {
+                    model_key: model_key.clone(),
+                    reason: planned.reason.to_string(),
+                };
+            }
+        }
+    }
+    PlanExecOutcome::Loaded
+}
+
 /// Make every placement in one wave actually resident before its jobs
 /// dispatch. `plan_waves` (called once, up front, in [`run_bounded`]) only
 /// PARTITIONS placements into co-resident-safe groups — it performs no I/O.
@@ -343,17 +417,52 @@ fn run_local_waves<T: Send + 'static>(
 /// `plan_waves`/`plan_acquire` themselves already being pure snapshot-in
 /// functions — this keeps the one place that DOES real host I/O equally
 /// injectable rather than silently reaching past the caller's test double.
+///
+/// # Reconcile-to-need (#1487 PR2)
+///
+/// Scope was `AcquireScope::Additive` — load what this wave wants, touch
+/// nothing else — which is exactly why residency only ever grew across
+/// waves/phases/runs (the stale-orphan bug this PR fixes). It is now
+/// `Exclusive`: pass 1 unloads darkmux-owned residents this wave does NOT
+/// desire, before any load. Concurrency-safe via the residency-lease
+/// registry (`darkmux_types::residency_lease`, #1487 PR2 part A): every
+/// OTHER live darkmux command's leased `darkmux:*` model ids are read
+/// fresh on every attempt and fed in as `AcquireOpts.pinned` (#1487 PR1) —
+/// `plan_acquire` never pass-1-unloads a pinned resident and always counts
+/// it as occupied, so a concurrent command's in-use model is never yanked
+/// out from under it. This process's OWN lease is written/refreshed to
+/// this wave's placements BEFORE planning, so OTHER commands protect them
+/// symmetrically; [`run_local_waves`] holds the [`residency_lease::LeaseGuard`]
+/// for the whole local track's lifetime, so a normal return or a
+/// panic-unwind releases it, and a hard crash leaves it for the pid-liveness
+/// sweep to reclaim.
+///
+/// # The honest ceiling — hold-not-fail, kept simple (v1)
+///
+/// The #1487 addendum's feasibility guarantee: a mission always completes
+/// as long as every individual profile fits the machine alone, so RAM
+/// pressure between CONCURRENT commands is a scheduling question, never a
+/// mission failure. `plan_acquire` has no budget engaged on this path yet
+/// (see the PR body — #1243 isn't wired to a live config source), so a
+/// resource shortfall surfaces here as a live `HostError::InsufficientResources`
+/// (the #1139 fast-fail) rather than a typed `Block`. Two cases:
+///
+///   - A live PINNED holder explains the shortfall → transient contention,
+///     not a failure: [`BLOCKED_BY_HOLDER_RETRY_ATTEMPTS`] bounded retries
+///     (the holder may free) before surfacing loudly, naming the pinned
+///     model(s) — never evicting them.
+///   - No pin explains it → this placement likely does not fit the machine
+///     AT ALL, alone; retrying can never help, so this fails immediately.
+///
+/// A planning-level `Action::Block` (unknown model key, a foreign duplicate
+/// with no capacity, or — once #1243 is wired — a single profile that
+/// exceeds the WHOLE budget) is never retried: no wait changes what
+/// `plan_acquire` already refused to plan.
 fn ensure_wave_loaded(
     placements: &[Placement],
     est: &(dyn FootprintEstimator + Sync),
     host: &mut dyn ModelHost,
 ) -> Result<()> {
-    let residents = host
-        .list_resident()
-        .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}"))?;
-    let pools = MacProbe.pools().unwrap_or_default();
-    let facts = Facts { residents, pools, ..Default::default() };
-    let opts = AcquireOpts::new(CallerIntent::Auto, AcquireScope::Additive);
     // (#1442 ship-2b, found live) A wave's placements are per-STEP, and the
     // seats x k fan-out makes SAME-MODEL duplicates the norm (k sibling
     // `dispatch.map` steps all place the same model, differing only in
@@ -376,25 +485,69 @@ fn ensure_wave_loaded(
             None => unique.push(p.clone()),
         }
     }
-    let plan = plan_acquire(&unique, &facts, opts, est);
+
+    // (#1487 PR2) Write/refresh THIS process's own lease BEFORE planning —
+    // the models this wave is actively dispatching to, so a CONCURRENT
+    // darkmux command's own reconcile sees them as pinned as early as
+    // possible. Wholesale overwrite, never a delta (`write_lease`'s
+    // contract): `run_local_waves`'s wave loop only reaches the NEXT wave
+    // after every job in THIS wave has completed (the `thread::scope` join
+    // there), so there is no cross-wave overlap WITHIN one process to
+    // protect against — this lease only ever needs to protect against
+    // OTHER processes.
+    let own_pid = std::process::id();
+    let own_models: Vec<String> = unique.iter().map(|p| p.identifier.clone()).collect();
+    residency_lease::write_lease(&own_models)
+        .map_err(|e| anyhow!("darkmux: could not write this wave's residency lease: {e}"))?;
+
     let deadline = resolved_load_deadline();
-    for planned in &plan.actions {
-        match &planned.action {
-            Action::Reuse { .. } => {}
-            Action::Unload { target } => {
-                host.unload(target, deadline)
-                    .map_err(|e| anyhow!("darkmux: unload failed for \"{}\": {e}", target.identifier()))?;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let residents = host
+            .list_resident()
+            .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}"))?;
+        let pools = MacProbe.pools().unwrap_or_default();
+        let facts = Facts { residents, pools, ..Default::default() };
+
+        // Other live commands' leases, read fresh every attempt (the
+        // blocker this attempt is retrying past may free between
+        // attempts).
+        let pinned = residency_lease::live_leased_models(own_pid);
+        let opts = AcquireOpts {
+            pinned: pinned.clone(),
+            ..AcquireOpts::new(CallerIntent::Auto, AcquireScope::Exclusive)
+        };
+        let plan = plan_acquire(&unique, &facts, opts, est);
+
+        match execute_plan(&plan, host, deadline) {
+            PlanExecOutcome::Loaded => return Ok(()),
+            PlanExecOutcome::Blocked { model_key, reason } => {
+                bail!("darkmux: cannot load \"{model_key}\" for this wave — {reason}");
             }
-            Action::Load { model_key, identifier, min_ctx } => {
-                host.load(model_key, identifier, *min_ctx, deadline)
-                    .map_err(|e| anyhow!("darkmux: load failed for \"{model_key}\" (\"{identifier}\"): {e}"))?;
-            }
-            Action::Block { model_key, .. } => {
-                bail!("darkmux: cannot load \"{model_key}\" for this wave — {}", planned.reason)
+            PlanExecOutcome::HostFailed { detail, host_error } => {
+                let insufficient = matches!(host_error, HostError::InsufficientResources { .. });
+                if insufficient && !pinned.is_empty() {
+                    if attempt < BLOCKED_BY_HOLDER_RETRY_ATTEMPTS {
+                        std::thread::sleep(BLOCKED_BY_HOLDER_RETRY_DELAY);
+                        continue;
+                    }
+                    bail!(
+                        "darkmux: could not load for this wave after {attempt} attempt(s) — \
+                         blocked by (a) concurrent live darkmux command holding {pinned:?} \
+                         ({detail}); this is transient contention, not a capacity failure — \
+                         retry once the other command frees its model (the full hold/serialize \
+                         scheduler is deferred, #1487 PR3)"
+                    );
+                }
+                bail!(
+                    "darkmux: could not load for this wave: {detail} (no concurrent darkmux \
+                     command has this RAM pinned — this placement likely does not fit the \
+                     machine at all, on its own)"
+                );
             }
         }
     }
-    Ok(())
 }
 
 /// The remote track: chunk `remote_jobs` into `cap`-sized batches (in input
@@ -433,8 +586,10 @@ mod tests {
     use super::*;
     use darkmux_gestalt::{mock::MockHost, Budget, FixedEstimator, ResidentFact};
     use std::collections::BTreeMap;
+    use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     /// Hermetic `host_factory` for these fixtures — synthetic `Facts`/
     /// placements (fake model keys like "m"/"small-a") were never intended
@@ -442,6 +597,40 @@ mod tests {
     /// (#1360 follow-up) specifically so this stays true.
     fn mock_host_factory() -> Box<dyn ModelHost> {
         Box::new(MockHost::new())
+    }
+
+    /// (#1487 PR2) `ensure_wave_loaded` now writes/reads a residency lease
+    /// on every call — every test that reaches it (directly, or via
+    /// `run_bounded` with a `Residency::Local` job) MUST point
+    /// `DARKMUX_HOME` at a throwaway tempdir, never the real
+    /// `~/.darkmux/residency/`. Pair with `#[serial_test::serial]` on the
+    /// test (env vars are process-global; `cargo test`'s default
+    /// multi-threaded runner would otherwise race this against every
+    /// other test in this file that also touches it).
+    struct LeaseTestEnv {
+        _tmp: TempDir,
+        prev: Option<String>,
+    }
+    impl LeaseTestEnv {
+        fn new() -> Self {
+            let tmp = TempDir::new().expect("tempdir for DARKMUX_HOME");
+            let prev = std::env::var("DARKMUX_HOME").ok();
+            unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+            Self { _tmp: tmp, prev }
+        }
+        fn home(&self) -> &Path {
+            self._tmp.path()
+        }
+    }
+    impl Drop for LeaseTestEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
+                }
+            }
+        }
     }
 
     fn placement(model_key: &str, min_ctx: u32) -> Placement {
@@ -467,8 +656,10 @@ mod tests {
     /// model ONCE — one unload, one load at the duplicates' MAX `min_ctx` —
     /// never once per duplicate (the second unload would hit the mock's
     /// enforced #1279 NotResident error, exactly the live failure).
+    #[serial_test::serial]
     #[test]
     fn ensure_wave_loaded_collapses_duplicate_placements_before_planning() {
+        let _env = LeaseTestEnv::new();
         let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
         let mut host = MockHost::new()
             .resident("darkmux:m", "m", 32_000, Some(1_000))
@@ -497,13 +688,198 @@ mod tests {
         assert_eq!(loads, vec![68_000], "one load, at the duplicates' MAX min_ctx: {:?}", host.ops);
     }
 
+    /// (#1487 PR2) The headline orphan-eviction fix: a darkmux-owned
+    /// resident NOT in this wave's desired set is unloaded (Exclusive
+    /// scope's pass 1) rather than left to grow residency forever
+    /// (Additive's old behavior). The desired model still loads.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_evicts_a_darkmux_owned_orphan_not_in_the_desired_set() {
+        let _env = LeaseTestEnv::new();
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:orphan", "orphan", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![placement("m", 8_000)];
+
+        ensure_wave_loaded(&wave, &est, &mut host).expect("the wanted model loads");
+
+        assert_eq!(
+            host.ops,
+            vec![
+                darkmux_gestalt::mock::HostOp::ListResident,
+                darkmux_gestalt::mock::HostOp::Unload { identifier: "darkmux:orphan".to_string() },
+                darkmux_gestalt::mock::HostOp::Load {
+                    model_key: "m".to_string(),
+                    identifier: "darkmux:m".to_string(),
+                    min_ctx: 8_000,
+                },
+            ],
+            "the stale orphan is evicted (pass 1) before the desired model loads"
+        );
+    }
+
+    /// (#1487 PR2) The concurrency-safety delta test: the SAME orphan as
+    /// above, but a DIFFERENT live darkmux process has it leased (pinned).
+    /// It must survive — never evicted out from under a command actively
+    /// dispatching to it — while the wave's own desired model still loads.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_never_evicts_a_model_pinned_by_a_live_external_lease() {
+        let env = LeaseTestEnv::new();
+        // A genuinely live OTHER process (this test's own pid would be
+        // excluded as "own" by `ensure_wave_loaded`'s internal
+        // `live_leased_models(std::process::id())` call — the lease must
+        // belong to some OTHER live pid to prove the cross-process path).
+        let mut holder = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawning a short-lived holder process");
+        let holder_pid = holder.id();
+        let residency_dir = env.home().join("residency");
+        std::fs::create_dir_all(&residency_dir).unwrap();
+        std::fs::write(
+            residency_dir.join(format!("{holder_pid}.lease")),
+            format!(r#"{{"pid":{holder_pid},"models":["darkmux:orphan"]}}"#),
+        )
+        .expect("hand-writing a lease for the external holder pid");
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:orphan", "orphan", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![placement("m", 8_000)];
+
+        ensure_wave_loaded(&wave, &est, &mut host).expect("the wanted model loads");
+
+        let unloads: Vec<_> = host
+            .ops
+            .iter()
+            .filter(|op| matches!(op, darkmux_gestalt::mock::HostOp::Unload { .. }))
+            .collect();
+        assert!(unloads.is_empty(), "a pinned resident must never be evicted: {:?}", host.ops);
+        assert!(
+            host.residents.iter().any(|r| r.identifier == "darkmux:orphan"),
+            "the pinned orphan must still be resident afterward: {:?}",
+            host.residents
+        );
+        assert!(
+            host.ops.iter().any(|op| matches!(
+                op,
+                darkmux_gestalt::mock::HostOp::Load { identifier, .. } if identifier == "darkmux:m"
+            )),
+            "the wave's own desired model still loads: {:?}",
+            host.ops
+        );
+
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
+
+    /// (#1487 PR2) `ensure_wave_loaded` writes its OWN lease before
+    /// planning, naming exactly the (deduplicated) models this wave holds
+    /// — so a DIFFERENT concurrent darkmux command reading the registry
+    /// sees them pinned.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_writes_its_own_lease_for_the_wave() {
+        let _env = LeaseTestEnv::new();
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new().cataloged("m", 1_000);
+        let wave = vec![placement("m", 8_000)];
+
+        ensure_wave_loaded(&wave, &est, &mut host).expect("the model loads");
+
+        // Read back as if from a DIFFERENT process — own-pid exclusion is
+        // exactly what `residency_lease`'s own unit tests already prove, so
+        // this test only needs to confirm the CONTENT this call site wrote.
+        let other_own_pid = std::process::id().wrapping_add(1);
+        let leased = residency_lease::live_leased_models(other_own_pid);
+        assert_eq!(
+            leased,
+            vec!["darkmux:m".to_string()],
+            "this wave's own lease names exactly its (deduplicated) desired models"
+        );
+    }
+
+    /// (#1487 PR2 addendum) The hold-not-fail feasibility contract: a
+    /// resource shortfall (`HostError::InsufficientResources`, the #1139
+    /// fast-fail) that a LIVE pinned holder explains is transient — the
+    /// bounded retry-hold re-plans and succeeds once the scripted failure
+    /// drains, without ever surfacing an error to the caller.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_retries_past_a_transient_shortfall_when_a_holder_is_pinned() {
+        let env = LeaseTestEnv::new();
+        let mut holder = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawning a short-lived holder process");
+        let holder_pid = holder.id();
+        let residency_dir = env.home().join("residency");
+        std::fs::create_dir_all(&residency_dir).unwrap();
+        std::fs::write(
+            residency_dir.join(format!("{holder_pid}.lease")),
+            format!(r#"{{"pid":{holder_pid},"models":["darkmux:busy-elsewhere"]}}"#),
+        )
+        .expect("hand-writing a lease for the external holder pid");
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new().cataloged("m", 1_000);
+        host.fail_next_load = Some(HostError::InsufficientResources { detail: "no room right now".into() });
+        let wave = vec![placement("m", 8_000)];
+
+        ensure_wave_loaded(&wave, &est, &mut host)
+            .expect("a pinned-external shortfall retries past the scripted failure and succeeds");
+
+        let load_attempts = host
+            .ops
+            .iter()
+            .filter(|op| matches!(op, darkmux_gestalt::mock::HostOp::Load { .. }))
+            .count();
+        assert_eq!(load_attempts, 2, "one failed attempt, one successful retry: {:?}", host.ops);
+
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
+
+    /// (#1487 PR2 addendum) The OTHER half of the ceiling distinction: the
+    /// SAME `InsufficientResources` shortfall, but with NO live holder
+    /// pinned to explain it — this fails IMMEDIATELY (no retry; nothing a
+    /// wait could fix), naming that no concurrent holder is blocking it.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_fails_immediately_with_no_pinned_holder_to_blame() {
+        let _env = LeaseTestEnv::new();
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new().cataloged("m", 1_000);
+        host.fail_next_load = Some(HostError::InsufficientResources { detail: "too big alone".into() });
+        let wave = vec![placement("m", 8_000)];
+
+        let err = ensure_wave_loaded(&wave, &est, &mut host)
+            .expect_err("no pinned holder explains the shortfall — this can never be transient");
+        assert!(
+            err.to_string().contains("no concurrent darkmux"),
+            "the error must name that no concurrent holder is pinned: {err:#}"
+        );
+
+        let load_attempts = host
+            .ops
+            .iter()
+            .filter(|op| matches!(op, darkmux_gestalt::mock::HostOp::Load { .. }))
+            .count();
+        assert_eq!(load_attempts, 1, "no retry when nothing explains the shortfall as transient: {:?}", host.ops);
+    }
+
     /// The plan sketch's headline test: `run_bounded` respects
     /// `plan_waves`'s own partitioning under a byte budget that fits two
     /// small models together but not a third — mirrors `waves.rs`'s own
     /// table tests (two-fit-together, third overflows to a second wave),
     /// just exercised through the executor instead of `plan_waves` directly.
+    #[serial_test::serial]
     #[test]
     fn run_bounded_respects_wave_partitioning_under_budget() {
+        let _env = LeaseTestEnv::new();
         let est = FixedEstimator(BTreeMap::from([
             ("small-a".to_string(), 10_000_000_000),
             ("small-b".to_string(), 10_000_000_000),
@@ -531,8 +907,10 @@ mod tests {
     /// A local job whose placement can never fit ANY wave (its estimate
     /// alone exceeds the whole budget) never runs — it comes back as an
     /// `Err` naming the refusal, and every OTHER job still completes.
+    #[serial_test::serial]
     #[test]
     fn run_bounded_never_runs_a_refused_placement() {
+        let _env = LeaseTestEnv::new();
         let est = FixedEstimator(BTreeMap::from([
             ("fits".to_string(), 5_000_000_000),
             ("too-big".to_string(), 50_000_000_000),
@@ -558,8 +936,10 @@ mod tests {
     /// `same_local_model` concurrency question the module doc names is
     /// exactly this shape; today the executor does not serialize them
     /// itself, matching the documented open item.
+    #[serial_test::serial]
     #[test]
     fn run_bounded_runs_both_jobs_sharing_one_resident_placement() {
+        let _env = LeaseTestEnv::new();
         let est = FixedEstimator::default();
         let facts = Facts {
             residents: vec![ResidentFact {
@@ -626,8 +1006,10 @@ mod tests {
     /// unwinds through a different code path (the per-wave nested
     /// `thread::scope` inside `run_local_waves`), so the reconcile is proven
     /// on both tracks. The sibling local job in the same wave still completes.
+    #[serial_test::serial]
     #[test]
     fn run_bounded_reconciles_a_panicking_local_job_to_a_terminal_error() {
+        let _env = LeaseTestEnv::new();
         let est = FixedEstimator::default();
         let facts = Facts::default();
         let marker = Arc::new(AtomicU32::new(0));
