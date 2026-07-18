@@ -1037,36 +1037,32 @@
         assert!(env.staffing.is_none());
     }
 
-    /// (#1426 ship-2 / #44) The snapshot carries each seat's PROVENANCE
-    /// (scored vs pinned) verbatim from the resolver — the envelope records
-    /// WHY a seat was staffed, not just what resolved — and a pre-ship-2
-    /// snapshot without the field still parses (`None`), per the module's
-    /// schema-lenience discipline.
+    /// (#1475 / #44) The snapshot carries each seat's role→profile PROVENANCE
+    /// verbatim from the resolver — the envelope records WHY a seat was staffed
+    /// (role → profile → binding-source), not just what resolved — and a
+    /// pre-provenance snapshot without the field still parses (`None`), per the
+    /// module's schema-lenience discipline.
     #[test]
     fn staffing_snapshot_carries_provenance_and_reads_old_snapshots_leniently() {
         use darkmux_crew::resourcing::StaffingProvenance;
         let mut probe = staffing("fast", "probe-model", 2);
-        probe.provenance = Some(StaffingProvenance {
-            kind: "scored".to_string(),
-            detail: "select_model capability scoring for role \"review-probe\" against roster profile \"fast\"".to_string(),
-        });
+        probe.provenance =
+            Some(StaffingProvenance::role_profile("review-probe-high", "fast", "role_profiles map"));
         let mut judge = staffing("fast", "judge-model", 1);
-        judge.provenance = Some(StaffingProvenance {
-            kind: "pinned".to_string(),
-            detail: "pinned by launch param judge_model=judge-model".to_string(),
-        });
+        judge.provenance =
+            Some(StaffingProvenance::role_profile("review-judge", "big", "launch override"));
         let snap = staffing_snapshot(std::slice::from_ref(&probe), &judge, None, false);
-        assert_eq!(snap.probes[0].provenance.as_ref().unwrap().kind, "scored");
-        assert!(snap.probes[0].provenance.as_ref().unwrap().detail.contains("roster profile"));
+        assert_eq!(snap.probes[0].provenance.as_ref().unwrap().kind, "role-profile");
+        assert!(snap.probes[0].provenance.as_ref().unwrap().detail.contains("role_profiles map"));
         let judge_snap = snap.judge.as_ref().unwrap();
-        assert_eq!(judge_snap.provenance.as_ref().unwrap().kind, "pinned");
-        assert!(judge_snap.provenance.as_ref().unwrap().detail.contains("judge_model"));
+        assert_eq!(judge_snap.provenance.as_ref().unwrap().kind, "role-profile");
+        assert!(judge_snap.provenance.as_ref().unwrap().detail.contains("launch override"));
 
         // Round-trips through JSON; an old snapshot WITHOUT the field parses
         // as None.
         let json = serde_json::to_string(&snap).unwrap();
         let back: StaffingSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.probes[0].provenance.as_ref().unwrap().kind, "scored");
+        assert_eq!(back.probes[0].provenance.as_ref().unwrap().kind, "role-profile");
         let old = r#"{"probes":[{"name":"fast","model":"m","k":2,"passes":2}],"judge":null}"#;
         let old_snap: StaffingSnapshot = serde_json::from_str(old).expect("pre-ship-2 snapshot parses");
         assert!(old_snap.probes[0].provenance.is_none());
@@ -2701,9 +2697,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         .iter()
         .map(|(r, p)| (r.to_string(), p.to_string()))
         .collect();
-        let crew =
-            resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &|r| bindings.get(r).cloned())
-                .unwrap();
+        let crew = resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &|r| {
+            match bindings.get(r) {
+                Some(p) => darkmux_profiles::profiles::RoleBinding::Mapped(p.clone()),
+                None => darkmux_profiles::profiles::RoleBinding::Unmapped,
+            }
+        })
+        .unwrap();
 
         let seats = validate_review_crew(&crew).expect("role crew is a valid review crew");
         let probes: Vec<_> = seats.probes.clone();

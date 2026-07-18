@@ -1,6 +1,33 @@
     use super::*;
     use tempfile::TempDir;
 
+    /// (#1475 packet 3, contract 6) The four probe personas — `review-probe`
+    /// and its three role→profile copies `review-probe-high`/`-mid`/`-low` — must
+    /// be BYTE-EQUAL. Probe recall diversity lives entirely in each role's
+    /// profile→model binding, never in the persona text (the frozen #1256
+    /// persona). This lock makes "one hash, not one intention" structural: a
+    /// future golden bump to `review-probe.md` that forgets to re-copy the three
+    /// siblings fails HERE, before it can silently desync the measured prompts.
+    #[test]
+    fn probe_persona_copies_are_byte_equal() {
+        let prompt_for = |id: &str| {
+            BUILTIN_ROLE_PROMPTS
+                .iter()
+                .find(|(pid, _)| *pid == id)
+                .map(|(_, c)| *c)
+                .unwrap_or_else(|| panic!("{id} prompt must be embedded"))
+        };
+        let base = prompt_for("review-probe");
+        for id in ["review-probe-high", "review-probe-mid", "review-probe-low"] {
+            assert_eq!(
+                prompt_for(id),
+                base,
+                "{id}.md must be byte-equal to review-probe.md — recall diversity is \
+                 role→profile-borne, not persona-borne (#1256 frozen text / #1475 packet 3)"
+            );
+        }
+    }
+
     /// (#1053) The pr-reviewer prompt must carry the intent-assessment
     /// directive — the cross-tier-validated lever against "restate-the-fix"
     /// false positives (a reviewer flagging the very bug a PR fixes). The

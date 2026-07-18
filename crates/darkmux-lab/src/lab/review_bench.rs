@@ -268,21 +268,23 @@ pub struct ReviewBenchOpts {
     pub prosecutor_profile: Option<String>,
     pub defender_profile: Option<String>,
     pub judge_profile: Option<String>,
-    /// (#1426 ship-2, renamed in #1465) `Funnel` mode's ROSTER profile — the
-    /// profile whose `models[]` the resourcing resolver scores each review seat
-    /// (probe / judge / verify) against. Falls back to `profile_name`, else the
-    /// registry's `default_profile`. (Renamed from `crew`: the crew family
-    /// retired entirely in #1426, so this names the roster PROFILE it resolves
-    /// against, not a retired `crews.<name>` entry — the `--roster-profile`
-    /// flag.)
+    /// (#1475) `Funnel` mode's ROSTER profile — the one profile the bench pins
+    /// EVERY review seat (probe / judge / verify) to for a controlled run, via
+    /// packet 3's per-run role→profile override. Falls back to `profile_name`,
+    /// else the registry's `default_profile`. (The `--roster-profile` flag;
+    /// renamed from `--crew` in #1465. The roster-scoring resolver it once fed
+    /// was deleted in #1475 packet 3 — the bench and the operator path now share
+    /// one resolver.)
     pub roster_profile: Option<String>,
     /// (#1222) `Funnel` mode's model-cycling mode override —
     /// `"sequential"` | `"parallel"` | `"auto"` (default: `auto`, resolved
     /// once against the local hardware tier — see `review::resolve_mode`).
     pub exec_mode: Option<String>,
-    /// (#1222) `Funnel` mode's override for every `review-probe` staffing's
-    /// draw count `k` — the crew registry's per-staffing `k` applies
-    /// unchanged when `None`.
+    /// (#1222 / #1475) `Funnel` mode's probe draw-BREADTH knob — applied
+    /// post-resolution to every `review-probe` seat's `k`. `None` => the
+    /// role→profile flip's one-draw-per-probe-role default (three distinct probe
+    /// roles ⇒ three probe draws). A measurement sweep the operator path doesn't
+    /// expose.
     pub k_override: Option<u32>,
     /// (#1222) `Funnel` mode's external bundler command
     /// (`<cmd> --worktree <dir> --diff <file>`, `lab::bundle::external_bundles`'s
@@ -763,34 +765,77 @@ fn parse_exec_mode(s: Option<&str>) -> Result<super::review::ExecMode> {
     }
 }
 
-/// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, DERIVE the
-/// review staffing from the roster via the resourcing resolver
-/// (`darkmux_crew::resourcing::resolve_review_resourcing` — #1426 ship-2, which
-/// scores a model per seat against the active profile), validate it carries the
-/// funnel's own seat requirements (`review::validate_review_crew` — the SAME
-/// check `run_review` runs internally, called here too so a misconfigured
-/// roster fails at bench START, not at the first case's dispatch), apply `--k`
-/// as the probe draw count, parse `--exec-mode`, and resolve the seat system
-/// prompts. Every failure here is loud and happens BEFORE any dispatch.
+/// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, staff the
+/// review seats via the SAME role→profile resolver the operator path uses
+/// (`darkmux_crew::resourcing::resolve_review_role_crew` — #1475), validate it
+/// carries the funnel's own seat requirements (`review::validate_review_crew` —
+/// the SAME check `run_review` runs internally, called here too so a
+/// misconfigured roster fails at bench START, not at the first case's dispatch),
+/// apply `--k` as the probe draw breadth, parse `--exec-mode`, and resolve the
+/// seat system prompts. Every failure here is loud and happens BEFORE any
+/// dispatch.
 ///
-/// (#1426 ship-2, renamed in #1465) `--roster-profile` names the ROSTER
-/// PROFILE the seats are resourced from (the retired `crews.<name>` map is
-/// gone); absent, the bench's `--profile` (else the registry's
-/// `default_profile`) is the roster.
+/// (#1475) The bench is a CONTROLLED comparison: it pins EVERY review role to
+/// one profile — `--roster-profile` (else `--profile`, else the registry's
+/// `default_profile`) — through packet 3's per-run role→profile OVERRIDE, so the
+/// funnel measures that one profile across every seat deterministically (never
+/// whatever the machine's `role_profiles` map happens to hold). `--k` then sets
+/// each probe seat's draw breadth; the flip resolves three distinct probe roles,
+/// so the default (`--k` omitted, k=1 each) already draws three probes — the
+/// same total breadth the old default `k=3` gave from one seat, now role-borne.
 fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
+    use darkmux_crew::resourcing::{
+        ReviewRoleStaffing, REVIEW_JUDGE_ROLE, REVIEW_PROBE_ROLE, REVIEW_PROBE_ROLES,
+        REVIEW_VERIFY_ROLE,
+    };
     let loaded = darkmux_profiles::profiles::load_registry(opts.config_path.as_deref())
         .context("loading profile registry for --funnel")?;
+    // The one profile every seat is pinned to for this controlled run.
     let roster = opts
         .roster_profile
         .clone()
-        .or_else(|| opts.profile_name.clone());
-    let resourcing = darkmux_crew::resourcing::ReviewResourcing {
-        profile: roster,
-        k: opts.k_override,
-        ..Default::default()
-    };
-    let crew = darkmux_crew::resourcing::resolve_review_resourcing(&loaded.registry, &resourcing)
-        .context("resolving review staffing for --funnel")?;
+        .or_else(|| opts.profile_name.clone())
+        .or_else(|| loaded.registry.default_profile.clone())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            let available: Vec<&str> =
+                loaded.registry.profiles.keys().map(String::as_str).collect();
+            let listed = if available.is_empty() { "(none)".to_string() } else { available.join(", ") };
+            anyhow!(
+                "darkmux: --funnel needs a roster profile — pass --roster-profile <name> (or \
+                 --profile <name>), or set a `default_profile` in the registry. \
+                 Available: {listed}."
+            )
+        })?;
+    // A roster naming a profile the registry doesn't have fails LOUD here,
+    // naming the roster ONCE (get_profile's "not found. Available:" message) —
+    // cleaner than the per-role override error that would otherwise name the
+    // first probe role. Every seat is pinned to this same roster, so one check
+    // suffices.
+    darkmux_profiles::profiles::get_profile(&loaded.registry, &roster)
+        .context("resolving the --funnel roster profile")?;
+    // Pin all five review roles to the roster via the per-run override — one
+    // canonical resolver, no second staffing path.
+    let overrides: std::collections::BTreeMap<String, String> = REVIEW_PROBE_ROLES
+        .into_iter()
+        .chain([REVIEW_JUDGE_ROLE, REVIEW_VERIFY_ROLE])
+        .map(|role| (role.to_string(), roster.clone()))
+        .collect();
+    let mut crew =
+        darkmux_crew::resourcing::resolve_review_role_crew(&loaded.registry, &ReviewRoleStaffing::default(), &overrides)
+            .context("resolving review staffing for --funnel")?;
+    // `--k` is the bench's probe draw-breadth knob (a measurement sweep the
+    // operator path doesn't expose): applied post-resolution to every probe
+    // seat, leaving the judge/verify seats at one draw. Absent => the flip's
+    // one-draw-per-probe-role default.
+    if let Some(k) = opts.k_override {
+        if let Some(probes) = crew.seats.get_mut(REVIEW_PROBE_ROLE) {
+            for seat in probes {
+                seat.k = k;
+            }
+        }
+    }
     super::review::validate_review_crew(&crew).context("review staffing for --funnel")?;
     let exec_mode = parse_exec_mode(opts.exec_mode.as_deref())?;
     let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
@@ -1768,12 +1813,12 @@ fn write_scores_artifact(
         "role".to_string(),
         serde_json::Value::String(opts.role.clone()),
     );
-    // (#1222 Phase B packet 7) Funnel-mode provenance: roster profile +
-    // resolved exec mode + k override — the cell-identity fields a future
+    // (#1222 Phase B packet 7 / #1475) Funnel-mode provenance: roster profile +
+    // resolved exec mode + k breadth — the cell-identity fields a future
     // comparison needs to know two funnel runs are the same condition. The
-    // `"crew"` envelope KEY is unchanged (the serve daemon + viewer consume it
-    // — a schema field, out of scope for #1465's flag rename); only its source
-    // moved from the retired `--crew` flag to `--roster-profile`.
+    // `"crew"` envelope KEY is unchanged (the serve daemon + viewer consume it —
+    // a schema field, out of scope here); its source is the `--roster-profile`
+    // flag (the one profile every seat was pinned to for this run).
     if opts.mode == BenchMode::Funnel {
         doc.extras.insert(
             "crew".to_string(),
@@ -1788,7 +1833,8 @@ fn write_scores_artifact(
             "k".to_string(),
             match opts.k_override {
                 Some(k) => serde_json::Value::Number(k.into()),
-                None => serde_json::Value::String("(profile default)".to_string()),
+                // (#1475) Absent => one draw per probe role (the flip's default).
+                None => serde_json::Value::String("(one per probe role)".to_string()),
             },
         );
     }

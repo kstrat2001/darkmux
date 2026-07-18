@@ -2791,7 +2791,7 @@
             "crew": crew,
             "exec_mode": "sequential",
             "mode": "funnel",
-            "k": "(profile default)"
+            "k": "(one per probe role)"
         });
         fs::write(dir.join("scores.json"), serde_json::to_vec_pretty(&scores).unwrap()).unwrap();
     }

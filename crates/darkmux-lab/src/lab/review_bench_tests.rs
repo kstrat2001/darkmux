@@ -1332,7 +1332,7 @@
     }
 
     #[test]
-    fn write_scores_artifact_funnel_extras_k_defaults_to_profile_default_label_when_unset() {
+    fn write_scores_artifact_funnel_extras_k_defaults_to_one_per_probe_role_label_when_unset() {
         use super::super::review::Tier;
         let env = funnel_env(
             vec![judged_flag(Some("start.plus(30)"), Tier::Confirmed, "note", "evidence")],
@@ -1354,7 +1354,7 @@
         let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_out, 0).unwrap();
         let content = fs::read_to_string(&path).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(doc["k"], serde_json::json!("(profile default)"));
+        assert_eq!(doc["k"], serde_json::json!("(one per probe role)"));
     }
 
     // (#1465) `role` is now an operator knob (was a `pr-reviewer` constant),
@@ -1660,10 +1660,11 @@
     }
 
     // ── resolve_funnel_ctx: roster resolution + --k / --exec-mode plumbing ───
-    // (#1426 ship-2) The crews map retired — the funnel derives its staffing
-    // from the roster profile (the `--roster-profile`/`--profile` name, else
-    // default_profile) via the resourcing resolver. `--roster-profile` (#1465,
-    // renamed from `--crew`) names the roster profile, not a `crews.<name>` entry.
+    // (#1475) The funnel pins EVERY review seat to one profile (the
+    // `--roster-profile`/`--profile` name, else default_profile) through packet
+    // 3's per-run role→profile override — one canonical resolver shared with the
+    // operator path. `--roster-profile` (#1465, renamed from `--crew`) names
+    // that profile.
 
     fn write_test_registry(dir: &Path, roster: &str) -> PathBuf {
         use std::collections::BTreeMap;
@@ -1716,7 +1717,9 @@
         // extracts the error without that bound.
         let err = resolve_funnel_ctx(&opts).err().unwrap();
         let msg = format!("{err:#}");
-        assert!(msg.contains("roster profile \"ghost\""), "names the missing roster: {msg}");
+        // (#1475) The bench pins every seat to the roster via the per-run
+        // override, so a bad roster surfaces the resolver's loud override error.
+        assert!(msg.contains("ghost"), "names the missing roster: {msg}");
         assert!(msg.contains("fast"), "lists the available profile: {msg}");
     }
 
@@ -1747,11 +1750,12 @@
         let opts = funnel_ctx_opts(path, "fast", None, None);
 
         let ctx = resolve_funnel_ctx(&opts).unwrap();
-        assert_eq!(
-            ctx.crew.seats.get("review-probe").unwrap()[0].k,
-            3,
-            "no override ⇒ the resolver's default probe k (3)"
-        );
+        let probes = ctx.crew.seats.get("review-probe").unwrap();
+        // (#1475) The flip staffs three distinct probe roles, one draw each —
+        // the same total probe breadth (3) the old default `k=3` gave from one
+        // seat, now role-borne rather than draw-borne.
+        assert_eq!(probes.len(), 3, "three distinct probe roles staff by default");
+        assert!(probes.iter().all(|s| s.k == 1), "no override ⇒ one draw per probe role");
         assert_eq!(
             ctx.exec_mode,
             super::super::review::ExecMode::Auto,

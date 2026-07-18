@@ -96,7 +96,10 @@ use darkmux_lab::lab::review::{
     staffing_snapshot, validate_review_crew, BundleInput, ChatCall, ExecMode, LmsCycler,
     ProbeFlag, ReviewEmitter, ReviewEnvelope, ReviewInputs, ReviewStepContext,
 };
-use darkmux_crew::resourcing::{resolve_review_role_crew, ResolvedCrew, ReviewRoleStaffing};
+use darkmux_crew::resourcing::{
+    resolve_review_role_crew, ResolvedCrew, ReviewRoleStaffing, REVIEW_JUDGE_ROLE,
+    REVIEW_PROBE_ROLES, REVIEW_VERIFY_ROLE,
+};
 use darkmux_profiles::profiles::load_registry;
 use darkmux_profiles::swap;
 use darkmux_types::dispatch_liveness::{liveness, liveness_case, liveness_detail};
@@ -116,23 +119,33 @@ fn path_input(collected: &BTreeMap<String, Value>, key: &str) -> Option<PathBuf>
     str_input(collected, key).map(PathBuf::from)
 }
 
-/// (#1426 ship-2) Parse a comma-separated `--param key=a,b,c` into a `Vec` of
-/// trimmed, non-empty items — the launch-param shape for `probe_models` (one
-/// probe staffing per listed model id). Absent/blank => empty.
-// (#1475 packet 2) The role→profile flip stopped consuming `probe_models`, the
-// only caller of this CSV parser — kept (allow dead_code) until packet 4
-// retires the seat-pin inputs wholesale.
-#[allow(dead_code)]
-fn csv_input(collected: &BTreeMap<String, Value>, key: &str) -> Vec<String> {
-    str_input(collected, key)
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+/// (#1475 packet 3) The review roles an operator may bind per run via
+/// `--param <role>=<profile>` — the three probe roles plus judge + verify, the
+/// same five [`resolve_review_role_crew`] resolves. Declared as inputs in
+/// `review.json` so the surface is self-documenting.
+fn review_override_role_ids() -> [&'static str; 5] {
+    [
+        REVIEW_PROBE_ROLES[0],
+        REVIEW_PROBE_ROLES[1],
+        REVIEW_PROBE_ROLES[2],
+        REVIEW_JUDGE_ROLE,
+        REVIEW_VERIFY_ROLE,
+    ]
+}
+
+/// (#1475 packet 3) Collect the per-run role→profile launch overrides — one
+/// `--param <role>=<profile>` per review role the operator wants to rebind for
+/// this run without editing `config.json`. Only the five known review roles are
+/// read; a blank value is ignored. Fed to [`resolve_review_role_crew`], where it
+/// wins over the `role_profiles` map and `default_profile`.
+fn collect_role_overrides(collected: &BTreeMap<String, Value>) -> BTreeMap<String, String> {
+    let mut overrides = BTreeMap::new();
+    for role in review_override_role_ids() {
+        if let Some(profile) = str_input(collected, role).map(str::trim).filter(|s| !s.is_empty()) {
+            overrides.insert(role.to_string(), profile.to_string());
+        }
+    }
+    overrides
 }
 
 /// (#1426 ship-2) Parse a boolean `--param key=true` — truthy on
@@ -615,18 +628,14 @@ pub(crate) fn launch(
             // shape. Warn (don't error) — operator sovereignty: surface,
             // never silently ignore.
             let mut ignored: Vec<&str> = Vec::new();
-            for key in [
-                "profile",
-                "probe_models",
-                "judge_model",
-                "verify_model",
-                "worktree",
-                "github",
-                "head_sha",
-                "bundler",
-                "k",
-                "passes",
-            ] {
+            // The per-run role→profile overrides (#1475 packet 3) shape staffing,
+            // which a synthesis-only launch never resolves — so they're ignored
+            // here too, alongside the source/bundler/knob inputs.
+            let dispatch_shaping: Vec<&str> = review_override_role_ids()
+                .into_iter()
+                .chain(["worktree", "github", "head_sha", "bundler", "passes"])
+                .collect();
+            for key in dispatch_shaping {
                 if collected.contains_key(key) {
                     ignored.push(key);
                 }
@@ -679,26 +688,26 @@ fn run_dispatch(
     let source = resolve_source(collected)?;
     liveness_detail("config-resolved", &case, &config_detail());
     let loaded = load_registry(str_input(collected, "profiles"))?;
-    // (#1475 packet 2) THE FLIP — review staffing is now the role→profile
-    // rollup, not the roster-scoring resolver. Each of the five review roles
-    // (review-probe-high/-mid/-low, review-judge, review-verify) resolves
-    // through the machine-local `role_profiles` map in config.json:
-    // role → profile → model, with an unmapped role falling back to
-    // `default_profile` (the fresh-user floor). The three probe pins
-    // (`probe_models`/`judge_model`/`verify_model`) and the roster `profile`
-    // input are no longer consumed here — a bare `mission launch review`
-    // assembles the operator's heterogeneous crew straight from the map (the
-    // old roster resolver stays compiled but bypassed; packet 3 deletes it).
-    // Only the non-model knobs survive: judge consensus DEPTH (`passes`) and
-    // the blocking-vs-advisory render choice. The envelope snapshot records
-    // what role→profile actually resolved (operator sovereignty #44).
+    // (#1475) Review staffing is the role→profile rollup. Each of the five
+    // review roles (review-probe-high/-mid/-low, review-judge, review-verify)
+    // resolves INDEPENDENTLY: a per-run launch override (`--param
+    // <role>=<profile>`) wins, else the machine-local `role_profiles` map in
+    // config.json, else `default_profile` (the fresh-user floor). A bare
+    // `mission launch review` assembles the operator's heterogeneous crew
+    // straight from the map; a `--param review-judge=<profile>` rebinds one seat
+    // for this run without editing config.json. Only the non-model knobs live in
+    // `ReviewRoleStaffing`: judge consensus DEPTH (`passes`) and the
+    // blocking-vs-advisory render choice. The envelope snapshot records what
+    // role→profile actually resolved AND from which tier (operator sovereignty
+    // #44).
+    let overrides = collect_role_overrides(collected);
     let resourcing = ReviewRoleStaffing {
         // (#1266) `None` => the resolver's double-confirm default; validated
         // `>= 1` in the resolver.
         passes: u32_input(collected, "passes")?,
         request_changes: bool_input(collected, "request_changes"),
     };
-    let crew = resolve_review_role_crew(&loaded.registry, &resourcing)?;
+    let crew = resolve_review_role_crew(&loaded.registry, &resourcing, &overrides)?;
     liveness_detail("crew-resolved", &case, &crew_detail(&crew));
 
     liveness_case("bundling-start", &case);
