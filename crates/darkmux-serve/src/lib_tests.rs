@@ -4276,3 +4276,103 @@
             .expect("s1 row");
         assert!(row.get("tokensFinal").is_none(), "no flow records -> no backfill");
     }
+
+    /// (#1488 follow-up — mission-graph phantom-tokens fix) The review
+    /// pipeline's step ids ("review-verify-step", "review-judge-step", …)
+    /// are literal constants reused by EVERY review mission instance, and
+    /// the backfill's day-file window has no upper bound — so a flow
+    /// record that genuinely correlates to this step's id can belong to a
+    /// DIFFERENT, earlier mission's real dispatch on the same-named step.
+    /// A step that has NOT started (`started_ts: None`, status planned)
+    /// must render NO token count even when such a record is present —
+    /// confirmed live against review-1e47c34023, whose planned verify step
+    /// read a phantom 46832 tokens folded from an unrelated same-day
+    /// mission's real verify run.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_graph_json_planned_step_shows_no_phantom_tokens_from_collided_record() {
+        use darkmux_crew::types::{NodeStatus, Step, Task};
+        let _guard = CrewDirGuard::new();
+        let mission_id = "phantom-tokens-mission";
+        let phase_id = "p1";
+        save_test_mission(&minimal_mission(mission_id, vec![phase_id.to_string()]));
+        save_test_phase(&minimal_phase(phase_id, mission_id));
+
+        let task = Task {
+            id: "verify-task".to_string(),
+            phase_id: phase_id.to_string(),
+            description: "verify-task".to_string(),
+            display_name: None,
+            step_ids: vec!["review-verify-step".to_string()],
+            depends_on: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
+        // The step exists on disk (already scheduled) but has NOT started:
+        // no started_ts, status Planned — exactly the graph shape a
+        // dispatch.map verify seat has before its own dispatch begins.
+        darkmux_crew::lifecycle::save_step(
+            mission_id,
+            phase_id,
+            &Step {
+                id: "review-verify-step".to_string(),
+                task_id: "verify-task".to_string(),
+                kind: "dispatch.map".to_string(),
+                status: NodeStatus::Planned,
+                config: serde_json::Value::Null,
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
+        )
+        .unwrap();
+
+        // A flow record that DOES correlate to "review-verify-step" by
+        // session id — simulating an unrelated, earlier mission's real,
+        // completed verify dispatch that happens to share this mission
+        // template's literal step id (the confirmed collision mechanism).
+        let flows = TempDir::new().unwrap();
+        let rec = serde_json::json!({
+            "action": "dispatch complete",
+            "session_id": "step-review-verify-step",
+            "payload": { "total_tokens": 46_832, "total_turns": 5 }
+        });
+        let today = crate::mission_graph::epoch_days_to_stem((now_unix() / 86400) as i64);
+        std::fs::write(
+            flows.path().join(format!("{today}.jsonl")),
+            format!("{}\n", serde_json::to_string(&rec).unwrap()),
+        )
+        .unwrap();
+
+        let app = build_router(flows.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mission/{mission_id}/graph.json"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let row = json["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["kind"] == "task")
+            .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
+            .find(|r| r["id"] == "review-verify-step")
+            .expect("review-verify-step row");
+        assert_eq!(row["status"], "planned");
+        assert!(row["startedTs"].is_null(), "planned step must have no startedTs");
+        assert!(
+            row.get("tokensFinal").is_none(),
+            "a planned step must show no tokens even when a same-named record exists: {row:?}"
+        );
+        assert!(row.get("turnsFinal").is_none());
+    }

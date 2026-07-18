@@ -131,6 +131,18 @@ pub struct StepRow {
     /// the LIVE-increment channel; these are only the terminal totals.
     /// Additive camelCase (`tokensFinal`/`turnsFinal`/`cloud`); pre-#1432
     /// consumers ignore them.
+    ///
+    /// **Gated on `started_ts.is_some()` (#1488 follow-up).** The review
+    /// pipeline's step ids (`review-verify-step`, `review-judge-step`, …)
+    /// are literal constants reused by EVERY review mission instance, not
+    /// scoped to one mission run, and the backfill's day-file window has no
+    /// upper bound — so an unrelated, earlier same-day mission's real
+    /// completed dispatch can fold onto a same-named step that hasn't
+    /// started in THIS mission. A not-yet-started step (no `started_ts`)
+    /// therefore always carries `tokens_final: None`, regardless of what the
+    /// fold found — "the graph tells the truth" extends to the finalized
+    /// total, not just the live SSE meter (which #1488 already gated
+    /// client-side on `startTs > 0`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_final: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -764,6 +776,34 @@ where
     out
 }
 
+/// Pure: gate a folded [`StepFinals`] behind whether the OWNING step has
+/// actually started (`started_ts.is_some()` at the call site).
+///
+/// `fold_step_finals`'s correlation keys (`step_id`/`session_id`/`handle` —
+/// `step_for_record`) are exact string matches, but the review pipeline's
+/// step ids are literal constants reused by EVERY review mission instance
+/// (`"review-verify-step"` names the verify step on every review run, not
+/// just this one), and the backfill's day-file window has no upper bound.
+/// So a match found by `fold_step_finals` can legitimately belong to an
+/// unrelated, earlier mission that ran the same-named step for real — a
+/// not-yet-started step in THIS mission cannot have produced any of those
+/// tokens, so a `false` gate always answers `(None, None, None)` regardless
+/// of what the fold found (#1488 follow-up: the client already gates its
+/// live SSE fold on `startTs > 0`; this is the same invariant for the
+/// server's finalized total).
+fn gate_finals_by_started(started: bool, fin: Option<&StepFinals>) -> (Option<u64>, Option<u64>, Option<bool>) {
+    if !started {
+        return (None, None, None);
+    }
+    let tokens_final = fin.and_then(|f| f.tokens);
+    let turns_final = fin.and_then(|f| f.turns);
+    let cloud = match fin {
+        Some(f) if f.cloud => Some(true),
+        _ => None,
+    };
+    (tokens_final, turns_final, cloud)
+}
+
 /// Days since the Unix epoch for a civil calendar date (Howard Hinnant's
 /// `days_from_civil`) — lets the backfill compare a flow day file's
 /// `YYYY-MM-DD` stem against a mission's `created_ts` without a date crate.
@@ -1042,16 +1082,30 @@ pub fn build_mission_graph(
                 .step_ids
                 .iter()
                 .map(|step_id| {
-                    // (#1432 item 4) Attach the backfilled finalized totals
-                    // (None everywhere the mission has no folded records for
-                    // this step — a never-dispatched or mixed-era step).
-                    let fin = step_finals.get(step_id);
-                    let tokens_final = fin.and_then(|f| f.tokens);
-                    let turns_final = fin.and_then(|f| f.turns);
-                    let cloud = match fin {
-                        Some(f) if f.cloud => Some(true),
-                        _ => None,
-                    };
+                    // (#1432 item 4, #1488/#1483 follow-up) Attach the
+                    // backfilled finalized totals — but ONLY to a step that
+                    // has actually STARTED. The fold's correlation keys
+                    // (`step_id`/`session_id`/`handle` — see
+                    // `step_for_record`) are the review pipeline's literal,
+                    // NON-mission-scoped step ids ("review-verify-step" is
+                    // the same string on every review mission instance), and
+                    // the backfill's day-file window has no upper bound —
+                    // so an EARLIER, unrelated mission's real completed
+                    // dispatch on the same literal step id can fold onto
+                    // THIS mission's not-yet-started step of the same kind.
+                    // A step with no `started_ts` cannot have produced any
+                    // of its own tokens yet, so gating on "has this step
+                    // actually started" is a correctness condition, not
+                    // just a display nicety — mirrors the client's
+                    // `startTs > 0` gate on the live SSE fold
+                    // (`assets/mission-graph.html`, #1488) on the SERVER
+                    // side for the finalized total. Confirmed live against
+                    // review-1e47c34023: a fully-planned verify step read
+                    // 46832 finalized tokens folded from an unrelated,
+                    // already-closed same-day mission's real verify run.
+                    let started = steps.get(step_id).is_some_and(|s| s.started_ts.is_some());
+                    let (tokens_final, turns_final, cloud) =
+                        gate_finals_by_started(started, step_finals.get(step_id));
                     match steps.get(step_id) {
                         Some(step) => StepRow {
                             id: step.id.clone(),
@@ -1069,6 +1123,10 @@ pub fn build_mission_graph(
                             model: step_model_from_config(&step.config),
                         },
                         None => {
+                            // A synthesized (not-yet-persisted) step is by
+                            // definition not started — `started` above is
+                            // always false here, so `tokens_final`/
+                            // `turns_final`/`cloud` are already `None`.
                             let kind = kind_from_config_snapshot(mission_id, &task.id, step_id)
                                 .unwrap_or_default();
                             StepRow {
@@ -1340,6 +1398,54 @@ mod tests {
         });
         let out = fold_step_finals(vec![rec], &step_ids);
         assert!(!out.contains_key("s1"), "colon-era session id must not correlate");
+    }
+
+    // ─── (#1488 follow-up) planned steps show no phantom tokens ─────────
+    //
+    // The review pipeline's step ids (`review-verify-step`, `review-judge-
+    // step`, …) are literal constants reused by EVERY review mission
+    // instance — not scoped to one mission run — and the backfill's
+    // day-file window has no upper bound. So `fold_step_finals` can
+    // correctly correlate a record to a step id string while that record
+    // actually belongs to a DIFFERENT, earlier mission instance that
+    // dispatched the same-named step for real. A step that has not
+    // started in THIS mission cannot have produced any of those tokens, so
+    // `gate_finals_by_started` (called from `build_mission_graph`'s
+    // `StepRow` construction) must zero out the fold's answer whenever the
+    // step's own `started_ts` is `None` — confirmed live against
+    // review-1e47c34023, whose fully-planned verify step read 46832
+    // finalized tokens folded from an unrelated, already-closed same-day
+    // mission's real verify run.
+
+    #[test]
+    fn gate_finals_by_started_blanks_a_planned_steps_collided_total() {
+        // Simulates the confirmed collision: `fold_step_finals` found a
+        // real sibling/earlier mission's finalized total under this step's
+        // literal id, but the step itself never started.
+        let collided = StepFinals { tokens: Some(46_832), turns: Some(12), cloud: false };
+        let (tokens, turns, cloud) = gate_finals_by_started(false, Some(&collided));
+        assert_eq!(tokens, None, "a not-started step must never show a collided total");
+        assert_eq!(turns, None);
+        assert_eq!(cloud, None);
+    }
+
+    #[test]
+    fn gate_finals_by_started_keeps_a_started_steps_real_total() {
+        let real = StepFinals { tokens: Some(133_785), turns: Some(9), cloud: true };
+        let (tokens, turns, cloud) = gate_finals_by_started(true, Some(&real));
+        assert_eq!(tokens, Some(133_785), "a genuinely started step keeps its real total");
+        assert_eq!(turns, Some(9));
+        assert_eq!(cloud, Some(true));
+    }
+
+    #[test]
+    fn gate_finals_by_started_started_with_no_fold_is_honest_absent() {
+        // Started, but the backfill found nothing for it (mixed-era or
+        // truly never-dispatched) — absent, not a manufactured zero.
+        let (tokens, turns, cloud) = gate_finals_by_started(true, None);
+        assert_eq!(tokens, None);
+        assert_eq!(turns, None);
+        assert_eq!(cloud, None);
     }
 
     // ─── (#1445 gate must-fix) bounded backfill scan ────────────────────
