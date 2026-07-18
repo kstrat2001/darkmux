@@ -214,7 +214,7 @@ pub struct MissionGraph {
 fn mission_status_str(s: MissionStatus) -> &'static str {
     match s {
         MissionStatus::Active => "active",
-        MissionStatus::Closed => "closed",
+        MissionStatus::Finalized => "finalized",
         MissionStatus::Paused => "paused",
     }
 }

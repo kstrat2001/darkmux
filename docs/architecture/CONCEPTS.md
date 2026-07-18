@@ -128,12 +128,13 @@ informal summaries tend to drift.
 ### Mission
 
 A mission groups a body of work. Its fields
-(`crates/darkmux-crew/src/types.rs:304-325`):
+(`crates/darkmux-crew/src/types.rs:267-318`):
 
 - `id`, `description`
-- `status` — `Active` / `Paused` / `Closed` (default `Active`)
+- `status` — `Active` / `Paused` / `Finalized` (default `Active`; renamed from
+  `Closed` for terminology consistency with the `mission finalize` verb — #1463)
 - `phase_ids: Vec<String>`
-- timestamps: `created_ts`, `started_ts`, `paused_ts`, `closed_ts`
+- timestamps: `created_ts`, `started_ts`, `paused_ts`, `finalized_ts`
 
 There is **no `scope` field and no `goal` field**: a mission carries a
 `description`, not a separate goal/scope pair. "Scope" appears in the codebase
@@ -173,9 +174,9 @@ Burn-down/remaining-work tracking is [planned](#8-planned--not-yet-shipped).
 
 ### Lifecycle state machines
 
-- **Mission:** `Active ⇄ Paused → Closed` (terminal). Operator verbs: `start`,
+- **Mission:** `Active ⇄ Paused → Finalized` (terminal). Operator verbs: `start`,
   `pause`, `resume`, and the two terminals — `finalize` (success: drive
-  non-terminal phases → Complete, tear down worktrees, mission → Closed) and
+  non-terminal phases → Complete, tear down worktrees, mission → Finalized) and
   `abort` (kill: the same teardown, phases → Abandoned). Each persisted with
   operator reasoning.
 - **Phase:** `Planned → Running → Complete | Abandoned`. Phase status is

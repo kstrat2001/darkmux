@@ -710,6 +710,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let mid = "m-debrief";
         let phases_dir = home.path().join("missions").join(mid).join("phases");
         std::fs::create_dir_all(&phases_dir).unwrap();
+        // Legacy on-disk shape (pre-Closed→Finalized rename, #1463 lineage):
+        // `"status":"closed"` deliberately, exercising the `alias = "closed"`
+        // lenient-read path — a mission finalized before this rename shipped
+        // must still deserialize.
         std::fs::write(
             home.path().join("missions").join(mid).join("mission.json"),
             format!(
@@ -767,7 +771,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         let report = report.expect("mission found");
         assert_eq!(report.mission_id, mid);
-        assert_eq!(report.mission_status, "closed");
+        // The legacy `"closed"` on disk (above) reads as `Finalized` via the
+        // alias, and `mission_status_label` renders the canonical new word.
+        assert_eq!(report.mission_status, "finalized");
         assert_eq!(report.phases.len(), 2, "both phases surfaced: {:?}", report.phases);
         assert!(
             report.phases.iter().any(|(id, _, st)| id == "s1" && *st == "complete"),
@@ -1061,7 +1067,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             phase_ids: vec![],
             created_ts: 0,
             started_ts: None,
-            closed_ts: None,
+            finalized_ts: None,
             paused_ts: None,
             source_input: None,
             ticket: None,
@@ -1398,7 +1404,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let mid = "fin-all-complete";
         seed_finalize_mission(mid, &[("p1", PhaseStatus::Complete)]);
         finalize_mission_if_complete(mid);
-        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Finalized);
         let env = crew::lifecycle::load_envelope(mid).unwrap().expect("envelope.json persisted");
         assert_eq!(env.status, crew::envelope::MissionOutcomeStatus::Clean);
     }
@@ -1412,7 +1418,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let mid = "fin-abandoned";
         seed_finalize_mission(mid, &[("p1", PhaseStatus::Abandoned)]);
         finalize_mission_if_complete(mid);
-        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Finalized);
         let env = crew::lifecycle::load_envelope(mid).unwrap().expect("envelope.json persisted");
         assert_eq!(env.status, crew::envelope::MissionOutcomeStatus::Degraded);
     }
@@ -1532,7 +1538,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         // Planned; this assertion is what fails if that ever happens.
         assert_eq!(phase_status_now("p1"), PhaseStatus::Complete, "Planned → Complete via the two-step");
         assert_eq!(phase_status_now("p2"), PhaseStatus::Complete, "Running → Complete");
-        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Finalized);
     }
 
     #[test]
@@ -1550,7 +1556,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         assert_eq!(phase_status_now("p1"), PhaseStatus::Abandoned, "Planned → Abandoned");
         assert_eq!(phase_status_now("p2"), PhaseStatus::Abandoned, "Running → Abandoned");
-        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Finalized);
     }
 
     #[test]
@@ -1569,7 +1575,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(finalize(fin, None).unwrap(), 0);
         assert_eq!(phase_status_now("f1"), PhaseStatus::Complete, "Complete stays Complete");
         assert_eq!(phase_status_now("f2"), PhaseStatus::Abandoned, "Abandoned is left as-is, never flipped to Complete");
-        assert_eq!(mission_status_now(fin), crew::types::MissionStatus::Closed);
+        assert_eq!(mission_status_now(fin), crew::types::MissionStatus::Finalized);
 
         // abort must NOT re-stamp an already-Complete phase to Abandoned.
         let ab = "abort-terminal-untouched";
@@ -1580,7 +1586,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(abort(ab, None).unwrap(), 0);
         assert_eq!(phase_status_now("a1"), PhaseStatus::Complete, "Complete is left as-is, never flipped to Abandoned");
         assert_eq!(phase_status_now("a2"), PhaseStatus::Abandoned, "Abandoned stays Abandoned");
-        assert_eq!(mission_status_now(ab), crew::types::MissionStatus::Closed);
+        assert_eq!(mission_status_now(ab), crew::types::MissionStatus::Finalized);
     }
 
     #[test]
@@ -1596,13 +1602,13 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         assert_eq!(finalize(mid, None).unwrap(), 0, "no panic without a git repo");
         assert_eq!(phase_status_now("p1"), PhaseStatus::Complete);
-        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Finalized);
     }
 
     #[test]
     #[serial_test::serial]
     fn finalize_leaves_no_phase_non_terminal_impossibility_pin() {
-        // (#1463) The invariant the removed "Closed + non-terminal phase" drift
+        // (#1463) The invariant the removed "Finalized + non-terminal phase" drift
         // detector used to guard: after finalize, NO phase is left non-terminal.
         let _g = CrewEnvGuard::new();
         let _cwd = NonGitCwdGuard::new();
@@ -1618,14 +1624,14 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         assert_eq!(finalize(mid, None).unwrap(), 0);
         assert!(every_phase_terminal(mid), "finalize must leave EVERY phase terminal");
-        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Finalized);
     }
 
     #[test]
     #[serial_test::serial]
     fn abort_leaves_no_phase_non_terminal_impossibility_pin() {
         // (#1463) Same invariant for the kill terminal: after abort, NO phase is
-        // left non-terminal. A Closed mission can no longer strand a Planned or
+        // left non-terminal. A Finalized mission can no longer strand a Planned or
         // Running phase — the impossibility the removed detector arm asserted.
         let _g = CrewEnvGuard::new();
         let _cwd = NonGitCwdGuard::new();
@@ -1641,7 +1647,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         assert_eq!(abort(mid, None).unwrap(), 0);
         assert!(every_phase_terminal(mid), "abort must leave EVERY phase terminal");
-        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Closed);
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Finalized);
     }
 
     // ── (#1463 CONSIDER 6) branch force-delete guard (pure) ──────────────────

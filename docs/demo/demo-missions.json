@@ -12,11 +12,11 @@
     {
       "id": "demo-shipped",
       "description": "Per-turn token telemetry — the savings odometer.",
-      "status": "closed",
+      "status": "finalized",
       "phase_ids": ["demo-feature"],
       "created_ts": 1779410000,
       "started_ts": 1779410000,
-      "closed_ts": 1779495000
+      "finalized_ts": 1779495000
     }
   ],
   "generated_at_ms": 1779497611000

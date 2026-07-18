@@ -89,7 +89,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// carrying the old column name is harmless — it's just detected as
 /// stale by this bump and rebuilt from the JSON source-of-truth (which
 /// itself is read-compat via serde aliases, see `Mission::phase_ids`).
-const SCHEMA_VERSION: i32 = 6;
+///
+/// Bumped 6 -> 7 for the Closed -> Finalized rename (#1463 lineage): the
+/// `missions` table's `closed_ts` column is now `finalized_ts`, and the
+/// `status` CHECK constraint's `'closed'` literal is now `'finalized'`.
+/// Same self-heal story as the prior bump — a stale on-disk index is
+/// harmless, detected as stale by this bump, and rebuilt from the JSON
+/// source-of-truth (itself read-compat via `MissionStatus`'s `alias =
+/// "closed"` / `Mission::finalized_ts`'s `alias = "closed_ts"`).
+const SCHEMA_VERSION: i32 = 7;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS source_files (
@@ -175,13 +183,13 @@ CREATE TABLE IF NOT EXISTS crew_members (
 );
 
 CREATE TABLE IF NOT EXISTS missions (
-    id          TEXT PRIMARY KEY,
-    description TEXT NOT NULL,
-    status      TEXT NOT NULL CHECK (status IN ('active','closed','paused')),
-    created_ts  INTEGER NOT NULL,
-    started_ts  INTEGER,  -- Active transition; #95
-    closed_ts   INTEGER,  -- Closed transition (terminal); #95
-    paused_ts   INTEGER   -- most-recent Paused transition; #95
+    id           TEXT PRIMARY KEY,
+    description  TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('active','finalized','paused')),
+    created_ts   INTEGER NOT NULL,
+    started_ts   INTEGER,  -- Active transition; #95
+    finalized_ts INTEGER,  -- Finalized transition (terminal); #95, renamed from closed_ts (#1463 lineage)
+    paused_ts    INTEGER   -- most-recent Paused transition; #95
 );
 
 CREATE TABLE IF NOT EXISTS phases (
@@ -352,7 +360,7 @@ fn position_str(p: Position) -> &'static str {
 fn mission_status_str(s: MissionStatus) -> &'static str {
     match s {
         MissionStatus::Active => "active",
-        MissionStatus::Closed => "closed",
+        MissionStatus::Finalized => "finalized",
         MissionStatus::Paused => "paused",
     }
 }
@@ -592,7 +600,7 @@ fn populate(conn: &mut Connection) -> Result<()> {
     // Missions.
     for mission in &missions {
         tx.execute(
-            "INSERT INTO missions (id, description, status, created_ts, started_ts, closed_ts, paused_ts)
+            "INSERT INTO missions (id, description, status, created_ts, started_ts, finalized_ts, paused_ts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 mission.id,
@@ -600,7 +608,7 @@ fn populate(conn: &mut Connection) -> Result<()> {
                 mission_status_str(mission.status),
                 mission.created_ts as i64,
                 mission.started_ts.map(|t| t as i64),
-                mission.closed_ts.map(|t| t as i64),
+                mission.finalized_ts.map(|t| t as i64),
                 mission.paused_ts.map(|t| t as i64),
             ],
         )?;
@@ -1731,7 +1739,7 @@ mod tests {
     }
 
     /// (#914) A pre-#95 index whose `missions` table predates the
-    /// `started_ts`/`closed_ts`/`paused_ts` columns. Pre-fix, the
+    /// `started_ts`/`finalized_ts`/`paused_ts` columns. Pre-fix, the
     /// `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL skipped the existing table
     /// (so a `populate` INSERT with `started_ts` crashed, or rolled back to
     /// stale data). The self-healing drop+recreate in `init_schema` must
@@ -1929,9 +1937,9 @@ mod tests {
             (
                 "missions",
                 &[
-                    "closed_ts",
                     "created_ts",
                     "description",
+                    "finalized_ts",
                     "id",
                     "paused_ts",
                     "started_ts",

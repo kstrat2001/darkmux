@@ -248,7 +248,7 @@ pub(crate) enum Cmd {
         sub: RoleCmd,
     },
     /// Mission lifecycle — transition missions through their state machine.
-    /// Mission status flows: Active ↔ Paused → Closed. All transitions are
+    /// Mission status flows: Active ↔ Paused → Finalized. All transitions are
     /// operator-explicit; nothing auto-decides a mission is paused or done.
     /// Wall-clock UI consumes mission timestamps via `darkmux serve`.
     Mission {
@@ -335,7 +335,7 @@ pub(crate) enum RoleCmd {
 pub(crate) enum MissionCmd {
     /// Global mission-control read (#829): the whole board — every mission
     /// grouped by status with phase progress, the inconsistencies that need
-    /// attention (a Closed mission with a non-terminal phase; an open mission
+    /// attention (a Finalized mission with a non-terminal phase; an open mission
     /// whose phases are all done), and copy-pasteable reconcile commands.
     /// READ-ONLY — surfaces and suggests, never mutates. The CLI twin of the
     /// viewer's missions lens; run it as session-start housekeeping.
@@ -378,8 +378,8 @@ pub(crate) enum MissionCmd {
     },
     /// Finalize a mission — the SUCCESS terminal (#1463). Drives every
     /// non-terminal phase to `Complete`, tears down each phase's worktree +
-    /// branch, and transitions the mission to `Closed` (stamps
-    /// `closed_ts=now()`). The frontier orchestrator does the git/gh work by
+    /// branch, and transitions the mission to `Finalized` (stamps
+    /// `finalized_ts=now()`). The frontier orchestrator does the git/gh work by
     /// hand (commit/push/PR/merge — its native job), then calls this to close
     /// out the darkmux-side state. The clear opposite of `abort` (which records
     /// `Abandoned` instead of `Complete`); both clean up whatever exists. Named

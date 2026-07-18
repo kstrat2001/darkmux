@@ -1480,7 +1480,7 @@ mod tests {
         for phase_id in &phase_ids {
             assert_eq!(phase_status(&mission_id, phase_id), "complete", "clean run completes every phase");
         }
-        assert_eq!(mission_status_str(&mission_id), "closed", "clean run closes the mission");
+        assert_eq!(mission_status_str(&mission_id), "finalized", "clean run finalizes the mission");
     }
 
     #[test]
@@ -1500,7 +1500,7 @@ mod tests {
             let status = phase_status(&mission_id, phase_id);
             assert_eq!(status, "abandoned", "a degenerate Ok(env) must abandon, never complete: {status}");
         }
-        assert_eq!(mission_status_str(&mission_id), "closed");
+        assert_eq!(mission_status_str(&mission_id), "finalized");
     }
 
     #[test]
@@ -1516,7 +1516,7 @@ mod tests {
         for phase_id in &phase_ids {
             assert_eq!(phase_status(&mission_id, phase_id), "abandoned");
         }
-        assert_eq!(mission_status_str(&mission_id), "closed");
+        assert_eq!(mission_status_str(&mission_id), "finalized");
     }
 
     /// (C5, #1284 Packet 4b review gate) The review-shaped RERUN path,
@@ -1534,7 +1534,7 @@ mod tests {
         let clean: Result<ReviewEnvelope> = Ok(ReviewEnvelope { degenerate: None, ..Default::default() });
         let ids: [&str; 3] = [&phase_ids[0], &phase_ids[1], &phase_ids[2]];
         finalize_review_mission(&mission_id, &ids, &clean);
-        assert_eq!(mission_status_str(&mission_id), "closed");
+        assert_eq!(mission_status_str(&mission_id), "finalized");
 
         // Re-run the SAME case through the same mint path.
         let (mission_id2, _) = mint_review_instance(case);

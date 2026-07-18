@@ -43,12 +43,12 @@
 //!   This is the only transition that clears a `*_ts` field.
 //!
 //! Mission:
-//!   | from     | start             | close                | pause                 | resume                | reopen ⁴              |
-//!   |----------|-------------------|----------------------|-----------------------|------------------------|-----------------------|
-//!   | `Active` | error if          | → Closed ✓           | → Paused ✓            | error: already Active | error: not Closed     |
-//!   |          | started_ts set ²  |                      |                       |                        |                       |
-//!   | `Paused` | error: use resume | → Closed ✓           | error: already Paused | → Active ³            | error: use resume     |
-//!   | `Closed` | error: terminal   | error: already       | error: terminal       | error: terminal       | → Active ⁴ ✓          |
+//!   | from        | start             | close                | pause                 | resume                | reopen ⁴              |
+//!   |-------------|-------------------|----------------------|-----------------------|------------------------|-----------------------|
+//!   | `Active`    | error if          | → Finalized ✓        | → Paused ✓            | error: already Active | error: not Finalized  |
+//!   |             | started_ts set ²  |                      |                       |                        |                       |
+//!   | `Paused`    | error: use resume | → Finalized ✓        | error: already Paused | → Active ³            | error: use resume     |
+//!   | `Finalized` | error: terminal   | error: already       | error: terminal       | error: terminal       | → Active ⁴ ✓          |
 //!
 //! ² `mission_start` requires a fresh start — it stamps `started_ts=now()`
 //!   on first invocation and errors thereafter. Use `mission resume` to
@@ -56,12 +56,13 @@
 //!   mission running.
 //! ³ Resume does NOT clear `paused_ts` — operator may want to see when
 //!   the most recent pause occurred even after resuming.
-//! ⁴ `mission_reopen` (#1372) is the ONLY way out of `Closed` — Closed is
-//!   terminal for every OTHER transition, by design, so a fresh path was
-//!   needed rather than loosening `start`/`resume`'s own guards. Clears
-//!   `closed_ts` (mirrors `phase_start`'s "restart clears the prior
-//!   terminal timestamp" convention — the attempt starting now supersedes
-//!   the old closure). System-triggered only today (no CLI verb — see
+//! ⁴ `mission_reopen` (#1372) is the ONLY way out of `Finalized` —
+//!   Finalized is terminal for every OTHER transition, by design, so a
+//!   fresh path was needed rather than loosening `start`/`resume`'s own
+//!   guards. Clears `finalized_ts` (mirrors `phase_start`'s "restart
+//!   clears the prior terminal timestamp" convention — the attempt
+//!   starting now supersedes the old closure). System-triggered only
+//!   today (no CLI verb — see
 //!   `mission_reopen_with_reasoning`'s own doc); a human-operator-facing
 //!   `darkmux mission reopen` verb is a natural follow-up, out of scope
 //!   here.
@@ -549,7 +550,7 @@ pub(crate) fn load_phase_by_id(phase_id: &str) -> Result<Phase> {
 
 /// (#1433) Read a mission by id for a caller that needs its current status —
 /// `envelope::finalize_mission` classifies a `mission_close` refusal (benign
-/// already-Closed vs genuine drift) off this. Thin pub(crate) wrapper over the
+/// already-Finalized vs genuine drift) off this. Thin pub(crate) wrapper over the
 /// private loader; the `Err` (missing file, parse failure) is itself treated
 /// as "unknown status" by the classifier.
 pub(crate) fn load_mission_by_id(id: &str) -> Result<Mission> {
@@ -759,7 +760,7 @@ pub fn mission_start_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
             bail!("mission `{id}` is already Active and was started at ts={:?}", mission.started_ts)
         }
         MissionStatus::Paused => bail!("mission `{id}` is Paused — use `mission resume` instead"),
-        MissionStatus::Closed => bail!("mission `{id}` is Closed (terminal) — create a new mission instead"),
+        MissionStatus::Finalized => bail!("mission `{id}` is Finalized (terminal) — create a new mission instead"),
         MissionStatus::Active => {}
     }
     mission.status = MissionStatus::Active;
@@ -769,7 +770,7 @@ pub fn mission_start_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
     Ok(mission)
 }
 
-/// `mission close <id>` — Active/Paused → Closed (terminal).
+/// `mission close <id>` — Active/Paused → Finalized (terminal).
 #[allow(dead_code)]
 pub(crate) fn mission_close(id: &str) -> Result<Mission> {
     mission_close_with_reasoning(id, None)
@@ -779,10 +780,10 @@ pub fn mission_close_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
     let mut mission = load_mission(id)?;
     match mission.status {
         MissionStatus::Active | MissionStatus::Paused => {}
-        MissionStatus::Closed => bail!("mission `{id}` is already Closed"),
+        MissionStatus::Finalized => bail!("mission `{id}` is already Finalized"),
     }
-    mission.status = MissionStatus::Closed;
-    mission.closed_ts = Some(now_unix());
+    mission.status = MissionStatus::Finalized;
+    mission.finalized_ts = Some(now_unix());
     save_json(&mission_path(id), &mission)?;
     emit_mission_transition_record_with_reasoning(id, "mission close", reasoning);
     Ok(mission)
@@ -800,7 +801,7 @@ pub fn mission_pause_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
     match mission.status {
         MissionStatus::Active => {}
         MissionStatus::Paused => bail!("mission `{id}` is already Paused"),
-        MissionStatus::Closed => bail!("mission `{id}` is Closed — can't pause a finished mission"),
+        MissionStatus::Finalized => bail!("mission `{id}` is Finalized — can't pause a finished mission"),
     }
     mission.status = MissionStatus::Paused;
     mission.paused_ts = Some(now_unix());
@@ -821,7 +822,7 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
     match mission.status {
         MissionStatus::Paused => {}
         MissionStatus::Active => bail!("mission `{id}` is already Active"),
-        MissionStatus::Closed => bail!("mission `{id}` is Closed — can't resume a finished mission"),
+        MissionStatus::Finalized => bail!("mission `{id}` is Finalized — can't resume a finished mission"),
     }
     mission.status = MissionStatus::Active;
     save_json(&mission_path(id), &mission)?;
@@ -829,18 +830,18 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
     Ok(mission)
 }
 
-/// `mission reopen <id>` — Closed → Active (#1372). The ONLY legal
-/// transition OUT of Closed — every other verb treats Closed as terminal
-/// by design (see the module doc's state table), so a re-run that reuses a
-/// finalized mission id needs this dedicated path rather than a loosened
-/// `start`/`resume` guard.
+/// `mission reopen <id>` — Finalized → Active (#1372). The ONLY legal
+/// transition OUT of Finalized — every other verb treats Finalized as
+/// terminal by design (see the module doc's state table), so a re-run that
+/// reuses a finalized mission id needs this dedicated path rather than a
+/// loosened `start`/`resume` guard.
 ///
-/// Clears `closed_ts` (mirrors `phase_start`'s "restart clears the prior
-/// terminal timestamp" convention, `Abandoned → Running`) — the attempt
-/// starting now supersedes the old closure; a caller checking `closed_ts`
-/// for "when did this mission last finish" shouldn't see a stale value
-/// from before the reopen. `started_ts` is left untouched (the mission's
-/// original start time is still meaningful provenance).
+/// Clears `finalized_ts` (mirrors `phase_start`'s "restart clears the
+/// prior terminal timestamp" convention, `Abandoned → Running`) — the
+/// attempt starting now supersedes the old closure; a caller checking
+/// `finalized_ts` for "when did this mission last finish" shouldn't see a
+/// stale value from before the reopen. `started_ts` is left untouched
+/// (the mission's original start time is still meaningful provenance).
 ///
 /// System-triggered only today — `build_mission_for_review`'s reuse-of-a-
 /// terminal-mission fix (#1372) is the only caller. A human-operator-
@@ -857,12 +858,12 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
 pub fn mission_reopen_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
     let mut mission = load_mission(id)?;
     match mission.status {
-        MissionStatus::Closed => {}
+        MissionStatus::Finalized => {}
         MissionStatus::Active => bail!("mission `{id}` is already Active"),
         MissionStatus::Paused => bail!("mission `{id}` is Paused — use `mission resume` instead"),
     }
     mission.status = MissionStatus::Active;
-    mission.closed_ts = None; // reopen clears the prior closure, mirrors phase_start
+    mission.finalized_ts = None; // reopen clears the prior closure, mirrors phase_start
     save_json(&mission_path(id), &mission)?;
     emit_mission_transition_record_with_reasoning(id, "mission reopen", reasoning);
     Ok(mission)
@@ -1103,7 +1104,7 @@ mod tests {
             phase_ids: Vec::new(),
             created_ts: 1_700_000_000,
             started_ts: None,
-            closed_ts: None,
+            finalized_ts: None,
             paused_ts: None,
             source_input: None,
             ticket: None,
@@ -1252,21 +1253,21 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn mission_close_from_active_sets_closed_and_closed_ts() {
+    fn mission_close_from_active_sets_finalized_and_finalized_ts() {
         let _g = CrewGuard::new();
         seed_mission("m4", MissionStatus::Active);
         let updated = mission_close("m4").unwrap();
-        assert_eq!(updated.status, MissionStatus::Closed);
-        assert!(updated.closed_ts.is_some());
+        assert_eq!(updated.status, MissionStatus::Finalized);
+        assert!(updated.finalized_ts.is_some());
     }
 
     #[serial_test::serial]
     #[test]
     fn mission_close_terminal_state_errors() {
         let _g = CrewGuard::new();
-        seed_mission("m5", MissionStatus::Closed);
+        seed_mission("m5", MissionStatus::Finalized);
         let err = mission_close("m5").unwrap_err();
-        assert!(err.to_string().contains("already Closed"));
+        assert!(err.to_string().contains("already Finalized"));
     }
 
     #[serial_test::serial]
@@ -1304,15 +1305,15 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn mission_reopen_from_closed_sets_active_and_clears_closed_ts() {
+    fn mission_reopen_from_finalized_sets_active_and_clears_finalized_ts() {
         let _g = CrewGuard::new();
-        let mut m = seed_mission("m8", MissionStatus::Closed);
-        m.closed_ts = Some(1_700_000_900);
+        let mut m = seed_mission("m8", MissionStatus::Finalized);
+        m.finalized_ts = Some(1_700_000_900);
         save_json(&mission_path("m8"), &m).unwrap();
 
         let reopened = mission_reopen_with_reasoning("m8", Some("review re-run")).unwrap();
         assert_eq!(reopened.status, MissionStatus::Active);
-        assert!(reopened.closed_ts.is_none(), "reopen clears the prior closure, mirroring phase_start");
+        assert!(reopened.finalized_ts.is_none(), "reopen clears the prior closure, mirroring phase_start");
     }
 
     #[serial_test::serial]

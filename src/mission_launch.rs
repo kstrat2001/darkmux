@@ -658,7 +658,7 @@ fn new_planned_phase(
 /// phase Planned and started via the real `mission_start_with_reasoning`
 /// lifecycle verb (so the standard "mission start" flow record lands); an
 /// EXISTING mission (same derived id → same prior launch) is reopened if the
-/// prior run left it Closed, any Abandoned phase is restarted, and any phase
+/// prior run left it Finalized, any Abandoned phase is restarted, and any phase
 /// the config declares that the old instance is MISSING (the config grew a
 /// phase since the prior launch — #1284 review round 1, consider 5) is
 /// minted Planned and appended to `phase_ids` — never re-created from
@@ -712,7 +712,7 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
     if mission_path.exists() {
         if let Ok(text) = std::fs::read_to_string(&mission_path) {
             if let Ok(mission) = serde_json::from_str::<Mission>(&text) {
-                if mission.status == MissionStatus::Closed {
+                if mission.status == MissionStatus::Finalized {
                     let default_reasoning = format!("relaunch of config `{}`", config.id);
                     crew::lifecycle::mission_reopen_with_reasoning(
                         mission_id,
@@ -784,7 +784,7 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
         phase_ids: config.phases.iter().map(|p| real_phase_ids[&p.id].clone()).collect(),
         created_ts: now,
         started_ts: None,
-        closed_ts: None,
+        finalized_ts: None,
         paused_ts: None,
         // (must-fix 2) Hydrate from the config's extras overflow — where
         // `mission propose` preserves the operator's verbatim words (#815)
@@ -1333,7 +1333,7 @@ pub(crate) fn lazy_start_phase_for_step(
 /// uniform run-level outcome. The old uniform mapping marked a never-started
 /// (`Planned`) phase `Complete` on a `Degraded` run; `finalize_mission` then
 /// called `phase_complete` on a `Planned` phase, which the state machine
-/// refuses, leaving a Closed mission with a permanently `Planned` phase whose
+/// refuses, leaving a Finalized mission with a permanently `Planned` phase whose
 /// `envelope.json` disagreed with disk. The honest per-phase rules:
 ///
 /// - all of the phase's steps `Complete` (and it has at least one) → Complete
@@ -1672,7 +1672,7 @@ mod tests {
         let closed: Mission =
             serde_json::from_str(&std::fs::read_to_string(crew::lifecycle::mission_path(&mission_id)).unwrap())
                 .unwrap();
-        assert_eq!(closed.status, MissionStatus::Closed);
+        assert_eq!(closed.status, MissionStatus::Finalized);
 
         // Relaunch: same config, same (empty) inputs -> reopens the SAME
         // instance (Packet 2 reopen semantics) rather than minting a
@@ -1683,7 +1683,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(crew::lifecycle::mission_path(&mission_id)).unwrap())
                 .unwrap();
         assert_eq!(reopened.status, MissionStatus::Active, "relaunch must reopen a terminal instance");
-        assert!(reopened.closed_ts.is_none(), "reopen clears the prior closure");
+        assert!(reopened.finalized_ts.is_none(), "reopen clears the prior closure");
         assert_eq!(reopened.id, mission_id, "relaunch reuses the SAME instance id, never a duplicate");
     }
 
@@ -1864,7 +1864,7 @@ mod tests {
             phase_ids: vec![phase_id.to_string()],
             created_ts: now,
             started_ts: Some(now),
-            closed_ts: None,
+            finalized_ts: None,
             paused_ts: None,
             source_input: None,
             ticket: None,
@@ -2204,7 +2204,7 @@ mod tests {
     }
 
     /// (#1400 + #1372) The reopen-semantics regression test: a relaunch of
-    /// a Closed mission must restart ONLY what reruns. Simulates a prior
+    /// a Finalized mission must restart ONLY what reruns. Simulates a prior
     /// partial run — phase 1 finished cleanly (`Complete`), phase 2
     /// errored and was abandoned (`Abandoned`) — then reopens the SAME
     /// mission id and asserts the reopen itself touches NEITHER phase's
@@ -2228,7 +2228,7 @@ mod tests {
         crew::lifecycle::phase_start(p2).unwrap();
         crew::lifecycle::phase_abandon(p2).unwrap();
         crew::lifecycle::mission_close_with_reasoning(mission_id, Some("test close")).unwrap();
-        assert_eq!(mission_status_on_disk(mission_id), MissionStatus::Closed);
+        assert_eq!(mission_status_on_disk(mission_id), MissionStatus::Finalized);
 
         // Relaunch (reopen) the SAME mission id.
         let (real_phase_ids2, reused) = ensure_mission_and_phases(mission_id, &config).unwrap();
@@ -2305,7 +2305,7 @@ mod tests {
             phase_ids: phases.iter().map(|(id, _)| id.to_string()).collect(),
             created_ts: now,
             started_ts: Some(now),
-            closed_ts: None,
+            finalized_ts: None,
             paused_ts: None,
             source_input: None,
             ticket: None,
@@ -2436,10 +2436,10 @@ mod tests {
         // (#1433 follow-up) The pre-graph strand window: a `?` before interpret
         // ever produced tasks (a config-snapshot write fault, an interpret
         // fault). Reconcile runs with EMPTY tasks/steps — nothing to flip, no
-        // per-phase outcomes to derive — so the mission is driven Closed while
-        // its phases stay Planned. That Closed-with-Planned shape is the honest,
-        // surfaced outcome (no stranded Active mission); `mission status` flags
-        // the phase drift for the operator to reconcile.
+        // per-phase outcomes to derive — so the mission is driven Finalized
+        // while its phases stay Planned. That Finalized-with-Planned shape is
+        // the honest, surfaced outcome (no stranded Active mission); `mission
+        // status` flags the phase drift for the operator to reconcile.
         let _guard = LaunchTestGuard::new();
         let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
         let mid = "gen3strand";
@@ -2454,7 +2454,7 @@ mod tests {
         let mut no_steps = BTreeMap::new();
         reconcile_and_finalize_on_error(mid, &config, &real, &[], &mut no_steps, &err);
 
-        assert_eq!(mission_status_on_disk(mid), MissionStatus::Closed, "no stranded Active mission");
+        assert_eq!(mission_status_on_disk(mid), MissionStatus::Finalized, "no stranded Active mission");
         for rp in [&rp1, &rp2, &rp3] {
             assert_eq!(
                 phase_status_on_disk(mid, rp),
@@ -2469,9 +2469,9 @@ mod tests {
     fn finalize_the_1406_scenario_agrees_with_disk() {
         // (#1406) End to end: build the honest envelope for the issue's
         // scenario and finalize it against seeded disk state, asserting the
-        // mission Closes with p1 Complete, p2 terminal-not-complete, p3
-        // Abandoned (no phase left Planned inside a Closed mission), and the
-        // persisted envelope.json agrees with the phase files.
+        // mission Finalizes with p1 Complete, p2 terminal-not-complete, p3
+        // Abandoned (no phase left Planned inside a Finalized mission), and
+        // the persisted envelope.json agrees with the phase files.
         let _guard = LaunchTestGuard::new();
         let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
         let mid = "gen3";
@@ -2500,10 +2500,10 @@ mod tests {
         assert_ne!(
             phase_status_on_disk(mid, &rp3),
             PhaseStatus::Planned,
-            "p3 must NEVER be left Planned inside a Closed mission (the #1406 bug)"
+            "p3 must NEVER be left Planned inside a Finalized mission (the #1406 bug)"
         );
         assert_eq!(phase_status_on_disk(mid, &rp3), PhaseStatus::Abandoned);
-        assert_eq!(mission_status_on_disk(mid), MissionStatus::Closed);
+        assert_eq!(mission_status_on_disk(mid), MissionStatus::Finalized);
 
         // Envelope-on-disk agrees with the phase files.
         use crew::envelope::PhaseOutcomeKind;
@@ -2555,7 +2555,7 @@ mod tests {
         // The mission reaches a terminal status with honest per-phase
         // outcomes (p1 completed before the failure; p2 interrupted; p3 never
         // reached).
-        assert_eq!(mission_status_on_disk(mid), MissionStatus::Closed, "the failed run is no longer stranded Active");
+        assert_eq!(mission_status_on_disk(mid), MissionStatus::Finalized, "the failed run is no longer stranded Active");
         assert_eq!(phase_status_on_disk(mid, &rp1), PhaseStatus::Complete);
         assert_eq!(phase_status_on_disk(mid, &rp2), PhaseStatus::Abandoned);
         assert_eq!(phase_status_on_disk(mid, &rp3), PhaseStatus::Abandoned);
