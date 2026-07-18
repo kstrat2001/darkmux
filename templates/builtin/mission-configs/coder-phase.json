@@ -2,7 +2,7 @@
   "id": "coder-phase",
   "name": "Coder Phase",
   "description": "The 3-Task/3-Step graph `darkmux mission launch coder-phase` runs for one phase: prepare a git worktree, dispatch a specialist role into it, run mechanical verify (code-reviewer). A strict linear chain (worktree -> coder -> verify, each depends_on the last). This document is the EXECUTABLE source of truth for that graph; the launch path resolves role/workdir/image as task_overrides and calls mission_config::interpret, and the Tier-3 step kinds it references (mission.worktree/mission.coder/mission.verify) live in src/coder_phase.rs, the launch-owned module (#1426 ship-4 retired the `mission run` verb and its hand-built default_phase_graph launcher). ID SCHEME (placeholder-prefix rule): every task/step id below carries the literal `build-` prefix standing in for the launcher's real composed phase id -- mission_config::interpret substitutes it at launch (`{phase_id}-worktree`, `{phase_id}-coder`, `{phase_id}-verify`; steps append `-step`), so persisted ids stay stable across launches, byte for byte.",
-  "schema_version": "1.2",
+  "schema_version": "1.3",
   "inputs": [
     {
       "name": "workdir",

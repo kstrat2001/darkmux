@@ -4009,9 +4009,12 @@
         let loaded = darkmux_crew::mission_config::load("review").expect("embedded review config loads");
 
         let mut expansions = std::collections::BTreeMap::new();
+        // (#1475 packet 2) The probe stage expands over the probe ROLES now
+        // (`probe_roles`, not the retired `probe_seats`). Two items still yield
+        // two probe tasks — the node-count shape this test pins is unchanged.
         expansions.insert(
-            "probe_seats".to_string(),
-            vec!["seat-a".to_string(), "seat-b".to_string()],
+            "probe_roles".to_string(),
+            vec!["review-probe-high".to_string(), "review-probe-mid".to_string()],
         );
         let params = darkmux_crew::mission_config::LaunchParams {
             phase_ids: std::collections::BTreeMap::new(),

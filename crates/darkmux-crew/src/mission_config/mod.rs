@@ -54,10 +54,13 @@ use std::collections::{BTreeMap, BTreeSet};
 /// optional `display_name` field (an operator-facing short label, split
 /// from `description` which is deliberately long — see each field's own
 /// doc), and [`ExpansionSpec`] gained the optional `display_name_pattern`
-/// twin of its existing `description_pattern`. Bump discipline (see
-/// `CLAUDE.md`'s "Versioning" — same rule, different data shape): additive
-/// field/section → minor; rename/retype/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "1.2";
+/// twin of its existing `description_pattern`. Bumped to "1.3" (#1475 packet
+/// 2) — additive: [`ExpansionSpec`] gained the optional `role_pattern` (a
+/// per-expanded-copy `role_id`, so the review probe stage binds one distinct
+/// role per expanded task). Bump discipline (see `CLAUDE.md`'s "Versioning" —
+/// same rule, different data shape): additive field/section → minor;
+/// rename/retype/new-required-field → major.
+pub const MISSION_CONFIG_SCHEMA: &str = "1.3";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -264,6 +267,16 @@ pub struct ExpansionSpec {
     /// distinct per-copy label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name_pattern: Option<String>,
+    /// (#1475 packet 2, schema 1.3) Per-copy `role_id` pattern. When present,
+    /// each expanded copy's `Task.role_id` renders from it (`{name}` = the
+    /// item — for the review probe stage the item IS the probe role id, so
+    /// `role_pattern: "{name}"` binds copy 0 → `review-probe-high`, copy 1 →
+    /// `review-probe-mid`, copy 2 → `review-probe-low`). Absent falls back to
+    /// the template `TaskConfig.role_id` verbatim (every copy shares one role,
+    /// the pre-1.3 behavior) — this is how a config assigns a DISTINCT role
+    /// per expanded task, which the fixed template `role_id` could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_pattern: Option<String>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
@@ -809,6 +822,7 @@ mod tests {
                 kind_pattern: "{kind}:{name}".to_string(),
                 description_pattern: None,
                 display_name_pattern: None,
+                role_pattern: None,
                 extras: BTreeMap::new(),
             }),
             extras: BTreeMap::new(),
@@ -935,6 +949,10 @@ mod tests {
         assert_eq!(adjudicate.tasks[0].id, "review-judge-task");
         assert_eq!(adjudicate.tasks[0].depends_on, vec!["review-dedup-task"]);
         assert_eq!(adjudicate.tasks[0].steps[0].kind, "review.judge");
+        // (#1475 packet 2) The judge task assigns the `review-judge` role — the
+        // role→profile flip's model source (the crew is the task→role→profile
+        // rollup).
+        assert_eq!(adjudicate.tasks[0].role_id.as_deref(), Some("review-judge"));
         assert_eq!(
             adjudicate.tasks[0].steps[0].config,
             serde_json::json!({"concurrency": 1})
@@ -943,6 +961,8 @@ mod tests {
         let report = &cfg.phases[2];
         let report_task_ids: Vec<&str> = report.tasks.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(report_task_ids, vec!["review-verify-task", "review-synthesis-task"]);
+        // (#1475 packet 2) The verify task assigns the `review-verify` role.
+        assert_eq!(report.tasks[0].role_id.as_deref(), Some("review-verify"));
         // (#1442 ship-2b) The verify task is two sequential steps — the
         // bespoke frozen-prompt render, then the GENERIC dispatch.map the
         // stage's dispatches now ride.
@@ -967,13 +987,21 @@ mod tests {
             .expand
             .as_ref()
             .expect("probe-template task must declare an `expand` block");
-        assert_eq!(expand.over, "probe_seats");
+        // (#1475 packet 2) The probe stage now expands over the three probe
+        // ROLES (mint-time-known: `review-probe-high`/`-mid`/`-low`), not a
+        // resolver-fed seat/draw list. Each expanded copy binds its own role
+        // via `role_pattern`, so the crew is the task→role→profile→model
+        // rollup — diversity falls out of three distinct role bindings.
+        assert_eq!(expand.over, "probe_roles");
         assert_eq!(expand.task_id_pattern, "review-probe-{index}-task");
         assert_eq!(expand.step_id_pattern, "review-probe-{index}-step");
-        // (#1442 ship-2b) Every expanded (seat, draw) copy is the SAME
-        // generic kind — the seat identity lives in the stamped per-step
-        // config, not the kind id.
+        // (#1442 ship-2b) Every expanded copy is the SAME generic kind — the
+        // seat identity lives in the stamped per-step config, not the kind id.
         assert_eq!(expand.kind_pattern, "{kind}");
+        // (#1475 packet 2) Each expanded copy's role_id renders from the item
+        // (the probe role name) — the mechanism that binds one distinct role
+        // per expanded probe task.
+        assert_eq!(expand.role_pattern.as_deref(), Some("{name}"));
         assert_eq!(probe_template.steps[0].kind, "dispatch.map");
         // after expansion, review-dedup-task's depends_on must resolve to
         // every EXPANDED probe task id, not just this template's id — see
@@ -1137,8 +1165,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_1_2() {
-        // (#1398) Additive minor bump for the display_name field.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "1.2");
+    fn schema_version_constant_is_1_3() {
+        // (#1475 packet 2) Additive minor bump for the ExpansionSpec
+        // `role_pattern` field (per-expanded-copy role_id).
+        assert_eq!(MISSION_CONFIG_SCHEMA, "1.3");
     }
 }

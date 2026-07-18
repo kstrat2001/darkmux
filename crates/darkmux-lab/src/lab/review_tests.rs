@@ -18,6 +18,7 @@
     fn staffing(profile: &str, model: &str, k: u32) -> ResolvedSeatStaffing {
         ResolvedSeatStaffing {
             name: profile.to_string(),
+            role_id: None,
             pm: pm(model),
             k,
             // Default double-confirm — a test needing a different judge depth
@@ -2297,6 +2298,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     fn remote_staffing(profile: &str, model: &str, k: u32) -> ResolvedSeatStaffing {
         ResolvedSeatStaffing {
             name: profile.to_string(),
+            role_id: None,
             pm: remote_pm(model),
             k,
             passes: 2,
@@ -2475,6 +2477,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     fn graph_staffing(profile: &str, model: &str, k: u32) -> ResolvedSeatStaffing {
         ResolvedSeatStaffing {
             name: profile.to_string(),
+            role_id: None,
             pm: graph_pm(model),
             k,
             passes: 2,
@@ -2666,6 +2669,79 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             9,
             "bundle + 3 probe maps + dedup + judge + verify render + verify map + synthesis"
         );
+    }
+
+    /// (#1475 packet 2, THE FLIP) End-to-end: a role→profile crew (built via the
+    /// packet-2 resolver over a temp `role_profiles` map) flows through
+    /// `build_review_graph` and each probe task lands (a) role-bound
+    /// (`Task.role_id` = its probe role) and (b) with its dispatch config's
+    /// `model` = the model that role's PROFILE resolves to — the whole
+    /// task→role→profile→model rollup, not a roster-scored pick. Also pins the
+    /// envelope snapshot recording the role→profile resolution per seat.
+    #[test]
+    fn role_profile_crew_binds_each_probe_task_to_its_role_resolved_model() {
+        use darkmux_crew::resourcing::{resolve_review_role_crew_with, ReviewRoleStaffing};
+        use darkmux_types::{Profile, ProfileModel, ProfileRegistry};
+
+        let mk = |id: &str, n: u32| ProfileModel { id: id.into(), n_ctx: Some(n), ..Default::default() };
+        let mut profiles = BTreeMap::new();
+        profiles.insert("phigh".to_string(), Profile { models: vec![mk("m-high", 40000)], ..Default::default() });
+        profiles.insert("pmid".to_string(), Profile { models: vec![mk("m-mid", 40000)], ..Default::default() });
+        profiles.insert("plow".to_string(), Profile { models: vec![mk("m-low", 32000)], ..Default::default() });
+        let reg = ProfileRegistry {
+            profiles,
+            default_profile: Some("plow".to_string()),
+            ..Default::default()
+        };
+        let bindings: BTreeMap<String, String> = [
+            ("review-probe-high", "phigh"),
+            ("review-probe-mid", "pmid"),
+            ("review-probe-low", "plow"),
+        ]
+        .iter()
+        .map(|(r, p)| (r.to_string(), p.to_string()))
+        .collect();
+        let crew =
+            resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &|r| bindings.get(r).cloned())
+                .unwrap();
+
+        let seats = validate_review_crew(&crew).expect("role crew is a valid review crew");
+        let probes: Vec<_> = seats.probes.clone();
+        // The envelope snapshot records role → profile → model per seat.
+        let snap = staffing_snapshot(&probes, seats.judge, seats.verify, crew.request_changes);
+        assert_eq!(snap.probes[0].role_id.as_deref(), Some("review-probe-high"));
+        assert_eq!(snap.probes[0].name, "phigh", "the high probe's profile is recorded");
+        assert_eq!(snap.probes[0].provenance.as_ref().unwrap().kind, "role-profile");
+        assert_eq!(snap.probes[2].role_id.as_deref(), Some("review-probe-low"));
+
+        let ctx = step_ctx(&crew, vec![]);
+        let graph = build_review_graph(
+            ctx,
+            seats.judge.clone(),
+            seats.verify.cloned(),
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("role-driven review graph builds");
+
+        // Exactly three probe tasks, each bound to its distinct probe role.
+        let mut probe_tasks: Vec<_> =
+            graph.tasks.iter().filter(|t| t.id.starts_with("review-probe-") && t.id.ends_with("-task")).collect();
+        probe_tasks.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(probe_tasks.len(), 3, "one role-bound probe task per probe role");
+        assert_eq!(probe_tasks[0].role_id.as_deref(), Some("review-probe-high"));
+        assert_eq!(probe_tasks[1].role_id.as_deref(), Some("review-probe-mid"));
+        assert_eq!(probe_tasks[2].role_id.as_deref(), Some("review-probe-low"));
+
+        // Each probe step's stamped dispatch model is the model its ROLE's
+        // profile resolved to (namespaced local identifier) — the flip's core.
+        let model_of = |step_id: &str| graph.steps[step_id].config["model"].as_str().unwrap().to_string();
+        assert!(model_of("review-probe-0-step").contains("m-high"), "{}", model_of("review-probe-0-step"));
+        assert!(model_of("review-probe-1-step").contains("m-mid"), "{}", model_of("review-probe-1-step"));
+        assert!(model_of("review-probe-2-step").contains("m-low"), "{}", model_of("review-probe-2-step"));
     }
 
     /// (#1402) Pins `review_step_kind_display_name` (the pure lookup
@@ -3605,6 +3681,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 "review-probe",
                 vec![ResolvedSeatStaffing {
                     name: "fast".to_string(),
+                    role_id: None,
                     pm: graph_pm("probe-model"),
                     k: 2,
                     passes: 2,

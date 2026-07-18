@@ -1,0 +1,20 @@
+{
+  "id": "review-probe-low",
+  "role_family": "specialist",
+  "description": "Low-tier probe seat of the review pipeline (#1475 packet 2): one of three distinct probe roles whose recall diversity IS the crew's breadth (replacing k draws of one scored model). Shares the FROZEN probe persona (#1256) byte-for-byte with review-probe-high / review-probe-mid and the base review-probe seat — only the bound profile (and thus model) differs. The machine-local role_profiles map in config.json binds this role to a profile (`darkmux config set role_profiles.review-probe-low <profile>`); unbound, it falls back to default_profile (the fresh-user single-model floor). Deliberately tool-less and deliberately no output_schema (free prose, not a grammar-locked flag object).",
+  "skills": [
+    "code-reviewing"
+  ],
+  "tool_palette": {
+    "allow": [],
+    "deny": [
+      "read",
+      "write",
+      "edit",
+      "exec",
+      "process",
+      "update_plan"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation"
+}

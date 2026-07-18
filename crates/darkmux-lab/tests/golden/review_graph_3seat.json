@@ -144,49 +144,53 @@
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe seat `alpha/draw-0`",
-      "display_name": "Probe alpha/draw-0",
+      "description": "probe role `alpha`",
+      "display_name": "Probe alpha",
       "id": "review-probe-0-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-probe-0-step"
-      ]
+      ],
+      "role_id": "alpha"
     },
     {
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe seat `bravo/draw-0`",
-      "display_name": "Probe bravo/draw-0",
+      "description": "probe role `bravo`",
+      "display_name": "Probe bravo",
       "id": "review-probe-1-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-probe-1-step"
-      ]
+      ],
+      "role_id": "bravo"
     },
     {
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe seat `bravo/draw-1`",
-      "display_name": "Probe bravo/draw-1",
+      "description": "probe role `bravo`",
+      "display_name": "Probe bravo",
       "id": "review-probe-2-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-probe-2-step"
-      ]
+      ],
+      "role_id": "bravo"
     },
     {
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe seat `charlie/draw-0`",
-      "display_name": "Probe charlie/draw-0",
+      "description": "probe role `charlie`",
+      "display_name": "Probe charlie",
       "id": "review-probe-3-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
         "review-probe-3-step"
-      ]
+      ],
+      "role_id": "charlie"
     },
     {
       "depends_on": [
@@ -195,7 +199,7 @@
         "review-probe-2-task",
         "review-probe-3-task"
       ],
-      "description": "dedup probe flags \u2014 mechanism-family keying + anchor matching",
+      "description": "dedup probe flags — mechanism-family keying + anchor matching",
       "display_name": "Dedup",
       "id": "review-dedup-task",
       "phase_id": "pr-review-golden-investigate",
@@ -207,26 +211,28 @@
       "depends_on": [
         "review-dedup-task"
       ],
-      "description": "double-confirm judge \u2014 internal pass1/pass2 loop over deduped flags",
+      "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
       "display_name": "Judge",
       "id": "review-judge-task",
       "phase_id": "pr-review-golden-adjudicate",
       "step_ids": [
         "review-judge-step"
-      ]
+      ],
+      "role_id": "review-judge"
     },
     {
       "depends_on": [
         "review-judge-task"
       ],
-      "description": "verify \u2014 render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
+      "description": "verify — render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
       "display_name": "Verify",
       "id": "review-verify-task",
       "phase_id": "pr-review-golden-report",
       "step_ids": [
         "review-verify-render-step",
         "review-verify-step"
-      ]
+      ],
+      "role_id": "review-verify"
     },
     {
       "depends_on": [
@@ -234,7 +240,7 @@
         "review-judge-task",
         "review-verify-task"
       ],
-      "description": "synthesis \u2014 apply verify adjudications, finalize tier counts + needs-check clustering",
+      "description": "synthesis — apply verify adjudications, finalize tier counts + needs-check clustering",
       "display_name": "Synthesis",
       "id": "review-synthesis-task",
       "phase_id": "pr-review-golden-report",

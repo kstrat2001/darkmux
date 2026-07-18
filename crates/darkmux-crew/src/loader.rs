@@ -54,6 +54,14 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     // bail-with-explanation shape — the review dispatches both through the
     // container-free single-shot chat primitive, never the agent loop.
     ("review-probe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe.json"))),
+    // (#1475 packet 2) The three DISTINCT probe roles the role->profile flip
+    // staffs — each shares the FROZEN probe persona (#1256) byte-for-byte with
+    // review-probe (their .md is a verbatim copy); only the role_profiles
+    // binding (and thus model) differs. The crew's recall diversity IS these
+    // three distinct role->profile->model bindings.
+    ("review-probe-high", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-high.json"))),
+    ("review-probe-mid", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-mid.json"))),
+    ("review-probe-low", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-low.json"))),
     ("review-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-judge.json"))),
     // (#1260/#1177) Optional fourth review seat: one adjudication call per
     // double-confirmed finding (in practice staffed by a frontier endpoint).
@@ -111,6 +119,12 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     // (#1222 Phase B packet 4) Review seat prompts — frozen texts
     // (see the role JSON descriptions above for provenance).
     ("review-probe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe.md"))),
+    // (#1475 packet 2) The three probe roles' prompts are byte-identical copies
+    // of review-probe.md (the FROZEN #1256 persona) — probe recall diversity
+    // lives in the role->profile MODEL binding, never in the persona text.
+    ("review-probe-high", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-high.md"))),
+    ("review-probe-mid", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-mid.md"))),
+    ("review-probe-low", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe-low.md"))),
     ("review-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-judge.md"))),
     // (#1260) The verify seat's persona — frozen text (contract 6): the
     // byte-lock golden lives beside the other review-seat goldens in

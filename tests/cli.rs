@@ -1877,18 +1877,19 @@ fn pr_review_run_github_without_head_sha_rejected() {
         .stderr(predicate::str::contains("head_sha"));
 }
 
-/// (#1426 ship-2) A real (non `from_envelope`) run whose registry has no
-/// resolvable roster (no `default_profile`, and no `profile` param naming one)
-/// fails loud at the resourcing resolver, naming the missing roster, before any
-/// bundling/dispatch happens.
+/// (#1475 packet 2) A real (non `from_envelope`) run on a registry with a
+/// profile but NO `default_profile`, and no role→profile bindings (a bare
+/// DARKMUX_HOME with no `role_profiles` config), fails loud at role→profile
+/// resolution: an UNMAPPED review role has no `default_profile` floor to fall
+/// back to. Loud + named, before any bundling/dispatch happens.
 #[test]
-fn pr_review_run_no_roster_profile_errors_loudly() {
+fn pr_review_run_no_profile_binding_or_default_errors_loudly() {
     let tmp = TempDir::new().unwrap();
     let diff_path = tmp.path().join("pr.diff");
     fs::write(&diff_path, pr_review_run_diff()).unwrap();
     let profiles = tmp.path().join("profiles.json");
-    // A valid registry with a profile but NO default_profile — and the run
-    // names no `profile` param, so the resolver has no roster to score against.
+    // A valid registry with a profile but NO default_profile — and no
+    // role_profiles bindings, so every review role is unmapped with no floor.
     fs::write(
         &profiles,
         r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":32000}]}}}"#,
@@ -1897,6 +1898,10 @@ fn pr_review_run_no_roster_profile_errors_loudly() {
 
     Command::cargo_bin("darkmux")
         .unwrap()
+        // Isolate the config root so no operator `role_profiles` bindings leak
+        // in — a bare DARKMUX_HOME (no config.json) means every review role is
+        // unmapped, exercising the no-binding-and-no-default path deterministically.
+        .env("DARKMUX_HOME", tmp.path())
         .args([
             "mission",
             "launch",
@@ -1910,7 +1915,7 @@ fn pr_review_run_no_roster_profile_errors_loudly() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("roster profile"));
+        .stderr(predicate::str::contains("default_profile"));
 }
 
 // ─── review-bench --funnel flag plumbing (#1222 Phase B packet 7) ─────────

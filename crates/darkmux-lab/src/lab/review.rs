@@ -873,6 +873,15 @@ fn seat_endpoint(pm: &ProfileModel) -> Option<&ModelEndpoint> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeatStaffingSnapshot {
     pub name: String,
+    /// (#1475 packet 2) The review ROLE this seat was staffed for
+    /// (`review-probe-high`/`-mid`/`-low`, `review-judge`, `review-verify`)
+    /// when the role→profile flip produced it — so the envelope names WHICH
+    /// role bound this seat's profile+model, the truthful record of the
+    /// task→role→profile→model rollup (operator sovereignty #44). `Option` +
+    /// `#[serde(default)]`: absent on the legacy roster-scoring staffings and
+    /// on pre-#1475 snapshots, the module's standard schema-lenience.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_id: Option<String>,
     /// The darkmux-namespaced LMStudio identifier for a LOCAL seat; the
     /// profile's bare model id for a REMOTE one — the same form
     /// [`MemberRecord::model`] records, so the two line up at a glance.
@@ -960,6 +969,9 @@ pub fn staffing_snapshot(
     fn one(s: &ResolvedSeatStaffing) -> SeatStaffingSnapshot {
         SeatStaffingSnapshot {
             name: s.name.clone(),
+            // (#1475 packet 2) Carry the seat's bound role verbatim so the
+            // envelope records role → profile → model, not just profile+model.
+            role_id: s.role_id.clone(),
             model: seat_identifier(&s.pm),
             remote: s.pm.is_remote(),
             endpoint: seat_endpoint_host(&s.pm),
@@ -3512,9 +3524,9 @@ impl StepKind for ReviewBundleStepKind {
 /// boundary uses to reconstruct the review's domain results (raw
 /// [`ProbeFlag`]s, per-seat [`MemberRecord`] accounting, reduced-coverage
 /// warnings, the probe stage's remote budget row) from the generic
-/// `dispatch.map` fan-out's per-item results. The probe stage is `seats x k`
-/// sibling `dispatch.map` steps (one per `(seat, draw)`, minted by
-/// `build_review_graph`'s `probe_seats` expansion, sharing one
+/// `dispatch.map` fan-out's per-item results. The probe stage is one sibling
+/// `dispatch.map` step per probe ROLE (#1475 packet 2 — minted by
+/// `build_review_graph`'s `probe_roles` expansion, sharing one
 /// `bucket_group: "probe"` remote allowance); each spec records which draw
 /// TASK ids belong to this seat (index = draw) and which bundles its
 /// selector chose (in pre-rendered collection order), so reconstruction is
@@ -3758,7 +3770,7 @@ pub struct ReviewDedupStepKind {
     /// here — the reconstruction boundary (see `probe_specs` below).
     pub env: SharedReviewEnvelope,
     /// (#1442 ship-2b) The mint-time per-seat specs `build_review_graph`
-    /// computed alongside the `probe_seats` expansion — this step's `input`
+    /// computed alongside the `probe_roles` expansion (#1475 packet 2) — this step's `input`
     /// map (keyed by probe TASK id) is raw `MapItemResult` arrays from the
     /// generic `dispatch.map` fan-out, and [`reconstruct_probe_stage`]
     /// aligns them back into domain results against these specs before the
@@ -4633,8 +4645,8 @@ pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
 /// "review" mission config (`darkmux_crew::mission_config::load`), resolves
 /// every genuinely per-launch value THIS FUNCTION's own parameters carry —
 /// the three real phase ids, the resolved judge concurrency, and the
-/// config's one documented per-staffed-seat expansion (`probe_seats`, this
-/// call's `probes` in staffing order) — into
+/// config's one documented per-probe-role expansion (`probe_roles`, this
+/// call's `probes` in role order — #1475 packet 2, each seat's `role_id`) — into
 /// `mission_config::interpret::LaunchParams`, then calls
 /// `mission_config::interpret` to materialize the real `Vec<Task>` +
 /// `BTreeMap<String, Step>`. `interpret` does NOT construct `StepKind`
@@ -4682,19 +4694,25 @@ pub fn build_review_graph(
     phase_ids.insert("adjudicate".to_string(), adjudicate_phase_id.to_string());
     phase_ids.insert("report".to_string(), report_phase_id.to_string());
 
-    // (#1442 ship-2b) k is expansion FAN-OUT: the probe template expands
-    // into one task per (seat, draw) — both mint-time-known — so every draw
-    // is a visible graph node and the scheduler parallelizes draws. The
-    // item NAME feeds only the expanded task's description/display
-    // patterns; ids render from `{index}`.
+    // (#1475 packet 2) The probe stage expands over the probe ROLES — the item
+    // NAME is each seat's `role_id` (review-probe-high/-mid/-low in production,
+    // where the role→profile resolver staffs exactly one seat per role at k=1).
+    // review.json's `role_pattern: "{name}"` renders each expanded task's
+    // `role_id` from this same name, so the graph is role-bound. The item also
+    // feeds the description/display patterns; ids render from `{index}`. A
+    // hand-built staffing with no `role_id` (test crews) falls back to the
+    // profile name, and k still fans out per staffing — the SAME (seat, draw)
+    // ordering the config-stamping loop below walks, keeping item i ↔ the
+    // `review-probe-{i}` step.
     let mut probe_expansion: Vec<String> = Vec::new();
     for staffing in probes {
-        for draw in 0..staffing.k {
-            probe_expansion.push(format!("{}/draw-{draw}", staffing.name));
+        let item = staffing.role_id.as_deref().unwrap_or(staffing.name.as_str());
+        for _draw in 0..staffing.k {
+            probe_expansion.push(item.to_string());
         }
     }
     let mut expansions = std::collections::BTreeMap::new();
-    expansions.insert("probe_seats".to_string(), probe_expansion);
+    expansions.insert("probe_roles".to_string(), probe_expansion);
 
     // (#1284 Packet 3 worklist) `judge_concurrency` is ALWAYS an override,
     // never read back out of review.json's own static

@@ -30,6 +30,24 @@ pub const REVIEW_PROBE_ROLE: &str = "review-probe";
 pub const REVIEW_JUDGE_ROLE: &str = "review-judge";
 pub const REVIEW_VERIFY_ROLE: &str = "review-verify";
 
+/// (#1475 packet 2) The three distinct PROBE roles the role→profile flip
+/// staffs. The crew's recall diversity now falls out of three distinct
+/// role→profile→model bindings, not k draws of one scored model. All three
+/// SHARE the frozen probe persona (#1256): only the bound profile (and thus
+/// model) differs. The seat FAMILY key in [`ResolvedCrew::seats`] stays
+/// [`REVIEW_PROBE_ROLE`] (`"review-probe"`, what `validate_review_crew`
+/// keys on); each of the three staffings under it carries its own distinct
+/// `role_id` (high/mid/low) so role→profile resolution + the envelope
+/// snapshot can name which role bound which profile.
+pub const REVIEW_PROBE_HIGH_ROLE: &str = "review-probe-high";
+pub const REVIEW_PROBE_MID_ROLE: &str = "review-probe-mid";
+pub const REVIEW_PROBE_LOW_ROLE: &str = "review-probe-low";
+/// The three probe roles in graph order (high → mid → low) — the order the
+/// probe stage expands them into tasks, and the order the review driver
+/// stamps their per-seat config.
+pub const REVIEW_PROBE_ROLES: [&str; 3] =
+    [REVIEW_PROBE_HIGH_ROLE, REVIEW_PROBE_MID_ROLE, REVIEW_PROBE_LOW_ROLE];
+
 /// Probe-seat draw breadth default (matches the retired `SeatStaffing`
 /// default `k`, so an unpinned probe behaves as `review-deep`'s did).
 const DEFAULT_PROBE_K: u32 = 3;
@@ -69,6 +87,20 @@ impl StaffingProvenance {
             detail: format!("pinned by launch param {param}={model_id}"),
         }
     }
+    /// (#1475 packet 2) A seat staffed by the role→profile flip: the role was
+    /// resolved through the machine-local `role_profiles` map (`source =
+    /// "role_profiles map"`) or fell through to `default_profile` (`source =
+    /// "default_profile fallback"`, the fresh-user floor). Names the whole
+    /// role→profile→model chain so the envelope answers "where did this seat's
+    /// model come from" directly (operator sovereignty #44).
+    pub fn role_profile(role_id: &str, profile_name: &str, source: &str) -> Self {
+        StaffingProvenance {
+            kind: "role-profile".to_string(),
+            detail: format!(
+                "role \"{role_id}\" → profile \"{profile_name}\" ({source})"
+            ),
+        }
+    }
 }
 
 /// A seat staffing resolved to a concrete model — the resolver's per-seat
@@ -79,6 +111,13 @@ pub struct ResolvedSeatStaffing {
     /// The roster [`Profile`](darkmux_types::Profile) name this staffing
     /// dispatches through.
     pub name: String,
+    /// (#1475 packet 2) The review ROLE this seat was staffed for, when it
+    /// came from the role→profile flip — `review-probe-high`/`-mid`/`-low`,
+    /// `review-judge`, or `review-verify`. `None` for the legacy
+    /// roster-scoring resolver's staffings (which key seats by family, not by
+    /// a distinct per-seat role) and for hand-built test staffings. The
+    /// envelope snapshot records it so a run names which role bound each seat.
+    pub role_id: Option<String>,
     pub pm: ProfileModel,
     /// Probe-seat draw BREADTH (a union over draws — recall). Ignored by the
     /// judge/verify seats.
@@ -251,6 +290,7 @@ pub fn resolve_review_resourcing(
     let probes: Vec<ResolvedSeatStaffing> = if ov.probe_models.is_empty() {
         vec![ResolvedSeatStaffing {
             name: profile_name.clone(),
+            role_id: None,
             pm: scored_pm(REVIEW_PROBE_ROLE, "review-probe")?,
             k: probe_k,
             passes: DEFAULT_JUDGE_PASSES,
@@ -264,6 +304,7 @@ pub fn resolve_review_resourcing(
             .map(|id| {
                 Ok(ResolvedSeatStaffing {
                     name: profile_name.clone(),
+                    role_id: None,
                     pm: pm_for(id, "review-probe")?,
                     k: probe_k,
                     passes: DEFAULT_JUDGE_PASSES,
@@ -289,6 +330,7 @@ pub fn resolve_review_resourcing(
         REVIEW_JUDGE_ROLE.to_string(),
         vec![ResolvedSeatStaffing {
             name: profile_name.clone(),
+            role_id: None,
             pm: judge_pm,
             k: 1,
             passes: judge_passes,
@@ -314,6 +356,7 @@ pub fn resolve_review_resourcing(
         REVIEW_VERIFY_ROLE.to_string(),
         vec![ResolvedSeatStaffing {
             name: profile_name.clone(),
+            role_id: None,
             pm: verify_pm,
             k: 1,
             passes: 1,
@@ -328,6 +371,165 @@ pub fn resolve_review_resourcing(
         seats,
         request_changes: ov.request_changes,
     })
+}
+
+// ─── (#1475 packet 2) role→profile staffing — THE FLIP ──────────────────────
+
+/// (#1475 packet 2) Launch-time knobs for the role→profile review crew — the
+/// slice of [`ReviewResourcing`] that survives the flip. The per-seat MODEL is
+/// no longer chosen here (roster capability-scoring is retired for review);
+/// each seat's model resolves from its role's `role_profiles` binding. Only the
+/// non-model knobs remain: the judge's consensus DEPTH and the render's
+/// blocking-vs-advisory choice. (The three roster/seat model pins —
+/// `probe_models`/`judge_model`/`verify_model` — are gone here; the general
+/// per-run role→profile override lands in a later packet.)
+#[derive(Debug, Default, Clone)]
+pub struct ReviewRoleStaffing {
+    /// (#1266) Judge consensus DEPTH (`passes`) override. `None` =>
+    /// [`DEFAULT_JUDGE_PASSES`] (double-confirm). Validated `>= 1` here (a
+    /// zero-pass judge makes no ruling); governs the JUDGE seat only.
+    pub passes: Option<u32>,
+    /// Whether confirmed findings render as a blocking `REQUEST_CHANGES` review
+    /// (`true`) or an advisory `COMMENT` (`false`, the default).
+    pub request_changes: bool,
+}
+
+/// (#1475 packet 2) THE FLIP — staff the review crew from the machine-local
+/// role→profile map instead of roster capability-scoring. Each of the five
+/// review roles (`review-probe-high`/`-mid`/`-low`, `review-judge`,
+/// `review-verify`) resolves INDEPENDENTLY through
+/// [`darkmux_profiles::profiles::resolve_role_profile`]: role → `role_profiles`
+/// map → profile → model. An UNMAPPED role falls through to `default_profile`
+/// (the fresh-user floor — a bare machine with an empty map runs every seat on
+/// one model: works, no diversity; the operator populates the map for the real
+/// heterogeneous crew). A role MAPPED to a profile absent from the registry is
+/// a loud resolution error (packet 1's `resolve_role_profile_with` owns that
+/// message; `darkmux doctor` surfaces the same dangling binding).
+///
+/// Hands back the SAME [`ResolvedCrew`] shape the review driver + envelope
+/// snapshot already consume — only the PRODUCER changed (role→profile, not
+/// roster scoring). The three probe staffings land under the
+/// [`REVIEW_PROBE_ROLE`] family key (what `validate_review_crew` reads), each
+/// carrying its own distinct `role_id`; judge/verify each get their single
+/// seat. Operator sovereignty (#44) is intact: the resolved truth — role →
+/// profile → model → binding-source — is stamped on every seat's provenance.
+pub fn resolve_review_role_crew(reg: &ProfileRegistry, ov: &ReviewRoleStaffing) -> Result<ResolvedCrew> {
+    resolve_review_role_crew_with(reg, ov, &|role| darkmux_types::config_access::role_profile(role))
+}
+
+/// (#1475 packet 2) Pure core of [`resolve_review_role_crew`] — the role→profile
+/// binding lookup is INJECTED (`mapped(role_id)` = the `config.json` binding, or
+/// `None` = unmapped), so the whole flip is unit-testable against a temp map
+/// without the process-wide `config()`. Mirrors packet 1's
+/// `resolve_role_profile_with` seam exactly.
+pub fn resolve_review_role_crew_with(
+    reg: &ProfileRegistry,
+    ov: &ReviewRoleStaffing,
+    mapped: &dyn Fn(&str) -> Option<String>,
+) -> Result<ResolvedCrew> {
+    // Same surface-never-silently-clamp posture as the roster resolver
+    // (sovereignty #44): a zero-pass judge is a loud error, not a clamp.
+    if ov.passes == Some(0) {
+        bail!(
+            "darkmux: review resourcing: passes must be >= 1 (got 0) — a zero-pass judge \
+             makes no ruling. Omit passes for the default ({DEFAULT_JUDGE_PASSES}, \
+             double-confirm). (#1266)"
+        );
+    }
+    let judge_passes = ov.passes.unwrap_or(DEFAULT_JUDGE_PASSES);
+
+    let mut seats: BTreeMap<String, Vec<ResolvedSeatStaffing>> = BTreeMap::new();
+
+    // Probe seat family: one staffing per distinct probe role. Recall
+    // diversity is the three distinct role→profile→model bindings — no k
+    // draw-fanout of one model (k=1 per probe role).
+    let mut probes = Vec::with_capacity(REVIEW_PROBE_ROLES.len());
+    for role_id in REVIEW_PROBE_ROLES {
+        probes.push(staff_review_role(reg, role_id, mapped, 1, DEFAULT_JUDGE_PASSES)?);
+    }
+    seats.insert(REVIEW_PROBE_ROLE.to_string(), probes);
+
+    // Judge seat: exactly one, carrying the consensus depth.
+    seats.insert(
+        REVIEW_JUDGE_ROLE.to_string(),
+        vec![staff_review_role(reg, REVIEW_JUDGE_ROLE, mapped, 1, judge_passes)?],
+    );
+
+    // Verify seat: exactly one; adjudicates each confirmed finding once.
+    seats.insert(
+        REVIEW_VERIFY_ROLE.to_string(),
+        vec![staff_review_role(reg, REVIEW_VERIFY_ROLE, mapped, 1, 1)?],
+    );
+
+    Ok(ResolvedCrew { name: role_crew_name(&seats), seats, request_changes: ov.request_changes })
+}
+
+/// (#1475 packet 2) Resolve ONE review role to a concrete seat staffing via the
+/// role→profile binding. A LOCAL seat's model must declare `n_ctx` (it's loaded
+/// at that context) — a missing window is a named resolution error; a REMOTE
+/// (endpoint-bearing) model needs none. The seat carries its `role_id` +
+/// role→profile provenance so the envelope snapshot is self-describing.
+fn staff_review_role(
+    reg: &ProfileRegistry,
+    role_id: &str,
+    mapped: &dyn Fn(&str) -> Option<String>,
+    k: u32,
+    passes: u32,
+) -> Result<ResolvedSeatStaffing> {
+    let bound = mapped(role_id);
+    let resolved =
+        darkmux_profiles::profiles::resolve_role_profile_with(role_id, bound.as_deref(), reg)
+            .with_context(|| format!("staffing review role \"{role_id}\" via its role→profile binding"))?;
+    let model_id = resolved.profile.default_model_id().map(str::to_string).ok_or_else(|| {
+        anyhow!(
+            "darkmux: review role \"{role_id}\" resolved to profile \"{}\", which declares no \
+             models — bind the role to a profile with at least one model \
+             (`darkmux config set role_profiles.{role_id} <profile>`). (#1475)",
+            resolved.profile_name
+        )
+    })?;
+    let pm = resolved.profile.models.iter().find(|m| m.id == model_id).cloned().ok_or_else(|| {
+        anyhow!(
+            "darkmux: review role \"{role_id}\" profile \"{}\" names default model \"{model_id}\", \
+             absent from its own models[]. (#1475)",
+            resolved.profile_name
+        )
+    })?;
+    if !pm.is_remote() {
+        pm.require_n_ctx()
+            .map_err(|e| anyhow!("darkmux: review role \"{role_id}\" model \"{model_id}\": {e}"))?;
+    }
+    let source = match resolved.source {
+        darkmux_profiles::profiles::RoleProfileSource::Mapped => "role_profiles map",
+        darkmux_profiles::profiles::RoleProfileSource::DefaultFallback => "default_profile fallback",
+    };
+    Ok(ResolvedSeatStaffing {
+        name: resolved.profile_name.clone(),
+        role_id: Some(role_id.to_string()),
+        pm,
+        k,
+        passes,
+        max_tokens: None,
+        selector: None,
+        provenance: Some(StaffingProvenance::role_profile(role_id, &resolved.profile_name, source)),
+    })
+}
+
+/// (#1475 packet 2) The role→profile crew's display identity: the DISTINCT
+/// resolved profile names across all seats, sorted + `+`-joined. A homogeneous
+/// fresh-user crew (every role → default_profile) reads as that one profile
+/// name; a heterogeneous crew reads as `devstral+qwen27b+qwen35b+qwen4b`. Shown
+/// on bookend records + the mission board — the honest set of profiles in play,
+/// never a fabricated single "roster".
+fn role_crew_name(seats: &BTreeMap<String, Vec<ResolvedSeatStaffing>>) -> String {
+    let mut names: Vec<&str> = seats.values().flatten().map(|s| s.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        "review".to_string()
+    } else {
+        names.join("+")
+    }
 }
 
 #[cfg(test)]
@@ -634,5 +836,142 @@ mod tests {
         assert_eq!(probe_model, "coder-model", "the code-demanding probe scores the coder");
         assert_eq!(judge_model, "reasoner-model", "the judgment-demanding judge scores the reasoner");
         assert_ne!(probe_model, judge_model, "a mixed roster differentiates the seats");
+    }
+
+    // ─── (#1475 packet 2) role→profile flip resolver ───────────────────────
+
+    /// A multi-profile registry (no `default_profile` unless a test sets one),
+    /// for exercising distinct role→profile bindings.
+    fn multi_reg(profiles: Vec<(&str, Vec<ProfileModel>)>, default: Option<&str>) -> ProfileRegistry {
+        let map = profiles
+            .into_iter()
+            .map(|(name, models)| (name.to_string(), Profile { models, ..Default::default() }))
+            .collect();
+        ProfileRegistry { profiles: map, default_profile: default.map(String::from), ..Default::default() }
+    }
+
+    /// A `mapped` closure over a fixed role→profile table — the injected
+    /// `config.json` binding the pure resolver reads.
+    fn map_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(r, p)| (r.to_string(), p.to_string())).collect()
+    }
+
+    /// (#1475 packet 2, headline) Five roles → five bindings → a heterogeneous
+    /// crew. Distinct probe roles resolve to distinct profiles/models straight
+    /// from the map — no roster scoring, no launch pins.
+    #[test]
+    fn role_crew_staffs_five_roles_from_the_map() {
+        let reg = multi_reg(
+            vec![
+                ("p27", vec![model("m27", 40000)]),
+                ("pdev", vec![model("mdev", 40000)]),
+                ("p4b", vec![model("m4b", 32000)]),
+                ("p35", vec![model("m35", 60000)]),
+            ],
+            Some("p4b"),
+        );
+        let bindings = map_of(&[
+            ("review-probe-high", "p27"),
+            ("review-probe-mid", "pdev"),
+            ("review-probe-low", "p4b"),
+            ("review-judge", "p35"),
+            ("review-verify", "p35"),
+        ]);
+        let crew =
+            resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &|r| bindings.get(r).cloned())
+                .unwrap();
+
+        let probes = crew.seats.get(REVIEW_PROBE_ROLE).unwrap();
+        assert_eq!(probes.len(), 3, "one staffing per distinct probe role");
+        assert_eq!(probes[0].role_id.as_deref(), Some("review-probe-high"));
+        assert_eq!(probes[0].pm.id, "m27", "probe-high → p27 → m27");
+        assert_eq!(probes[1].pm.id, "mdev", "probe-mid → pdev → mdev");
+        assert_eq!(probes[2].pm.id, "m4b", "probe-low → p4b → m4b");
+        assert_eq!(probes[0].k, 1, "one draw per probe role — diversity is role-borne, not k-borne");
+        assert_eq!(crew.seats.get(REVIEW_JUDGE_ROLE).unwrap()[0].pm.id, "m35");
+        assert_eq!(crew.seats.get(REVIEW_VERIFY_ROLE).unwrap()[0].pm.id, "m35");
+        // The crew name is the distinct profile set (heterogeneous here).
+        assert_eq!(crew.name, "p27+p35+p4b+pdev");
+        // Provenance records role→profile, not scored/pinned.
+        let prov = probes[0].provenance.as_ref().unwrap();
+        assert_eq!(prov.kind, "role-profile");
+        assert!(prov.detail.contains("review-probe-high"), "{}", prov.detail);
+        assert!(prov.detail.contains("p27"), "{}", prov.detail);
+        assert!(prov.detail.contains("role_profiles map"), "names the binding source: {}", prov.detail);
+    }
+
+    /// (#1475 packet 2) An UNMAPPED role falls through to `default_profile` —
+    /// the fresh-user floor. An empty map runs every seat on one model.
+    #[test]
+    fn unmapped_roles_fall_back_to_default_profile() {
+        let reg = multi_reg(vec![("solo", vec![model("only", 32000)])], Some("solo"));
+        let crew = resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &|_| None).unwrap();
+        for seat in crew.seats.values().flatten() {
+            assert_eq!(seat.pm.id, "only", "every unmapped seat → default_profile's model");
+            assert!(
+                seat.provenance.as_ref().unwrap().detail.contains("default_profile fallback"),
+                "provenance names the fallback"
+            );
+        }
+        assert_eq!(crew.name, "solo", "homogeneous crew reads as the one profile");
+    }
+
+    /// (#1475 packet 2) A role mapped to a profile absent from the registry is a
+    /// loud resolution error (packet 1's message), never a silent fallback.
+    #[test]
+    fn role_mapped_to_missing_profile_errors_loudly() {
+        let reg = multi_reg(vec![("solo", vec![model("only", 32000)])], Some("solo"));
+        let bindings = map_of(&[("review-judge", "ghost")]);
+        // `{:#}` renders the full anyhow chain — the seat context is the outer
+        // layer, packet 1's missing-profile message the inner cause.
+        let err = format!(
+            "{:#}",
+            resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &|r| bindings.get(r).cloned())
+                .unwrap_err()
+        );
+        assert!(err.contains("review-judge"), "names the role: {err}");
+        assert!(err.contains("ghost"), "names the missing profile: {err}");
+    }
+
+    /// (#1475 packet 2) `passes >= 1` is enforced here too (the mission-launch
+    /// path has no clap guard) — a zero-pass judge is a loud error.
+    #[test]
+    fn role_crew_passes_zero_errors() {
+        let reg = multi_reg(vec![("solo", vec![model("only", 32000)])], Some("solo"));
+        let ov = ReviewRoleStaffing { passes: Some(0), ..Default::default() };
+        let err = resolve_review_role_crew_with(&reg, &ov, &|_| None).unwrap_err().to_string();
+        assert!(err.contains("passes must be >= 1"), "got: {err}");
+    }
+
+    /// (#1475 packet 2) A LOCAL seat whose resolved model declares no `n_ctx`
+    /// fails at resolution, naming the role — same guard the roster resolver
+    /// applies (a local model is loaded at its declared context).
+    #[test]
+    fn role_crew_local_seat_without_n_ctx_fails() {
+        let reg = multi_reg(
+            vec![("solo", vec![ProfileModel { id: "no-ctx".into(), ..Default::default() }])],
+            Some("solo"),
+        );
+        let err = resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &|_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("n_ctx"), "names the field: {err}");
+    }
+
+    /// (#1475 packet 2) A remote-bound seat needs no `n_ctx` — nothing is
+    /// loaded locally.
+    #[test]
+    fn role_crew_remote_seat_needs_no_n_ctx() {
+        let reg = multi_reg(
+            vec![("local", vec![model("m", 32000)]), ("cloud", vec![remote("gpt")])],
+            Some("local"),
+        );
+        let bindings = map_of(&[("review-verify", "cloud")]);
+        let crew =
+            resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &|r| bindings.get(r).cloned())
+                .unwrap();
+        let verify = &crew.seats.get(REVIEW_VERIFY_ROLE).unwrap()[0];
+        assert_eq!(verify.pm.id, "gpt");
+        assert!(verify.pm.is_remote(), "a remote-bound verify seat needs no n_ctx");
     }
 }

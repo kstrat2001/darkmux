@@ -24,9 +24,9 @@
 //! (`mission_launch::derive_mission_id`, `mission_launch::
 //! ensure_mission_and_phases`) every other config-launched mission uses —
 //! `build_review_graph` still calls `mission_config::interpret` itself
-//! internally (it needs the crew-resolved `probe_seats` expansion this
-//! module's caller doesn't have until AFTER crew resolution), so no double
-//! interpretation happens.
+//! internally (it needs the `probe_roles` expansion built from the crew's
+//! probe seats — #1475 packet 2 — which this module's caller doesn't have
+//! until AFTER crew resolution), so no double interpretation happens.
 //!
 //! **Gate semantics.** Review has no operator sign-off gate — unlike
 //! `coder-phase`, there is nothing for `mission finalize`/`mission abort` to
@@ -96,7 +96,7 @@ use darkmux_lab::lab::review::{
     staffing_snapshot, validate_review_crew, BundleInput, ChatCall, ExecMode, LmsCycler,
     ProbeFlag, ReviewEmitter, ReviewEnvelope, ReviewInputs, ReviewStepContext,
 };
-use darkmux_crew::resourcing::{resolve_review_resourcing, ResolvedCrew, ReviewResourcing};
+use darkmux_crew::resourcing::{resolve_review_role_crew, ResolvedCrew, ReviewRoleStaffing};
 use darkmux_profiles::profiles::load_registry;
 use darkmux_profiles::swap;
 use darkmux_types::dispatch_liveness::{liveness, liveness_case, liveness_detail};
@@ -119,6 +119,10 @@ fn path_input(collected: &BTreeMap<String, Value>, key: &str) -> Option<PathBuf>
 /// (#1426 ship-2) Parse a comma-separated `--param key=a,b,c` into a `Vec` of
 /// trimmed, non-empty items — the launch-param shape for `probe_models` (one
 /// probe staffing per listed model id). Absent/blank => empty.
+// (#1475 packet 2) The role→profile flip stopped consuming `probe_models`, the
+// only caller of this CSV parser — kept (allow dead_code) until packet 4
+// retires the seat-pin inputs wholesale.
+#[allow(dead_code)]
 fn csv_input(collected: &BTreeMap<String, Value>, key: &str) -> Vec<String> {
     str_input(collected, key)
         .map(|s| {
@@ -675,32 +679,26 @@ fn run_dispatch(
     let source = resolve_source(collected)?;
     liveness_detail("config-resolved", &case, &config_detail());
     let loaded = load_registry(str_input(collected, "profiles"))?;
-    // (#1426 ship-2) The crews map retired: review staffing is DERIVED by the
-    // resourcing resolver from the active profile's models (per-seat
-    // `select_model` scoring) plus launch-param seat pins. `profile` names the
-    // roster (else `default_profile`); `probe_models`/`judge_model`/
-    // `verify_model` pin a seat to an explicit model id; `k` is the probe draw
-    // breadth. System proposes, operator overrides, the envelope snapshot
-    // records what resolved (operator sovereignty #44).
-    let resourcing = ReviewResourcing {
-        profile: str_input(collected, "profile").map(str::to_string),
-        probe_models: csv_input(collected, "probe_models"),
-        judge_model: str_input(collected, "judge_model")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        verify_model: str_input(collected, "verify_model")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        k: u32_input(collected, "k")?,
-        // (#1266) Judge consensus depth, sourced from the `passes` input;
-        // `None` => the resolver's double-confirm default. Validated `>= 1` in
-        // the resolver.
+    // (#1475 packet 2) THE FLIP — review staffing is now the role→profile
+    // rollup, not the roster-scoring resolver. Each of the five review roles
+    // (review-probe-high/-mid/-low, review-judge, review-verify) resolves
+    // through the machine-local `role_profiles` map in config.json:
+    // role → profile → model, with an unmapped role falling back to
+    // `default_profile` (the fresh-user floor). The three probe pins
+    // (`probe_models`/`judge_model`/`verify_model`) and the roster `profile`
+    // input are no longer consumed here — a bare `mission launch review`
+    // assembles the operator's heterogeneous crew straight from the map (the
+    // old roster resolver stays compiled but bypassed; packet 3 deletes it).
+    // Only the non-model knobs survive: judge consensus DEPTH (`passes`) and
+    // the blocking-vs-advisory render choice. The envelope snapshot records
+    // what role→profile actually resolved (operator sovereignty #44).
+    let resourcing = ReviewRoleStaffing {
+        // (#1266) `None` => the resolver's double-confirm default; validated
+        // `>= 1` in the resolver.
         passes: u32_input(collected, "passes")?,
         request_changes: bool_input(collected, "request_changes"),
     };
-    let crew = resolve_review_resourcing(&loaded.registry, &resourcing)?;
+    let crew = resolve_review_role_crew(&loaded.registry, &resourcing)?;
     liveness_detail("crew-resolved", &case, &crew_detail(&crew));
 
     liveness_case("bundling-start", &case);
@@ -1226,6 +1224,7 @@ mod tests {
     fn staffing(model_id: &str) -> ResolvedSeatStaffing {
         ResolvedSeatStaffing {
             name: "fast".into(),
+            role_id: None,
             pm: ProfileModel { id: model_id.into(), ..Default::default() },
             k: 1,
             passes: 2,
