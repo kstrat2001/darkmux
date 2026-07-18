@@ -140,6 +140,22 @@ pub struct StepRow {
     /// the same "cloud" hue the live meter uses. Absent when local-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud: Option<bool>,
+    /// (#1481) The resolved model this step's dispatch ran against, read from
+    /// the persisted `Step.config` (`model`, else `model_key`). A
+    /// `dispatch.map` seat stamps its launch-resolved model here — the
+    /// `review-probe-*`/`review-judge`/`review-verify` seats via
+    /// `build_review_graph`'s per-role role→profile→model rollup (#1475) — so
+    /// the page can render WHICH model staffed a seat directly on its card
+    /// (the graph payload otherwise carried no model at all, forcing a full
+    /// re-navigate to the run view). `None` when the step config declares no
+    /// model: a procedural step (bundle/dedup), a not-yet-materialized
+    /// synthesized step (unresolved template config), or a Tier 3 kind
+    /// (`mission.coder`) whose model resolves at dispatch time and isn't
+    /// stamped into the step config — the page omits the chip cleanly in
+    /// every such case (operator sovereignty #44: show provenance where it
+    /// exists, never fabricate it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// One edge in the rendered graph. Same `camelCase` wire contract as
@@ -237,6 +253,25 @@ fn description_or_none(text: &str) -> Option<String> {
     } else {
         Some(text.to_string())
     }
+}
+
+/// (#1481) The resolved model a dispatch step ran against, read from its
+/// persisted `Step.config`: `model` first (the namespaced identifier a
+/// `dispatch.map` seat stamps, e.g. `darkmux:qwen/qwen3.6-27b`), else
+/// `model_key` (the bare LMStudio key). `None` when neither is present or
+/// non-empty — a procedural step, or a Tier 3 kind whose model isn't stamped
+/// into the step config. The `darkmux:` namespace prefix is kept verbatim
+/// here (raw provenance); the page strips it for the compact chip label.
+fn step_model_from_config(config: &serde_json::Value) -> Option<String> {
+    let read = |key: &str| {
+        config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    read("model").or_else(|| read("model_key"))
 }
 
 /// Derive a Task's status from its Steps' statuses — `Task` carries no
@@ -1028,6 +1063,10 @@ pub fn build_mission_graph(
                             tokens_final,
                             turns_final,
                             cloud,
+                            // (#1481) The seat's resolved model, if its config
+                            // stamps one (dispatch.map seats do; procedural /
+                            // Tier 3 kinds don't).
+                            model: step_model_from_config(&step.config),
                         },
                         None => {
                             let kind = kind_from_config_snapshot(mission_id, &task.id, step_id)
@@ -1042,6 +1081,11 @@ pub fn build_mission_graph(
                                 tokens_final,
                                 turns_final,
                                 cloud,
+                                // (#1481) A synthesized step has no persisted
+                                // config yet — the model resolves at launch and
+                                // isn't recoverable from the null template
+                                // config; omit cleanly.
+                                model: None,
                             }
                         }
                     }
@@ -1549,6 +1593,22 @@ mod tests {
     fn resolve_step_label_tier1_kind_resolves_via_the_registry() {
         assert_eq!(resolve_step_label("dispatch.internal", "s1"), "Dispatch");
         assert_eq!(resolve_step_label("procedural.noop", "s1"), "No-op");
+    }
+
+    #[test]
+    fn step_model_reads_model_then_model_key_and_omits_when_absent() {
+        // `model` wins when present (the namespaced identifier a dispatch.map
+        // seat stamps).
+        let cfg = serde_json::json!({ "model": "darkmux:qwen/qwen3.6-27b", "model_key": "qwen/qwen3.6-27b" });
+        assert_eq!(step_model_from_config(&cfg).as_deref(), Some("darkmux:qwen/qwen3.6-27b"));
+        // Falls back to `model_key` when `model` is absent.
+        let cfg = serde_json::json!({ "model_key": "qwen/qwen3.6-27b" });
+        assert_eq!(step_model_from_config(&cfg).as_deref(), Some("qwen/qwen3.6-27b"));
+        // A procedural / Tier 3 step with no model config → None (omit chip).
+        assert_eq!(step_model_from_config(&serde_json::Value::Null), None);
+        assert_eq!(step_model_from_config(&serde_json::json!({ "concurrency": 3 })), None);
+        // Empty / whitespace values are treated as absent, never a blank chip.
+        assert_eq!(step_model_from_config(&serde_json::json!({ "model": "   " })), None);
     }
 
     #[test]
