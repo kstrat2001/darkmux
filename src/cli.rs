@@ -1130,13 +1130,13 @@ pub(crate) enum LabCmd {
         #[arg(long, conflicts_with_all = ["freeform", "agentic"])]
         dialectic: bool,
         /// (#1222 Phase B packet 7) Dispatch the review funnel (bundles →
-        /// probe seats ×k draws → dedup → double-confirm judge) instead of a
-        /// single reviewer or the dialectic pipeline — the release-guard
-        /// validation mode: recall/precision scored EXACTLY like every other
-        /// mode. Requires --workdirs (the probe/judge seats read the case's
-        /// repo tree, like --agentic/--dialectic); seat staffing is derived
-        /// from the roster profile (--roster-profile, else --profile, else the
-        /// registry's default_profile) by the resourcing resolver (#1426).
+        /// probe roles → dedup → double-confirm judge) instead of a single
+        /// reviewer or the dialectic pipeline — the release-guard validation
+        /// mode: recall/precision scored EXACTLY like every other mode. Requires
+        /// --workdirs (the probe/judge seats read the case's repo tree, like
+        /// --agentic/--dialectic); every review seat is pinned to one profile
+        /// (--roster-profile, else --profile, else the registry's
+        /// default_profile) via the role→profile resolver (#1475).
         #[arg(long, conflicts_with_all = ["freeform", "agentic", "dialectic"])]
         funnel: bool,
         /// Evidence root for --agentic / --dialectic / --funnel: one
@@ -1156,13 +1156,11 @@ pub(crate) enum LabCmd {
         /// denser local or remote-endpoint profile while the advocates stay.
         #[arg(long = "judge-profile", requires = "dialectic")]
         judge_profile: Option<String>,
-        /// (#1426 ship-2, renamed in #1465) The ROSTER profile the resourcing
-        /// resolver staffs the review seats (probe / judge / verify) from —
-        /// capability scoring per seat against the profile's models[]. Falls
-        /// back to --profile, else the registry's `default_profile`. (Renamed
-        /// from `--crew`: the crew family retired entirely in #1426, so the
-        /// flag names the roster PROFILE it resolves against, not a retired
-        /// `crews.<name>` entry.)
+        /// (#1475, the `--roster-profile` flag; renamed from `--crew` in #1465)
+        /// The one profile the bench pins EVERY review seat (probe / judge /
+        /// verify) to for a controlled funnel run — via the per-run role→profile
+        /// override. Falls back to --profile, else the registry's
+        /// `default_profile`.
         #[arg(long = "roster-profile", requires = "funnel")]
         roster_profile: Option<String>,
         /// (#1222) Funnel model-cycling mode: "sequential" | "parallel" |
@@ -1170,10 +1168,11 @@ pub(crate) enum LabCmd {
         /// hardware tier).
         #[arg(long = "exec-mode", requires = "funnel")]
         exec_mode: Option<String>,
-        /// (#1426 ship-2) The probe seat's draw count `k` for this run (the
-        /// resourcing resolver's default of 3 otherwise applies). Must be at
-        /// least 1 — a 0 draw count guarantees a degenerate run (zero probe
-        /// flags).
+        /// (#1475) The probe draw BREADTH per probe role for this run, applied
+        /// to every probe seat. Omitted ⇒ one draw per probe role (the funnel
+        /// staffs three distinct probe roles, so the default already draws
+        /// three). Must be at least 1 — a 0 draw count guarantees a degenerate
+        /// run (zero probe flags).
         #[arg(long, requires = "funnel", value_parser = clap::value_parser!(u32).range(1..))]
         k: Option<u32>,
         /// (#1222) Run an external bundler

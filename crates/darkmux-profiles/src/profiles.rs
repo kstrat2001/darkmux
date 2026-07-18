@@ -200,20 +200,38 @@ pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profi
     })
 }
 
-/// (#1475 packet 1) How a role's profile was resolved — whether the machine's
-/// `role_profiles` map bound it explicitly, or it fell through to
+/// (#1475 packet 1/3) How a role's profile was resolved — a per-run launch
+/// override, the machine's `role_profiles` map, or a fall-through to
 /// `default_profile` (the fresh-user single-model floor). Lets a caller (and
-/// `darkmux doctor`) tell a deliberate binding from the default fallback.
+/// `darkmux doctor`) tell an override from a deliberate map binding from the
+/// default fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// (#1475 packet 4) a third `Overridden` variant lands here when the launch
-// override does — kept out now to avoid a dead-code variant; the pure
-// `resolve_role_profile_with`'s `Option<&str>` mapped arg is already the
-// override seam.
 pub enum RoleProfileSource {
+    /// (#1475 packet 3) The role was bound by a per-run launch override
+    /// (`mission launch review --param <role>=<profile>`) — highest precedence,
+    /// above the `role_profiles` map and `default_profile`.
+    Overridden,
     /// The role was bound to this profile by the `role_profiles` map.
     Mapped,
     /// The role was unmapped; it fell back to the registry's `default_profile`.
     DefaultFallback,
+}
+
+/// (#1475 packet 3) The origin of a role→profile binding, supplied to
+/// [`resolve_role_profile_with`] so it can stamp the right [`RoleProfileSource`]
+/// without collapsing a per-run launch override into a plain map binding.
+/// Precedence (override > map > unmapped) is decided by the CALLER building this
+/// value; the resolver only reads which tier won. Owns its profile name so a
+/// caller can build it from `config_access`'s owned `Option<String>` return
+/// without lifetime gymnastics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleBinding {
+    /// A per-run launch override (`--param <role>=<profile>`). Highest precedence.
+    Overridden(String),
+    /// The machine-local `role_profiles` map binding in `config.json`.
+    Mapped(String),
+    /// Unmapped — resolve through `default_profile` (the fresh-user floor).
+    Unmapped,
 }
 
 /// (#1475 packet 1) The resolved binding for a role: `role -> profile -> model`.
@@ -243,22 +261,37 @@ pub fn resolve_role_profile<'a>(
     role_id: &str,
     registry: &'a ProfileRegistry,
 ) -> Result<ResolvedRoleProfile<'a>> {
-    let mapped = darkmux_types::config_access::role_profile(role_id);
-    resolve_role_profile_with(role_id, mapped.as_deref(), registry)
+    // The config-only production entry knows nothing of launch overrides — it
+    // reads the `role_profiles` map (→ `Mapped`) or resolves unmapped
+    // (→ `Unmapped`). Override bindings enter only via `resolve_role_profile_with`
+    // from a launcher that has the `--param <role>=<profile>` values (#1475 packet 3).
+    let binding = match darkmux_types::config_access::role_profile(role_id) {
+        Some(p) => RoleBinding::Mapped(p),
+        None => RoleBinding::Unmapped,
+    };
+    resolve_role_profile_with(role_id, &binding, registry)
 }
 
-/// (#1475 packet 1) Pure core of [`resolve_role_profile`] — the mapped profile
-/// name is supplied explicitly (`Some` = the role is bound to that profile name;
-/// `None` = unmapped), so the resolution + validation is unit-testable without
+/// (#1475 packet 1/3) Pure core of [`resolve_role_profile`] — the binding is
+/// supplied explicitly ([`RoleBinding::Overridden`]/[`Mapped`](RoleBinding::Mapped)
+/// name the bound profile, [`Unmapped`](RoleBinding::Unmapped) falls through to
+/// `default_profile`), so the resolution + validation is unit-testable without
 /// the process-wide `config()`. Same layering as `config_access`'s `pick_*`
-/// helpers taking explicit args.
+/// helpers taking explicit args. Override and map bindings resolve identically
+/// (both name a profile that must exist); only the recorded
+/// [`RoleProfileSource`] differs, so the envelope names the winning tier.
 pub fn resolve_role_profile_with<'a>(
     role_id: &str,
-    mapped: Option<&str>,
+    binding: &RoleBinding,
     registry: &'a ProfileRegistry,
 ) -> Result<ResolvedRoleProfile<'a>> {
-    if let Some(profile_name) = mapped {
-        // Loud semantic validation (contract 7): a mapping to a profile the
+    let (bound_name, source) = match binding {
+        RoleBinding::Overridden(p) => (Some(p.as_str()), RoleProfileSource::Overridden),
+        RoleBinding::Mapped(p) => (Some(p.as_str()), RoleProfileSource::Mapped),
+        RoleBinding::Unmapped => (None, RoleProfileSource::DefaultFallback),
+    };
+    if let Some(profile_name) = bound_name {
+        // Loud semantic validation (contract 7): a binding to a profile the
         // registry doesn't define is a clear error naming the role, the bad
         // profile, and the fix — NEVER a silent fallback to default_profile.
         // A quarantined target reuses the shared quarantine message.
@@ -268,19 +301,29 @@ pub fn resolve_role_profile_with<'a>(
             }
             let available: Vec<&str> = registry.profiles.keys().map(String::as_str).collect();
             let listed = if available.is_empty() { "(none)".to_string() } else { available.join(", ") };
+            // The fix suggestion tracks the binding tier: an override is fixed
+            // on the launch line, a map binding via `config set`.
+            let (how, fix) = match source {
+                RoleProfileSource::Overridden => (
+                    "is overridden to",
+                    format!("check the `--param {role_id}=<profile>` launch value"),
+                ),
+                _ => (
+                    "is mapped to",
+                    format!("`darkmux config set role_profiles.{role_id} <profile>`"),
+                ),
+            };
             anyhow!(
-                "darkmux: role \"{role_id}\" is mapped to profile \"{profile_name}\" \
-                 (role_profiles in config.json), which is not in the profile registry. \
-                 Available: {listed}. Fix the binding — \
-                 `darkmux config set role_profiles.{role_id} <profile>` — \
-                 or verify with `darkmux doctor`. (#1475)"
+                "darkmux: role \"{role_id}\" {how} profile \"{profile_name}\", \
+                 which is not in the profile registry. Available: {listed}. \
+                 Fix the binding — {fix} — or verify with `darkmux doctor`. (#1475)"
             )
         })?;
         return Ok(ResolvedRoleProfile {
             role_id: role_id.to_string(),
             profile_name: profile_name.to_string(),
             profile,
-            source: RoleProfileSource::Mapped,
+            source,
         });
     }
 
@@ -614,7 +657,7 @@ mod tests {
     #[test]
     fn resolve_mapped_role_binds_to_its_profile() {
         let reg = two_profile_reg();
-        let r = resolve_role_profile_with("judge", Some("qwen35b"), &reg).unwrap();
+        let r = resolve_role_profile_with("judge", &RoleBinding::Mapped("qwen35b".into()), &reg).unwrap();
         assert_eq!(r.profile_name, "qwen35b");
         assert_eq!(r.profile.models[0].id, "qwen3.5-35b");
         assert_eq!(r.source, RoleProfileSource::Mapped);
@@ -622,11 +665,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_overridden_role_binds_and_records_overridden_source() {
+        // (#1475 packet 3) A per-run launch override binds identically to a map
+        // binding, but the recorded source is `Overridden` (highest precedence)
+        // so the envelope names the winning tier.
+        let reg = two_profile_reg();
+        let r = resolve_role_profile_with("judge", &RoleBinding::Overridden("qwen35b".into()), &reg).unwrap();
+        assert_eq!(r.profile_name, "qwen35b");
+        assert_eq!(r.source, RoleProfileSource::Overridden);
+    }
+
+    #[test]
+    fn resolve_overridden_to_nonexistent_profile_names_the_launch_value() {
+        // (#1475 packet 3) A bad override profile is a loud error whose fix
+        // suggestion points at the launch line, not `config set`.
+        let reg = two_profile_reg();
+        let err = resolve_role_profile_with("judge", &RoleBinding::Overridden("ghost35b".into()), &reg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overridden to"), "names the tier: {err}");
+        assert!(err.contains("ghost35b"), "names the bad profile: {err}");
+        assert!(err.contains("--param judge=<profile>"), "points at the launch value: {err}");
+    }
+
+    #[test]
     fn resolve_unmapped_role_falls_back_to_default_profile() {
         let reg = two_profile_reg();
         // An unmapped role degrades to default_profile SILENTLY — the fresh-user
         // single-model floor.
-        let r = resolve_role_profile_with("probe-high", None, &reg).unwrap();
+        let r = resolve_role_profile_with("probe-high", &RoleBinding::Unmapped, &reg).unwrap();
         assert_eq!(r.profile_name, "qwen4b", "unmapped → default_profile");
         assert_eq!(r.source, RoleProfileSource::DefaultFallback);
     }
@@ -637,7 +704,7 @@ mod tests {
         // Contract 7: a mapping to a profile the registry doesn't define is a
         // clear typed error naming the role + the bad profile + the fix, NEVER a
         // silent fallback to default_profile.
-        let err = resolve_role_profile_with("judge", Some("ghost35b"), &reg)
+        let err = resolve_role_profile_with("judge", &RoleBinding::Mapped("ghost35b".into()), &reg)
             .unwrap_err()
             .to_string();
         assert!(err.contains("judge"), "names the role: {err}");
@@ -654,7 +721,7 @@ mod tests {
             r#"{"profiles": {"qwen35b": {"models": [{"id": "m", "n_ctx": 40000}]}}}"#,
         )
         .unwrap();
-        let err = resolve_role_profile_with("judge", None, &reg).unwrap_err().to_string();
+        let err = resolve_role_profile_with("judge", &RoleBinding::Unmapped, &reg).unwrap_err().to_string();
         assert!(err.contains("not bound"), "names the unbound role: {err}");
         assert!(err.contains("no default_profile"), "explains the missing floor: {err}");
     }
@@ -675,7 +742,7 @@ mod tests {
                 "default_profile":"qwen4b"}"#,
         );
         let reg = load_registry(Some(p.to_str().unwrap())).unwrap().registry;
-        let err = resolve_role_profile_with("judge", Some("broken"), &reg)
+        let err = resolve_role_profile_with("judge", &RoleBinding::Mapped("broken".into()), &reg)
             .unwrap_err()
             .to_string();
         assert!(err.contains("quarantined"), "got: {err}");

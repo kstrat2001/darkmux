@@ -1995,9 +1995,9 @@ fn review_bench_funnel_requires_workdirs() {
 
 #[test]
 fn review_bench_funnel_no_resolvable_roster_fails_preflight() {
-    // (#1426 ship-2) --funnel + --workdirs but no --crew/--profile AND a
-    // registry with no default_profile: the funnel-context preflight
-    // (resolve_funnel_ctx → the resourcing resolver) fails loud before any
+    // (#1426 ship-2) --funnel + --workdirs but no --roster-profile/--profile AND
+    // a registry with no default_profile: the funnel-context preflight
+    // (resolve_funnel_ctx → the role→profile resolver) fails loud before any
     // dispatch spends a token, naming the missing roster. Uses a minimal
     // one-case fixture so the --workdirs tree-existence check (which runs
     // first) passes and the resourcing check is the one under test.
@@ -2121,10 +2121,10 @@ fn review_bench_funnel_roster_local_model_without_n_ctx_fails_loud() {
 // role-prompt resolution), the per-case funnel branch, the console line,
 // and the scores.json/funnels.json artifact pair.
 
-/// (#1426 ship-2) A profiles registry whose `review-funnel` ROSTER profile the
-/// resourcing resolver scores each review seat against — the crews map retired,
-/// so `--crew review-funnel` now names this profile, not a crews entry. The
-/// resolver staffs probe/judge/verify from its models; no LMStudio involved.
+/// (#1475) A profiles registry whose `review-funnel` profile every review seat
+/// is pinned to for the funnel bench (via the per-run role→profile override);
+/// `--roster-profile review-funnel` names it. The resolver staffs
+/// probe/judge/verify from its default model; no LMStudio involved.
 fn funnel_registry_json() -> &'static str {
     r#"{
         "profiles": {
@@ -2164,8 +2164,8 @@ fn write_funnel_fixture(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBu
 
 #[test]
 fn review_bench_funnel_nonexistent_roster_fails_preflight_listing_available() {
-    // (#1426 ship-2) --crew names a ROSTER profile the registry doesn't have:
-    // the resourcing resolver fails loud BEFORE any dispatch, and the error
+    // (#1475) --roster-profile names a profile the registry doesn't have: the
+    // bench's roster pre-check fails loud BEFORE any dispatch, and the error
     // names both the missing profile and the profiles that DO exist (get_profile's
     // "Available:" listing) — the operator never has to open profiles.json.
     let tmp = TempDir::new().unwrap();
@@ -2241,7 +2241,8 @@ fn review_bench_funnel_degenerate_run_completes_offline_with_console_line_and_ar
     assert_eq!(scores["mode"], serde_json::json!("funnel"));
     assert_eq!(scores["crew"], serde_json::json!("review-funnel"));
     assert_eq!(scores["exec_mode"], serde_json::json!("sequential"));
-    assert_eq!(scores["k"], serde_json::json!("(profile default)"));
+    // (#1475) `--k` omitted ⇒ one draw per probe role (the flip's default).
+    assert_eq!(scores["k"], serde_json::json!("(one per probe role)"));
 
     // funnels.json: one envelope, degenerate reason set, zero dispatches.
     let funnels: serde_json::Value =

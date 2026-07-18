@@ -627,8 +627,9 @@ pub struct ProfileRegistry {
     // (round-4 decision). A profiles.json still carrying a `crews` key parses
     // fine: the key overflows into `extras` below (lenient-on-read) and
     // re-serializes flat, harmless residue. Review staffing now comes from the
-    // resourcing resolver (`darkmux_crew::resourcing`) — per-seat `select_model`
-    // scoring against the active profile, plus launch-param seat pins.
+    // role→profile resolver (`darkmux_crew::resourcing`, #1475) — each review
+    // role resolves via its binding: a `--param <role>=<profile>` launch
+    // override, else the `role_profiles` map, else `default_profile`.
     /// (#1282) Entries whose per-entry typed parse failed — quarantined by
     /// the `darkmux-profiles` loader instead of blasting the whole file.
     /// Runtime-only state (never serialized): a quarantined name is absent
