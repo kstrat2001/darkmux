@@ -139,6 +139,14 @@
   .react-flow__edge-path{stroke:var(--muted)}
   .react-flow__edge.edge-depends_on .react-flow__edge-path{stroke:var(--amber-dim);stroke-width:1.6}
   .react-flow__edge.edge-contains .react-flow__edge-path{stroke:var(--line);stroke-dasharray:3 3}
+  /* (#1230 graph-lens lineage) Phase-order edges — a client-synthesized
+     phase[i]->phase[i+1] arrow (see `phaseOrderEdges`) showing the mission's
+     phase sequence. Heavier, solid, `--good` green so it reads as the
+     graph's structural backbone at a glance — distinct from both the teal
+     `depends_on` task-dependency edges and the fine dashed `contains`
+     phase->task membership edges, but still the same dark-theme teal/green
+     edge family, just a third, more prominent member of it. */
+  .react-flow__edge.edge-phase_order .react-flow__edge-path{stroke:var(--good);stroke-width:2.4;opacity:.85}
   .react-flow__controls{background:var(--panel);border:1px solid var(--line)}
   .react-flow__controls button{background:var(--panel);border-bottom:1px solid var(--line);fill:var(--text)}
   /* (#1482) The minimap must never INTERLEAVE with node cards — React Flow's
@@ -587,6 +595,16 @@ function stepRowEls(s, meter){
   ];
 }
 
+// (phase-order edges) A phase node ALSO carries a dedicated Top/Bottom
+// handle pair (ids "phase-in"/"phase-out"), separate from the Left/Right
+// pair every node uses for `depends_on`/`contains`. This lets the synthetic
+// phase[i]->phase[i+1] edge (see `phaseOrderEdges`) route straight down
+// through the left phase-label column instead of bowing out through the
+// task-card area the Left/Right handles serve — phase nodes stack at the
+// same x, so a vertical Top->Bottom path is the natural one. Every handle on
+// every node now carries an explicit `id` ("lr-in"/"lr-out", plus
+// "phase-in"/"phase-out" on phase nodes only) so React Flow never has to
+// guess which of a node's multiple same-type handles an edge means.
 function MissionNode(props){
   var d = props.data;
   var mnSteps = (d.steps && d.steps.length)
@@ -596,12 +614,17 @@ function MissionNode(props){
         );
       }))
     : null;
+  var phaseHandles = d.kind === "phase" ? [
+    h(V.Handle, {key:"pin", type:"target", id:"phase-in", position: V.Position.Top, style:{opacity:0}}),
+    h(V.Handle, {key:"pout", type:"source", id:"phase-out", position: V.Position.Bottom, style:{opacity:0}})
+  ] : null;
   return h("div", {className: "mnode k-" + d.kind + " s-" + d.status, title: d.description || d.label},
-    h(V.Handle, {type:"target", position: V.Position.Left, style:{opacity:0}}),
+    h(V.Handle, {type:"target", id:"lr-in", position: V.Position.Left, style:{opacity:0}}),
+    phaseHandles,
     h("div", {className:"mn-kind"}, d.kind),
     h("div", {className:"mn-label"}, d.label),
     mnSteps,
-    h(V.Handle, {type:"source", position: V.Position.Right, style:{opacity:0}})
+    h(V.Handle, {type:"source", id:"lr-out", position: V.Position.Right, style:{opacity:0}})
   );
 }
 var nodeTypes = { missionNode: MissionNode };
@@ -633,15 +656,49 @@ function toRfNodes(graphNodes, positions, metrics, now){
     };
   });
 }
-function toRfEdges(graphEdges){
-  return graphEdges.map(function(e){
+// (#1230 graph-lens lineage) Consecutive phase[i]->phase[i+1] edges,
+// synthesized CLIENT-SIDE — no new server data needed. `depth` is already
+// stamped on every phase node (the same field `computeLayout` sorts phases
+// by, mirroring the Rust `layer_tasks_by_depth`), so phase ORDER is already
+// present in the payload the server sends today; this just draws the arrow
+// the server never had to. A single-phase (or phase-less/freeform) mission
+// has zero consecutive pairs, so it's a no-op there — no edge invented where
+// there's no "next phase" to point to.
+function phaseOrderEdges(nodes){
+  var phases = (nodes || []).filter(function(n){ return n.kind === "phase"; })
+    .sort(function(a,b){ return a.depth - b.depth; });
+  var edges = [];
+  for (var i = 0; i < phases.length - 1; i++){
+    edges.push({
+      id: "phase-order:" + phases[i].id + ":" + phases[i + 1].id,
+      source: phases[i].id,
+      target: phases[i + 1].id,
+      kind: "phase_order",
+    });
+  }
+  return edges;
+}
+
+function toRfEdges(graphEdges, graphNodes){
+  var all = graphEdges.concat(phaseOrderEdges(graphNodes));
+  return all.map(function(e){
+    var isPhaseOrder = e.kind === "phase_order";
     return {
       id: e.id,
       source: e.source,
       target: e.target,
+      // Phase-order edges route through the dedicated Top/Bottom handle pair
+      // (see `MissionNode`); every other edge kind (`depends_on`/`contains`)
+      // keeps using the original Left/Right pair, same as before this
+      // feature — just explicit now that phase nodes carry more than one
+      // handle of each type.
+      sourceHandle: isPhaseOrder ? "phase-out" : "lr-out",
+      targetHandle: isPhaseOrder ? "phase-in" : "lr-in",
       className: "edge-" + e.kind,
       animated: false,
-      markerEnd: e.kind === "depends_on" ? { type: MarkerType.ArrowClosed, color: "#2a8a96" } : undefined,
+      markerEnd: (e.kind === "depends_on" || isPhaseOrder)
+        ? { type: MarkerType.ArrowClosed, color: isPhaseOrder ? "#5af0a3" : "#2a8a96" }
+        : undefined,
     };
   });
 }
@@ -1523,7 +1580,7 @@ function App(){
   } else {
     var positions = computeLayout(g.nodes);
     var rfNodes = toRfNodes(g.nodes, positions, metrics, now);
-    var rfEdges = toRfEdges(g.edges);
+    var rfEdges = toRfEdges(g.edges, g.nodes);
     body = h("div", {className:"canvas"},
       g.note ? h("div", {className:"note"}, g.note) : null,
       h(ReactFlowProvider, null,
