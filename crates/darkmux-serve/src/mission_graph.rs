@@ -191,12 +191,29 @@ fn mission_status_str(s: MissionStatus) -> &'static str {
     }
 }
 
-fn phase_status_str(s: PhaseStatus) -> &'static str {
+/// (#1472) Map a `PhaseStatus` onto the `NodeStatus` lattice so a phase's
+/// persisted lifecycle status can be rank-compared against the status
+/// rolled up from its tasks. `PhaseStatus` has no `Error` variant (only a
+/// task/step can fail); every other variant maps one-to-one.
+fn phase_status_to_node(s: PhaseStatus) -> NodeStatus {
     match s {
-        PhaseStatus::Planned => "planned",
-        PhaseStatus::Running => "running",
-        PhaseStatus::Complete => "complete",
-        PhaseStatus::Abandoned => "abandoned",
+        PhaseStatus::Planned => NodeStatus::Planned,
+        PhaseStatus::Running => NodeStatus::Running,
+        PhaseStatus::Complete => NodeStatus::Complete,
+        PhaseStatus::Abandoned => NodeStatus::Abandoned,
+    }
+}
+
+/// (#1472) How advanced a node status is, mirroring the viewer's
+/// `statusRank` (`mission-graph.html`): `planned` < `running` < any
+/// terminal state (`complete` / `error` / `abandoned` share the top rank).
+/// Used by the phase rollup's monotone-authority rule so a persisted
+/// terminal phase status is never regressed by a lower-ranked task rollup.
+fn node_status_rank(s: NodeStatus) -> u8 {
+    match s {
+        NodeStatus::Planned => 0,
+        NodeStatus::Running => 1,
+        NodeStatus::Complete | NodeStatus::Error | NodeStatus::Abandoned => 2,
     }
 }
 
@@ -247,6 +264,35 @@ fn derive_task_status(step_statuses: &[NodeStatus]) -> NodeStatus {
         return NodeStatus::Abandoned;
     }
     NodeStatus::Planned
+}
+
+/// (#1472) Derive a Phase's DISPLAY status from its Tasks' derived statuses,
+/// symmetric with how a Task derives from its Steps — the same rollup rule
+/// (`derive_task_status` generalizes over any child-status list: error >
+/// running > all-complete > abandoned > planned) applied one level up.
+///
+/// Then apply the MONOTONE-AUTHORITY rule against the phase's PERSISTED
+/// lifecycle status: for a finalized/aborted mission the persisted phase
+/// status is the lifecycle-authoritative terminal, so the task-derived
+/// status wins ONLY when STRICTLY more advanced (by `node_status_rank`,
+/// mirroring the viewer's `statusRank` merge in `mission-graph.html`).
+///
+/// - Mid-run: persisted=`Running`, derived=`Complete` → `Complete` (the
+///   live #1472 case — the review launcher only advances persisted phase
+///   status to `Complete` at mission finalization, so a phase whose tasks
+///   are all done kept reading `running` until the whole mission finalized).
+/// - Any task `Running` → phase `Running`; any task `Error` → phase `Error`.
+/// - Aborted mission: persisted=`Abandoned` (rank 2) outranks a mixed
+///   task rollup that derives lower — the persisted terminal wins.
+/// - A phase with all-`Planned` tasks (and persisted `Planned`) → `Planned`.
+fn phase_display_status(persisted: PhaseStatus, task_statuses: &[NodeStatus]) -> NodeStatus {
+    let derived = derive_task_status(task_statuses);
+    let persisted = phase_status_to_node(persisted);
+    if node_status_rank(derived) > node_status_rank(persisted) {
+        derived
+    } else {
+        persisted
+    }
 }
 
 /// Topological longest-path depth over a set of Tasks connected by
@@ -907,21 +953,21 @@ pub fn build_mission_graph(
         let Some(phase) = phase_by_id.remove(phase_id) else {
             continue;
         };
-        nodes.push(GraphNode {
-            id: phase.id.clone(),
-            label: phase.display_name.clone().unwrap_or_else(|| phase.id.clone()),
-            kind: "phase",
-            status: phase_status_str(phase.status),
-            parent_id: None,
-            started_ts: phase.started_ts,
-            completed_ts: phase.completed_ts,
-            depth: phase_index,
-            description: description_or_none(&phase.description),
-            steps: Vec::new(),
-        });
-
         let tasks = tasks_by_phase.remove(phase_id).unwrap_or_default();
         let steps = steps_by_phase.remove(phase_id).unwrap_or_default();
+
+        // (#1472) Build the phase's task nodes into a buffer and collect
+        // each task's derived status + completed_ts FIRST, so the phase
+        // node's DISPLAY status can roll up from its tasks — symmetric with
+        // how a task rolls up from its steps (`derive_task_status`). The
+        // phase node used to be pushed here reading the PERSISTED phase
+        // status, but the review launcher only advances that to Complete at
+        // mission finalization (`finalize_review_mission`), so mid-run a
+        // phase whose tasks were all complete still showed `running`. The
+        // phase node is pushed AFTER this loop, once the rollup is known.
+        let mut task_statuses: Vec<NodeStatus> = Vec::new();
+        let mut task_completed_ts: Vec<Option<u64>> = Vec::new();
+        let mut task_nodes: Vec<GraphNode> = Vec::new();
 
         for task in &tasks {
             edges.push(GraphEdge {
@@ -949,6 +995,9 @@ pub fn build_mission_graph(
             } else {
                 None
             };
+            // (#1472) Feed the phase rollup computed after this loop.
+            task_statuses.push(status);
+            task_completed_ts.push(completed_ts);
 
             // (#1401) Steps render as ROWS on the task node, in
             // `Task.step_ids` order — a synthesized (not-yet-persisted)
@@ -999,7 +1048,7 @@ pub fn build_mission_graph(
                 })
                 .collect();
 
-            nodes.push(GraphNode {
+            task_nodes.push(GraphNode {
                 id: task.id.clone(),
                 label: task.display_name.clone().unwrap_or_else(|| task.id.clone()),
                 kind: "task",
@@ -1031,6 +1080,38 @@ pub fn build_mission_graph(
                 });
             }
         }
+
+        // (#1472) Roll the phase's DISPLAY status up from its tasks, applying
+        // the monotone-authority rule against the persisted phase status
+        // (see `phase_display_status`). This is what fixes the live case —
+        // Investigate showed `running` while all its tasks were complete.
+        let phase_display = phase_display_status(phase.status, &task_statuses);
+        // (#1472) A phase that now derives Complete should carry a truthful
+        // `completed_ts` — the max of its tasks' — when the persisted phase
+        // record doesn't already have one (it won't mid-run, since the
+        // launcher stamps it only at finalization). Never fabricated: left
+        // None if genuinely unknown (no complete tasks with a timestamp).
+        let phase_completed_ts = phase.completed_ts.or_else(|| {
+            if phase_display == NodeStatus::Complete {
+                task_completed_ts.iter().flatten().copied().max()
+            } else {
+                None
+            }
+        });
+
+        nodes.push(GraphNode {
+            id: phase.id.clone(),
+            label: phase.display_name.clone().unwrap_or_else(|| phase.id.clone()),
+            kind: "phase",
+            status: node_status_str(phase_display),
+            parent_id: None,
+            started_ts: phase.started_ts,
+            completed_ts: phase_completed_ts,
+            depth: phase_index,
+            description: description_or_none(&phase.description),
+            steps: Vec::new(),
+        });
+        nodes.extend(task_nodes);
     }
 
     let legacy = !any_tasks;
@@ -1383,6 +1464,81 @@ mod tests {
         // read as a complete task.
         assert_eq!(
             derive_task_status(&[NodeStatus::Complete, NodeStatus::Planned]),
+            NodeStatus::Planned
+        );
+    }
+
+    // ─── phase_display_status (#1472) ───────────────────────────────────
+
+    #[test]
+    fn phase_display_all_tasks_complete_derives_complete_over_persisted_running() {
+        // The exact live #1472 case: the review launcher only advances the
+        // persisted phase status to Complete at mission finalization, so
+        // mid-run a phase whose tasks are all complete still persists as
+        // Running. The rollup must show Complete.
+        assert_eq!(
+            phase_display_status(
+                PhaseStatus::Running,
+                &[NodeStatus::Complete, NodeStatus::Complete, NodeStatus::Complete]
+            ),
+            NodeStatus::Complete
+        );
+    }
+
+    #[test]
+    fn phase_display_any_task_running_derives_running() {
+        assert_eq!(
+            phase_display_status(
+                PhaseStatus::Running,
+                &[NodeStatus::Complete, NodeStatus::Running]
+            ),
+            NodeStatus::Running
+        );
+    }
+
+    #[test]
+    fn phase_display_any_task_error_derives_error() {
+        // Error outranks a persisted Running (rank 2 > 1).
+        assert_eq!(
+            phase_display_status(PhaseStatus::Running, &[NodeStatus::Complete, NodeStatus::Error]),
+            NodeStatus::Error
+        );
+    }
+
+    #[test]
+    fn phase_display_persisted_abandoned_wins_over_mixed_tasks() {
+        // Monotone authority: an aborted mission's persisted Abandoned
+        // (rank 2) is the lifecycle terminal — a lower-ranked task rollup
+        // (here Planned, rank 0) never regresses it.
+        assert_eq!(
+            phase_display_status(
+                PhaseStatus::Abandoned,
+                &[NodeStatus::Complete, NodeStatus::Planned]
+            ),
+            NodeStatus::Abandoned
+        );
+    }
+
+    #[test]
+    fn phase_display_persisted_complete_stays_complete() {
+        // A finalized phase stays Complete even if a task rollup would tie
+        // or fall lower — persisted terminal wins on a rank tie.
+        assert_eq!(
+            phase_display_status(
+                PhaseStatus::Complete,
+                &[NodeStatus::Complete, NodeStatus::Complete]
+            ),
+            NodeStatus::Complete
+        );
+    }
+
+    #[test]
+    fn phase_display_all_planned_tasks_stays_planned() {
+        assert_eq!(
+            phase_display_status(
+                PhaseStatus::Planned,
+                &[NodeStatus::Planned, NodeStatus::Planned]
+            ),
             NodeStatus::Planned
         );
     }
