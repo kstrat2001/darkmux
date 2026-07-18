@@ -353,7 +353,7 @@ fn ensure_wave_loaded(
         .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}"))?;
     let pools = MacProbe.pools().unwrap_or_default();
     let facts = Facts { residents, pools, ..Default::default() };
-    let opts = AcquireOpts { intent: CallerIntent::Auto, scope: AcquireScope::Additive };
+    let opts = AcquireOpts::new(CallerIntent::Auto, AcquireScope::Additive);
     // (#1442 ship-2b, found live) A wave's placements are per-STEP, and the
     // seats x k fan-out makes SAME-MODEL duplicates the norm (k sibling
     // `dispatch.map` steps all place the same model, differing only in

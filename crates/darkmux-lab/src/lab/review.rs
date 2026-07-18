@@ -1071,7 +1071,7 @@ impl ModelCycler for LmsCycler {
         let facts = gather_facts(&mut host)?;
         let placement =
             Placement { model_key: pm.id.clone(), identifier, min_ctx: n_ctx, seat: "review".to_string() };
-        let opts = AcquireOpts { intent: CallerIntent::Auto, scope: AcquireScope::Additive };
+        let opts = AcquireOpts::new(CallerIntent::Auto, AcquireScope::Additive);
         let plan =
             darkmux_gestalt::plan_acquire(std::slice::from_ref(&placement), &facts, opts, &inert_estimator());
         let deadline = resolved_load_deadline();

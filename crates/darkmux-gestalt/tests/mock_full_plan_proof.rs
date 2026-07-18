@@ -80,7 +80,7 @@ fn mock_ports_drive_a_full_acquire_then_release_round_trip() {
 
     // ── plan_acquire: pure function, Facts in, Plan out ──────────────────
     let est = FixedEstimator(BTreeMap::from([("mock-model".to_string(), 5_000_000_000)]));
-    let opts = AcquireOpts { intent: CallerIntent::Auto, scope: AcquireScope::Additive };
+    let opts = AcquireOpts::new(CallerIntent::Auto, AcquireScope::Additive);
     let plan = plan_acquire(&placements, &facts, opts, &est);
 
     assert_eq!(plan.actions.len(), 1, "exactly one placement ⇒ exactly one planned action");
