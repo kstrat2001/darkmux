@@ -406,7 +406,12 @@ pub fn run_step_graph(
         // producer stalled on backpressure could wedge the drain that would
         // relieve it. `emit` is best-effort observability, never load-bearing
         // control flow, so unbounded-with-continuous-drain is the right trade.
-        let (tx, rx) = std::sync::mpsc::channel::<FlowRecord>();
+        // (#1483 Bug 3) One channel per wave carrying BOTH live per-item flow
+        // records AND each step's OWN terminal transition (see `WaveSignal`).
+        // The main thread drains it and applies each `StepTerminal` the moment
+        // that step's job finishes — so a fast seat's node freezes without
+        // waiting for the wave's slowest sibling.
+        let (tx, rx) = std::sync::mpsc::channel::<crate::step_kinds::WaveSignal>();
         // Re-borrow immutably now that every ready step's status flip is
         // recorded — `gather_inputs` needs `&steps`/`&tasks` (completed
         // sibling/upstream outputs), and the job closures below need owned
@@ -469,16 +474,48 @@ pub fn run_step_graph(
                 remote_bucket,
                 dispatch_override.clone(),
             );
+            // (#1483 Bug 3) The job wrapper's OWN handle on the wave channel,
+            // used to stream this step's terminal transition the instant its
+            // dispatch finishes. Distinct from the `ctx` clone (which carries
+            // the step's per-item records); both drop when this closure ends,
+            // so the channel still closes at wave-end exactly as before.
+            let term_tx = tx.clone();
             let job: crate::concurrent_dispatch::DispatchJob<StepJobResult> =
                 Box::new(move || {
-                    let outcome =
-                        kind.run_streaming(&step_snapshot, &task_snapshot, &input, &ctx)?;
-                    Ok((
-                        StepJobResult {
-                            output: outcome.output,
-                        },
-                        outcome.flow_records,
-                    ))
+                    let result =
+                        kind.run_streaming(&step_snapshot, &task_snapshot, &input, &ctx);
+                    // That step's OWN finish time — not the wave's flush time.
+                    let at = now_unix();
+                    match result {
+                        Ok(outcome) => {
+                            let output = outcome.output;
+                            // Stream the terminal transition LIVE. The main
+                            // thread applies it (status + `completed_ts` +
+                            // lifecycle record + persist) on receipt, freezing
+                            // this seat's node while slower siblings run on.
+                            let _ = term_tx.send(crate::step_kinds::WaveSignal::StepTerminal {
+                                index: idx,
+                                at,
+                                result: Ok(output.clone()),
+                                flow_records: outcome.flow_records,
+                            });
+                            // The returned value is consumed by `run_bounded`
+                            // for index accounting + panic reconciliation only;
+                            // the main thread already applied the transition
+                            // from the streamed signal, so return empty records
+                            // (they went live above) to avoid a double emit.
+                            Ok((StepJobResult { output }, Vec::new()))
+                        }
+                        Err(e) => {
+                            let _ = term_tx.send(crate::step_kinds::WaveSignal::StepTerminal {
+                                index: idx,
+                                at,
+                                result: Err(format!("{e:#}")),
+                                flow_records: Vec::new(),
+                            });
+                            Err(e)
+                        }
+                    }
                 });
             jobs.push(crate::concurrent_dispatch::QueuedJob {
                 index: idx,
@@ -488,55 +525,121 @@ pub fn run_step_graph(
         }
 
         // (#1442 gate C3) The scheduler holds NO sender past job-building —
-        // only the jobs' `StepRunCtx`s do. When `run_bounded` finishes every
-        // job (each ctx dropped, each `Sender` clone dropped), the channel
-        // closes and the drain loop below ends naturally.
+        // only the jobs' `StepRunCtx`s and their job wrappers do. When
+        // `run_bounded` finishes every job (each ctx + `term_tx` clone
+        // dropped), the channel closes and the drain loop below ends naturally.
         drop(tx);
-        // Run the wave on a sibling scoped thread and drain its live records
-        // on this (main) thread. `emit` stays main-thread-only (no `Send`
-        // bound needed on the caller's closure); the `Sender`s crossing into
-        // worker threads carry only owned `FlowRecord`s.
+        // Run the wave on a sibling scoped thread and drain its live signals on
+        // this (main) thread. `emit`/`persist`/`steps` stay main-thread-only
+        // (no `Send` bound needed on the caller's closures); the `Sender`s
+        // crossing into worker threads carry only owned `WaveSignal`s.
+        //
+        // (#1483 Bug 3) `applied` tracks which steps were already flushed live
+        // from a `StepTerminal` signal, so the post-scope reconcile only has to
+        // handle a step that produced NO terminal signal — i.e. a job that
+        // PANICKED mid-wave (`run_bounded` synthesizes a terminal `Err` for it,
+        // #1452), never a normal completion.
+        let mut applied: HashSet<usize> = HashSet::new();
         let results = std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
                 crate::concurrent_dispatch::run_bounded(jobs, facts, est, remote_cap, host_factory)
             });
-            for rec in rx.iter() {
-                emit(rec);
+            for sig in rx.iter() {
+                match sig {
+                    crate::step_kinds::WaveSignal::Record(rec) => emit(rec),
+                    crate::step_kinds::WaveSignal::StepTerminal { index, at, result, flow_records } => {
+                        apply_step_terminal(
+                            steps,
+                            &mut report,
+                            &mut *emit,
+                            &mut *persist,
+                            &ready_ids[index],
+                            at,
+                            result,
+                            flow_records,
+                        );
+                        applied.insert(index);
+                    }
+                }
             }
             worker.join().expect("run_bounded worker thread panicked")
         })?;
 
+        // (#1483 Bug 3) Reconcile only the indices that never streamed a
+        // terminal — the panic path. Every normally-completed job already
+        // flipped its step live above, so its index is in `applied` and is
+        // skipped here. A panicked job left its step `Running`; `run_bounded`
+        // handed back a terminal `Err` for it (#1452), applied here as an error
+        // so the run fails loud rather than stranding the step.
         let finished_at = now_unix();
         for (idx, outcome) in results {
-            let id = &ready_ids[idx];
-            let step = steps.get_mut(id).expect("id came from ready_ids itself");
-            match outcome {
-                Ok((job_result, flow_records)) => {
-                    for record in flow_records {
-                        emit(record);
-                    }
-                    step.status = NodeStatus::Complete;
-                    step.completed_ts = Some(finished_at);
-                    step.output = Some(job_result.output);
-                    emit(step_lifecycle_record(step, "step complete"));
-                    persist(step);
-                    report.completed.push(id.clone());
-                }
-                Err(e) => {
-                    step.status = NodeStatus::Error;
-                    step.completed_ts = Some(finished_at);
-                    step.output = Some(format!("{e:#}"));
-                    emit(step_lifecycle_record(step, "step error"));
-                    persist(step);
-                    report.errored.push(id.clone());
-                }
+            if applied.contains(&idx) {
+                continue;
             }
+            let id = ready_ids[idx].clone();
+            let (result, flow_records) = match outcome {
+                Ok((job_result, records)) => (Ok(job_result.output), records),
+                Err(e) => (Err(format!("{e:#}")), Vec::new()),
+            };
+            apply_step_terminal(
+                steps,
+                &mut report,
+                &mut *emit,
+                &mut *persist,
+                &id,
+                finished_at,
+                result,
+                flow_records,
+            );
         }
 
         report.iterations += 1;
     }
 
     Ok(report)
+}
+
+/// (#1483 Bug 3) Apply one step's terminal transition — status flip,
+/// `completed_ts`, batched flow records, the `step complete`/`step error`
+/// lifecycle record, and a durable `persist` — to `steps`/`report`. Shared by
+/// the live per-seat drain (a `WaveSignal::StepTerminal` the moment a job
+/// finishes) and the post-scope reconcile (a panicked job's synthesized
+/// terminal `Err`, #1452), so both paths flip a step identically. `at` is the
+/// step's own completion epoch (seconds); `result` is `Ok(output)` /
+/// `Err(message)`.
+#[allow(clippy::too_many_arguments)]
+fn apply_step_terminal(
+    steps: &mut BTreeMap<String, Step>,
+    report: &mut SchedulerReport,
+    emit: &mut dyn FnMut(FlowRecord),
+    persist: &mut dyn FnMut(&Step),
+    id: &str,
+    at: u64,
+    result: std::result::Result<String, String>,
+    flow_records: Vec<FlowRecord>,
+) {
+    let step = steps.get_mut(id).expect("id came from ready_ids itself");
+    for record in flow_records {
+        emit(record);
+    }
+    match result {
+        Ok(output) => {
+            step.status = NodeStatus::Complete;
+            step.completed_ts = Some(at);
+            step.output = Some(output);
+            emit(step_lifecycle_record(step, "step complete"));
+            persist(step);
+            report.completed.push(id.to_string());
+        }
+        Err(message) => {
+            step.status = NodeStatus::Error;
+            step.completed_ts = Some(at);
+            step.output = Some(message);
+            emit(step_lifecycle_record(step, "step error"));
+            persist(step);
+            report.errored.push(id.to_string());
+        }
+    }
 }
 
 /// The value a `dispatch.internal`/etc. job closure returns through
@@ -1411,6 +1514,96 @@ mod tests {
         let entries = log.lock().unwrap().clone();
         let solo = entries.iter().find(|e| e.0 == "solo-step").expect("ran");
         assert!(!solo.1, "ungrouped step receives no scheduler-shared bucket (step-scoped instead)");
+    }
+
+    /// (#1483 Bug 3) A step kind that sleeps `config.sleep_ms` before
+    /// returning — a deterministic way to make one sibling in a wave finish
+    /// well after another so the ORDER terminal transitions land is
+    /// observable.
+    struct SleepKind;
+    impl StepKind for SleepKind {
+        fn id(&self) -> &'static str {
+            "test.sleep"
+        }
+        fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            let ms = step.config.get("sleep_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            Ok(StepOutcome { output: step.id.clone(), flow_records: vec![] })
+        }
+    }
+
+    /// (#1483 Bug 3) Per-seat live completion: within ONE wave, a fast seat's
+    /// terminal transition must be emitted the moment ITS OWN job finishes,
+    /// not batched at wave-drain behind the slowest sibling. The slow step
+    /// sorts FIRST in `ready_ids` (BTreeMap key order), so the OLD wave-drain
+    /// code — which flipped steps in `ready_ids` order after `run_bounded`
+    /// returned — emitted the slow step's `step complete` FIRST regardless of
+    /// actual finish time. With per-seat streaming the FAST sibling's terminal
+    /// lands first. This is exactly the live bug (a done seat's node stayed
+    /// `running` until the slow gpt-oss seat finished and the whole wave
+    /// flushed).
+    #[test]
+    fn per_seat_terminal_streams_at_each_job_finish_not_wave_drain() {
+        let kind = Arc::new(SleepKind);
+        let (ta, sa) = kinded_step("a-slow", "test.sleep", json!({ "sleep_ms": 250 }), &[]);
+        let (tb, sb) = kinded_step("b-fast", "test.sleep", json!({ "sleep_ms": 0 }), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb)]);
+
+        let emitted = run_graph_with_kind(kind, &tasks, &mut steps);
+
+        let complete_pos = |handle: &str| {
+            emitted
+                .iter()
+                .position(|r| r.action == "step complete" && r.handle == handle)
+                .unwrap_or_else(|| panic!("no `step complete` emitted for {handle}"))
+        };
+        let fast = complete_pos("b-fast-step");
+        let slow = complete_pos("a-slow-step");
+        assert!(
+            fast < slow,
+            "the fast seat's terminal must stream before the slow sibling's \
+             (per-seat completion, not wave-drain) — got fast={fast} slow={slow}"
+        );
+        // Both still reach a terminal Complete — per-seat streaming changes
+        // WHEN each flips, never WHETHER the wave completes.
+        assert_eq!(steps["b-fast-step"].status, NodeStatus::Complete);
+        assert_eq!(steps["a-slow-step"].status, NodeStatus::Complete);
+    }
+
+    /// (#1483 Bug 3) Per-seat early completion must NOT relax the wave
+    /// scheduling barrier: a step that DEPENDS on a whole wave still waits for
+    /// EVERY sibling in that wave to finish. The fast probe flipping to
+    /// Complete live cannot let the dependent (dedup-shaped) step start before
+    /// the slow probe is also done. Proven by ordering: the dependent's `step
+    /// start` must come AFTER both probes' `step complete`.
+    #[test]
+    fn dependent_step_still_waits_for_the_whole_wave() {
+        let kind = Arc::new(SleepKind);
+        // Two independent probe tasks (one slow, one fast) in wave 1; a third
+        // task depends on BOTH, so it can only run in wave 2 once the whole
+        // wave-1 barrier clears.
+        let (ta, sa) = kinded_step("a-slow", "test.sleep", json!({ "sleep_ms": 200 }), &[]);
+        let (tb, sb) = kinded_step("b-fast", "test.sleep", json!({ "sleep_ms": 0 }), &[]);
+        let (tc, sc) = kinded_step("c-dep", "test.sleep", json!({ "sleep_ms": 0 }), &["a-slow", "b-fast"]);
+        let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb), (tc, sc)]);
+
+        let emitted = run_graph_with_kind(kind, &tasks, &mut steps);
+
+        let pos = |action: &str, handle: &str| {
+            emitted
+                .iter()
+                .position(|r| r.action == action && r.handle == handle)
+                .unwrap_or_else(|| panic!("no `{action}` for {handle}"))
+        };
+        let dep_start = pos("step start", "c-dep-step");
+        let slow_done = pos("step complete", "a-slow-step");
+        let fast_done = pos("step complete", "b-fast-step");
+        assert!(
+            dep_start > slow_done && dep_start > fast_done,
+            "the dependent step must not start until BOTH wave-1 siblings finish \
+             (barrier preserved) — dep_start={dep_start} slow_done={slow_done} fast_done={fast_done}"
+        );
+        assert_eq!(steps["c-dep-step"].status, NodeStatus::Complete);
     }
 
     /// (#1442 ship-2b, the operator-recorded seam decision on PR #1455) The

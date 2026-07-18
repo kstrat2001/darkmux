@@ -155,14 +155,53 @@ pub type MapDispatchOverride =
 ///    meter one allowance BETWEEN them. `None` when the step named no group
 ///    (the kind falls back to a step-scoped bucket).
 pub struct StepRunCtx {
-    emitter: Option<std::sync::mpsc::Sender<FlowRecord>>,
+    emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
     remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
     dispatch_override: Option<MapDispatchOverride>,
 }
 
+/// (#1483 Bug 3) One message on a wave's live streaming channel from a
+/// `run_bounded` worker thread back to `run_step_graph`'s main-thread drain.
+/// Two shapes ride ONE channel so the main thread interleaves them without a
+/// `select` (`std::sync::mpsc` has none):
+///
+/// - [`WaveSignal::Record`] — a per-item flow record a step emits mid-run via
+///   [`StepRunCtx::emit`] (the #1442 gate-C3 live-emission seam).
+/// - [`WaveSignal::StepTerminal`] — the step's OWN terminal transition, sent
+///   by the scheduler's job wrapper the moment THAT job finishes. Before
+///   #1483, every step's terminal status was applied at wave-drain (after
+///   `run_bounded` returned, i.e. after the SLOWEST job in the wave), so a
+///   fast seat's node stayed `running` — clock ticking — until the whole wave
+///   flushed. Streaming the terminal transition freezes each done seat's node
+///   the instant its own dispatch completes, WITHOUT relaxing the wave
+///   scheduling barrier (the next wave still waits for `run_bounded` to
+///   return, so a dependent step never starts early).
+// `Record` carries a whole `FlowRecord` by value — the same unboxed payload
+// the pre-#1483 `Sender<FlowRecord>` channel already moved per send. Boxing it
+// to shrink the enum would add a heap allocation to the hot per-item record
+// path for no behavioral gain, so the size asymmetry with `StepTerminal` is
+// deliberate.
+#[allow(clippy::large_enum_variant)]
+pub enum WaveSignal {
+    /// A live per-item flow record (from [`StepRunCtx::emit`]).
+    Record(FlowRecord),
+    /// A step's terminal transition, keyed by its position in the wave's
+    /// `ready_ids`. `at` is that step's own completion epoch (seconds);
+    /// `result` is `Ok(output)` / `Err(message)`; `flow_records` are the
+    /// step's batched [`StepOutcome::flow_records`] to emit just before the
+    /// `step complete`/`step error` lifecycle record (empty for the live-
+    /// streaming kinds, which emit per-item via `Record`).
+    StepTerminal {
+        index: usize,
+        at: u64,
+        result: std::result::Result<String, String>,
+        flow_records: Vec<FlowRecord>,
+    },
+}
+
 impl StepRunCtx {
     pub(crate) fn new(
-        emitter: Option<std::sync::mpsc::Sender<FlowRecord>>,
+        emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
         remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
         dispatch_override: Option<MapDispatchOverride>,
     ) -> Self {
@@ -179,7 +218,7 @@ impl StepRunCtx {
             // A closed channel (the scheduler stopped draining, e.g. on an
             // early return) is not a step-level error — the record is best-
             // effort observability, never load-bearing control flow.
-            let _ = tx.send(record);
+            let _ = tx.send(WaveSignal::Record(record));
         }
     }
 
