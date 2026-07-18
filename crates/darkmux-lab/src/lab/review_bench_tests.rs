@@ -1499,6 +1499,7 @@
             "review-probe".to_string(),
             vec![ResolvedSeatStaffing {
                 name: "fast".into(),
+                role_id: None,
                 pm: dummy_pm("probe-model"),
                 k: 3,
                 passes: 2,
@@ -1511,6 +1512,7 @@
             "review-judge".to_string(),
             vec![ResolvedSeatStaffing {
                 name: "fast".into(),
+                role_id: None,
                 pm: dummy_pm("judge-model"),
                 k: 1,
                 passes: 2,

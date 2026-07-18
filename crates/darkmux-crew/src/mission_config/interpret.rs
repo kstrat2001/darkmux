@@ -197,6 +197,16 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
                             .as_deref()
                             .map(|p| render(p, index, name))
                             .or_else(|| task_cfg.display_name.clone());
+                        // (#1475 packet 2) Per-copy role_id: `role_pattern`
+                        // renders one DISTINCT role per expanded copy (the
+                        // review probe stage binds copy 0 → review-probe-high,
+                        // etc.); absent falls back to the template's single
+                        // `role_id` (the pre-1.3 shared-role behavior).
+                        let copy_role_id = spec
+                            .role_pattern
+                            .as_deref()
+                            .map(|p| render(p, index, name))
+                            .or_else(|| task_cfg.role_id.clone());
                         push_task(
                             &mut tasks,
                             &real_task_id,
@@ -205,7 +215,7 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
                             display_name,
                             vec![real_step_id.clone()],
                             override_,
-                            task_cfg.role_id.as_deref(),
+                            copy_role_id.as_deref(),
                         )?;
                         push_step(
                             &mut steps,
@@ -683,6 +693,48 @@ mod tests {
         assert_eq!(steps["review-judge-step"].config, serde_json::json!({"concurrency": 1}));
     }
 
+    /// (#1475 packet 2) `role_pattern` renders a DISTINCT `role_id` per
+    /// expanded copy from the item — the mechanism the review probe stage uses
+    /// to bind copy 0 → review-probe-high, copy 1 → review-probe-mid, etc.
+    /// Absent, every copy shares the template's single `role_id`.
+    #[test]
+    fn expansion_role_pattern_renders_a_distinct_role_per_copy() {
+        let cfg = doc(vec![phase(
+            "investigate",
+            vec![TaskConfig {
+                id: "probe-template".to_string(),
+                description: None,
+                display_name: None,
+                depends_on: vec![],
+                role_id: Some("fallback-role".to_string()),
+                steps: vec![step("probe-template-step", "dispatch.map", serde_json::Value::Null)],
+                expand: Some(ExpansionSpec {
+                    over: "probe_roles".to_string(),
+                    task_id_pattern: "probe-{index}-task".to_string(),
+                    step_id_pattern: "probe-{index}-step".to_string(),
+                    kind_pattern: "{kind}".to_string(),
+                    description_pattern: None,
+                    display_name_pattern: None,
+                    role_pattern: Some("{name}".to_string()),
+                    extras: Map::new(),
+                }),
+                extras: Map::new(),
+            }],
+        )]);
+        let mut phase_ids = Map::new();
+        phase_ids.insert("investigate".to_string(), "investigate".to_string());
+        let mut expansions = Map::new();
+        expansions.insert(
+            "probe_roles".to_string(),
+            vec!["review-probe-high".to_string(), "review-probe-mid".to_string()],
+        );
+        let params = LaunchParams { phase_ids, expansions, ..Default::default() };
+        let (tasks, _steps, _warnings) = interpret(&cfg, &params).unwrap();
+        let by_id: BTreeMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        assert_eq!(by_id["probe-0-task"].role_id.as_deref(), Some("review-probe-high"));
+        assert_eq!(by_id["probe-1-task"].role_id.as_deref(), Some("review-probe-mid"));
+    }
+
     /// The expansion primitive's central case — a template task expanding
     /// into N real copies, one per staffed seat, AND a dependent task's
     /// `depends_on` rewriting from the template id to every real expanded
@@ -707,6 +759,7 @@ mod tests {
                         kind_pattern: "{kind}:{name}".to_string(),
                         description_pattern: Some("probe seat `{name}`".to_string()),
                         display_name_pattern: Some("Probe `{name}`".to_string()),
+                        role_pattern: None,
                         extras: Map::new(),
                     }),
                     extras: Map::new(),
@@ -772,6 +825,7 @@ mod tests {
                         kind_pattern: "{kind}:{name}".to_string(),
                         description_pattern: None,
                         display_name_pattern: None,
+                        role_pattern: None,
                         extras: Map::new(),
                     }),
                     extras: Map::new(),
@@ -820,6 +874,7 @@ mod tests {
                     kind_pattern: "{kind}:{name}".to_string(),
                     description_pattern: None,
                     display_name_pattern: None,
+                    role_pattern: None,
                     extras: Map::new(),
                 }),
                 extras: Map::new(),
@@ -858,6 +913,7 @@ mod tests {
                     kind_pattern: "{kind}:{name}".to_string(),
                     description_pattern: None,
                     display_name_pattern: None,
+                    role_pattern: None,
                     extras: Map::new(),
                 }),
                 extras: Map::new(),
@@ -992,6 +1048,7 @@ mod tests {
                 kind_pattern: "{kind}:{name}".to_string(),
                 description_pattern: None,
                 display_name_pattern: None,
+                role_pattern: None,
                 extras: Map::new(),
             }),
             extras: Map::new(),
