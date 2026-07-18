@@ -53,7 +53,11 @@
   *{box-sizing:border-box}
   html,body{margin:0;height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 'Inter',-apple-system,system-ui,sans-serif;overflow:hidden}
   #root{height:100vh;display:flex;flex-direction:column}
-  .top{height:46px;flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--bg2)}
+  /* min-height (not a fixed 46px) + safe-area padding so the bar clears the
+     notch/status bar when the page runs as a standalone home-screen PWA
+     (#1403, viewport-fit=cover). env() resolves to 0 in a normal browser tab,
+     so desktop is unchanged. */
+  .top{position:relative;min-height:46px;flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:env(safe-area-inset-top,0px) calc(16px + env(safe-area-inset-right,0px)) 0 calc(16px + env(safe-area-inset-left,0px));border-bottom:1px solid var(--line);background:var(--bg2)}
   .brand{font-weight:700;letter-spacing:.04em}
   .brand a{color:inherit;text-decoration:none}
   .brand b{color:var(--amber)}
@@ -116,7 +120,7 @@
 
   /* (#1403) Header live token/turn readout — mission-scoped, local vs cloud
      honesty split, same convention as the main viewer's savings hero. */
-  .mmeter{display:inline-flex;align-items:baseline;gap:6px;font:11px/1 'JetBrains Mono',monospace;color:var(--muted)}
+  .mmeter{display:inline-flex;align-items:baseline;gap:6px;font:11px/1 'JetBrains Mono',monospace;color:var(--muted);white-space:nowrap}
   .mmeter b{color:var(--amber);font-weight:700}
   .mmeter .split{color:var(--muted)}
   .mmeter .cloud{color:var(--warn)}
@@ -165,7 +169,10 @@
 
   /* (#1403) Mission-scoped events panel — a right-side rail on desktop, a
      bottom sheet on phones. Newest first, this mission's flow records only. */
-  .evbtn{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:5px 9px;background:none;cursor:pointer}
+  /* .legbtn shares the .evbtn appearance (it's shown only below the mobile
+     breakpoint, where it stands in for the inline .legend dots) — without this
+     it fell back to a raw white default-button on phones. */
+  .evbtn,.legbtn{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:5px 9px;background:none;cursor:pointer}
   .evbtn:hover{color:var(--text);border-color:var(--amber-dim)}
   .evbtn.on{color:var(--amber);border-color:var(--amber)}
   .body{flex:1 1 auto;display:flex;min-height:0;position:relative}
@@ -239,7 +246,10 @@
      to three lines on a portrait phone (operator repro). Mission id truncates
      with an ellipsis; the status legend hides behind a tap (the .legend below
      the breakpoint becomes a popover). */
-  .legendpop{position:absolute;top:44px;right:8px;z-index:30;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;display:none;flex-direction:column;gap:6px}
+  /* Anchored to the bottom of `.top` (which is a positioning context) rather
+     than a hard-coded 44px — the header grows to two rows + a safe-area inset
+     on phones, so a fixed offset opened the popover ON TOP of the tab row. */
+  .legendpop{position:absolute;top:calc(100% + 4px);right:8px;z-index:30;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;display:none;flex-direction:column;gap:6px}
   .legendpop.on{display:flex}
   .legbtn{display:none}
 
@@ -267,7 +277,8 @@
      renders). The timeline's tall bottom padding keeps the last card
      reachable above it. */
   html.timeline-mode .evpanel{position:fixed;left:0;right:0;bottom:0;z-index:45;
-    max-height:45vh;border-left:none;border-top:1px solid var(--line)}
+    max-height:45vh;border-left:none;border-top:1px solid var(--line);
+    padding-bottom:env(safe-area-inset-bottom,0px)}
   /* Only pad the list past the sheet while the sheet is actually open
      (`:has` — degrades to the base 40px padding on engines without it,
      where the open sheet may cover the last card until closed). */
@@ -275,16 +286,35 @@
 
   @media (max-width:700px){
     html,body{overflow:hidden}
-    .top{gap:8px;padding:0 10px}
+    /* (#1432 follow-up) The header packs 8–9 controls; on a phone they
+       overflowed a single non-wrapping 46px row and the rightmost tabs + the
+       token split clipped off-screen (unreachable). Reflow to two rows:
+       row 1 = identity + status (nav · brand · mission · status · live),
+       row 2 = the token readout + the graph/events/legend tabs. `.midname`
+       grows to fill row 1, which forces the meter + tabs to wrap together as
+       the second row. Safe-area padding keeps the bar clear of the notch /
+       status bar when the page runs as a standalone home-screen PWA (#1403). */
+    .top{flex-wrap:wrap;align-items:center;gap:8px;row-gap:6px;min-height:0;
+      padding:calc(7px + env(safe-area-inset-top,0px)) calc(10px + env(safe-area-inset-right,0px)) 7px calc(10px + env(safe-area-inset-left,0px))}
     .brand{font-size:12px}
     .brand .sub{display:none}
-    .midname{font-size:11px;max-width:34vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .legend{display:none}
-    .legbtn{display:inline-block}
+    .midname{flex:1 1 30px;min-width:0;max-width:none;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    /* One shared box height so the back button, status pill, live toggle and
+       tabs sit on a common center line instead of reading as a pile of
+       differently-sized boxes. */
+    .nav a,.mstatus,.livepill,.evbtn,.legbtn{display:inline-flex;align-items:center;min-height:30px;box-sizing:border-box}
     .nav a{padding:6px 8px}
+    /* The token readout leads row 2 and pushes the tabs to the right edge; keep
+       it on ONE line (it wrapped to "170k / tok" when squeezed) and drop the
+       verbose local+cloud breakdown on phones — the headline total is what a
+       glance needs, and the split still shows on the per-step meters. */
+    .mmeter{margin-right:auto}
+    .mmeter .split:has(.cloud){display:none}
+    .legend{display:none}
+    .legbtn{display:inline-flex}
     /* Bottom-sheet events panel on phones. */
     .body{flex-direction:column}
-    .evpanel{flex:0 0 45vh;border-left:none;border-top:1px solid var(--line)}
+    .evpanel{flex:0 0 45vh;border-left:none;border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom,0px)}
     .evrow{padding:9px 12px}
   }
 </style>
