@@ -1286,17 +1286,19 @@ pub fn validate_review_crew(crew: &ResolvedCrew) -> Result<ReviewSeats<'_>> {
         .ok_or_else(|| {
             anyhow!(
                 "darkmux: review staffing \"{}\" is missing the \"review-probe\" seat (the \
-                 review needs >= 1 probe staffing) — the resourcing resolver staffs it from \
-                 the roster profile; pin drawers explicitly with `--param probe_models=<id,...>` \
-                 (#1426 ship-2)",
+                 review needs >= 1 probe staffing) — the role→profile resolver staffs the three \
+                 probe roles from their bindings; bind or override one \
+                 (`darkmux config set role_profiles.review-probe-high <profile>`, or \
+                 `--param review-probe-high=<profile>`) (#1475)",
                 crew.name
             )
         })?;
     let judges = crew.seats.get("review-judge").ok_or_else(|| {
         anyhow!(
             "darkmux: review staffing \"{}\" is missing the \"review-judge\" seat (the \
-             review needs exactly 1 judge staffing) — the resourcing resolver staffs it from \
-             the roster profile; pin it explicitly with `--param judge_model=<id>` (#1426 ship-2)",
+             review needs exactly 1 judge staffing) — the role→profile resolver staffs it from \
+             its binding; bind or override it (`darkmux config set role_profiles.review-judge \
+             <profile>`, or `--param review-judge=<profile>`) (#1475)",
             crew.name
         )
     })?;

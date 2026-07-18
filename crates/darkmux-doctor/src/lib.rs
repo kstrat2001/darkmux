@@ -2430,10 +2430,10 @@ fn check_crews_residue() -> Check {
                       in 2.0"
                 .into(),
             hint: Some(
-                "the `crews` map retired in 2.0 (#1426) — review staffing is now derived from \
-                 the roster profile plus launch-param seat pins (probe_models / judge_model / \
-                 verify_model / k). The key is harmless residue; delete it from \
-                 ~/.darkmux/profiles.json."
+                "the `crews` map retired in 2.0 (#1426) — review staffing is now the role→profile \
+                 rollup (#1475): each review role resolves via a `--param <role>=<profile>` launch \
+                 override, else the `role_profiles` map in config.json, else `default_profile`. The \
+                 key is harmless residue; delete it from ~/.darkmux/profiles.json."
                     .into(),
             ),
         }
