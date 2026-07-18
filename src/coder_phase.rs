@@ -576,12 +576,19 @@ impl StepKind for MissionCoderStepKind {
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
     ) -> Result<StepOutcome> {
-        let opts = self
+        let mut opts = self
             .opts
             .lock()
             .expect("mission.coder opts mutex poisoned")
             .take()
             .ok_or_else(|| anyhow::anyhow!("mission.coder step ran more than once"))?;
+        // (#1483) Stamp the graph step id so the live trajectory tailer can
+        // attribute this AGENTIC seat's per-turn / per-tool / per-token flow
+        // records to the coder seat card. The coder dispatch runs under the
+        // shared `mission-run-<…>` session (NOT the `step-<id>` default the
+        // viewer's session->step map resolves), so without the step id its
+        // live turn+tool climb was unattributable and the seat never ticked.
+        opts.step_id = Some(step.id.clone());
         let result = crew::dispatch::dispatch(opts)?;
         eprintln!(
             "{}",

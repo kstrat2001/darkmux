@@ -1031,6 +1031,7 @@ fn dispatch_task(
         max_completion_tokens: None,
         image: image.map(str::to_string),
         model_base_url_override: None,
+        step_id: None, // (#1483) set on the graph-step path only
     };
     let result = dispatch(opts).context("internal-runtime dispatch via tool-bench")?;
     Ok((

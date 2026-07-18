@@ -256,6 +256,10 @@ impl StepKind for DispatchInternalStepKind {
             max_completion_tokens: None,
             image,
             model_base_url_override: None,
+            // (#1483) Stamp the step id so the tailer's live turn/tool/token
+            // records attribute to this seat even if `session_id` was
+            // config-overridden off the `step-<id>` default the viewer maps.
+            step_id: Some(step.id.clone()),
         };
         let result =
             dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;

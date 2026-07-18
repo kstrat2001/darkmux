@@ -729,6 +729,7 @@ fn dispatch_case(
         max_completion_tokens: None,
         image: None,
         model_base_url_override: None,
+        step_id: None, // (#1483) set on the graph-step path only
     };
     let r = dispatch(d).context("pr-review-bench internal-runtime dispatch")?;
     Ok(r.stdout)

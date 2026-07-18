@@ -2996,6 +2996,148 @@
         assert_eq!(turns, 2, "dispatch.turn unaffected by the telemetry emission");
     }
 
+    /// (#1483) A multi-turn / multi-tool agent loop stamps EVERY live per-event
+    /// flow record (`dispatch.turn`, `dispatch.tool`, `telemetry.tokens`) with
+    /// the graph `step_id` — so the mission-graph viewer can attribute the live
+    /// turn/tool/token climb to the AGENTIC seat card even when the dispatch's
+    /// `session_id` isn't the `step-<id>` default (the coder-phase seat's shared
+    /// `mission-run-<…>` session). Each turn/tool record also carries the
+    /// AUTHORITATIVE monotonic running count the viewer's meter ticks off.
+    #[test]
+    #[serial]
+    fn handle_event_stamps_step_id_and_running_counts_for_agentic_seat() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        // The coder seat's shared mission-run session — NOT `step-<id>`. Without
+        // the stamped `step_id`, these records would be unattributable.
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "mission-run-m1-build-abc".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        )
+        .with_step(Some("coder-1".into()));
+
+        // Two turns, three tool calls interleaved — a real agentic loop shape.
+        state.handle_event(
+            r#"{"type":"model.completed","seq":1,"finish_reason":"tool_calls","usage":{"prompt_tokens":100,"completion_tokens":20}}"#,
+        );
+        state.handle_event(r#"{"type":"tool.completed","tool_seq":1,"tool_name":"read","ok":true}"#);
+        state.handle_event(r#"{"type":"tool.completed","tool_seq":2,"tool_name":"bash","ok":true}"#);
+        state.handle_event(
+            r#"{"type":"model.completed","seq":2,"finish_reason":"tool_calls","usage":{"prompt_tokens":150,"completion_tokens":30}}"#,
+        );
+        state.handle_event(r#"{"type":"tool.completed","tool_seq":3,"tool_name":"edit","ok":true}"#);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let records = drain_flow_records(tmp.path());
+
+        // dispatch.turn — running count 1,2; step_id stamped on each.
+        let turn_recs: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|v| v["action"] == "dispatch.turn")
+            .collect();
+        assert_eq!(turn_recs.len(), 2, "one dispatch.turn per model.completed");
+        assert_eq!(turn_recs[0]["payload"]["turns_so_far"], 1);
+        assert_eq!(turn_recs[1]["payload"]["turns_so_far"], 2);
+        for r in &turn_recs {
+            assert_eq!(r["payload"]["step_id"], "coder-1", "turn record must carry step_id");
+        }
+
+        // dispatch.tool — running count 1,2,3; step_id stamped on each.
+        let tool_recs: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|v| v["action"] == "dispatch.tool")
+            .collect();
+        assert_eq!(tool_recs.len(), 3, "one dispatch.tool per tool.completed");
+        assert_eq!(tool_recs[0]["payload"]["tool_calls_so_far"], 1);
+        assert_eq!(tool_recs[1]["payload"]["tool_calls_so_far"], 2);
+        assert_eq!(tool_recs[2]["payload"]["tool_calls_so_far"], 3);
+        for r in &tool_recs {
+            assert_eq!(r["payload"]["step_id"], "coder-1", "tool record must carry step_id");
+        }
+
+        // telemetry.tokens also attributes to the seat.
+        let tok_recs: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|v| v["category"] == "telemetry" && v["source"] == "tokens")
+            .collect();
+        assert_eq!(tok_recs.len(), 2, "one tokens record per usage-bearing turn");
+        for r in &tok_recs {
+            assert_eq!(r["payload"]["step_id"], "coder-1", "tokens record must carry step_id");
+        }
+    }
+
+    /// (#1483) A dispatch that is NOT a graph step (`step_id` unset — the
+    /// one-off `darkmux dispatch` path) emits the SAME records WITHOUT a
+    /// `step_id` payload key, so the field is purely additive and those records
+    /// attribute via `session_id` exactly as before the emit half landed.
+    #[test]
+    #[serial]
+    fn handle_event_omits_step_id_when_not_a_graph_step() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-oneoff".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{"prompt_tokens":100,"completion_tokens":20}}"#,
+        );
+        state.handle_event(r#"{"type":"tool.completed","tool_seq":1,"tool_name":"read","ok":true}"#);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let records = drain_flow_records(tmp.path());
+        let turn = records
+            .iter()
+            .find(|v| v["action"] == "dispatch.turn")
+            .expect("a dispatch.turn record");
+        assert!(
+            turn["payload"].get("step_id").is_none(),
+            "no step_id key when the dispatch isn't a graph step; got {turn:?}"
+        );
+        // The running count still rides even without a step id.
+        assert_eq!(turn["payload"]["turns_so_far"], 1);
+    }
+
     /// (#557 slice 3) A `dispatch.context` trajectory line → a
     /// `category=telemetry, source=context` flow record carrying
     /// `{used, max}`. Same capture mechanism + env-scrub as the cycle

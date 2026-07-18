@@ -1868,6 +1868,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // wiring, so the internal path resolves it directly from `opts`.
     let mission_id = crate::dispatch::resolve_mission_for_phase(opts.phase_id.as_deref());
     let phase_id = opts.phase_id.clone();
+    // (#1483) The mission-graph step this dispatch runs as (when it's a
+    // graph step). Stamped onto every live per-event flow record's payload
+    // so the viewer attributes the turn/tool/token climb to the seat card
+    // even when `session_id` isn't the `step-<id>` default (coder-phase's
+    // shared `mission-run-<…>` session). `None` for a non-graph dispatch.
+    let step_id = opts.step_id.clone();
 
     // 4. Workspace resolution. Two paths (#206):
     //
@@ -2255,6 +2261,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let model = model.clone();
         let mission_id = mission_id.clone();
         let phase_id = phase_id.clone();
+        let step_id = step_id.clone();
         let inactivity_deadline = Arc::clone(&inactivity_deadline);
         thread::spawn(move || {
             run_tailer(
@@ -2264,6 +2271,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 model,
                 mission_id,
                 phase_id,
+                step_id,
                 stop,
                 inactivity_deadline,
                 inactivity_secs,
@@ -2678,6 +2686,7 @@ fn run_tailer(
     model: String,
     mission_id: Option<String>,
     phase_id: Option<String>,
+    step_id: Option<String>,
     stop_flag: Arc<AtomicBool>,
     inactivity_deadline: Arc<Mutex<Instant>>,
     inactivity_secs: u64,
@@ -2695,6 +2704,7 @@ fn run_tailer(
         inactivity_secs,
     )
     .with_mission(mission_id, phase_id)
+    .with_step(step_id)
     .with_compaction_threshold(compaction_threshold);
 
     loop {
@@ -2897,6 +2907,12 @@ struct TailerState {
     /// mission in the observability view. `None` for a one-off dispatch.
     mission_id: Option<String>,
     phase_id: Option<String>,
+    /// (#1483) The mission-graph step id this dispatch runs as, stamped into
+    /// every live per-event flow record's payload (`dispatch.turn`,
+    /// `dispatch.tool`, `telemetry.tokens`, …) so the viewer attributes the
+    /// live turn/tool/token climb to the seat card. `None` for a non-graph
+    /// dispatch — those records attribute via `session_id` alone.
+    step_id: Option<String>,
     last_heartbeat_at: Option<Instant>,
     summary: TrajectorySummary,
     /// (#457) Shared with the watchdog thread. Tailer writes a new
@@ -2931,6 +2947,7 @@ impl TailerState {
             model,
             mission_id: None,
             phase_id: None,
+            step_id: None,
             last_heartbeat_at: None,
             summary: TrajectorySummary::default(),
             inactivity_deadline: Some(inactivity_deadline),
@@ -2946,6 +2963,15 @@ impl TailerState {
     fn with_mission(mut self, mission_id: Option<String>, phase_id: Option<String>) -> Self {
         self.mission_id = mission_id;
         self.phase_id = phase_id;
+        self
+    }
+
+    /// (#1483) Stamp the mission-graph step id this dispatch runs as, so every
+    /// live per-event flow record carries `payload.step_id` and the viewer can
+    /// attribute the turn/tool/token climb to the seat card. Builder-style;
+    /// only production `run_tailer` opts in (new/test callers keep `None`).
+    fn with_step(mut self, step_id: Option<String>) -> Self {
+        self.step_id = step_id;
         self
     }
 
@@ -2977,6 +3003,7 @@ impl TailerState {
             model,
             mission_id: None,
             phase_id: None,
+            step_id: None,
             last_heartbeat_at: None,
             summary: TrajectorySummary::default(),
             inactivity_deadline: None,
@@ -3042,6 +3069,12 @@ impl TailerState {
                     "finish_reason": cap_json_str(event.get("finish_reason"), MAX_TRAJ_FIELD_BYTES),
                     "tool_calls_count": event.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
                     "usage": event.get("usage"),
+                    // (#1483) The AUTHORITATIVE running turn count for this
+                    // dispatch (monotonic, 1-based). The mission-graph viewer's
+                    // live seat-card meter uses this as the running tick so a
+                    // page opened MID-dispatch reads the true count immediately
+                    // rather than under-counting from the tail-from-now stream.
+                    "turns_so_far": self.summary.turns,
                 });
                 self.emit("dispatch.turn", darkmux_flow::Level::Info, payload);
                 // (#795) Per-turn token telemetry — the live "tokens
@@ -3099,6 +3132,11 @@ impl TailerState {
                 }
                 let payload = serde_json::json!({
                     "tool_seq": event.get("tool_seq"),
+                    // (#1483) The AUTHORITATIVE running tool-call count for this
+                    // dispatch (monotonic, 1-based) — the viewer's live seat-card
+                    // meter ticks tool-calls off this, same mid-dispatch-open
+                    // robustness as `turns_so_far` on `dispatch.turn`.
+                    "tool_calls_so_far": self.summary.tool_calls,
                     "tool_name": cap_json_str(event.get("tool_name"), MAX_TRAJ_FIELD_BYTES),
                     // The actual arguments (search pattern / path / command) so the
                     // viewer can show WHAT the model did, not just that it acted.
@@ -3260,7 +3298,8 @@ impl TailerState {
         }
     }
 
-    fn emit(&self, action: &str, level: darkmux_flow::Level, payload: serde_json::Value) {
+    fn emit(&self, action: &str, level: darkmux_flow::Level, mut payload: serde_json::Value) {
+        self.stamp_step_id(&mut payload);
         let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
             level,
             action,
@@ -3273,11 +3312,24 @@ impl TailerState {
         ));
     }
 
+    /// (#1483) Stamp `step_id` into the payload object so the mission-graph
+    /// viewer can attribute this live record to the seat card via its
+    /// `payload.step_id` -> step lookup — the attribution path that works even
+    /// when `session_id` isn't the `step-<id>` default (the coder-phase seat's
+    /// shared `mission-run-<…>` session). No-op when this dispatch isn't a
+    /// graph step (`step_id` unset) or the payload isn't a JSON object.
+    fn stamp_step_id(&self, payload: &mut serde_json::Value) {
+        if let (Some(step_id), Some(obj)) = (self.step_id.as_deref(), payload.as_object_mut()) {
+            obj.insert("step_id".to_string(), serde_json::Value::from(step_id));
+        }
+    }
+
     /// (#557 slice 2) Emit a telemetry flow record. Same plumbing as
     /// `emit` but routes through `build_telemetry_record` so the record
     /// lands under `category=telemetry` with a caller-supplied `source`
     /// (`"detector"`, `"runtime"`, …) the observability viewer keys on.
-    fn emit_telemetry(&self, source: &str, action: &str, payload: serde_json::Value) {
+    fn emit_telemetry(&self, source: &str, action: &str, mut payload: serde_json::Value) {
+        self.stamp_step_id(&mut payload);
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             action,
