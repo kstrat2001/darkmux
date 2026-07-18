@@ -1024,6 +1024,53 @@ function App(){
       es.onerror = function(){ setLive(false); }; // native EventSource keeps retrying
       es.onmessage = onMessage;
     }
+    // (#1471) One-shot events backfill on load, mirroring viewer.html's
+    // fetch-then-tail (viewer.html's `/flow/<date>` fetch). The SSE stream only
+    // carries records from NOW, so a refresh would otherwise show "no events"
+    // until the next record streams — even for a mission with a rich history.
+    // Fetch the day's records, filter through the SAME `recordInMission`
+    // predicate the live path uses (so backfill and live stay consistent —
+    // step records carry `mission_id:null`, so a mission_id-only filter would
+    // miss them), map to the same row shape, and seed. SINGLE-DAY scope on
+    // purpose: the SSE stream above only tails `todayUtc()`, so backfilling
+    // today's records matches the live behavior (no multi-day backfill).
+    // Best-effort: a failed backfill must never break the live panel or graph.
+    fetch("/flow/" + todayUtc(), {headers:{accept:"application/json"}})
+      .then(function(r){ return r.ok ? r.json() : []; })
+      .then(function(body){
+        var recs = Array.isArray(body) ? body : (body && (body.records || body.flow)) || [];
+        var idx = idxRef.current;
+        var rows = [];
+        for (var i = 0; i < recs.length; i++) {
+          var rec = recs[i];
+          if (!rec || typeof rec !== "object") continue;
+          if (!recordInMission(rec, idx, missionId)) continue;
+          rows.push({ id: evSeqRef.current++, ts: rec.ts, action: rec.action || "",
+                      handle: rec.handle || "", category: rec.category || "",
+                      level: rec.level || "" });
+        }
+        // Newest-first, matching the live path's prepend order.
+        rows.sort(function(a, b){ return (b.ts < a.ts) ? -1 : (b.ts > a.ts) ? 1 : 0; });
+        setEvents(function(prev){
+          // Dedup against live rows that may already have arrived via SSE in the
+          // race window between openStream() and this fetch resolving — key on
+          // (ts + action + handle) so a backfilled row never clobbers a live one.
+          var seen = {};
+          var keyOf = function(x){ return String(x.ts) + " " + x.action + " " + x.handle; };
+          var merged = [];
+          for (var j = 0; j < prev.length; j++) { seen[keyOf(prev[j])] = true; merged.push(prev[j]); }
+          for (var k = 0; k < rows.length; k++) {
+            var key = keyOf(rows[k]);
+            if (seen[key]) continue;
+            seen[key] = true;
+            merged.push(rows[k]);
+          }
+          merged.sort(function(a, b){ return (b.ts < a.ts) ? -1 : (b.ts > a.ts) ? 1 : 0; });
+          return merged.length > EVENTS_CAP ? merged.slice(0, EVENTS_CAP) : merged;
+        });
+      })
+      .catch(function(){ /* best-effort; the live panel + graph keep working */ });
+
     openStream();
     // (#1151-style safety net) periodic reconcile in case an SSE gap
     // (a reconnect between the last delta and now) dropped a status flip —

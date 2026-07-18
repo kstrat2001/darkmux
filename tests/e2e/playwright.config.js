@@ -69,6 +69,25 @@ const PORT = 47823;
     path.join(SERVED, 'lab-runs-fixture.json'),
     fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'lab-runs-fixture.json'), 'utf8')
   );
+
+  // (#1471) Mission-graph harness. The mission-graph lens is a SEPARATE asset
+  // from viewer.html with its own vendored React Flow bundle (assets/vendor/),
+  // served same-origin. The events-panel backfill spec
+  // (mission-graph-events.spec.js) route-mocks the DATA endpoints (graph.json,
+  // /flow/<date>, the SSE stream) but the page shell + its vendor bundle load
+  // from here: the spec fulfills the `/mission/<id>/graph` route with these
+  // bytes (missionIdFromPath() needs the real path), and the page's own
+  // `/vendor/*` requests fall through to this static server.
+  fs.writeFileSync(
+    path.join(SERVED, 'mission-graph.html'),
+    fs.readFileSync(path.join(repo, 'crates', 'darkmux-serve', 'assets', 'mission-graph.html'), 'utf8')
+  );
+  const vendorSrc = path.join(repo, 'crates', 'darkmux-serve', 'assets', 'vendor');
+  const vendorDst = path.join(SERVED, 'vendor');
+  fs.mkdirSync(vendorDst, { recursive: true });
+  for (const f of fs.readdirSync(vendorSrc)) {
+    fs.copyFileSync(path.join(vendorSrc, f), path.join(vendorDst, f));
+  }
 })();
 
 // Serve over HTTP (not file://) so the viewer's boot() fetch('./xss-flow.jsonl')
