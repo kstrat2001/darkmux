@@ -250,6 +250,18 @@ pub struct DispatchOpts {
     /// reached over a real socket, not a function-call fake — see its
     /// crate doc and `crates/darkmux-crew/tests/mock_dispatch_proof.rs`.
     pub model_base_url_override: Option<String>,
+    /// (#1483) The mission-graph STEP id this dispatch runs as, when it is
+    /// one step of a Task/Step graph. When set, the live trajectory tailer
+    /// stamps `step_id` into every per-turn / per-tool / per-token flow
+    /// record's `payload`, so the mission-graph viewer can attribute the
+    /// live turn+tool+token climb to the seat card even when the dispatch's
+    /// `session_id` is NOT the `step-<id>` default. The coder-phase
+    /// `mission.coder` seat dispatches under a shared `mission-run-<…>`
+    /// session (see `session_id::mission_run`), so its live records were
+    /// previously unattributable and the agentic seat never ticked turns.
+    /// `None` for a one-off `dispatch` that isn't a graph step; such records
+    /// attribute via `session_id` alone, exactly as before.
+    pub step_id: Option<String>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime

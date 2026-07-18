@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.17.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.18.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -171,6 +171,22 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.17.0";
 //           so exactly one review record vocabulary now exists. These records
 //           are per-run-local/ephemeral (no versioned consumer), so no bump
 //           and no migration — the vocabulary simply stops being written.
+//   1.18.0 — live seat-card metrics for AGENTIC seats (#1483 emit half; the
+//           render half shipped in #1485/#1488). The live trajectory tailer's
+//           per-event records gain optional `payload.step_id` — the
+//           mission-graph STEP this dispatch runs as — so the viewer can
+//           attribute the live turn/tool/token climb to the seat card even
+//           when `session_id` isn't the `step-<id>` default (the coder-phase
+//           `mission.coder` seat dispatches under a shared `mission-run-<…>`
+//           session, so its live records were previously unattributable and
+//           the agentic seat never ticked). Alongside it, `dispatch.turn`
+//           gains `turns_so_far` and `dispatch.tool` gains `tool_calls_so_far`
+//           — the AUTHORITATIVE monotonic running counts the viewer's seat
+//           meter ticks off (so a page opened mid-dispatch reads the true
+//           count, not an under-count from the tail-from-now stream). Same
+//           actions, same `payload` blob — additive optional fields only;
+//           older readers ignore them; new records only, so prior AuditFileSink
+//           chains survive without rotation.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

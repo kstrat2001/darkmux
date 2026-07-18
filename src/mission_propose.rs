@@ -279,6 +279,7 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         max_completion_tokens: None,
         image: None,
         model_base_url_override: None,
+        step_id: None, // (#1483) set on the graph-step path only
     };
     let dispatch_result = crate::fleet::dispatch_routed(opts);
 

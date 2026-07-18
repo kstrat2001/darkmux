@@ -1028,6 +1028,7 @@ fn register_coder_phase_kinds(
         max_completion_tokens: None,
         image: image.clone(),
         model_base_url_override: None,
+        step_id: None, // (#1483) set on the graph-step path only
     };
     registry
         .register(Arc::new(coder_phase::MissionCoderStepKind {

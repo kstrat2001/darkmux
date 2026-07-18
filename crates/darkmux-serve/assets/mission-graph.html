@@ -477,6 +477,12 @@ function stepMeterEl(meter){
   if (meter.turns) {
     children.push(h("span", {key:"n"}, meter.turns + (meter.turns === 1 ? " turn" : " turns")));
   }
+  // (#1483) Tool-calls for AGENTIC seats — ticks live alongside turns. Absent
+  // on single-shot seats (probe/judge/verify emit no `dispatch.tool`), so the
+  // meter is task-type-aware without an explicit kind branch.
+  if (meter.tools) {
+    children.push(h("span", {key:"c"}, meter.tools + (meter.tools === 1 ? " tool" : " tools")));
+  }
   // AI kind with no data yet AND not running — the idle placeholder, so the
   // meter's absence never reads as "this step isn't AI-dispatching".
   if (!children.length) {
@@ -503,7 +509,7 @@ function stepMeterFor(step, metrics, now){
   var generating = step.status === "running";
   var startMs = stepStartMs(step, m);
   var elapsedMs = (generating && startMs && now) ? Math.max(0, now - startMs) : 0;
-  return { show: show || generating, tokens: d.tokens, turns: d.turns, cloud: d.cloud,
+  return { show: show || generating, tokens: d.tokens, turns: d.turns, tools: d.tools, cloud: d.cloud,
            generating: generating, elapsedMs: elapsedMs };
 }
 
@@ -742,12 +748,18 @@ function applyRecordToMetrics(metrics, rec, idx){
   var sid = stepForRecord(rec, idx);
   if (!sid) return metrics;
   var p = rec.payload || {};
-  var cur = metrics[sid] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, cloud:false, startTs:0, endTs:0 };
+  var cur = metrics[sid] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, startTs:0, endTs:0 };
   var next = { tokRun:cur.tokRun, tokFinal:cur.tokFinal, turnRun:cur.turnRun, turnFinal:cur.turnFinal,
+               toolRun:cur.toolRun||0, toolFinal:cur.toolFinal||0,
                cloud:cur.cloud, startTs:cur.startTs, endTs:cur.endTs };
   var action = rec.action || "";
   var isTok = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
   var isTurn = action === "dispatch.turn";
+  // (#1483) Per-tool-call live tick for AGENTIC seats — the coder loop's
+  // `dispatch.tool` records. Single-shot seats (probe/judge/verify) emit no
+  // `dispatch.tool`, so they naturally show no tool count (task-type-aware
+  // by construction, like turns).
+  var isTool = action === "dispatch.tool";
   var isComplete = action === "dispatch complete" || action === "dispatch.complete";
   var isStepResult = action === "step result";
   // (#1483) Dispatch-liveness bookends (contract 2) drive the elapsed timer +
@@ -782,7 +794,17 @@ function applyRecordToMetrics(metrics, rec, idx){
   // not gated here.
   var started = next.startTs > 0;
   if (isTok && started) { next.tokRun += (p.total_tokens || 0); }
-  else if (isTurn && started) { next.turnRun += 1; }
+  // (#1483) Turns/tool-calls tick off the AUTHORITATIVE monotonic running
+  // count the emit half now stamps (`turns_so_far`/`tool_calls_so_far`), so a
+  // page opened mid-dispatch reads the true count instead of under-counting
+  // from the tail-from-now stream. Legacy records lacking the field fall back
+  // to the +1 increment (unchanged #1485/#1488 behavior).
+  else if (isTurn && started) {
+    next.turnRun = p.turns_so_far ? Math.max(next.turnRun, p.turns_so_far) : next.turnRun + 1;
+  }
+  else if (isTool && started) {
+    next.toolRun = p.tool_calls_so_far ? Math.max(next.toolRun, p.tool_calls_so_far) : next.toolRun + 1;
+  }
   else if (isComplete) {
     if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
     if (p.total_turns) next.turnFinal = Math.max(next.turnFinal, p.total_turns);
@@ -791,6 +813,7 @@ function applyRecordToMetrics(metrics, rec, idx){
   }
   if (next.tokRun === cur.tokRun && next.tokFinal === cur.tokFinal
       && next.turnRun === cur.turnRun && next.turnFinal === cur.turnFinal
+      && next.toolRun === (cur.toolRun||0) && next.toolFinal === (cur.toolFinal||0)
       && next.cloud === cur.cloud && next.startTs === cur.startTs
       && next.endTs === cur.endTs) return metrics;
   var out = Object.assign({}, metrics);
@@ -823,18 +846,24 @@ function seedMetricsFromGraph(metrics, g){
       var nf = (typeof s.turnsFinal === "number") ? s.turnsFinal : 0;
       var cl = !!s.cloud;
       var st = tsToMs(s.startedTs);
-      if (!tf && !nf && !cl && !st) return;
-      var cur = out[s.id] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, cloud:false, startTs:0 };
+      // (#1483) `toolsFinal` seeds the same way turns/tokens do, so a page
+      // opened after an agentic seat closed still shows its tool-call total if
+      // the server ever folds it (absent today -> 0, no behavior change; the
+      // key must exist so the live fold's `Math.max` never sees `undefined`).
+      var cf = (typeof s.toolsFinal === "number") ? s.toolsFinal : 0;
+      if (!tf && !nf && !cf && !cl && !st) return;
+      var cur = out[s.id] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, startTs:0 };
       var ntf = Math.max(cur.tokFinal, tf);
       var nnf = Math.max(cur.turnFinal, nf);
+      var ncf = Math.max(cur.toolFinal||0, cf);
       var ncl = cur.cloud || cl;
       // Keep the EARLIEST known start; 0 means unknown, so a real `st` always
       // wins over 0 (and a live start bookend already set wins by min).
       var curSt = cur.startTs || 0;
       var nst = curSt ? (st ? Math.min(curSt, st) : curSt) : st;
-      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncl === cur.cloud && nst === curSt) return;
+      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncf === (cur.toolFinal||0) && ncl === cur.cloud && nst === curSt) return;
       if (out === metrics) out = Object.assign({}, metrics);
-      out[s.id] = Object.assign({}, cur, { tokFinal:ntf, turnFinal:nnf, cloud:ncl, startTs:nst });
+      out[s.id] = Object.assign({ toolRun:0 }, cur, { tokFinal:ntf, turnFinal:nnf, toolFinal:ncf, cloud:ncl, startTs:nst });
     });
   });
   return out;
@@ -842,10 +871,12 @@ function seedMetricsFromGraph(metrics, g){
 // The number a step row shows: the finalized total when the dispatch closed,
 // else the running per-turn sum.
 function stepDisplayMetrics(m){
-  if (!m) return { tokens:0, turns:0, cloud:false, has:false };
+  if (!m) return { tokens:0, turns:0, tools:0, cloud:false, has:false };
   var tokens = m.tokFinal || m.tokRun || 0;
   var turns = m.turnFinal || m.turnRun || 0;
-  return { tokens: tokens, turns: turns, cloud: !!m.cloud, has: tokens > 0 || turns > 0 };
+  // (#1483) Tool-calls: finalized when folded, else the running live count.
+  var tools = m.toolFinal || m.toolRun || 0;
+  return { tokens: tokens, turns: turns, tools: tools, cloud: !!m.cloud, has: tokens > 0 || turns > 0 || tools > 0 };
 }
 function missionTotals(metrics){
   var local = 0, cloud = 0, turns = 0;

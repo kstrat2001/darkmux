@@ -1373,6 +1373,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         // darkmux's CLAUDE.md doctrine on shipping the underlying mechanism
         // before the CLI verb). `None` on every operator-facing dispatch.
         model_base_url_override: None,
+        step_id: None, // (#1483) set on the graph-step path only
     };
     let result = fleet::dispatch_routed(opts)?;
     // Announce the resolved session id on stderr so operators can correlate

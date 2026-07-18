@@ -2441,7 +2441,14 @@ mod tests {
         //           task/step/ruling vocabulary is RETIRED — both review paths
         //           now emit only the generic `step result` companion. Records
         //           are per-run-local/ephemeral, so no bump, no migration.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.17.0");
+        //   1.18.0 — live seat-card metrics for agentic seats (#1483 emit half):
+        //           the trajectory tailer's per-event records gain optional
+        //           `payload.step_id` (viewer seat-card attribution), plus
+        //           `turns_so_far` on dispatch.turn and `tool_calls_so_far` on
+        //           dispatch.tool (authoritative running counts). Minor +
+        //           additive — older readers ignore the new payload fields; see
+        //           schema.rs's fuller changelog entry.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.18.0");
     }
 
     #[test]
