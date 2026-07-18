@@ -290,6 +290,68 @@ pub fn review_judge_concurrency() -> u32 {
         .max(1)
 }
 
+// ── Role -> profile map (#1475 packet 1) ──
+/// (#1475 packet 1) Normalize a raw role->profile map: trim BOTH the role key
+/// AND the profile value, and drop any binding whose profile is blank (a
+/// `"judge": "  "` slip never binds a blank name). Both public accessors below
+/// funnel through this ONE normalizer so that doctor's view (`role_profiles`)
+/// and resolution's lookup (`role_profile`) can never disagree on a key: a
+/// hand-edited padded key like `" judge"` reads as `judge` for BOTH, so it can't
+/// be doctor-visible-but-resolution-invisible (the honesty split #1475 forbids).
+/// Pure (takes the raw map explicitly) so it's testable without the process-wide
+/// `config()`.
+fn normalize_role_profiles(
+    raw: Option<&std::collections::BTreeMap<String, String>>,
+) -> std::collections::BTreeMap<String, String> {
+    match raw {
+        None => std::collections::BTreeMap::new(),
+        Some(m) => m
+            .iter()
+            .filter_map(|(role, profile)| {
+                let p = profile.trim();
+                (!p.is_empty()).then(|| (role.trim().to_string(), p.to_string()))
+            })
+            .collect(),
+    }
+}
+
+/// (#1475 packet 1) Look up a role's bound profile in a raw map, normalized.
+/// The role id is trimmed to match the normalized (trimmed) keys — the pure core
+/// of [`role_profile`], sharing the exact same key handling as [`role_profiles`]
+/// so the two never diverge. `None` = the role is UNMAPPED.
+fn lookup_role_profile(
+    raw: Option<&std::collections::BTreeMap<String, String>>,
+    role_id: &str,
+) -> Option<String> {
+    normalize_role_profiles(raw).get(role_id.trim()).cloned()
+}
+
+/// (#1475 packet 1) The full machine-local role->profile map from
+/// `config.json` (`{ "<role-id>": "<profile-name>" }`), or an empty map when
+/// unset. Config is the PRIMARY (and only) mechanism — there is deliberately no
+/// per-role env var (a `DARKMUX_ROLE_PROFILE_<role>` over a map is awkward and
+/// unneeded; the map is edited via `darkmux config set role_profiles.<role>
+/// <profile>`), mirroring the CONFIG-ONLY Redis connection bits above. Keys and
+/// values are trimmed and blank bindings dropped via [`normalize_role_profiles`]
+/// — the SAME normalizer [`role_profile`] resolves through, so doctor (which
+/// reads this) and resolution (which reads `role_profile`) validate the identical
+/// key set.
+pub fn role_profiles() -> std::collections::BTreeMap<String, String> {
+    normalize_role_profiles(config().role_profiles.as_ref())
+}
+
+/// (#1475 packet 1) The profile name bound to `role_id` in the role->profile
+/// map, or `None` when the role is UNMAPPED (the caller then falls back to
+/// `default_profile` — the fresh-user floor). Resolves through the SAME
+/// [`normalize_role_profiles`] that [`role_profiles`] (doctor's view) uses, so a
+/// padded key resolves exactly as doctor reports it — no silent divergence. The
+/// registry-existence of the named profile is NOT checked here (config-leniency
+/// contract 7 — semantic validation lives at resolution:
+/// `darkmux_profiles::resolve_role_profile` — and in `darkmux doctor`).
+pub fn role_profile(role_id: &str) -> Option<String> {
+    lookup_role_profile(config().role_profiles.as_ref(), role_id)
+}
+
 pub fn default_role() -> Option<String> {
     let cfg = config().runtime.as_ref().and_then(|r| r.default_role.as_deref());
     pick_string("DARKMUX_DEFAULT_ROLE", cfg, None)
@@ -997,6 +1059,53 @@ mod tests {
                 Some(v) => std::env::set_var(k, v),
                 None => std::env::remove_var(k),
             }
+        }
+    }
+
+    // ── role_profiles / role_profile (#1475 packet 1) ──
+    // Under the empty test config (#811) the map is empty and every role is
+    // unmapped — the fresh-user floor. Populated-map resolution is exercised by
+    // `darkmux_profiles::resolve_role_profile_with` (the pure core that takes the
+    // mapped name explicitly, so it doesn't depend on the process-wide config()).
+    #[test]
+    fn role_profile_unset_is_empty_and_none() {
+        assert!(role_profiles().is_empty(), "empty test config → no role bindings");
+        assert_eq!(role_profile("judge"), None, "unmapped role → None (caller uses default_profile)");
+    }
+
+    #[test]
+    fn padded_role_key_resolves_same_as_doctor_reports() {
+        // (#1475 packet 1) A hand-edited padded key (`" judge"`) must resolve the
+        // SAME binding doctor validates. Doctor reads `role_profiles()` (→
+        // `normalize_role_profiles`), resolution reads `role_profile()` (→
+        // `lookup_role_profile` → the same normalizer). This asserts they can't
+        // diverge: the padded key is doctor-visible AND resolution finds it — no
+        // "doctor says fine / resolution silently falls back to default" split.
+        let mut raw = std::collections::BTreeMap::new();
+        raw.insert(" judge".to_string(), "qwen35b".to_string());
+
+        // Doctor's view: the padded key reads under its trimmed name.
+        let doctor_view = normalize_role_profiles(Some(&raw));
+        assert_eq!(
+            doctor_view.get("judge"),
+            Some(&"qwen35b".to_string()),
+            "doctor validates the padded key under its trimmed name"
+        );
+
+        // Resolution's view: the SAME binding is found — no silent divergence.
+        assert_eq!(
+            lookup_role_profile(Some(&raw), "judge"),
+            Some("qwen35b".to_string()),
+            "resolution finds the binding doctor reported (not None → default fallback)"
+        );
+
+        // And they agree key-for-key across the whole doctor-visible map.
+        for (role, profile) in &doctor_view {
+            assert_eq!(
+                lookup_role_profile(Some(&raw), role).as_ref(),
+                Some(profile),
+                "every doctor-visible binding resolves identically for role `{role}`"
+            );
         }
     }
 

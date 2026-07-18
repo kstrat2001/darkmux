@@ -20,11 +20,13 @@ use std::path::Path;
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
     /// Set a config key (dotted path) to a value, e.g.
-    /// `darkmux config set redis.host 100.74.208.36` or
-    /// `darkmux config set fleet.mode hub`.
+    /// `darkmux config set redis.host 100.74.208.36`,
+    /// `darkmux config set fleet.mode hub`, or
+    /// `darkmux config set role_profiles.judge qwen35b` (bind a role to a
+    /// profile — #1475).
     Set {
         /// Dotted config key (e.g. `redis.host`, `fleet.mode`,
-        /// `runtime.strict_selection`).
+        /// `runtime.strict_selection`, `role_profiles.<role-id>`).
         key: String,
         /// The value. Coerced to the key's type (bool/number/string).
         value: String,
@@ -57,6 +59,11 @@ enum Ty {
 /// by `every_with_defaults_key_is_settable` so a new visible config field can't
 /// silently become un-settable. Secrets are deliberately absent (see
 /// `SECRET_KEYS`); `schema_version` is managed, not operator-set.
+///
+/// (#1475 packet 1) The `role_profiles` map is NOT listed here — its keys are
+/// dynamic (`role_profiles.<role-id>`, one per role the operator binds), so
+/// `key_type` recognizes that prefix directly. `with_defaults` writes it as an
+/// empty `{}` (no leaves), so the settable-keys drift guard is unaffected.
 const KEYS: &[(&str, Ty)] = &[
     ("machine_id", Ty::Str),
     ("orchestrator", Ty::Str),
@@ -137,8 +144,18 @@ pub fn run(cmd: ConfigCmd) -> Result<()> {
     Ok(())
 }
 
-/// Look up a key's type, or `None` if it isn't a known settable key.
+/// Look up a key's type, or `None` if it isn't a known settable key. Static
+/// keys come from `KEYS`; the `role_profiles.<role-id>` map (#1475 packet 1) is
+/// DYNAMIC — any single `role_profiles.<role-id>` segment is a settable string
+/// (the bound profile name). Only the SHAPE is validated here (one level:
+/// `role_profiles.<role> -> <profile>`); that the named profile EXISTS is a
+/// resolution-time / `darkmux doctor` concern (config-leniency contract 7).
 fn key_type(key: &str) -> Option<Ty> {
+    if let Some(role) = key.strip_prefix("role_profiles.") {
+        // Exactly one more segment — reject a blank role (`role_profiles.`) or a
+        // deeper path (`role_profiles.a.b`); the map is role -> profile name.
+        return (!role.is_empty() && !role.contains('.')).then_some(Ty::Str);
+    }
     KEYS.iter().find(|(k, _)| *k == key).map(|(_, t)| *t)
 }
 
@@ -346,6 +363,47 @@ mod tests {
         // The written file still parses as a DarkmuxConfig.
         let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         assert_eq!(cfg.redis.unwrap().port, Some(6380));
+    }
+
+    /// (#1475 packet 1) `role_profiles.<role>` is a dynamic settable key — it
+    /// round-trips through set → get → list and the written file parses back as
+    /// a `DarkmuxConfig` with the role bound to the profile name. Many roles may
+    /// name one profile.
+    #[test]
+    fn role_profiles_dynamic_key_round_trips() {
+        let f = tmp();
+        let p = f.path();
+        set_at(p, "role_profiles.judge", "qwen35b").unwrap();
+        set_at(p, "role_profiles.verify", "qwen35b").unwrap();
+        set_at(p, "role_profiles.probe-high", "qwen27b").unwrap();
+
+        // get reads the stored value back.
+        assert!(get_at(p, "role_profiles.judge").unwrap().contains("qwen35b"));
+        assert!(get_at(p, "role_profiles.probe-high").unwrap().contains("qwen27b"));
+        // An unbound role reports unset (falls through to default_profile).
+        assert!(get_at(p, "role_profiles.analyst").unwrap().contains("unset"));
+
+        // list dumps the whole map.
+        let listed = list_at(p).unwrap();
+        assert!(listed.contains("role_profiles"));
+
+        // The written file parses back as a DarkmuxConfig with the bindings.
+        let cfg: DarkmuxConfig =
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        let map = cfg.role_profiles.unwrap();
+        assert_eq!(map.get("judge").map(String::as_str), Some("qwen35b"));
+        assert_eq!(map.get("verify").map(String::as_str), Some("qwen35b"), "many roles -> one profile");
+    }
+
+    /// The `role_profiles` map is one level deep: a blank role or a deeper path
+    /// isn't settable, and the bare `role_profiles` key sets a specific role, not
+    /// the whole map.
+    #[test]
+    fn role_profiles_rejects_malformed_keys() {
+        let f = tmp();
+        assert!(set_at(f.path(), "role_profiles", "x").is_err(), "bare map key not settable");
+        assert!(set_at(f.path(), "role_profiles.", "x").is_err(), "blank role rejected");
+        assert!(set_at(f.path(), "role_profiles.a.b", "x").is_err(), "deeper path rejected");
     }
 
     #[test]
