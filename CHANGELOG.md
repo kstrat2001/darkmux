@@ -11,8 +11,74 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
-### Removed (breaking, 2.0-track)
-- **`GET /diff/:session_id`** and the viewer's live-diff panel (#1387, part of the #1386 2.0 sweep). This was the daemon's only workspace-content route: it shipped a mission-run worktree's unified diff TEXT over HTTP behind its own always-on token gate (even on loopback), plus a 256KB server-side cap and a 4,000-line client cap. Replaced by `GET /worktree-summary/:session_id`, a numbers-only endpoint (`files`/`adds`/`dels`/`base`/`path`, derived from `git diff --numstat`, never diff content) that rides the general remote-read gate like every other route. The session view now renders a "what changed" totals line plus the worktree path with a copy-to-clipboard button and a `zed://file/<path>` anchor (inert, by design, on machines without Zed; no editor detection, no config matrix). No shim, both the route and the panel are gone.
+## [2.0.0] - 2026-07-18
+
+**darkmux 2.0 — the mission orchestrator.** The 1.x line grew a swap tool into a
+dispatch tool into a review pipeline; 2.0 unifies all of it under one model.
+Config-defined **missions** launched with `darkmux mission launch <config>` run
+as a live **Task/Step dependency graph** on a real scheduler, with concurrent
+local dispatch bounded by a residency arbiter that loads exactly what each seat's
+staffing declares — and a React Flow **mission-graph lens** that draws the graph
+light up as it runs. The PR-review funnel and the coder pipeline both became
+missions; residency (the founding profile-multiplexer) became an internal
+capability underneath, not a verb the operator drives. The verb surface shrank
+hard, the openclaw shell-out path is gone, and review seats staff from a
+machine-local role→profile map. This is a **major** release: many verbs were
+renamed or retired without deprecation shims — see **Migration** below.
+
+### Added
+- **`darkmux mission launch <config>`** — configs mint mission instances; `mission propose` emits configs; the whole pipeline runs as a real **Task/Step DAG** with a dependency-graph scheduler, concurrent local dispatch, and per-mission `MissionEnvelope` finalization (#1284, #1230, #1352). Built-in configs: `review` (bundle → probe → dedup → judge → verify → synthesis) and `coder-phase` (worktree → coder → verify).
+- **Mission-graph lens** — a live React Flow Phase/Task/Step diagram is now THE mission view: direct nav + standalone shell, per-seat model chips + step metrics, an events panel, a mobile vertical timeline, refresh/reconnect, a minimap toggle, live turn/tool-call metrics for agentic seats, and **phase→phase order arrows** (#1384, #1403, #1404, #1431, #1485, #1491, #1497).
+- **`darkmux dispatch <role>`** as a top-level verb (promoted from `crew dispatch`) — one role, one turn, through the internal Docker-bounded runtime; `--image <tag>` runs the seat in any Linux environment you name (#1435, #703).
+- **Residency arbiter (`darkmux-gestalt`)** wired as the production resource planner — grow-only additive acquisition, wave scheduling, an architecture-aware KV estimator, and a deadline-bounded `lms` load/unload adapter, all scoped to the `darkmux:*` namespace so user-loaded models are never touched (#1230 packet 1, #1274/#1276).
+- **`darkmux doctor` staleness checks** — a running daemon vs. the installed binary vs. the source tree vs. the runtime image, so a stale-binary "bug" is caught structurally (#1461).
+- **`darkmux-bundler-rust`** — the reference `--bundler` plugin: Rust function-boundary scanning + differential call-site facts, so the review funnel can bundle a Rust diff with real context (#1319).
+- **Mission staleness / dead-dependency drift detection** in `mission status` — an Active mission stalled at zero complete phases, or a phase permanently unreachable behind an abandoned dependency, is surfaced with a reconcile suggestion (#1230 packet 5).
+
+### Changed (breaking)
+- **Review seats staff via a role→profile map** — crews dissolve; each seat (`review-probe-high`/`-mid`/`-low`, `review-judge`, `review-verify`) resolves to a profile through a machine-local `role_profiles` map in `config.json`, with a single `--param <role>=<profile>` per-run override (`Overridden` provenance). The roster-scoring resolver and seat pins are gone (#1475, #1438).
+- **Verb collapse** — `dispatch` and `machine` are the new top-level families. `swap`, `status`, `recommendations`, and the old `fleet` family fold into `machine` (`machine list/add/remove/status/eject`); the `profile` family merges; `notebook` joins `lab`; `lessons` becomes `memory` (`memory lesson` / `memory correction`); `review-bench` becomes `lab eval`; `--crew` becomes `--roster-profile` (#1426, #1430, #1435, #1437, #1462, #1470).
+- **Mission lifecycle** — `mission run` collapses into `mission launch`; `mission ship` retires; `mission close` → **`mission finalize`** (which now reconciles its phases honestly from step statuses); the standalone `phase` verb family retires; `MissionStatus::Closed` → **`Finalized`** (existing "closed" records read lenient) (#1439, #1463, #1468, #1498, #1406).
+- **`WorkJob` schema bump** — the `deliver` and `runtime` fields retire; a version-first mismatch now errors loudly instead of mis-parsing (#1440).
+- **`FLOW_SCHEMA` 1.17.0 → 1.18.0**, **`CONFIG_SCHEMA` → 1.5**, mission-config schema, all additive / lenient-on-read.
+
+### Removed (breaking)
+- **The openclaw shell-out dispatch path** — `--runtime openclaw`, the per-dispatch `--runtime-cmd`, and `crew sync` are gone. The internal runtime reads role manifests directly and is the one and only dispatch path (#1405).
+- **`GET /diff/:session_id`** and the viewer's live-diff panel (#1387) — replaced by `GET /worktree-summary/:session_id`, a numbers-only endpoint (`files`/`adds`/`dels`/`base`/`path` from `git diff --numstat`, never diff content) that rides the general remote-read gate. The session view renders a "what changed" totals line + the worktree path with a copy button and an (inert-by-default) `zed://` anchor.
+- **`optimize scaffold`** and **`doctor --fix`** — two dead surfaces (#1419).
+
+### Fixed
+- **The mission graph tells the truth mid-run** — parallel seats show elapsed units + a model chip + per-seat completion (no more "all-or-nothing" wall-clock), planned steps show no phantom tokens (server-side fold gates on step-started), phase status rolls up from its tasks instead of a stale persisted value, and an error/untracked-mission state keeps the nav reachable (#1488, #1493, #1472, #1496).
+- **A 0-member probe stage fails loud with per-seat reasons**, routed to a degraded run, not a silent Clean (#1486).
+- **Liveness guards on the utility dispatch paths** (propose, phase review, timeout narration) + metering on the `dispatch.single_shot` hosted arm (#1413, #1412).
+- **The 2.0 upgrade path** — `darkmux init` prunes retired skills and refreshes its managed doc blocks; 2.0 identity swept through source-embedded strings, clap `about`, and init templates (#1467, #1449).
+
+### Migration (1.18.x → 2.0.0)
+No deprecation shims — old verbs error rather than silently mis-run. The map:
+
+| 1.x | 2.0 |
+|---|---|
+| `darkmux crew dispatch <role>` | `darkmux dispatch <role>` |
+| `darkmux crew sync` | *(gone — internal runtime reads role manifests directly)* |
+| `darkmux swap <profile>` | *(gone — gestalt loads what each seat's staffing declares)* |
+| `darkmux pr-review run` | `darkmux mission launch review` |
+| `darkmux mission run` / `mission ship` | `darkmux mission launch coder-phase` |
+| `darkmux mission close` | `darkmux mission finalize` |
+| `darkmux notebook draft/list` | `darkmux lab notebook draft/list` |
+| `darkmux review-bench` | `darkmux lab eval` |
+| `darkmux lessons …` | `darkmux memory lesson …` / `memory correction …` |
+| `swap` / `status` / `recommendations` / `fleet` | the `machine` family |
+| `--crew <profile>` | `--roster-profile <profile>` |
+| `--runtime openclaw` / `--runtime-cmd` | *(gone — internal runtime only)* |
+
+**Review staffing config.** 2.0 review needs a `role_profiles` map in
+`~/.darkmux/config.json` binding each seat to a profile — e.g.
+`{"review-probe-high":"…","review-probe-mid":"…","review-probe-low":"…","review-judge":"…","review-verify":"…"}`.
+`darkmux init` on 2.0 writes the block; `darkmux doctor` surfaces an unstaffed seat.
+
+**Data.** Existing `~/.darkmux/missions/*` load unchanged (mission status
+`"closed"` reads as `Finalized` via a serde alias; `closed_ts` reads as
+`finalized_ts`). Flow records and profiles are lenient-on-read across the bump.
 
 ## [1.18.5] - 2026-07-12
 
@@ -117,6 +183,7 @@ funnel, fixed same-day.
   exit paths, `source: "funnel"`) so a live PR review is visible as a running dispatch in the
   viewer's fleet and machine views (#1272, #1277).
 
+[2.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.0.0
 [1.18.5]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.5
 [1.18.4]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.4
 [1.18.3]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.3
