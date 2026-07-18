@@ -3527,6 +3527,7 @@
             tokens_final: None,
             turns_final: None,
             cloud: None,
+            model: None,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["kind"], "dispatch.internal");
@@ -3535,6 +3536,31 @@
         assert!(v.get("tokensFinal").is_none());
         assert!(v.get("turnsFinal").is_none());
         assert!(v.get("cloud").is_none());
+        // (#1481) `model` is absent when None so a modelless step (procedural
+        // / Tier 3) never renders an empty chip on the page.
+        assert!(v.get("model").is_none());
+    }
+
+    /// (#1481) A step row carrying a resolved model serializes it under the
+    /// `model` key (single word — camelCase is a no-op) so the page can render
+    /// the seat's model chip. Pins the wire name against a future rename that
+    /// would silently blank every seat card's model.
+    #[test]
+    fn step_row_serializes_resolved_model() {
+        let row = crate::mission_graph::StepRow {
+            id: "review-probe-0-step".to_string(),
+            label: "Probe".to_string(),
+            kind: "dispatch.map".to_string(),
+            status: "running",
+            started_ts: None,
+            completed_ts: None,
+            tokens_final: None,
+            turns_final: None,
+            cloud: None,
+            model: Some("darkmux:qwen/qwen3.6-27b".to_string()),
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["model"], "darkmux:qwen/qwen3.6-27b");
     }
 
     /// (#881 parity) The graph.json route must ride the SAME remote-only
