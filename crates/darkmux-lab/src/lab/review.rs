@@ -5065,6 +5065,44 @@ pub(crate) fn review_dispatch_override(ctx: &ReviewStepContext) -> Option<MapDis
     }))
 }
 
+/// (#1486) Build the LOUD, SPECIFIC degenerate reason for a run whose
+/// scheduler reported errored steps — surfacing each errored step's OWN
+/// failure message, never just the bare step ids.
+///
+/// A step that terminates in error carries its failure reason in its
+/// `output`: the scheduler's `apply_step_terminal` stores the message there
+/// (`Err(format!("{e:#}"))`, the per-job `Err` `run_bounded` synthesizes for
+/// a residency block or a wave-load failure). A wholesale probe-stage failure
+/// — every seat's model failing to load, e.g. a 120B model that never fit the
+/// RAM budget — used to finalize `flags=0 members=0` with a reason that named
+/// only the step IDS, swallowing that "could not load … for this wave"
+/// message. This surfaces the reason itself, keyed by step id, so the
+/// operator/orchestrator sees WHY nothing ran — the dispatch-liveness
+/// contract's converse (#857/#1272): blocked/failed work is as visible, and
+/// as reasoned, as running work.
+fn errored_steps_degenerate_reason(
+    errored: &[String],
+    steps: &std::collections::BTreeMap<String, Step>,
+) -> String {
+    let reasons: Vec<String> = errored
+        .iter()
+        .map(|id| {
+            let msg = steps
+                .get(id)
+                .and_then(|s| s.output.as_deref())
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .unwrap_or("(no failure reason recorded)");
+            format!("{id}: {msg}")
+        })
+        .collect();
+    format!(
+        "review graph: {} step(s) errored, zero usable signal — {}",
+        errored.len(),
+        reasons.join("; ")
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_review_graph(
     ctx: &ReviewStepContext,
@@ -5224,11 +5262,19 @@ pub fn run_review_graph(
         env
     } else {
         let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();
+        // (#1486) Surface each errored step's OWN failure message — the
+        // residency block / model-load error / synthesized dispatch error
+        // that `run_bounded` handed back and the scheduler stored in the
+        // step's `output` — never just the bare step ids. A wholesale
+        // probe-stage failure (every seat's model failed to load, e.g. a
+        // 120B model that never fit) previously finalized `flags=0
+        // members=0` with a reason naming only the step IDS, swallowing the
+        // "could not load … for this wave" message that pinpoints the cause.
+        // That is the dispatch-liveness contract's converse (#857/#1272):
+        // blocked/failed work must be as visible — and as REASONED — as
+        // running work, never a silent Clean.
         if env.degenerate.is_none() {
-            env.degenerate = Some(format!(
-                "review graph: step(s) errored: {}",
-                report.errored.join(", ")
-            ));
+            env.degenerate = Some(errored_steps_degenerate_reason(&report.errored, &steps));
         }
         env
     };
