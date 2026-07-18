@@ -52,10 +52,10 @@
 //!
 //! | Status       | Phase outcome | Mission outcome        |
 //! |--------------|---------------|-------------------------|
-//! | Clean        | Complete      | Closed (real reason)   |
-//! | Degraded     | Complete      | Closed (real reason)   |
-//! | Degenerate   | Abandoned     | Closed (real reason)   |
-//! | Error        | Abandoned     | Closed (real reason)   |
+//! | Clean        | Complete      | Finalized (real reason) |
+//! | Degraded     | Complete      | Finalized (real reason) |
+//! | Degenerate   | Abandoned     | Finalized (real reason) |
+//! | Error        | Abandoned     | Finalized (real reason) |
 //!
 //! Degraded folds into the SAME phase/mission outcome as Clean — a
 //! degraded run still posted real findings (CLAUDE.md: "DEGRADED-but-
@@ -233,7 +233,7 @@ impl MissionEnvelope {
 /// (e.g. a `Planned` phase asked to `Complete`, the exact #1406 bug the
 /// honest per-phase derivation upstream is meant to prevent), is surfaced as
 /// a loud warning naming the phase, the intended outcome, and the refusal,
-/// instead of leaving a Closed mission whose envelope disagrees with disk
+/// instead of leaving a Finalized mission whose envelope disagrees with disk
 /// with no signal. This function still applies the declared outcome and lets
 /// `lifecycle` do the legality check; it only inspects current state to
 /// classify a refusal, never to gate the transition.
@@ -284,13 +284,14 @@ fn classify_phase_refusal(
 }
 
 /// Classify a MISSION-close refusal from the mission's CURRENT status. Benign
-/// iff the mission is already `Closed` (an idempotent re-finalize); every other
-/// refusal — including an unknown status because the mission can't be read — is
-/// Drift (#1433: the mission-close arm was previously `let _`-swallowed, hiding
-/// a Closed mission whose envelope disagreed with disk).
+/// iff the mission is already `Finalized` (an idempotent re-finalize); every
+/// other refusal — including an unknown status because the mission can't be
+/// read — is Drift (#1433: the mission-close arm was previously
+/// `let _`-swallowed, hiding a Finalized mission whose envelope disagreed
+/// with disk).
 fn classify_mission_close_refusal(current: Option<MissionStatus>) -> FinalizeRefusal {
     match current {
-        Some(MissionStatus::Closed) => FinalizeRefusal::Benign,
+        Some(MissionStatus::Finalized) => FinalizeRefusal::Benign,
         _ => FinalizeRefusal::Drift,
     }
 }
@@ -320,7 +321,7 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
         // (#1433 follow-up) Was `let _`-swallowed — a mission that couldn't be
         // closed left its envelope.json disagreeing with an Active mission on
         // disk, silently. Classify like the phase refusals: quiet only when the
-        // mission is ALREADY Closed (idempotent re-finalize), loud otherwise.
+        // mission is ALREADY Finalized (idempotent re-finalize), loud otherwise.
         let current = lifecycle::load_mission_by_id(&envelope.mission_id).map(|m| m.status).ok();
         if classify_mission_close_refusal(current) == FinalizeRefusal::Drift {
             eprintln!(
@@ -381,7 +382,7 @@ mod tests {
     #[test]
     fn mission_close_refusal_quiet_only_when_already_closed() {
         assert_eq!(
-            classify_mission_close_refusal(Some(MissionStatus::Closed)),
+            classify_mission_close_refusal(Some(MissionStatus::Finalized)),
             FinalizeRefusal::Benign
         );
         assert_eq!(
@@ -454,7 +455,7 @@ mod tests {
             phase_ids: vec!["p1".to_string(), "p2".to_string()],
             created_ts: 1_700_000_000,
             started_ts: Some(1_700_000_000),
-            closed_ts: None,
+            finalized_ts: None,
             paused_ts: None,
             source_input: None,
             ticket: None,
@@ -503,7 +504,7 @@ mod tests {
 
         assert_eq!(phase_status("m1", "p1"), PhaseStatus::Complete);
         assert_eq!(phase_status("m1", "p2"), PhaseStatus::Complete);
-        assert_eq!(mission_status("m1"), MissionStatus::Closed);
+        assert_eq!(mission_status("m1"), MissionStatus::Finalized);
     }
 
     #[serial_test::serial]
@@ -523,7 +524,7 @@ mod tests {
 
         assert_eq!(phase_status("m2", "p1"), PhaseStatus::Complete);
         assert_eq!(phase_status("m2", "p2"), PhaseStatus::Complete);
-        assert_eq!(mission_status("m2"), MissionStatus::Closed);
+        assert_eq!(mission_status("m2"), MissionStatus::Finalized);
     }
 
     #[serial_test::serial]
@@ -540,7 +541,7 @@ mod tests {
 
         assert_eq!(phase_status("m3", "p1"), PhaseStatus::Abandoned);
         assert_eq!(phase_status("m3", "p2"), PhaseStatus::Abandoned);
-        assert_eq!(mission_status("m3"), MissionStatus::Closed);
+        assert_eq!(mission_status("m3"), MissionStatus::Finalized);
     }
 
     #[serial_test::serial]
@@ -557,7 +558,7 @@ mod tests {
 
         assert_eq!(phase_status("m4", "p1"), PhaseStatus::Abandoned);
         assert_eq!(phase_status("m4", "p2"), PhaseStatus::Abandoned);
-        assert_eq!(mission_status("m4"), MissionStatus::Closed);
+        assert_eq!(mission_status("m4"), MissionStatus::Finalized);
     }
 
     #[serial_test::serial]

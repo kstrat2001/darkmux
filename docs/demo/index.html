@@ -101,7 +101,7 @@
   .midimrow{opacity:.55}
   .mistatus{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted);flex:0 0 auto}
   .mistatus.active{color:var(--good);border-color:var(--good)}
-  .mistatus.closed{color:var(--muted)}
+  .mistatus.finalized{color:var(--muted)}
   .mistatus.paused{color:var(--warn);border-color:var(--warn)}
   .miname{font:600 13px 'JetBrains Mono',monospace;color:var(--amber);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .miprog{display:inline-flex;align-items:center;gap:7px;font:11px 'JetBrains Mono',monospace;color:var(--muted);flex:0 0 auto}
@@ -488,7 +488,7 @@
      with renderMission/renderMissionFromFlow. .mstat stays — missionBadge
      (the missions index + the static mission summary) still renders it. */
   .mstat{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:2px 8px;border-radius:3px;border:1px solid var(--line);color:var(--muted);vertical-align:middle}
-  .mstat.active{color:var(--good);border-color:var(--good)}.mstat.closed{color:var(--muted)}.mstat.paused{color:var(--warn);border-color:var(--warn)}
+  .mstat.active{color:var(--good);border-color:var(--good)}.mstat.finalized{color:var(--muted)}.mstat.paused{color:var(--warn);border-color:var(--warn)}
   .preview-text{color:var(--muted);font-style:italic}
   .rec.sel .preview-text{color:rgba(232,230,227,0.7)}
   /* Per-activity glyph on each log line — scannable "what's the model doing". */
@@ -2327,7 +2327,7 @@ function renderMissionStatic(){
   const mid=state.missionId||primaryMission()||"—";
   state.stageScope=r=>r.mission_id===mid; $("logscope").textContent="mission";
   const mObj=MISSIONS.find(m=>m&&m.id===mid)||null;
-  const mstat=mObj?(mObj.status||"active"):null;
+  const mstat=mObj?normalizeMissionStatus(mObj.status||"active"):null;
   const phases=PHASES.filter(s=>s&&s.mission_id===mid)
     .sort((a,b)=>(a.created_ts||0)-(b.created_ts||0)||String(a.id).localeCompare(b.id));
   const done=phases.filter(s=>s.status==="complete").length;
@@ -2378,7 +2378,7 @@ function renderMissionsIndex(){
     // (#827 Slice B) status is the durable MISSION status; a mission with no
     // /missions struct (flow-only) has no status — it's "untracked", shown as
     // a separate provenance tag, NOT jammed into the status slot.
-    const status=m?(m.status||"active"):"untracked";
+    const status=m?normalizeMissionStatus(m.status||"active"):"untracked";
     const known=!!m;
     // Phase progress from the durable plan when present.
     const sids=(m&&Array.isArray(m.phase_ids))?m.phase_ids:[];
@@ -2393,18 +2393,20 @@ function renderMissionsIndex(){
                    .reduce((a,r)=>a+((r.payload&&r.payload.total_tokens)||0),0);
     const last=recs.length?Math.max(...recs.map(r=>T(r.ts))):0;
     return {id,status,total,done,pct,machs,toks,last,known};
-  }).sort((a,b)=> (a.status==="closed")-(b.status==="closed") || b.last-a.last );
+  }).sort((a,b)=> (a.status==="finalized")-(b.status==="finalized") || b.last-a.last );
   const body=rows.length?rows.map(r=>{
     const prog=r.total?`<span class="miprog"><span class="mibar"><span style="width:${r.pct}%"></span></span> ${r.done}/${r.total}</span>`
                       :`<span class="midim">no phases yet</span>`;
     const tok=r.toks?` · ${fmtC(r.toks)} tok`:'';
     const mach=r.machs.length?` · ${esc(r.machs.length===1?r.machs[0]:r.machs.length+' machines')}`:'';
-    // closed → done check; untracked (flow-only) → a quiet provenance tag, not
-    // a status chip; otherwise the real mission status.
+    // finalized → done check; untracked (flow-only) → a quiet provenance tag,
+    // not a status chip; otherwise the real mission status. `r.status` is
+    // already normalized (Closed→Finalized rename, #1463 lineage) — see
+    // `normalizeMissionStatus`.
     const chip=r.known
-      ? `<span class="mistatus ${esc(r.status)}">${r.status==="closed"?"✓ ":""}${esc(r.status)}</span>`
+      ? `<span class="mistatus ${esc(r.status)}">${r.status==="finalized"?"✓ ":""}${esc(r.status)}</span>`
       : `<span class="mitag">untracked</span>`;
-    return `<div class="mirow ${r.status==="closed"?'midimrow':''}" data-act="missiondrill" data-arg="${esc(r.id)}">
+    return `<div class="mirow ${r.status==="finalized"?'midimrow':''}" data-act="missiondrill" data-arg="${esc(r.id)}">
       ${chip}
       <span class="miname">◆ ${esc(r.id)}</span>
       ${prog}
@@ -2418,6 +2420,14 @@ function renderMissionsIndex(){
 // invalidate the class; strip to alpha (enum values are alpha today — this is
 // the defensive guard the index originally had, restored consistently).
 const clsSafe=s=>String(s).replace(/[^a-z]/gi,'');
+// (Closed→Finalized rename, #1463 lineage) Lenient-read on the viewer side:
+// a mission.json written before this rename self-migrates to "finalized" on
+// its next save (the darkmux-crew serde alias), but a mission that hasn't
+// been re-saved since — or any other un-normalized source — may still carry
+// the old "closed" value. Normalize at the read sites so status handling
+// (class name, display label, sort/chip logic) never has to special-case
+// both spellings downstream.
+const normalizeMissionStatus=s=>s==="closed"?"finalized":s;
 // Mission-status badge, or an "untracked" tag for a flow-only mission (no
 // /missions struct) — same provenance distinction the index makes.
 const missionBadge=ms=>ms?`<span class="mstat ${clsSafe(ms)}">${esc(ms)}</span>`

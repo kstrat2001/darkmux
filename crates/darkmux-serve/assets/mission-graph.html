@@ -88,7 +88,7 @@
   .midname{font:600 13px 'JetBrains Mono',monospace;color:var(--text)}
   .mstatus{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted)}
   .mstatus.active{color:var(--good);border-color:var(--good)}
-  .mstatus.closed{color:var(--muted)}
+  .mstatus.finalized{color:var(--muted)}
   .mstatus.paused{color:var(--warn);border-color:var(--warn)}
   .livepill{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);padding:3px 8px;border-radius:3px}
   @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.5}}
@@ -720,10 +720,21 @@ function todayUtc(){
 var STATUS_ACTIONS = {
   "step start": "running", "step complete": "complete", "step error": "error",
   "phase start": "running", "phase complete": "complete", "phase abandon": "abandoned",
-  "mission start": "active", "mission close": "closed", "mission pause": "paused", "mission resume": "active",
+  "mission start": "active", "mission close": "finalized", "mission pause": "paused", "mission resume": "active",
 };
 function statusFromRecord(rec){
-  return STATUS_ACTIONS[rec.action] || null;
+  return normalizeMissionStatus(STATUS_ACTIONS[rec.action] || null);
+}
+
+// (Closed→Finalized rename, #1463 lineage) Lenient-read on the viewer side:
+// a disk mission.json written before this rename self-migrates to
+// "finalized" on its next save (the darkmux-crew serde alias), but a flow
+// record or any other un-normalized source may still carry the old
+// "closed" value. Normalize here so status handling (class name, display
+// label, rank lookup) never has to special-case both spellings at every
+// call site.
+function normalizeMissionStatus(s){
+  return s === "closed" ? "finalized" : s;
 }
 
 // How advanced a node status is, for the merge in the reconcile poll.
@@ -732,7 +743,7 @@ function statusFromRecord(rec){
 // vice versa on rank alone (equal rank keeps the page's value; the SSE
 // delta that set it is more recent than the disk snapshot).
 var STATUS_RANK = { planned: 0, running: 1, complete: 2, error: 2, abandoned: 2,
-                    active: 1, closed: 2, paused: 1 };
+                    active: 1, finalized: 2, closed: 2, paused: 1 };
 function statusRank(s){
   return STATUS_RANK[s] !== undefined ? STATUS_RANK[s] : 0;
 }
@@ -1624,7 +1635,7 @@ function App(){
       h("div", {className:"nav"}, h("a", {href:"/", title:"back to the darkmux viewer"}, "‹ viewer")),
       h("div", {className:"brand"}, h("a", {href:"/"}, h("b", null, "darkmux"), h("span", {className:"sub"}, " · mission"))),
       h("span", {className:"midname", title: g.mission_id}, g.mission_id),
-      h("span", {className:"mstatus " + g.mission_status}, g.mission_status),
+      h("span", {className:"mstatus " + normalizeMissionStatus(g.mission_status)}, normalizeMissionStatus(g.mission_status)),
       // (#1480) Connection state — "● live" (calm amber) vs a LOUD warn
       // "○ reconnecting" so stale-but-looks-live never happens silently.
       h("span", {className:"livepill" + (live ? " on" : " off")}, live ? "● live" : "○ reconnecting"),

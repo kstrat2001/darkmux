@@ -250,7 +250,15 @@ pub struct Crew {
 pub enum MissionStatus {
     #[default]
     Active,
-    Closed,
+    /// Terminal (SUCCESS path). Renamed from `Closed` for 2.0 terminology
+    /// consistency with the `mission finalize` verb (#1463 renamed the
+    /// lifecycle VERB; this rename catches the STATUS up to it). Pre-2.0
+    /// mission.json on disk carries `"status":"closed"` — `alias` accepts
+    /// it on read; every subsequent write emits the canonical
+    /// `"finalized"`, so a mission self-migrates the next time it's
+    /// touched (same pattern as `phase_ids`'s `sprint_ids` alias above).
+    #[serde(alias = "closed")]
+    Finalized,
     Paused,
 }
 
@@ -273,10 +281,18 @@ pub struct Mission {
     /// `darkmux mission start` runs. Used by the wall-clock UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_ts: Option<u64>,
-    /// When the mission transitioned to `Closed`. Closed is terminal —
-    /// once set, lifecycle verbs can't move the mission elsewhere.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub closed_ts: Option<u64>,
+    /// When the mission transitioned to `Finalized`. Finalized is
+    /// terminal — once set, lifecycle verbs can't move the mission
+    /// elsewhere. Field renamed from `closed_ts` (#1463 terminology
+    /// consistency); `alias` accepts the pre-rename wire name on read,
+    /// every subsequent write emits `finalized_ts`.
+    #[serde(
+        default,
+        rename = "finalized_ts",
+        alias = "closed_ts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub finalized_ts: Option<u64>,
     /// When the mission most recently transitioned to `Paused`. Resume
     /// flips status back to `Active` but does NOT clear this field —
     /// the operator may want to see when the most recent pause occurred.
@@ -791,5 +807,48 @@ mod tests {
                 Capability::AgenticToolUse,
             ],
         );
+    }
+
+    /// Closed→Finalized terminology rename (#1463 lineage): a mission.json
+    /// written by a pre-rename binary carries `"status":"closed"` and
+    /// `"closed_ts"`. Lenient-read must accept both — a mission finalized
+    /// yesterday can't stop deserializing the day this ships. Mirrors the
+    /// `sprint_ids` alias precedent for `phase_ids` above.
+    #[test]
+    fn mission_status_old_shape_closed_deserializes_to_finalized() {
+        let legacy_json = r#"{
+            "id": "m-old",
+            "description": "pre-rename mission",
+            "status": "closed",
+            "phase_ids": [],
+            "created_ts": 1700000000,
+            "closed_ts": 1700000900
+        }"#;
+        let m: Mission = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(m.status, MissionStatus::Finalized);
+        assert_eq!(m.finalized_ts, Some(1700000900));
+    }
+
+    /// The canonical (post-rename) wire shape round-trips, and writing a
+    /// `Finalized` mission always emits the new field/value names —
+    /// self-migration happens the next time the mission is saved.
+    #[test]
+    fn mission_status_finalized_serializes_to_new_wire_shape() {
+        let m = Mission {
+            id: "m-new".to_string(),
+            description: "post-rename mission".to_string(),
+            status: MissionStatus::Finalized,
+            phase_ids: Vec::new(),
+            created_ts: 1700000000,
+            started_ts: None,
+            finalized_ts: Some(1700000900),
+            paused_ts: None,
+            source_input: None,
+            ticket: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""status":"finalized""#), "got {s}");
+        assert!(s.contains(r#""finalized_ts":1700000900"#), "got {s}");
+        assert!(!s.contains("closed"), "old wire names must not appear on write, got {s}");
     }
 }

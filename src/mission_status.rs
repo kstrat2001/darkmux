@@ -62,8 +62,8 @@ fn is_terminal(s: PhaseStatus) -> bool {
 ///
 /// (#1463) The old "CLOSED mission with a non-terminal phase" arm RETIRED:
 /// `mission finalize` / `mission abort` now reconcile EVERY phase to a
-/// terminal status as part of closing the mission, so a Closed mission with an
-/// open phase is no longer a reachable state to detect. (Its `phase
+/// terminal status as part of closing the mission, so a Finalized mission
+/// with an open phase is no longer a reachable state to detect. (Its `phase
 /// complete`/`phase abandon` reconcile hints went with the retired `phase`
 /// family; the surviving hints point at `mission finalize` / `mission abort`.)
 fn detect_drift(m: &Mission, phases: &[&Phase], now: u64, stale_days: u64) -> Vec<Drift> {
@@ -77,7 +77,7 @@ fn detect_drift(m: &Mission, phases: &[&Phase], now: u64, stale_days: u64) -> Ve
         && complete > 0
     {
         out.push(Drift {
-            kind: "done-not-closed",
+            kind: "done-not-finalized",
             detail: "all phases are terminal — the mission looks done but is still open"
                 .to_string(),
             suggest: vec![format!("darkmux mission finalize {}", m.id)],
@@ -215,7 +215,7 @@ pub fn run(json: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    for group in [MissionStatus::Active, MissionStatus::Paused, MissionStatus::Closed] {
+    for group in [MissionStatus::Active, MissionStatus::Paused, MissionStatus::Finalized] {
         let g: Vec<&MissionView> = views.iter().filter(|v| v.m.status == group).collect();
         if g.is_empty() {
             continue;
@@ -284,7 +284,7 @@ fn status_word(s: MissionStatus) -> &'static str {
     match s {
         MissionStatus::Active => "active",
         MissionStatus::Paused => "paused",
-        MissionStatus::Closed => "closed",
+        MissionStatus::Finalized => "finalized",
     }
 }
 
@@ -332,7 +332,7 @@ mod tests {
             phase_ids: vec![],
             created_ts: 0,
             started_ts: None,
-            closed_ts: None,
+            finalized_ts: None,
             paused_ts: None,
             source_input: None,
             ticket: None,
@@ -354,22 +354,22 @@ mod tests {
     }
 
     #[test]
-    fn closed_mission_with_open_phase_no_longer_drifts() {
-        // (#1463) The "closed-with-open-phase" arm retired: `mission finalize`
-        // / `mission abort` reconcile every phase to terminal as part of
-        // closing, so this is no longer a reachable state — and a Closed
-        // mission never surfaces a drift on this axis anymore, even if a
-        // hand-edited JSON produced one. (Legacy on-disk data is a `mission
-        // finalize`/`abort` re-run away from clean.)
-        let m = mission("m1", MissionStatus::Closed);
+    fn finalized_mission_with_open_phase_no_longer_drifts() {
+        // (#1463) The "finalized-with-open-phase" arm retired: `mission
+        // finalize` / `mission abort` reconcile every phase to terminal as
+        // part of closing, so this is no longer a reachable state — and a
+        // Finalized mission never surfaces a drift on this axis anymore,
+        // even if a hand-edited JSON produced one. (Legacy on-disk data is a
+        // `mission finalize`/`abort` re-run away from clean.)
+        let m = mission("m1", MissionStatus::Finalized);
         let running = phase("s1", "m1", PhaseStatus::Running);
         let planned = phase("s2", "m1", PhaseStatus::Planned);
         assert!(detect_drift(&m, &[&running, &planned], 0, 14).is_empty());
     }
 
     #[test]
-    fn closed_mission_all_terminal_is_clean() {
-        let m = mission("m1", MissionStatus::Closed);
+    fn finalized_mission_all_terminal_is_clean() {
+        let m = mission("m1", MissionStatus::Finalized);
         let s = phase("s1", "m1", PhaseStatus::Complete);
         assert!(detect_drift(&m, &[&s], 0, 14).is_empty());
     }
@@ -380,7 +380,7 @@ mod tests {
         let s = phase("s1", "m1", PhaseStatus::Complete);
         let d = detect_drift(&m, &[&s], 0, 14);
         assert_eq!(d.len(), 1);
-        assert_eq!(d[0].kind, "done-not-closed");
+        assert_eq!(d[0].kind, "done-not-finalized");
         assert!(d[0].suggest[0].contains("mission finalize m1"));
     }
 
@@ -440,12 +440,12 @@ mod tests {
     #[test]
     fn active_mission_with_a_complete_phase_is_not_flagged_stale() {
         // Old started_ts, but at least one phase completed — progress is
-        // happening, this is `done-not-closed`/normal territory, not stale.
+        // happening, this is `done-not-finalized`/normal territory, not stale.
         let mut m = mission("m1", MissionStatus::Active);
         m.started_ts = Some(0);
         let s = phase("s1", "m1", PhaseStatus::Complete);
         let d = detect_drift(&m, &[&s], 30 * 86_400, 14);
-        // `done-not-closed` fires (all terminal + complete>0), but NOT
+        // `done-not-finalized` fires (all terminal + complete>0), but NOT
         // `stale-active`.
         assert!(!d.iter().any(|dr| dr.kind == "stale-active"));
     }
@@ -526,7 +526,7 @@ mod tests {
             ],
             created_ts: 1_782_141_824,
             started_ts: Some(1_782_141_824),
-            closed_ts: None,
+            finalized_ts: None,
             paused_ts: None,
             source_input: None,
             ticket: None,

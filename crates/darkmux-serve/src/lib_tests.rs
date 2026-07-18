@@ -3360,7 +3360,7 @@
             phase_ids,
             created_ts: now_unix(),
             started_ts: None,
-            closed_ts: None,
+            finalized_ts: None,
             paused_ts: None,
             source_input: None,
             ticket: None,

@@ -1281,7 +1281,7 @@ pub(crate) async fn worktree_summary_handler(
 /// the blocking pool to keep the axum executor free.
 /// GET /missions — list of all missions from the JSON source-of-truth
 /// (`~/.darkmux/crew/missions/`). Includes status + transition timestamps
-/// (started_ts/closed_ts/paused_ts) so the viewer can render wall-clock
+/// (started_ts/finalized_ts/paused_ts) so the viewer can render wall-clock
 /// durations and the phase-progress widget. Empty array on no missions
 /// or unreachable crew root; never errors.
 async fn missions_handler() -> axum::Json<serde_json::Value> {

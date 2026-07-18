@@ -16,7 +16,7 @@
 //! ([`coder_brief`] + the cautions/lessons/corrections allocation), and the
 //! two operator-facing whole-mission terminals (#1463): [`finalize`] (the
 //! SUCCESS terminal — non-terminal phases → Complete, worktrees torn down,
-//! mission Closed) and [`abort`] (the KILL terminal — the same teardown, phases
+//! mission Finalized) and [`abort`] (the KILL terminal — the same teardown, phases
 //! → Abandoned; whole-mission by default, `--phase` for a single run). [`debrief`]
 //! reports on how a mission's phases ended.
 //!
@@ -1014,7 +1014,7 @@ fn teardown_and_terminate_phase(
 
 /// Whole-mission terminal (#1463): tear down every NON-terminal phase's
 /// worktree + branch, drive each to `kind`'s terminal status, then close the
-/// mission (stamping `closed_ts`). Shared engine behind `mission finalize` (the
+/// mission (stamping `finalized_ts`). Shared engine behind `mission finalize` (the
 /// success terminal — phases → Complete) and the default whole-mission `mission
 /// abort` (the kill terminal — phases → Abandoned). Both clean up whatever
 /// exists; only the recorded truth differs. Already-terminal phases are left
@@ -1070,18 +1070,18 @@ fn terminate_mission(mission_id: &str, kind: MissionTerminal, reasoning: Option<
         println!("{}", style::dim("all phases already terminal — nothing to tear down"));
     }
 
-    // Close the mission. Best-effort against an already-Closed mission (a
+    // Close the mission. Best-effort against an already-Finalized mission (a
     // graph/review run may have auto-closed it) — surface, don't fail.
     match crew::lifecycle::mission_close_with_reasoning(mission_id, reasoning) {
         Ok(m) => {
             let started = m.started_ts.unwrap_or(0);
-            let closed = m.closed_ts.unwrap_or(0);
-            let dur = closed.saturating_sub(started);
+            let finalized = m.finalized_ts.unwrap_or(0);
+            let dur = finalized.saturating_sub(started);
             println!(
                 "{}",
                 style::success(&format!(
-                    "✓ mission {} → Closed  duration={}s  closed_ts={}",
-                    m.id, dur, closed
+                    "✓ mission {} → Finalized  duration={}s  finalized_ts={}",
+                    m.id, dur, finalized
                 ))
             );
         }
@@ -1103,14 +1103,14 @@ fn terminate_mission(mission_id: &str, kind: MissionTerminal, reasoning: Option<
 /// `darkmux mission finalize` — the SUCCESS terminal (#1463). The frontier
 /// orchestrator does the git/gh work by hand (commit/push/PR/merge — its native
 /// job), then calls this to close out the darkmux-side state: every non-terminal
-/// phase → Complete, worktrees + branches torn down, mission → Closed. Absorbs
+/// phase → Complete, worktrees + branches torn down, mission → Finalized. Absorbs
 /// the darkmux-half of the retired `ship` verb; the clear opposite of `abort`.
 pub fn finalize(mission_id: &str, reasoning: Option<&str>) -> Result<i32> {
     terminate_mission(mission_id, MissionTerminal::Finalize, reasoning)
 }
 
 /// `darkmux mission abort` — the KILL terminal (#1463). Default: the WHOLE
-/// mission — every non-terminal phase torn down + Abandoned, mission Closed
+/// mission — every non-terminal phase torn down + Abandoned, mission Finalized
 /// (ends a stuck mission in one command). Pass `--phase <id>` to scope the
 /// teardown to a SINGLE gate-held coder-phase run instead, flipping just that
 /// phase Abandoned and finalizing the mission only if that left every phase
@@ -1889,7 +1889,7 @@ fn mission_status_label(s: crew::types::MissionStatus) -> &'static str {
     use crew::types::MissionStatus::*;
     match s {
         Active => "active",
-        Closed => "closed",
+        Finalized => "finalized",
         Paused => "paused",
     }
 }
