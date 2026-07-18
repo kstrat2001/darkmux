@@ -1139,7 +1139,7 @@ function eventsPanelEls(events, closePanel){
 
 function App(){
   var missionId = missionIdFromPath();
-  var _s = React.useState({loading:true, error:null, graph:null});
+  var _s = React.useState({loading:true, error:null, errorNotFound:false, graph:null});
   var state = _s[0], setState = _s[1];
   var _live = React.useState(false);
   var live = _live[0], setLive = _live[1];
@@ -1202,7 +1202,18 @@ function App(){
   function fetchGraph(){
     return fetch("/mission/" + encodeURIComponent(missionId) + "/graph.json", {headers:{accept:"application/json"}})
       .then(function(r){
-        if (r.status === 404) { throw new Error("no mission with id `" + missionId + "` found"); }
+        // (mobile-nav lineage: #1403/#1495) Tag a 404 distinctly from any other fetch failure —
+        // the id is well-formed but the server has no mission dir for it
+        // (deleted/ephemeral run, or an "untracked" flow-only mission the
+        // missions index already showed with no durable plan behind it —
+        // see viewer.html's `mitag untracked`). The render below reads
+        // `notFound` to show a calm in-chrome message instead of the raw
+        // server error text.
+        if (r.status === 404) {
+          var notFoundErr = new Error("no mission with id `" + missionId + "` found");
+          notFoundErr.notFound = true;
+          throw notFoundErr;
+        }
         if (!r.ok) { throw new Error("graph.json fetch failed: " + r.status); }
         return r.json();
       });
@@ -1259,7 +1270,7 @@ function App(){
       idxRef.current = indexGraph(g);
       setMetrics(function(prev){ return seedMetricsFromGraph(prev, g); });
       setState(function(prev){
-        if (!prev.graph) return { loading:false, error:null, graph:g };
+        if (!prev.graph) return { loading:false, error:null, errorNotFound:false, graph:g };
         return Object.assign({}, prev, {graph: mergeGraphs(prev.graph, g)});
       });
     }).catch(function(){ /* best-effort; keep showing the last-known graph */ });
@@ -1270,7 +1281,7 @@ function App(){
   refreshRef.current = refresh;
 
   React.useEffect(function(){
-    if (!missionId) { setState({loading:false, error:"no mission id in URL (expected /mission/<id>/graph)", graph:null}); return; }
+    if (!missionId) { setState({loading:false, error:"no mission id in URL (expected /mission/<id>/graph)", errorNotFound:false, graph:null}); return; }
     var cancelled = false;
     fetchGraph().then(function(g){
       if (cancelled) return;
@@ -1278,10 +1289,10 @@ function App(){
       // (#1432 item 4) Seed the meters from the server's finalized backfill
       // BEFORE the SSE stream (which only carries deltas from now on) starts.
       setMetrics(function(prev){ return seedMetricsFromGraph(prev, g); });
-      setState({loading:false, error:null, graph:g});
+      setState({loading:false, error:null, errorNotFound:false, graph:g});
     }).catch(function(e){
       if (cancelled) return;
-      setState({loading:false, error:String(e.message||e), graph:null});
+      setState({loading:false, error:String(e.message||e), errorNotFound:!!e.notFound, graph:null});
     });
     return function(){ cancelled = true; };
   }, [missionId]);
@@ -1458,8 +1469,47 @@ function App(){
     return function(){ clearInterval(id); };
   }, [anyRunning]);
 
-  if (state.loading) return h("div", {className:"msg"}, "loading mission graph…");
-  if (state.error) return h("div", {className:"msg"}, "darkmux mission graph: " + state.error);
+  // (mobile-nav lineage: #1403/#1495) The loading/error renders MUST keep the
+  // same sticky `.top` nav shell the loaded graph gets — this is a chromeless
+  // home-screen PWA with no browser back, so the back link is the ONLY way
+  // out of the page. Before this fix, both early returns below skipped the
+  // `.top` bar entirely and rendered a bare full-screen `.msg`, trapping the
+  // user on a fetch failure (observed: a stale/untracked mission id 404s and
+  // strands the phone on a blank screen). `minimalTopBar` renders a reduced
+  // nav (back link + brand + mission id, no graph-derived meters/buttons —
+  // there's no graph to derive them from) so the content area is the only
+  // thing that changes between loading/error/loaded.
+  function minimalTopBar(showRetry){
+    return h("div", {className:"top"},
+      h("div", {className:"nav"}, h("a", {href:"/", title:"back to the darkmux viewer"}, "‹ viewer")),
+      h("div", {className:"brand"}, h("a", {href:"/"}, h("b", null, "darkmux"), h("span", {className:"sub"}, " · mission"))),
+      missionId ? h("span", {className:"midname", title: missionId}, missionId) : null,
+      showRetry ? h("button", {className:"evbtn", title:"retry — refetch graph",
+                   onClick: function(){ refresh(); }}, "↻") : null
+    );
+  }
+  if (state.loading) {
+    return h(React.Fragment, null,
+      minimalTopBar(false),
+      h("div", {className:"body"}, h("div", {className:"msg"}, "loading mission graph…"))
+    );
+  }
+  if (state.error) {
+    // (mobile-nav lineage: #1403/#1495) A 404 (id well-formed, no mission dir — an ephemeral run
+    // whose directory was cleared, or an "untracked" flow-only mission the
+    // missions index already flagged with no durable plan behind it) reads
+    // as a calm, expected outcome, not a technical fault — the raw server
+    // error text (`no mission with id \`...\` found`) is reserved for the
+    // non-404 branch (network failure, 500, malformed id) where the detail
+    // is actually diagnostic.
+    var errMsg = state.errorNotFound
+      ? "This mission's graph data isn't available — it may have been an ephemeral or cleared run."
+      : "darkmux mission graph: " + state.error;
+    return h(React.Fragment, null,
+      minimalTopBar(true),
+      h("div", {className:"body"}, h("div", {className:"msg"}, errMsg))
+    );
+  }
 
   var g = state.graph;
   // (#1404) One data source, two renderers. Timeline is the narrow-viewport
