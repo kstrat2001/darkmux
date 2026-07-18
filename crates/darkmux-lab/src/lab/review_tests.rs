@@ -3230,6 +3230,167 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         (recorded, steps)
     }
 
+    /// (#1486) A `ModelHost` whose every `load` fails — the deterministic
+    /// stand-in for the live repro (a 120B probe model that never fit the RAM
+    /// budget). Lets a test drive the wholesale probe-stage model-load failure
+    /// through the REAL scheduler + wave loader without a live LMStudio.
+    struct FailingLoadHost {
+        detail: String,
+    }
+
+    impl darkmux_gestalt::ModelHost for FailingLoadHost {
+        fn list_resident(
+            &mut self,
+        ) -> std::result::Result<Vec<darkmux_gestalt::ResidentFact>, darkmux_gestalt::HostError>
+        {
+            Ok(Vec::new())
+        }
+        fn list_catalog(
+            &mut self,
+        ) -> std::result::Result<Vec<darkmux_gestalt::CatalogFact>, darkmux_gestalt::HostError>
+        {
+            Ok(Vec::new())
+        }
+        fn load(
+            &mut self,
+            _model_key: &str,
+            _identifier: &str,
+            _min_ctx: u32,
+            _deadline: darkmux_gestalt::Deadline,
+        ) -> std::result::Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+            Err(darkmux_gestalt::HostError::InsufficientResources { detail: self.detail.clone() })
+        }
+        fn unload(
+            &mut self,
+            _target: &darkmux_gestalt::OwnedTarget,
+            _deadline: darkmux_gestalt::Deadline,
+        ) -> std::result::Result<(), darkmux_gestalt::HostError> {
+            Ok(())
+        }
+    }
+
+    /// (#1486) The reason builder surfaces each errored step's OWN failure
+    /// message (stored in its `output` by the scheduler's terminal
+    /// transition), never just the bare step ids — the whole point of the
+    /// fix. A run whose reason names only step ids swallowed the "could not
+    /// load … for this wave" cause the operator needs.
+    #[test]
+    fn errored_steps_degenerate_reason_surfaces_each_steps_message() {
+        let mut steps: BTreeMap<String, Step> = BTreeMap::new();
+        let mk = |id: &str, output: Option<&str>| Step {
+            id: id.to_string(),
+            task_id: format!("{id}-task"),
+            kind: "dispatch.map".to_string(),
+            status: NodeStatus::Error,
+            config: serde_json::json!({}),
+            started_ts: None,
+            completed_ts: None,
+            output: output.map(str::to_string),
+        };
+        steps.insert(
+            "probe-a".to_string(),
+            mk("probe-a", Some("darkmux: could not load \"gpt-oss-120b\" for this wave: host refused")),
+        );
+        // A step that reached Error with no recorded output must still read
+        // loud, never blank.
+        steps.insert("probe-b".to_string(), mk("probe-b", None));
+
+        let reason = errored_steps_degenerate_reason(
+            &["probe-a".to_string(), "probe-b".to_string()],
+            &steps,
+        );
+
+        assert!(reason.contains("2 step(s) errored"), "names how many errored: {reason}");
+        assert!(
+            reason.contains("could not load \"gpt-oss-120b\""),
+            "surfaces the real per-step failure message, not just step ids: {reason}"
+        );
+        assert!(reason.contains("probe-a:"), "attributes the reason to its step: {reason}");
+        assert!(
+            reason.contains("probe-b: (no failure reason recorded)"),
+            "an outputless errored step still reads loud: {reason}"
+        );
+    }
+
+    /// (#1486) The end-to-end model-load path: a review whose every LOCAL
+    /// probe seat's model fails to load runs through the real scheduler + wave
+    /// loader, marks every probe step `Error` with the load-failure reason in
+    /// its `output`, and the degenerate reason the review graph finalizes with
+    /// surfaces that reason — a LOUD, non-Clean outcome, never a silent
+    /// `flags=0 members=0` pass. This is the exact #1486 shape (probe stage
+    /// yields 0 members because nothing ever loaded), reproduced without a
+    /// live LMStudio via `FailingLoadHost`.
+    #[test]
+    fn probe_stage_wholesale_model_load_failure_is_loud_with_reasons() {
+        // LOCAL probe + judge (both have n_ctx → wave-loaded track), so the
+        // probe map steps hit the wave loader where the load fails.
+        let crew = valid_crew();
+        let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), |_call: &ChatCall| {
+            panic!("no probe dispatch may fire when the model never loads");
+        });
+        let seats = validate_review_crew(&ctx.crew).expect("valid crew");
+        let judge = seats.judge.clone();
+        let probes: Vec<_> = seats.probes.clone();
+        let graph = build_review_graph(
+            ctx.clone(),
+            judge,
+            None,
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
+        let BuiltReviewGraph { tasks, mut steps, registry, .. } = graph;
+        let tasks_by_id: BTreeMap<String, Task> =
+            tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
+        let host_factory = || -> Box<dyn darkmux_gestalt::ModelHost> {
+            Box::new(FailingLoadHost { detail: "gpt-oss-120b won't fit the RAM budget".to_string() })
+        };
+        // A small fixed estimate so the planner decides Load (which then
+        // fails at the host), never Block — we want to exercise the
+        // load-failure reason specifically.
+        let est = darkmux_gestalt::FixedEstimator(
+            [("probe-model".to_string(), 1_000u64), ("judge-model".to_string(), 1_000u64)]
+                .into_iter()
+                .collect(),
+        );
+        let report = darkmux_crew::scheduler::run_step_graph(
+            &mut steps,
+            &tasks_by_id,
+            &registry,
+            &darkmux_gestalt::Facts::default(),
+            &est,
+            8,
+            &host_factory,
+            &mut |_record| {},
+            &mut |_step| {},
+            review_dispatch_override(&ctx),
+        )
+        .expect("graph run completes even when every probe step errors");
+
+        // Every probe step errored, and its OWN output carries the reason —
+        // the scheduler propagated `run_bounded`'s synthesized per-job Err.
+        assert!(!report.errored.is_empty(), "the failed probe stage must report errored steps");
+        for id in &report.errored {
+            let out = steps[id].output.as_deref().unwrap_or("");
+            assert!(
+                out.contains("could not load") && out.contains("won't fit the RAM budget"),
+                "errored step `{id}` must carry the load-failure reason, not an empty err: {out:?}"
+            );
+        }
+
+        // The degenerate reason the review graph finalizes with (else branch
+        // of `run_review_graph`) surfaces that reason — loud, not a bare id
+        // list, and never a silent Clean.
+        let reason = errored_steps_degenerate_reason(&report.errored, &steps);
+        assert!(
+            reason.contains("could not load") && reason.contains("won't fit the RAM budget"),
+            "the finalized degenerate reason names WHY the probe stage produced zero signal: {reason}"
+        );
+    }
+
     /// (#1426 ship-2 operator decision) ZERO confirmed findings + a pinned,
     /// DISTINCT local verify model: the verify step completes as a no-op and
     /// the residency wave loads NO model at all — `residency()` returns
