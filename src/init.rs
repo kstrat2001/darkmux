@@ -625,6 +625,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("CLAUDE.md");
         let stale = format!(
+            // drift-guard:allow darkmux swap — deliberate STALE fixture; the test proves --force strips this retired verb (#1469)
             "# My Project\n\nMy own notes above.\n\n{CLAUDE_MD_HEADER}\n\n# darkmux\n\nSTALE: multiplex local LLM stacks with `darkmux swap`.\n\n{CLAUDE_MD_FOOTER}\n\nMy own notes below.\n"
         );
         fs::write(&p, &stale).unwrap();
@@ -640,7 +641,7 @@ mod tests {
         let after = fs::read_to_string(&p).unwrap();
         assert!(!after.contains("STALE"), "stale block must be gone: {after}");
         assert!(!after.contains("multiplex"), "retired identity gone: {after}");
-        assert!(!after.contains("darkmux swap"), "retired verb gone: {after}");
+        assert!(!after.contains("darkmux swap"), "retired verb gone: {after}"); // drift-guard:allow darkmux swap — test asserts the retired verb is stripped (#1469)
         assert!(after.contains("mission orchestrator and lab"));
         // User prose on both sides is preserved.
         assert!(after.contains("My own notes above."));

@@ -1894,7 +1894,7 @@ mod tests {
         *handles.verify_slot.lock().unwrap() = Some(Ok(review_output(2, 1, "blockers")));
 
         let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps).unwrap();
-        assert_eq!(exit, 2, "QA blockers must exit 2, mirroring `mission run`");
+        assert_eq!(exit, 2, "QA blockers must exit 2, mirroring `mission run`"); // drift-guard:allow mission run — test names the retired verb whose exit code this preserves (#1469)
         assert_eq!(
             phase_status_on_disk("gate-test-mission", phase_id),
             PhaseStatus::Running,
@@ -1933,7 +1933,7 @@ mod tests {
         *handles.verify_slot.lock().unwrap() = Some(Err("reviewer image pull failed".to_string()));
 
         let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps).unwrap();
-        assert_eq!(exit, 3, "QA-unavailable must exit 3, mirroring `mission run`");
+        assert_eq!(exit, 3, "QA-unavailable must exit 3, mirroring `mission run`"); // drift-guard:allow mission run — test names the retired verb whose exit code this preserves (#1469)
         assert_eq!(phase_status_on_disk("gate-test-mission", phase_id), PhaseStatus::Running);
     }
 

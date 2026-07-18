@@ -773,7 +773,7 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("no on-disk darkmux skills") || msg.contains("missing sentinel"),
+            msg.contains("no on-disk darkmux skills") || msg.contains("missing sentinel"), // drift-guard:allow darkmux skills — noun (the skills/ source directory), not the retired verb (#1469)
             "unexpected error: {msg}"
         );
     }

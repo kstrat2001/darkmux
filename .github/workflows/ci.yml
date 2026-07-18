@@ -395,6 +395,15 @@ jobs:
             exit 1
           fi
           echo "docs drift guard passed: no retired terms"
+      - name: No retired verbs in .rs string literals
+        # (#1469) The docs scan above anchors on `darkmux <verb>` in DOCS, so it
+        # misses a retired verb baked into a Rust user-facing string — a help/
+        # error/hint message or a `println!`/`format!` banner. That blind spot
+        # recurred ~5 times on the 2.0 arc (#1468 shipped a stale `mission ship
+        # --merge` banner). This sibling scan closes it. The retired-verb list +
+        # the allowlist mechanism (`// drift-guard:allow <verb> — <reason>`) live
+        # in scripts/rs-drift-guard.py so both halves of the guard can't drift.
+        run: python3 scripts/rs-drift-guard.py
       - name: Demo page is in sync with the canonical viewer
         run: |
           # darkmux.com/demo IS crates/darkmux-serve/assets/viewer.html in
