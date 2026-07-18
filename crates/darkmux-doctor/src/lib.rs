@@ -162,6 +162,7 @@ pub fn run() -> DoctorReport {
         check_audit_write_drops(),
         check_daemon_auth(),
         check_utility_model_binding(),
+        check_role_profiles(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
         check_legacy_mission_layout(),
@@ -827,6 +828,87 @@ fn utility_binding_status(
                     ),
                 }
             }
+        }
+    }
+}
+
+/// (#1475 packet 1) Coherence of the machine-local role->profile map: every
+/// role BOUND in `role_profiles` (config.json) must name a profile the registry
+/// defines. A dangling binding (role -> a profile name absent from the registry)
+/// WARNs, naming the offending role->profile pair + the fix — so the operator
+/// learns a review seat won't assemble BEFORE a dispatch resolves it and fails,
+/// per the config-leniency contract (semantic validation at resolution + doctor,
+/// never the hot load path — the same discipline as `resolve_role_profile`'s
+/// loud error). An UNMAPPED role is NOT a finding: it's the fresh-user floor
+/// (falls back to `default_profile`).
+fn check_role_profiles() -> Check {
+    let map = darkmux_types::config_access::role_profiles();
+    // Only load the registry when there's a binding to verify.
+    if map.is_empty() {
+        return role_profiles_status(&map, &std::collections::BTreeMap::new());
+    }
+    match profiles::load_registry(None) {
+        Ok(l) => role_profiles_status(&map, &l.registry.profiles),
+        Err(e) => Check {
+            name: "role profiles".into(),
+            status: Status::Warn,
+            message: format!("can't verify the role->profile map (profile registry load failed: {e})"),
+            hint: Some("Fix the profile registry (`darkmux doctor` profile-registry check), then re-run.".into()),
+        },
+    }
+}
+
+/// Pure decision for `check_role_profiles`, split out so every arm is
+/// unit-testable without a real config.json / registry. `known_profiles` is the
+/// registry's defined profiles (a quarantined/absent name is simply not a key,
+/// so a binding to it reads as dangling).
+fn role_profiles_status(
+    map: &std::collections::BTreeMap<String, String>,
+    known_profiles: &std::collections::BTreeMap<String, darkmux_types::Profile>,
+) -> Check {
+    let name = "role profiles".to_string();
+    if map.is_empty() {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: "no role->profile bindings configured; unmapped roles use default_profile".into(),
+            hint: Some(
+                "Optional: bind a role to a profile with `darkmux config set role_profiles.<role> <profile>` (e.g. `role_profiles.judge qwen35b`). Profiles stay role-agnostic; the map welds a role to one on this machine. (#1475)".into(),
+            ),
+        };
+    }
+    // Dangling = a binding whose profile name the registry doesn't define.
+    let dangling: Vec<(&String, &String)> = map
+        .iter()
+        .filter(|(_role, profile)| !known_profiles.contains_key(profile.as_str()))
+        .collect();
+    if dangling.is_empty() {
+        Check {
+            name,
+            status: Status::Pass,
+            message: format!(
+                "{} role->profile binding{} — all name a defined profile",
+                map.len(),
+                if map.len() == 1 { "" } else { "s" }
+            ),
+            hint: None,
+        }
+    } else {
+        let pairs = dangling
+            .iter()
+            .map(|(role, profile)| format!("{role} -> {profile}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Check {
+            name,
+            status: Status::Warn,
+            message: format!(
+                "role->profile binding{} to an undefined profile: {pairs}",
+                if dangling.len() == 1 { "" } else { "s" }
+            ),
+            hint: Some(
+                "Point each binding at a profile in `darkmux profile list`, or add the profile to profiles.json — `darkmux config set role_profiles.<role> <profile>`. Until fixed, resolving that role errors (it does NOT silently fall back to default_profile). (#1475)".into(),
+            ),
         }
     }
 }
@@ -4200,10 +4282,11 @@ mod tests {
         // serve-daemon-auth [#881] + fleet.mode [#933] + env-masks-config
         // [#934] + binary-split-brain [#934] + crew-validation [#1269] +
         // mission-config-registry [#1284] + daemon-freshness +
-        // binary-vs-source + runtime-image-freshness [#1461]) + one per active
-        // eureka rule. Every check should appear regardless of environment —
-        // even if the underlying probe couldn't read state.
-        let expected = 35 + darkmux_eureka::all_rules().len();
+        // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
+        // [#1475]) + one per active eureka rule. Every check should appear
+        // regardless of environment — even if the underlying probe couldn't
+        // read state.
+        let expected = 36 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -4338,6 +4421,49 @@ mod tests {
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("registered but NOT loaded"));
         assert!(c.hint.unwrap().contains("Load it before dispatching"));
+    }
+
+    // ─── role_profiles coherence (#1475 packet 1) ───────────────────────
+    // The pure `role_profiles_status` takes the config map + the registry's
+    // defined profiles explicitly, so every arm is testable with no config.json
+    // / registry on disk. A dangling binding (role -> undefined profile) WARNs;
+    // an all-resolving map (and the empty map) Pass.
+    fn known(names: &[&str]) -> std::collections::BTreeMap<String, darkmux_types::Profile> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), darkmux_types::Profile::default()))
+            .collect()
+    }
+    fn bindings(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(r, p)| (r.to_string(), p.to_string())).collect()
+    }
+
+    #[test]
+    fn role_profiles_empty_map_passes() {
+        let c = super::role_profiles_status(&bindings(&[]), &known(&["qwen35b"]));
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("no role->profile bindings"));
+    }
+
+    #[test]
+    fn role_profiles_all_defined_passes() {
+        let map = bindings(&[("judge", "qwen35b"), ("verify", "qwen35b"), ("probe-low", "qwen4b")]);
+        let c = super::role_profiles_status(&map, &known(&["qwen35b", "qwen4b"]));
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("3 role->profile bindings"), "got: {}", c.message);
+        assert!(c.message.contains("all name a defined profile"));
+    }
+
+    #[test]
+    fn role_profiles_dangling_binding_warns_and_names_the_pair() {
+        let map = bindings(&[("judge", "qwen35b"), ("probe-high", "ghost27b")]);
+        let c = super::role_profiles_status(&map, &known(&["qwen35b", "qwen4b"]));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("probe-high -> ghost27b"), "names the dangling pair: {}", c.message);
+        assert!(!c.message.contains("judge -> qwen35b"), "the resolving binding is not flagged: {}", c.message);
+        let hint = c.hint.unwrap();
+        assert!(hint.contains("config set role_profiles"), "hint names the fix: {hint}");
+        assert!(hint.contains("does NOT silently fall back"), "hint states the loud-resolution contract: {hint}");
     }
 
     // ─── parse_semver / classify_version_vs_latest (issue #13) ───────────

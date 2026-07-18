@@ -200,6 +200,105 @@ pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profi
     })
 }
 
+/// (#1475 packet 1) How a role's profile was resolved — whether the machine's
+/// `role_profiles` map bound it explicitly, or it fell through to
+/// `default_profile` (the fresh-user single-model floor). Lets a caller (and
+/// `darkmux doctor`) tell a deliberate binding from the default fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleProfileSource {
+    /// The role was bound to this profile by the `role_profiles` map.
+    Mapped,
+    /// The role was unmapped; it fell back to the registry's `default_profile`.
+    DefaultFallback,
+}
+
+/// (#1475 packet 1) The resolved binding for a role: `role -> profile -> model`.
+/// Carries the resolved profile name, a borrow of the profile, and which tier
+/// resolved it. The FOUNDATION type packets 2-5 build the review crew rollup on;
+/// this packet does not yet wire review to it.
+#[derive(Debug)]
+pub struct ResolvedRoleProfile<'a> {
+    pub role_id: String,
+    pub profile_name: String,
+    pub profile: &'a Profile,
+    pub source: RoleProfileSource,
+}
+
+/// (#1475 packet 1) Resolve a role id to its bound profile via the machine-local
+/// `role_profiles` map in `config.json` (the production path): `role -> map ->
+/// profile -> model`. Reads the mapped name from
+/// [`darkmux_types::config_access::role_profile`], then delegates to the pure
+/// [`resolve_role_profile_with`] for the registry lookup + validation.
+///
+/// An UNMAPPED role falls back to `default_profile` SILENTLY (the fresh-user
+/// floor — a bare install gets a working single-model review). A role MAPPED to
+/// a profile name absent from the registry resolves to a **loud, clear error**
+/// (config-leniency contract 7: semantic validation at resolution, never a
+/// silent fallback); `darkmux doctor` surfaces the same dangling mapping.
+pub fn resolve_role_profile<'a>(
+    role_id: &str,
+    registry: &'a ProfileRegistry,
+) -> Result<ResolvedRoleProfile<'a>> {
+    let mapped = darkmux_types::config_access::role_profile(role_id);
+    resolve_role_profile_with(role_id, mapped.as_deref(), registry)
+}
+
+/// (#1475 packet 1) Pure core of [`resolve_role_profile`] — the mapped profile
+/// name is supplied explicitly (`Some` = the role is bound to that profile name;
+/// `None` = unmapped), so the resolution + validation is unit-testable without
+/// the process-wide `config()`. Same layering as `config_access`'s `pick_*`
+/// helpers taking explicit args.
+pub fn resolve_role_profile_with<'a>(
+    role_id: &str,
+    mapped: Option<&str>,
+    registry: &'a ProfileRegistry,
+) -> Result<ResolvedRoleProfile<'a>> {
+    if let Some(profile_name) = mapped {
+        // Loud semantic validation (contract 7): a mapping to a profile the
+        // registry doesn't define is a clear error naming the role, the bad
+        // profile, and the fix — NEVER a silent fallback to default_profile.
+        // A quarantined target reuses the shared quarantine message.
+        let profile = registry.profiles.get(profile_name).ok_or_else(|| {
+            if let Some(msg) = registry.quarantine_error_for(profile_name) {
+                return anyhow!(msg);
+            }
+            let available: Vec<&str> = registry.profiles.keys().map(String::as_str).collect();
+            let listed = if available.is_empty() { "(none)".to_string() } else { available.join(", ") };
+            anyhow!(
+                "darkmux: role \"{role_id}\" is mapped to profile \"{profile_name}\" \
+                 (role_profiles in config.json), which is not in the profile registry. \
+                 Available: {listed}. Fix the binding — \
+                 `darkmux config set role_profiles.{role_id} <profile>` — \
+                 or verify with `darkmux doctor`. (#1475)"
+            )
+        })?;
+        return Ok(ResolvedRoleProfile {
+            role_id: role_id.to_string(),
+            profile_name: profile_name.to_string(),
+            profile,
+            source: RoleProfileSource::Mapped,
+        });
+    }
+
+    // Unmapped role → default_profile, silently (the fresh-user floor).
+    let default_name = registry.default_profile.as_deref().ok_or_else(|| {
+        anyhow!(
+            "darkmux: role \"{role_id}\" is not bound to a profile and the registry has no \
+             default_profile — bind it (`darkmux config set role_profiles.{role_id} <profile>`) \
+             or set a default_profile in profiles.json. (#1475)"
+        )
+    })?;
+    // Reuse get_profile so a dangling/quarantined default_profile fails with the
+    // standard message shape rather than a bespoke one.
+    let profile = get_profile(registry, default_name)?;
+    Ok(ResolvedRoleProfile {
+        role_id: role_id.to_string(),
+        profile_name: default_name.to_string(),
+        profile,
+        source: RoleProfileSource::DefaultFallback,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +585,97 @@ mod tests {
         let reg = ProfileRegistry::default();
         let err = get_profile(&reg, "anything").unwrap_err();
         assert!(err.to_string().contains("(none)"));
+    }
+
+    // ── role -> profile resolution (#1475 packet 1) ──────────────────
+    // Build a registry with two role-agnostic profiles + a default. The pure
+    // `resolve_role_profile_with` takes the mapped profile name explicitly, so
+    // every arm (mapped / unmapped / dangling map) is testable with no config().
+
+    fn two_profile_reg() -> ProfileRegistry {
+        // `qwen35b` (judge/verify would bind here) and `qwen4b` (a probe), plus
+        // a `qwen4b` default so an unmapped role has a floor.
+        serde_json::from_str(
+            r#"{
+                "profiles": {
+                    "qwen35b": {"models": [{"id": "qwen3.5-35b", "n_ctx": 40000}]},
+                    "qwen4b":  {"models": [{"id": "qwen3-4b", "n_ctx": 16000}]}
+                },
+                "default_profile": "qwen4b"
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_mapped_role_binds_to_its_profile() {
+        let reg = two_profile_reg();
+        let r = resolve_role_profile_with("judge", Some("qwen35b"), &reg).unwrap();
+        assert_eq!(r.profile_name, "qwen35b");
+        assert_eq!(r.profile.models[0].id, "qwen3.5-35b");
+        assert_eq!(r.source, RoleProfileSource::Mapped);
+        assert_eq!(r.role_id, "judge");
+    }
+
+    #[test]
+    fn resolve_unmapped_role_falls_back_to_default_profile() {
+        let reg = two_profile_reg();
+        // An unmapped role degrades to default_profile SILENTLY — the fresh-user
+        // single-model floor.
+        let r = resolve_role_profile_with("probe-high", None, &reg).unwrap();
+        assert_eq!(r.profile_name, "qwen4b", "unmapped → default_profile");
+        assert_eq!(r.source, RoleProfileSource::DefaultFallback);
+    }
+
+    #[test]
+    fn resolve_mapped_to_nonexistent_profile_is_a_loud_error() {
+        let reg = two_profile_reg();
+        // Contract 7: a mapping to a profile the registry doesn't define is a
+        // clear typed error naming the role + the bad profile + the fix, NEVER a
+        // silent fallback to default_profile.
+        let err = resolve_role_profile_with("judge", Some("ghost35b"), &reg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("judge"), "names the role: {err}");
+        assert!(err.contains("ghost35b"), "names the bad profile: {err}");
+        assert!(err.contains("not in the profile registry"), "explains the failure: {err}");
+        assert!(err.contains("darkmux config set role_profiles.judge"), "names the fix: {err}");
+    }
+
+    #[test]
+    fn resolve_unmapped_with_no_default_profile_errors() {
+        // No default_profile → an unmapped role has no floor; a clear error, not
+        // a panic or silent empty resolution.
+        let reg: ProfileRegistry = serde_json::from_str(
+            r#"{"profiles": {"qwen35b": {"models": [{"id": "m", "n_ctx": 40000}]}}}"#,
+        )
+        .unwrap();
+        let err = resolve_role_profile_with("judge", None, &reg).unwrap_err().to_string();
+        assert!(err.contains("not bound"), "names the unbound role: {err}");
+        assert!(err.contains("no default_profile"), "explains the missing floor: {err}");
+    }
+
+    #[test]
+    fn resolve_mapped_to_quarantined_profile_surfaces_quarantine_reason() {
+        // A role mapped to a profile that FAILED per-entry parse (quarantined,
+        // #1282) surfaces the quarantine reason + doctor pointer, not a generic
+        // "not in the registry".
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{
+                    "qwen4b":{"models":[{"id":"a","n_ctx":1000}]},
+                    "broken":{"models":[{"n_ctx":32000}]}
+                },
+                "default_profile":"qwen4b"}"#,
+        );
+        let reg = load_registry(Some(p.to_str().unwrap())).unwrap().registry;
+        let err = resolve_role_profile_with("judge", Some("broken"), &reg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("quarantined"), "got: {err}");
+        assert!(err.contains("darkmux doctor"), "points at doctor: {err}");
     }
 
     #[test]

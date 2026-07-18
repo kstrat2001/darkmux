@@ -290,6 +290,42 @@ pub fn review_judge_concurrency() -> u32 {
         .max(1)
 }
 
+// ── Role -> profile map (#1475 packet 1) ──
+/// (#1475 packet 1) The full machine-local role->profile map from
+/// `config.json` (`{ "<role-id>": "<profile-name>" }`), or an empty map when
+/// unset. Config is the PRIMARY (and only) mechanism — there is deliberately no
+/// per-role env var (a `DARKMUX_ROLE_PROFILE_<role>` over a map is awkward and
+/// unneeded; the map is edited via `darkmux config set role_profiles.<role>
+/// <profile>`), mirroring the CONFIG-ONLY Redis connection bits above. Blank
+/// bindings are trimmed out so a `"judge": "  "` slip never binds a blank name.
+pub fn role_profiles() -> std::collections::BTreeMap<String, String> {
+    match config().role_profiles.as_ref() {
+        None => std::collections::BTreeMap::new(),
+        Some(m) => m
+            .iter()
+            .filter_map(|(role, profile)| {
+                let p = profile.trim();
+                (!p.is_empty()).then(|| (role.trim().to_string(), p.to_string()))
+            })
+            .collect(),
+    }
+}
+
+/// (#1475 packet 1) The profile name bound to `role_id` in the role->profile
+/// map, or `None` when the role is UNMAPPED (the caller then falls back to
+/// `default_profile` — the fresh-user floor). A blank binding is treated as
+/// unset. The registry-existence of the named profile is NOT checked here
+/// (config-leniency contract 7 — semantic validation lives at resolution:
+/// `darkmux_profiles::resolve_role_profile` — and in `darkmux doctor`).
+pub fn role_profile(role_id: &str) -> Option<String> {
+    config()
+        .role_profiles
+        .as_ref()
+        .and_then(|m| m.get(role_id))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub fn default_role() -> Option<String> {
     let cfg = config().runtime.as_ref().and_then(|r| r.default_role.as_deref());
     pick_string("DARKMUX_DEFAULT_ROLE", cfg, None)
@@ -998,6 +1034,17 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    // ── role_profiles / role_profile (#1475 packet 1) ──
+    // Under the empty test config (#811) the map is empty and every role is
+    // unmapped — the fresh-user floor. Populated-map resolution is exercised by
+    // `darkmux_profiles::resolve_role_profile_with` (the pure core that takes the
+    // mapped name explicitly, so it doesn't depend on the process-wide config()).
+    #[test]
+    fn role_profile_unset_is_empty_and_none() {
+        assert!(role_profiles().is_empty(), "empty test config → no role bindings");
+        assert_eq!(role_profile("judge"), None, "unmapped role → None (caller uses default_profile)");
     }
 
     #[serial_test::serial]

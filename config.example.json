@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.4",
+  "schema_version": "1.5",
   "machine_id": "my-machine",
   "orchestrator": "",
   "lms_bin": "lms",
@@ -36,5 +36,6 @@
   },
   "review": {
     "judge_concurrency": 1
-  }
+  },
+  "role_profiles": {}
 }

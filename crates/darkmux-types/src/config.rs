@@ -22,6 +22,7 @@
 //! round-trip invariant tests for the pattern this file's tests copy.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Semver of the `config.json` shape. Additive field/section adds are a
@@ -43,7 +44,13 @@ use std::path::Path;
 // `DARKMUX_FUNNEL_JUDGE_CONCURRENCY` env read onto the standard precedence
 // chain as part of the funnel->review rename). Minor bump, same
 // lenient-read reasoning.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.4";
+// 1.5 (#1475 packet 1): additive `role_profiles{}` map (a machine-local
+// `role-id -> profile-name` binding — profiles stay role-agnostic + reusable,
+// the map welds a role to a profile on THIS machine). Resolution is role ->
+// map -> profile -> model, an unmapped role falling back to `default_profile`.
+// Minor bump — an older binary tolerates it (all-Option + `extras` overflow),
+// per the lenient-read doctrine.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.5";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -84,6 +91,23 @@ pub struct DarkmuxConfig {
     pub mission: Option<MissionBoardConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewConfig>,
+
+    /// (#1475 packet 1) The machine-local **role → profile** map — the binding
+    /// that welds an abstract role id (e.g. `judge`, `probe-high`) to a
+    /// role-agnostic profile (e.g. `qwen35b`) on THIS machine. Many roles may
+    /// name one profile. Deliberately lives in `config.json` (machine config),
+    /// NOT in `profiles.json`, so profiles stay pure, reusable model configs.
+    ///
+    /// Resolution is `role -> this map -> profile -> model`; an unmapped role
+    /// falls back to `default_profile` (the fresh-user single-model floor). A
+    /// mapping to a profile name absent from the registry is a **loud** doctor
+    /// warning + a clear resolution error (config-leniency contract 7: semantic
+    /// validation at resolution + doctor, never the hot load path), never a
+    /// silent fallback. `darkmux init` writes it as a visible empty `{}` per the
+    /// visible-defaults doctrine, so the surface is discoverable and one
+    /// `darkmux config set role_profiles.<role> <profile>` from bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_profiles: Option<BTreeMap<String, String>>,
 
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer config read by an older binary).
@@ -409,6 +433,11 @@ impl DarkmuxConfig {
                 judge_concurrency: Some(1),
                 extras: Default::default(),
             }),
+            // (#1475 packet 1) Written as a visible empty `{}` — the operator
+            // discovers the role->profile surface and binds a role with
+            // `darkmux config set role_profiles.<role> <profile>`. Empty (not
+            // absent) so it shows up in `config list` / the example file.
+            role_profiles: Some(BTreeMap::new()),
             extras: Default::default(),
         }
     }
@@ -541,6 +570,44 @@ mod tests {
         assert_eq!(back.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
         assert_eq!(back.remote.as_ref().unwrap().max_tokens_per_execution, Some(500_000));
         assert_eq!(back.remote.as_ref().unwrap().concurrent_cap, Some(4));
+    }
+
+    /// (#1475 packet 1) `role_profiles` is written by `init` as a visible empty
+    /// map, round-trips a populated map losslessly, and an absent map deserializes
+    /// to `None` (lenient — a fresh/older config never carries it).
+    #[test]
+    fn role_profiles_map_visible_default_and_round_trips() {
+        // `init`/`with_defaults` writes a VISIBLE empty `{}` (discoverable, off).
+        let cfg = DarkmuxConfig::with_defaults();
+        assert_eq!(
+            cfg.role_profiles.as_ref().map(|m| m.is_empty()),
+            Some(true),
+            "with_defaults writes a visible empty role_profiles map"
+        );
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"role_profiles\":{}"), "empty map serializes visible, got: {json}");
+
+        // A populated map round-trips losslessly (many roles -> one profile ok).
+        let populated = r#"{
+            "role_profiles": {
+                "probe-high": "qwen27b",
+                "probe-mid": "devstral",
+                "probe-low": "qwen4b",
+                "judge": "qwen35b",
+                "verify": "qwen35b"
+            }
+        }"#;
+        let cfg: DarkmuxConfig = serde_json::from_str(populated).unwrap();
+        let map = cfg.role_profiles.as_ref().unwrap();
+        assert_eq!(map.get("judge").map(String::as_str), Some("qwen35b"));
+        assert_eq!(map.get("verify").map(String::as_str), Some("qwen35b"), "many roles -> one profile");
+        assert_eq!(map.get("probe-low").map(String::as_str), Some("qwen4b"));
+        let back: DarkmuxConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.role_profiles, cfg.role_profiles, "lossless round-trip");
+
+        // Absent map -> None (lenient; a fresh/older config never carries it).
+        let cfg: DarkmuxConfig = serde_json::from_str(r#"{ "machine_id": "x" }"#).unwrap();
+        assert!(cfg.role_profiles.is_none(), "absent role_profiles is None, not a brick");
     }
 
     /// (#933) `FleetMode::parse` is lenient (trim + case-insensitive) and
