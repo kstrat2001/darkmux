@@ -1375,7 +1375,16 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
     };
-    let result = fleet::dispatch_routed(opts)?;
+    // (#1509) Route the LOCAL half of `dispatch_routed`'s routing decision
+    // through the engine as a crew of one (a full Mission -> Phase ->
+    // Task(role) -> Step graph at cardinality one, run through the SAME
+    // `run_step_graph` scheduler missions use) instead of the raw
+    // `crew::dispatch::dispatch` primitive — see
+    // `darkmux_crew::dispatch_as_crew_of_one`'s module doc for the full
+    // rationale (closes the #1487 residency-lease bypass a raw `dispatch`
+    // fell through). `--machine` routing (and every other caller of
+    // `fleet::dispatch_routed`) is untouched.
+    let result = fleet::dispatch_routed_via(opts, crew::dispatch_as_crew_of_one::dispatch_as_crew_of_one)?;
     // Announce the resolved session id on stderr so operators can correlate
     // this dispatch with the flow stream — without polluting the --json
     // envelope on stdout that orchestrators parse.

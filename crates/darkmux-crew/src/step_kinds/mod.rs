@@ -44,7 +44,7 @@ mod types;
 pub use builtins::{
     parse_failed_verifiers, resolve_local_placement, DispatchInternalStepKind,
     DispatchMapStepKind, DispatchSingleShotStepKind, FailedVerifier, MapItemResult,
-    ProceduralNoopStepKind, ProceduralShellStepKind,
+    ProceduralNoopStepKind, ProceduralShellStepKind, RawDispatchOutcome,
 };
 pub use builtins::MAP_BUDGET_SKIP_ERROR;
 pub use registry::StepKindRegistry;

@@ -190,7 +190,50 @@ pub fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedVerifier> {
 /// downstream steps entirely" contract `mission.coder` always enforced; it
 /// is now this kind's DEFAULT for every caller, not a mission-specific
 /// carve-out.
+///
+/// **`config.preserve_dispatch_result` (#1509, opt-in, default `false`).**
+/// The `darkmux dispatch` CLI verb's crew-of-one graph
+/// (`dispatch_as_crew_of_one`) sets this `true` so it can reconstruct the
+/// EXACT pre-#1509 `DispatchResult` (`exit_code`/`stdout`/`stderr`/
+/// `session_id`/`out_dir`) the CLI's `--json`, exit-code, and stdout/stderr
+/// contract depends on byte-for-byte — the default bail-on-nonzero path
+/// above collapses that into one error string and drops `stderr`/`exit_code`
+/// entirely, which is fine for a mission-graph step (only Complete/Error
+/// matters downstream) but not for a CLI verb whose callers parse the exact
+/// shape. When `true`: the non-zero-exit bail above is skipped (a non-zero
+/// exit is data, not a step failure — matching the CLI's own pre-#1509
+/// semantics, where only a hard `dispatch()`-level `Err` was ever a
+/// failure), and `StepOutcome.output` carries a JSON-serialized
+/// [`RawDispatchOutcome`] instead of the bare stdout string. Every other
+/// caller (mission launch, coder-phase, review) never sets this key, so
+/// `config_str` reads `None` and the original behavior is byte-identical.
+///
+/// Also newly config-driven, same additive/default-preserving shape, so the
+/// crew-of-one path can thread the CLI's own `--skip-preflight`/
+/// `--max-completion-tokens`/`--json` flags through: `config.skip_preflight`
+/// (bool, default `false` — matches every existing caller's hardcoded
+/// `false`), `config.max_completion_tokens` (u64, default `None`), and
+/// `config.json` (bool, default `true` — matches every existing caller,
+/// which always wants the runtime's machine-parseable envelope; the CLI
+/// verb is the first caller that ever wants `false`, for its human-readable
+/// no-`--json` path).
 pub struct DispatchInternalStepKind;
+
+/// (#1509) The full pre-#1509 `crew::dispatch::DispatchResult` shape,
+/// packed as `StepOutcome.output` JSON when `config.preserve_dispatch_result`
+/// is set — see `DispatchInternalStepKind`'s doc. `dispatch_as_crew_of_one`
+/// is the sole consumer today; kept `pub` (not `pub(crate)`) since a
+/// `Step.output` on disk is operator-inspectable data, same visibility as
+/// `FailedVerifier` above.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RawDispatchOutcome {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_dir: Option<std::path::PathBuf>,
+}
 
 /// `task.<field>.clone()`, falling back to `Step.config.<key>` (as a
 /// string) when the Task leaves it unset — the shared sourcing rule every
@@ -237,14 +280,34 @@ impl StepKind for DispatchInternalStepKind {
             .get("parse_verifiers")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // (#1509) Additive, default-preserving config passthroughs — see
+        // `DispatchInternalStepKind`'s doc. Every existing caller (mission
+        // launch, coder-phase, review) never sets these keys, so each falls
+        // back to the exact literal the code used to hardcode here.
+        let skip_preflight = step
+            .config
+            .get("skip_preflight")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let json = step.config.get("json").and_then(|v| v.as_bool()).unwrap_or(true);
+        let max_completion_tokens = step
+            .config
+            .get("max_completion_tokens")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        let preserve_dispatch_result = step
+            .config
+            .get("preserve_dispatch_result")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let opts = DispatchOpts {
             role_id,
             message,
             session_id: Some(session_id),
             timeout_seconds,
-            skip_preflight: false,
-            json: true,
+            skip_preflight,
+            json,
             workdir,
             phase_id,
             machine: None,
@@ -253,7 +316,7 @@ impl StepKind for DispatchInternalStepKind {
             profile_name,
             config_path,
             force_container: false,
-            max_completion_tokens: None,
+            max_completion_tokens,
             image,
             model_base_url_override: None,
             // (#1483) Stamp the step id so the tailer's live turn/tool/token
@@ -263,6 +326,25 @@ impl StepKind for DispatchInternalStepKind {
         };
         let result =
             dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;
+
+        // (#1509) `preserve_dispatch_result` callers (the CLI dispatch verb's
+        // crew-of-one graph) want the exact `DispatchResult` back, including a
+        // non-zero exit code AS DATA — the pre-#1509 CLI never treated a
+        // non-zero dispatch exit as a Rust-level failure, only as a different
+        // process exit code. Skip the bail-on-nonzero contract below entirely
+        // for this opt-in path.
+        if preserve_dispatch_result {
+            let payload = RawDispatchOutcome {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                session_id: result.session_id,
+                out_dir: result.out_dir,
+            };
+            let output = serde_json::to_string(&payload)
+                .context("serializing RawDispatchOutcome for preserve_dispatch_result")?;
+            return Ok(StepOutcome { output, flow_records: Vec::new() });
+        }
 
         if result.exit_code != 0 {
             anyhow::bail!(
@@ -1538,6 +1620,46 @@ mod tests {
     fn parse_failed_verifiers_empty_on_garbage() {
         assert!(parse_failed_verifiers("not json at all").is_empty());
     }
+
+    /// (#1509) `RawDispatchOutcome`'s wire shape is a cross-module contract —
+    /// `DispatchInternalStepKind::run` (this module) packs it,
+    /// `dispatch_as_crew_of_one` (a different crate module) unpacks it. Lock
+    /// the round-trip here so a field rename/retype on either side fails
+    /// loud in THIS crate, not silently at the `serde_json::from_str` call
+    /// in `dispatch_as_crew_of_one_with`.
+    #[test]
+    fn raw_dispatch_outcome_round_trips_through_json() {
+        let original = RawDispatchOutcome {
+            exit_code: 2,
+            stdout: "some output".to_string(),
+            stderr: "some warning".to_string(),
+            session_id: "crew-dispatch-coder-123-0".to_string(),
+            out_dir: Some(std::path::PathBuf::from("/tmp/darkmux-out")),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: RawDispatchOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.exit_code, 2);
+        assert_eq!(back.stdout, "some output");
+        assert_eq!(back.stderr, "some warning");
+        assert_eq!(back.session_id, "crew-dispatch-coder-123-0");
+        assert_eq!(back.out_dir, Some(std::path::PathBuf::from("/tmp/darkmux-out")));
+    }
+
+    #[test]
+    fn raw_dispatch_outcome_out_dir_omitted_when_none() {
+        let original = RawDispatchOutcome {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            session_id: "s".to_string(),
+            out_dir: None,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(!json.contains("out_dir"), "None out_dir must not serialize a key: {json}");
+        let back: RawDispatchOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.out_dir, None);
+    }
+
 
     #[test]
     fn parse_failed_verifiers_falls_back_to_last_line() {
