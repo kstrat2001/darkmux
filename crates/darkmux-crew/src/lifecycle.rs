@@ -714,6 +714,12 @@ fn emit_phase_added_record_with_reasoning(
 /// discipline): a load/save hiccup here must never block the Phase
 /// transition that already succeeded — only the Step's own on-disk record
 /// would lag, reconcilable via a future `mission finalize`/`abort` re-run.
+///
+/// This is a DEFENSIVE BACKSTOP — it should rarely fire on a healthy run.
+/// When it genuinely rolls a step (never on the common no-op path), it
+/// `eprintln!`s a named warning so the operator sees the backstop actually
+/// caught something, matching the drift-warning style `finalize_mission`
+/// already uses.
 fn reconcile_phase_steps_terminal(mission_id: &str, phase_id: &str) {
     let Ok(steps) = load_steps_for_phase(mission_id, phase_id) else {
         return;
@@ -734,6 +740,12 @@ fn reconcile_phase_steps_terminal(mission_id: &str, phase_id: &str) {
                 if was_running { "Running" } else { "Planned" }
             ));
         }
+        eprintln!(
+            "warning: mission `{mission_id}` phase `{phase_id}` step `{}` was still {} while the \
+             phase reached a terminal status — reconciled to Abandoned (#1504 defensive backstop)",
+            step.id,
+            if was_running { "Running" } else { "Planned" }
+        );
         let _ = save_step(mission_id, phase_id, &step);
     }
 }
@@ -748,12 +760,21 @@ fn reconcile_phase_steps_terminal(mission_id: &str, phase_id: &str) {
 /// refusal (should be unreachable; the filter above only ever selects
 /// `Planned`/`Running`, both legal `phase_abandon` sources) is swallowed,
 /// same discipline as every other lifecycle transition in this module.
+///
+/// Same defensive-backstop framing as [`reconcile_phase_steps_terminal`]:
+/// a genuinely rolled phase (never the common no-op path) gets a named
+/// `eprintln!` warning.
 fn reconcile_mission_phases_terminal(mission_id: &str) {
     let Ok(phases) = load_phases() else {
         return;
     };
     for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
         if !matches!(phase.status, PhaseStatus::Complete | PhaseStatus::Abandoned) {
+            eprintln!(
+                "warning: mission `{mission_id}` phase `{}` was still {:?} while the mission reached \
+                 Finalized — reconciled to Abandoned (#1504 defensive backstop)",
+                phase.id, phase.status
+            );
             let _ = phase_abandon(&phase.id);
         }
     }
@@ -787,7 +808,17 @@ pub fn reconcile_mint_failure(mission_id: &str, reason: &str) {
     if !mission_path(mission_id).is_file() {
         return; // never minted — nothing on disk to reconcile
     }
-    let _ = mission_close_with_reasoning(mission_id, Some(reason));
+    // This is the strand-fix helper itself — it must never strand silently.
+    // A swallowed `let _ =` here would leave the mission Active with ZERO
+    // signal that reconcile was even attempted, defeating the entire point
+    // of this function.
+    if let Err(e) = mission_close_with_reasoning(mission_id, Some(reason)) {
+        eprintln!(
+            "warning: mission `{mission_id}` errored during mint AND could not be reconciled to \
+             terminal ({e:#}) — it is STRANDED Active. Run `darkmux mission abort {mission_id}` by \
+             hand to close it out (#1504)."
+        );
+    }
 }
 
 // ─── Phase transitions ─────────────────────────────────────────────────
@@ -823,10 +854,16 @@ pub fn phase_complete(id: &str) -> Result<Phase> {
         PhaseStatus::Abandoned => bail!("phase `{id}` is Abandoned — restart it to Running before completing (#1463)"),
         PhaseStatus::Complete => bail!("phase `{id}` is already Complete"),
     }
+    // (#1504) Reconcile the phase's own Steps BEFORE writing its terminal
+    // status — a crash between the two writes then leaves disk in the LEGAL
+    // shape (a still-Running phase with its live steps already reconciled to
+    // Abandoned), never the #1504 shape (a Complete phase with a live step).
+    // Mirrors how `mission_close_with_reasoning` already reconciles its
+    // phases before saving its own terminal status.
+    reconcile_phase_steps_terminal(&phase.mission_id, id);
     phase.status = PhaseStatus::Complete;
     phase.completed_ts = Some(now_unix());
     save_json(&phase_path(&phase.mission_id, id), &phase)?;
-    reconcile_phase_steps_terminal(&phase.mission_id, id);
     emit_phase_transition_record(id, &phase.mission_id, "phase complete");
     Ok(phase)
 }
@@ -845,10 +882,13 @@ pub fn phase_abandon(id: &str) -> Result<Phase> {
         PhaseStatus::Abandoned => bail!("phase `{id}` is already Abandoned"),
         PhaseStatus::Complete => bail!("phase `{id}` is Complete — can't abandon a finished phase"),
     }
+    // (#1504) Reconcile BEFORE writing the phase's own terminal status — see
+    // `phase_complete`'s matching comment for why (a crash mid-write leaves
+    // the legal shape, never the impossible one).
+    reconcile_phase_steps_terminal(&phase.mission_id, id);
     phase.status = PhaseStatus::Abandoned;
     phase.abandoned_ts = Some(now_unix());
     save_json(&phase_path(&phase.mission_id, id), &phase)?;
-    reconcile_phase_steps_terminal(&phase.mission_id, id);
     emit_phase_transition_record(id, &phase.mission_id, "phase abandon");
     Ok(phase)
 }
