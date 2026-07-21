@@ -930,18 +930,55 @@ mod tests {
         assert!(!cfg.inputs.is_empty(), "review declares its runtime-only inputs");
         assert!(
             cfg.inputs.iter().any(|i| i.name == "staffing"),
-            "the dynamic-probe-count limitation must be named as a declared input"
+            "the resolved staffing snapshot must be named as a declared input"
         );
 
         let phase_ids: Vec<&str> = cfg.phases.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(phase_ids, vec!["investigate", "adjudicate", "report"]);
 
+        // (#1512) No `expand` template — three EXPLICIT one-role probe
+        // tasks, statically declared, each depending only on the bundle
+        // task (parallelism emergent from `depends_on`, never a "parallel"
+        // flag).
         let investigate = &cfg.phases[0];
         let investigate_task_ids: Vec<&str> =
             investigate.tasks.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(
             investigate_task_ids,
-            vec!["review-bundle-task", "review-probe-template-task", "review-dedup-task"]
+            vec![
+                "review-bundle-task",
+                "review-probe-high-task",
+                "review-probe-mid-task",
+                "review-probe-low-task",
+                "review-dedup-task"
+            ]
+        );
+        for (task_id, role_id) in [
+            ("review-probe-high-task", "review-probe-high"),
+            ("review-probe-mid-task", "review-probe-mid"),
+            ("review-probe-low-task", "review-probe-low"),
+        ] {
+            let task = investigate.tasks.iter().find(|t| t.id == task_id).unwrap();
+            assert_eq!(task.role_id.as_deref(), Some(role_id), "task `{task_id}` carries its own role_id");
+            assert_eq!(
+                task.depends_on,
+                vec!["review-bundle-task".to_string()],
+                "task `{task_id}` depends only on the bundle task"
+            );
+            assert!(task.expand.is_none(), "no `expand` template — every probe task is explicit (#1512)");
+            assert_eq!(task.steps.len(), 1);
+            assert_eq!(task.steps[0].kind, "dispatch.map");
+        }
+        let dedup = investigate.tasks.iter().find(|t| t.id == "review-dedup-task").unwrap();
+        assert_eq!(
+            dedup.depends_on,
+            vec![
+                "review-probe-high-task".to_string(),
+                "review-probe-mid-task".to_string(),
+                "review-probe-low-task".to_string()
+            ],
+            "dedup fans in from all three explicit probe tasks — this list IS the probe role \
+             registry (#1512): `discover_review_probe_role_ids` reads it directly"
         );
 
         let adjudicate = &cfg.phases[1];
@@ -977,36 +1014,6 @@ mod tests {
             report.tasks[1].depends_on,
             vec!["review-dedup-task", "review-judge-task", "review-verify-task"]
         );
-
-        // (#1284 Packet 3) The probe-template task declares its dynamic
-        // per-staffed-seat expansion via the typed `expand` field — the
-        // real primitive that replaced the pre-1.1 `expands_per_staffed_seat`
-        // bool + prose `notes` extras placeholder.
-        let probe_template = &investigate.tasks[1];
-        let expand = probe_template
-            .expand
-            .as_ref()
-            .expect("probe-template task must declare an `expand` block");
-        // (#1475 packet 2) The probe stage now expands over the three probe
-        // ROLES (mint-time-known: `review-probe-high`/`-mid`/`-low`), not a
-        // resolver-fed seat/draw list. Each expanded copy binds its own role
-        // via `role_pattern`, so the crew is the task→role→profile→model
-        // rollup — diversity falls out of three distinct role bindings.
-        assert_eq!(expand.over, "probe_roles");
-        assert_eq!(expand.task_id_pattern, "review-probe-{index}-task");
-        assert_eq!(expand.step_id_pattern, "review-probe-{index}-step");
-        // (#1442 ship-2b) Every expanded copy is the SAME generic kind — the
-        // seat identity lives in the stamped per-step config, not the kind id.
-        assert_eq!(expand.kind_pattern, "{kind}");
-        // (#1475 packet 2) Each expanded copy's role_id renders from the item
-        // (the probe role name) — the mechanism that binds one distinct role
-        // per expanded probe task.
-        assert_eq!(expand.role_pattern.as_deref(), Some("{name}"));
-        assert_eq!(probe_template.steps[0].kind, "dispatch.map");
-        // after expansion, review-dedup-task's depends_on must resolve to
-        // every EXPANDED probe task id, not just this template's id — see
-        // `interpret::interpret`'s tests for that mechanics assertion.
-        assert_eq!(investigate.tasks[2].depends_on, vec!["review-probe-template-task"]);
     }
 
     #[test]

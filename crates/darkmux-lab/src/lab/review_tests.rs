@@ -2568,10 +2568,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// Pure structural assertion — no dispatch, no network.
     #[test]
     fn build_review_graph_has_three_phases_and_correct_dependencies() {
-        // (#1442 ship-2b) Two seats, k=1 and k=2 — the probe stage expands
-        // seats x k = 3 `dispatch.map` tasks (k as expansion fan-out).
+        // (#1512) Two hand-built probe seats, no `role_id` — claimed
+        // POSITIONALLY against review.json's three declared probe tasks
+        // (review-probe-high-task, then -mid-task), pruning the unclaimed
+        // third (-low-task). `k` no longer multiplies dispatch tasks (one
+        // role, one task) — it's carried on the staffing purely for
+        // envelope/back-compat reporting.
         let crew = crew_with(vec![
-            ("review-probe", vec![staffing("fast", "probe-model-a", 1), staffing("slow", "probe-model-b", 2)]),
+            ("review-probe", vec![staffing("fast", "probe-model-a", 1), staffing("slow", "probe-model-b", 1)]),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
         let seats = validate_review_crew(&crew).expect("valid crew");
@@ -2589,12 +2593,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         )
         .expect("built-in review config builds cleanly");
 
-        // bundle(1) + probe(seats x k = 1 + 2) + dedup(1) = investigate's 5 tasks.
+        // bundle(1) + probe(2 claimed, 1 pruned) + dedup(1) = investigate's 4 tasks.
         let investigate_tasks: Vec<_> = graph.tasks.iter().filter(|t| t.phase_id == "investigate").collect();
-        assert_eq!(investigate_tasks.len(), 5, "bundle + (seats x k = 3) probe map tasks + dedup");
+        assert_eq!(investigate_tasks.len(), 4, "bundle + 2 claimed probe tasks + dedup (the 3rd declared probe task is pruned, unclaimed)");
         let probe_map_steps: Vec<_> =
             graph.steps.values().filter(|s| s.id.starts_with("review-probe-") ).collect();
-        assert_eq!(probe_map_steps.len(), 3, "one dispatch.map step per (seat, draw)");
+        assert_eq!(probe_map_steps.len(), 2, "one dispatch.map step per CLAIMED probe seat — no k fan-out (#1512)");
         assert!(
             probe_map_steps.iter().all(|s| s.kind == "dispatch.map"),
             "every probe step is the GENERIC dispatch.map kind (#1442): {:?}",
@@ -2662,8 +2666,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // reach every step — `depends_on` alone determines readiness.
         assert_eq!(
             graph.steps.len(),
-            9,
-            "bundle + 3 probe maps + dedup + judge + verify render + verify map + synthesis"
+            8,
+            "bundle + 2 claimed probe maps + dedup + judge + verify render + verify map + synthesis"
         );
     }
 
@@ -2697,7 +2701,9 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         .iter()
         .map(|(r, p)| (r.to_string(), p.to_string()))
         .collect();
-        let crew = resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &|r| {
+        let probe_role_ids =
+            vec!["review-probe-high".to_string(), "review-probe-mid".to_string(), "review-probe-low".to_string()];
+        let crew = resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &probe_role_ids, &|r| {
             match bindings.get(r) {
                 Some(p) => darkmux_profiles::profiles::RoleBinding::Mapped(p.clone()),
                 None => darkmux_profiles::profiles::RoleBinding::Unmapped,
@@ -2728,20 +2734,281 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         .expect("role-driven review graph builds");
 
         // Exactly three probe tasks, each bound to its distinct probe role.
-        let mut probe_tasks: Vec<_> =
+        // (Found by ROLE, not by sorting task ids — "review-probe-low-task"
+        // sorts before "review-probe-mid-task" alphabetically, so an
+        // id-sort doesn't recover high/mid/low semantic order.)
+        let probe_tasks: Vec<_> =
             graph.tasks.iter().filter(|t| t.id.starts_with("review-probe-") && t.id.ends_with("-task")).collect();
-        probe_tasks.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(probe_tasks.len(), 3, "one role-bound probe task per probe role");
-        assert_eq!(probe_tasks[0].role_id.as_deref(), Some("review-probe-high"));
-        assert_eq!(probe_tasks[1].role_id.as_deref(), Some("review-probe-mid"));
-        assert_eq!(probe_tasks[2].role_id.as_deref(), Some("review-probe-low"));
+        for role in ["review-probe-high", "review-probe-mid", "review-probe-low"] {
+            assert!(
+                probe_tasks.iter().any(|t| t.role_id.as_deref() == Some(role)),
+                "expected a probe task bound to role `{role}` among {:?}",
+                probe_tasks.iter().map(|t| t.role_id.as_deref()).collect::<Vec<_>>()
+            );
+        }
+
+        // (#1512, the law) One role per task, no hard-coded seats: each
+        // probe task depends ONLY on the bundle task (no cross-probe
+        // dependency), so parallelism is EMERGENT from `depends_on` — one
+        // ready-batch, concurrent by construction, never a "parallel" flag.
+        for t in &probe_tasks {
+            assert_eq!(
+                t.depends_on,
+                vec!["review-bundle-task".to_string()],
+                "probe task `{}` depends only on the bundle task — no cross-probe edge",
+                t.id
+            );
+        }
+        // dedup fans IN from all three — real three-way convergence, not a
+        // template's single upstream.
+        let dedup_task = graph.tasks.iter().find(|t| t.id == "review-dedup-task").unwrap();
+        let mut dedup_deps = dedup_task.depends_on.clone();
+        dedup_deps.sort();
+        assert_eq!(
+            dedup_deps,
+            vec![
+                "review-probe-high-task".to_string(),
+                "review-probe-low-task".to_string(),
+                "review-probe-mid-task".to_string(),
+            ],
+            "dedup depends on all three probe tasks"
+        );
 
         // Each probe step's stamped dispatch model is the model its ROLE's
-        // profile resolved to (namespaced local identifier) — the flip's core.
+        // profile resolved to (namespaced local identifier) — the flip's
+        // core. (#1512) Ids are the document's own literal ids now, not a
+        // `review-probe-{index}` pattern.
         let model_of = |step_id: &str| graph.steps[step_id].config["model"].as_str().unwrap().to_string();
-        assert!(model_of("review-probe-0-step").contains("m-high"), "{}", model_of("review-probe-0-step"));
-        assert!(model_of("review-probe-1-step").contains("m-mid"), "{}", model_of("review-probe-1-step"));
-        assert!(model_of("review-probe-2-step").contains("m-low"), "{}", model_of("review-probe-2-step"));
+        assert!(model_of("review-probe-high-step").contains("m-high"), "{}", model_of("review-probe-high-step"));
+        assert!(model_of("review-probe-mid-step").contains("m-mid"), "{}", model_of("review-probe-mid-step"));
+        assert!(model_of("review-probe-low-step").contains("m-low"), "{}", model_of("review-probe-low-step"));
+    }
+
+    // ─── (#1512) config-driven probe count — the payoff, end to end ──────────
+
+    /// A genuinely ONE-probe "review" mission config — the Studio 32GB case
+    /// #1512 names: the SAME shape as the real `review.json`, minus two of
+    /// the three probe tasks, with `review-dedup-task.depends_on` naming
+    /// only the survivor. No Rust code change backs this — only the
+    /// document differs from production's. Parsed directly into a
+    /// `MissionConfig` (never written to disk / `DARKMUX_CREW_DIR`) so the
+    /// test stays hermetic — no global env mutation to race every other
+    /// concurrently-running test in this file that also calls
+    /// `build_review_graph`.
+    fn one_probe_review_config() -> darkmux_crew::mission_config::MissionConfig {
+        let doc = serde_json::json!({
+            "id": "review",
+            "name": "PR Review",
+            "schema_version": "1.3",
+            "phases": [
+                {
+                    "id": "investigate",
+                    "tasks": [
+                        {
+                            "id": "review-bundle-task",
+                            "depends_on": [],
+                            "steps": [{"id": "review-bundle-step", "kind": "review.bundle"}]
+                        },
+                        {
+                            "id": "review-probe-only-task",
+                            "role_id": "review-probe-only",
+                            "depends_on": ["review-bundle-task"],
+                            "steps": [{"id": "review-probe-only-step", "kind": "dispatch.map"}]
+                        },
+                        {
+                            "id": "review-dedup-task",
+                            "depends_on": ["review-probe-only-task"],
+                            "steps": [{"id": "review-dedup-step", "kind": "review.dedup"}]
+                        }
+                    ]
+                },
+                {
+                    "id": "adjudicate",
+                    "tasks": [
+                        {
+                            "id": "review-judge-task",
+                            "role_id": "review-judge",
+                            "depends_on": ["review-dedup-task"],
+                            "steps": [{"id": "review-judge-step", "kind": "review.judge", "config": {"concurrency": 1}}]
+                        }
+                    ]
+                },
+                {
+                    "id": "report",
+                    "tasks": [
+                        {
+                            "id": "review-verify-task",
+                            "role_id": "review-verify",
+                            "depends_on": ["review-judge-task"],
+                            "steps": [
+                                {"id": "review-verify-render-step", "kind": "review.verify-render"},
+                                {"id": "review-verify-step", "kind": "dispatch.map"}
+                            ]
+                        },
+                        {
+                            "id": "review-synthesis-task",
+                            "depends_on": ["review-dedup-task", "review-judge-task", "review-verify-task"],
+                            "steps": [{"id": "review-synthesis-step", "kind": "review.synthesis"}]
+                        }
+                    ]
+                }
+            ]
+        });
+        serde_json::from_value(doc).expect("hand-built one-probe review config parses")
+    }
+
+    /// [`run_graph`]'s twin for a CALLER-SUPPLIED config — everything
+    /// `run_graph` does, except it builds the graph via
+    /// `build_review_graph_from_config` (the hermetic inner seam, #1512)
+    /// instead of the public `build_review_graph` (which always loads the
+    /// real "review" document off disk/embedded).
+    fn run_graph_against(
+        config: &darkmux_crew::mission_config::MissionConfig,
+        ctx: &Arc<ReviewStepContext>,
+        emitter: &mut dyn ReviewEmitter,
+    ) -> Result<ReviewEnvelope> {
+        let seats = validate_review_crew(&ctx.crew)?;
+        let judge = seats.judge.clone();
+        let verify = seats.verify.cloned();
+        let probes: Vec<_> = seats.probes.clone();
+        let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
+        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.crew.request_changes);
+        let graph = build_review_graph_from_config(
+            config,
+            "hand-built test config",
+            ctx.clone(),
+            judge,
+            verify,
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )?;
+        let (env, _steps) = run_review_graph(
+            ctx,
+            &ctx.crew.name,
+            ExecMode::Sequential,
+            fingerprint_val,
+            staffing_snap,
+            graph,
+            emitter,
+            &mut |_step| {},
+        )?;
+        Ok(env)
+    }
+
+    /// The #1512 payoff, proven end to end: a review.json declaring exactly
+    /// ONE probe task builds a valid graph AND runs it to completion —
+    /// bundle → 1 probe → dedup → judge → verify(unstaffed, no-op) →
+    /// synthesis — with zero Rust changes. This is the Studio 32GB case the
+    /// issue names: dropping from three probe tasks to one is purely the
+    /// document edit `one_probe_review_config` performs.
+    #[test]
+    fn build_review_graph_runs_a_config_driven_one_probe_review_json() {
+        let config = one_probe_review_config();
+        let crew = crew_with(vec![
+            ("review-probe", {
+                let mut s = graph_staffing("fast", "probe-model", 1);
+                s.role_id = Some("review-probe-only".to_string());
+                vec![s]
+            }),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), |call: &ChatCall| {
+            if call.model.contains("judge-model") {
+                Ok(reply(CONFIRM_JSON))
+            } else {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            }
+        });
+        let env = run_graph_against(&config, &ctx, &mut NullEmitter)
+            .expect("a config-driven one-probe graph runs to completion");
+
+        assert!(env.degenerate.is_none(), "a genuine one-probe review is a clean run, not degenerate: {:?}", env.degenerate);
+        assert_eq!(env.raw_flags, 1, "exactly one probe dispatch fired — the document declares exactly one");
+        assert_eq!(env.judged.len(), 1);
+        assert_eq!(env.confirmed, 1);
+    }
+
+    /// A five-probe config also builds and runs cleanly — the issue's other
+    /// named example ("three, or five, likewise"), proven the same
+    /// hermetic way.
+    #[test]
+    fn build_review_graph_runs_a_config_driven_five_probe_review_json() {
+        let probe_ids: Vec<String> = (0..5).map(|i| format!("review-probe-{i}")).collect();
+        let probe_tasks: Vec<serde_json::Value> = probe_ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": format!("{id}-task"),
+                    "role_id": id,
+                    "depends_on": ["review-bundle-task"],
+                    "steps": [{"id": format!("{id}-step"), "kind": "dispatch.map"}]
+                })
+            })
+            .collect();
+        let mut tasks = vec![serde_json::json!({
+            "id": "review-bundle-task",
+            "depends_on": [],
+            "steps": [{"id": "review-bundle-step", "kind": "review.bundle"}]
+        })];
+        tasks.extend(probe_tasks);
+        tasks.push(serde_json::json!({
+            "id": "review-dedup-task",
+            "depends_on": probe_ids.iter().map(|id| format!("{id}-task")).collect::<Vec<_>>(),
+            "steps": [{"id": "review-dedup-step", "kind": "review.dedup"}]
+        }));
+        let doc = serde_json::json!({
+            "id": "review",
+            "name": "PR Review",
+            "phases": [
+                {"id": "investigate", "tasks": tasks},
+                {"id": "adjudicate", "tasks": [
+                    {"id": "review-judge-task", "role_id": "review-judge", "depends_on": ["review-dedup-task"],
+                     "steps": [{"id": "review-judge-step", "kind": "review.judge", "config": {"concurrency": 1}}]}
+                ]},
+                {"id": "report", "tasks": [
+                    {"id": "review-verify-task", "role_id": "review-verify", "depends_on": ["review-judge-task"],
+                     "steps": [
+                        {"id": "review-verify-render-step", "kind": "review.verify-render"},
+                        {"id": "review-verify-step", "kind": "dispatch.map"}
+                     ]},
+                    {"id": "review-synthesis-task", "depends_on": ["review-dedup-task", "review-judge-task", "review-verify-task"],
+                     "steps": [{"id": "review-synthesis-step", "kind": "review.synthesis"}]}
+                ]}
+            ]
+        });
+        let config: darkmux_crew::mission_config::MissionConfig =
+            serde_json::from_value(doc).expect("hand-built five-probe review config parses");
+
+        let probes: Vec<ResolvedSeatStaffing> = probe_ids
+            .iter()
+            .map(|id| {
+                let mut s = graph_staffing("fast", "probe-model", 1);
+                s.role_id = Some(id.clone());
+                s
+            })
+            .collect();
+        let crew = crew_with(vec![
+            ("review-probe", probes),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), |call: &ChatCall| {
+            if call.model.contains("judge-model") {
+                Ok(reply(CONFIRM_JSON))
+            } else {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            }
+        });
+        let env = run_graph_against(&config, &ctx, &mut NullEmitter)
+            .expect("a config-driven five-probe graph runs to completion");
+
+        assert!(env.degenerate.is_none(), "{:?}", env.degenerate);
+        assert_eq!(env.raw_flags, 5, "five probe roles, all sharing the same bundle => 5 raw flags");
+        assert_eq!(env.judged.len(), 1, "identical defect text from all five collapses to one flag");
+        assert_eq!(env.confirmed, 1);
     }
 
     /// (#1402) Pins `review_step_kind_display_name` (the pure lookup
@@ -2796,26 +3063,23 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         }
     }
 
-    /// (#1284 Packet 3, review round 2 MUST FIX 2) LAUNCHER-LEVEL
+    /// (#1284 Packet 3, review round 2 MUST FIX 2, #1512) LAUNCHER-LEVEL
     /// conformance golden: the full serialized `(tasks, steps)` this
-    /// launcher produces for a three-seat staffing (k = 1/2/1) must be
+    /// launcher produces for the real three-role staffing (review.json's
+    /// own declared roles, each with its own resolved model) must be
     /// byte-equal (as JSON values) to the golden — every task id,
     /// `phase_id`, description, step id, `depends_on` set, kind id,
     /// `Step.config` payload, and `Vec<Task>` ORDER (a JSON array pins
     /// order under `Value` equality).
     ///
-    /// **REGENERATED DELIBERATELY for #1442 ship-2b** (the probe/verify →
-    /// `dispatch.map` retirement — the graph SHAPE is the feature). The
-    /// old→new delta this golden now pins: probe goes from 3
-    /// `review.probe:<seat>` steps to 4 (seats × k) generic `dispatch.map`
-    /// steps, each carrying its full stamped config (inline collection,
-    /// `bucket_group: "probe"` + `bucket_budget`, `retry_on_empty: 1`,
-    /// seat identity + local-residency hints); verify goes from one
-    /// `review.verify` step to `review.verify-render` (frozen-prompt
-    /// render) + a `dispatch.map` step in ONE task; and synthesis
-    /// `depends_on` gains `review-judge-task` (the judged docket flows
-    /// from the judge directly; verify's own output is the map's per-item
-    /// result array).
+    /// **REGENERATED DELIBERATELY for #1512** (the probe-role dissolution —
+    /// the graph SHAPE is the feature). The old→new delta this golden now
+    /// pins: probe tasks/steps carry the DOCUMENT's own literal ids
+    /// (`review-probe-high-task`/`-mid-task`/`-low-task`) instead of a
+    /// `review-probe-{index}-task` numeric pattern (the `expand` template
+    /// that minted those retired with #1512), and there are always exactly
+    /// three — one per role review.json declares, never `seats x k` (the
+    /// `k` multiplier retired too; one role is one task is one dispatch).
     /// Composed phase ids that differ from the document's own phase ids
     /// are deliberate — they pin that review's task/step ids are FIXED (no
     /// placeholder-prefix substitution applies to them).
@@ -2823,20 +3087,33 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// into `Step.config`.
     ///
     /// (#1432 item 3) The golden also pins each task's `display_name`
-    /// (Bundle / Probe {index} / Dedup / Judge / Verify / Synthesis) — the
-    /// phone-facing labels threaded through `interpret` (task `display_name`
-    /// + the probe expansion's `display_name_pattern`).
+    /// (Bundle / Probe high/mid/low / Dedup / Judge / Verify / Synthesis) —
+    /// the phone-facing labels the document declares directly now (#1512
+    /// retired the probe expansion's `display_name_pattern` rendering, since
+    /// there's no template left to render from).
     #[test]
-    fn build_review_graph_matches_the_pre_cutover_golden_exactly() {
+    fn build_review_graph_matches_the_golden_exactly() {
+        let probes = vec![
+            {
+                let mut s = staffing("phigh", "probe-model-a", 1);
+                s.role_id = Some("review-probe-high".to_string());
+                s
+            },
+            {
+                let mut s = staffing("pmid", "probe-model-b", 1);
+                s.role_id = Some("review-probe-mid".to_string());
+                s
+            },
+            {
+                let mut s = staffing("plow", "probe-model-c", 1);
+                s.role_id = Some("review-probe-low".to_string());
+                s
+            },
+        ];
         let crew = crew_with(vec![
-            ("alpha", vec![staffing("alpha", "probe-model-a", 1)]),
+            ("review-probe", probes.clone()),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
-        let probes = vec![
-            staffing("alpha", "probe-model-a", 1),
-            staffing("bravo", "probe-model-b", 2),
-            staffing("charlie", "probe-model-c", 1),
-        ];
         let judge = staffing("fast", "judge-model", 1);
         let ctx = step_ctx(&crew, vec![]);
 
@@ -2861,7 +3138,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(
             actual,
             golden,
-            "interpreted review graph diverged from main's pre-cutover builder output:\n{}",
+            "interpreted review graph diverged from the golden:\n{}",
             serde_json::to_string_pretty(&actual).unwrap()
         );
     }
@@ -3582,12 +3859,20 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// note above `step_telemetry_*`).
     #[test]
     fn graph_envelope_counts_are_internally_consistent() {
-        let crew = graph_valid_crew();
+        // (#1512) Two DISTINCT probe seats, not one seat drawn twice (`k`
+        // no longer multiplies dispatch tasks) — the same "2 raw collapse
+        // to 1" shape, now role-borne. Positional claim (neither staffing
+        // carries a `role_id`) binds them to the first two of the three
+        // declared probe tasks; the third is pruned, unclaimed.
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1), graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
         let call_n = std::sync::atomic::AtomicU32::new(0);
         let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), move |_call: &ChatCall| {
             let n = call_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n < 2 {
-                // two probe draws (k=2), both find the same defect
+                // two distinct probe roles, both find the same defect
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             } else {
                 Ok(reply(CONFIRM_JSON))
@@ -3597,13 +3882,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(env.degenerate.is_none());
         assert_eq!(env.bundles, 1, "one changed file in the fixture diff");
         // (#1373 gate e, FIXED) `ReviewDedupStepKind` now writes the TRUE
-        // pre-dedup count (2 draws here) into the shared envelope the
+        // pre-dedup count (2 probe roles here) into the shared envelope the
         // moment it's known, so `raw_flags` and `deduped_flags` diverge
         // again on the graph path — the "N raw collapsed to M"
         // observability signal the field name promises.
         assert_eq!(
             env.raw_flags, 2,
-            "env.raw_flags reads the true pre-dedup draw count, not the deduped count"
+            "env.raw_flags reads the true pre-dedup count (2 distinct probe roles), not the deduped count"
         );
         assert_eq!(env.deduped_flags, 1, "identical anchor+family collapses to one");
         assert_eq!(env.flags.len(), env.deduped_flags);
@@ -4007,10 +4292,27 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// `env.remote_budgets` on the graph path (`BuiltReviewGraph::
     /// probe_bucket`, merged post-run in `run_review_graph`) — unlike
     /// judge/verify, whose equivalent threading is the gap named above.
+    ///
+    /// (#1512) Rewritten from one seat drawing k=3 (the retired
+    /// multi-draw-per-role fan-out) to THREE DISTINCT probe roles sharing
+    /// the SAME `bucket_group: "probe"` remote allowance — the same
+    /// exhaustion shape, now role-borne: whichever role's dispatch fires
+    /// first exhausts the shared bucket, and the other two get SKIPPED
+    /// (never billed), never a dead/degenerate run. Aggregate counts only
+    /// (fired=1, skipped=2) — which specific role wins the race isn't
+    /// pinned, since sibling probe tasks have no ordering guarantee
+    /// relative to each other.
     #[test]
     fn graph_remote_probe_budget_exhaustion_is_reduced_coverage_not_a_dead_run() {
         let crew = crew_with(vec![
-            ("review-probe", vec![remote_staffing("cloud", "gpt-remote", 3)]),
+            (
+                "review-probe",
+                vec![
+                    remote_staffing("cloud", "gpt-remote", 1),
+                    remote_staffing("cloud", "gpt-remote", 1),
+                    remote_staffing("cloud", "gpt-remote", 1),
+                ],
+            ),
             ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
         ]);
         let ctx = step_ctx_with_chat_and_budget(&crew, vec![bundle_input("a.ts")], 100, |call: &ChatCall| {
@@ -4029,12 +4331,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
 
         assert!(env.degenerate.is_none(), "probe exhaustion never degrades the run");
-        assert_eq!(env.raw_flags, 1, "only the pre-exhaustion draw landed");
+        assert_eq!(env.raw_flags, 1, "only the pre-exhaustion role's dispatch landed");
         assert_eq!(env.confirmed, 1, "the surviving flag still went through the judge");
         let rec = env.remote_budgets.iter().find(|r| r.stage == "probe").expect("probe budget row");
         assert!(rec.exhausted);
         assert_eq!(rec.used_tokens, 600);
-        assert_eq!(rec.skipped_calls, 2, "the remaining k-1 draws were skipped, not billed");
+        assert_eq!(rec.skipped_calls, 2, "the remaining two roles were skipped, not billed");
         assert!(
             env.warnings.iter().any(|w| w.contains("reduced coverage")),
             "the named reason lands in the envelope: {:?}",
@@ -4751,46 +5053,21 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(prompts, expected, "render output is byte-identical to direct verify_prompt calls");
     }
 
-    /// The seats x k fan-out's per-seat member accounting: 2 seats x k=2
-    /// mints FOUR sibling map steps, and the dedup boundary sums each
-    /// seat's two sibling steps back into ONE `MemberRecord` (draws /
-    /// tokens / wall summed; served_model None-for-local by construction).
-    #[test]
-    fn graph_seats_by_k_fan_out_sums_member_accounting_across_sibling_steps() {
-        let crew = crew_with(vec![
-            (
-                "review-probe",
-                vec![graph_staffing("fast", "probe-model-a", 2), graph_staffing("slow", "probe-model-b", 2)],
-            ),
-            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
-        ]);
-        let ctx = step_ctx_with_chat(&crew, vec![bundle_input("a.ts")], |call: &ChatCall| {
-            if call.model == "darkmux:judge-model" {
-                Ok(reply(CONFIRM_JSON))
-            } else {
-                // Every probe draw lands a flag and reports usage + a model
-                // echo the local gate must filter out.
-                Ok(SingleShotReply {
-                    content: "a real defect `const end = start.plus(30)`".to_string(),
-                    total_tokens: Some(10),
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    model: Some(call.model.to_string()),
-                })
-            }
-        });
-        let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
-
-        assert_eq!(env.raw_flags, 4, "2 seats x 2 draws x 1 bundle = 4 raw flags");
-        let probe_members: Vec<_> = env.members.iter().filter(|m| m.seat == "review-probe").collect();
-        assert_eq!(probe_members.len(), 2, "ONE member row per seat, not per sibling step");
-        for m in &probe_members {
-            assert_eq!(m.draws, 2, "k sibling steps sum into the seat's draw count: {m:?}");
-            assert_eq!(m.total_tokens, 20, "tokens summed across the seat's k sibling steps");
-            assert!(m.served_model.is_none(), "local seat: None by construction");
-        }
-        assert_eq!(env.confirmed, 1, "the four duplicate flags dedup + confirm normally");
-    }
+    // (#1512) `graph_seats_by_k_fan_out_sums_member_accounting_across_
+    // sibling_steps` RETIRED here — it proved `build_review_graph` minted
+    // multiple sibling map tasks per seat via `ResolvedSeatStaffing::k`
+    // (2 seats x k=2 -> 4 sibling tasks). That graph-construction shape is
+    // exactly what #1512 dissolves (one role, one task, one dispatch; probe
+    // recall breadth is now a review.json edit, never a per-run draw
+    // multiplier) — `build_review_graph` no longer mints sibling tasks for
+    // k>1, so the scenario this test built can no longer occur. The
+    // per-seat SUMMING mechanism it was also exercising (multiple
+    // `draw_task_ids` collapsing into one `MemberRecord`) remains fully
+    // covered independent of graph construction by
+    // `reconstruct_probe_stage_accounts_skips_errors_and_flags` below,
+    // which hand-builds a `ProbeSeatSpec` with two `draw_task_ids` and
+    // calls `reconstruct_probe_stage` directly — so no coverage is lost,
+    // only the now-impossible integration shape.
 
     /// `reconstruct_probe_stage` pure-function coverage: budget-skips are
     /// never draws, dispatch errors are, per-seat accounting sums across

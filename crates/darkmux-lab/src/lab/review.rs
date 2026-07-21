@@ -3522,17 +3522,19 @@ impl StepKind for ReviewBundleStepKind {
 
 // ─── investigate: probe reconstruction (seats x k dispatch.map fan-out) ─
 
-/// (#1442 ship-2b) One probe SEAT's mint-time spec — the key the dedup
-/// boundary uses to reconstruct the review's domain results (raw
+/// (#1442 ship-2b, #1512) One probe SEAT's mint-time spec — the key the
+/// dedup boundary uses to reconstruct the review's domain results (raw
 /// [`ProbeFlag`]s, per-seat [`MemberRecord`] accounting, reduced-coverage
 /// warnings, the probe stage's remote budget row) from the generic
-/// `dispatch.map` fan-out's per-item results. The probe stage is one sibling
-/// `dispatch.map` step per probe ROLE (#1475 packet 2 — minted by
-/// `build_review_graph`'s `probe_roles` expansion, sharing one
-/// `bucket_group: "probe"` remote allowance); each spec records which draw
-/// TASK ids belong to this seat (index = draw) and which bundles its
-/// selector chose (in pre-rendered collection order), so reconstruction is
-/// pure data alignment — never re-derivation.
+/// `dispatch.map` fan-out's per-item results. The probe stage is one
+/// EXPLICIT one-role `dispatch.map` task per probe role, declared
+/// statically in review.json (#1512 — no `expand` template, no crew-level
+/// probe-role enumeration; `build_review_graph` claims each resolved seat
+/// against its declared task by `role_id`), sharing one `bucket_group:
+/// "probe"` remote allowance. `draw_task_ids` is a single-entry `Vec` today
+/// (one role, one task, one dispatch) — kept plural for the dedup step's
+/// existing per-draw iteration shape, not because more than one entry is
+/// ever produced.
 #[derive(Debug, Clone)]
 pub(crate) struct ProbeSeatSpec {
     pub(crate) name: String,
@@ -3542,9 +3544,10 @@ pub(crate) struct ProbeSeatSpec {
     pub(crate) identifier: String,
     pub(crate) remote: bool,
     pub(crate) endpoint_host: Option<String>,
-    /// This seat's k sibling map TASK ids, indexed by draw — the dedup
-    /// step's `input` keys (`gather_inputs` keys a first-step input by
-    /// dependency TASK id, #1341).
+    /// This seat's claimed probe task id, wrapped in a `Vec` for the dedup
+    /// step's `input`-key iteration (`gather_inputs` keys a first-step
+    /// input by dependency TASK id, #1341) — always exactly one entry as of
+    /// #1512 (one role, one task).
     pub(crate) draw_task_ids: Vec<String>,
     /// The selected bundles, in the exact order the pre-rendered prompt
     /// collection was minted: `(bundle_id, fact_family)` per item index.
@@ -3771,8 +3774,9 @@ pub struct ReviewDedupStepKind {
     /// reconstructed remote-budget row + all-draws-failed degenerate reason
     /// here — the reconstruction boundary (see `probe_specs` below).
     pub env: SharedReviewEnvelope,
-    /// (#1442 ship-2b) The mint-time per-seat specs `build_review_graph`
-    /// computed alongside the `probe_roles` expansion (#1475 packet 2) — this step's `input`
+    /// (#1442 ship-2b, #1512) The mint-time per-seat specs `build_review_graph`
+    /// computed while claiming each staffing against its declared probe
+    /// task — this step's `input`
     /// map (keyed by probe TASK id) is raw `MapItemResult` arrays from the
     /// generic `dispatch.map` fan-out, and [`reconstruct_probe_stage`]
     /// aligns them back into domain results against these specs before the
@@ -4643,19 +4647,30 @@ pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
 /// Caller persists `tasks`/`steps`, then runs the graph via
 /// [`run_review_graph`].
 ///
-/// (#1284 Packet 3) A THIN LAUNCHER as of this packet: loads the built-in
-/// "review" mission config (`darkmux_crew::mission_config::load`), resolves
-/// every genuinely per-launch value THIS FUNCTION's own parameters carry —
-/// the three real phase ids, the resolved judge concurrency, and the
-/// config's one documented per-probe-role expansion (`probe_roles`, this
-/// call's `probes` in role order — #1475 packet 2, each seat's `role_id`) — into
+/// (#1284 Packet 3, #1512) A THIN LAUNCHER: loads the built-in "review"
+/// mission config (`darkmux_crew::mission_config::load`), resolves every
+/// genuinely per-launch value THIS FUNCTION's own parameters carry — the
+/// three real phase ids and the resolved judge concurrency — into
 /// `mission_config::interpret::LaunchParams`, then calls
 /// `mission_config::interpret` to materialize the real `Vec<Task>` +
 /// `BTreeMap<String, Step>`. `interpret` does NOT construct `StepKind`
 /// instances (#1284 Packet 3's own scope, #1352's Tier 3 rule) — this
-/// function still owns registering every Tier 3 kind this pipeline needs,
-/// unconditionally (the config's graph SHAPE is fixed except for the
-/// probe-seat count, so every non-probe kind is always present).
+/// function still owns registering every Tier 3 kind this pipeline needs.
+///
+/// **No `expand` template (#1512).** review.json declares its probe tasks
+/// EXPLICITLY — one task per probe role, statically, each carrying its own
+/// `role_id` and depending only on `review-bundle-task`. `interpret` needs
+/// no expansion collection at all; the probe COUNT is whatever
+/// `review-dedup-task.depends_on` names. This function claims each
+/// resolved `probes` staffing against the interpreted task whose `role_id`
+/// matches (falling back to positional claiming for a hand-built staffing
+/// with no `role_id` — test/back-compat fixtures), then PRUNES any declared
+/// probe task nobody claimed. Pruning is what makes "fewer probe seats than
+/// the document declares" a valid graph — it's how a hermetic test can
+/// stand up a graph with 1-2 probes against the real 3-probe embedded
+/// document without a second copy of review.json, and it's the same
+/// mechanism an operator gets for free by editing the document itself (the
+/// #1512 payoff: a genuinely 1-probe REVIEW.JSON has nothing to prune).
 ///
 /// **Ids are FIXED, not case-id-seeded** (fixing a pre-Packet-3 doc-drift
 /// finding): review.json's task/step ids are literal strings
@@ -4677,8 +4692,6 @@ pub fn build_review_graph(
     report_phase_id: &str,
     judge_concurrency: u32,
 ) -> Result<BuiltReviewGraph> {
-    use darkmux_crew::mission_config::{interpret, LaunchParams};
-
     // (#1284 review round 2, consider 7) `load` resolves user →
     // on-disk → embedded, so a failure here is NOT necessarily the
     // embedded built-in's fault — a malformed USER-tier
@@ -4690,31 +4703,49 @@ pub fn build_review_graph(
          (~/.darkmux/mission-configs/review.json) or an on-disk template \
          overrides the embedded built-in; the failing file is named below",
     )?;
+    build_review_graph_from_config(
+        &loaded.config,
+        &format!("resolved from the {} tier at {}", loaded.source, loaded.manifest_path.display()),
+        ctx,
+        judge,
+        verify,
+        probes,
+        investigate_phase_id,
+        adjudicate_phase_id,
+        report_phase_id,
+        judge_concurrency,
+    )
+}
+
+/// [`build_review_graph`]'s pure core — everything AFTER loading the
+/// document. Split out (#1512) so a test can build a graph from a
+/// HAND-BUILT `MissionConfig` (e.g. a genuinely one-probe document) without
+/// mutating the process-wide `DARKMUX_CREW_DIR` env var that
+/// `mission_config::load`'s user tier reads — env mutation would race every
+/// OTHER concurrently-running test in this crate that also calls
+/// `build_review_graph` (cargo test's default parallelism), where a purely
+/// in-memory `MissionConfig` races nothing. `source_detail` is folded into
+/// the `interpret` error context (mirrors what `loaded.source`/
+/// `loaded.manifest_path` gave the caller before this split).
+#[allow(clippy::too_many_arguments)]
+fn build_review_graph_from_config(
+    config: &darkmux_crew::mission_config::MissionConfig,
+    source_detail: &str,
+    ctx: Arc<ReviewStepContext>,
+    judge: ResolvedSeatStaffing,
+    verify: Option<ResolvedSeatStaffing>,
+    probes: &[ResolvedSeatStaffing],
+    investigate_phase_id: &str,
+    adjudicate_phase_id: &str,
+    report_phase_id: &str,
+    judge_concurrency: u32,
+) -> Result<BuiltReviewGraph> {
+    use darkmux_crew::mission_config::{interpret, LaunchParams};
 
     let mut phase_ids = std::collections::BTreeMap::new();
     phase_ids.insert("investigate".to_string(), investigate_phase_id.to_string());
     phase_ids.insert("adjudicate".to_string(), adjudicate_phase_id.to_string());
     phase_ids.insert("report".to_string(), report_phase_id.to_string());
-
-    // (#1475 packet 2) The probe stage expands over the probe ROLES — the item
-    // NAME is each seat's `role_id` (review-probe-high/-mid/-low in production,
-    // where the role→profile resolver staffs exactly one seat per role at k=1).
-    // review.json's `role_pattern: "{name}"` renders each expanded task's
-    // `role_id` from this same name, so the graph is role-bound. The item also
-    // feeds the description/display patterns; ids render from `{index}`. A
-    // hand-built staffing with no `role_id` (test crews) falls back to the
-    // profile name, and k still fans out per staffing — the SAME (seat, draw)
-    // ordering the config-stamping loop below walks, keeping item i ↔ the
-    // `review-probe-{i}` step.
-    let mut probe_expansion: Vec<String> = Vec::new();
-    for staffing in probes {
-        let item = staffing.role_id.as_deref().unwrap_or(staffing.name.as_str());
-        for _draw in 0..staffing.k {
-            probe_expansion.push(item.to_string());
-        }
-    }
-    let mut expansions = std::collections::BTreeMap::new();
-    expansions.insert("probe_roles".to_string(), probe_expansion);
 
     // (#1284 Packet 3 worklist) `judge_concurrency` is ALWAYS an override,
     // never read back out of review.json's own static
@@ -4730,27 +4761,86 @@ pub fn build_review_graph(
         json!({ "concurrency": judge_concurrency }),
     );
 
+    // (#1512) No expansion collection — the probe stage is static tasks in
+    // the document now, not a template.
     let params = LaunchParams {
         phase_ids,
         task_overrides: std::collections::BTreeMap::new(),
         step_config_overrides,
-        expansions,
+        expansions: std::collections::BTreeMap::new(),
     };
 
-    // (#1418) `interpret_warnings` currently covers exactly one case: an
-    // `expand.over` key absent from `expansions` above (e.g. a user-tier
-    // `review.json` typo'ing the probe-seat expansion's collection name),
-    // threaded into `shared_env.warnings` below so a launch that silently
-    // expanded to zero probe tasks is named in the posted review, not just
-    // caught by the (separate) zero-draws honesty gate in
-    // `run_review_graph`'s post-run merge.
-    let (tasks, mut steps, interpret_warnings) = interpret(&loaded.config, &params).with_context(|| {
-        format!(
-            "interpreting mission config \"review\" (resolved from the {} tier at {})",
-            loaded.source,
-            loaded.manifest_path.display()
-        )
+    let (mut tasks, mut steps, interpret_warnings) = interpret(config, &params)
+        .with_context(|| format!("interpreting mission config \"review\" ({source_detail})"))?;
+
+    // (#1512) Claim each resolved probe staffing against the DECLARED
+    // task-id it dispatches through: by `role_id` when the staffing carries
+    // one (the production/config-driven path — `role_id` is always some
+    // review.json-declared probe role), else POSITIONALLY (a hand-built
+    // staffing with no `role_id` — hermetic tests, mainly — claims the
+    // first still-unclaimed declared probe task, in
+    // `review-dedup-task.depends_on` order). `claims` is a task id per
+    // `probes` entry, in the SAME order — never an index, so it survives
+    // the pruning step below untouched.
+    let dedup_task = tasks.iter().find(|t| t.id == "review-dedup-task").ok_or_else(|| {
+        anyhow!("darkmux: interpreted \"review\" graph has no \"review-dedup-task\" task")
     })?;
+    let declared_probe_task_ids: Vec<String> = dedup_task.depends_on.clone();
+
+    let mut claims: Vec<String> = Vec::with_capacity(probes.len());
+    for staffing in probes {
+        let claimed_id = if let Some(role_id) = staffing.role_id.as_deref() {
+            tasks
+                .iter()
+                .find(|t| t.role_id.as_deref() == Some(role_id) && declared_probe_task_ids.iter().any(|id| id == &t.id))
+                .map(|t| t.id.clone())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "darkmux: interpreted \"review\" graph has no probe task for role \
+                         \"{role_id}\" — review.json must declare a task with role_id \
+                         \"{role_id}\" that \"review-dedup-task\" depends on (#1512)"
+                    )
+                })?
+        } else {
+            // Positional fallback: the first declared probe task no
+            // earlier staffing already claimed.
+            declared_probe_task_ids
+                .iter()
+                .find(|id| !claims.contains(id))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "darkmux: more probe staffings resolved ({}) than \"review\" declares \
+                         probe tasks for ({}) — bind each staffing's role_id, or add more probe \
+                         tasks to review.json (#1512)",
+                        probes.len(),
+                        declared_probe_task_ids.len()
+                    )
+                })?
+        };
+        claims.push(claimed_id);
+    }
+
+    // Prune any declared probe task nobody claimed — lets a caller staff
+    // fewer probe roles than review.json declares (the review's own
+    // hermetic test suite relies on this; it's also how a genuinely
+    // 1-probe review.json needs zero pruning at all, since every declared
+    // task gets claimed).
+    let pruned_ids: Vec<String> =
+        declared_probe_task_ids.iter().filter(|id| !claims.contains(*id)).cloned().collect();
+    if !pruned_ids.is_empty() {
+        for id in &pruned_ids {
+            if let Some(t) = tasks.iter().find(|t| &t.id == id) {
+                for sid in &t.step_ids {
+                    steps.remove(sid);
+                }
+            }
+        }
+        tasks.retain(|t| !pruned_ids.contains(&t.id));
+        if let Some(d) = tasks.iter_mut().find(|t| t.id == "review-dedup-task") {
+            d.depends_on.retain(|id| !pruned_ids.contains(id));
+        }
+    }
 
     // `step_id -> Task.phase_id`, derived once from `tasks` (each Task
     // already carries both) rather than threaded through every push site
@@ -4798,80 +4888,83 @@ pub fn build_review_graph(
     let probe_members = Arc::new(StdMutex::new(Vec::new()));
     let probe_warnings = Arc::new(StdMutex::new(Vec::new()));
 
-    // (#1442 ship-2b) Stamp each expanded (seat, draw) map step's FULL
-    // config — the pre-rendered `probe_user_message` collection (byte
-    // parity by construction: `user_template: "{item}"` substitutes each
-    // rendered prompt verbatim), the seat's dispatch identity, the shared
-    // `bucket_group: "probe"` allowance (+ its resolved budget, so the
-    // artifact is self-describing), `retry_on_empty: 1` (the historical
-    // single empty-content retry), and the residency hints for local
-    // seats. NOTE: a hosted seat's `endpoint` block carries only the URL /
-    // auth MECHANICS (Keychain item name / env-var NAME — never a secret
-    // value; see `EndpointAuth`), the same material `profiles.json`
+    // (#1512) Stamp each CLAIMED probe task's single step with its FULL
+    // dispatch config — the pre-rendered `probe_user_message` collection
+    // (byte parity by construction: `user_template: "{item}"` substitutes
+    // each rendered prompt verbatim), the seat's dispatch identity, the
+    // shared `bucket_group: "probe"` allowance (+ its resolved budget, so
+    // the artifact is self-describing), `retry_on_empty: 1` (the
+    // historical single empty-content retry), and the residency hints for
+    // local seats. NOTE: a hosted seat's `endpoint` block carries only the
+    // URL / auth MECHANICS (Keychain item name / env-var NAME — never a
+    // secret value; see `EndpointAuth`), the same material `profiles.json`
     // already persists on disk.
+    //
+    // One role, one task, one dispatch (#1512) — the old (seat, draw) fan-
+    // out (`ResolvedSeatStaffing::k` multiplying a seat into several sibling
+    // tasks) retired with the `expand` template it depended on. `k` still
+    // exists on the staffing (snapshotted into the envelope verbatim for
+    // back-compat/bench reporting) but is no longer read here — probe
+    // recall breadth is a config edit (add another probe role/task to
+    // review.json), never a per-run draw multiplier.
     let remote_budget = ctx.remote_max_tokens_per_execution;
     let mut probe_specs: Vec<ProbeSeatSpec> = Vec::new();
-    {
-        let mut flat_index = 0usize;
-        for staffing in probes {
-            let identifier = seat_identifier(&staffing.pm);
-            let endpoint = seat_endpoint(&staffing.pm);
-            let endpoint_host = seat_endpoint_host(&staffing.pm);
-            let max_tokens = resolve_seat_max_tokens(staffing, DEFAULT_PROBE_MAX_TOKENS);
-            let selected = select_bundles_for_staffing(&ctx.bundles, staffing.selector.as_ref());
-            let collection: Vec<String> =
-                selected.iter().map(|b| probe_user_message(&ctx.probe_system, b)).collect();
-            let bundles: Vec<(String, String)> =
-                selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
-            let mut draw_task_ids = Vec::with_capacity(staffing.k as usize);
-            for _draw in 0..staffing.k {
-                let task_id = format!("review-probe-{flat_index}-task");
-                let step_id = format!("review-probe-{flat_index}-step");
-                let step = steps.get_mut(&step_id).unwrap_or_else(|| {
-                    // (#1284 review round 2, consider 3) Hard assert posture
-                    // preserved: a release build must not silently mint a
-                    // spec no interpreted step backs.
-                    panic!(
-                        "the interpreted graph must have expanded `{step_id}` for every (seat, draw)"
-                    )
-                });
-                let mut config = json!({
-                    "model": identifier,
-                    "system": "",
-                    "user_template": "{item}",
-                    "collection": collection,
-                    "temperature": PROBE_TEMPERATURE,
-                    "max_tokens": max_tokens,
-                    "timeout_seconds": ctx.timeout_seconds,
-                    "retry_on_empty": 1,
-                    "bucket_group": "probe",
-                    "bucket_budget": remote_budget,
-                });
-                if let Some(ep) = endpoint {
-                    config["endpoint"] =
-                        serde_json::to_value(ep).context("serializing probe seat endpoint")?;
-                } else {
-                    // Residency hints: the wire `model` is the NAMESPACED
-                    // identifier; the loadable key is the bare profile id.
-                    config["model_key"] = json!(staffing.pm.id);
-                    config["identifier"] = json!(identifier);
-                    if let Some(n_ctx) = staffing.pm.n_ctx {
-                        config["n_ctx"] = json!(n_ctx);
-                    }
-                }
-                step.config = config;
-                draw_task_ids.push(task_id);
-                flat_index += 1;
+    for (staffing, task_id) in probes.iter().zip(claims.iter()) {
+        let identifier = seat_identifier(&staffing.pm);
+        let endpoint = seat_endpoint(&staffing.pm);
+        let endpoint_host = seat_endpoint_host(&staffing.pm);
+        let max_tokens = resolve_seat_max_tokens(staffing, DEFAULT_PROBE_MAX_TOKENS);
+        let selected = select_bundles_for_staffing(&ctx.bundles, staffing.selector.as_ref());
+        let collection: Vec<String> =
+            selected.iter().map(|b| probe_user_message(&ctx.probe_system, b)).collect();
+        let bundles: Vec<(String, String)> =
+            selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
+
+        let task = tasks.iter().find(|t| &t.id == task_id).unwrap_or_else(|| {
+            panic!("the claimed probe task `{task_id}` must survive pruning")
+        });
+        let step_id = task.step_ids.first().cloned().unwrap_or_else(|| {
+            panic!("claimed probe task `{task_id}` must have exactly one step")
+        });
+        let step = steps.get_mut(&step_id).unwrap_or_else(|| {
+            // (#1284 review round 2, consider 3) Hard assert posture
+            // preserved: a release build must not silently mint a spec no
+            // interpreted step backs.
+            panic!("the interpreted graph must have a step `{step_id}` for probe task `{task_id}`")
+        });
+        let mut config = json!({
+            "model": identifier,
+            "system": "",
+            "user_template": "{item}",
+            "collection": collection,
+            "temperature": PROBE_TEMPERATURE,
+            "max_tokens": max_tokens,
+            "timeout_seconds": ctx.timeout_seconds,
+            "retry_on_empty": 1,
+            "bucket_group": "probe",
+            "bucket_budget": remote_budget,
+        });
+        if let Some(ep) = endpoint {
+            config["endpoint"] = serde_json::to_value(ep).context("serializing probe seat endpoint")?;
+        } else {
+            // Residency hints: the wire `model` is the NAMESPACED
+            // identifier; the loadable key is the bare profile id.
+            config["model_key"] = json!(staffing.pm.id);
+            config["identifier"] = json!(identifier);
+            if let Some(n_ctx) = staffing.pm.n_ctx {
+                config["n_ctx"] = json!(n_ctx);
             }
-            probe_specs.push(ProbeSeatSpec {
-                name: staffing.name.clone(),
-                identifier,
-                remote: endpoint.is_some(),
-                endpoint_host,
-                draw_task_ids,
-                bundles,
-            });
         }
+        step.config = config;
+
+        probe_specs.push(ProbeSeatSpec {
+            name: staffing.name.clone(),
+            identifier,
+            remote: endpoint.is_some(),
+            endpoint_host,
+            draw_task_ids: vec![task_id.clone()],
+            bundles,
+        });
     }
 
     // (#1442 ship-2b) The verify map step's config — its COLLECTION arrives

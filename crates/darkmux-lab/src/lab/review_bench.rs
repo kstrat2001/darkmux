@@ -776,18 +776,21 @@ fn parse_exec_mode(s: Option<&str>) -> Result<super::review::ExecMode> {
 /// seat system prompts. Every failure here is loud and happens BEFORE any
 /// dispatch.
 ///
-/// (#1475) The bench is a CONTROLLED comparison: it pins EVERY review role to
-/// one profile — `--roster-profile` (else `--profile`, else the registry's
-/// `default_profile`) — through packet 3's per-run role→profile OVERRIDE, so the
-/// funnel measures that one profile across every seat deterministically (never
-/// whatever the machine's `role_profiles` map happens to hold). `--k` then sets
-/// each probe seat's draw breadth; the flip resolves three distinct probe roles,
-/// so the default (`--k` omitted, k=1 each) already draws three probes — the
-/// same total breadth the old default `k=3` gave from one seat, now role-borne.
+/// (#1475, #1512) The bench is a CONTROLLED comparison: it pins EVERY review
+/// role to one profile — `--roster-profile` (else `--profile`, else the
+/// registry's `default_profile`) — through packet 3's per-run role→profile
+/// OVERRIDE, so the funnel measures that one profile across every seat
+/// deterministically (never whatever the machine's `role_profiles` map
+/// happens to hold). The probe roles themselves are discovered off
+/// `review.json` (`discover_review_probe_role_ids`, #1512 — never a Rust
+/// constant), so the roster is pinned across however many probe roles the
+/// document declares (three, by default). `--k` is snapshotted verbatim on
+/// each probe staffing for reporting (see `write_scores_artifact`'s `k`
+/// field) but no longer multiplies dispatch tasks (#1512 — one role, one
+/// task; see `build_review_graph`'s own doc).
 fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
     use darkmux_crew::resourcing::{
-        ReviewRoleStaffing, REVIEW_JUDGE_ROLE, REVIEW_PROBE_ROLE, REVIEW_PROBE_ROLES,
-        REVIEW_VERIFY_ROLE,
+        discover_review_probe_role_ids, ReviewRoleStaffing, REVIEW_JUDGE_ROLE, REVIEW_VERIFY_ROLE,
     };
     let loaded = darkmux_profiles::profiles::load_registry(opts.config_path.as_deref())
         .context("loading profile registry for --funnel")?;
@@ -816,22 +819,31 @@ fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
     // suffices.
     darkmux_profiles::profiles::get_profile(&loaded.registry, &roster)
         .context("resolving the --funnel roster profile")?;
-    // Pin all five review roles to the roster via the per-run override — one
-    // canonical resolver, no second staffing path.
-    let overrides: std::collections::BTreeMap<String, String> = REVIEW_PROBE_ROLES
-        .into_iter()
-        .chain([REVIEW_JUDGE_ROLE, REVIEW_VERIFY_ROLE])
-        .map(|role| (role.to_string(), roster.clone()))
+    // (#1512) The probe roles come off review.json itself, not a Rust
+    // constant — pin every one of them (plus judge + verify) to the roster
+    // via the per-run override.
+    let review_config = darkmux_crew::mission_config::load("review")
+        .context("loading mission config \"review\" to discover its probe roles for --funnel")?;
+    let probe_role_ids = discover_review_probe_role_ids(&review_config.config)?;
+    let overrides: std::collections::BTreeMap<String, String> = probe_role_ids
+        .iter()
+        .cloned()
+        .chain([REVIEW_JUDGE_ROLE.to_string(), REVIEW_VERIFY_ROLE.to_string()])
+        .map(|role| (role, roster.clone()))
         .collect();
-    let mut crew =
-        darkmux_crew::resourcing::resolve_review_role_crew(&loaded.registry, &ReviewRoleStaffing::default(), &overrides)
-            .context("resolving review staffing for --funnel")?;
-    // `--k` is the bench's probe draw-breadth knob (a measurement sweep the
-    // operator path doesn't expose): applied post-resolution to every probe
-    // seat, leaving the judge/verify seats at one draw. Absent => the flip's
-    // one-draw-per-probe-role default.
+    let mut crew = darkmux_crew::resourcing::resolve_review_role_crew(
+        &loaded.registry,
+        &ReviewRoleStaffing::default(),
+        &overrides,
+        &probe_role_ids,
+    )
+    .context("resolving review staffing for --funnel")?;
+    // `--k` is snapshotted onto every probe seat's staffing (reported by
+    // `write_scores_artifact`'s `k` field, #1222 packet 7) but no longer
+    // multiplies dispatch tasks in the built graph (#1512) — probe recall
+    // breadth is a review.json edit now, not a per-run draw multiplier.
     if let Some(k) = opts.k_override {
-        if let Some(probes) = crew.seats.get_mut(REVIEW_PROBE_ROLE) {
+        if let Some(probes) = crew.seats.get_mut("review-probe") {
             for seat in probes {
                 seat.k = k;
             }

@@ -1,7 +1,7 @@
 {
   "id": "review",
   "name": "PR Review",
-  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired the `pr-review run` verb in Packet 4b): investigate (resolve bundles from the diff, probe every staffed seat as seats x k generic dispatch.map steps (#1442), dedup the flags with domain reconstruction at the dedup boundary) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of Packet 3, this document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config, resolves staffing into the probe-template task's `expand` collection, and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
+  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired the `pr-review run` verb in Packet 4b): investigate (resolve bundles from the diff, probe every explicit one-role probe task (#1512 -- no `expand` template, no crew-level probe-role enumeration), dedup the flags with domain reconstruction at the dedup boundary) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of #1512, the probe stage is three EXPLICIT tasks (`review-probe-high-task`/`-mid-task`/`-low-task`), each carrying its own `role_id` and depending only on `review-bundle-task` -- parallelism is emergent from `depends_on` (all three share one dependency, none depend on each other, so `review-dedup-task`'s three-way `depends_on` is a real fan-in). Changing the probe COUNT is a config edit (add/remove a probe task with its own `role_id`, and its entry in `review-dedup-task.depends_on`), never a Rust change -- `build_review_graph` discovers the probe roles by reading `review-dedup-task`'s `depends_on`, never by enumerating role names in code. This document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
   "schema_version": "1.3",
   "inputs": [
     {
@@ -116,7 +116,7 @@
     },
     {
       "name": "staffing",
-      "description": "Resolved probe/judge/verify seat staffing (StaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from the role->profile resolver (#1475 -- each review role resolves via launch override > role_profiles map > default_profile), never a literal CLI input. The probe-template task expands over the three distinct probe roles (review-probe-high/-mid/-low), one task per role. See the 'review-probe-template' task's notes below.",
+      "description": "Resolved probe/judge/verify seat staffing (StaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from the role->profile resolver (#1475 -- each review role resolves via launch override > role_profiles map > default_profile), never a literal CLI input. (#1512) The probe roles themselves are read directly off this document -- `review-dedup-task.depends_on` names the three explicit probe tasks (review-probe-high-task/-mid-task/-low-task), each carrying its own `role_id`; there is no Rust-side enumeration of probe role ids.",
       "required": false
     },
     {
@@ -129,7 +129,7 @@
     {
       "id": "investigate",
       "display_name": "Investigate",
-      "description": "resolve review bundles from the diff, probe every staffed seat, dedup",
+      "description": "resolve review bundles from the diff, probe every explicit probe task, dedup",
       "tasks": [
         {
           "id": "review-bundle-task",
@@ -145,35 +145,61 @@
           ]
         },
         {
-          "id": "review-probe-template-task",
-          "display_name": "Probe",
-          "description": "TEMPLATE for the probe stage. build_review_graph builds ONE task/step PER PROBE ROLE (#1475 packet 2 — the role->profile flip): the expansion is over the three distinct probe roles (review-probe-high / -mid / -low), mint-time-known, not a resolver-fed seat list. Each expanded copy binds its own role via `role_pattern` (the item IS the probe role id), so the crew is the task->role->profile->model rollup -- recall diversity falls out of three distinct role bindings, not k draws of one scored model. build_review_graph stamps each expanded step's dispatch config (model resolved from that role's role_profiles binding, ids `review-probe-{index}-task` / `review-probe-{index}-step`).",
+          "id": "review-probe-high-task",
+          "display_name": "Probe high",
+          "description": "probe role `review-probe-high` — one role, one task (#1512); parallelism with the other two probe tasks is emergent from all three depending only on review-bundle-task",
+          "role_id": "review-probe-high",
           "depends_on": [
             "review-bundle-task"
           ],
           "steps": [
             {
-              "id": "review-probe-template-step",
+              "id": "review-probe-high-step",
               "kind": "dispatch.map",
               "config": null
             }
+          ]
+        },
+        {
+          "id": "review-probe-mid-task",
+          "display_name": "Probe mid",
+          "description": "probe role `review-probe-mid` — one role, one task (#1512)",
+          "role_id": "review-probe-mid",
+          "depends_on": [
+            "review-bundle-task"
           ],
-          "expand": {
-            "over": "probe_roles",
-            "task_id_pattern": "review-probe-{index}-task",
-            "step_id_pattern": "review-probe-{index}-step",
-            "kind_pattern": "{kind}",
-            "role_pattern": "{name}",
-            "description_pattern": "probe role `{name}`",
-            "display_name_pattern": "Probe {name}"
-          }
+          "steps": [
+            {
+              "id": "review-probe-mid-step",
+              "kind": "dispatch.map",
+              "config": null
+            }
+          ]
+        },
+        {
+          "id": "review-probe-low-task",
+          "display_name": "Probe low",
+          "description": "probe role `review-probe-low` — one role, one task (#1512)",
+          "role_id": "review-probe-low",
+          "depends_on": [
+            "review-bundle-task"
+          ],
+          "steps": [
+            {
+              "id": "review-probe-low-step",
+              "kind": "dispatch.map",
+              "config": null
+            }
+          ]
         },
         {
           "id": "review-dedup-task",
           "display_name": "Dedup",
-          "description": "dedup probe flags — mechanism-family keying + anchor matching",
+          "description": "dedup probe flags — mechanism-family keying + anchor matching. (#1512) `depends_on` below IS the probe role registry: build_review_graph reads it to discover which roles staff the probe stage, so adding/removing a probe task here (with its own role_id) changes the probe count with zero Rust changes.",
           "depends_on": [
-            "review-probe-template-task"
+            "review-probe-high-task",
+            "review-probe-mid-task",
+            "review-probe-low-task"
           ],
           "steps": [
             {
