@@ -72,7 +72,7 @@
 //! leaves `started_ts: None`.
 
 use crate::loader::load_phases;
-use crate::types::{Mission, MissionStatus, Phase, PhaseStatus};
+use crate::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus};
 use darkmux_flow as flow;
 use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
 use anyhow::{bail, Context, Result};
@@ -684,6 +684,112 @@ fn emit_phase_added_record_with_reasoning(
     });
 }
 
+// ─── Graph-truth invariant reconcile (#1504) ───────────────────────────
+//
+// The mission graph is only ever drawn correctly when a terminal parent
+// never contains a live child: a `Complete` Phase can't contain a
+// `Running`/`Planned` Step, and a `Finalized` Mission can't contain a
+// `Running`/`Planned` Phase — otherwise the graph draws the impossible
+// (a live node upstream of a complete one, #1504's exact repro: a
+// Finalized review mission's `adjudicate` Phase read Complete while its
+// `review-judge-step` was still persisted `running`).
+//
+// Enforced PHYSICALLY at the two mutation chokepoints every caller in this
+// codebase already routes through (`grep` confirms `phase_complete`/
+// `phase_abandon`/`mission_close_with_reasoning` are the ONLY places a
+// Phase reaches Complete/Abandoned or a Mission reaches Finalized) rather
+// than as a separate helper callers have to remember to invoke — the
+// invariant lives in the write path itself, so no future caller can bypass
+// it by forgetting a reconcile call.
+
+/// Roll every non-terminal (`Planned`/`Running`) Step under `phase_id` to
+/// `NodeStatus::Abandoned` — called from [`phase_complete`]/[`phase_abandon`]
+/// so a Phase can never persist a terminal status while a Step it contains
+/// is still live. `Abandoned`, not `Error`: this function has no visibility
+/// into whether a live Step's own work actually failed (that's the
+/// scheduler's call, made via its own Error path before this ever runs) —
+/// `Abandoned` is the honest label for "superseded by the Phase closing
+/// around it," matching `phase_abandon`'s own semantics one level up.
+/// Best-effort throughout (matches `finalize_mission`'s documented
+/// discipline): a load/save hiccup here must never block the Phase
+/// transition that already succeeded — only the Step's own on-disk record
+/// would lag, reconcilable via a future `mission finalize`/`abort` re-run.
+fn reconcile_phase_steps_terminal(mission_id: &str, phase_id: &str) {
+    let Ok(steps) = load_steps_for_phase(mission_id, phase_id) else {
+        return;
+    };
+    for mut step in steps {
+        if !matches!(step.status, NodeStatus::Planned | NodeStatus::Running) {
+            continue;
+        }
+        let was_running = step.status == NodeStatus::Running;
+        step.status = NodeStatus::Abandoned;
+        if step.completed_ts.is_none() {
+            step.completed_ts = Some(now_unix());
+        }
+        if step.output.is_none() {
+            step.output = Some(format!(
+                "reconciled to Abandoned: phase `{phase_id}` reached a terminal status while \
+                 this step was still {} (#1504 defensive backstop)",
+                if was_running { "Running" } else { "Planned" }
+            ));
+        }
+        let _ = save_step(mission_id, phase_id, &step);
+    }
+}
+
+/// Roll every non-terminal (`Planned`/`Running`) Phase belonging to
+/// `mission_id` to `Abandoned` — called from [`mission_close_with_reasoning`]
+/// so a Mission can never persist `Finalized` while a Phase it contains is
+/// still live. Routes through [`phase_abandon`] itself (not a raw status
+/// write) so the phase-level reconcile above cascades automatically: one
+/// call here closes BOTH invariant gaps (mission→phase and, transitively,
+/// phase→step) from a single entry point. Best-effort — a `phase_abandon`
+/// refusal (should be unreachable; the filter above only ever selects
+/// `Planned`/`Running`, both legal `phase_abandon` sources) is swallowed,
+/// same discipline as every other lifecycle transition in this module.
+fn reconcile_mission_phases_terminal(mission_id: &str) {
+    let Ok(phases) = load_phases() else {
+        return;
+    };
+    for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
+        if !matches!(phase.status, PhaseStatus::Complete | PhaseStatus::Abandoned) {
+            let _ = phase_abandon(&phase.id);
+        }
+    }
+}
+
+/// (#1504) Reconcile a `mission launch` failure that happened AFTER
+/// `mission.json` was written to disk (a partial mint — e.g. a later
+/// `save_phase` call failed, or the mission was minted but a subsequent
+/// post-mint step like `save_config_snapshot` errored before the scheduler
+/// ever ran). Without this, a `?`-propagated error from one of those calls
+/// strands a fresh, permanently-`Active` mission on disk with no envelope —
+/// and since #1503 made every launch mint a UNIQUE run id, a repeated
+/// failing launch no longer converges onto one reused instance the way the
+/// old derive-from-inputs id used to; each failed attempt mints (and, absent
+/// this call, strands) its OWN mission.
+///
+/// A failure BEFORE `mission.json` was ever written (e.g. the pre-mint
+/// collision bail-out) has nothing to reconcile — `mission_path` not
+/// existing is the signal this function uses to no-op cleanly rather than
+/// erroring on a missing mission.
+///
+/// Closes the mission via [`mission_close_with_reasoning`], whose own
+/// #1504 reconcile (above) rolls any Planned/Running phases — and,
+/// transitively, their steps — to `Abandoned` first, so the mission reaches
+/// an honest terminal `Finalized` state with no live children left behind.
+/// Best-effort: a `mission_close_with_reasoning` refusal is swallowed
+/// (mirrors `finalize_mission`'s own discipline) — the caller's original
+/// error is what propagates; this is defensive cleanup, never the primary
+/// failure signal.
+pub fn reconcile_mint_failure(mission_id: &str, reason: &str) {
+    if !mission_path(mission_id).is_file() {
+        return; // never minted — nothing on disk to reconcile
+    }
+    let _ = mission_close_with_reasoning(mission_id, Some(reason));
+}
+
 // ─── Phase transitions ─────────────────────────────────────────────────
 
 /// `phase start <id>` — Planned/Abandoned → Running.
@@ -704,6 +810,11 @@ pub fn phase_start(id: &str) -> Result<Phase> {
 }
 
 /// `phase complete <id>` — Running → Complete (terminal).
+///
+/// (#1504) Reconciles every Step under this Phase to a terminal status as
+/// part of the transition — see [`reconcile_phase_steps_terminal`]. A Phase
+/// can never persist Complete while a Step it contains is still
+/// `Planned`/`Running`.
 pub fn phase_complete(id: &str) -> Result<Phase> {
     let mut phase = load_phase_by_id(id)?;
     match phase.status {
@@ -715,12 +826,18 @@ pub fn phase_complete(id: &str) -> Result<Phase> {
     phase.status = PhaseStatus::Complete;
     phase.completed_ts = Some(now_unix());
     save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    reconcile_phase_steps_terminal(&phase.mission_id, id);
     emit_phase_transition_record(id, &phase.mission_id, "phase complete");
     Ok(phase)
 }
 
 /// `phase abandon <id>` — Planned/Running → Abandoned.
 /// Cannot abandon a `Complete` phase (terminal in the other direction).
+///
+/// (#1504) Reconciles every Step under this Phase to a terminal status as
+/// part of the transition — see [`reconcile_phase_steps_terminal`]. A Phase
+/// can never persist Abandoned while a Step it contains is still
+/// `Planned`/`Running`.
 pub fn phase_abandon(id: &str) -> Result<Phase> {
     let mut phase = load_phase_by_id(id)?;
     match phase.status {
@@ -731,6 +848,7 @@ pub fn phase_abandon(id: &str) -> Result<Phase> {
     phase.status = PhaseStatus::Abandoned;
     phase.abandoned_ts = Some(now_unix());
     save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    reconcile_phase_steps_terminal(&phase.mission_id, id);
     emit_phase_transition_record(id, &phase.mission_id, "phase abandon");
     Ok(phase)
 }
@@ -775,12 +893,18 @@ pub(crate) fn mission_close(id: &str) -> Result<Mission> {
     mission_close_with_reasoning(id, None)
 }
 
+/// (#1504) Reconciles every non-terminal Phase belonging to this mission to
+/// `Abandoned` (which itself cascades into each abandoned Phase's own Step
+/// reconcile — see [`reconcile_mission_phases_terminal`]) BEFORE closing —
+/// a Mission can never persist `Finalized` while a Phase it contains is
+/// still `Planned`/`Running`.
 pub fn mission_close_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
     let mut mission = load_mission(id)?;
     match mission.status {
         MissionStatus::Active | MissionStatus::Paused => {}
         MissionStatus::Finalized => bail!("mission `{id}` is already Finalized"),
     }
+    reconcile_mission_phases_terminal(id);
     mission.status = MissionStatus::Finalized;
     mission.finalized_ts = Some(now_unix());
     save_json(&mission_path(id), &mission)?;
@@ -1276,6 +1400,194 @@ mod tests {
 
     // (#1503) `mission_reopen` tests removed alongside `mission_reopen_
     // with_reasoning` itself — see the function's removal note above.
+
+    // ─── Graph-truth invariant reconcile (#1504) ────────────────────────
+
+    fn seed_step(mission_id: &str, phase_id: &str, id: &str, status: crate::types::NodeStatus) -> crate::types::Step {
+        let s = crate::types::Step {
+            id: id.to_string(),
+            task_id: format!("{id}-task"),
+            kind: "procedural.noop".to_string(),
+            status,
+            config: serde_json::Value::Null,
+            started_ts: Some(1_700_000_100),
+            completed_ts: None,
+            output: None,
+        };
+        save_step(mission_id, phase_id, &s).unwrap();
+        s
+    }
+
+    /// The #1504 repro, at the exact mutation chokepoint: a phase completing
+    /// while one of its steps is still `running` (the live review-mission
+    /// evidence — `adjudicate` read `complete`, `review-judge-step` read
+    /// `running`, `completed_ts: null`). `phase_complete` must never persist
+    /// with a live step left behind.
+    #[serial_test::serial]
+    #[test]
+    fn phase_complete_reconciles_a_running_step_to_abandoned() {
+        let _g = CrewGuard::new();
+        seed_phase("adjudicate", PhaseStatus::Running);
+        seed_step("test-mission", "adjudicate", "review-judge-step", crate::types::NodeStatus::Running);
+
+        let updated = phase_complete("adjudicate").unwrap();
+        assert_eq!(updated.status, PhaseStatus::Complete, "phase completes as requested");
+
+        let step = load_step("test-mission", "adjudicate", "review-judge-step").unwrap();
+        assert_eq!(
+            step.status,
+            crate::types::NodeStatus::Abandoned,
+            "no Complete phase may persist with a live (running) step — #1504"
+        );
+        assert!(step.completed_ts.is_some(), "a reconciled step gets a completed_ts, not left null forever");
+        assert!(step.output.is_some(), "the reconcile leaves a named reason on the step");
+    }
+
+    /// Same invariant, the `Planned` (never-started) step variant — a phase
+    /// completing must reconcile a step that never even got picked up.
+    #[serial_test::serial]
+    #[test]
+    fn phase_complete_reconciles_a_planned_step_to_abandoned() {
+        let _g = CrewGuard::new();
+        seed_phase("p-planned", PhaseStatus::Running);
+        seed_step("test-mission", "p-planned", "never-started-step", crate::types::NodeStatus::Planned);
+
+        phase_complete("p-planned").unwrap();
+
+        let step = load_step("test-mission", "p-planned", "never-started-step").unwrap();
+        assert_eq!(step.status, crate::types::NodeStatus::Abandoned);
+    }
+
+    /// `phase_abandon` gets the same treatment as `phase_complete` — an
+    /// Abandoned phase can't leave a live step behind either.
+    #[serial_test::serial]
+    #[test]
+    fn phase_abandon_reconciles_a_running_step_to_abandoned() {
+        let _g = CrewGuard::new();
+        seed_phase("p-abandon", PhaseStatus::Running);
+        seed_step("test-mission", "p-abandon", "mid-flight-step", crate::types::NodeStatus::Running);
+
+        phase_abandon("p-abandon").unwrap();
+
+        let step = load_step("test-mission", "p-abandon", "mid-flight-step").unwrap();
+        assert_eq!(step.status, crate::types::NodeStatus::Abandoned);
+    }
+
+    /// A step already terminal (Complete/Abandoned/Error) is left completely
+    /// untouched by the reconcile — only live steps get rolled.
+    #[serial_test::serial]
+    #[test]
+    fn phase_complete_leaves_already_terminal_steps_untouched() {
+        let _g = CrewGuard::new();
+        seed_phase("p-mixed", PhaseStatus::Running);
+        seed_step("test-mission", "p-mixed", "done-step", crate::types::NodeStatus::Complete);
+        {
+            // Give the Complete step a distinguishing output so we can tell
+            // if the reconcile clobbered it.
+            let mut s = load_step("test-mission", "p-mixed", "done-step").unwrap();
+            s.output = Some("real output".to_string());
+            save_step("test-mission", "p-mixed", &s).unwrap();
+        }
+
+        phase_complete("p-mixed").unwrap();
+
+        let step = load_step("test-mission", "p-mixed", "done-step").unwrap();
+        assert_eq!(step.status, crate::types::NodeStatus::Complete, "a terminal step is never touched");
+        assert_eq!(step.output.as_deref(), Some("real output"), "its real output survives untouched");
+    }
+
+    /// The mission→phase half of the invariant: `mission_close_with_reasoning`
+    /// must never persist Finalized while a phase it contains is still
+    /// non-terminal — this is the `finalized_mission_with_open_phase` shape
+    /// `mission_status.rs`'s drift detector already knows about (#1463's own
+    /// finding), now prevented structurally at the source instead of merely
+    /// detected after the fact.
+    #[serial_test::serial]
+    #[test]
+    fn mission_close_reconciles_a_non_terminal_phase_to_abandoned() {
+        let _g = CrewGuard::new();
+        // `seed_phase` always writes under mission id "test-mission" — seed
+        // the mission under the SAME id so `mission_close_with_reasoning`'s
+        // phase scan (which filters `load_phases()` by `mission_id`) finds it.
+        seed_mission("test-mission", MissionStatus::Active);
+        seed_phase("still-running", PhaseStatus::Running);
+        let mission = mission_close_with_reasoning("test-mission", Some("test close")).unwrap();
+        assert_eq!(mission.status, MissionStatus::Finalized);
+
+        let phase = load_phase("test-mission", "still-running").unwrap();
+        assert_eq!(
+            phase.status,
+            PhaseStatus::Abandoned,
+            "no Finalized mission may persist with a non-terminal phase — #1504"
+        );
+    }
+
+    /// The cascade: closing a mission with an open phase that ITSELF has a
+    /// live step reconciles both levels from the single `mission_close_
+    /// with_reasoning` call — `reconcile_mission_phases_terminal` routes
+    /// through `phase_abandon`, which already reconciles its own steps.
+    #[serial_test::serial]
+    #[test]
+    fn mission_close_cascades_through_to_a_grandchild_step() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Active);
+        seed_phase("open-with-step", PhaseStatus::Running);
+        seed_step("test-mission", "open-with-step", "orphan-step", crate::types::NodeStatus::Running);
+
+        mission_close_with_reasoning("test-mission", Some("test close")).unwrap();
+
+        assert_eq!(load_phase("test-mission", "open-with-step").unwrap().status, PhaseStatus::Abandoned);
+        assert_eq!(
+            load_step("test-mission", "open-with-step", "orphan-step").unwrap().status,
+            crate::types::NodeStatus::Abandoned,
+            "the phase-level reconcile's own step-cascade fires even when triggered from the mission level"
+        );
+    }
+
+    /// A mission whose phases are ALL already terminal closes with zero
+    /// reconcile work — the common case stays a clean no-op.
+    #[serial_test::serial]
+    #[test]
+    fn mission_close_is_a_noop_reconcile_when_every_phase_is_already_terminal() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Active);
+        seed_phase("already-done", PhaseStatus::Complete);
+
+        mission_close_with_reasoning("test-mission", Some("test close")).unwrap();
+
+        assert_eq!(load_phase("test-mission", "already-done").unwrap().status, PhaseStatus::Complete);
+    }
+
+    /// `reconcile_mint_failure`: a mission that made it to disk before the
+    /// launcher errored gets closed out (never left permanently Active) —
+    /// the strand-accumulation gap #1504 also closes (#1503 made every
+    /// launch mint a fresh id, so a repeated failing launch no longer
+    /// converges onto one reused instance; each failure needs its own
+    /// reconcile or it strands a NEW Active mission per attempt).
+    #[serial_test::serial]
+    #[test]
+    fn reconcile_mint_failure_closes_a_minted_mission() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Active);
+        seed_phase("p1", PhaseStatus::Planned);
+
+        reconcile_mint_failure("test-mission", "mission launch errored during mint: disk full");
+
+        let mission = load_mission("test-mission").unwrap();
+        assert_eq!(mission.status, MissionStatus::Finalized, "a partial mint is closed out, never left stranded Active");
+        assert_eq!(load_phase("test-mission", "p1").unwrap().status, PhaseStatus::Abandoned);
+    }
+
+    /// A failure BEFORE `mission.json` was ever written has nothing to
+    /// reconcile — the function must no-op cleanly, never error.
+    #[serial_test::serial]
+    #[test]
+    fn reconcile_mint_failure_is_a_noop_when_nothing_was_ever_minted() {
+        let _g = CrewGuard::new();
+        // No mission seeded at all — mission_path("never-minted") doesn't exist.
+        reconcile_mint_failure("never-minted", "mint failed before any write");
+        assert!(!mission_path("never-minted").is_file(), "still nothing on disk");
+    }
 
     // ─── Error paths ──────────────────────────────────────────────────
 

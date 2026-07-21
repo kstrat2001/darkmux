@@ -928,14 +928,38 @@ fn run_dispatch(
         // state.
         let description =
             format!("PR review — {case_id_for_bookends} (crew `{crew_name_for_bookends}`)");
-        mission_launch::ensure_mission_and_phases_with_provenance(
+        // (#1504) Both calls below are post-mint strand windows the #1417
+        // comment above didn't close: a bare `?` here would leave a fresh,
+        // permanently-Active mission on disk (a partial mint from
+        // `ensure_mission_and_phases_with_provenance`, or a fully-minted one
+        // whose `config-snapshot.json` write then failed) — and since #1503
+        // mints a UNIQUE run id per launch, a repeated failing launch no
+        // longer converges onto one reused instance the way the old
+        // derive-from-inputs id used to; each failure needs its own reconcile
+        // or it strands a NEW Active mission per attempt. `reconcile_mint_
+        // failure` closes the mission (cascading any Planned phases to
+        // Abandoned) ONLY if `mission.json` was actually written.
+        if let Err(e) = mission_launch::ensure_mission_and_phases_with_provenance(
             &mission_id,
             config,
             Some(&description),
             Some(spec),
-        )?;
-        crew::lifecycle::save_config_snapshot(&mission_id, config)
-            .context("persisting config-snapshot.json")?;
+        ) {
+            crew::lifecycle::reconcile_mint_failure(
+                &mission_id,
+                &format!("mission launch review errored during mint: {e:#}"),
+            );
+            return Err(e);
+        }
+        if let Err(e) = crew::lifecycle::save_config_snapshot(&mission_id, config)
+            .context("persisting config-snapshot.json")
+        {
+            crew::lifecycle::reconcile_mint_failure(
+                &mission_id,
+                &format!("mission launch review errored during mint: {e:#}"),
+            );
+            return Err(e);
+        }
 
         for task in &graph.tasks {
             let _ = crew::lifecycle::save_task(&mission_id, task);
@@ -1663,6 +1687,52 @@ mod tests {
         assert!(
             !missions_dir.is_dir() || std::fs::read_dir(&missions_dir).unwrap().next().is_none(),
             "no mission.json may exist — a failed pre-graph validation must never strand a minted mission"
+        );
+    }
+
+    /// (#1504) The COMPLEMENTARY strand window #1417 didn't close: a
+    /// failure AFTER `ensure_mission_and_phases_with_provenance` has
+    /// already written `mission.json` (a partial mint — a later
+    /// `save_phase` call fails) used to leave a bare `?` with no reconcile,
+    /// stranding a fresh, permanently-Active mission. Since #1503 mints a
+    /// UNIQUE run id per launch, a repeated failing launch no longer
+    /// converges onto one reused instance the way the old derive-from-inputs
+    /// id used to — each failure needs its own reconcile or it strands its
+    /// OWN mission. Forces the failure deterministically (no OS-permission
+    /// tricks): pre-occupies the `phases/` subdir path with a plain file so
+    /// `fs::create_dir_all` can't create a directory there, failing the
+    /// very first `save_phase` call right after `save_mission` already
+    /// succeeded.
+    #[test]
+    #[serial_test::serial]
+    fn post_mint_phase_write_failure_reconciles_via_mint_failure_helper_not_stranded_active() {
+        let _guard = CrewDirGuard::new();
+        let config = crew::mission_config::load("review").expect("review is embedded").config;
+        let mission_id = "review-post-mint-strand";
+
+        let mission_dir = crew::lifecycle::mission_path(mission_id).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        std::fs::write(mission_dir.join("phases"), b"blocks phase dir creation").unwrap();
+
+        let err = mission_launch::ensure_mission_and_phases_with_provenance(mission_id, &config, None, None)
+            .unwrap_err();
+        assert_eq!(
+            mission_status_str(mission_id),
+            "active",
+            "sanity: mission.json WAS written before the phase save failed"
+        );
+
+        // Exactly what `run_dispatch`'s error arm now does on this failure.
+        crew::lifecycle::reconcile_mint_failure(
+            mission_id,
+            &format!("mission launch review errored during mint: {err:#}"),
+        );
+
+        assert_eq!(
+            mission_status_str(mission_id),
+            "finalized",
+            "a partial mint must reconcile to terminal — one fresh mission, terminal, never an \
+             accumulating Active row (#1504)"
         );
     }
 

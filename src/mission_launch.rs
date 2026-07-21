@@ -252,8 +252,30 @@ pub fn launch(
         collected.insert("mission_id".to_string(), serde_json::Value::String(mission_id.clone()));
     }
 
+    // (#1504) `ensure_mission_and_phases_with_provenance` itself is a strand
+    // window `reconcile_and_finalize_on_error` (below) can't cover — that
+    // helper needs a bound `real_phase_ids`, which is exactly what a failure
+    // HERE means was never produced (e.g. `save_mission` wrote `mission.json`
+    // but a later `save_phase` failed, or `mission_start_with_reasoning`
+    // errored after every phase was minted). Left bare, this `?` would strand
+    // a fresh, permanently-Active mission per failed attempt — #1503 made
+    // every launch mint a UNIQUE id, so a repeated failing launch no longer
+    // converges onto one reused instance the way the old derive-from-inputs
+    // id used to. `reconcile_mint_failure` closes the mission (which cascades
+    // any partially-minted Planned phases to Abandoned via its own #1504
+    // reconcile) ONLY if minting got far enough to write `mission.json` in
+    // the first place; a failure before that point never touched disk.
     let real_phase_ids =
-        ensure_mission_and_phases_with_provenance(&mission_id, config, None, Some(spec))?;
+        match ensure_mission_and_phases_with_provenance(&mission_id, config, None, Some(spec)) {
+            Ok(v) => v,
+            Err(e) => {
+                crew::lifecycle::reconcile_mint_failure(
+                    &mission_id,
+                    &format!("mission launch errored during mint: {e:#}"),
+                );
+                return Err(e);
+            }
+        };
 
     // (#1433 follow-up) The mission is now minted (Active, Planned phases) on
     // disk. Every fallible step from here to the scheduler is a strand window:
@@ -2286,6 +2308,49 @@ mod tests {
         assert_eq!(phase_status_on_disk(mission_id, p1), PhaseStatus::Complete);
     }
 
+    /// (#1504) The strand-accumulation gap: `ensure_mission_and_phases_with_
+    /// provenance`'s own `?` in `launch()` had NO reconcile — a partial mint
+    /// (mission.json written, a later phase save fails) would strand a
+    /// fresh, permanently-Active mission. Since #1503 mints a UNIQUE run id
+    /// per launch, a repeated failing launch no longer converges onto one
+    /// reused instance — each failure would strand its OWN mission absent
+    /// this reconcile. Forces the failure deterministically (no OS-
+    /// permission tricks, portable): pre-occupies the `phases/` subdir path
+    /// with a plain file so `fs::create_dir_all` can't create a directory
+    /// there, failing the very first `save_phase` call right after
+    /// `save_mission` already succeeded — exactly the partial-mint shape.
+    #[test]
+    #[serial_test::serial]
+    fn post_mint_phase_write_failure_reconciles_via_mint_failure_helper_not_stranded_active() {
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        let mission_id = "post-mint-strand";
+
+        let mission_dir = crew::lifecycle::mission_path(mission_id).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        std::fs::write(mission_dir.join("phases"), b"blocks phase dir creation").unwrap();
+
+        let err = ensure_mission_and_phases_with_provenance(mission_id, &config, None, None).unwrap_err();
+        assert_eq!(
+            mission_status_on_disk(mission_id),
+            MissionStatus::Active,
+            "sanity: mission.json WAS written before the phase save failed"
+        );
+
+        // Exactly what `launch()`'s error arm now does on this failure.
+        crew::lifecycle::reconcile_mint_failure(
+            mission_id,
+            &format!("mission launch errored during mint: {err:#}"),
+        );
+
+        assert_eq!(
+            mission_status_on_disk(mission_id),
+            MissionStatus::Finalized,
+            "a partial mint must reconcile to terminal — one fresh mission, terminal, never an \
+             accumulating Active row (#1504)"
+        );
+    }
+
     // ── (#1406) Honest finalize: per-phase outcomes from step statuses ──
 
     /// A single-step `Task` bound to `phase_real_id`, whose one step is
@@ -2446,14 +2511,19 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn reconcile_with_no_tasks_closes_mission_leaving_planned_phases() {
-        // (#1433 follow-up) The pre-graph strand window: a `?` before interpret
-        // ever produced tasks (a config-snapshot write fault, an interpret
-        // fault). Reconcile runs with EMPTY tasks/steps — nothing to flip, no
-        // per-phase outcomes to derive — so the mission is driven Finalized
-        // while its phases stay Planned. That Finalized-with-Planned shape is
-        // the honest, surfaced outcome (no stranded Active mission); `mission
-        // status` flags the phase drift for the operator to reconcile.
+    fn reconcile_with_no_tasks_closes_mission_and_reconciles_planned_phases() {
+        // (#1433 follow-up, revised #1504) The pre-graph strand window: a `?`
+        // before interpret ever produced tasks (a config-snapshot write
+        // fault, an interpret fault). Reconcile runs with EMPTY tasks/steps —
+        // nothing to flip, no per-phase outcomes to derive — so `envelope.
+        // phases` is empty and `finalize_mission`'s own per-phase loop never
+        // touches any of the three phases. Before #1504, that left the
+        // mission Finalized with its phases stranded Planned — the exact
+        // invariant violation #1504 targets, just one level up (mission↔phase
+        // instead of phase↔step). `mission_close_with_reasoning`'s own #1504
+        // reconcile now catches it: every non-terminal phase (and any step
+        // it might contain) rolls to Abandoned as part of the SAME close
+        // call, so a Finalized mission never persists with a live phase.
         let _guard = LaunchTestGuard::new();
         let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
         let mid = "gen3strand";
@@ -2472,8 +2542,10 @@ mod tests {
         for rp in [&rp1, &rp2, &rp3] {
             assert_eq!(
                 phase_status_on_disk(mid, rp),
-                PhaseStatus::Planned,
-                "with no tasks, phases have no derived outcome and stay Planned (the surfaced drift shape)"
+                PhaseStatus::Abandoned,
+                "no phase may be left Planned inside a Finalized mission (#1504) — `finalize_mission`'s \
+                 own empty phase loop leaves them untouched, but `mission_close_with_reasoning`'s \
+                 reconcile catches every leftover before the mission closes"
             );
         }
     }
