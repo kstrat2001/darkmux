@@ -336,6 +336,7 @@ mod tests {
             paused_ts: None,
             source_input: None,
             ticket: None,
+            spec: None,
         }
     }
     fn phase(id: &str, mid: &str, status: PhaseStatus) -> Phase {
@@ -530,6 +531,7 @@ mod tests {
             paused_ts: None,
             source_input: None,
             ticket: None,
+            spec: None,
         };
         let runtime_capture = phase("runtime-capture", "doom-loop-m4", PhaseStatus::Planned);
         let mut file_match = phase("file-match", "doom-loop-m4", PhaseStatus::Abandoned);

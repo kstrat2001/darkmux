@@ -43,12 +43,12 @@
 //!   This is the only transition that clears a `*_ts` field.
 //!
 //! Mission:
-//!   | from        | start             | close                | pause                 | resume                | reopen ⁴              |
-//!   |-------------|-------------------|----------------------|-----------------------|------------------------|-----------------------|
-//!   | `Active`    | error if          | → Finalized ✓        | → Paused ✓            | error: already Active | error: not Finalized  |
-//!   |             | started_ts set ²  |                      |                       |                        |                       |
-//!   | `Paused`    | error: use resume | → Finalized ✓        | error: already Paused | → Active ³            | error: use resume     |
-//!   | `Finalized` | error: terminal   | error: already       | error: terminal       | error: terminal       | → Active ⁴ ✓          |
+//!   | from        | start             | close                | pause                 | resume                |
+//!   |-------------|-------------------|----------------------|-----------------------|------------------------|
+//!   | `Active`    | error if          | → Finalized ✓        | → Paused ✓            | error: already Active |
+//!   |             | started_ts set ²  |                      |                       |                        |
+//!   | `Paused`    | error: use resume | → Finalized ✓        | error: already Paused | → Active ³            |
+//!   | `Finalized` | error: terminal   | error: already       | error: terminal       | error: terminal       |
 //!
 //! ² `mission_start` requires a fresh start — it stamps `started_ts=now()`
 //!   on first invocation and errors thereafter. Use `mission resume` to
@@ -56,16 +56,15 @@
 //!   mission running.
 //! ³ Resume does NOT clear `paused_ts` — operator may want to see when
 //!   the most recent pause occurred even after resuming.
-//! ⁴ `mission_reopen` (#1372) is the ONLY way out of `Finalized` —
-//!   Finalized is terminal for every OTHER transition, by design, so a
-//!   fresh path was needed rather than loosening `start`/`resume`'s own
-//!   guards. Clears `finalized_ts` (mirrors `phase_start`'s "restart
-//!   clears the prior terminal timestamp" convention — the attempt
-//!   starting now supersedes the old closure). System-triggered only
-//!   today (no CLI verb — see
-//!   `mission_reopen_with_reasoning`'s own doc); a human-operator-facing
-//!   `darkmux mission reopen` verb is a natural follow-up, out of scope
-//!   here.
+//!
+//! `Finalized` has no transition back to `Active` today — `mission_reopen`
+//! (#1372) once provided one for `mission_launch`'s implicit relaunch-by-
+//! derived-id path, but that path was removed in #1503 (a mission run's id
+//! is now minted uniquely per launch — see `mission_launch::mint_run_id` —
+//! so relaunching the same config+inputs never revisits an existing id).
+//! Explicit resume of an interrupted run, if ever wanted, is a fresh
+//! human-operator-facing `darkmux mission reopen` verb — out of scope here,
+//! same as before.
 //!
 //! Missions have no `created_ts → started_ts` distinction at creation
 //! time; `start` is the explicit "this mission is now being worked on"
@@ -830,44 +829,17 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
     Ok(mission)
 }
 
-/// `mission reopen <id>` — Finalized → Active (#1372). The ONLY legal
-/// transition OUT of Finalized — every other verb treats Finalized as
-/// terminal by design (see the module doc's state table), so a re-run that
-/// reuses a finalized mission id needs this dedicated path rather than a
-/// loosened `start`/`resume` guard.
-///
-/// Clears `finalized_ts` (mirrors `phase_start`'s "restart clears the
-/// prior terminal timestamp" convention, `Abandoned → Running`) — the
-/// attempt starting now supersedes the old closure; a caller checking
-/// `finalized_ts` for "when did this mission last finish" shouldn't see a
-/// stale value from before the reopen. `started_ts` is left untouched
-/// (the mission's original start time is still meaningful provenance).
-///
-/// System-triggered only today — `build_mission_for_review`'s reuse-of-a-
-/// terminal-mission fix (#1372) is the only caller. A human-operator-
-/// facing `darkmux mission reopen` CLI verb is a natural follow-up (the
-/// same operator-sovereignty question every other lifecycle verb already
-/// answers — see `CLAUDE.md`'s "Operator sovereignty" section) but is out
-/// of this fix's scope: the mission this fix reopens is SYSTEM-created
-/// ephemera (`build_mission_for_review` stood it up purely so the review's
-/// own Task/Step graph had somewhere to live), so the system reopening its
-/// own closed mission when it re-launches the same case is consistent with
-/// that doctrine the same way `finalize_review_mission`'s auto-close is
-/// (#1365's own doc makes the identical argument for auto-CLOSING this
-/// class of mission).
-pub fn mission_reopen_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
-    let mut mission = load_mission(id)?;
-    match mission.status {
-        MissionStatus::Finalized => {}
-        MissionStatus::Active => bail!("mission `{id}` is already Active"),
-        MissionStatus::Paused => bail!("mission `{id}` is Paused — use `mission resume` instead"),
-    }
-    mission.status = MissionStatus::Active;
-    mission.finalized_ts = None; // reopen clears the prior closure, mirrors phase_start
-    save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record_with_reasoning(id, "mission reopen", reasoning);
-    Ok(mission)
-}
+// (#1503) `mission_reopen_with_reasoning` (Finalized → Active, #1372) is
+// removed. Its only caller was `mission_launch::ensure_mission_and_phases_
+// with_provenance`'s Finalized→reopen branch, which existed to service the
+// implicit "relaunch the same derived id" resume path — the exact category
+// error #1503 fixes (AI work is non-deterministic; two launches of the same
+// config+inputs are two DIFFERENT runs, not one to reopen). A mission's id
+// is now minted uniquely per launch, so no launch ever revisits an existing
+// Finalized mission's id, and this function has no remaining caller. An
+// explicit, human-operator-facing `darkmux mission reopen` verb (resuming a
+// NAMED run id on purpose) remains a legitimate future feature — out of
+// scope here — and would reintroduce this same state transition when built.
 
 // ─── Mission scope growth ──────────────────────────────────────────────
 
@@ -1108,6 +1080,7 @@ mod tests {
             paused_ts: None,
             source_input: None,
             ticket: None,
+            spec: None,
         };
         save_json(&mission_path(id), &m).unwrap();
         m
@@ -1301,38 +1274,8 @@ mod tests {
         assert!(err.to_string().contains("already Active"));
     }
 
-    // ─── mission_reopen (#1372) ─────────────────────────────────────────
-
-    #[serial_test::serial]
-    #[test]
-    fn mission_reopen_from_finalized_sets_active_and_clears_finalized_ts() {
-        let _g = CrewGuard::new();
-        let mut m = seed_mission("m8", MissionStatus::Finalized);
-        m.finalized_ts = Some(1_700_000_900);
-        save_json(&mission_path("m8"), &m).unwrap();
-
-        let reopened = mission_reopen_with_reasoning("m8", Some("review re-run")).unwrap();
-        assert_eq!(reopened.status, MissionStatus::Active);
-        assert!(reopened.finalized_ts.is_none(), "reopen clears the prior closure, mirroring phase_start");
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn mission_reopen_from_active_errors() {
-        let _g = CrewGuard::new();
-        seed_mission("m9", MissionStatus::Active);
-        let err = mission_reopen_with_reasoning("m9", None).unwrap_err();
-        assert!(err.to_string().contains("already Active"));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn mission_reopen_from_paused_errors_with_resume_hint() {
-        let _g = CrewGuard::new();
-        seed_mission("m10", MissionStatus::Paused);
-        let err = mission_reopen_with_reasoning("m10", None).unwrap_err();
-        assert!(err.to_string().contains("resume"));
-    }
+    // (#1503) `mission_reopen` tests removed alongside `mission_reopen_
+    // with_reasoning` itself — see the function's removal note above.
 
     // ─── Error paths ──────────────────────────────────────────────────
 

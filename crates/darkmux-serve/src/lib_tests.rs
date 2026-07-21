@@ -3364,6 +3364,7 @@
             paused_ts: None,
             source_input: None,
             ticket: None,
+            spec: None,
         }
     }
 

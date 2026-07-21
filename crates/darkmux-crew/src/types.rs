@@ -315,6 +315,34 @@ pub struct Mission {
     /// fall back to darkmux defaults with a soft warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<String>,
+    /// (#1503) The spec this run was launched from — a GROUPING key
+    /// (which config + which resolved inputs), never identity. A mission's
+    /// `id` is now minted uniquely per launch (see
+    /// `mission_launch::mint_run_id`): two launches of the same config with
+    /// the same inputs are two DIFFERENT runs (AI work is non-deterministic),
+    /// so they get two different ids. `spec` is what still lets those runs be
+    /// grouped for corpus analysis — a first-class queryable field, not a
+    /// string-prefix on the id. `None` on missions minted before this field
+    /// existed, or on a run with no meaningful input spec — they simply read
+    /// as ungrouped; no migration needed (lenient-on-read, contract 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<MissionSpec>,
+}
+
+/// (#1503) A run's spec — which config, with which resolved inputs. Kept
+/// deliberately generic (no mission-specific fields) so it's
+/// consolidation-ready: a future dispatch or lab-run record could carry the
+/// same shape as its own grouping key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionSpec {
+    /// The mission config id this run was launched from (e.g. `coder-phase`,
+    /// `review`).
+    pub config_id: String,
+    /// A compact fingerprint over the resolved inputs — the blake3 digest
+    /// that, pre-#1503, WAS the mission id. Two runs of the same config with
+    /// the same inputs fingerprint identically (they group); different
+    /// inputs fingerprint differently.
+    pub inputs_fingerprint: String,
 }
 
 /// Status of a phase.
@@ -829,6 +857,43 @@ mod tests {
         assert_eq!(m.finalized_ts, Some(1700000900));
     }
 
+    /// (#1503) A pre-#1503 mission.json — id derived from an input hash,
+    /// no `spec` field at all — must still deserialize. `spec` is lenient
+    /// (`#[serde(default)]`); an absent field reads as `None` (ungrouped),
+    /// never a load failure. No migration.
+    #[test]
+    fn mission_with_no_spec_field_deserializes_as_ungrouped() {
+        let legacy_json = r#"{
+            "id": "coder-phase-a1b2c3d4e5",
+            "description": "pre-#1503 input-hash-identity mission",
+            "status": "finalized",
+            "phase_ids": ["coder-phase-a1b2c3d4e5-build"],
+            "created_ts": 1700000000,
+            "finalized_ts": 1700000900
+        }"#;
+        let m: Mission = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(m.id, "coder-phase-a1b2c3d4e5");
+        assert!(m.spec.is_none(), "an absent `spec` field must read as ungrouped, never fail to load");
+    }
+
+    /// (#1503) `spec` round-trips: two missions sharing the same config +
+    /// inputs fingerprint carry EQUAL `MissionSpec`s (so they group), while
+    /// differing on either field makes them distinct groups.
+    #[test]
+    fn mission_spec_groups_on_config_and_fingerprint_equality() {
+        let a = MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "abc123".to_string() };
+        let b = MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "abc123".to_string() };
+        let different_inputs = MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "def456".to_string() };
+        let different_config = MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "abc123".to_string() };
+        assert_eq!(a, b, "same config + same fingerprint must be equal (they group)");
+        assert_ne!(a, different_inputs, "different fingerprint must not be equal (distinct groups)");
+        assert_ne!(a, different_config, "different config must not be equal (distinct groups)");
+
+        let s = serde_json::to_string(&a).unwrap();
+        let round_tripped: MissionSpec = serde_json::from_str(&s).unwrap();
+        assert_eq!(a, round_tripped);
+    }
+
     /// The canonical (post-rename) wire shape round-trips, and writing a
     /// `Finalized` mission always emits the new field/value names —
     /// self-migration happens the next time the mission is saved.
@@ -845,6 +910,7 @@ mod tests {
             paused_ts: None,
             source_input: None,
             ticket: None,
+            spec: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""status":"finalized""#), "got {s}");

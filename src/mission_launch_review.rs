@@ -20,9 +20,12 @@
 //! forcing it through the generic scheduler call would be "a feature change
 //! wearing a tiering fix's clothes," not a real simplification. So this
 //! module is a NEW CALLER of the SAME driver `pr_review.rs::run_dispatch`
-//! used to own, wired through the same generic instance-minting primitives
-//! (`mission_launch::derive_mission_id`, `mission_launch::
-//! ensure_mission_and_phases`) every other config-launched mission uses —
+//! used to own, wired through the same generic run-minting primitives
+//! (`mission_launch::mint_run_id`, `mission_launch::
+//! ensure_mission_and_phases_with_provenance`) every other config-launched
+//! mission uses (#1503: a run id is minted fresh per launch, never derived
+//! from `case_id` — a re-run of the same case is a DIFFERENT run, grouped
+//! via `Mission.spec`, never a reopen of the prior one) —
 //! `build_review_graph` still calls `mission_config::interpret` itself
 //! internally (it needs the `probe_roles` expansion built from the crew's
 //! probe seats — #1475 packet 2 — which this module's caller doesn't have
@@ -837,9 +840,19 @@ fn run_dispatch(
             chat_override: None,
         });
 
+        // (#1503) The run id is minted fresh — never derived from
+        // `case_id`. A re-run of the same case (a new commit push, a
+        // manual re-trigger) is a genuinely different run — AI work is
+        // non-deterministic — so it gets its own id; `id_input`'s
+        // fingerprint still groups same-case runs together via
+        // `Mission.spec`, just as metadata rather than identity.
         let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
         id_input.insert("case_id".to_string(), Value::String(case_id_for_bookends.clone()));
-        let mission_id = mission_launch::derive_mission_id("review", &id_input)?;
+        let mission_id = mission_launch::mint_run_id("review")?;
+        let spec = crew::types::MissionSpec {
+            config_id: "review".to_string(),
+            inputs_fingerprint: mission_launch::spec_fingerprint(&id_input)?,
+        };
 
         // (#1417) Resolve the phase ids and build the review graph BEFORE
         // minting the Mission — `derive_phase_ids` is a pure, no-I/O
@@ -886,13 +899,13 @@ fn run_dispatch(
             judge_concurrency,
         )?;
 
-        // (#1417) Mint (or idempotently reuse/reopen) the Mission + the SAME
-        // three phases review.json declares (investigate/adjudicate/report)
-        // — the GENERIC instance-minting primitive every config-launched
-        // mission uses, replacing the retired `build_mission_for_review`/
-        // `reopen_terminal_mission_for_rerun` bespoke pair (their reopen
-        // semantics are already implemented once, generically, here). Moved
-        // to run AFTER `build_review_graph` succeeds (see the comment
+        // (#1417, id-minting fixed #1503) Mint the Mission + the SAME three
+        // phases review.json declares (investigate/adjudicate/report) — the
+        // GENERIC run-minting primitive every config-launched mission uses.
+        // Every review dispatch is a FRESH run now — a re-run of the same
+        // case never reopens the prior run's record; `spec` (built above)
+        // is what still lets same-case runs group for corpus analysis.
+        // Moved to run AFTER `build_review_graph` succeeds (see the comment
         // above) — everything the graph needed (the phase id strings) was
         // already derived without touching the Mission, so nothing here
         // needs to run earlier.
@@ -902,8 +915,7 @@ fn run_dispatch(
         // strings: a fresh mint's description names the case + crew (N CI
         // reviews must be distinguishable on `mission status`/the viewer —
         // the config's own description is an 800-char transcription
-        // paragraph, useless as a board row), and a reopen's reasoning
-        // names the case being re-run.
+        // paragraph, useless as a board row).
         //
         // (C4, same review gate) Mission bookkeeping on this path is
         // HARD-FAIL (`?`) — a DELIBERATE reversal of the retired
@@ -916,12 +928,11 @@ fn run_dispatch(
         // state.
         let description =
             format!("PR review — {case_id_for_bookends} (crew `{crew_name_for_bookends}`)");
-        let reopen_reasoning = format!("review re-run for case `{case_id_for_bookends}`");
-        let (_, _reused) = mission_launch::ensure_mission_and_phases_with_provenance(
+        mission_launch::ensure_mission_and_phases_with_provenance(
             &mission_id,
             config,
             Some(&description),
-            Some(&reopen_reasoning),
+            Some(spec),
         )?;
         crew::lifecycle::save_config_snapshot(&mission_id, config)
             .context("persisting config-snapshot.json")?;
@@ -1318,41 +1329,45 @@ mod tests {
         v["status"].as_str().unwrap().to_string()
     }
 
-    /// Mint (or, on a rerun, reopen) a review-config instance via the SAME
-    /// provenance-bearing primitive `run_dispatch` uses, returning
-    /// `(mission_id, [investigate, adjudicate, report])`.
+    /// Mint a FRESH review-config run via the SAME provenance-bearing
+    /// primitive `run_dispatch` uses, returning
+    /// `(mission_id, [investigate, adjudicate, report])`. (#1503) Every
+    /// call mints a NEW run — never reuses or reopens a prior one, even
+    /// for the same `case_id`; `spec` is what still groups same-case runs.
     fn mint_review_instance(case_id: &str) -> (String, [String; 3]) {
         let config = crew::mission_config::load("review").expect("review is embedded").config;
         let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
         id_input.insert("case_id".to_string(), Value::String(case_id.to_string()));
-        let mission_id = mission_launch::derive_mission_id("review", &id_input).unwrap();
+        let mission_id = mission_launch::mint_run_id("review").unwrap();
+        let spec = crew::types::MissionSpec {
+            config_id: "review".to_string(),
+            inputs_fingerprint: mission_launch::spec_fingerprint(&id_input).unwrap(),
+        };
         // Same call shape as `run_dispatch` (must-fix 2 provenance).
         let description = format!("PR review — {case_id} (crew `test-crew`)");
-        let reopen_reasoning = format!("review re-run for case `{case_id}`");
-        let (real_phase_ids, _) = mission_launch::ensure_mission_and_phases_with_provenance(
+        let real_phase_ids = mission_launch::ensure_mission_and_phases_with_provenance(
             &mission_id,
             &config,
             Some(&description),
-            Some(&reopen_reasoning),
+            Some(spec),
         )
         .unwrap();
-        // `ensure_mission_and_phases` mints phases Planned. `run_dispatch`'s
-        // REAL flow no longer flips all three eagerly (#1400 — that was the
-        // bug: every phase pulsed "running" from second zero); each starts
-        // LAZILY instead, via `mission_launch::lazy_start_phase_for_step`
-        // fired from the `persist` closure as the graph actually reaches
-        // it (see `review_phases_start_lazily_not_all_at_mint`, right below
-        // this fixture, for a direct test of that). This fixture still
-        // starts every phase up front because the tests THAT USE IT
+        // `ensure_mission_and_phases_with_provenance` mints phases Planned.
+        // `run_dispatch`'s REAL flow no longer flips all three eagerly
+        // (#1400 — that was the bug: every phase pulsed "running" from
+        // second zero); each starts LAZILY instead, via
+        // `mission_launch::lazy_start_phase_for_step` fired from the
+        // `persist` closure as the graph actually reaches it (see
+        // `review_phases_start_lazily_not_all_at_mint`, right below this
+        // fixture, for a direct test of that). This fixture still starts
+        // every phase up front because the tests THAT USE IT
         // (`finalize_review_mission_*`) are exercising *finalization*
         // behavior, which needs "every phase already Running" as its
-        // precondition, not the start-timing #1400 is about. `let _ =`
-        // (not unwrap): on a REUSE of a previously-CLEAN instance a phase
-        // is already terminal Complete and `phase_start` correctly
-        // refuses — same silent skip the production lazy-start path
-        // performs.
+        // precondition, not the start-timing #1400 is about. Every mint is
+        // fresh (#1503), so `phase_start` always succeeds — no reuse
+        // collision to silently skip anymore.
         for real_id in real_phase_ids.values() {
-            let _ = crew::lifecycle::phase_start(real_id);
+            crew::lifecycle::phase_start(real_id).unwrap();
         }
         (
             mission_id,
@@ -1377,11 +1392,8 @@ mod tests {
     fn review_phases_start_lazily_not_all_at_mint() {
         let _guard = CrewDirGuard::new();
         let config = crew::mission_config::load("review").expect("review is embedded").config;
-        let case_id = "owner/repo@lazy1400";
-        let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
-        id_input.insert("case_id".to_string(), Value::String(case_id.to_string()));
-        let mission_id = mission_launch::derive_mission_id("review", &id_input).unwrap();
-        let (real_phase_ids, _reused) = mission_launch::ensure_mission_and_phases_with_provenance(
+        let mission_id = mission_launch::mint_run_id("review").unwrap();
+        let real_phase_ids = mission_launch::ensure_mission_and_phases_with_provenance(
             &mission_id,
             &config,
             Some("PR review test — lazy start"),
@@ -1519,14 +1531,18 @@ mod tests {
         assert_eq!(mission_status_str(&mission_id), "finalized");
     }
 
-    /// (C5, #1284 Packet 4b review gate) The review-shaped RERUN path,
-    /// covering what the retired `reopen_terminal_mission_for_rerun` tests
-    /// covered: a re-run of the SAME case must REOPEN the prior terminal
-    /// instance — never error, never double-mint — with case-bearing
-    /// provenance on the reopened record (must-fix 2).
+    /// (#1503) The review-shaped RERUN path: a re-run of the SAME case now
+    /// mints a genuinely NEW run — never reopens the prior terminal
+    /// record — since AI work is non-deterministic and two dispatches of
+    /// the same case are two different runs. Replaces the pre-#1503
+    /// `review_rerun_of_the_same_case_reopens_the_terminal_instance`
+    /// (which asserted the removed reopen behavior: same case -> same
+    /// mission id, reopened rather than double-minted). The two runs still
+    /// GROUP via `Mission.spec` (same case -> same fingerprint), and each
+    /// carries the same case-bearing provenance (must-fix 2) independently.
     #[test]
     #[serial_test::serial]
-    fn review_rerun_of_the_same_case_reopens_the_terminal_instance() {
+    fn review_rerun_of_the_same_case_mints_a_new_run_that_groups_with_the_prior_one() {
         let _guard = CrewDirGuard::new();
         let case = "owner/repo@rerun4b";
 
@@ -1538,18 +1554,29 @@ mod tests {
 
         // Re-run the SAME case through the same mint path.
         let (mission_id2, _) = mint_review_instance(case);
-        assert_eq!(mission_id2, mission_id, "same case -> same instance id, reused not double-minted");
-        assert_eq!(mission_status_str(&mission_id), "active", "the terminal instance was reopened");
+        assert_ne!(mission_id2, mission_id, "same case must mint a NEW run id, never reuse the prior one (#1503)");
+        assert_eq!(mission_status_str(&mission_id2), "active", "the new run starts Active");
+        // The prior (finalized) run is left completely untouched.
+        assert_eq!(mission_status_str(&mission_id), "finalized", "a rerun must never mutate the prior terminal run");
 
         // Case-bearing provenance (must-fix 2): the board row names the
-        // case + crew, never the config's transcription paragraph.
-        let text = std::fs::read_to_string(crew::lifecycle::mission_path(&mission_id)).unwrap();
-        let v: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(
-            v["description"].as_str().unwrap(),
-            format!("PR review — {case} (crew `test-crew`)"),
-            "fresh-mint description must be case-bearing"
-        );
+        // case + crew, never the config's transcription paragraph — on
+        // BOTH runs, independently.
+        let describe = |id: &str| -> String {
+            let text = std::fs::read_to_string(crew::lifecycle::mission_path(id)).unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            v["description"].as_str().unwrap().to_string()
+        };
+        let expected_description = format!("PR review — {case} (crew `test-crew`)");
+        assert_eq!(describe(&mission_id), expected_description);
+        assert_eq!(describe(&mission_id2), expected_description);
+
+        // (#1503) The two runs still GROUP: same case -> same `spec`.
+        let spec_of = |id: &str| -> Value {
+            let text = std::fs::read_to_string(crew::lifecycle::mission_path(id)).unwrap();
+            serde_json::from_str::<Value>(&text).unwrap()["spec"].clone()
+        };
+        assert_eq!(spec_of(&mission_id), spec_of(&mission_id2), "same-case reruns must group via `spec`");
     }
 
     /// (#1417) Direct regression test for the mint-then-strand bug: a
@@ -1628,13 +1655,14 @@ mod tests {
         // The regression: the Mission must NEVER have been minted. Before
         // the #1417 fix, `ensure_mission_and_phases_with_provenance` ran
         // BEFORE this validation and would have already written
-        // mission.json (Active, 3 Planned phases) to disk.
-        let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
-        id_input.insert("case_id".to_string(), Value::String(case_id.to_string()));
-        let mission_id = mission_launch::derive_mission_id("review", &id_input).unwrap();
+        // mission.json (Active, 3 Planned phases) to disk. (#1503) A run id
+        // is minted, not derived, so this can no longer re-derive the id to
+        // check — instead assert NOTHING landed under the isolated
+        // missions dir at all.
+        let missions_dir = crew::loader::missions_dir();
         assert!(
-            !crew::lifecycle::mission_path(&mission_id).exists(),
-            "mission.json must not exist — a failed pre-graph validation must never strand a minted mission"
+            !missions_dir.is_dir() || std::fs::read_dir(&missions_dir).unwrap().next().is_none(),
+            "no mission.json may exist — a failed pre-graph validation must never strand a minted mission"
         );
     }
 

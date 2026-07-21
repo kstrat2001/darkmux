@@ -459,18 +459,18 @@ pub(crate) enum MissionCmd {
         #[arg(long, value_name = "ID")]
         ticket: Option<String>,
     },
-    /// Launch a named mission CONFIG into a new (or idempotently reused)
-    /// mission INSTANCE (#1284 Packet 4a). Resolves `<config-id>` through
-    /// the mission-config registry (user → on-disk → embedded — see
+    /// Launch a named mission CONFIG into a brand-new mission RUN (#1284
+    /// Packet 4a; run-identity fixed in #1503). Resolves `<config-id>`
+    /// through the mission-config registry (user → on-disk → embedded — see
     /// `darkmux doctor`'s mission-config-registry check), validates it
     /// loud, collects its declared runtime-only `inputs` from `--input` /
     /// `--param` (bailing with a copy-pasteable example if any required
     /// input is missing), then mints `mission.json` + one phase per
     /// declared phase + a `config-snapshot.json` freezing the resolved
-    /// config alongside the instance. A graph with no tasks anywhere (a
-    /// freeform/manual config) mints the instance and starts the mission
-    /// but leaves every phase transition operator-driven. A coder-phase
-    /// graph executes worktree → coder → QA and then STOPS at an operator
+    /// config alongside the run. A graph with no tasks anywhere (a
+    /// freeform/manual config) mints the run and starts the mission but
+    /// leaves every phase transition operator-driven. A coder-phase graph
+    /// executes worktree → coder → QA and then STOPS at an operator
     /// sign-off gate — the phase stays Running. The frontier orchestrator
     /// ships the git work by hand (commit/push/PR/merge), then `mission
     /// finalize` closes it out; `mission abort` tears it down (#1463). Launch
@@ -481,11 +481,13 @@ pub(crate) enum MissionCmd {
     /// envelope finalizes generically once the run completes, and the old
     /// CLI flags map one-to-one onto `--param key=value` (see
     /// `templates/builtin/mission-configs/review.json`'s own `inputs` doc
-    /// for the mapping table). With no `--input`/`--param` the instance id
-    /// IS the config id; with inputs the id gets a deterministic
-    /// per-inputs suffix — either way, relaunching with the same values
-    /// reuses (and reopens, if terminal) the SAME instance rather than
-    /// minting a duplicate.
+    /// for the mapping table). The run id is ALWAYS minted fresh — never
+    /// derived from config+inputs (#1503): two launches of the same config
+    /// with the same inputs are two DIFFERENT runs (AI work is
+    /// non-deterministic), so relaunching with identical values mints a
+    /// brand-new run rather than reusing or reopening a prior one. The
+    /// config+inputs pairing is still recorded — as `Mission.spec`, a
+    /// grouping key for corpus analysis, never identity.
     ///
     /// Exit codes (coder-phase / gate-less generic graphs): `0` freeform
     /// mint, or coder ran with QA clean/flags-only (gate banner, phase

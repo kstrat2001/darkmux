@@ -76,7 +76,7 @@ use crate::flow;
 use crate::coder_phase;
 use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::{self, FindingSeverity, LaunchParams, MissionConfig, TaskOverride};
-use crew::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus};
+use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus};
 use darkmux_types::style;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -233,29 +233,27 @@ pub fn launch(
         precheck_coder_phase_inputs(config, &collected)?;
     }
 
-    // Instance id: the bare config id when the operator supplied no inputs
-    // (a constant hash suffix would disambiguate nothing — #1284 review
-    // round 1, must-fix 3), else `<config-id>-<disambiguator>` derived from
-    // the OPERATOR-SUPPLIED inputs (never `mission_id` itself, which the
-    // launcher supplies below — hashing it would be circular). Same params
-    // → same instance id → the reuse/reopen path below fires (idempotent
-    // relaunch); different params → a distinct instance. No `--mission-id`
-    // flag needed.
-    let mission_id = derive_mission_id(config_id, &collected)?;
+    // Run id: minted fresh for THIS launch, never derived from inputs
+    // (#1503). AI work is non-deterministic, so two launches of the same
+    // config with the same inputs are two DIFFERENT runs, not one to
+    // dedupe/reopen onto — collapsing them onto one id was the category
+    // error #1503 fixes. `spec_fingerprint`, computed from the
+    // OPERATOR-SUPPLIED inputs below (never `mission_id` itself — hashing it
+    // would be circular), is what still lets same-config-same-inputs runs be
+    // GROUPED for corpus analysis, via `Mission.spec` — a metadata field,
+    // never identity. No `--mission-id` flag needed.
+    let mission_id = mint_run_id(config_id)?;
+    let spec = MissionSpec {
+        config_id: config_id.to_string(),
+        inputs_fingerprint: spec_fingerprint(&collected)?,
+    };
     let mut collected = collected;
     if config.inputs.iter().any(|i| i.name == "mission_id") {
         collected.insert("mission_id".to_string(), serde_json::Value::String(mission_id.clone()));
     }
 
-    let (real_phase_ids, reused) = ensure_mission_and_phases(&mission_id, config)?;
-    if reused {
-        println!(
-            "  {}",
-            style::dim(&format!(
-                "reusing existing instance `{mission_id}` (same config + inputs as a prior launch)"
-            ))
-        );
-    }
+    let real_phase_ids =
+        ensure_mission_and_phases_with_provenance(&mission_id, config, None, Some(spec))?;
 
     // (#1433 follow-up) The mission is now minted (Active, Planned phases) on
     // disk. Every fallible step from here to the scheduler is a strand window:
@@ -306,11 +304,10 @@ pub fn launch(
         // (#1463) The per-phase `phase start/complete/abandon` bookkeeping
         // retired; the operator does the work by hand, then `mission finalize`
         // (success) or `mission abort` (kill) closes the mission out.
-        let verb = if reused { "reopened" } else { "minted" };
         println!(
             "{}",
             style::success(&format!(
-                "✓ mission `{mission_id}` {verb} from config \"{config_id}\" — {} freeform phase(s)",
+                "✓ mission `{mission_id}` minted from config \"{config_id}\" — {} freeform phase(s)",
                 config.phases.len()
             ))
         );
@@ -394,32 +391,13 @@ pub fn launch(
         None
     };
 
-    // (#1400) Preflight, READ-ONLY pass: name any phase that's already
-    // terminal-Complete from a prior finalized run — informational only,
-    // no `phase_start` call here. Phases don't start eagerly at mint
-    // anymore (that was the bug — every phase pulsed "running" from second
-    // zero regardless of whether the scheduler had reached it); each
-    // phase's OWN `phase_start` fires lazily, inside the `persist` closure
-    // below, the FIRST time one of its steps actually flips `Running`.
-    for phase in &config.phases {
-        let real_id = &real_phase_ids[&phase.id];
-        if !tasks.iter().any(|t| &t.phase_id == real_id) {
-            continue;
-        }
-        if let Ok(p) = load_phase_for_brief(&mission_id, real_id) {
-            if p.status == PhaseStatus::Complete {
-                eprintln!(
-                    "{}",
-                    style::dim(&format!(
-                        "mission launch: phase `{real_id}` is already Complete (terminal) from a \
-                         prior finalized run — steps will still execute, but the phase's own \
-                         status cannot move; abandon-and-recreate is not automated (operator \
-                         sovereignty #44)."
-                    ))
-                );
-            }
-        }
-    }
+    // (#1503) The #1400 preflight that used to run here — warning that a
+    // phase was already terminal-Complete from a prior finalized run — only
+    // ever mattered on the reuse/reopen path: a freshly-minted mission's
+    // phases are always `Planned` (`ensure_mission_and_phases_with_provenance`
+    // mints unconditionally now, never reopens an existing record), so the
+    // condition it checked for can no longer occur. Removed with the reuse
+    // path itself.
 
     let tasks_by_id: BTreeMap<String, crew::types::Task> =
         tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
@@ -596,27 +574,51 @@ fn missing_inputs_message(config: &MissionConfig, missing: &[&mission_config::Mi
     msg
 }
 
-/// The instance id for one launch. Zero operator-supplied inputs → the
-/// BARE config id (#1284 review round 1, must-fix 3: hashing an empty map
-/// produced the same constant suffix for EVERY zero-input launch of every
-/// config — a disambiguator that disambiguated nothing and made the guide's
-/// bare-id follow-up commands fail). With inputs →
-/// `<config-id>-<10-hex-char digest>` over the CANONICAL (BTreeMap-sorted)
-/// JSON of `collected`, so the SAME inputs always derive the SAME instance
-/// id (idempotent relaunch) while different inputs derive a distinct one (a
-/// genuinely new instance). No CLI flag needed — see the module doc.
-pub(crate) fn derive_mission_id(config_id: &str, collected: &BTreeMap<String, serde_json::Value>) -> Result<String> {
-    let id = if collected.is_empty() {
-        config_id.to_string()
-    } else {
-        let canon = serde_json::to_string(collected).context("serializing collected inputs for id derivation")?;
-        let digest = blake3::hash(canon.as_bytes());
-        let hex = digest.to_hex();
-        let short = &hex.as_str()[..10];
-        format!("{config_id}-{short}")
-    };
+/// (#1503) Mint a fresh, UNIQUE run id for one `mission launch` call — never
+/// derived from inputs. Two launches of the same config with the same
+/// inputs are two DIFFERENT runs (AI work is non-deterministic); collapsing
+/// them onto one id was the category error #1503 fixes (the old
+/// `derive_mission_id`'s deterministic hash-of-inputs id, which made a
+/// relaunch collide with — and reopen — its own prior run).
+///
+/// Shape mirrors the lab harness's own `run_id` convention
+/// (`crates/darkmux-lab/src/lab/run.rs`: `<workload>-<profile>-<unix-secs>-
+/// <index>`) for mission↔lab consistency: `<config-id>-<unix-secs>-<6-hex
+/// token>`. The lab convention's own disambiguator is a batch-loop index
+/// (`--runs N`); `mission launch` has no such loop, so the token here is a
+/// blake3 digest over (nanosecond time, pid, an in-process atomic counter)
+/// instead — robustly unique even for two launches within the same
+/// wall-clock second (the lab scheme is itself only second-granular).
+pub(crate) fn mint_run_id(config_id: &str) -> Result<String> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let token_src = format!("{nanos}-{pid}-{n}");
+    let digest = blake3::hash(token_src.as_bytes());
+    let hex = digest.to_hex();
+    let secs = nanos / 1_000_000_000;
+    let id = format!("{config_id}-{secs}-{}", &hex.as_str()[..6]);
     fleet::validate_identifier("mission_id", &id)?;
     Ok(id)
+}
+
+/// (#1503) The spec fingerprint — what USED to be the mission id itself,
+/// now demoted to `Mission.spec.inputs_fingerprint`, a grouping key rather
+/// than identity. Blake3 over the canonical (BTreeMap-sorted) JSON of the
+/// OPERATOR-SUPPLIED inputs (never including `mission_id`, which the
+/// launcher supplies separately — hashing it in would be circular): the
+/// SAME inputs against the SAME config always fingerprint identically (so
+/// those runs group for corpus analysis), while different inputs
+/// fingerprint differently.
+pub(crate) fn spec_fingerprint(collected: &BTreeMap<String, serde_json::Value>) -> Result<String> {
+    let canon =
+        serde_json::to_string(collected).context("serializing collected inputs for the spec fingerprint")?;
+    let digest = blake3::hash(canon.as_bytes());
+    Ok(digest.to_hex().as_str()[..10].to_string())
 }
 
 fn now_unix() -> u64 {
@@ -626,8 +628,7 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// One Phase JSON literal, shared by the fresh-mint loop and the
-/// reuse-path missing-phase backfill (#1284 review round 1, consider 5).
+/// One Phase JSON literal, minted for every declared phase at launch.
 /// `display_name` (#1398) is `PhaseConfig::display_name` verbatim — `None`
 /// on a config that doesn't set one, which every renderer falls back to
 /// `id` for (never `description`).
@@ -652,34 +653,6 @@ fn new_planned_phase(
     }
 }
 
-/// Mint (or, on relaunch, reopen-if-terminal reuse) the Mission + one Phase
-/// per declared phase. Mirrors `src/pr_review.rs::build_mission_for_review`'s
-/// exact reuse pattern (#1372): a fresh mission is created Active with every
-/// phase Planned and started via the real `mission_start_with_reasoning`
-/// lifecycle verb (so the standard "mission start" flow record lands); an
-/// EXISTING mission (same derived id → same prior launch) is reopened if the
-/// prior run left it Finalized, any Abandoned phase is restarted, and any phase
-/// the config declares that the old instance is MISSING (the config grew a
-/// phase since the prior launch — #1284 review round 1, consider 5) is
-/// minted Planned and appended to `phase_ids` — never re-created from
-/// scratch, so a relaunch's Task/Step overwrites land on the SAME instance
-/// rather than silently forking a duplicate.
-///
-/// The fresh-mint path hydrates `Mission.source_input`/`Mission.ticket`
-/// from the config's `extras` (#1284 review round 1, must-fix 2) — that's
-/// where `mission propose` preserves the operator's verbatim words (#815)
-/// and ticket id (#816), and dropping them silently broke `coder_brief`'s
-/// source-input injection plus the conventions' `{ticket}` templates.
-///
-/// Returns the doc phase id → real (composed) phase id map every subsequent
-/// step needs, plus whether an EXISTING instance was reused.
-pub(crate) fn ensure_mission_and_phases(
-    mission_id: &str,
-    config: &MissionConfig,
-) -> Result<(BTreeMap<String, String>, bool)> {
-    ensure_mission_and_phases_with_provenance(mission_id, config, None, None)
-}
-
 /// Pure, no-I/O derivation of the doc phase id → real (composed) phase id
 /// map (`<mission_id>-<doc_id>`). Extracted from
 /// [`ensure_mission_and_phases_with_provenance`] (#1417) so a caller can
@@ -692,85 +665,50 @@ pub(crate) fn derive_phase_ids(mission_id: &str, config: &MissionConfig) -> BTre
     config.phases.iter().map(|p| (p.id.clone(), format!("{mission_id}-{}", p.id))).collect()
 }
 
-/// [`ensure_mission_and_phases`] with per-launcher PROVENANCE overrides
-/// (#1284 Packet 4b review gate, must-fix 2). A dedicated launcher whose
-/// instances are per-case (the review launcher: N CI reviews of N PRs)
-/// passes a case-bearing `description` ("PR review — owner/repo@sha (crew
-/// `x`)") and a case-bearing `reopen_reasoning` ("review re-run for case
-/// ...") so the mission board / viewer can tell the instances apart —
-/// falling back to the generic config-derived description and "relaunch of
-/// config `<id>`" reasoning when `None` (the generic `launch` path).
+/// Mint the Mission + one Phase per declared phase, with per-launcher
+/// PROVENANCE overrides (#1284 Packet 4b review gate, must-fix 2). (#1503)
+/// Every call is a FRESH mint — the reuse/reopen-by-derived-id path is
+/// gone: since `mission_id` is now minted uniquely per launch (never
+/// derived from inputs), a launch never revisits an existing mission's id,
+/// so there is nothing to reopen. If the id somehow already exists on disk
+/// (should be impossible given `mint_run_id`'s uniqueness guarantee), this
+/// bails loud rather than silently reopening or overwriting a stranger's
+/// record.
+///
+/// A dedicated launcher whose instances are per-case (the review launcher:
+/// N CI reviews of N PRs) passes a case-bearing `description` ("PR review
+/// — owner/repo@sha (crew `x`)") so the mission board / viewer can tell
+/// the instances apart — falling back to the generic config-derived
+/// description when `None` (the generic `launch` path). `spec` (#1503) is
+/// the run's GROUPING metadata — which config, which resolved-inputs
+/// fingerprint — recorded on the minted `Mission`; `None` for a caller
+/// with no meaningful spec (a bare test fixture, e.g.).
+///
+/// Hydrates `Mission.source_input`/`Mission.ticket` from the config's
+/// `extras` (#1284 review round 1, must-fix 2) — that's where `mission
+/// propose` preserves the operator's verbatim words (#815) and ticket id
+/// (#816), and dropping them silently broke `coder_brief`'s source-input
+/// injection plus the conventions' `{ticket}` templates.
+///
+/// Returns the doc phase id → real (composed) phase id map every subsequent
+/// step needs.
 pub(crate) fn ensure_mission_and_phases_with_provenance(
     mission_id: &str,
     config: &MissionConfig,
     description: Option<&str>,
-    reopen_reasoning: Option<&str>,
-) -> Result<(BTreeMap<String, String>, bool)> {
+    spec: Option<MissionSpec>,
+) -> Result<BTreeMap<String, String>> {
     let real_phase_ids: BTreeMap<String, String> = derive_phase_ids(mission_id, config);
 
     let mission_path = crew::lifecycle::mission_path(mission_id);
     if mission_path.exists() {
-        if let Ok(text) = std::fs::read_to_string(&mission_path) {
-            if let Ok(mission) = serde_json::from_str::<Mission>(&text) {
-                if mission.status == MissionStatus::Finalized {
-                    let default_reasoning = format!("relaunch of config `{}`", config.id);
-                    crew::lifecycle::mission_reopen_with_reasoning(
-                        mission_id,
-                        Some(reopen_reasoning.unwrap_or(&default_reasoning)),
-                    )?;
-                }
-            }
-        }
-        // Re-read AFTER the possible reopen so the phase_ids maintenance
-        // below never writes a stale (pre-reopen) status back to disk.
-        let mut mission_doc: Option<Mission> = std::fs::read_to_string(&mission_path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok());
-        let mut phase_ids_dirty = false;
-        let now = now_unix();
-        for phase in &config.phases {
-            let real_id = &real_phase_ids[&phase.id];
-            let phase_path = crew::lifecycle::phase_path(mission_id, real_id);
-            if phase_path.is_file() {
-                // (#1400) An `Abandoned` phase on reuse is NOT restarted
-                // here anymore — that used to eagerly flip it (and, on a
-                // multi-phase config, every OTHER abandoned phase) straight
-                // to `Running` before the scheduler dispatched anything.
-                // `lazy_start_phase_for_step` already treats `Abandoned`
-                // as startable (mirrors `phase_start`'s own state machine —
-                // `Abandoned -> Running` clears `abandoned_ts`, same as a
-                // fresh restart), so the SAME persist-hook path that starts
-                // a `Planned` phase on reach also restarts an `Abandoned`
-                // one — preserving #1372's "restarts only what reruns"
-                // semantics while fixing the "all phases pulse at once"
-                // symptom for the reopen path too.
-            } else {
-                // (consider 5) The config declares a phase the old instance
-                // doesn't have — mint it before executing, and register it
-                // in phase_ids so it isn't a dangling file.
-                let p = new_planned_phase(
-                    mission_id,
-                    real_id,
-                    phase.description.as_deref(),
-                    phase.display_name.as_deref(),
-                    now,
-                );
-                crew::lifecycle::save_phase(&p)
-                    .with_context(|| format!("minting missing phase {real_id} on reuse"))?;
-                if let Some(m) = &mut mission_doc {
-                    if !m.phase_ids.contains(real_id) {
-                        m.phase_ids.push(real_id.clone());
-                        phase_ids_dirty = true;
-                    }
-                }
-            }
-        }
-        if phase_ids_dirty {
-            if let Some(m) = &mission_doc {
-                let _ = crew::lifecycle::save_mission(m);
-            }
-        }
-        return Ok((real_phase_ids, true));
+        bail!(
+            "mission launch: run id `{mission_id}` already exists on disk — this should be \
+             impossible (run ids are minted uniquely per launch, never derived from inputs, \
+             see `mint_run_id`); if you're hitting this, it's either a genuine id collision or \
+             a re-run against a copied/restored `.darkmux` directory. Rename or remove the \
+             existing record and relaunch — implicit reuse/reopen was removed in #1503."
+        );
     }
 
     let now = now_unix();
@@ -795,6 +733,7 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
             .and_then(|v| v.as_str())
             .map(String::from),
         ticket: config.extras.get("ticket").and_then(|v| v.as_str()).map(String::from),
+        spec,
     };
     crew::lifecycle::save_mission(&mission).context("persisting mission.json")?;
 
@@ -816,7 +755,7 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
     )
     .context("starting the newly-minted mission")?;
 
-    Ok((real_phase_ids, false))
+    Ok(real_phase_ids)
 }
 
 /// Build the [`LaunchParams`] `mission_config::interpret` needs: every
@@ -1612,6 +1551,36 @@ mod tests {
 
     // ── Generic launch path — freeform (no dispatch, no Docker) ────────
 
+    /// All mission ids currently minted under the test's isolated crew root
+    /// (`missions_dir()`'s per-mission SUBDIRECTORIES — see
+    /// `crew::lifecycle::mission_path`'s own doc), sorted for a stable
+    /// comparison order. (#1503) Since a mission id is no longer derivable
+    /// from its inputs, tests recover the minted id(s) by reading the
+    /// isolated crew root back, rather than re-deriving what `launch`
+    /// itself minted.
+    fn all_mission_ids() -> Vec<String> {
+        let dir = crew::loader::missions_dir();
+        let mut ids: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    /// The single mission id minted so far — panics if zero or more than
+    /// one exists, so a test asserting "exactly one launch happened" fails
+    /// loud on a miscount rather than silently reading the wrong mission.
+    fn single_mission_id() -> String {
+        let ids = all_mission_ids();
+        assert_eq!(ids.len(), 1, "expected exactly one minted mission, found {ids:?}");
+        ids.into_iter().next().unwrap()
+    }
+
     #[test]
     #[serial_test::serial]
     fn freeform_launch_mints_instance_and_leaves_phases_manual() {
@@ -1621,9 +1590,13 @@ mod tests {
         let exit = launch("freeform-test-mission", None, &[], None).expect("launch should succeed");
         assert_eq!(exit, 0);
 
-        // No operator inputs at all -> the id derives from an empty map,
-        // deterministically, every time.
-        let mission_id = derive_mission_id("freeform-test-mission", &BTreeMap::new()).unwrap();
+        // (#1503) The run id is minted fresh, never derived from (the
+        // empty) inputs — recover it from disk rather than re-deriving it.
+        let mission_id = single_mission_id();
+        assert!(
+            mission_id.starts_with("freeform-test-mission-"),
+            "a minted run id is still config-id-prefixed, got {mission_id}"
+        );
 
         let mission_path = crew::lifecycle::mission_path(&mission_id);
         assert!(mission_path.is_file(), "mission.json must exist at {}", mission_path.display());
@@ -1633,6 +1606,17 @@ mod tests {
         assert_eq!(mission.phase_ids.len(), 2);
         assert_eq!(mission.phase_ids[0], format!("{mission_id}-p1"));
         assert_eq!(mission.phase_ids[1], format!("{mission_id}-p2"));
+
+        // (#1503) `spec` records the grouping key: this config, zero inputs.
+        let expected_fingerprint = spec_fingerprint(&BTreeMap::new()).unwrap();
+        assert_eq!(
+            mission.spec,
+            Some(MissionSpec {
+                config_id: "freeform-test-mission".to_string(),
+                inputs_fingerprint: expected_fingerprint.clone(),
+            }),
+            "spec must record the config id + inputs fingerprint as grouping metadata"
+        );
 
         for real_phase_id in &mission.phase_ids {
             let phase_path = crew::lifecycle::phase_path(&mission_id, real_phase_id);
@@ -1652,21 +1636,33 @@ mod tests {
         // finalize_mission never ran.
         assert!(crew::lifecycle::load_envelope(&mission_id).unwrap().is_none());
 
-        // Idempotent relaunch: same (empty) inputs must derive the SAME id.
+        // (#1503) The core behavior change: a relaunch with IDENTICAL
+        // (empty) inputs mints a DISTINCT run — never reuses/reopens the
+        // prior one — but the two runs still GROUP (equal `spec`).
         let exit2 = launch("freeform-test-mission", None, &[], None).expect("relaunch should succeed");
         assert_eq!(exit2, 0);
-        let mission_id2 = derive_mission_id("freeform-test-mission", &BTreeMap::new()).unwrap();
-        assert_eq!(mission_id, mission_id2, "same inputs must derive the same instance id");
+        let ids = all_mission_ids();
+        assert_eq!(ids.len(), 2, "two launches must mint TWO missions, never collapse onto one id");
+        let mission_id2 = ids.into_iter().find(|id| id != &mission_id).unwrap();
+        assert_ne!(mission_id, mission_id2, "identical inputs must still mint a DIFFERENT run id per launch");
+
+        let mission2: Mission =
+            serde_json::from_str(&std::fs::read_to_string(crew::lifecycle::mission_path(&mission_id2)).unwrap())
+                .unwrap();
+        assert_eq!(
+            mission2.spec, mission.spec,
+            "same config + same inputs must fingerprint identically — the two runs group"
+        );
     }
 
     #[test]
     #[serial_test::serial]
-    fn freeform_relaunch_after_close_reopens_the_terminal_instance() {
+    fn freeform_relaunch_after_close_mints_a_new_run_never_reopens_the_terminal_one() {
         let guard = LaunchTestGuard::new();
         guard.write_config("freeform-test-mission", FREEFORM_CONFIG);
 
         launch("freeform-test-mission", None, &[], None).unwrap();
-        let mission_id = derive_mission_id("freeform-test-mission", &BTreeMap::new()).unwrap();
+        let mission_id = single_mission_id();
 
         crew::lifecycle::mission_close_with_reasoning(&mission_id, Some("test close")).unwrap();
         let closed: Mission =
@@ -1674,37 +1670,59 @@ mod tests {
                 .unwrap();
         assert_eq!(closed.status, MissionStatus::Finalized);
 
-        // Relaunch: same config, same (empty) inputs -> reopens the SAME
-        // instance (Packet 2 reopen semantics) rather than minting a
-        // duplicate or erroring on "already exists".
+        // (#1503) Relaunch: same config, same (empty) inputs -> mints a
+        // FRESH run id. The implicit reopen-of-a-terminal-mission path is
+        // gone — a relaunch is a new run, never a rendezvous with a prior
+        // one.
         let exit = launch("freeform-test-mission", None, &[], None).unwrap();
         assert_eq!(exit, 0);
-        let reopened: Mission =
+        let ids = all_mission_ids();
+        assert_eq!(ids.len(), 2, "relaunch after close must mint a SECOND mission, never reopen the first");
+        let new_id = ids.into_iter().find(|id| id != &mission_id).unwrap();
+        assert_ne!(new_id, mission_id, "relaunch must mint a NEW id, never reuse the terminal one");
+
+        let new_mission: Mission =
+            serde_json::from_str(&std::fs::read_to_string(crew::lifecycle::mission_path(&new_id)).unwrap()).unwrap();
+        assert_eq!(new_mission.status, MissionStatus::Active, "the new run starts Active");
+
+        // The prior (closed) mission is untouched by the relaunch.
+        let still_closed: Mission =
             serde_json::from_str(&std::fs::read_to_string(crew::lifecycle::mission_path(&mission_id)).unwrap())
                 .unwrap();
-        assert_eq!(reopened.status, MissionStatus::Active, "relaunch must reopen a terminal instance");
-        assert!(reopened.finalized_ts.is_none(), "reopen clears the prior closure");
-        assert_eq!(reopened.id, mission_id, "relaunch reuses the SAME instance id, never a duplicate");
+        assert_eq!(
+            still_closed.status,
+            MissionStatus::Finalized,
+            "a later relaunch must never mutate the prior terminal mission"
+        );
     }
 
     #[test]
     #[serial_test::serial]
-    fn different_inputs_derive_a_distinct_instance_for_the_same_config() {
+    fn different_inputs_produce_distinct_run_ids_and_distinct_spec_fingerprints() {
         let guard = LaunchTestGuard::new();
         guard.write_config("freeform-test-mission", FREEFORM_CONFIG);
 
         launch("freeform-test-mission", None, &["note=first".to_string()], None).unwrap();
         launch("freeform-test-mission", None, &["note=second".to_string()], None).unwrap();
 
-        let mut m1 = BTreeMap::new();
-        m1.insert("note".to_string(), serde_json::Value::String("first".to_string()));
-        let mut m2 = BTreeMap::new();
-        m2.insert("note".to_string(), serde_json::Value::String("second".to_string()));
-        let id1 = derive_mission_id("freeform-test-mission", &m1).unwrap();
-        let id2 = derive_mission_id("freeform-test-mission", &m2).unwrap();
-        assert_ne!(id1, id2);
-        assert!(crew::lifecycle::mission_path(&id1).is_file());
-        assert!(crew::lifecycle::mission_path(&id2).is_file());
+        let ids = all_mission_ids();
+        assert_eq!(ids.len(), 2, "two launches must mint two missions");
+        assert_ne!(ids[0], ids[1], "distinct launches always mint distinct run ids (#1503)");
+
+        // (#1503) The load-bearing behavior different inputs now drive:
+        // distinct SPEC fingerprints (distinct groups), not distinct ids
+        // (every launch already gets a distinct id regardless of inputs).
+        let specs: Vec<Option<MissionSpec>> = ids
+            .iter()
+            .map(|id| {
+                let text = std::fs::read_to_string(crew::lifecycle::mission_path(id)).unwrap();
+                serde_json::from_str::<Mission>(&text).unwrap().spec
+            })
+            .collect();
+        assert_ne!(
+            specs[0], specs[1],
+            "different inputs must fingerprint differently — distinct spec groups"
+        );
         let _ = guard;
     }
 
@@ -1754,9 +1772,8 @@ mod tests {
         collected.insert("base".to_string(), serde_json::json!("main"));
         collected.insert("role".to_string(), serde_json::json!("coder"));
 
-        let mission_id = derive_mission_id("coder-phase", &collected).unwrap();
-        let (real_phase_ids, reused) = ensure_mission_and_phases(&mission_id, config).unwrap();
-        assert!(!reused, "a fresh mint must not report reuse");
+        let mission_id = mint_run_id("coder-phase").unwrap();
+        let real_phase_ids = ensure_mission_and_phases_with_provenance(&mission_id, config, None, None).unwrap();
 
         let registry = crew::step_kinds::StepKindRegistry::with_builtins();
         let handles =
@@ -1784,8 +1801,8 @@ mod tests {
         let loaded = mission_config::load("coder-phase").unwrap();
         let config = &loaded.config;
         let collected: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        let mission_id = derive_mission_id("coder-phase", &collected).unwrap();
-        let (real_phase_ids, _) = ensure_mission_and_phases(&mission_id, config).unwrap();
+        let mission_id = mint_run_id("coder-phase").unwrap();
+        let real_phase_ids = ensure_mission_and_phases_with_provenance(&mission_id, config, None, None).unwrap();
         let registry = crew::step_kinds::StepKindRegistry::with_builtins();
         let err = match register_coder_phase_kinds(&registry, &mission_id, config, &real_phase_ids, &collected, 600)
         {
@@ -1868,6 +1885,7 @@ mod tests {
             paused_ts: None,
             source_input: None,
             ticket: None,
+            spec: None,
         };
         crew::lifecycle::save_mission(&mission).unwrap();
         let mut phase = new_planned_phase(mission_id, phase_id, Some("gate phase"), None, now);
@@ -1998,8 +2016,10 @@ mod tests {
         let exit = launch("hydration-test", None, &[], None).unwrap();
         assert_eq!(exit, 0);
 
-        // Zero inputs -> bare config id (must-fix 3).
-        let mission = load_mission_for_brief("hydration-test").unwrap();
+        // (#1503) The run id is minted fresh, not the bare config id —
+        // recover it from disk.
+        let mission_id = single_mission_id();
+        let mission = load_mission_for_brief(&mission_id).unwrap();
         assert_eq!(
             mission.source_input.as_deref(),
             Some("the operator's original unabridged words"),
@@ -2012,15 +2032,17 @@ mod tests {
         );
     }
 
-    // ── zero-input instance id (#1284 review round 1, must-fix 3) ───────
+    // ── run id minting is unique, never derived from inputs (#1503) ─────
 
     #[test]
-    fn zero_input_launch_derives_the_bare_config_id() {
-        let id = derive_mission_id("draft-blog-post", &BTreeMap::new()).unwrap();
-        assert_eq!(
-            id, "draft-blog-post",
-            "no operator inputs -> the bare config id (a constant hash suffix disambiguates nothing)"
-        );
+    fn zero_input_launch_still_mints_a_config_id_prefixed_run_id() {
+        // (#1503) A run id is never derived from inputs at all now — zero
+        // inputs no longer collapses onto the bare config id (that
+        // must-fix-3 concern doesn't apply once every launch mints
+        // uniquely); it's still config-id-PREFIXED for readability.
+        let id = mint_run_id("draft-blog-post").unwrap();
+        assert!(id.starts_with("draft-blog-post-"), "a minted id is still config-id-prefixed, got {id}");
+        assert_ne!(id, "draft-blog-post", "a minted id is never the bare config id — every launch is unique");
     }
 
     #[test]
@@ -2101,18 +2123,37 @@ mod tests {
     }
 
     #[test]
-    fn derive_mission_id_is_deterministic_and_charset_safe() {
+    fn mint_run_id_is_unique_per_call_and_charset_safe() {
+        // (#1503) `mint_run_id` takes no inputs at all — it can't derive
+        // anything from them. Two mints of the SAME config id must never
+        // collide, and the result must satisfy `fleet::validate_identifier`'s
+        // charset ([a-z0-9_-]).
+        let a = mint_run_id("coder-phase").unwrap();
+        let b = mint_run_id("coder-phase").unwrap();
+        assert_ne!(a, b, "two mints of the same config id must never collide");
+        assert!(a.starts_with("coder-phase-"));
+        assert!(
+            a.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'),
+            "minted id must satisfy fleet::validate_identifier's charset: {a}"
+        );
+    }
+
+    #[test]
+    fn spec_fingerprint_is_deterministic_and_differs_on_different_inputs() {
+        // (#1503) The grouping key: same inputs -> same fingerprint (runs
+        // group); different inputs -> different fingerprint (distinct
+        // groups) — the exact behavior the old `derive_mission_id` used to
+        // give the mission ITSELF, now demoted to metadata.
         let mut m = BTreeMap::new();
         m.insert("workdir".to_string(), serde_json::json!("/tmp/x"));
-        let a = derive_mission_id("coder-phase", &m).unwrap();
-        let b = derive_mission_id("coder-phase", &m).unwrap();
-        assert_eq!(a, b, "same config id + same inputs must derive the same instance id");
-        assert!(a.starts_with("coder-phase-"));
+        let a = spec_fingerprint(&m).unwrap();
+        let b = spec_fingerprint(&m).unwrap();
+        assert_eq!(a, b, "same inputs must fingerprint identically (so runs group)");
 
         let mut m2 = m.clone();
         m2.insert("workdir".to_string(), serde_json::json!("/tmp/y"));
-        let c = derive_mission_id("coder-phase", &m2).unwrap();
-        assert_ne!(a, c, "different inputs must derive a different instance id");
+        let c = spec_fingerprint(&m2).unwrap();
+        assert_ne!(a, c, "different inputs must fingerprint differently (distinct groups)");
     }
 
     #[test]
@@ -2149,7 +2190,7 @@ mod tests {
         let _guard = LaunchTestGuard::new();
         let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
         let mission_id = "lazy-start-test";
-        let (real_phase_ids, _reused) = ensure_mission_and_phases(mission_id, &config).unwrap();
+        let real_phase_ids = ensure_mission_and_phases_with_provenance(mission_id, &config, None, None).unwrap();
         let p1 = &real_phase_ids["p1"];
         let p2 = &real_phase_ids["p2"];
 
@@ -2189,7 +2230,7 @@ mod tests {
         let _guard = LaunchTestGuard::new();
         let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
         let mission_id = "lazy-start-idempotent";
-        let (real_phase_ids, _) = ensure_mission_and_phases(mission_id, &config).unwrap();
+        let real_phase_ids = ensure_mission_and_phases_with_provenance(mission_id, &config, None, None).unwrap();
         let p1 = &real_phase_ids["p1"];
 
         let mut started = std::collections::HashSet::new();
@@ -2203,74 +2244,46 @@ mod tests {
         assert_eq!(phase_status_on_disk(mission_id, p1), PhaseStatus::Running);
     }
 
-    /// (#1400 + #1372) The reopen-semantics regression test: a relaunch of
-    /// a Finalized mission must restart ONLY what reruns. Simulates a prior
-    /// partial run — phase 1 finished cleanly (`Complete`), phase 2
-    /// errored and was abandoned (`Abandoned`) — then reopens the SAME
-    /// mission id and asserts the reopen itself touches NEITHER phase's
-    /// status (no eager restart of the abandoned phase — the pre-#1400
-    /// bug), while the lazy hook still restarts the abandoned one once its
-    /// own step actually begins, and the terminal phase stays untouched
-    /// throughout (nothing reruns for it, so nothing calls the hook for
-    /// it).
+    /// (#1503) The reuse/reopen-by-derived-id path is gone: a mint against
+    /// an id that already exists on disk — which should never happen in
+    /// practice, since `mint_run_id` mints uniquely — bails loud rather
+    /// than silently reopening a terminal mission or mutating live phase
+    /// state. This replaces the pre-#1503 reopen-semantics regression test
+    /// (`reopen_preserves_terminal_phase_status_and_restarts_only_
+    /// abandoned_ones_lazily`), which asserted the removed reopen
+    /// behavior — a SECOND `ensure_mission_and_phases` call against the
+    /// same id used to reactivate a Finalized mission and restart only
+    /// what reruns; now it errors instead, and the original (however
+    /// terminal or mid-flight) record is left completely untouched.
     #[test]
     #[serial_test::serial]
-    fn reopen_preserves_terminal_phase_status_and_restarts_only_abandoned_ones_lazily() {
+    fn ensure_mission_and_phases_bails_loud_on_an_existing_mission_id_never_reopens() {
         let _guard = LaunchTestGuard::new();
         let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
-        let mission_id = "lazy-reopen-test";
-        let (real_phase_ids, _) = ensure_mission_and_phases(mission_id, &config).unwrap();
+        let mission_id = "collision-test";
+        let real_phase_ids = ensure_mission_and_phases_with_provenance(mission_id, &config, None, None).unwrap();
         let p1 = &real_phase_ids["p1"];
-        let p2 = &real_phase_ids["p2"];
 
         crew::lifecycle::phase_start(p1).unwrap();
         crew::lifecycle::phase_complete(p1).unwrap();
-        crew::lifecycle::phase_start(p2).unwrap();
-        crew::lifecycle::phase_abandon(p2).unwrap();
         crew::lifecycle::mission_close_with_reasoning(mission_id, Some("test close")).unwrap();
         assert_eq!(mission_status_on_disk(mission_id), MissionStatus::Finalized);
 
-        // Relaunch (reopen) the SAME mission id.
-        let (real_phase_ids2, reused) = ensure_mission_and_phases(mission_id, &config).unwrap();
-        assert!(reused);
-        assert_eq!(real_phase_ids2, real_phase_ids);
-        assert_eq!(mission_status_on_disk(mission_id), MissionStatus::Active, "reopen reactivates the mission");
-
-        // (#1400) Preserved #1372 semantics: reopen restarts only what
-        // reruns. p1 (terminal Complete) is untouched; p2 (Abandoned) is
-        // ALSO untouched AT REOPEN TIME — not eagerly flipped to Running —
-        // only the scheduler's own lazy hook, once it actually reaches
-        // p2's first step, does that.
-        assert_eq!(
-            phase_status_on_disk(mission_id, p1),
-            PhaseStatus::Complete,
-            "a terminal phase is never touched by reopen"
-        );
-        assert_eq!(
-            phase_status_on_disk(mission_id, p2),
-            PhaseStatus::Abandoned,
-            "reopen must NOT eagerly restart an abandoned phase — that was the #1400 bug"
-        );
-
-        // The lazy hook restarts p2 once its own step actually begins; p1
-        // is never called (its graph doesn't rerun), proving the restart
-        // stays scoped to "only what reruns."
-        let mut started = std::collections::HashSet::new();
-        lazy_start_phase_for_step(mission_id, p2, NodeStatus::Running, &mut started);
-        assert_eq!(
-            phase_status_on_disk(mission_id, p2),
-            PhaseStatus::Running,
-            "the lazy hook restarts an Abandoned phase on reach"
-        );
+        // A second mint against the SAME id must bail loud, never reopen.
+        let err = ensure_mission_and_phases_with_provenance(mission_id, &config, None, None).unwrap_err();
         assert!(
-            load_phase_for_brief(mission_id, p2).unwrap().abandoned_ts.is_none(),
-            "restart clears abandoned_ts, matching phase_start's own convention"
+            err.to_string().contains("already exists"),
+            "a second mint against an existing id must bail loud, never reopen: {err}"
         );
+
+        // The original terminal mission and its completed phase are
+        // completely untouched by the failed second mint.
         assert_eq!(
-            phase_status_on_disk(mission_id, p1),
-            PhaseStatus::Complete,
-            "p1 stays untouched since nothing reruns for it"
+            mission_status_on_disk(mission_id),
+            MissionStatus::Finalized,
+            "a bailed-out collision attempt must never mutate the existing record"
         );
+        assert_eq!(phase_status_on_disk(mission_id, p1), PhaseStatus::Complete);
     }
 
     // ── (#1406) Honest finalize: per-phase outcomes from step statuses ──
@@ -2309,6 +2322,7 @@ mod tests {
             paused_ts: None,
             source_input: None,
             ticket: None,
+            spec: None,
         };
         crew::lifecycle::save_mission(&mission).unwrap();
         for (id, status) in phases {

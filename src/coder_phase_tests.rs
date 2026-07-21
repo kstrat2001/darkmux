@@ -1071,6 +1071,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             paused_ts: None,
             source_input: None,
             ticket: None,
+            spec: None,
         }
     }
 
