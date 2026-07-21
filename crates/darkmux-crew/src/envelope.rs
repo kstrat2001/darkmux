@@ -459,6 +459,7 @@ mod tests {
             paused_ts: None,
             source_input: None,
             ticket: None,
+            spec: None,
         };
         write_json(&lifecycle::mission_path(id), &m);
         m
