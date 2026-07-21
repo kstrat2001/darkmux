@@ -127,11 +127,29 @@ pub(crate) fn dispatch_as_crew_of_one_with(
     let step_id = step.id.clone();
 
     lifecycle::save_mission(&mission).context("persisting mission.json for the dispatch run")?;
-    lifecycle::save_phase(&phase).context("persisting phase.json for the dispatch run")?;
-    lifecycle::mission_start_with_reasoning(&mission_id, Some(&format!("darkmux dispatch {}", opts.role_id)))
-        .context("starting the newly-minted dispatch run")?;
-    lifecycle::phase_start(&phase_id).context("starting the dispatch run's phase")?;
-    lifecycle::save_task(&mission_id, &task).context("persisting task.json for the dispatch run")?;
+
+    // (#1504 parity, found live in review) `mission.json` now exists on
+    // disk, so EVERY fallible call from here through `run_step_graph`
+    // starting is a strand window: a bare `?` on any of these would leave an
+    // Active mission with no reconcile (`reconcile_on_error` below only
+    // covers `run_step_graph`'s own `Err`, which fires strictly AFTER this
+    // block). Mirrors `mission_launch.rs`'s identical guarding of its own
+    // post-mint setup calls — route every failure in this window through
+    // `reconcile_mint_failure` (the #1504 helper: closes the mission
+    // terminal, cascading any partially-minted `Planned`/`Running` phase to
+    // `Abandoned`) before propagating.
+    let setup: Result<()> = (|| {
+        lifecycle::save_phase(&phase).context("persisting phase.json for the dispatch run")?;
+        lifecycle::mission_start_with_reasoning(&mission_id, Some(&format!("darkmux dispatch {}", opts.role_id)))
+            .context("starting the newly-minted dispatch run")?;
+        lifecycle::phase_start(&phase_id).context("starting the dispatch run's phase")?;
+        lifecycle::save_task(&mission_id, &task).context("persisting task.json for the dispatch run")?;
+        Ok(())
+    })();
+    if let Err(e) = setup {
+        lifecycle::reconcile_mint_failure(&mission_id, &format!("dispatch run errored during setup: {e:#}"));
+        return Err(e);
+    }
 
     let mut steps: BTreeMap<String, Step> = BTreeMap::new();
     steps.insert(step_id.clone(), step);
@@ -180,7 +198,15 @@ pub(crate) fn dispatch_as_crew_of_one_with(
                 session_id: raw.session_id,
                 out_dir: raw.out_dir,
             };
-            finalize(&mission_id, &phase_id, result.exit_code == 0, step_result_reason(result.exit_code));
+            // A non-zero dispatch exit is real, postable output (the dispatch
+            // RAN, it just didn't finish cleanly) — `Degraded`, which
+            // `MissionOutcomeStatus::phase_outcome` maps to phase `Complete`,
+            // same as `Clean`. `Error` is reserved for the two arms below,
+            // where the step itself never produced a `RawDispatchOutcome` at
+            // all.
+            let status =
+                if result.exit_code == 0 { MissionOutcomeStatus::Clean } else { MissionOutcomeStatus::Degraded };
+            finalize(&mission_id, &phase_id, status, step_result_reason(result.exit_code));
             Ok(result)
         }
         NodeStatus::Error => {
@@ -189,14 +215,21 @@ pub(crate) fn dispatch_as_crew_of_one_with(
             // `.with_context(...)?`), the one case `preserve_dispatch_result`
             // doesn't intercept. Matches the pre-#1509 contract: a raw
             // `dispatch()` `Err` propagated straight through `dispatch_routed`'s
-            // `?` to the CLI.
+            // `?` to the CLI. This is a HARD failure — no `RawDispatchOutcome`
+            // was ever produced, so it is `MissionOutcomeStatus::Error` (->
+            // phase `Abandoned`), never `Degraded`/`Clean` (-> phase
+            // `Complete`) — matching `mission_launch.rs::build_envelope`'s
+            // canonical "any errored step -> phase Abandoned, mission Error"
+            // derivation (found live in review: this arm previously mapped to
+            // `Degraded`/`Complete`, writing a dishonest "success" record over
+            // a step that never ran to completion at all).
             let reason = step.output.clone().unwrap_or_default();
-            finalize(&mission_id, &phase_id, false, Some(reason.clone()));
+            finalize(&mission_id, &phase_id, MissionOutcomeStatus::Error, Some(reason.clone()));
             Err(anyhow!("{reason}"))
         }
         other => {
             let reason = format!("dispatch: crew-of-one step ended in unexpected status {other:?}");
-            finalize(&mission_id, &phase_id, false, Some(reason.clone()));
+            finalize(&mission_id, &phase_id, MissionOutcomeStatus::Error, Some(reason.clone()));
             bail!(reason);
         }
     }
@@ -210,15 +243,11 @@ fn step_result_reason(exit_code: i32) -> Option<String> {
     }
 }
 
-/// Drive the crew-of-one mission to its terminal status. `clean` maps to
-/// `MissionOutcomeStatus::Clean` (phase Complete); anything else maps to
-/// `Degraded` when the step at least completed with output (a non-zero
-/// dispatch exit is real, postable output — the same "Degraded still
-/// completes the phase" reasoning `envelope.rs`'s module doc gives every
-/// mission type) — never `Error`, which this function reserves for the
-/// harness-level failure paths that call `reconcile_on_error` instead.
-fn finalize(mission_id: &str, phase_id: &str, clean: bool, reason: Option<String>) {
-    let status = if clean { MissionOutcomeStatus::Clean } else { MissionOutcomeStatus::Degraded };
+/// Drive the crew-of-one mission to its terminal status per
+/// `MissionOutcomeStatus::phase_outcome` (Clean/Degraded -> phase Complete;
+/// Degenerate/Error -> phase Abandoned) — see that type's own doc for the
+/// full mapping this function defers to entirely rather than re-deciding.
+fn finalize(mission_id: &str, phase_id: &str, status: MissionOutcomeStatus, reason: Option<String>) {
     let mut envelope = MissionEnvelope::new(mission_id, status, &[phase_id]);
     envelope.reason = reason;
     crate::envelope::finalize_mission(&envelope);
@@ -352,7 +381,10 @@ fn mint_dispatch_run_id(role_id: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let secs = nanos / 1_000_000_000;
     let slug = sanitize_role_slug(role_id);
-    format!("dispatch-{slug}-{secs}-{pid:x}{n:x}")
+    // (#1509 review) A `-` separator between the pid and counter hex avoids
+    // digit-boundary aliasing — pid=0x1,n=0xa23 and pid=0x1a,n=0x23 would
+    // otherwise both concatenate to "1a23".
+    format!("dispatch-{slug}-{secs}-{pid:x}-{n:x}")
 }
 
 /// Reduce `role_id` to the `[a-z0-9_-]` charset every persisted id in this
@@ -849,6 +881,68 @@ mod tests {
         // `fleet::dispatch_routed(opts)?` contract.
         let err = dispatch_as_crew_of_one_with(opts, &registry, &host_factory).unwrap_err();
         assert!(err.to_string().contains("fake dispatch() failure"), "{err}");
+    }
+
+    /// (#1509 review — the MUST FIX) A hard `dispatch()`-level `Err` must
+    /// write an HONEST terminal record, not a dishonest "success"-shaped
+    /// one. Before this fix, the `NodeStatus::Error` arm finalized with
+    /// `clean: false` -> `MissionOutcomeStatus::Degraded` ->
+    /// `PhaseOutcomeKind::Complete` — a mission `Finalized`/`Degraded` with
+    /// its phase `Complete`, over a step that actually ended `Error` and
+    /// never produced a `RawDispatchOutcome` at all. `mission status` /
+    /// debrief / the future `/runs` aggregator would have read that as a
+    /// SUCCESS. Asserts the ON-DISK state directly — the returned `Err` alone
+    /// (asserted by the sibling test above) does not catch this, since the
+    /// bug was in what got PERSISTED, not in what got RETURNED.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_as_crew_of_one_hard_error_writes_an_honest_terminal_record() {
+        let _guard = RunGuard::new();
+        let kind = FakeDispatchKind {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            should_err: true,
+            placement: placement(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let registry = test_registry(kind);
+        let host = Arc::new(Mutex::new(MockHost::new().cataloged("test-model", 5_000_000_000)));
+        let host_for_factory = host.clone();
+        let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> {
+            Box::new(SharedMockHost(host_for_factory.clone()))
+        };
+
+        let opts = test_opts("coder", "build the thing");
+        assert!(dispatch_as_crew_of_one_with(opts, &registry, &host_factory).is_err());
+
+        let missions_dir = crate::loader::missions_dir();
+        let entries: Vec<_> = std::fs::read_dir(&missions_dir).unwrap().collect();
+        assert_eq!(entries.len(), 1, "exactly one mission dir minted");
+        let mission_id = entries[0].as_ref().unwrap().file_name().to_string_lossy().to_string();
+
+        let mission = crate::lifecycle::load_mission_by_id(&mission_id).unwrap();
+        assert_eq!(
+            mission.status,
+            MissionStatus::Finalized,
+            "a hard dispatch error still reaches a terminal mission status, never left Active"
+        );
+
+        let phase_id = &mission.phase_ids[0];
+        let phase = crate::lifecycle::load_phase_by_id(phase_id).unwrap();
+        assert_eq!(
+            phase.status,
+            PhaseStatus::Abandoned,
+            "a hard dispatch error must Abandon the phase, never Complete it — a Complete phase \
+             over an Error step reads as success to mission status/debrief/the /runs aggregator"
+        );
+
+        let envelope = crate::lifecycle::load_envelope(&mission_id).unwrap().expect("envelope persisted");
+        assert_eq!(
+            envelope.status,
+            MissionOutcomeStatus::Error,
+            "the envelope must record Error, not Degraded/Clean, for a hard dispatch() failure"
+        );
     }
 
     #[test]

@@ -78,19 +78,94 @@ fn require_config_str<'a>(step: &'a Step, kind_id: &str, key: &str) -> Result<&'
 /// no active profile, a remote-endpoint model, or a local model missing
 /// `n_ctx`. A misclassification here costs a missed RAM-safety
 /// optimization, never a hard failure — see the trait doc on `residency`.
+///
+/// **The fail-open is not free (#1509 review finding).** `Residency::Remote`
+/// means `run_step_graph` never calls `ensure_wave_loaded` for this step —
+/// no wave load, and (load-bearing) **no #1487 residency lease written**, so
+/// the dispatch runs completely UNPROTECTED against a concurrent command's
+/// `Exclusive` reconcile, which can evict its model mid-generation with zero
+/// warning. That's the correct, silent behavior for a GENUINELY remote
+/// (endpoint-bearing) model — it was never going to touch local residency.
+/// It is a SILENT SAFETY GAP for every other fail-open cause (unresolvable
+/// role, unloadable registry, no active profile, a local model missing
+/// `n_ctx`) — those mean "this SHOULD have been a local, lease-protected
+/// dispatch, but resolution broke," and voiding the #1487 protection with no
+/// signal is exactly the "loud beats quiet" anti-pattern `CLAUDE.md` names.
+/// [`resolve_local_placement_or_warn`] is that distinction made real: it
+/// classifies WHICH fail-open reason fired and `eprintln!`s a named warning
+/// for every cause except the legitimate remote-model one.
 pub fn resolve_local_placement(
     role_id: &str,
     profile_name: Option<&str>,
     config_path: Option<&str>,
     seat: &str,
 ) -> Option<darkmux_gestalt::Placement> {
+    resolve_local_placement_or_warn(role_id, profile_name, config_path, seat)
+}
+
+/// Why [`resolve_local_placement_inner`] returned no `Placement` — see that
+/// function's doc. `Remote` is the legitimate, silent case (an
+/// endpoint-bearing model was never going to need local residency);
+/// `ResolutionFailed` is the loud one (see [`resolve_local_placement`]'s own
+/// doc on why fail-open silence there is a real safety gap).
+enum PlacementMiss {
+    Remote,
+    ResolutionFailed(String),
+}
+
+/// [`resolve_local_placement`]'s actual body, classified per [`PlacementMiss`]
+/// instead of collapsing every miss to a bare `None`. `eprintln!`s a named
+/// warning on every `ResolutionFailed` cause (never on the legitimate
+/// `Remote` case) before falling open to `None`, same return contract as
+/// before.
+fn resolve_local_placement_or_warn(
+    role_id: &str,
+    profile_name: Option<&str>,
+    config_path: Option<&str>,
+    seat: &str,
+) -> Option<darkmux_gestalt::Placement> {
+    match resolve_local_placement_inner(role_id, profile_name, config_path, seat) {
+        Ok(placement) => Some(placement),
+        Err(PlacementMiss::Remote) => None,
+        Err(PlacementMiss::ResolutionFailed(reason)) => {
+            eprintln!(
+                "darkmux: step `{seat}` (role `{role_id}`) could not resolve a LOCAL residency \
+                 placement ({reason}) — classifying this dispatch Remote. If this role/profile IS \
+                 meant to run a local model, this dispatch just lost the #1487 residency-lease \
+                 protection: a concurrent darkmux command's Exclusive reconcile could evict its \
+                 model mid-generation with no further warning. (This is a best-effort SCHEDULING \
+                 classification, not the dispatch's own strict preflight — that still runs \
+                 separately and may itself fail loud.)"
+            );
+            None
+        }
+    }
+}
+
+/// The classified resolution chain — see [`PlacementMiss`] and
+/// [`resolve_local_placement_or_warn`]. Pure logic, no `eprintln!` here (the
+/// caller owns deciding which `Err` variant is worth surfacing).
+fn resolve_local_placement_inner(
+    role_id: &str,
+    profile_name: Option<&str>,
+    config_path: Option<&str>,
+    seat: &str,
+) -> std::result::Result<darkmux_gestalt::Placement, PlacementMiss> {
     use crate::select::select_model;
+    use PlacementMiss::ResolutionFailed;
 
-    let loaded = darkmux_profiles::profiles::load_registry(config_path).ok()?;
-    let (_active_name, profile) = loaded.registry.resolve_active(profile_name)?;
+    let loaded = darkmux_profiles::profiles::load_registry(config_path)
+        .map_err(|e| ResolutionFailed(format!("profile registry: {e}")))?;
+    let (_active_name, profile) = loaded
+        .registry
+        .resolve_active(profile_name)
+        .ok_or_else(|| ResolutionFailed("no active profile".to_string()))?;
 
-    let roles = crate::loader::load_roles().ok()?;
-    let role = roles.iter().find(|r| r.id == role_id)?;
+    let roles = crate::loader::load_roles().map_err(|e| ResolutionFailed(format!("loading roles: {e}")))?;
+    let role = roles
+        .iter()
+        .find(|r| r.id == role_id)
+        .ok_or_else(|| ResolutionFailed(format!("role `{role_id}` not found")))?;
 
     let skill_index: std::collections::HashMap<String, crate::types::Skill> =
         crate::loader::load_skills()
@@ -98,14 +173,21 @@ pub fn resolve_local_placement(
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
-    let model_id = select_model(role, profile, |id| skill_index.get(id)).ok()?;
-    let pm = profile.models.iter().find(|m| m.id == model_id)?;
+    let model_id = select_model(role, profile, |id| skill_index.get(id))
+        .map_err(|e| ResolutionFailed(format!("select_model: {e}")))?;
+    let pm = profile
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| ResolutionFailed(format!("selected model `{model_id}` not found in profile")))?;
     if pm.is_remote() {
-        return None;
+        return Err(PlacementMiss::Remote);
     }
-    let min_ctx = pm.n_ctx?;
+    let min_ctx = pm
+        .n_ctx
+        .ok_or_else(|| ResolutionFailed(format!("model `{}` has no declared n_ctx", pm.id)))?;
     let identifier = darkmux_gestalt::namespaced_identifier(&pm.id, pm.identifier.as_deref());
-    Some(darkmux_gestalt::Placement {
+    Ok(darkmux_gestalt::Placement {
         model_key: pm.id.clone(),
         identifier,
         min_ctx,
