@@ -252,16 +252,42 @@ pub fn build_work_job(
 
 use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision};
 
+/// Route a dispatch local-vs-remote, then run it locally via the raw
+/// `crew::dispatch::dispatch` primitive — the pre-#1509 behavior, and still
+/// what every caller other than the `darkmux dispatch` CLI verb wants
+/// (`phase_cli`'s QA-gate dispatch, `mission_propose`, `notebook` — #1509's
+/// scope is the CLI verb only; those three are a named follow-up, see
+/// `dispatch_as_crew_of_one`'s module doc). Thin wrapper over
+/// [`dispatch_routed_via`]; see that function's doc for the full routing
+/// contract.
+pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
+    dispatch_routed_via(opts, dispatch::dispatch)
+}
+
 /// Route a dispatch local-vs-remote, then run it. When `--machine` is set
 /// (and isn't the local machine), publish to the single global work queue
 /// and (if `--wait`) block on the runner's `dispatch.complete` flow
-/// record. Otherwise fall through to the local dispatch path
-/// (`crew::dispatch::dispatch`). After #590 there is no tier auto-route:
-/// the only fleet-queue path is explicit `--machine`, and it's advisory
-/// (any runner may claim; a non-target runner logs a soft warning and
-/// proceeds). (#246 PR-C.3; relocated from `crew::dispatch::dispatch` in
-/// #463; tier auto-route retired in #590.)
-pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
+/// record. Otherwise fall through to `local_dispatch` — a caller-injected
+/// LOCAL execution primitive (#1509). Every caller except the `darkmux
+/// dispatch` CLI verb passes the raw `crew::dispatch::dispatch` primitive
+/// (via the [`dispatch_routed`] thin wrapper, unchanged pre-#1509 behavior);
+/// the CLI verb passes `darkmux_crew::dispatch_as_crew_of_one::
+/// dispatch_as_crew_of_one`, which runs the SAME primitive wrapped in a
+/// crew-of-one Mission/Phase/Task/Step graph through `run_step_graph` — a
+/// first-class run whose residency participates in the #1487 lease/
+/// reconcile regime. Only the LOCAL fall-through switches; the `--machine`
+/// routing decision, the queue-publish path, and every warning/route-record
+/// emission below are unchanged for every caller (a `--machine` dispatch's
+/// residency lives on the REMOTE runner machine, out of #1509's scope — see
+/// its own module doc). After #590 there is no tier auto-route: the only
+/// fleet-queue path is explicit `--machine`, and it's advisory (any runner
+/// may claim; a non-target runner logs a soft warning and proceeds). (#246
+/// PR-C.3; relocated from `crew::dispatch::dispatch` in #463; tier
+/// auto-route retired in #590; `local_dispatch` injection added in #1509.)
+pub fn dispatch_routed_via(
+    opts: DispatchOpts,
+    local_dispatch: impl FnOnce(DispatchOpts) -> Result<DispatchResult>,
+) -> Result<DispatchResult> {
     if let Some(target) = opts.machine.clone() {
         let local = darkmux_flow::resolve_machine_id();
         match dispatch::routing_decision(Some(target.as_str()), local.as_deref()) {
@@ -322,8 +348,9 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
 
     // Local fall-through — no `--machine` means run on this machine
     // (#590: the tier auto-route arm was removed; there's no tier to
-    // trigger auto-routing).
-    dispatch::dispatch(opts)
+    // trigger auto-routing). `local_dispatch` is the caller-injected LOCAL
+    // execution primitive (#1509) — see this function's own doc.
+    local_dispatch(opts)
 }
 
 /// Publish a dispatch to the single global fleet work queue instead of
@@ -629,6 +656,65 @@ mod tests {
             payload: None,
         };
         assert_eq!(completion_to_dispatch_result(bad).exit_code, 1, "non-ok → 1");
+    }
+
+    // (#1509) `dispatch_routed_via`'s local-dispatch injection seam. No
+    // `opts.machine` means the local fall-through runs — never touches
+    // Redis/the queue, so this is a fast, hermetic unit test even though
+    // `dispatch_routed_via` is the same function a live `--machine` dispatch
+    // uses.
+
+    fn local_opts(role_id: &str) -> DispatchOpts {
+        DispatchOpts {
+            role_id: role_id.to_string(),
+            message: "hi".to_string(),
+            session_id: None,
+            timeout_seconds: 60,
+            skip_preflight: false,
+            json: true,
+            workdir: None,
+            phase_id: None,
+            machine: None,
+            wait: true,
+            compaction: darkmux_crew::dispatch::CompactionDispatchArgs::default(),
+            profile_name: None,
+            config_path: None,
+            force_container: false,
+            max_completion_tokens: None,
+            image: None,
+            model_base_url_override: None,
+            step_id: None,
+        }
+    }
+
+    #[test]
+    fn dispatch_routed_via_runs_the_injected_local_dispatch_on_the_local_fallthrough() {
+        let called = std::cell::RefCell::new(false);
+        let result = dispatch_routed_via(local_opts("coder"), |opts| {
+            *called.borrow_mut() = true;
+            assert_eq!(opts.role_id, "coder", "the SAME opts must reach the injected closure");
+            Ok(DispatchResult {
+                exit_code: 0,
+                stdout: "injected stdout".to_string(),
+                stderr: String::new(),
+                session_id: "sess-injected".to_string(),
+                out_dir: None,
+            })
+        })
+        .unwrap();
+
+        assert!(*called.borrow(), "the local fall-through must call the injected closure");
+        assert_eq!(result.stdout, "injected stdout");
+        assert_eq!(result.session_id, "sess-injected");
+    }
+
+    #[test]
+    fn dispatch_routed_via_propagates_the_injected_closures_error() {
+        let err = dispatch_routed_via(local_opts("coder"), |_opts| {
+            Err(anyhow!("injected failure"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("injected failure"), "{err}");
     }
 }
 

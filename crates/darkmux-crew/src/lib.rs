@@ -22,6 +22,10 @@ pub mod concurrent_dispatch;
 // injection path and `darkmux memory correction list`.
 pub mod corrections;
 pub mod dispatch;
+// (#1509) `darkmux dispatch` as a crew of one — routes the CLI verb through
+// the same `run_step_graph` engine every mission/coder-phase/review run
+// uses, so its residency participates in the #1487 lease/reconcile regime.
+pub mod dispatch_as_crew_of_one;
 pub mod dispatch_internal;
 // (#1284 Packet 2) The standard output contract every mission emits +
 // generalized finalization. `ReviewEnvelope` (darkmux-lab) maps INTO
