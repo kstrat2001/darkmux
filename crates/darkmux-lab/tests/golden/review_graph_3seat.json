@@ -164,7 +164,7 @@
         "review-probe-mid-task",
         "review-probe-low-task"
       ],
-      "description": "dedup probe flags — mechanism-family keying + anchor matching. (#1512) `depends_on` below IS the probe role registry: build_review_graph reads it to discover which roles staff the probe stage, so adding/removing a probe task here (with its own role_id) changes the probe count with zero Rust changes.",
+      "description": "dedup probe flags — mechanism-family keying + anchor matching. (#1512, #1513 review) `depends_on` below is build_review_graph's CLAIM/PRUNE boundary, NOT the probe role registry: a resolved staffing claims its declared task by role_id, and any declared task nobody claims is pruned (loudly, with a warning). Probe roles are discovered separately, by resolve_review_roles walking every task in this document and classifying each by its step kind. Adding/removing a probe task here (with its own role_id, and its entry in this depends_on list) still changes the probe count with zero Rust changes.",
       "display_name": "Dedup",
       "id": "review-dedup-task",
       "phase_id": "pr-review-golden-investigate",

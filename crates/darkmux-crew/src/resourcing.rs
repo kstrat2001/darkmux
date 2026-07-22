@@ -123,6 +123,13 @@ pub struct ResolvedReviewRoles {
     /// Whether confirmed findings render as a blocking `REQUEST_CHANGES` review
     /// (`true`) or a non-blocking `COMMENT` review (`false`, the default).
     pub request_changes: bool,
+    /// (#1513 review C3) Non-fatal resolution-time findings — today, exactly
+    /// one shape: a `review.verify-render` task exists in the document but
+    /// carries no `role_id`, so `verify` above resolves to `None` for a
+    /// reason worth naming rather than silently. Empty in the healthy
+    /// default case. Callers should fold these into the run's envelope
+    /// warnings so "verify never ran" always has a stated cause.
+    pub warnings: Vec<String>,
 }
 
 impl ResolvedReviewRoles {
@@ -223,32 +230,64 @@ pub fn resolve_review_roles(
     let judge_passes = ov.passes.unwrap_or(DEFAULT_JUDGE_PASSES);
 
     let mut judge_role: Option<String> = None;
+    let mut judge_roleless_task_id: Option<String> = None;
     let mut verify_role: Option<String> = None;
+    let mut verify_roleless_task_id: Option<String> = None;
     let mut probe_role_ids: Vec<String> = Vec::new();
 
+    // (#1513 review C3) Classify by step kind FIRST, before looking at
+    // `role_id` at all — the old order (`let Some(role_id) = ... else {
+    // continue }` before the kind check) meant a judge/verify task with a
+    // MISSING role_id was skipped silently, so its absence read identically
+    // to "this document declares no judge/verify task" downstream. Checking
+    // the kind first lets a roleless judge/verify task be told apart from a
+    // genuinely absent one.
     for task in config.phases.iter().flat_map(|p| p.tasks.iter()) {
-        let Some(role_id) = &task.role_id else { continue };
         let is_judge = task.steps.iter().any(|s| s.kind == "review.judge");
         let is_verify = task.steps.iter().any(|s| s.kind == "review.verify-render");
         if is_judge {
-            if judge_role.is_some() {
+            if judge_role.is_some() || judge_roleless_task_id.is_some() {
                 bail!(
                     "darkmux: \"review\" mission config declares more than one task with a \
                      \"review.judge\" step — the judge stage is exactly one task (#1512)"
                 );
             }
-            judge_role = Some(role_id.clone());
-        } else if is_verify {
-            if verify_role.is_some() {
+            match &task.role_id {
+                Some(role_id) => judge_role = Some(role_id.clone()),
+                None => judge_roleless_task_id = Some(task.id.clone()),
+            }
+            continue;
+        }
+        if is_verify {
+            if verify_role.is_some() || verify_roleless_task_id.is_some() {
                 bail!(
                     "darkmux: \"review\" mission config declares more than one task with a \
                      \"review.verify-render\" step — the verify stage is at most one task (#1512)"
                 );
             }
-            verify_role = Some(role_id.clone());
-        } else {
-            probe_role_ids.push(role_id.clone());
+            match &task.role_id {
+                Some(role_id) => verify_role = Some(role_id.clone()),
+                None => verify_roleless_task_id = Some(task.id.clone()),
+            }
+            continue;
         }
+        let Some(role_id) = &task.role_id else { continue };
+        // (#1513 review C2) Two probe tasks sharing a role_id would let
+        // `build_review_graph_from_config`'s by-role_id claim match BOTH to
+        // the same declared task — one claims it, the other silently loses
+        // its dispatch (and `reconstruct_probe_stage` double-counts the
+        // claimant). Bail here, at the source of truth for what "a probe
+        // role" even is, rather than downstream where the collision is a
+        // symptom.
+        if probe_role_ids.contains(role_id) {
+            bail!(
+                "darkmux: \"review\" mission config declares two probe tasks with the same \
+                 role_id \"{role_id}\" — each probe task needs a distinct role_id, or the \
+                 by-role_id claim step in build_review_graph can't tell them apart (#1512, \
+                 #1513 review C2)"
+            );
+        }
+        probe_role_ids.push(role_id.clone());
     }
 
     if probe_role_ids.is_empty() {
@@ -257,24 +296,48 @@ pub fn resolve_review_roles(
              declares no role-bearing task outside the judge/verify stages (#1512)"
         );
     }
-    let judge_role_id = judge_role.ok_or_else(|| {
-        anyhow!(
+    let judge_role_id = if let Some(role_id) = judge_role {
+        role_id
+    } else if let Some(task_id) = judge_roleless_task_id {
+        // (#1513 review C3) Distinct from "no judge task at all" below —
+        // the task IS there, it's just unstaffed.
+        bail!(
+            "darkmux: review resourcing: \"review\" mission config's judge task (\"{task_id}\", \
+             the task with a \"review.judge\" step) declares no role_id — a judge stage with no \
+             staffed role can't dispatch (#1512, #1513 review C3)"
+        );
+    } else {
+        bail!(
             "darkmux: review resourcing: \"review\" mission config declares no judge task (a \
              task with a \"review.judge\" step) (#1512)"
-        )
-    })?;
+        );
+    };
 
     let mut probes = Vec::with_capacity(probe_role_ids.len());
     for role_id in &probe_role_ids {
         probes.push(resolve_task_role(reg, role_id, mapped, DEFAULT_JUDGE_PASSES)?);
     }
     let judge = resolve_task_role(reg, &judge_role_id, mapped, judge_passes)?;
+    let mut warnings: Vec<String> = Vec::new();
     let verify = match verify_role {
         Some(role_id) => Some(resolve_task_role(reg, &role_id, mapped, 1)?),
-        None => None,
+        None => {
+            // (#1513 review C3) The task exists but has no role_id — surface
+            // WHY verify resolved to None instead of leaving the caller to
+            // infer "verify never ran" with no stated cause.
+            if let Some(task_id) = verify_roleless_task_id {
+                warnings.push(format!(
+                    "\"review\" mission config's verify task (\"{task_id}\", the task with a \
+                     \"review.verify-render\" step) declares no role_id — verify will not run \
+                     this pass (resolved to no verify staffing) because there is no role to \
+                     staff it (#1512, #1513 review C3)"
+                ));
+            }
+            None
+        }
     };
 
-    Ok(ResolvedReviewRoles { probes, judge, verify, request_changes: ov.request_changes })
+    Ok(ResolvedReviewRoles { probes, judge, verify, request_changes: ov.request_changes, warnings })
 }
 
 /// (#1475 packet 2, #1512, #1513 review) Resolve ONE task's role to a
@@ -709,5 +772,109 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no judge task"), "{err}");
+    }
+
+    // ─── (#1513 review C1/C2/C3) config-edit-path safety ──────────────────────
+
+    /// (#1513 review C2) Two probe tasks sharing a role_id is a loud error at
+    /// the source of truth for "what a probe role is" — downstream,
+    /// `build_review_graph_from_config`'s by-role_id claim can't tell them
+    /// apart (one claims the shared declared task, the other silently loses
+    /// its dispatch; `reconstruct_probe_stage` double-counts the claimant).
+    #[test]
+    fn resolve_review_roles_with_duplicate_probe_role_id_errors_loudly() {
+        let reg = multi_reg(vec![("solo", vec![model("only", 32000)])], Some("solo"));
+        let doc = serde_json::json!({
+            "id": "review",
+            "name": "PR Review",
+            "phases": [
+                {"id": "investigate", "tasks": [
+                    {"id": "review-bundle-task", "depends_on": [], "steps": [{"id": "review-bundle-step", "kind": "review.bundle"}]},
+                    {"id": "review-probe-a-task", "role_id": "review-probe-dup", "depends_on": ["review-bundle-task"],
+                     "steps": [{"id": "review-probe-a-step", "kind": "dispatch.map"}]},
+                    {"id": "review-probe-b-task", "role_id": "review-probe-dup", "depends_on": ["review-bundle-task"],
+                     "steps": [{"id": "review-probe-b-step", "kind": "dispatch.map"}]}
+                ]},
+                {"id": "adjudicate", "tasks": [
+                    {"id": "review-judge-task", "role_id": "review-judge", "depends_on": [],
+                     "steps": [{"id": "review-judge-step", "kind": "review.judge"}]}
+                ]}
+            ]
+        });
+        let config: crate::mission_config::MissionConfig = serde_json::from_value(doc).unwrap();
+        let err = resolve_review_roles(&reg, &config, &ReviewRoleStaffing::default(), &|_| RoleBinding::Unmapped)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("review-probe-dup"), "names the shared role_id: {err}");
+    }
+
+    /// (#1513 review C3) A judge task that EXISTS but declares no role_id
+    /// must produce a DIFFERENT error than "no judge task at all" — the old
+    /// behavior (skip roleless tasks before checking kind) collapsed both
+    /// into the same message, hiding that the task is right there, just
+    /// unstaffed.
+    #[test]
+    fn resolve_review_roles_judge_task_present_but_roleless_errors_distinctly_from_absent() {
+        let reg = multi_reg(vec![("solo", vec![model("only", 32000)])], Some("solo"));
+        let doc = serde_json::json!({
+            "id": "review",
+            "name": "PR Review",
+            "phases": [
+                {"id": "investigate", "tasks": [
+                    {"id": "review-bundle-task", "depends_on": [], "steps": [{"id": "review-bundle-step", "kind": "review.bundle"}]},
+                    {"id": "review-probe-only-task", "role_id": "review-probe-only", "depends_on": ["review-bundle-task"],
+                     "steps": [{"id": "review-probe-only-step", "kind": "dispatch.map"}]}
+                ]},
+                {"id": "adjudicate", "tasks": [
+                    {"id": "review-judge-task", "depends_on": ["review-probe-only-task"],
+                     "steps": [{"id": "review-judge-step", "kind": "review.judge"}]}
+                ]}
+            ]
+        });
+        let config: crate::mission_config::MissionConfig = serde_json::from_value(doc).unwrap();
+        let err = resolve_review_roles(&reg, &config, &ReviewRoleStaffing::default(), &|_| RoleBinding::Unmapped)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("review-judge-task"), "names the roleless task: {err}");
+        assert!(err.contains("no role_id"), "distinguishes from \"no judge task\": {err}");
+        assert!(!err.contains("declares no judge task"), "must not reuse the absent-task message: {err}");
+    }
+
+    /// (#1513 review C3) A verify task that EXISTS but declares no role_id
+    /// resolves `verify: None` (same observable shape as "no verify task at
+    /// all" — a config expresses "no verify stage" either way), but now
+    /// carries a named warning explaining WHY, instead of leaving the
+    /// caller to infer "verify never ran" with no stated cause.
+    #[test]
+    fn resolve_review_roles_verify_task_present_but_roleless_warns_and_resolves_to_none() {
+        let reg = multi_reg(vec![("solo", vec![model("only", 32000)])], Some("solo"));
+        let doc = serde_json::json!({
+            "id": "review",
+            "name": "PR Review",
+            "phases": [
+                {"id": "investigate", "tasks": [
+                    {"id": "review-bundle-task", "depends_on": [], "steps": [{"id": "review-bundle-step", "kind": "review.bundle"}]},
+                    {"id": "review-probe-only-task", "role_id": "review-probe-only", "depends_on": ["review-bundle-task"],
+                     "steps": [{"id": "review-probe-only-step", "kind": "dispatch.map"}]}
+                ]},
+                {"id": "adjudicate", "tasks": [
+                    {"id": "review-judge-task", "role_id": "review-judge", "depends_on": ["review-probe-only-task"],
+                     "steps": [{"id": "review-judge-step", "kind": "review.judge"}]}
+                ]},
+                {"id": "report", "tasks": [
+                    {"id": "review-verify-task", "depends_on": ["review-judge-task"],
+                     "steps": [
+                        {"id": "review-verify-render-step", "kind": "review.verify-render"},
+                        {"id": "review-verify-step", "kind": "dispatch.map"}
+                     ]}
+                ]}
+            ]
+        });
+        let config: crate::mission_config::MissionConfig = serde_json::from_value(doc).unwrap();
+        let roles = resolve_review_roles(&reg, &config, &ReviewRoleStaffing::default(), &|_| RoleBinding::Unmapped)
+            .unwrap();
+        assert!(roles.verify.is_none(), "no role_id ⇒ no verify staffing");
+        assert_eq!(roles.warnings.len(), 1, "the roleless verify task is named, not silently dropped");
+        assert!(roles.warnings[0].contains("review-verify-task"), "{}", roles.warnings[0]);
     }
 }

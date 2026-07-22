@@ -1170,11 +1170,15 @@ pub(crate) enum LabCmd {
         /// hardware tier).
         #[arg(long = "exec-mode", requires = "funnel")]
         exec_mode: Option<String>,
-        /// (#1475) The probe draw BREADTH per probe role for this run, applied
-        /// to every probe seat. Omitted ⇒ one draw per probe role (the funnel
-        /// staffs three distinct probe roles, so the default already draws
-        /// three). Must be at least 1 — a 0 draw count guarantees a degenerate
-        /// run (zero probe flags).
+        /// (#1475, RETIRED as a multiplier #1512/#1513 review) Historically
+        /// the probe draw BREADTH per probe role. Draw multiplication no
+        /// longer exists — one probe role now maps to exactly one dispatch
+        /// (#1512) — so this flag is back-compat-only: omitted or `1` is a
+        /// no-op; any value greater than 1 is a loud error (a `--k 3` run
+        /// would fire the SAME single dispatch per role while claiming a 3x
+        /// multiplier happened, a dishonest artifact). To change probe
+        /// recall breadth, edit the SET of probe roles the "review" mission
+        /// config declares instead (add/remove a probe task).
         #[arg(long, requires = "funnel", value_parser = clap::value_parser!(u32).range(1..))]
         k: Option<u32>,
         /// (#1222) Run an external bundler

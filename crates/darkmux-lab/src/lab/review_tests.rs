@@ -57,6 +57,7 @@
             judge: judge.expect("test fixture: crew_with needs a \"review-judge\" entry"),
             verify,
             request_changes: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -2660,6 +2661,83 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             8,
             "bundle + 2 claimed probe maps + dedup + judge + verify render + verify map + synthesis"
         );
+
+        // (#1513 review C1) The SAME scenario above prunes the third,
+        // unclaimed declared probe task — that pruning must be LOUD, not
+        // silent, since a production run pruning a declared task is exactly
+        // the reduced-coverage failure mode a Studio hand-edit can trigger.
+        let warnings = graph.shared_env.lock().expect("shared env mutex poisoned").warnings.clone();
+        assert!(
+            warnings.iter().any(|w| w.contains("pruned")),
+            "pruning an unclaimed declared probe task must warn: {warnings:?}"
+        );
+    }
+
+    /// (#1513 review C1) A task named in `review-dedup-task.depends_on`
+    /// with no `role_id` is the "Studio hand-edit forgot a role_id"
+    /// failure mode: before this fix, `resolve_review_roles` silently
+    /// skipped it (never classified as a probe role) and the claim/prune
+    /// step below silently dropped its dispatch. It must now bail loudly
+    /// instead — a reduced-coverage run must never look like a clean pass.
+    #[test]
+    fn build_review_graph_bails_on_a_declared_probe_task_with_no_role_id() {
+        let doc = serde_json::json!({
+            "id": "review",
+            "name": "PR Review",
+            "phases": [
+                {"id": "investigate", "tasks": [
+                    {"id": "review-bundle-task", "depends_on": [], "steps": [{"id": "review-bundle-step", "kind": "review.bundle"}]},
+                    {"id": "review-probe-only-task", "role_id": "review-probe-only", "depends_on": ["review-bundle-task"],
+                     "steps": [{"id": "review-probe-only-step", "kind": "dispatch.map"}]},
+                    // No role_id — the misconfiguration under test.
+                    {"id": "review-probe-orphan-task", "depends_on": ["review-bundle-task"],
+                     "steps": [{"id": "review-probe-orphan-step", "kind": "dispatch.map"}]},
+                    {"id": "review-dedup-task", "depends_on": ["review-probe-only-task", "review-probe-orphan-task"],
+                     "steps": [{"id": "review-dedup-step", "kind": "review.dedup"}]}
+                ]},
+                {"id": "adjudicate", "tasks": [
+                    {"id": "review-judge-task", "role_id": "review-judge", "depends_on": ["review-dedup-task"],
+                     "steps": [{"id": "review-judge-step", "kind": "review.judge", "config": {"concurrency": 1}}]}
+                ]},
+                {"id": "report", "tasks": [
+                    {"id": "review-synthesis-task", "depends_on": ["review-dedup-task", "review-judge-task"],
+                     "steps": [{"id": "review-synthesis-step", "kind": "review.synthesis"}]}
+                ]}
+            ]
+        });
+        let config: darkmux_crew::mission_config::MissionConfig =
+            serde_json::from_value(doc).expect("hand-built config parses");
+
+        let crew = crew_with(vec![
+            ("review-probe", {
+                let mut s = graph_staffing("fast", "probe-model", 1);
+                s.role_id = Some("review-probe-only".to_string());
+                vec![s]
+            }),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let ctx = step_ctx(&crew, vec![]);
+        // (`BuiltReviewGraph` carries no `Debug` impl, so `unwrap_err` —
+        // which formats the `Ok` side on panic — doesn't compile here;
+        // match instead.)
+        let result = build_review_graph_from_config(
+            &config,
+            "hand-built test config",
+            ctx,
+            crew.judge.clone(),
+            crew.verify.clone(),
+            &crew.probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        );
+        let err = match result {
+            Ok(_) => panic!("expected a bail on the roleless declared probe task"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("review-probe-orphan-task"), "names the roleless declared task: {err}");
+        assert!(err.contains("role_id"), "{err}");
     }
 
     /// (#1475 packet 2, THE FLIP) End-to-end: a role→profile crew (built via the
@@ -4724,7 +4802,36 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// Was `local_only_envelope_carries_no_remote_fields`.
     #[test]
     fn graph_local_only_envelope_carries_no_remote_fields() {
-        let crew = graph_valid_crew();
+        // (#1513 review C1) A crew claiming all three of the built-in
+        // review.json's declared probe roles — NOT `graph_valid_crew()`'s
+        // single positionally-claimed probe, which would now leave the
+        // other two declared probe tasks pruned (loudly, with a warning
+        // per C1) and defeat this test's own "empty warnings never
+        // serialize" assertion below for a reason unrelated to what the
+        // test actually checks (remote-field omission).
+        let crew = crew_with(vec![
+            (
+                "review-probe",
+                vec![
+                    {
+                        let mut s = graph_staffing("fast", "probe-model-a", 1);
+                        s.role_id = Some("review-probe-high".to_string());
+                        s
+                    },
+                    {
+                        let mut s = graph_staffing("fast", "probe-model-b", 1);
+                        s.role_id = Some("review-probe-mid".to_string());
+                        s
+                    },
+                    {
+                        let mut s = graph_staffing("fast", "probe-model-c", 1);
+                        s.role_id = Some("review-probe-low".to_string());
+                        s
+                    },
+                ],
+            ),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
         let ctx = step_ctx_with_chat(&crew, vec![bundle_input("a.ts")], |call: &ChatCall| {
             if call.model == "darkmux:judge-model" {
                 Ok(reply(CONFIRM_JSON))

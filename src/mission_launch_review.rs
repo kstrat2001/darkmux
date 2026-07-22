@@ -635,22 +635,37 @@ pub(crate) fn launch(
             // shape. Warn (don't error) — operator sovereignty: surface,
             // never silently ignore.
             let mut ignored: Vec<String> = Vec::new();
-            // The per-run role→profile overrides (#1475 packet 3, #1512,
-            // #1513 review) shape staffing, which a synthesis-only launch
-            // never resolves — so they're ignored here too, alongside the
-            // source/bundler/knob inputs. Discovering the declared role ids
-            // needs only the "review" mission config document (no profile
-            // registry, no dispatch) — cheap enough to load here purely for
-            // this warning check.
-            let review_config = darkmux_crew::mission_config::load("review")
-                .context("loading mission config \"review\" to discover its declared roles")?;
-            let dispatch_shaping: Vec<String> = declared_role_ids(&review_config.config)
-                .into_iter()
-                .chain(["worktree", "github", "head_sha", "bundler", "passes"].map(String::from))
-                .collect();
-            for key in &dispatch_shaping {
+            // The static dispatch-shaping inputs never need the config —
+            // check them unconditionally.
+            for key in ["worktree", "github", "head_sha", "bundler", "passes"] {
                 if collected.contains_key(key) {
-                    ignored.push(key.clone());
+                    ignored.push(key.to_string());
+                }
+            }
+            // The per-run role→profile overrides (#1475 packet 3, #1512,
+            // #1513 review) ALSO shape staffing a synthesis-only launch
+            // never resolves — but discovering which role ids the document
+            // declares needs the "review" mission config, and that load is
+            // BEST-EFFORT here (#1513 review C4): a malformed USER-TIER
+            // `~/.darkmux/mission-configs/review.json` must not break a
+            // replay that otherwise needs no config at all — warn and
+            // continue with whatever the static check above already found,
+            // rather than hard-failing on a check that only ever produces a
+            // warning anyway.
+            match darkmux_crew::mission_config::load("review") {
+                Ok(review_config) => {
+                    for key in declared_role_ids(&review_config.config) {
+                        if collected.contains_key(&key) {
+                            ignored.push(key);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "mission launch review: could not load mission config \"review\" to check \
+                         for ignored per-run role overrides — continuing the `from_envelope` \
+                         replay without that check: {e:#}"
+                    );
                 }
             }
             if !ignored.is_empty() {
@@ -801,7 +816,7 @@ fn run_dispatch(
         ),
     );
 
-    if let Some(charges_path) = path_input(collected, "charges_file") {
+    let outcome: Result<ReviewEnvelope> = if let Some(charges_path) = path_input(collected, "charges_file") {
         let inputs = ReviewInputs {
             case_id: case.clone(),
             roles: &crew,
@@ -1108,7 +1123,20 @@ fn run_dispatch(
         finalize_review_mission(&mission_id_for_status, &phase_ids, &result);
 
         result
-    }
+    };
+
+    // (#1513 review C3) Fold `resolve_review_roles`'s own warnings (today,
+    // just the "a `review.verify-render` task exists but declares no
+    // role_id" case) into the returned envelope. Both dispatch paths above
+    // — the charges-file replay and the graph run — resolve `crew` from the
+    // SAME `resolve_review_roles` call near the top of this function, so
+    // one merge point covers both without threading the warnings through
+    // `build_review_graph`'s signature (which the pure-refactor gate keeps
+    // byte-identical).
+    outcome.map(|mut env| {
+        env.warnings.extend(crew.warnings.iter().cloned());
+        env
+    })
 }
 
 #[cfg(test)]
@@ -1401,6 +1429,7 @@ mod tests {
             judge: staffing("zzz-probe"),
             verify: None,
             request_changes: false,
+            warnings: Vec::new(),
         };
 
         let summary = crew_model_summary(&roles).expect("non-empty roles have a summary");

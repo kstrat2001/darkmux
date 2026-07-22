@@ -4727,7 +4727,7 @@ fn build_review_graph_from_config(
         expansions: std::collections::BTreeMap::new(),
     };
 
-    let (mut tasks, mut steps, interpret_warnings) = interpret(config, &params)
+    let (mut tasks, mut steps, mut interpret_warnings) = interpret(config, &params)
         .with_context(|| format!("interpreting mission config \"review\" ({source_detail})"))?;
 
     // (#1512) Claim each resolved probe staffing against the DECLARED
@@ -4744,12 +4744,41 @@ fn build_review_graph_from_config(
     })?;
     let declared_probe_task_ids: Vec<String> = dedup_task.depends_on.clone();
 
+    // (#1513 review C1) A task named in `review-dedup-task.depends_on` with
+    // no `role_id` used to be silently invisible: `resolve_review_roles`
+    // never classified it (it isn't a probe role — there's no role to
+    // resolve), and the claim/prune step below would then prune it with no
+    // signal — a declared task quietly loses its dispatch. This is the
+    // "Studio hand-edits review.json and forgets a role_id" failure mode.
+    // Bail loudly rather than let a reduced-coverage run pass as healthy.
+    for id in &declared_probe_task_ids {
+        let Some(t) = tasks.iter().find(|t| &t.id == id) else { continue };
+        if t.role_id.is_none() {
+            bail!(
+                "darkmux: \"review\" mission config's \"review-dedup-task\" depends on task \
+                 \"{id}\", but that task declares no role_id — a probe task with no role_id has \
+                 no staffing to resolve and would be silently pruned (zero dispatch, reduced \
+                 coverage, no signal). Give \"{id}\" a role_id, or remove it from \
+                 review-dedup-task's depends_on (#1512, #1513 review C1)"
+            );
+        }
+    }
+
     let mut claims: Vec<String> = Vec::with_capacity(probes.len());
     for staffing in probes {
         let claimed_id = if let Some(role_id) = staffing.role_id.as_deref() {
             tasks
                 .iter()
-                .find(|t| t.role_id.as_deref() == Some(role_id) && declared_probe_task_ids.iter().any(|id| id == &t.id))
+                .find(|t| {
+                    // (#1513 review C2) Defense in depth alongside
+                    // resolve_review_roles's own duplicate-role_id bail:
+                    // skip a declared task this loop already claimed, so
+                    // two probe tasks that (somehow) share a role_id can't
+                    // both match the same declared task here.
+                    t.role_id.as_deref() == Some(role_id)
+                        && declared_probe_task_ids.iter().any(|id| id == &t.id)
+                        && !claims.contains(&t.id)
+                })
                 .map(|t| t.id.clone())
                 .ok_or_else(|| {
                     anyhow!(
@@ -4786,6 +4815,16 @@ fn build_review_graph_from_config(
     let pruned_ids: Vec<String> =
         declared_probe_task_ids.iter().filter(|id| !claims.contains(*id)).cloned().collect();
     if !pruned_ids.is_empty() {
+        // (#1513 review C1) Loud, not silent: the production path pruning a
+        // DECLARED task is exactly the reduced-coverage scenario a Studio
+        // hand-edit (fewer staffed roles than review.json declares tasks
+        // for) can trigger with zero other signal.
+        interpret_warnings.push(format!(
+            "\"review\" mission config declares probe task(s) {} that no resolved probe \
+             staffing claimed — pruned from the graph (fewer roles resolved than review.json \
+             declares probe tasks for) (#1512, #1513 review C1)",
+            pruned_ids.join(", ")
+        ));
         for id in &pruned_ids {
             if let Some(t) = tasks.iter().find(|t| &t.id == id) {
                 for sid in &t.step_ids {
