@@ -1834,12 +1834,17 @@ function runRegions(){
   const role=String(handle||"").replace(/^darkmux\//,"");
   const sv=statusVisual({open:!done, errored:!!c&&dispatchErrored(c), killed:!!c&&dispatchKilled(c), clean:done&&!!c&&!dispatchErrored(c)});
   const sp=(d&&d.payload)||{}, dp=(c&&c.payload)||{};
-  // (#1518) A remote (sp.endpoint-served) run has no local LMStudio load of its
+  // (#1518) A run is remote if EITHER bookend carries the endpoint. The review
+  // path stamps `endpoint` only on `dispatch.complete` (dp), not on start (sp);
+  // the internal single-shot path stamps it on both. Read both so completed
+  // remote reviews classify correctly.
+  const remoteEp = sp.endpoint || dp.endpoint;
+  // (#1518) A remote (remoteEp-served) run has no local LMStudio load of its
   // own — the `distinct[0]` fallback would surface a stray local model id that
   // merely happened to be resident, misattributing the run's model. Prefer the
   // endpoint's own model (the tail after the last "/") as the remote fallback
-  // instead; local runs (no sp.endpoint) are unchanged.
-  const model=d&&d.model?d.model:(sp.endpoint?String(sp.endpoint).slice(String(sp.endpoint).lastIndexOf("/")+1):(distinct[0]||null));
+  // instead; local runs (no remoteEp) are unchanged.
+  const model=d&&d.model?d.model:(remoteEp?String(remoteEp).slice(String(remoteEp).lastIndexOf("/")+1):(distinct[0]||null));
   // (#1151) tokens in/out accumulate LIVE from the per-turn telemetry.tokens
   // records (source="tokens"), whose running sum equals the terminal
   // dispatch.complete totals EXACTLY (verified) — so the tiles grow turn-by-turn
@@ -1858,7 +1863,10 @@ function runRegions(){
   // openclaw) — render it in words so a hosted "direct" isn't cryptic. Route +
   // runtime are separate axes: WHERE the model was served vs HOW darkmux drove it.
   const rtLabel={internal:'internal container',direct:'direct client (hosted · no container)',openclaw:'openclaw shell-out'}[sp.runtime]||sp.runtime;
-  const ep=sp.endpoint;
+  // (#1518) Sourced from remoteEp (sp OR dp), not sp alone — see the classifier
+  // comment above. This single line also fixes the modelTrack panel below,
+  // which already reads `ep`.
+  const ep=remoteEp;
   const route=ep
     ? (()=>{const i=String(ep).indexOf(':');const kind=i>=0?ep.slice(0,i):'';const rest=i>=0?ep.slice(i+1):ep;
         const label=kind==='azure'?'Azure OpenAI':kind==='openai'?'OpenAI':esc(kind||'remote');
