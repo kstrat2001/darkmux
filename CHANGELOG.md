@@ -11,6 +11,37 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-22
+
+**Config-composable review + concurrency-safe residency.** The review pipeline
+stops being hard-coded and becomes pure config-composed primitives — you declare
+the graph, darkmux runs it — and the residency arbiter learns to evict stale
+orphans and protect a concurrent command's in-use model, so heavier cross-family
+crews run without a manual `machine eject`. A `darkmux dispatch` is now a
+first-class run through the same engine as missions. No schema-version bumps
+(FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`, PROFILES `1.5`, all
+lenient-on-read) — a 2.0 install upgrades cleanly.
+
+### Added
+- **Reconcile-to-need residency + a concurrency-safe lease registry** (#1487) — the residency arbiter (`darkmux-gestalt`) now evicts darkmux-owned models a dispatch's staffing doesn't need (no more monotonic growth), and protects a model a *concurrent* darkmux command is mid-dispatch on: each command writes a per-pid lease at the load chokepoint (`~/.darkmux/residency/<pid>.lease`), read by every other command's reconcile so a busy model is never yanked. `lms ps` stays residency truth; the lease is a subordinate busy-overlay. Heavy cross-family crews (a 62 GB probe + a 35B judge) now load and run without a manual `machine eject`.
+- **The review pipeline is config-composed** (#1513) — the probes are now explicit one-role tasks in `review.json`, not a hard-coded three-seat template. The probe COUNT is config-driven (compose a lean one-probe review for a constrained-RAM tier), step kinds are swappable per step, and there is no "probe role" concept in the code — a probe is just a role on a task with a probe step, emergent from your composition. Staffing is the generic machine-local `role_profiles` map (the same one judge/verify already used).
+
+### Changed (behavior — surface preserved)
+- **A mission run is a first-class record** (#1503) — each `mission launch` mints a **unique run id** (matching the lab's `run_id` convention), and the old input-hash that was the id is demoted to a queryable `spec` fingerprint for grouping. Re-launching a spec now **mints a fresh run** (history preserved for comparison) instead of reopening the prior one — AI runs are non-deterministic, so input-hash-as-identity was a category error. The mission-id scheme changes from `<config>-<inputhash>` to a minted run id; existing missions on disk load unchanged.
+- **`darkmux dispatch` routes through the engine as a crew of one** (#1510) — a dispatch is now a full Mission→Phase→Task(role)→Step at cardinality one, so it mints a first-class run, emits mission/step flow records (it shows up in `mission status` and the missions lens), and — the load-bearing part — participates in the #1487 lease/reconcile regime, closing a gap where a raw dispatch could be evicted by a concurrent mission. **The `--json` output contract is byte-identical.**
+- **`k` (probe draw-multiplication) retired** (#1513) — one role = one task = one dispatch; recall breadth is varying the *set* of probe roles, not drawing one model `k` times. `darkmux lab eval`/`review-bench --k>1` is now a typed rejection pointing at the config, so a recall sweep can't silently produce a flat-but-mislabeled series.
+
+### Fixed
+- **Phase↔step terminality invariant** (#1504) — a phase can never be persisted `Complete` while a step it contains is still live, and a launch that fails after minting reconciles to a terminal `Error` instead of stranding an Active mission. Enforced at the single `lifecycle.rs` chokepoint, with a loud warning when the backstop actually fires.
+- **The darkmux self-review workflow** (#1515) drops the deleted roster-profile/seat-pin/`k` params and staffs from the `role_profiles` map — matching the current model.
+
+### Migration (2.0.0 → 2.1.0)
+No schema bumps; a 2.0 install upgrades in place. The behavior changes to know:
+- **A dispatch is now a run.** `darkmux dispatch` appears in `mission status`, the missions lens, and the flow stream, and writes a `~/.darkmux/missions/dispatch-*` record. The `--json` output is unchanged.
+- **Re-launching a spec mints a fresh run.** The prior run is left on disk for analysis; there is no implicit reuse/reopen. Mission ids are now minted, not input-hashed.
+- **`--k>1` is rejected.** Vary the probe-role set in the review config for recall breadth.
+- **Review configs**: `review.json` now declares explicit probe tasks — a lean N-probe review is a config edit (delete/add tasks). Staffing is the `role_profiles` map; per-run overrides remain `--param review-probe-high=<profile>` (and `-mid`/`-low`/`review-judge`/`review-verify`).
+
 ## [2.0.0] - 2026-07-18
 
 **darkmux 2.0 — the mission orchestrator.** The 1.x line grew a swap tool into a
@@ -183,6 +214,7 @@ funnel, fixed same-day.
   exit paths, `source: "funnel"`) so a live PR review is visible as a running dispatch in the
   viewer's fleet and machine views (#1272, #1277).
 
+[2.1.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.1.0
 [2.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.0.0
 [1.18.5]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.5
 [1.18.4]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.4
