@@ -14,6 +14,7 @@
 
 use crate::providers::prompt::extract_reply_text;
 use anyhow::{anyhow, Context, Result};
+use darkmux_profiles::profiles::RoleBinding;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -741,7 +742,7 @@ fn dispatch_case(
 /// [`resolve_funnel_ctx`] before the per-case loop (fail loud before any
 /// dispatch spends a token, same discipline as the `--workdirs` preflight).
 struct FunnelCtx {
-    crew: darkmux_crew::resourcing::ResolvedCrew,
+    roles: darkmux_crew::resourcing::ResolvedReviewRoles,
     exec_mode: super::review::ExecMode,
     probe_system: String,
     judge_system: String,
@@ -766,32 +767,26 @@ fn parse_exec_mode(s: Option<&str>) -> Result<super::review::ExecMode> {
     }
 }
 
-/// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, staff the
-/// review seats via the SAME role→profile resolver the operator path uses
-/// (`darkmux_crew::resourcing::resolve_review_role_crew` — #1475), validate it
-/// carries the funnel's own seat requirements (`review::validate_review_crew` —
-/// the SAME check `run_review` runs internally, called here too so a
-/// misconfigured roster fails at bench START, not at the first case's dispatch),
-/// apply `--k` as the probe draw breadth, parse `--exec-mode`, and resolve the
-/// seat system prompts. Every failure here is loud and happens BEFORE any
-/// dispatch.
+/// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, staff
+/// every review role via the ONE generic per-task resolver the operator
+/// path uses (`darkmux_crew::resourcing::resolve_review_roles` — #1475,
+/// #1512, #1513 review — its own resolution loop already enforces the
+/// review's shape rules, so there is no separate "validate the crew"
+/// step), apply `--k` as the probe draw breadth (reporting only, #1512),
+/// parse `--exec-mode`, and resolve the seat system prompts. Every failure
+/// here is loud and happens BEFORE any dispatch.
 ///
-/// (#1475, #1512) The bench is a CONTROLLED comparison: it pins EVERY review
-/// role to one profile — `--roster-profile` (else `--profile`, else the
-/// registry's `default_profile`) — through packet 3's per-run role→profile
-/// OVERRIDE, so the funnel measures that one profile across every seat
-/// deterministically (never whatever the machine's `role_profiles` map
-/// happens to hold). The probe roles themselves are discovered off
-/// `review.json` (`discover_review_probe_role_ids`, #1512 — never a Rust
-/// constant), so the roster is pinned across however many probe roles the
-/// document declares (three, by default). `--k` is snapshotted verbatim on
-/// each probe staffing for reporting (see `write_scores_artifact`'s `k`
-/// field) but no longer multiplies dispatch tasks (#1512 — one role, one
-/// task; see `build_review_graph`'s own doc).
+/// (#1475, #1512, #1513 review) The bench is a CONTROLLED comparison: it
+/// pins EVERY review role to one profile — `--roster-profile` (else
+/// `--profile`, else the registry's `default_profile`) — via an override
+/// binding that answers `Overridden(roster)` for ANY role_id asked, so the
+/// funnel measures that one profile across every role deterministically
+/// (never whatever the machine's `role_profiles` map happens to hold).
+/// Which roles exist (however many probe roles `review.json` declares,
+/// plus judge, plus the optional verify) is `resolve_review_roles`'s own
+/// discovery — never enumerated here.
 fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
-    use darkmux_crew::resourcing::{
-        discover_review_probe_role_ids, ReviewRoleStaffing, REVIEW_JUDGE_ROLE, REVIEW_VERIFY_ROLE,
-    };
+    use darkmux_crew::resourcing::ReviewRoleStaffing;
     let loaded = darkmux_profiles::profiles::load_registry(opts.config_path.as_deref())
         .context("loading profile registry for --funnel")?;
     // The one profile every seat is pinned to for this controlled run.
@@ -819,23 +814,16 @@ fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
     // suffices.
     darkmux_profiles::profiles::get_profile(&loaded.registry, &roster)
         .context("resolving the --funnel roster profile")?;
-    // (#1512) The probe roles come off review.json itself, not a Rust
-    // constant — pin every one of them (plus judge + verify) to the roster
-    // via the per-run override.
     let review_config = darkmux_crew::mission_config::load("review")
-        .context("loading mission config \"review\" to discover its probe roles for --funnel")?;
-    let probe_role_ids = discover_review_probe_role_ids(&review_config.config)?;
-    let overrides: std::collections::BTreeMap<String, String> = probe_role_ids
-        .iter()
-        .cloned()
-        .chain([REVIEW_JUDGE_ROLE.to_string(), REVIEW_VERIFY_ROLE.to_string()])
-        .map(|role| (role, roster.clone()))
-        .collect();
-    let mut crew = darkmux_crew::resourcing::resolve_review_role_crew(
+        .context("loading mission config \"review\" for --funnel")?;
+    // Every role, whichever `resolve_review_roles` discovers, resolves to
+    // the SAME pinned roster — the override binding ignores the role_id it's
+    // asked about entirely.
+    let mut roles = darkmux_crew::resourcing::resolve_review_roles(
         &loaded.registry,
+        &review_config.config,
         &ReviewRoleStaffing::default(),
-        &overrides,
-        &probe_role_ids,
+        &|_role| RoleBinding::Overridden(roster.clone()),
     )
     .context("resolving review staffing for --funnel")?;
     // `--k` is snapshotted onto every probe seat's staffing (reported by
@@ -843,13 +831,10 @@ fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
     // multiplies dispatch tasks in the built graph (#1512) — probe recall
     // breadth is a review.json edit now, not a per-run draw multiplier.
     if let Some(k) = opts.k_override {
-        if let Some(probes) = crew.seats.get_mut("review-probe") {
-            for seat in probes {
-                seat.k = k;
-            }
+        for seat in &mut roles.probes {
+            seat.k = k;
         }
     }
-    super::review::validate_review_crew(&crew).context("review staffing for --funnel")?;
     let exec_mode = parse_exec_mode(opts.exec_mode.as_deref())?;
     let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
         anyhow!("darkmux: role \"review-probe\" has no system prompt (missing review-probe.md)")
@@ -861,7 +846,7 @@ fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
         anyhow!("darkmux: role \"review-verify\" has no system prompt (missing review-verify.md)")
     })?;
     Ok(FunnelCtx {
-        crew,
+        roles,
         exec_mode,
         probe_system,
         judge_system,
@@ -1044,16 +1029,16 @@ fn run_funnel_case(
     // identical either way (contract 6)" comment) — the only thing this
     // migration changes is which orchestration code runs the dispatches,
     // so what bench measures is finally what production actually executes.
-    let seats = review::validate_review_crew(&ctx.crew)
-        .with_context(|| format!("validating crew for case {}", c.id))?;
-    let probes: Vec<_> = seats.probes.clone();
-    let judge = seats.judge.clone();
-    let verify = seats.verify.cloned();
+    // (#1512, #1513 review) `ctx.roles` is already the validated, resolved
+    // shape — no separate crew-validation step.
+    let probes = ctx.roles.probes.clone();
+    let judge = ctx.roles.judge.clone();
+    let verify = ctx.roles.verify.clone();
     let judge_identifier = review::seat_identifier(&judge.pm);
 
     let step_ctx = std::sync::Arc::new(review::ReviewStepContext {
         case_id: c.id.clone(),
-        crew: ctx.crew.clone(),
+        roles: ctx.roles.clone(),
         // Passed through raw — `judge_prompt` does the per-field
         // default/strip itself now (byte-matching judge-runner.py's
         // `judge_one`, #1256), so this caller no longer pre-joins
@@ -1085,14 +1070,15 @@ fn run_funnel_case(
     .with_context(|| format!("building review graph for case {}", c.id))?;
     let fingerprint_val = review::fingerprint(&judge_identifier, &step_ctx.judge_system);
     let staffing_snapshot =
-        review::staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.crew.request_changes);
+        review::staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+    let crew_name = ctx.roles.distinct_profile_names();
 
     // (#1397) A bench run mints no real Mission — lab-vs-fleet boundary —
     // so there is nothing to persist a Step to; `persist` is a no-op here,
     // same as `run_review_graph`'s own tests.
     let (env, _steps) = review::run_review_graph(
         &step_ctx,
-        &ctx.crew.name,
+        &crew_name,
         ctx.exec_mode,
         fingerprint_val,
         staffing_snapshot,

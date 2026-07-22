@@ -977,8 +977,10 @@ mod tests {
                 "review-probe-mid-task".to_string(),
                 "review-probe-low-task".to_string()
             ],
-            "dedup fans in from all three explicit probe tasks — this list IS the probe role \
-             registry (#1512): `discover_review_probe_role_ids` reads it directly"
+            "dedup fans in from all three explicit probe tasks — parallelism is emergent from \
+             depends_on (#1512). (#1513 review) the probe role SET is no longer read off this \
+             list: `darkmux_crew::resourcing::resolve_review_roles` discovers each probe role \
+             structurally, by step kind, walking every task in the document directly"
         );
 
         let adjudicate = &cfg.phases[1];

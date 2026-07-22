@@ -10,8 +10,9 @@
 //!        → judge pass-2(pass-1 confirms only) → {confirmed, needs_check, archived}
 //! ```
 //!
-//! This module is the DRIVER: given a resolved crew (packet 1's
-//! the resourcing resolver `darkmux_crew::resourcing`), a diff, and an intent, it runs
+//! This module is the DRIVER: given resolved roles (#1512, #1513 review —
+//! `darkmux_crew::resourcing::resolve_review_roles`, the one generic
+//! per-task resolver; no "crew" concept), a diff, and an intent, it runs
 //! the whole pipeline and returns a [`ReviewEnvelope`]. Dispatch itself goes
 //! through a caller-injected `chat` closure (the container-free single-shot
 //! primitive from packet 2, `darkmux_crew::single_shot::single_shot_chat`,
@@ -131,7 +132,7 @@ use darkmux_crew::telemetry_sampler::{sample_host, HostSample};
 // adapters (their first production call site) — see the "model cycling"
 // section below.
 use darkmux_gestalt::{AcquireOpts, AcquireScope, Action, CallerIntent, Facts, ModelHost, Placement, ResourceProbe, V1Estimator};
-use darkmux_crew::resourcing::{ResolvedCrew, ResolvedSeatStaffing};
+use darkmux_crew::resourcing::{ResolvedReviewRoles, ResolvedSeatStaffing};
 use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
 use darkmux_profiles::swap;
 use darkmux_types::{BundleSelector, ModelEndpoint, ProfileModel};
@@ -1249,80 +1250,17 @@ fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &Resolve
     }
 }
 
-// ─── crew validation (review-owned seat requirements) ───────────────────
-
-/// The review's validated seat set — what [`validate_review_crew`] hands
-/// back. `verify` is the OPTIONAL fourth seat (#1260): when a crew declares
-/// `review-verify` (exactly one staffing, like the judge), every
-/// double-confirmed finding gets one adjudication call after pass-2; a crew
-/// without it behaves byte-identically to today.
-#[derive(Debug)]
-pub struct ReviewSeats<'a> {
-    pub probes: &'a Vec<ResolvedSeatStaffing>,
-    pub judge: &'a ResolvedSeatStaffing,
-    pub verify: Option<&'a ResolvedSeatStaffing>,
-}
-
-/// Validate `crew` carries what the review needs: seat `"review-probe"`
-/// with >= 1 staffing, seat `"review-judge"` with EXACTLY 1 staffing, and
-/// — when declared — seat `"review-verify"` with EXACTLY 1 staffing
-/// (#1260; the seat is optional, its shape is not).
-/// `resolve_crew` (packet 1) validates the crew schema is well-formed and
-/// every model resolvable; it deliberately does NOT know about
-/// pipeline-specific seat requirements — that's this function's job, and
-/// it runs at review start so a misconfigured crew fails loud before any
-/// dispatch spends a token.
-///
-/// `pub` (not private) since #1222 Phase B packet 7 review round: the
-/// `review-bench --review` preflight (`darkmux_lab::lab::review_bench::
-/// resolve_review_ctx`) calls this directly, ahead of `run_review`'s own
-/// internal call, so a misconfigured crew fails at bench START (before the
-/// per-case loop even begins) rather than at the first case's dispatch.
-pub fn validate_review_crew(crew: &ResolvedCrew) -> Result<ReviewSeats<'_>> {
-    let probes = crew
-        .seats
-        .get("review-probe")
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "darkmux: review staffing \"{}\" is missing the \"review-probe\" seat (the \
-                 review needs >= 1 probe staffing) — the role→profile resolver staffs the three \
-                 probe roles from their bindings; bind or override one \
-                 (`darkmux config set role_profiles.review-probe-high <profile>`, or \
-                 `--param review-probe-high=<profile>`) (#1475)",
-                crew.name
-            )
-        })?;
-    let judges = crew.seats.get("review-judge").ok_or_else(|| {
-        anyhow!(
-            "darkmux: review staffing \"{}\" is missing the \"review-judge\" seat (the \
-             review needs exactly 1 judge staffing) — the role→profile resolver staffs it from \
-             its binding; bind or override it (`darkmux config set role_profiles.review-judge \
-             <profile>`, or `--param review-judge=<profile>`) (#1475)",
-            crew.name
-        )
-    })?;
-    if judges.len() != 1 {
-        bail!(
-            "darkmux: review staffing \"{}\" seat \"review-judge\" must have EXACTLY 1 staffing \
-             (got {}) — the double-confirm judge is a single seat, unlike \"review-probe\"",
-            crew.name,
-            judges.len()
-        );
-    }
-    let verify = match crew.seats.get("review-verify") {
-        None => None,
-        Some(v) if v.len() == 1 => Some(&v[0]),
-        Some(v) => bail!(
-            "darkmux: review staffing \"{}\" seat \"review-verify\" must have EXACTLY 1 staffing \
-             when declared (got {}) — the adjudication seat is single, like \"review-judge\" \
-             (#1260)",
-            crew.name,
-            v.len()
-        ),
-    };
-    Ok(ReviewSeats { probes, judge: &judges[0], verify })
-}
+// ─── (#1512, #1513 review) role validation dissolved ─────────────────────
+//
+// `ReviewSeats`/`validate_review_crew` used to re-check a `ResolvedCrew`'s
+// `seats` map carried >= 1 probe staffing, EXACTLY 1 judge, and an optional
+// verify. That check is now REDUNDANT by construction: `resolve_review_roles`
+// (`darkmux_crew::resourcing`) already enforces every one of those shape
+// rules as part of resolving them (a config with zero probe-role tasks, or
+// no judge task, is a resolution ERROR, never a value that reaches a
+// caller) — so a `ResolvedReviewRoles` is valid the moment it exists.
+// There is nothing left to separately validate, and nothing to extract:
+// `.probes`/`.judge`/`.verify` are direct fields.
 
 // ─── mechanism-family keyword table (for dedup) ──────────────────────────
 
@@ -2073,7 +2011,12 @@ pub struct ChatCall<'a> {
 /// couldn't provide more simply.
 pub struct ReviewInputs<'a> {
     pub case_id: String,
-    pub crew: &'a ResolvedCrew,
+    /// (#1512, #1513 review) Every role this run resolved — however many
+    /// probe roles, the judge, the optional verify — via the ONE generic
+    /// per-task resolver (`darkmux_crew::resourcing::resolve_review_roles`).
+    /// Not a "crew": no family grouping, just the three fields
+    /// [`run_judge_only`] needs.
+    pub roles: &'a ResolvedReviewRoles,
     /// The author's stated case (PR title). Fed into [`judge_prompt`] only
     /// — Phase A never showed the probe seat the intent (#1256), so
     /// [`probe_user_message`] never reads this field.
@@ -3175,7 +3118,13 @@ pub fn run_judge_only(
     cycler: &mut dyn ModelCycler,
     emitter: &mut dyn ReviewEmitter,
 ) -> Result<ReviewEnvelope> {
-    let ReviewSeats { probes, judge, verify } = validate_review_crew(inputs.crew)?;
+    // (#1512, #1513 review) `inputs.roles` is already the validated,
+    // resolved shape — no separate crew-validation step. Probes/judge are
+    // required by construction; verify is optionally present.
+    let probes = &inputs.roles.probes;
+    let judge = &inputs.roles.judge;
+    let verify = inputs.roles.verify.as_ref();
+    let crew_name = inputs.roles.distinct_profile_names();
     // Judge-only runs one model, so the mode is telemetry, not behavior —
     // but the envelope still records the CALLER's resolved mode rather
     // than a hardcoded label, so a judge-only re-run of a parallel review
@@ -3188,7 +3137,7 @@ pub fn run_judge_only(
 
     let mut env = ReviewEnvelope {
         case_id: inputs.case_id.clone(),
-        crew: inputs.crew.name.clone(),
+        crew: crew_name.clone(),
         mode: mode_label(mode).to_string(),
         bundles: bundles.len(),
         // Same up-front stamp as `run_review` — degenerate (zero-flag)
@@ -3196,7 +3145,7 @@ pub fn run_judge_only(
         fingerprint: fingerprint(&seat_identifier(&judge.pm), inputs.judge_system),
         // (#1247) The resolved staffing this run actually used, post any
         // caller-applied `--k` override — see `ReviewEnvelope::staffing`.
-        staffing: Some(staffing_snapshot(probes, judge, verify, inputs.crew.request_changes)),
+        staffing: Some(staffing_snapshot(probes, judge, verify, inputs.roles.request_changes)),
         ..Default::default()
     };
     // (#1434) Run observability rides the injected emitter via `ReviewObs`,
@@ -3204,7 +3153,7 @@ pub fn run_judge_only(
     // task-level bookend here — the caller's `with_dispatch_bookends` wrap
     // owns run liveness (contract 2). `obs` drops at function end (early
     // `?`-return or clean), tearing down its sampler thread.
-    let mut obs = ReviewObs::new(emitter, &inputs.case_id, &inputs.crew.name);
+    let mut obs = ReviewObs::new(emitter, &inputs.case_id, &crew_name);
     env.steps.push(StepRecord {
         step_id: "bundle".to_string(),
         kind: "procedural".to_string(),
@@ -3295,7 +3244,15 @@ use std::sync::Mutex as StdMutex;
 /// survives only for `run_judge_only`'s sequential path).
 pub struct ReviewStepContext {
     pub case_id: String,
-    pub crew: ResolvedCrew,
+    /// (#1512, #1513 review) Every role this run resolved, via the ONE
+    /// generic per-task resolver — not a "crew". Carried here purely for
+    /// test-fixture convenience (`step_ctx`'s callers build it once
+    /// alongside the rest of the context); the graph's own step kinds never
+    /// read it — `build_review_graph` stamps each task's resolved model
+    /// directly into that task's `Step.config` before the graph runs, and
+    /// `run_review_graph` takes the crew-display-name/staffing-snapshot it
+    /// needs as its own explicit parameters (see that function's doc).
+    pub roles: ResolvedReviewRoles,
     pub intent_title: String,
     pub intent_body: String,
     pub diff: String,

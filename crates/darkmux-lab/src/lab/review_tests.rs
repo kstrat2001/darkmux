@@ -30,15 +30,37 @@
         }
     }
 
-    fn crew_with(seats: Vec<(&str, Vec<ResolvedSeatStaffing>)>) -> ResolvedCrew {
-        let mut m = BTreeMap::new();
-        for (k, v) in seats {
-            m.insert(k.to_string(), v);
+    /// (#1512, #1513 review) Test-only fixture DSL: build a
+    /// [`ResolvedReviewRoles`] from a `(family label, staffings)` list — the
+    /// SAME literal shape the test suite has always used, so the ~60 call
+    /// sites across this file don't need touching. This is purely a test
+    /// fixture BUILDER's input format, not a production concept: production
+    /// resolution (`darkmux_crew::resourcing::resolve_review_roles`) never
+    /// reads a "family" string anywhere — it classifies roles structurally,
+    /// by each task's own step kind. `"review-probe"` may repeat (each
+    /// entry's staffings all become probes, in the order given);
+    /// `"review-judge"`/`"review-verify"` take their entry's FIRST staffing.
+    fn crew_with(seats: Vec<(&str, Vec<ResolvedSeatStaffing>)>) -> ResolvedReviewRoles {
+        let mut probes = Vec::new();
+        let mut judge = None;
+        let mut verify = None;
+        for (label, staffings) in seats {
+            match label {
+                "review-probe" => probes.extend(staffings),
+                "review-judge" => judge = staffings.into_iter().next(),
+                "review-verify" => verify = staffings.into_iter().next(),
+                other => panic!("test fixture: unknown seat family `{other}`"),
+            }
         }
-        ResolvedCrew { name: "test-crew".to_string(), seats: m, request_changes: false }
+        ResolvedReviewRoles {
+            probes,
+            judge: judge.expect("test fixture: crew_with needs a \"review-judge\" entry"),
+            verify,
+            request_changes: false,
+        }
     }
 
-    fn valid_crew() -> ResolvedCrew {
+    fn valid_crew() -> ResolvedReviewRoles {
         crew_with(vec![
             ("review-probe", vec![staffing("fast", "probe-model", 2)]),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
@@ -842,49 +864,21 @@
         assert_eq!(selected[0].id, "b", "param-flow bundle is prioritized first");
     }
 
-    // ── crew seat-requirement validation ────────────────────────────
-
-    #[test]
-    fn validate_review_crew_happy_path() {
-        let crew = valid_crew();
-        let ReviewSeats { probes, judge, verify: _ } = validate_review_crew(&crew).expect("valid");
-        assert_eq!(probes.len(), 1);
-        assert_eq!(judge.pm.id, "judge-model");
-    }
-
-    #[test]
-    fn validate_review_crew_missing_probe_seat_rejected() {
-        let crew = crew_with(vec![("review-judge", vec![staffing("fast", "j", 1)])]);
-        let err = validate_review_crew(&crew).unwrap_err();
-        assert!(err.to_string().contains("review-probe"));
-    }
-
-    #[test]
-    fn validate_review_crew_empty_probe_staffing_rejected() {
-        let crew = crew_with(vec![
-            ("review-probe", vec![]),
-            ("review-judge", vec![staffing("fast", "j", 1)]),
-        ]);
-        let err = validate_review_crew(&crew).unwrap_err();
-        assert!(err.to_string().contains("review-probe"));
-    }
-
-    #[test]
-    fn validate_review_crew_missing_judge_seat_rejected() {
-        let crew = crew_with(vec![("review-probe", vec![staffing("fast", "p", 1)])]);
-        let err = validate_review_crew(&crew).unwrap_err();
-        assert!(err.to_string().contains("review-judge"));
-    }
-
-    #[test]
-    fn validate_review_crew_multiple_judge_staffings_rejected() {
-        let crew = crew_with(vec![
-            ("review-probe", vec![staffing("fast", "p", 1)]),
-            ("review-judge", vec![staffing("fast", "j1", 1), staffing("fast", "j2", 1)]),
-        ]);
-        let err = validate_review_crew(&crew).unwrap_err();
-        assert!(err.to_string().contains("EXACTLY 1"));
-    }
+    // (#1512, #1513 review) `validate_review_crew`'s own seat-shape-rejection
+    // tests RETIRED here — that validation dissolved into
+    // `resolve_review_roles`'s OWN resolution loop (it enforces "at least
+    // one probe role", "exactly one judge task", "verify optional" as part
+    // of resolving them from the config, structurally, by step kind — a
+    // config that violates any of these never produces an `Ok` value in the
+    // first place). The equivalent coverage now lives in
+    // `resourcing.rs`'s test module: `resolve_review_roles_with_no_probe_
+    // tasks_errors_loudly`, `resolve_review_roles_with_no_judge_task_errors_
+    // loudly`, `resolve_review_roles_verify_absent_from_the_document_
+    // resolves_to_none`. This module's `crew_with` test DSL (a hand-built
+    // fixture builder, not a production concept) no longer has a separate
+    // "is this shape valid" check to test — a `ResolvedReviewRoles` value
+    // built by hand is valid by construction (it's a plain struct, not a
+    // family-keyed map that could be malformed).
 
     // ── flow-record emission (#1247 Part 1) ───────────────────────────
 
@@ -1075,7 +1069,7 @@
         let crew = valid_crew();
         let inputs = ReviewInputs {
             case_id: "c1".to_string(),
-            crew: &crew,
+            roles: &crew,
             intent_title: "add a feature",
             intent_body: "",
             diff: DIFF,
@@ -1104,7 +1098,7 @@
         let crew = valid_crew();
         let inputs = ReviewInputs {
             case_id: "c1".to_string(),
-            crew: &crew,
+            roles: &crew,
             intent_title: "add a feature",
             intent_body: "",
             diff: DIFF,
@@ -1138,7 +1132,7 @@
         let crew = valid_crew();
         let inputs = ReviewInputs {
             case_id: "c1".to_string(),
-            crew: &crew,
+            roles: &crew,
             intent_title: "add a feature",
             intent_body: "",
             diff: DIFF,
@@ -1202,7 +1196,7 @@
         ]);
         let inputs = ReviewInputs {
             case_id: "c1".to_string(),
-            crew: &crew,
+            roles: &crew,
             intent_title: "add a feature",
             intent_body: "",
             diff: DIFF,
@@ -1255,7 +1249,7 @@
         ]);
         let inputs = ReviewInputs {
             case_id: "c1".to_string(),
-            crew: &crew,
+            roles: &crew,
             intent_title: "add a feature",
             intent_body: "",
             diff: DIFF,
@@ -1330,7 +1324,7 @@
         ]);
         let mut inputs = ReviewInputs {
             case_id: "c-judge-only-budget".to_string(),
-            crew: &crew,
+            roles: &crew,
             intent_title: "t",
             intent_body: "",
             diff: DIFF,
@@ -2233,7 +2227,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         }];
         let inputs = ReviewInputs {
             case_id: "c1".to_string(),
-            crew: &crew,
+            roles: &crew,
             intent_title: "add a feature",
             intent_body: "",
             diff: DIFF,
@@ -2357,29 +2351,25 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(parse_verify_ruling("no verdict here").is_none());
     }
 
-    /// The verify seat's staffing shape is validated like the judge's:
-    /// exactly one staffing when declared; absent is fine (optional seat).
+    /// The verify seat is genuinely optional: a hand-built fixture that
+    /// declares one is `Some`; one that doesn't is `None`. (#1512, #1513
+    /// review: `validate_review_crew`'s own "exactly 1 verify staffing when
+    /// declared" shape check retired with it — a `ResolvedReviewRoles`
+    /// built by hand carries `verify: Option<ResolvedSeatStaffing>`
+    /// directly, valid by construction; the equivalent production coverage
+    /// is `resourcing.rs`'s `resolve_review_roles_verify_absent_from_the_
+    /// document_resolves_to_none`.)
     #[test]
-    fn validate_review_crew_verify_seat_shape() {
+    fn crew_with_verify_seat_is_genuinely_optional() {
         let ok = crew_with(vec![
             ("review-probe", vec![staffing("fast", "a", 1)]),
             ("review-judge", vec![staffing("fast", "b", 1)]),
             ("review-verify", vec![staffing("frontier", "c", 1)]),
         ]);
-        let seats = validate_review_crew(&ok).expect("verify seat accepted");
-        assert!(seats.verify.is_some());
+        assert!(ok.verify.is_some());
 
         let absent = valid_crew();
-        assert!(validate_review_crew(&absent).expect("optional").verify.is_none());
-
-        let two = crew_with(vec![
-            ("review-probe", vec![staffing("fast", "a", 1)]),
-            ("review-judge", vec![staffing("fast", "b", 1)]),
-            ("review-verify", vec![staffing("frontier", "c", 1), staffing("frontier", "d", 1)]),
-        ]);
-        let err = validate_review_crew(&two).unwrap_err().to_string();
-        assert!(err.contains("review-verify"), "{err}");
-        assert!(err.contains("EXACTLY 1"), "{err}");
+        assert!(absent.verify.is_none());
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -2437,10 +2427,10 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
     // ─── (#1230/#1341 DRY pass) Task/Step graph orchestration ───────────
 
-    fn step_ctx(crew: &ResolvedCrew, bundles: Vec<BundleInput>) -> Arc<ReviewStepContext> {
+    fn step_ctx(crew: &ResolvedReviewRoles, bundles: Vec<BundleInput>) -> Arc<ReviewStepContext> {
         Arc::new(ReviewStepContext {
             case_id: "case-1".to_string(),
-            crew: crew.clone(),
+            roles: crew.clone(),
             intent_title: String::new(),
             intent_body: String::new(),
             diff: DIFF.to_string(),
@@ -2485,7 +2475,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
     /// A crew of `graph_staffing` seats — the graph-hermetic equivalent of
     /// `valid_crew()`.
-    fn graph_valid_crew() -> ResolvedCrew {
+    fn graph_valid_crew() -> ResolvedReviewRoles {
         crew_with(vec![
             ("review-probe", vec![graph_staffing("fast", "probe-model", 2)]),
             ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
@@ -2501,7 +2491,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// can't cross that boundary, which is exactly why `dispatch_chat`'s
     /// seam is an `Arc<dyn Fn + Send + Sync>` instead.
     fn step_ctx_with_chat(
-        crew: &ResolvedCrew,
+        crew: &ResolvedReviewRoles,
         bundles: Vec<BundleInput>,
         chat_fn: impl Fn(&ChatCall) -> Result<SingleShotReply> + Send + Sync + 'static,
     ) -> Arc<ReviewStepContext> {
@@ -2511,14 +2501,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// [`step_ctx_with_chat`] with a caller-chosen remote per-execution
     /// token budget — for the budget-exhaustion tests below.
     fn step_ctx_with_chat_and_budget(
-        crew: &ResolvedCrew,
+        crew: &ResolvedReviewRoles,
         bundles: Vec<BundleInput>,
         remote_max_tokens_per_execution: u64,
         chat_fn: impl Fn(&ChatCall) -> Result<SingleShotReply> + Send + Sync + 'static,
     ) -> Arc<ReviewStepContext> {
         Arc::new(ReviewStepContext {
             case_id: "case-1".to_string(),
-            crew: crew.clone(),
+            roles: crew.clone(),
             intent_title: String::new(),
             intent_body: String::new(),
             diff: DIFF.to_string(),
@@ -2540,17 +2530,19 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// ORDER to the historical sequential judge loop, per
     /// `build_review_graph`'s own doc.
     fn run_graph(ctx: &Arc<ReviewStepContext>, emitter: &mut dyn ReviewEmitter) -> Result<ReviewEnvelope> {
-        let seats = validate_review_crew(&ctx.crew)?;
-        let judge = seats.judge.clone();
-        let verify = seats.verify.cloned();
-        let probes: Vec<_> = seats.probes.clone();
+        // (#1512, #1513 review) `ctx.roles` is already the validated,
+        // resolved shape — no separate crew-validation step.
+        let judge = ctx.roles.judge.clone();
+        let verify = ctx.roles.verify.clone();
+        let probes = ctx.roles.probes.clone();
         let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
-        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.crew.request_changes);
+        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+        let crew_name = ctx.roles.distinct_profile_names();
         let graph =
             build_review_graph(ctx.clone(), judge, verify, &probes, "investigate", "adjudicate", "report", 1)?;
         let (env, _steps) = run_review_graph(
             ctx,
-            &ctx.crew.name,
+            &crew_name,
             ExecMode::Sequential,
             fingerprint_val,
             staffing_snap,
@@ -2578,14 +2570,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-probe", vec![staffing("fast", "probe-model-a", 1), staffing("slow", "probe-model-b", 1)]),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
-        let seats = validate_review_crew(&crew).expect("valid crew");
         let ctx = step_ctx(&crew, vec![]);
 
         let graph = build_review_graph(
             ctx,
-            seats.judge.clone(),
-            seats.verify.cloned(),
-            seats.probes,
+            crew.judge.clone(),
+            crew.verify.clone(),
+            &crew.probes,
             "investigate",
             "adjudicate",
             "report",
@@ -2680,7 +2671,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// envelope snapshot recording the role→profile resolution per seat.
     #[test]
     fn role_profile_crew_binds_each_probe_task_to_its_role_resolved_model() {
-        use darkmux_crew::resourcing::{resolve_review_role_crew_with, ReviewRoleStaffing};
+        use darkmux_crew::resourcing::{resolve_review_roles, ReviewRoleStaffing};
         use darkmux_types::{Profile, ProfileModel, ProfileRegistry};
 
         let mk = |id: &str, n: u32| ProfileModel { id: id.into(), n_ctx: Some(n), ..Default::default() };
@@ -2701,9 +2692,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         .iter()
         .map(|(r, p)| (r.to_string(), p.to_string()))
         .collect();
-        let probe_role_ids =
-            vec!["review-probe-high".to_string(), "review-probe-mid".to_string(), "review-probe-low".to_string()];
-        let crew = resolve_review_role_crew_with(&reg, &ReviewRoleStaffing::default(), &probe_role_ids, &|r| {
+        // (#1512, #1513 review) The REAL embedded "review" document — role
+        // discovery is `resolve_review_roles`'s own job now (structural, by
+        // step kind), never a caller-supplied role-id list.
+        let loaded = darkmux_crew::mission_config::load("review").expect("embedded review config loads");
+        let roles = resolve_review_roles(&reg, &loaded.config, &ReviewRoleStaffing::default(), &|r| {
             match bindings.get(r) {
                 Some(p) => darkmux_profiles::profiles::RoleBinding::Mapped(p.clone()),
                 None => darkmux_profiles::profiles::RoleBinding::Unmapped,
@@ -2711,20 +2704,19 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         })
         .unwrap();
 
-        let seats = validate_review_crew(&crew).expect("role crew is a valid review crew");
-        let probes: Vec<_> = seats.probes.clone();
+        let probes = roles.probes.clone();
         // The envelope snapshot records role → profile → model per seat.
-        let snap = staffing_snapshot(&probes, seats.judge, seats.verify, crew.request_changes);
+        let snap = staffing_snapshot(&probes, &roles.judge, roles.verify.as_ref(), roles.request_changes);
         assert_eq!(snap.probes[0].role_id.as_deref(), Some("review-probe-high"));
         assert_eq!(snap.probes[0].name, "phigh", "the high probe's profile is recorded");
         assert_eq!(snap.probes[0].provenance.as_ref().unwrap().kind, "role-profile");
         assert_eq!(snap.probes[2].role_id.as_deref(), Some("review-probe-low"));
 
-        let ctx = step_ctx(&crew, vec![]);
+        let ctx = step_ctx(&roles, vec![]);
         let graph = build_review_graph(
             ctx,
-            seats.judge.clone(),
-            seats.verify.cloned(),
+            roles.judge.clone(),
+            roles.verify.clone(),
             &probes,
             "investigate",
             "adjudicate",
@@ -2868,12 +2860,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         ctx: &Arc<ReviewStepContext>,
         emitter: &mut dyn ReviewEmitter,
     ) -> Result<ReviewEnvelope> {
-        let seats = validate_review_crew(&ctx.crew)?;
-        let judge = seats.judge.clone();
-        let verify = seats.verify.cloned();
-        let probes: Vec<_> = seats.probes.clone();
+        // (#1512, #1513 review) `ctx.roles` is already the validated,
+        // resolved shape — no separate crew-validation step.
+        let judge = ctx.roles.judge.clone();
+        let verify = ctx.roles.verify.clone();
+        let probes = ctx.roles.probes.clone();
         let fingerprint_val = fingerprint(&seat_identifier(&judge.pm), &ctx.judge_system);
-        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.crew.request_changes);
+        let staffing_snap = staffing_snapshot(&probes, &judge, verify.as_ref(), ctx.roles.request_changes);
+        let crew_name = ctx.roles.distinct_profile_names();
         let graph = build_review_graph_from_config(
             config,
             "hand-built test config",
@@ -2888,7 +2882,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         )?;
         let (env, _steps) = run_review_graph(
             ctx,
-            &ctx.crew.name,
+            &crew_name,
             ExecMode::Sequential,
             fingerprint_val,
             staffing_snap,
@@ -3023,13 +3017,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-probe", vec![staffing("fast", "probe-model-a", 1)]),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
-        let seats = validate_review_crew(&crew).expect("valid crew");
         let ctx = step_ctx(&crew, vec![]);
         let graph = build_review_graph(
             ctx,
-            seats.judge.clone(),
-            seats.verify.cloned(),
-            seats.probes,
+            crew.judge.clone(),
+            crew.verify.clone(),
+            &crew.probes,
             "investigate",
             "adjudicate",
             "report",
@@ -3154,10 +3147,9 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     #[test]
     fn run_review_graph_with_empty_bundles_completes_with_zero_dispatches() {
         let crew = valid_crew();
-        let seats = validate_review_crew(&crew).expect("valid crew");
-        let judge = seats.judge.clone();
-        let verify = seats.verify.cloned();
-        let probes: Vec<_> = seats.probes.clone();
+        let judge = crew.judge.clone();
+        let verify = crew.verify.clone();
+        let probes = crew.probes.clone();
         let ctx = step_ctx(&crew, vec![]);
 
         let graph = build_review_graph(ctx.clone(), judge.clone(), verify.clone(), &probes, "investigate", "adjudicate", "report", 1)
@@ -3257,10 +3249,9 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     #[test]
     fn run_review_graph_persists_running_before_terminal_for_every_step() {
         let crew = valid_crew();
-        let seats = validate_review_crew(&crew).expect("valid crew");
-        let judge = seats.judge.clone();
-        let verify = seats.verify.cloned();
-        let probes: Vec<_> = seats.probes.clone();
+        let judge = crew.judge.clone();
+        let verify = crew.verify.clone();
+        let probes = crew.probes.clone();
         let ctx = step_ctx(&crew, vec![]);
 
         let graph = build_review_graph(ctx.clone(), judge.clone(), verify.clone(), &probes, "investigate", "adjudicate", "report", 1)
@@ -3460,9 +3451,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         ctx: &Arc<ReviewStepContext>,
         verify: ResolvedSeatStaffing,
     ) -> (Vec<String>, BTreeMap<String, Step>) {
-        let seats = validate_review_crew(&ctx.crew).expect("valid crew");
-        let judge = seats.judge.clone();
-        let probes: Vec<_> = seats.probes.clone();
+        let judge = ctx.roles.judge.clone();
+        let probes = ctx.roles.probes.clone();
         let graph = build_review_graph(
             ctx.clone(),
             judge,
@@ -3605,9 +3595,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let ctx = step_ctx_with_chat(&crew, bundles_from_diff(DIFF), |_call: &ChatCall| {
             panic!("no probe dispatch may fire when the model never loads");
         });
-        let seats = validate_review_crew(&ctx.crew).expect("valid crew");
-        let judge = seats.judge.clone();
-        let probes: Vec<_> = seats.probes.clone();
+        let judge = ctx.roles.judge.clone();
+        let probes = ctx.roles.probes.clone();
         let graph = build_review_graph(
             ctx.clone(),
             judge,
@@ -4972,7 +4961,6 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         ]);
         let bundles = vec![bundle_input("a.ts"), bundle_input("b.ts")];
         let ctx = step_ctx(&crew, bundles);
-        let seats = validate_review_crew(&ctx.crew).expect("valid crew");
 
         // Two confirmed flags (one per bundle) + one needs-check flag that
         // must NOT render.
@@ -5007,7 +4995,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
         let kind = ReviewVerifyRenderStepKind {
             ctx: ctx.clone(),
-            verify: seats.verify.cloned(),
+            verify: ctx.roles.verify.clone(),
             env: Arc::new(StdMutex::new(ReviewEnvelope::default())),
         };
         let step = darkmux_crew::types::Step {

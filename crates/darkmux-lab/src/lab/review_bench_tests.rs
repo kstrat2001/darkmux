@@ -1491,13 +1491,10 @@
     // reaches the probe phase, so both the degenerate-envelope path and the
     // `--bundler` wiring are reachable without any network dispatch.
 
-    fn valid_funnel_crew() -> darkmux_crew::resourcing::ResolvedCrew {
+    fn valid_funnel_crew() -> darkmux_crew::resourcing::ResolvedReviewRoles {
         use darkmux_crew::resourcing::ResolvedSeatStaffing;
-        use std::collections::BTreeMap;
-        let mut seats = BTreeMap::new();
-        seats.insert(
-            "review-probe".to_string(),
-            vec![ResolvedSeatStaffing {
+        darkmux_crew::resourcing::ResolvedReviewRoles {
+            probes: vec![ResolvedSeatStaffing {
                 name: "fast".into(),
                 role_id: None,
                 pm: dummy_pm("probe-model"),
@@ -1507,10 +1504,7 @@
                 selector: None,
                 provenance: None,
             }],
-        );
-        seats.insert(
-            "review-judge".to_string(),
-            vec![ResolvedSeatStaffing {
+            judge: ResolvedSeatStaffing {
                 name: "fast".into(),
                 role_id: None,
                 pm: dummy_pm("judge-model"),
@@ -1519,14 +1513,15 @@
                 max_tokens: None,
                 selector: None,
                 provenance: None,
-            }],
-        );
-        darkmux_crew::resourcing::ResolvedCrew { name: "test-crew".into(), seats, request_changes: false }
+            },
+            verify: None,
+            request_changes: false,
+        }
     }
 
     fn test_funnel_ctx(bundler_cmd: Option<String>, exec_mode: super::super::review::ExecMode) -> FunnelCtx {
         FunnelCtx {
-            crew: valid_funnel_crew(),
+            roles: valid_funnel_crew(),
             exec_mode,
             probe_system: "probe system prompt".into(),
             judge_system: "judge system prompt".into(),
@@ -1712,9 +1707,8 @@
         let path = write_test_registry(tmp.path(), "fast");
         let opts = funnel_ctx_opts(path, "ghost", None, None);
 
-        // `Result::unwrap_err` requires `T: Debug`; `FunnelCtx` intentionally
-        // isn't (it holds a `ResolvedCrew`, not a debug/display type) — `.err().unwrap()`
-        // extracts the error without that bound.
+        // `Result::unwrap_err` requires `T: Debug`; `FunnelCtx` doesn't derive
+        // it — `.err().unwrap()` extracts the error without that bound.
         let err = resolve_funnel_ctx(&opts).err().unwrap();
         let msg = format!("{err:#}");
         // (#1475) The bench pins every seat to the roster via the per-run
@@ -1730,10 +1724,9 @@
         let opts = funnel_ctx_opts(path, "fast", Some("parallel"), Some(9));
 
         let ctx = resolve_funnel_ctx(&opts).unwrap();
-        let probes = ctx.crew.seats.get("review-probe").unwrap();
+        let probes = &ctx.roles.probes;
         assert!(probes.iter().all(|s| s.k == 9), "the probe seat's draw count is the k override");
-        let judges = ctx.crew.seats.get("review-judge").unwrap();
-        assert_eq!(judges[0].k, 1, "the judge seat draws once regardless of the probe k override");
+        assert_eq!(ctx.roles.judge.k, 1, "the judge seat draws once regardless of the probe k override");
         assert_eq!(
             ctx.exec_mode,
             super::super::review::ExecMode::Parallel,
@@ -1750,7 +1743,7 @@
         let opts = funnel_ctx_opts(path, "fast", None, None);
 
         let ctx = resolve_funnel_ctx(&opts).unwrap();
-        let probes = ctx.crew.seats.get("review-probe").unwrap();
+        let probes = &ctx.roles.probes;
         // (#1475) The flip staffs three distinct probe roles, one draw each —
         // the same total probe breadth (3) the old default `k=3` gave from one
         // seat, now role-borne rather than draw-borne.
