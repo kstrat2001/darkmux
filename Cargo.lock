@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-crew"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "darkmux-flow",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-doctor"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "darkmux-crew",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-eureka"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "darkmux-hardware",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-fleet"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "darkmux-crew",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-flow"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-gestalt"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "darkmux-types",
  "serde",
@@ -450,14 +450,14 @@ dependencies = [
 
 [[package]]
 name = "darkmux-hardware"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "darkmux-heuristics"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "darkmux-hardware",
  "darkmux-profiles",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-lab"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-profiles"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "darkmux-gestalt",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-serve"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-types"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "dirs",
