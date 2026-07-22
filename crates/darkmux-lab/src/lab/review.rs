@@ -10,8 +10,9 @@
 //!        → judge pass-2(pass-1 confirms only) → {confirmed, needs_check, archived}
 //! ```
 //!
-//! This module is the DRIVER: given a resolved crew (packet 1's
-//! the resourcing resolver `darkmux_crew::resourcing`), a diff, and an intent, it runs
+//! This module is the DRIVER: given resolved roles (#1512, #1513 review —
+//! `darkmux_crew::resourcing::resolve_review_roles`, the one generic
+//! per-task resolver; no "crew" concept), a diff, and an intent, it runs
 //! the whole pipeline and returns a [`ReviewEnvelope`]. Dispatch itself goes
 //! through a caller-injected `chat` closure (the container-free single-shot
 //! primitive from packet 2, `darkmux_crew::single_shot::single_shot_chat`,
@@ -131,7 +132,7 @@ use darkmux_crew::telemetry_sampler::{sample_host, HostSample};
 // adapters (their first production call site) — see the "model cycling"
 // section below.
 use darkmux_gestalt::{AcquireOpts, AcquireScope, Action, CallerIntent, Facts, ModelHost, Placement, ResourceProbe, V1Estimator};
-use darkmux_crew::resourcing::{ResolvedCrew, ResolvedSeatStaffing};
+use darkmux_crew::resourcing::{ResolvedReviewRoles, ResolvedSeatStaffing};
 use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
 use darkmux_profiles::swap;
 use darkmux_types::{BundleSelector, ModelEndpoint, ProfileModel};
@@ -1249,80 +1250,17 @@ fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &Resolve
     }
 }
 
-// ─── crew validation (review-owned seat requirements) ───────────────────
-
-/// The review's validated seat set — what [`validate_review_crew`] hands
-/// back. `verify` is the OPTIONAL fourth seat (#1260): when a crew declares
-/// `review-verify` (exactly one staffing, like the judge), every
-/// double-confirmed finding gets one adjudication call after pass-2; a crew
-/// without it behaves byte-identically to today.
-#[derive(Debug)]
-pub struct ReviewSeats<'a> {
-    pub probes: &'a Vec<ResolvedSeatStaffing>,
-    pub judge: &'a ResolvedSeatStaffing,
-    pub verify: Option<&'a ResolvedSeatStaffing>,
-}
-
-/// Validate `crew` carries what the review needs: seat `"review-probe"`
-/// with >= 1 staffing, seat `"review-judge"` with EXACTLY 1 staffing, and
-/// — when declared — seat `"review-verify"` with EXACTLY 1 staffing
-/// (#1260; the seat is optional, its shape is not).
-/// `resolve_crew` (packet 1) validates the crew schema is well-formed and
-/// every model resolvable; it deliberately does NOT know about
-/// pipeline-specific seat requirements — that's this function's job, and
-/// it runs at review start so a misconfigured crew fails loud before any
-/// dispatch spends a token.
-///
-/// `pub` (not private) since #1222 Phase B packet 7 review round: the
-/// `review-bench --review` preflight (`darkmux_lab::lab::review_bench::
-/// resolve_review_ctx`) calls this directly, ahead of `run_review`'s own
-/// internal call, so a misconfigured crew fails at bench START (before the
-/// per-case loop even begins) rather than at the first case's dispatch.
-pub fn validate_review_crew(crew: &ResolvedCrew) -> Result<ReviewSeats<'_>> {
-    let probes = crew
-        .seats
-        .get("review-probe")
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "darkmux: review staffing \"{}\" is missing the \"review-probe\" seat (the \
-                 review needs >= 1 probe staffing) — the role→profile resolver staffs the three \
-                 probe roles from their bindings; bind or override one \
-                 (`darkmux config set role_profiles.review-probe-high <profile>`, or \
-                 `--param review-probe-high=<profile>`) (#1475)",
-                crew.name
-            )
-        })?;
-    let judges = crew.seats.get("review-judge").ok_or_else(|| {
-        anyhow!(
-            "darkmux: review staffing \"{}\" is missing the \"review-judge\" seat (the \
-             review needs exactly 1 judge staffing) — the role→profile resolver staffs it from \
-             its binding; bind or override it (`darkmux config set role_profiles.review-judge \
-             <profile>`, or `--param review-judge=<profile>`) (#1475)",
-            crew.name
-        )
-    })?;
-    if judges.len() != 1 {
-        bail!(
-            "darkmux: review staffing \"{}\" seat \"review-judge\" must have EXACTLY 1 staffing \
-             (got {}) — the double-confirm judge is a single seat, unlike \"review-probe\"",
-            crew.name,
-            judges.len()
-        );
-    }
-    let verify = match crew.seats.get("review-verify") {
-        None => None,
-        Some(v) if v.len() == 1 => Some(&v[0]),
-        Some(v) => bail!(
-            "darkmux: review staffing \"{}\" seat \"review-verify\" must have EXACTLY 1 staffing \
-             when declared (got {}) — the adjudication seat is single, like \"review-judge\" \
-             (#1260)",
-            crew.name,
-            v.len()
-        ),
-    };
-    Ok(ReviewSeats { probes, judge: &judges[0], verify })
-}
+// ─── (#1512, #1513 review) role validation dissolved ─────────────────────
+//
+// `ReviewSeats`/`validate_review_crew` used to re-check a `ResolvedCrew`'s
+// `seats` map carried >= 1 probe staffing, EXACTLY 1 judge, and an optional
+// verify. That check is now REDUNDANT by construction: `resolve_review_roles`
+// (`darkmux_crew::resourcing`) already enforces every one of those shape
+// rules as part of resolving them (a config with zero probe-role tasks, or
+// no judge task, is a resolution ERROR, never a value that reaches a
+// caller) — so a `ResolvedReviewRoles` is valid the moment it exists.
+// There is nothing left to separately validate, and nothing to extract:
+// `.probes`/`.judge`/`.verify` are direct fields.
 
 // ─── mechanism-family keyword table (for dedup) ──────────────────────────
 
@@ -2073,7 +2011,12 @@ pub struct ChatCall<'a> {
 /// couldn't provide more simply.
 pub struct ReviewInputs<'a> {
     pub case_id: String,
-    pub crew: &'a ResolvedCrew,
+    /// (#1512, #1513 review) Every role this run resolved — however many
+    /// probe roles, the judge, the optional verify — via the ONE generic
+    /// per-task resolver (`darkmux_crew::resourcing::resolve_review_roles`).
+    /// Not a "crew": no family grouping, just the three fields
+    /// [`run_judge_only`] needs.
+    pub roles: &'a ResolvedReviewRoles,
     /// The author's stated case (PR title). Fed into [`judge_prompt`] only
     /// — Phase A never showed the probe seat the intent (#1256), so
     /// [`probe_user_message`] never reads this field.
@@ -3175,7 +3118,13 @@ pub fn run_judge_only(
     cycler: &mut dyn ModelCycler,
     emitter: &mut dyn ReviewEmitter,
 ) -> Result<ReviewEnvelope> {
-    let ReviewSeats { probes, judge, verify } = validate_review_crew(inputs.crew)?;
+    // (#1512, #1513 review) `inputs.roles` is already the validated,
+    // resolved shape — no separate crew-validation step. Probes/judge are
+    // required by construction; verify is optionally present.
+    let probes = &inputs.roles.probes;
+    let judge = &inputs.roles.judge;
+    let verify = inputs.roles.verify.as_ref();
+    let crew_name = inputs.roles.distinct_profile_names();
     // Judge-only runs one model, so the mode is telemetry, not behavior —
     // but the envelope still records the CALLER's resolved mode rather
     // than a hardcoded label, so a judge-only re-run of a parallel review
@@ -3188,7 +3137,7 @@ pub fn run_judge_only(
 
     let mut env = ReviewEnvelope {
         case_id: inputs.case_id.clone(),
-        crew: inputs.crew.name.clone(),
+        crew: crew_name.clone(),
         mode: mode_label(mode).to_string(),
         bundles: bundles.len(),
         // Same up-front stamp as `run_review` — degenerate (zero-flag)
@@ -3196,7 +3145,7 @@ pub fn run_judge_only(
         fingerprint: fingerprint(&seat_identifier(&judge.pm), inputs.judge_system),
         // (#1247) The resolved staffing this run actually used, post any
         // caller-applied `--k` override — see `ReviewEnvelope::staffing`.
-        staffing: Some(staffing_snapshot(probes, judge, verify, inputs.crew.request_changes)),
+        staffing: Some(staffing_snapshot(probes, judge, verify, inputs.roles.request_changes)),
         ..Default::default()
     };
     // (#1434) Run observability rides the injected emitter via `ReviewObs`,
@@ -3204,7 +3153,7 @@ pub fn run_judge_only(
     // task-level bookend here — the caller's `with_dispatch_bookends` wrap
     // owns run liveness (contract 2). `obs` drops at function end (early
     // `?`-return or clean), tearing down its sampler thread.
-    let mut obs = ReviewObs::new(emitter, &inputs.case_id, &inputs.crew.name);
+    let mut obs = ReviewObs::new(emitter, &inputs.case_id, &crew_name);
     env.steps.push(StepRecord {
         step_id: "bundle".to_string(),
         kind: "procedural".to_string(),
@@ -3295,7 +3244,15 @@ use std::sync::Mutex as StdMutex;
 /// survives only for `run_judge_only`'s sequential path).
 pub struct ReviewStepContext {
     pub case_id: String,
-    pub crew: ResolvedCrew,
+    /// (#1512, #1513 review) Every role this run resolved, via the ONE
+    /// generic per-task resolver — not a "crew". Carried here purely for
+    /// test-fixture convenience (`step_ctx`'s callers build it once
+    /// alongside the rest of the context); the graph's own step kinds never
+    /// read it — `build_review_graph` stamps each task's resolved model
+    /// directly into that task's `Step.config` before the graph runs, and
+    /// `run_review_graph` takes the crew-display-name/staffing-snapshot it
+    /// needs as its own explicit parameters (see that function's doc).
+    pub roles: ResolvedReviewRoles,
     pub intent_title: String,
     pub intent_body: String,
     pub diff: String,
@@ -3522,17 +3479,19 @@ impl StepKind for ReviewBundleStepKind {
 
 // ─── investigate: probe reconstruction (seats x k dispatch.map fan-out) ─
 
-/// (#1442 ship-2b) One probe SEAT's mint-time spec — the key the dedup
-/// boundary uses to reconstruct the review's domain results (raw
+/// (#1442 ship-2b, #1512) One probe SEAT's mint-time spec — the key the
+/// dedup boundary uses to reconstruct the review's domain results (raw
 /// [`ProbeFlag`]s, per-seat [`MemberRecord`] accounting, reduced-coverage
 /// warnings, the probe stage's remote budget row) from the generic
-/// `dispatch.map` fan-out's per-item results. The probe stage is one sibling
-/// `dispatch.map` step per probe ROLE (#1475 packet 2 — minted by
-/// `build_review_graph`'s `probe_roles` expansion, sharing one
-/// `bucket_group: "probe"` remote allowance); each spec records which draw
-/// TASK ids belong to this seat (index = draw) and which bundles its
-/// selector chose (in pre-rendered collection order), so reconstruction is
-/// pure data alignment — never re-derivation.
+/// `dispatch.map` fan-out's per-item results. The probe stage is one
+/// EXPLICIT one-role `dispatch.map` task per probe role, declared
+/// statically in review.json (#1512 — no `expand` template, no crew-level
+/// probe-role enumeration; `build_review_graph` claims each resolved seat
+/// against its declared task by `role_id`), sharing one `bucket_group:
+/// "probe"` remote allowance. `draw_task_ids` is a single-entry `Vec` today
+/// (one role, one task, one dispatch) — kept plural for the dedup step's
+/// existing per-draw iteration shape, not because more than one entry is
+/// ever produced.
 #[derive(Debug, Clone)]
 pub(crate) struct ProbeSeatSpec {
     pub(crate) name: String,
@@ -3542,9 +3501,10 @@ pub(crate) struct ProbeSeatSpec {
     pub(crate) identifier: String,
     pub(crate) remote: bool,
     pub(crate) endpoint_host: Option<String>,
-    /// This seat's k sibling map TASK ids, indexed by draw — the dedup
-    /// step's `input` keys (`gather_inputs` keys a first-step input by
-    /// dependency TASK id, #1341).
+    /// This seat's claimed probe task id, wrapped in a `Vec` for the dedup
+    /// step's `input`-key iteration (`gather_inputs` keys a first-step
+    /// input by dependency TASK id, #1341) — always exactly one entry as of
+    /// #1512 (one role, one task).
     pub(crate) draw_task_ids: Vec<String>,
     /// The selected bundles, in the exact order the pre-rendered prompt
     /// collection was minted: `(bundle_id, fact_family)` per item index.
@@ -3771,8 +3731,9 @@ pub struct ReviewDedupStepKind {
     /// reconstructed remote-budget row + all-draws-failed degenerate reason
     /// here — the reconstruction boundary (see `probe_specs` below).
     pub env: SharedReviewEnvelope,
-    /// (#1442 ship-2b) The mint-time per-seat specs `build_review_graph`
-    /// computed alongside the `probe_roles` expansion (#1475 packet 2) — this step's `input`
+    /// (#1442 ship-2b, #1512) The mint-time per-seat specs `build_review_graph`
+    /// computed while claiming each staffing against its declared probe
+    /// task — this step's `input`
     /// map (keyed by probe TASK id) is raw `MapItemResult` arrays from the
     /// generic `dispatch.map` fan-out, and [`reconstruct_probe_stage`]
     /// aligns them back into domain results against these specs before the
@@ -4643,19 +4604,30 @@ pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
 /// Caller persists `tasks`/`steps`, then runs the graph via
 /// [`run_review_graph`].
 ///
-/// (#1284 Packet 3) A THIN LAUNCHER as of this packet: loads the built-in
-/// "review" mission config (`darkmux_crew::mission_config::load`), resolves
-/// every genuinely per-launch value THIS FUNCTION's own parameters carry —
-/// the three real phase ids, the resolved judge concurrency, and the
-/// config's one documented per-probe-role expansion (`probe_roles`, this
-/// call's `probes` in role order — #1475 packet 2, each seat's `role_id`) — into
+/// (#1284 Packet 3, #1512) A THIN LAUNCHER: loads the built-in "review"
+/// mission config (`darkmux_crew::mission_config::load`), resolves every
+/// genuinely per-launch value THIS FUNCTION's own parameters carry — the
+/// three real phase ids and the resolved judge concurrency — into
 /// `mission_config::interpret::LaunchParams`, then calls
 /// `mission_config::interpret` to materialize the real `Vec<Task>` +
 /// `BTreeMap<String, Step>`. `interpret` does NOT construct `StepKind`
 /// instances (#1284 Packet 3's own scope, #1352's Tier 3 rule) — this
-/// function still owns registering every Tier 3 kind this pipeline needs,
-/// unconditionally (the config's graph SHAPE is fixed except for the
-/// probe-seat count, so every non-probe kind is always present).
+/// function still owns registering every Tier 3 kind this pipeline needs.
+///
+/// **No `expand` template (#1512).** review.json declares its probe tasks
+/// EXPLICITLY — one task per probe role, statically, each carrying its own
+/// `role_id` and depending only on `review-bundle-task`. `interpret` needs
+/// no expansion collection at all; the probe COUNT is whatever
+/// `review-dedup-task.depends_on` names. This function claims each
+/// resolved `probes` staffing against the interpreted task whose `role_id`
+/// matches (falling back to positional claiming for a hand-built staffing
+/// with no `role_id` — test/back-compat fixtures), then PRUNES any declared
+/// probe task nobody claimed. Pruning is what makes "fewer probe seats than
+/// the document declares" a valid graph — it's how a hermetic test can
+/// stand up a graph with 1-2 probes against the real 3-probe embedded
+/// document without a second copy of review.json, and it's the same
+/// mechanism an operator gets for free by editing the document itself (the
+/// #1512 payoff: a genuinely 1-probe REVIEW.JSON has nothing to prune).
 ///
 /// **Ids are FIXED, not case-id-seeded** (fixing a pre-Packet-3 doc-drift
 /// finding): review.json's task/step ids are literal strings
@@ -4677,8 +4649,6 @@ pub fn build_review_graph(
     report_phase_id: &str,
     judge_concurrency: u32,
 ) -> Result<BuiltReviewGraph> {
-    use darkmux_crew::mission_config::{interpret, LaunchParams};
-
     // (#1284 review round 2, consider 7) `load` resolves user →
     // on-disk → embedded, so a failure here is NOT necessarily the
     // embedded built-in's fault — a malformed USER-tier
@@ -4690,31 +4660,49 @@ pub fn build_review_graph(
          (~/.darkmux/mission-configs/review.json) or an on-disk template \
          overrides the embedded built-in; the failing file is named below",
     )?;
+    build_review_graph_from_config(
+        &loaded.config,
+        &format!("resolved from the {} tier at {}", loaded.source, loaded.manifest_path.display()),
+        ctx,
+        judge,
+        verify,
+        probes,
+        investigate_phase_id,
+        adjudicate_phase_id,
+        report_phase_id,
+        judge_concurrency,
+    )
+}
+
+/// [`build_review_graph`]'s pure core — everything AFTER loading the
+/// document. Split out (#1512) so a test can build a graph from a
+/// HAND-BUILT `MissionConfig` (e.g. a genuinely one-probe document) without
+/// mutating the process-wide `DARKMUX_CREW_DIR` env var that
+/// `mission_config::load`'s user tier reads — env mutation would race every
+/// OTHER concurrently-running test in this crate that also calls
+/// `build_review_graph` (cargo test's default parallelism), where a purely
+/// in-memory `MissionConfig` races nothing. `source_detail` is folded into
+/// the `interpret` error context (mirrors what `loaded.source`/
+/// `loaded.manifest_path` gave the caller before this split).
+#[allow(clippy::too_many_arguments)]
+fn build_review_graph_from_config(
+    config: &darkmux_crew::mission_config::MissionConfig,
+    source_detail: &str,
+    ctx: Arc<ReviewStepContext>,
+    judge: ResolvedSeatStaffing,
+    verify: Option<ResolvedSeatStaffing>,
+    probes: &[ResolvedSeatStaffing],
+    investigate_phase_id: &str,
+    adjudicate_phase_id: &str,
+    report_phase_id: &str,
+    judge_concurrency: u32,
+) -> Result<BuiltReviewGraph> {
+    use darkmux_crew::mission_config::{interpret, LaunchParams};
 
     let mut phase_ids = std::collections::BTreeMap::new();
     phase_ids.insert("investigate".to_string(), investigate_phase_id.to_string());
     phase_ids.insert("adjudicate".to_string(), adjudicate_phase_id.to_string());
     phase_ids.insert("report".to_string(), report_phase_id.to_string());
-
-    // (#1475 packet 2) The probe stage expands over the probe ROLES — the item
-    // NAME is each seat's `role_id` (review-probe-high/-mid/-low in production,
-    // where the role→profile resolver staffs exactly one seat per role at k=1).
-    // review.json's `role_pattern: "{name}"` renders each expanded task's
-    // `role_id` from this same name, so the graph is role-bound. The item also
-    // feeds the description/display patterns; ids render from `{index}`. A
-    // hand-built staffing with no `role_id` (test crews) falls back to the
-    // profile name, and k still fans out per staffing — the SAME (seat, draw)
-    // ordering the config-stamping loop below walks, keeping item i ↔ the
-    // `review-probe-{i}` step.
-    let mut probe_expansion: Vec<String> = Vec::new();
-    for staffing in probes {
-        let item = staffing.role_id.as_deref().unwrap_or(staffing.name.as_str());
-        for _draw in 0..staffing.k {
-            probe_expansion.push(item.to_string());
-        }
-    }
-    let mut expansions = std::collections::BTreeMap::new();
-    expansions.insert("probe_roles".to_string(), probe_expansion);
 
     // (#1284 Packet 3 worklist) `judge_concurrency` is ALWAYS an override,
     // never read back out of review.json's own static
@@ -4730,27 +4718,125 @@ pub fn build_review_graph(
         json!({ "concurrency": judge_concurrency }),
     );
 
+    // (#1512) No expansion collection — the probe stage is static tasks in
+    // the document now, not a template.
     let params = LaunchParams {
         phase_ids,
         task_overrides: std::collections::BTreeMap::new(),
         step_config_overrides,
-        expansions,
+        expansions: std::collections::BTreeMap::new(),
     };
 
-    // (#1418) `interpret_warnings` currently covers exactly one case: an
-    // `expand.over` key absent from `expansions` above (e.g. a user-tier
-    // `review.json` typo'ing the probe-seat expansion's collection name),
-    // threaded into `shared_env.warnings` below so a launch that silently
-    // expanded to zero probe tasks is named in the posted review, not just
-    // caught by the (separate) zero-draws honesty gate in
-    // `run_review_graph`'s post-run merge.
-    let (tasks, mut steps, interpret_warnings) = interpret(&loaded.config, &params).with_context(|| {
-        format!(
-            "interpreting mission config \"review\" (resolved from the {} tier at {})",
-            loaded.source,
-            loaded.manifest_path.display()
-        )
+    let (mut tasks, mut steps, mut interpret_warnings) = interpret(config, &params)
+        .with_context(|| format!("interpreting mission config \"review\" ({source_detail})"))?;
+
+    // (#1512) Claim each resolved probe staffing against the DECLARED
+    // task-id it dispatches through: by `role_id` when the staffing carries
+    // one (the production/config-driven path — `role_id` is always some
+    // review.json-declared probe role), else POSITIONALLY (a hand-built
+    // staffing with no `role_id` — hermetic tests, mainly — claims the
+    // first still-unclaimed declared probe task, in
+    // `review-dedup-task.depends_on` order). `claims` is a task id per
+    // `probes` entry, in the SAME order — never an index, so it survives
+    // the pruning step below untouched.
+    let dedup_task = tasks.iter().find(|t| t.id == "review-dedup-task").ok_or_else(|| {
+        anyhow!("darkmux: interpreted \"review\" graph has no \"review-dedup-task\" task")
     })?;
+    let declared_probe_task_ids: Vec<String> = dedup_task.depends_on.clone();
+
+    // (#1513 review C1) A task named in `review-dedup-task.depends_on` with
+    // no `role_id` used to be silently invisible: `resolve_review_roles`
+    // never classified it (it isn't a probe role — there's no role to
+    // resolve), and the claim/prune step below would then prune it with no
+    // signal — a declared task quietly loses its dispatch. This is the
+    // "Studio hand-edits review.json and forgets a role_id" failure mode.
+    // Bail loudly rather than let a reduced-coverage run pass as healthy.
+    for id in &declared_probe_task_ids {
+        let Some(t) = tasks.iter().find(|t| &t.id == id) else { continue };
+        if t.role_id.is_none() {
+            bail!(
+                "darkmux: \"review\" mission config's \"review-dedup-task\" depends on task \
+                 \"{id}\", but that task declares no role_id — a probe task with no role_id has \
+                 no staffing to resolve and would be silently pruned (zero dispatch, reduced \
+                 coverage, no signal). Give \"{id}\" a role_id, or remove it from \
+                 review-dedup-task's depends_on (#1512, #1513 review C1)"
+            );
+        }
+    }
+
+    let mut claims: Vec<String> = Vec::with_capacity(probes.len());
+    for staffing in probes {
+        let claimed_id = if let Some(role_id) = staffing.role_id.as_deref() {
+            tasks
+                .iter()
+                .find(|t| {
+                    // (#1513 review C2) Defense in depth alongside
+                    // resolve_review_roles's own duplicate-role_id bail:
+                    // skip a declared task this loop already claimed, so
+                    // two probe tasks that (somehow) share a role_id can't
+                    // both match the same declared task here.
+                    t.role_id.as_deref() == Some(role_id)
+                        && declared_probe_task_ids.iter().any(|id| id == &t.id)
+                        && !claims.contains(&t.id)
+                })
+                .map(|t| t.id.clone())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "darkmux: interpreted \"review\" graph has no probe task for role \
+                         \"{role_id}\" — review.json must declare a task with role_id \
+                         \"{role_id}\" that \"review-dedup-task\" depends on (#1512)"
+                    )
+                })?
+        } else {
+            // Positional fallback: the first declared probe task no
+            // earlier staffing already claimed.
+            declared_probe_task_ids
+                .iter()
+                .find(|id| !claims.contains(id))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "darkmux: more probe staffings resolved ({}) than \"review\" declares \
+                         probe tasks for ({}) — bind each staffing's role_id, or add more probe \
+                         tasks to review.json (#1512)",
+                        probes.len(),
+                        declared_probe_task_ids.len()
+                    )
+                })?
+        };
+        claims.push(claimed_id);
+    }
+
+    // Prune any declared probe task nobody claimed — lets a caller staff
+    // fewer probe roles than review.json declares (the review's own
+    // hermetic test suite relies on this; it's also how a genuinely
+    // 1-probe review.json needs zero pruning at all, since every declared
+    // task gets claimed).
+    let pruned_ids: Vec<String> =
+        declared_probe_task_ids.iter().filter(|id| !claims.contains(*id)).cloned().collect();
+    if !pruned_ids.is_empty() {
+        // (#1513 review C1) Loud, not silent: the production path pruning a
+        // DECLARED task is exactly the reduced-coverage scenario a Studio
+        // hand-edit (fewer staffed roles than review.json declares tasks
+        // for) can trigger with zero other signal.
+        interpret_warnings.push(format!(
+            "\"review\" mission config declares probe task(s) {} that no resolved probe \
+             staffing claimed — pruned from the graph (fewer roles resolved than review.json \
+             declares probe tasks for) (#1512, #1513 review C1)",
+            pruned_ids.join(", ")
+        ));
+        for id in &pruned_ids {
+            if let Some(t) = tasks.iter().find(|t| &t.id == id) {
+                for sid in &t.step_ids {
+                    steps.remove(sid);
+                }
+            }
+        }
+        tasks.retain(|t| !pruned_ids.contains(&t.id));
+        if let Some(d) = tasks.iter_mut().find(|t| t.id == "review-dedup-task") {
+            d.depends_on.retain(|id| !pruned_ids.contains(id));
+        }
+    }
 
     // `step_id -> Task.phase_id`, derived once from `tasks` (each Task
     // already carries both) rather than threaded through every push site
@@ -4798,80 +4884,83 @@ pub fn build_review_graph(
     let probe_members = Arc::new(StdMutex::new(Vec::new()));
     let probe_warnings = Arc::new(StdMutex::new(Vec::new()));
 
-    // (#1442 ship-2b) Stamp each expanded (seat, draw) map step's FULL
-    // config — the pre-rendered `probe_user_message` collection (byte
-    // parity by construction: `user_template: "{item}"` substitutes each
-    // rendered prompt verbatim), the seat's dispatch identity, the shared
-    // `bucket_group: "probe"` allowance (+ its resolved budget, so the
-    // artifact is self-describing), `retry_on_empty: 1` (the historical
-    // single empty-content retry), and the residency hints for local
-    // seats. NOTE: a hosted seat's `endpoint` block carries only the URL /
-    // auth MECHANICS (Keychain item name / env-var NAME — never a secret
-    // value; see `EndpointAuth`), the same material `profiles.json`
+    // (#1512) Stamp each CLAIMED probe task's single step with its FULL
+    // dispatch config — the pre-rendered `probe_user_message` collection
+    // (byte parity by construction: `user_template: "{item}"` substitutes
+    // each rendered prompt verbatim), the seat's dispatch identity, the
+    // shared `bucket_group: "probe"` allowance (+ its resolved budget, so
+    // the artifact is self-describing), `retry_on_empty: 1` (the
+    // historical single empty-content retry), and the residency hints for
+    // local seats. NOTE: a hosted seat's `endpoint` block carries only the
+    // URL / auth MECHANICS (Keychain item name / env-var NAME — never a
+    // secret value; see `EndpointAuth`), the same material `profiles.json`
     // already persists on disk.
+    //
+    // One role, one task, one dispatch (#1512) — the old (seat, draw) fan-
+    // out (`ResolvedSeatStaffing::k` multiplying a seat into several sibling
+    // tasks) retired with the `expand` template it depended on. `k` still
+    // exists on the staffing (snapshotted into the envelope verbatim for
+    // back-compat/bench reporting) but is no longer read here — probe
+    // recall breadth is a config edit (add another probe role/task to
+    // review.json), never a per-run draw multiplier.
     let remote_budget = ctx.remote_max_tokens_per_execution;
     let mut probe_specs: Vec<ProbeSeatSpec> = Vec::new();
-    {
-        let mut flat_index = 0usize;
-        for staffing in probes {
-            let identifier = seat_identifier(&staffing.pm);
-            let endpoint = seat_endpoint(&staffing.pm);
-            let endpoint_host = seat_endpoint_host(&staffing.pm);
-            let max_tokens = resolve_seat_max_tokens(staffing, DEFAULT_PROBE_MAX_TOKENS);
-            let selected = select_bundles_for_staffing(&ctx.bundles, staffing.selector.as_ref());
-            let collection: Vec<String> =
-                selected.iter().map(|b| probe_user_message(&ctx.probe_system, b)).collect();
-            let bundles: Vec<(String, String)> =
-                selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
-            let mut draw_task_ids = Vec::with_capacity(staffing.k as usize);
-            for _draw in 0..staffing.k {
-                let task_id = format!("review-probe-{flat_index}-task");
-                let step_id = format!("review-probe-{flat_index}-step");
-                let step = steps.get_mut(&step_id).unwrap_or_else(|| {
-                    // (#1284 review round 2, consider 3) Hard assert posture
-                    // preserved: a release build must not silently mint a
-                    // spec no interpreted step backs.
-                    panic!(
-                        "the interpreted graph must have expanded `{step_id}` for every (seat, draw)"
-                    )
-                });
-                let mut config = json!({
-                    "model": identifier,
-                    "system": "",
-                    "user_template": "{item}",
-                    "collection": collection,
-                    "temperature": PROBE_TEMPERATURE,
-                    "max_tokens": max_tokens,
-                    "timeout_seconds": ctx.timeout_seconds,
-                    "retry_on_empty": 1,
-                    "bucket_group": "probe",
-                    "bucket_budget": remote_budget,
-                });
-                if let Some(ep) = endpoint {
-                    config["endpoint"] =
-                        serde_json::to_value(ep).context("serializing probe seat endpoint")?;
-                } else {
-                    // Residency hints: the wire `model` is the NAMESPACED
-                    // identifier; the loadable key is the bare profile id.
-                    config["model_key"] = json!(staffing.pm.id);
-                    config["identifier"] = json!(identifier);
-                    if let Some(n_ctx) = staffing.pm.n_ctx {
-                        config["n_ctx"] = json!(n_ctx);
-                    }
-                }
-                step.config = config;
-                draw_task_ids.push(task_id);
-                flat_index += 1;
+    for (staffing, task_id) in probes.iter().zip(claims.iter()) {
+        let identifier = seat_identifier(&staffing.pm);
+        let endpoint = seat_endpoint(&staffing.pm);
+        let endpoint_host = seat_endpoint_host(&staffing.pm);
+        let max_tokens = resolve_seat_max_tokens(staffing, DEFAULT_PROBE_MAX_TOKENS);
+        let selected = select_bundles_for_staffing(&ctx.bundles, staffing.selector.as_ref());
+        let collection: Vec<String> =
+            selected.iter().map(|b| probe_user_message(&ctx.probe_system, b)).collect();
+        let bundles: Vec<(String, String)> =
+            selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
+
+        let task = tasks.iter().find(|t| &t.id == task_id).unwrap_or_else(|| {
+            panic!("the claimed probe task `{task_id}` must survive pruning")
+        });
+        let step_id = task.step_ids.first().cloned().unwrap_or_else(|| {
+            panic!("claimed probe task `{task_id}` must have exactly one step")
+        });
+        let step = steps.get_mut(&step_id).unwrap_or_else(|| {
+            // (#1284 review round 2, consider 3) Hard assert posture
+            // preserved: a release build must not silently mint a spec no
+            // interpreted step backs.
+            panic!("the interpreted graph must have a step `{step_id}` for probe task `{task_id}`")
+        });
+        let mut config = json!({
+            "model": identifier,
+            "system": "",
+            "user_template": "{item}",
+            "collection": collection,
+            "temperature": PROBE_TEMPERATURE,
+            "max_tokens": max_tokens,
+            "timeout_seconds": ctx.timeout_seconds,
+            "retry_on_empty": 1,
+            "bucket_group": "probe",
+            "bucket_budget": remote_budget,
+        });
+        if let Some(ep) = endpoint {
+            config["endpoint"] = serde_json::to_value(ep).context("serializing probe seat endpoint")?;
+        } else {
+            // Residency hints: the wire `model` is the NAMESPACED
+            // identifier; the loadable key is the bare profile id.
+            config["model_key"] = json!(staffing.pm.id);
+            config["identifier"] = json!(identifier);
+            if let Some(n_ctx) = staffing.pm.n_ctx {
+                config["n_ctx"] = json!(n_ctx);
             }
-            probe_specs.push(ProbeSeatSpec {
-                name: staffing.name.clone(),
-                identifier,
-                remote: endpoint.is_some(),
-                endpoint_host,
-                draw_task_ids,
-                bundles,
-            });
         }
+        step.config = config;
+
+        probe_specs.push(ProbeSeatSpec {
+            name: staffing.name.clone(),
+            identifier,
+            remote: endpoint.is_some(),
+            endpoint_host,
+            draw_task_ids: vec![task_id.clone()],
+            bundles,
+        });
     }
 
     // (#1442 ship-2b) The verify map step's config — its COLLECTION arrives

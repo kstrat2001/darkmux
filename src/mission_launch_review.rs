@@ -27,9 +27,11 @@
 //! from `case_id` — a re-run of the same case is a DIFFERENT run, grouped
 //! via `Mission.spec`, never a reopen of the prior one) —
 //! `build_review_graph` still calls `mission_config::interpret` itself
-//! internally (it needs the `probe_roles` expansion built from the crew's
-//! probe seats — #1475 packet 2 — which this module's caller doesn't have
-//! until AFTER crew resolution), so no double interpretation happens.
+//! internally (#1512: no expansion collection needed anymore — the probe
+//! stage is explicit static tasks in the document — but the interpret call
+//! still lives there since that's where the interpreted graph gets claimed
+//! against the resolved crew's staffings), so no double interpretation
+//! happens.
 //!
 //! **Gate semantics.** Review has no operator sign-off gate — unlike
 //! `coder-phase`, there is nothing for `mission finalize`/`mission abort` to
@@ -96,13 +98,10 @@ use darkmux_lab::lab::bundle::{
 };
 use darkmux_lab::lab::review::{
     build_review_graph, fingerprint, run_judge_only, run_review_graph, seat_identifier,
-    staffing_snapshot, validate_review_crew, BundleInput, ChatCall, ExecMode, LmsCycler,
-    ProbeFlag, ReviewEmitter, ReviewEnvelope, ReviewInputs, ReviewStepContext,
+    staffing_snapshot, BundleInput, ChatCall, ExecMode, LmsCycler, ProbeFlag, ReviewEmitter,
+    ReviewEnvelope, ReviewInputs, ReviewStepContext,
 };
-use darkmux_crew::resourcing::{
-    resolve_review_role_crew, ResolvedCrew, ReviewRoleStaffing, REVIEW_JUDGE_ROLE,
-    REVIEW_PROBE_ROLES, REVIEW_VERIFY_ROLE,
-};
+use darkmux_crew::resourcing::{resolve_review_roles, ResolvedReviewRoles, ResolvedSeatStaffing, ReviewRoleStaffing};
 use darkmux_profiles::profiles::load_registry;
 use darkmux_profiles::swap;
 use darkmux_types::dispatch_liveness::{liveness, liveness_case, liveness_detail};
@@ -122,30 +121,35 @@ fn path_input(collected: &BTreeMap<String, Value>, key: &str) -> Option<PathBuf>
     str_input(collected, key).map(PathBuf::from)
 }
 
-/// (#1475 packet 3) The review roles an operator may bind per run via
-/// `--param <role>=<profile>` — the three probe roles plus judge + verify, the
-/// same five [`resolve_review_role_crew`] resolves. Declared as inputs in
+/// (#1475 packet 3, #1512, #1513 review) Every role id the "review" mission
+/// config declares anywhere (whatever task carries a `role_id` — probe,
+/// judge, or verify alike) — the FULL set an operator may bind per run via
+/// `--param <role>=<profile>`. Fully generic: no Rust-side enumeration of
+/// "the probe roles" or "the judge/verify roles" — just "every `role_id`
+/// this document names," read straight off it. Declared as inputs in
 /// `review.json` so the surface is self-documenting.
-fn review_override_role_ids() -> [&'static str; 5] {
-    [
-        REVIEW_PROBE_ROLES[0],
-        REVIEW_PROBE_ROLES[1],
-        REVIEW_PROBE_ROLES[2],
-        REVIEW_JUDGE_ROLE,
-        REVIEW_VERIFY_ROLE,
-    ]
+fn declared_role_ids(config: &MissionConfig) -> Vec<String> {
+    let mut ids: Vec<String> =
+        config.phases.iter().flat_map(|p| p.tasks.iter()).filter_map(|t| t.role_id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
-/// (#1475 packet 3) Collect the per-run role→profile launch overrides — one
-/// `--param <role>=<profile>` per review role the operator wants to rebind for
-/// this run without editing `config.json`. Only the five known review roles are
-/// read; a blank value is ignored. Fed to [`resolve_review_role_crew`], where it
-/// wins over the `role_profiles` map and `default_profile`.
-fn collect_role_overrides(collected: &BTreeMap<String, Value>) -> BTreeMap<String, String> {
+/// (#1475 packet 3, #1512, #1513 review) Collect the per-run role→profile
+/// launch overrides — one `--param <role>=<profile>` per review role the
+/// operator wants to rebind for this run without editing `config.json`.
+/// Only roles the document actually declares are read (`declared_role_ids`);
+/// a blank value is ignored. Fed to [`resolve_review_roles`], where it wins
+/// over the `role_profiles` map and `default_profile`.
+fn collect_role_overrides(
+    collected: &BTreeMap<String, Value>,
+    role_ids: &[String],
+) -> BTreeMap<String, String> {
     let mut overrides = BTreeMap::new();
-    for role in review_override_role_ids() {
+    for role in role_ids {
         if let Some(profile) = str_input(collected, role).map(str::trim).filter(|s| !s.is_empty()) {
-            overrides.insert(role.to_string(), profile.to_string());
+            overrides.insert(role.clone(), profile.to_string());
         }
     }
     overrides
@@ -299,18 +303,20 @@ impl ReviewEmitter for FleetFlowEmitter {
 /// seat) — unlike a single-model `dispatch`, there's no one "the
 /// model" for the dispatch bookend's `model` field, so this is the closest
 /// honest equivalent: every model actually in play, comma-joined.
-fn crew_model_summary(crew: &ResolvedCrew) -> Option<String> {
-    let mut ids: Vec<String> = crew
-        .seats
-        .values()
-        .flatten()
-        .map(|s| {
-            if s.pm.is_remote() {
-                s.pm.id.clone()
-            } else {
-                swap::namespaced_identifier(&s.pm)
-            }
-        })
+fn crew_model_summary(roles: &ResolvedReviewRoles) -> Option<String> {
+    let one = |s: &ResolvedSeatStaffing| {
+        if s.pm.is_remote() {
+            s.pm.id.clone()
+        } else {
+            swap::namespaced_identifier(&s.pm)
+        }
+    };
+    let mut ids: Vec<String> = roles
+        .probes
+        .iter()
+        .chain(std::iter::once(&roles.judge))
+        .chain(roles.verify.iter())
+        .map(one)
         .collect();
     ids.sort();
     ids.dedup();
@@ -492,12 +498,10 @@ fn config_detail() -> String {
 /// NON-SECRET liveness detail for `crew-resolved` — crew name, seat count,
 /// and the distinct endpoint HOSTS of the remote seats. HOST ONLY: never
 /// the full URL, never any credential.
-fn crew_detail(crew: &ResolvedCrew) -> String {
-    let seat_count: usize = crew.seats.values().map(|v| v.len()).sum();
-    let mut hosts: Vec<String> = crew
-        .seats
-        .values()
-        .flatten()
+fn crew_detail(roles: &ResolvedReviewRoles) -> String {
+    let all = || roles.probes.iter().chain(std::iter::once(&roles.judge)).chain(roles.verify.iter());
+    let seat_count = all().count();
+    let mut hosts: Vec<String> = all()
         .filter(|s| s.pm.is_remote())
         .filter_map(|s| s.pm.endpoint.as_ref().map(|ep| ep.base_url()))
         .filter_map(|url| {
@@ -510,7 +514,7 @@ fn crew_detail(crew: &ResolvedCrew) -> String {
     hosts.sort();
     hosts.dedup();
     let hosts_str = if hosts.is_empty() { "(local-only)".to_string() } else { hosts.join(",") };
-    format!("crew={} seats={seat_count} remote_hosts={hosts_str}", crew.name)
+    format!("crew={} seats={seat_count} remote_hosts={hosts_str}", roles.distinct_profile_names())
 }
 
 /// (#1284 Packet 2) Map a review dispatch's `Result<ReviewEnvelope>` onto
@@ -630,17 +634,38 @@ pub(crate) fn launch(
             // Synthesis-only: dispatch-shaping inputs have nothing to
             // shape. Warn (don't error) — operator sovereignty: surface,
             // never silently ignore.
-            let mut ignored: Vec<&str> = Vec::new();
-            // The per-run role→profile overrides (#1475 packet 3) shape staffing,
-            // which a synthesis-only launch never resolves — so they're ignored
-            // here too, alongside the source/bundler/knob inputs.
-            let dispatch_shaping: Vec<&str> = review_override_role_ids()
-                .into_iter()
-                .chain(["worktree", "github", "head_sha", "bundler", "passes"])
-                .collect();
-            for key in dispatch_shaping {
+            let mut ignored: Vec<String> = Vec::new();
+            // The static dispatch-shaping inputs never need the config —
+            // check them unconditionally.
+            for key in ["worktree", "github", "head_sha", "bundler", "passes"] {
                 if collected.contains_key(key) {
-                    ignored.push(key);
+                    ignored.push(key.to_string());
+                }
+            }
+            // The per-run role→profile overrides (#1475 packet 3, #1512,
+            // #1513 review) ALSO shape staffing a synthesis-only launch
+            // never resolves — but discovering which role ids the document
+            // declares needs the "review" mission config, and that load is
+            // BEST-EFFORT here (#1513 review C4): a malformed USER-TIER
+            // `~/.darkmux/mission-configs/review.json` must not break a
+            // replay that otherwise needs no config at all — warn and
+            // continue with whatever the static check above already found,
+            // rather than hard-failing on a check that only ever produces a
+            // warning anyway.
+            match darkmux_crew::mission_config::load("review") {
+                Ok(review_config) => {
+                    for key in declared_role_ids(&review_config.config) {
+                        if collected.contains_key(&key) {
+                            ignored.push(key);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "mission launch review: could not load mission config \"review\" to check \
+                         for ignored per-run role overrides — continuing the `from_envelope` \
+                         replay without that check: {e:#}"
+                    );
                 }
             }
             if !ignored.is_empty() {
@@ -691,26 +716,49 @@ fn run_dispatch(
     let source = resolve_source(collected)?;
     liveness_detail("config-resolved", &case, &config_detail());
     let loaded = load_registry(str_input(collected, "profiles"))?;
-    // (#1475) Review staffing is the role→profile rollup. Each of the five
-    // review roles (review-probe-high/-mid/-low, review-judge, review-verify)
+    // (#1512, #1513 review) The review's roles are discovered + resolved in
+    // ONE generic pass, `resolve_review_roles` — never a Rust-side
+    // enumeration of "the probe roles". Loading the config here (ahead of
+    // `build_review_graph`'s own later `load` + `interpret`) is a second,
+    // cheap parse of the same document; `mission_config::load` is pure JSON
+    // I/O, and this call site needs only the RAW (pre-interpret) task shape
+    // `resolve_review_roles` classifies by step kind, while
+    // `build_review_graph` separately needs the INTERPRETED graph to stamp
+    // dispatch config — two different representations of the same
+    // document, not a second interpretation.
+    let review_config = darkmux_crew::mission_config::load("review")
+        .context("loading mission config \"review\"")?;
+    // (#1475, #1512, #1513 review) Review staffing is the role→profile
+    // rollup. Every review role (however many probe roles review.json
+    // declares, plus review-judge, plus the optional review-verify)
     // resolves INDEPENDENTLY: a per-run launch override (`--param
-    // <role>=<profile>`) wins, else the machine-local `role_profiles` map in
-    // config.json, else `default_profile` (the fresh-user floor). A bare
+    // <role>=<profile>`) wins, else the machine-local `role_profiles` map
+    // in config.json, else `default_profile` (the fresh-user floor). A bare
     // `mission launch review` assembles the operator's heterogeneous crew
-    // straight from the map; a `--param review-judge=<profile>` rebinds one seat
-    // for this run without editing config.json. Only the non-model knobs live in
-    // `ReviewRoleStaffing`: judge consensus DEPTH (`passes`) and the
-    // blocking-vs-advisory render choice. The envelope snapshot records what
-    // role→profile actually resolved AND from which tier (operator sovereignty
-    // #44).
-    let overrides = collect_role_overrides(collected);
+    // straight from the map; a `--param review-judge=<profile>` rebinds one
+    // seat for this run without editing config.json. Only the non-model
+    // knobs live in `ReviewRoleStaffing`: judge consensus DEPTH (`passes`)
+    // and the blocking-vs-advisory render choice. The envelope snapshot
+    // records what role→profile actually resolved AND from which tier
+    // (operator sovereignty #44).
+    let role_ids = declared_role_ids(&review_config.config);
+    let overrides = collect_role_overrides(collected, &role_ids);
     let resourcing = ReviewRoleStaffing {
         // (#1266) `None` => the resolver's double-confirm default; validated
         // `>= 1` in the resolver.
         passes: u32_input(collected, "passes")?,
         request_changes: bool_input(collected, "request_changes"),
     };
-    let crew = resolve_review_role_crew(&loaded.registry, &resourcing, &overrides)?;
+    let crew = resolve_review_roles(&loaded.registry, &review_config.config, &resourcing, &|role| {
+        // Precedence: launch override > role_profiles map > unmapped (default).
+        if let Some(p) = overrides.get(role).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            darkmux_profiles::profiles::RoleBinding::Overridden(p.to_string())
+        } else if let Some(p) = darkmux_types::config_access::role_profile(role) {
+            darkmux_profiles::profiles::RoleBinding::Mapped(p)
+        } else {
+            darkmux_profiles::profiles::RoleBinding::Unmapped
+        }
+    })?;
     liveness_detail("crew-resolved", &case, &crew_detail(&crew));
 
     liveness_case("bundling-start", &case);
@@ -752,7 +800,7 @@ fn run_dispatch(
     })?;
 
     let case_id_for_bookends = case.clone();
-    let crew_name_for_bookends = crew.name.clone();
+    let crew_name_for_bookends = crew.distinct_profile_names();
     let model_for_bookends = crew_model_summary(&crew);
     let remote_max_tokens_per_execution = darkmux_types::config_access::remote_max_tokens_per_execution();
 
@@ -768,10 +816,10 @@ fn run_dispatch(
         ),
     );
 
-    if let Some(charges_path) = path_input(collected, "charges_file") {
+    let outcome: Result<ReviewEnvelope> = if let Some(charges_path) = path_input(collected, "charges_file") {
         let inputs = ReviewInputs {
             case_id: case.clone(),
-            crew: &crew,
+            roles: &crew,
             intent_title: "",
             intent_body: &intent,
             diff: diff_text,
@@ -818,16 +866,17 @@ fn run_dispatch(
             move |emitter| run_judge_only(flags, &inputs, &mut chat, &mut cycler, emitter),
         )
     } else {
-        let seats = validate_review_crew(&crew)?;
-        let probes: Vec<_> = seats.probes.clone();
-        let judge = seats.judge.clone();
-        let verify = seats.verify.cloned();
+        // (#1512, #1513 review) `crew` is already the validated, resolved
+        // shape — no separate crew-validation step.
+        let probes = crew.probes.clone();
+        let judge = crew.judge.clone();
+        let verify = crew.verify.clone();
         let judge_identifier = seat_identifier(&judge.pm);
         let request_changes = crew.request_changes;
 
         let ctx = Arc::new(ReviewStepContext {
             case_id: case_id_for_bookends.clone(),
-            crew: crew.clone(),
+            roles: crew.clone(),
             intent_title: String::new(),
             intent_body: intent,
             diff: diff_text.to_string(),
@@ -1074,7 +1123,20 @@ fn run_dispatch(
         finalize_review_mission(&mission_id_for_status, &phase_ids, &result);
 
         result
-    }
+    };
+
+    // (#1513 review C3) Fold `resolve_review_roles`'s own warnings (today,
+    // just the "a `review.verify-render` task exists but declares no
+    // role_id" case) into the returned envelope. Both dispatch paths above
+    // — the charges-file replay and the graph run — resolve `crew` from the
+    // SAME `resolve_review_roles` call near the top of this function, so
+    // one merge point covers both without threading the warnings through
+    // `build_review_graph`'s signature (which the pure-refactor gate keeps
+    // byte-identical).
+    outcome.map(|mut env| {
+        env.warnings.extend(crew.warnings.iter().cloned());
+        env
+    })
 }
 
 #[cfg(test)]
@@ -1083,6 +1145,84 @@ mod tests {
     use darkmux_lab::lab::review::MemberRecord;
     use darkmux_crew::resourcing::ResolvedSeatStaffing;
     use darkmux_types::ProfileModel;
+
+    // ── #1512, #1513 review: config-driven `--param <role>=<profile>` override collection ──
+
+    /// A hand-built "review" mission config declaring `n` probe tasks (each
+    /// its own `role_id`) plus a judge task — the shape [`declared_role_ids`]
+    /// walks. Mirrors `resourcing.rs`'s own test fixture shape.
+    fn config_with_n_probe_roles(n: usize) -> MissionConfig {
+        let probe_tasks: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("review-probe-{i}-task"),
+                    "role_id": format!("review-probe-{i}"),
+                    "depends_on": [],
+                    "steps": [{"id": format!("review-probe-{i}-step"), "kind": "dispatch.map"}]
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "id": "review",
+            "name": "PR Review",
+            "phases": [
+                {"id": "investigate", "tasks": probe_tasks},
+                {"id": "adjudicate", "tasks": [
+                    {"id": "review-judge-task", "role_id": "review-judge", "depends_on": [],
+                     "steps": [{"id": "review-judge-step", "kind": "review.judge"}]}
+                ]}
+            ]
+        });
+        serde_json::from_value(doc).expect("hand-built review config parses")
+    }
+
+    /// The set of overridable role ids is read straight off the document's
+    /// own declared tasks (#1512, #1513 review) — never a fixed Rust-side
+    /// count. A one-probe review config yields exactly one probe role in
+    /// the returned set (plus judge); a five-probe config yields five.
+    #[test]
+    fn declared_role_ids_is_driven_by_the_document() {
+        let one = declared_role_ids(&config_with_n_probe_roles(1));
+        assert_eq!(one, vec!["review-judge".to_string(), "review-probe-0".to_string()]);
+
+        let five = declared_role_ids(&config_with_n_probe_roles(5));
+        assert_eq!(five.len(), 6, "5 probe roles + judge");
+        for i in 0..5 {
+            assert!(five.contains(&format!("review-probe-{i}")));
+        }
+    }
+
+    /// (#1475 packet 3, #1512) `--param <role>=<profile>` per-run overrides
+    /// still bind against whichever roles the review config declares —
+    /// preserved end to end through the config-driven refactor. A role NOT
+    /// in the declared set (nor judge/verify) is ignored, matching the
+    /// pre-#1512 behavior of only reading the five known roles.
+    #[test]
+    fn collect_role_overrides_reads_only_declared_probe_roles_plus_judge_and_verify() {
+        // (#1513 review) `role_ids` is the FULL declared set now — the
+        // caller's job (`declared_role_ids`), not something this function
+        // pads with judge/verify automatically.
+        let role_ids = vec![
+            "review-probe-high".to_string(),
+            "review-probe-mid".to_string(),
+            "review-judge".to_string(),
+        ];
+        let mut collected = BTreeMap::new();
+        collected.insert("review-probe-high".to_string(), Value::String("fast".to_string()));
+        collected.insert("review-probe-mid".to_string(), Value::String("  ".to_string())); // blank -> ignored
+        collected.insert("review-probe-low".to_string(), Value::String("ghost".to_string())); // not declared -> ignored
+        collected.insert("review-judge".to_string(), Value::String("frontier".to_string()));
+        collected.insert("review-verify".to_string(), Value::String("".to_string())); // not declared -> ignored
+
+        let overrides = collect_role_overrides(&collected, &role_ids);
+
+        assert_eq!(overrides.get("review-probe-high").map(String::as_str), Some("fast"));
+        assert_eq!(overrides.get("review-judge").map(String::as_str), Some("frontier"));
+        assert!(!overrides.contains_key("review-probe-mid"), "blank value is ignored");
+        assert!(!overrides.contains_key("review-probe-low"), "undeclared role is never read (#1512)");
+        assert!(!overrides.contains_key("review-verify"), "undeclared role is never read, even with a value present");
+        assert_eq!(overrides.len(), 2);
+    }
 
     // ── #1272-equivalent: dispatch.start/terminal bookends around a
     // production review run (ported from the retired `pr_review.rs` test
@@ -1280,19 +1420,20 @@ mod tests {
 
     #[test]
     fn crew_model_summary_dedupes_and_sorts_every_seat_model() {
-        let mut seats = BTreeMap::new();
-        seats.insert("review-probe".to_string(), vec![staffing("zzz-probe"), staffing("aaa-probe")]);
-        seats.insert("review-judge".to_string(), vec![staffing("zzz-probe")]);
-        let crew = ResolvedCrew { name: "test-crew".into(), seats, request_changes: false };
+        // (#1512, #1513 review) `ResolvedReviewRoles::judge` is required
+        // (never absent), so "an empty crew has no summary" is no longer a
+        // reachable state to test — a `ResolvedReviewRoles` always names at
+        // least the judge's model.
+        let roles = ResolvedReviewRoles {
+            probes: vec![staffing("zzz-probe"), staffing("aaa-probe")],
+            judge: staffing("zzz-probe"),
+            verify: None,
+            request_changes: false,
+            warnings: Vec::new(),
+        };
 
-        let summary = crew_model_summary(&crew).expect("non-empty crew has a summary");
+        let summary = crew_model_summary(&roles).expect("non-empty roles have a summary");
         assert_eq!(summary, "darkmux:aaa-probe, darkmux:zzz-probe", "sorted + deduped: {summary}");
-    }
-
-    #[test]
-    fn crew_model_summary_none_for_a_crew_with_no_staffed_seats() {
-        let crew = ResolvedCrew { name: "empty-crew".into(), seats: BTreeMap::new(), request_changes: false };
-        assert_eq!(crew_model_summary(&crew), None);
     }
 
     // ── #1365-equivalent: mission/phase terminal-status finalization,
@@ -1620,12 +1761,12 @@ mod tests {
     fn run_dispatch_with_a_renamed_phase_id_fails_before_minting_the_mission() {
         let _guard = CrewDirGuard::new();
 
-        // A minimal profiles.json with a crew that satisfies
-        // `validate_review_crew` (>= 1 review-probe staffing, exactly 1
-        // review-judge staffing) — enough to get `run_dispatch` past crew
-        // resolution and bundle-building (an empty worktree + empty diff
-        // yields an empty, valid bundle set) and up to the phase-id
-        // validation this test targets. No model dispatch is ever reached.
+        // A minimal profiles.json that lets `resolve_review_roles` (#1512,
+        // #1513 review) resolve every role the embedded review.json
+        // declares — enough to get `run_dispatch` past staffing resolution
+        // and bundle-building (an empty worktree + empty diff yields an
+        // empty, valid bundle set) and up to the phase-id validation this
+        // test targets. No model dispatch is ever reached.
         let profiles_dir = tempfile::TempDir::new().unwrap();
         let profiles_path = profiles_dir.path().join("profiles.json");
         std::fs::write(

@@ -2235,14 +2235,15 @@ fn review_bench_funnel_degenerate_run_completes_offline_with_console_line_and_ar
     )
     .stderr(predicate::str::contains("mode=funnel").and(predicate::str::contains("funnels:")));
 
-    // scores.json: funnel provenance extras (crew / exec_mode / k).
+    // scores.json: funnel provenance extras (crew / exec_mode).
     let scores: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&scores_out).unwrap()).unwrap();
     assert_eq!(scores["mode"], serde_json::json!("funnel"));
     assert_eq!(scores["crew"], serde_json::json!("review-funnel"));
     assert_eq!(scores["exec_mode"], serde_json::json!("sequential"));
-    // (#1475) `--k` omitted ⇒ one draw per probe role (the flip's default).
-    assert_eq!(scores["k"], serde_json::json!("(one per probe role)"));
+    // (#1512, #1513 review M1) The `"k"` extras field is RETIRED — draw
+    // multiplication no longer exists, so there is no value left to snapshot.
+    assert!(scores.get("k").is_none(), "the retired \"k\" field must not reappear in the artifact");
 
     // funnels.json: one envelope, degenerate reason set, zero dispatches.
     let funnels: serde_json::Value =

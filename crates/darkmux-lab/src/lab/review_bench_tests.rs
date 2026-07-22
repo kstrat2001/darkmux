@@ -1294,7 +1294,7 @@
     }
 
     #[test]
-    fn write_scores_artifact_funnel_extras_record_crew_and_k_and_the_envelopes_resolved_exec_mode() {
+    fn write_scores_artifact_funnel_extras_record_crew_and_the_envelopes_resolved_exec_mode() {
         use super::super::review::Tier;
         let mut env = funnel_env(
             vec![judged_flag(Some("start.plus(30)"), Tier::Confirmed, "note", "evidence")],
@@ -1317,7 +1317,6 @@
         let scores_out = tmp.path().join("scores.json");
         let mut opts = funnel_opts(scores_out.clone(), false);
         opts.roster_profile = Some("review-funnel".into());
-        opts.k_override = Some(9);
 
         let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_out, 0).unwrap();
         let content = fs::read_to_string(&path).unwrap();
@@ -1328,33 +1327,10 @@
             serde_json::json!("parallel"),
             "reports the envelope's resolved mode, not the raw --exec-mode flag"
         );
-        assert_eq!(doc["k"], serde_json::json!(9));
-    }
-
-    #[test]
-    fn write_scores_artifact_funnel_extras_k_defaults_to_one_per_probe_role_label_when_unset() {
-        use super::super::review::Tier;
-        let env = funnel_env(
-            vec![judged_flag(Some("start.plus(30)"), Tier::Confirmed, "note", "evidence")],
-            None,
-        );
-        let label = multi_lbl("bug", vec![ef("start.plus(30)", false)]);
-        let r = review_from_funnel(&env);
-        let s = score(&label, &r);
-        let case = funnel_case();
-        let scored: Vec<(&Case, CaseScore)> = vec![(&case, s)];
-        let meta = vec![EnvelopeMeta::default()];
-        let debates: Vec<super::super::dialectic::DebateEnvelope> = Vec::new();
-        let funnels = vec![env];
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let scores_out = tmp.path().join("scores.json");
-        let opts = funnel_opts(scores_out.clone(), false); // k_override left None
-
-        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_out, 0).unwrap();
-        let content = fs::read_to_string(&path).unwrap();
-        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(doc["k"], serde_json::json!("(one per probe role)"));
+        // (#1512, #1513 review M1) The `"k"` extras field is RETIRED — draw
+        // multiplication no longer exists, so there is no "k" value left to
+        // snapshot; coverage for it is moot, not missing.
+        assert!(doc.get("k").is_none(), "the retired \"k\" field must not reappear in the artifact");
     }
 
     // (#1465) `role` is now an operator knob (was a `pr-reviewer` constant),
@@ -1491,13 +1467,10 @@
     // reaches the probe phase, so both the degenerate-envelope path and the
     // `--bundler` wiring are reachable without any network dispatch.
 
-    fn valid_funnel_crew() -> darkmux_crew::resourcing::ResolvedCrew {
+    fn valid_funnel_crew() -> darkmux_crew::resourcing::ResolvedReviewRoles {
         use darkmux_crew::resourcing::ResolvedSeatStaffing;
-        use std::collections::BTreeMap;
-        let mut seats = BTreeMap::new();
-        seats.insert(
-            "review-probe".to_string(),
-            vec![ResolvedSeatStaffing {
+        darkmux_crew::resourcing::ResolvedReviewRoles {
+            probes: vec![ResolvedSeatStaffing {
                 name: "fast".into(),
                 role_id: None,
                 pm: dummy_pm("probe-model"),
@@ -1507,10 +1480,7 @@
                 selector: None,
                 provenance: None,
             }],
-        );
-        seats.insert(
-            "review-judge".to_string(),
-            vec![ResolvedSeatStaffing {
+            judge: ResolvedSeatStaffing {
                 name: "fast".into(),
                 role_id: None,
                 pm: dummy_pm("judge-model"),
@@ -1519,14 +1489,16 @@
                 max_tokens: None,
                 selector: None,
                 provenance: None,
-            }],
-        );
-        darkmux_crew::resourcing::ResolvedCrew { name: "test-crew".into(), seats, request_changes: false }
+            },
+            verify: None,
+            request_changes: false,
+            warnings: Vec::new(),
+        }
     }
 
     fn test_funnel_ctx(bundler_cmd: Option<String>, exec_mode: super::super::review::ExecMode) -> FunnelCtx {
         FunnelCtx {
-            crew: valid_funnel_crew(),
+            roles: valid_funnel_crew(),
             exec_mode,
             probe_system: "probe system prompt".into(),
             judge_system: "judge system prompt".into(),
@@ -1712,9 +1684,8 @@
         let path = write_test_registry(tmp.path(), "fast");
         let opts = funnel_ctx_opts(path, "ghost", None, None);
 
-        // `Result::unwrap_err` requires `T: Debug`; `FunnelCtx` intentionally
-        // isn't (it holds a `ResolvedCrew`, not a debug/display type) — `.err().unwrap()`
-        // extracts the error without that bound.
+        // `Result::unwrap_err` requires `T: Debug`; `FunnelCtx` doesn't derive
+        // it — `.err().unwrap()` extracts the error without that bound.
         let err = resolve_funnel_ctx(&opts).err().unwrap();
         let msg = format!("{err:#}");
         // (#1475) The bench pins every seat to the roster via the per-run
@@ -1724,16 +1695,39 @@
     }
 
     #[test]
-    fn resolve_funnel_ctx_k_override_applies_to_probe_and_exec_mode_parses() {
+    fn resolve_funnel_ctx_k_override_greater_than_one_is_rejected() {
+        // (#1512, #1513 review M1) Draw multiplication is retired — one
+        // probe role is one dispatch, always — so a `--k > 1` request can no
+        // longer be honored. Silently stamping it (the pre-#1513 behavior)
+        // would produce a run whose artifact claims a draw multiplier that
+        // never fired; reject it loudly instead.
         let tmp = tempfile::TempDir::new().unwrap();
         let path = write_test_registry(tmp.path(), "fast");
         let opts = funnel_ctx_opts(path, "fast", Some("parallel"), Some(9));
 
+        // (`FunnelCtx` carries no `Debug` impl, so `unwrap_err` — which
+        // formats the `Ok` side on panic — doesn't compile here; match
+        // instead.)
+        let err = match resolve_funnel_ctx(&opts) {
+            Ok(_) => panic!("expected --k 9 to be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("retired"), "names the retirement: {msg}");
+        assert!(msg.contains("--k 9") || msg.contains("9"), "names the rejected value: {msg}");
+    }
+
+    #[test]
+    fn resolve_funnel_ctx_k_override_of_one_is_accepted_as_a_no_op() {
+        // `--k 1` (explicit) stays legal back-compat, same as omitting it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = write_test_registry(tmp.path(), "fast");
+        let opts = funnel_ctx_opts(path, "fast", Some("parallel"), Some(1));
+
         let ctx = resolve_funnel_ctx(&opts).unwrap();
-        let probes = ctx.crew.seats.get("review-probe").unwrap();
-        assert!(probes.iter().all(|s| s.k == 9), "the probe seat's draw count is the k override");
-        let judges = ctx.crew.seats.get("review-judge").unwrap();
-        assert_eq!(judges[0].k, 1, "the judge seat draws once regardless of the probe k override");
+        let probes = &ctx.roles.probes;
+        assert!(probes.iter().all(|s| s.k == 1), "k=1 is a no-op — every probe seat still draws once");
+        assert_eq!(ctx.roles.judge.k, 1, "the judge seat draws once regardless");
         assert_eq!(
             ctx.exec_mode,
             super::super::review::ExecMode::Parallel,
@@ -1750,7 +1744,7 @@
         let opts = funnel_ctx_opts(path, "fast", None, None);
 
         let ctx = resolve_funnel_ctx(&opts).unwrap();
-        let probes = ctx.crew.seats.get("review-probe").unwrap();
+        let probes = &ctx.roles.probes;
         // (#1475) The flip staffs three distinct probe roles, one draw each —
         // the same total probe breadth (3) the old default `k=3` gave from one
         // seat, now role-borne rather than draw-borne.

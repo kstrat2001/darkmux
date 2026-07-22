@@ -4019,35 +4019,28 @@
         }
     }
 
-    /// (item 7) Shape test against a REAL review-config-interpreted graph:
-    /// loads the embedded `review` mission config, interprets it with a
-    /// launcher supplying two probe seats (mirroring how `pr-review run`
-    /// would resolve `staffing` at launch), persists the resulting
+    /// (item 7, #1512) Shape test against a REAL review-config-interpreted
+    /// graph: loads the embedded `review` mission config and interprets it
+    /// (no expansion collection needed — the probe stage is three EXPLICIT
+    /// static tasks now, not a template), persists the resulting
     /// Mission/Phase/Task/Step graph, and asserts the graph.json node
-    /// counts match what `review.json`'s own shape (3 phases; investigate
-    /// = bundle + N probe + dedup; adjudicate = judge; report = verify +
-    /// synthesis) predicts for N=2 probe seats: 3 phase nodes, 7 task nodes
-    /// (bundle, probe-0, probe-1, dedup, judge, verify, synthesis), 7 step
-    /// nodes (every task here is single-step).
+    /// counts match `review.json`'s own declared shape: 3 phase nodes, 8
+    /// task nodes (bundle, probe-high, probe-mid, probe-low, dedup, judge,
+    /// verify, synthesis), 9 step nodes-worth of rows (verify carries two).
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_review_config_interpreted_shape() {
         let _guard = CrewDirGuard::new();
         let loaded = darkmux_crew::mission_config::load("review").expect("embedded review config loads");
 
-        let mut expansions = std::collections::BTreeMap::new();
-        // (#1475 packet 2) The probe stage expands over the probe ROLES now
-        // (`probe_roles`, not the retired `probe_seats`). Two items still yield
-        // two probe tasks — the node-count shape this test pins is unchanged.
-        expansions.insert(
-            "probe_roles".to_string(),
-            vec!["review-probe-high".to_string(), "review-probe-mid".to_string()],
-        );
+        // (#1512) No expansion collection — review.json declares its three
+        // probe tasks explicitly now, so `interpret` needs nothing beyond
+        // the document itself to produce the full graph shape.
         let params = darkmux_crew::mission_config::LaunchParams {
             phase_ids: std::collections::BTreeMap::new(),
             task_overrides: std::collections::BTreeMap::new(),
             step_config_overrides: std::collections::BTreeMap::new(),
-            expansions,
+            expansions: std::collections::BTreeMap::new(),
         };
         let (tasks, steps, _warnings) = darkmux_crew::mission_config::interpret(&loaded.config, &params)
             .expect("interpret succeeds against the embedded review config");
@@ -4083,13 +4076,12 @@
         let nodes = json["nodes"].as_array().unwrap();
         let count_kind = |kind: &str| nodes.iter().filter(|n| n["kind"] == kind).count();
         assert_eq!(count_kind("phase"), 3, "{nodes:?}");
-        // (#1442 ship-2b) The two expansion items here stand in for two
-        // (seat, draw) pairs — k is expansion fan-out, so the probe stage
-        // is one task per pair, each a generic dispatch.map step.
-        assert_eq!(count_kind("task"), 7, "expected bundle+2 probe maps+dedup+judge+verify+synthesis: {nodes:?}");
+        // (#1512) Three EXPLICIT one-role probe tasks, statically declared
+        // — bundle + 3 probe maps + dedup + judge + verify + synthesis.
+        assert_eq!(count_kind("task"), 8, "expected bundle+3 probe maps+dedup+judge+verify+synthesis: {nodes:?}");
         // (#1401) No separate "step" node kind anymore — every task's
         // steps render as rows on ITS OWN node instead. Sum the `steps`
-        // array lengths across every task node: 8 (#1442 — the verify task
+        // array lengths across every task node: 9 (#1442 — the verify task
         // is two sequential rows now: the frozen-prompt render, then the
         // dispatch.map), no longer a separate node per step.
         assert_eq!(count_kind("step"), 0, "steps are rows now, not nodes (#1401): {nodes:?}");
@@ -4098,9 +4090,9 @@
             .filter(|n| n["kind"] == "task")
             .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
             .sum();
-        assert_eq!(total_step_rows, 8, "verify carries two rows (render + map): {nodes:?}");
-        assert_eq!(tasks.len(), 7);
-        assert_eq!(steps.len(), 8);
+        assert_eq!(total_step_rows, 9, "verify carries two rows (render + map): {nodes:?}");
+        assert_eq!(tasks.len(), 8);
+        assert_eq!(steps.len(), 9);
 
         // (#1402) Every row's label resolves through the real StepKind
         // display-name fallback chain — the probe/verify dispatch rows are

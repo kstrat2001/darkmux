@@ -23,7 +23,7 @@
       "status": "planned",
       "task_id": "review-judge-task"
     },
-    "review-probe-0-step": {
+    "review-probe-high-step": {
       "config": {
         "bucket_budget": 500000,
         "bucket_group": "probe",
@@ -39,12 +39,12 @@
         "timeout_seconds": 30,
         "user_template": "{item}"
       },
-      "id": "review-probe-0-step",
+      "id": "review-probe-high-step",
       "kind": "dispatch.map",
       "status": "planned",
-      "task_id": "review-probe-0-task"
+      "task_id": "review-probe-high-task"
     },
-    "review-probe-1-step": {
+    "review-probe-mid-step": {
       "config": {
         "bucket_budget": 500000,
         "bucket_group": "probe",
@@ -60,33 +60,12 @@
         "timeout_seconds": 30,
         "user_template": "{item}"
       },
-      "id": "review-probe-1-step",
+      "id": "review-probe-mid-step",
       "kind": "dispatch.map",
       "status": "planned",
-      "task_id": "review-probe-1-task"
+      "task_id": "review-probe-mid-task"
     },
-    "review-probe-2-step": {
-      "config": {
-        "bucket_budget": 500000,
-        "bucket_group": "probe",
-        "collection": [],
-        "identifier": "darkmux:probe-model-b",
-        "max_tokens": 4000,
-        "model": "darkmux:probe-model-b",
-        "model_key": "probe-model-b",
-        "n_ctx": 32000,
-        "retry_on_empty": 1,
-        "system": "",
-        "temperature": 0.20000000298023224,
-        "timeout_seconds": 30,
-        "user_template": "{item}"
-      },
-      "id": "review-probe-2-step",
-      "kind": "dispatch.map",
-      "status": "planned",
-      "task_id": "review-probe-2-task"
-    },
-    "review-probe-3-step": {
+    "review-probe-low-step": {
       "config": {
         "bucket_budget": 500000,
         "bucket_group": "probe",
@@ -102,10 +81,10 @@
         "timeout_seconds": 30,
         "user_template": "{item}"
       },
-      "id": "review-probe-3-step",
+      "id": "review-probe-low-step",
       "kind": "dispatch.map",
       "status": "planned",
-      "task_id": "review-probe-3-task"
+      "task_id": "review-probe-low-task"
     },
     "review-synthesis-step": {
       "config": null,
@@ -144,62 +123,48 @@
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe role `alpha`",
-      "display_name": "Probe alpha",
-      "id": "review-probe-0-task",
+      "description": "probe role `review-probe-high` — one role, one task (#1512); parallelism with the other two probe tasks is emergent from all three depending only on review-bundle-task",
+      "display_name": "Probe high",
+      "id": "review-probe-high-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
-        "review-probe-0-step"
+        "review-probe-high-step"
       ],
-      "role_id": "alpha"
+      "role_id": "review-probe-high"
     },
     {
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe role `bravo`",
-      "display_name": "Probe bravo",
-      "id": "review-probe-1-task",
+      "description": "probe role `review-probe-mid` — one role, one task (#1512)",
+      "display_name": "Probe mid",
+      "id": "review-probe-mid-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
-        "review-probe-1-step"
+        "review-probe-mid-step"
       ],
-      "role_id": "bravo"
+      "role_id": "review-probe-mid"
     },
     {
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe role `bravo`",
-      "display_name": "Probe bravo",
-      "id": "review-probe-2-task",
+      "description": "probe role `review-probe-low` — one role, one task (#1512)",
+      "display_name": "Probe low",
+      "id": "review-probe-low-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
-        "review-probe-2-step"
+        "review-probe-low-step"
       ],
-      "role_id": "bravo"
+      "role_id": "review-probe-low"
     },
     {
       "depends_on": [
-        "review-bundle-task"
+        "review-probe-high-task",
+        "review-probe-mid-task",
+        "review-probe-low-task"
       ],
-      "description": "probe role `charlie`",
-      "display_name": "Probe charlie",
-      "id": "review-probe-3-task",
-      "phase_id": "pr-review-golden-investigate",
-      "step_ids": [
-        "review-probe-3-step"
-      ],
-      "role_id": "charlie"
-    },
-    {
-      "depends_on": [
-        "review-probe-0-task",
-        "review-probe-1-task",
-        "review-probe-2-task",
-        "review-probe-3-task"
-      ],
-      "description": "dedup probe flags — mechanism-family keying + anchor matching",
+      "description": "dedup probe flags — mechanism-family keying + anchor matching. (#1512, #1513 review) `depends_on` below is build_review_graph's CLAIM/PRUNE boundary, NOT the probe role registry: a resolved staffing claims its declared task by role_id, and any declared task nobody claims is pruned (loudly, with a warning). Probe roles are discovered separately, by resolve_review_roles walking every task in this document and classifying each by its step kind. Adding/removing a probe task here (with its own role_id, and its entry in this depends_on list) still changes the probe count with zero Rust changes.",
       "display_name": "Dedup",
       "id": "review-dedup-task",
       "phase_id": "pr-review-golden-investigate",
