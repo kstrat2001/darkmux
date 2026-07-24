@@ -53,8 +53,16 @@ test('activity lane brackets a session.end-only session as ended, not in-flight'
   // bare `dispatchEnd().ts` read gated on the new `done` would TypeError here
   // (undefined for a session.end-only session) and blank the view. Navigate
   // fleet → machine → that session, then assert the subsystem rendered cleanly.
-  await page.locator('[data-act="machine"]').first().click();
+  // (#1508) The nav tab now shares data-act="machine" with the fleet cards
+  // (they differ by data-arg — a card carries the machine id, the tab drills
+  // the local box). Target a CARD (has data-arg), not the tab, to drill a
+  // specific machine.
+  await page.locator('[data-act="machine"][data-arg]').first().click();
   await page.waitForSelector('.stagehdr');
+  // (#1508) The unified machine page lists runs as collapsible recentRow
+  // <details>; the session-drill "open →" lives in the expanded body, so
+  // expand the run first, then click through to its session detail.
+  await page.locator('details[data-expand="recent:sess-ended-via-sessionend"] > summary').first().click();
   await page.locator('[data-act="session"][data-arg="sess-ended-via-sessionend"]').first().click();
   await page.waitForSelector('.sub', { timeout: 10_000 });
 

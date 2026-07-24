@@ -904,6 +904,16 @@ recompute();
 // via state.recentAll. Keeps a busy machine's panel from scrolling unbounded.
 const RECENT_CAP=20;
 let state={level:"fleet",machine:null,session:null,missionId:null,labRunDir:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,activityWindowMin:1440,
+  // (#1508) Navigational INTENT for the unified machine page's local-vs-
+  // remote health-region gate — true only via goMachine() (the nav tab /
+  // `#lens=machine` deep-link, which always means "my own page" even before
+  // the separate /machine/specs probe has resolved: a live daemon serves it
+  // eventually, but an offline/static context may never). A fleet-card drill
+  // leaves it false; renderMachine() ALSO re-derives locality live via
+  // isLocalMachine(state.machine), so a drill into what turns out to be your
+  // OWN machine still gets the health region once specs resolve and match —
+  // this flag only needs to force the answer for the "always mine" entry.
+  machineIsLocal:false,
   filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),act:new Set(FACTS),q:""},
   rawOpen:false,
   // (#expand) Open-state of `<details data-expand="<key>">` blocks, keyed so it
@@ -1571,8 +1581,12 @@ function renderMachine(){
   // the configured `internal.utility` model is resident / registered-not-loaded /
   // not-configured; for a remote machine (no specs probe — presence beats don't
   // carry the binding) it reads "not reported" rather than implying residency.
-  const isLocalMach = isLocalMachine(m);
-  const um = isLocalMach ? MACHINE_SPECS.utility_model : undefined; // {id,loaded} | null | undefined
+  // (#1508) This is the STRICT specs-confirmed check (unchanged #1008
+  // semantics) — distinct from the health region's isLocalMach below, which
+  // ALSO trusts the nav-tab/deep-link's explicit "always mine" intent even
+  // before /machine/specs has resolved.
+  const isLocalSpecs = isLocalMachine(m);
+  const um = isLocalSpecs ? MACHINE_SPECS.utility_model : undefined; // {id,loaded} | null | undefined
   let utilState, utilPill;
   // (#1071) utility-model residency is NOT a dispatch verdict — use neutral
   // (muted) for unknown/not-configured/not-loaded, green only for resident (ready).
@@ -1589,6 +1603,11 @@ function renderMachine(){
   // in gather_ms). Genuinely local-only data: showing it under a REMOTE
   // machine's name would silently mislabel this host's own figures as the
   // drilled machine's — the local-vs-remote honesty line (#1508 decision 2).
+  // isLocalMach ORs the explicit nav-tab/deep-link intent (state.machineIsLocal)
+  // with the specs-confirmed check: goMachine() always counts (even before
+  // /machine/specs resolves), and a fleet-card drill into what turns out to
+  // be your OWN machine self-corrects live once specs load and match.
+  const isLocalMach = state.machineIsLocal || isLocalSpecs;
   const b=MACHINE_MEM;
   let healthBody;
   if(!isLocalMach){
@@ -2286,13 +2305,21 @@ function render(){
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
   syncTransport();
 }
-// (#1508) True iff `m` is THIS daemon's own machine — the local-vs-remote
-// honesty gate for the unified machine page's health region (probe data is
-// always THIS host's) and the MACHINE_MEM poll's own level guard. MACHINE_SPECS
-// is only populated live (or fetched one-shot by goMachine below); null in
-// playback, which correctly reads every machine as "not local" there (no
-// probe to attribute).
+// (#1508) True iff `m` is THIS daemon's own machine, PER THE /machine/specs
+// PROBE specifically — the strict specs-confirmed identity check the
+// pre-existing #1008 utility-tier card uses (unchanged semantics). NOT the
+// general local/remote gate for the health region — see state.machineIsLocal
+// above and its use in renderMachine/pollMachineMem, which OR this in so a
+// drill into what turns out to be your own machine still self-corrects once
+// specs load, but don't REQUIRE this to have resolved for the "always mine"
+// nav-tab/deep-link entry (goMachine) to count as local.
 const isLocalMachine=m=>!!(MACHINE_SPECS && m!=null && nameOf(m)===MACHINE_SPECS.machine_id);
+// (#1508) The health region's actual local/remote gate — ORs the explicit
+// nav-tab/deep-link intent (state.machineIsLocal, set by goMachine/
+// drillMachine) with the specs-confirmed check above. Shared by
+// renderMachine (what to show) and pollMachineMem (whether to keep polling)
+// so the two can never disagree about which page is "mine".
+const machineIsLocalNow=()=>state.machineIsLocal||isLocalMachine(state.machine);
 // (#1508) Which machine uid IS this daemon, for the nav-tab/deep-link entry
 // into the unified machine page. MACHINE_SPECS.machine_id is a NAME, not the
 // stable hardware uid state.machine keys on — match it against the known
@@ -2305,29 +2332,32 @@ function localMachineUid(){
   return machines().find(x=>nameOf(x)===MACHINE_SPECS.machine_id) || MACHINE_SPECS.machine_id;
 }
 // (#1508) Drill into the unified machine page for a SPECIFIC machine uid —
-// the fleet-card entry point (local OR remote). `goMachine` below is the
-// sibling entry for "the local machine" (nav tab + `#lens=machine` deep
-// link); both land here.
-window.drillMachine=m=>{
+// the fleet-card entry point (local OR remote). `local` is the explicit
+// intent flag (see state.machineIsLocal); omitted/false for a plain
+// fleet-card drill. `goMachine` below is the sibling entry for "the local
+// machine" (nav tab + `#lens=machine` deep link) and passes `local=true`.
+window.drillMachine=(m,local)=>{
   state.level="machine";state.machine=m;state.session=null;state.follow=true;state.recentAll=false;
+  state.machineIsLocal=!!local;
   MACHINE_MEM_SIG=null; // force a fresh paint of the health region on this visit
   render();
   if(!MACHINE_MEM_POLLING) pollMachineMem();
 };
-// (#1508) The nav-tab / deep-link entry point — always "the local machine".
-// /machine/specs is a probe capability, not a flow-record one (same posture
-// as /machine/resources), so this fetches it directly rather than waiting on
-// the live-only 5s specs poll (pollMachineSpecs) — playback mode never
-// starts that poll, and even in live mode the operator can land here before
-// its first tick.
+// (#1508) The nav-tab / deep-link entry point — always "the local machine"
+// (passes local=true to drillMachine regardless of whether the specs fetch
+// below succeeds). /machine/specs is a probe capability, not a flow-record
+// one (same posture as /machine/resources), so this fetches it directly
+// rather than waiting on the live-only 5s specs poll (pollMachineSpecs) —
+// playback mode never starts that poll, and even in live mode the operator
+// can land here before its first tick.
 window.goMachine=async function(){
   if(!MACHINE_SPECS){
     try{
       const r=await fetch("/machine/specs",{headers:{accept:"application/json"}});
       if(r.ok) MACHINE_SPECS=await r.json();
-    }catch(_){/* best-effort — falls back to remote-style rendering until the next poll succeeds */}
+    }catch(_){/* best-effort — the health region still renders via the explicit local=true intent below */}
   }
-  drillMachine(localMachineUid());
+  drillMachine(localMachineUid(), true);
 };
 // (#691) Expand/collapse the recent-runs list past RECENT_CAP.
 window.toggleRecentAll=()=>{state.recentAll=!state.recentAll;render();};
@@ -3753,14 +3783,14 @@ const MACHINE_MEM_POLL_MS=5000; // client cadence (server caches ~2s; both recor
 // to a REMOTE machine's page, which the local-vs-remote honesty rule (#1508
 // decision 2) never feeds real figures — cleanly stops the loop.
 async function pollMachineMem(){
-  if(state.level!=="machine"||!isLocalMachine(state.machine)){ MACHINE_MEM_POLLING=false; return; }
+  if(state.level!=="machine"||!machineIsLocalNow()){ MACHINE_MEM_POLLING=false; return; }
   MACHINE_MEM_POLLING=true;
   try{
     const r=await fetch("/machine/resources",{headers:{accept:"application/json"}});
     if(r.ok){ MACHINE_MEM=await r.json(); MACHINE_MEM_ERR=false; }
     else MACHINE_MEM_ERR=true;
   }catch(_){ MACHINE_MEM_ERR=true; }
-  if(state.level!=="machine"||!isLocalMachine(state.machine)){ MACHINE_MEM_POLLING=false; return; } // navigated away mid-fetch
+  if(state.level!=="machine"||!machineIsLocalNow()){ MACHINE_MEM_POLLING=false; return; } // navigated away mid-fetch
   // The stageSig()/re-render-gap discipline: the structural signature
   // EXCLUDES the always-changing stamps (generated_at_ms / gather_ms), so a
   // poll that changes nothing rebuilds nothing — the volatile stamp line
