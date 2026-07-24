@@ -3383,6 +3383,85 @@
         }
     }
 
+    // ─── /runs aggregator (#1508 step 3) ────────────────────────────────
+    //
+    // The normalization/dedup logic itself is unit-tested in `runs.rs`'s
+    // own `mod tests` (kind derivation, status mapping, the mission_id-gap
+    // dedup, ghost synthesis). These are wiring-level tests only: does the
+    // route exist, does it read the SAME `AppState` sources every other
+    // handler reads, does the envelope shape match `/missions`'s own.
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runs_handler_lists_a_tracked_mission_run() {
+        let _guard = CrewDirGuard::new();
+        let mission = minimal_mission("runs-test-mission", vec![]);
+        save_test_mission(&mission);
+
+        let flows = TempDir::new().unwrap();
+        let app = build_router_full(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let response = app
+            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["generated_at_ms"].as_u64().unwrap() > 0);
+        let runs = json["runs"].as_array().unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r["id"] == "runs-test-mission")
+            .expect("the saved mission appears in /runs");
+        // Zero phases -> not the crew-of-one shape -> kind "mission" (see
+        // `runs::classify_mission`'s doc).
+        assert_eq!(run["kind"], "mission");
+        assert_eq!(run["status"], "running"); // MissionStatus::Active default
+        assert_eq!(run["tracked"], true);
+    }
+
+    #[tokio::test]
+    async fn runs_handler_includes_lab_runs_with_kind_lab() {
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+        let app = build_router_full(
+            flows.path().to_path_buf(),
+            worktrees_base_dir(),
+            Some(lab.path().to_path_buf()),
+        );
+        let response = app
+            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let runs = json["runs"].as_array().unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r["id"] == "case-a/run1")
+            .expect("the lab run appears in /runs");
+        assert_eq!(run["kind"], "lab");
+        assert_eq!(run["tracked"], true);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runs_handler_never_errors_with_no_sources_configured() {
+        let _guard = CrewDirGuard::new();
+        let flows = TempDir::new().unwrap();
+        let app = build_router_full(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let response = app
+            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["runs"].as_array().unwrap().len(), 0);
+    }
+
     #[tokio::test]
     async fn mission_graph_html_serves_the_page() {
         let app = build_router(PathBuf::new());

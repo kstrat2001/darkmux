@@ -34,6 +34,15 @@ use std::time::Duration;
 /// way).
 pub mod mission_graph;
 
+/// `GET /runs` — the flat, kind-tagged, normalized run view-model (#1508
+/// step 3: the read-side union over missions + lab + flow the future Runs
+/// lens will consume). Own module (like `mission_graph`) rather than inlined
+/// here — the normalization/dedup logic is substantial enough to warrant
+/// its own unit-test surface; see the module's own doc for the full
+/// design. Private (unlike `mission_graph`, which the binary crate also
+/// pins against) — `runs_handler` below is this module's only caller.
+mod runs;
+
 /// (#925) Per-route request timeout for the NON-streaming routes. Bounds a
 /// slow/hung request; the long-lived `/flow/:date/stream` SSE route is
 /// deliberately excluded.
@@ -294,6 +303,7 @@ pub(crate) fn build_router_full(
         .route("/machine/specs", get(machine_specs_handler))
         .route("/machine/resources", get(machine_resources_handler))
         .route("/missions", get(missions_handler))
+        .route("/runs", get(runs_handler))
         .route("/phases", get(phases_handler))
         .route("/mission/:id/graph", get(mission_graph_html))
         .route("/mission/:id/graph.json", get(mission_graph_json_handler))
@@ -1296,6 +1306,32 @@ async fn missions_handler() -> axum::Json<serde_json::Value> {
     }))
 }
 
+/// GET /runs — the flat, kind-tagged, normalized run view-model (#1508 step
+/// 3): a READ-SIDE UNION over three existing sources — mission records
+/// (`/missions`'s own source), lab-bench runs (`/lab/runs`'s own scan), and
+/// the flow stream (route resolution + untracked-ghost synthesis). See
+/// `runs::build_runs`'s own doc for the full normalization + dedup rules —
+/// this handler is a thin `spawn_blocking` + envelope wrapper, same shape
+/// as `missions_handler` above.
+///
+/// Computed fresh per request — NO new persistence (sink-boundary contract
+/// #3 stays honored: this only READS across the lab/flow/crew boundary,
+/// never writes across it). Never a 500: `runs::build_runs` already
+/// degrades each source independently to zero contribution on failure
+/// (mirrors `missions_handler`'s `_ => Vec::new()`); the `unwrap_or_default`
+/// below covers only the outer `spawn_blocking` join itself panicking.
+async fn runs_handler(State(state): State<AppState>) -> axum::Json<serde_json::Value> {
+    let flows_dir = state.flows_dir.clone();
+    let lab_dir = state.lab_dir.clone();
+    let result = tokio::task::spawn_blocking(move || runs::build_runs(&flows_dir, lab_dir.as_deref()))
+        .await;
+    let runs = result.unwrap_or_default();
+    axum::Json(serde_json::json!({
+        "runs": runs,
+        "generated_at_ms": current_millis(),
+    }))
+}
+
 /// GET /phases — list of all phases from the JSON source-of-truth
 /// (`~/.darkmux/crew/phases/`). Includes status + transition timestamps
 /// (started_ts/completed_ts/abandoned_ts) so the viewer's wall-clock
@@ -1526,37 +1562,44 @@ fn resolve_lab_run_dir(lab_dir: &StdPath, dir: &str) -> Option<PathBuf> {
 }
 
 /// One run cluster's summary row for `GET /lab/runs`.
+///
+/// `pub(crate)` (was private until #1508 step 3): the `/runs` aggregator's
+/// `runs` module reads this struct directly to fold lab-bench runs into the
+/// flat cross-source view-model — see `runs::lab_summary_to_run`. No change
+/// to the wire shape or to `/lab/runs`'s own behavior; this is purely a
+/// crate-internal visibility widening so a sibling module can reuse the
+/// SAME scan `/lab/runs` already does, rather than re-deriving it.
 #[derive(Debug, serde::Serialize)]
-struct LabRunSummary {
+pub(crate) struct LabRunSummary {
     /// POSIX-style path relative to `lab_dir` — the identifier every other
     /// `/lab/*` endpoint's `dir` query param takes.
-    dir: String,
+    pub(crate) dir: String,
     /// Newest mtime among the run's marker artifacts, epoch milliseconds.
-    mtime_ms: u64,
-    case_ids: Vec<String>,
+    pub(crate) mtime_ms: u64,
+    pub(crate) case_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    crew: Option<String>,
+    pub(crate) crew: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    exec_mode: Option<String>,
+    pub(crate) exec_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    profile: Option<String>,
+    pub(crate) profile: Option<String>,
     /// The resolved per-seat staffing (model/k/max_tokens/n_ctx) this run
     /// actually used — `None` only for a brand-new live run whose first case
     /// hasn't completed yet (no `funnels.json` snapshot exists).
     #[serde(skip_serializing_if = "Option::is_none")]
-    staffing: Option<darkmux_lab::lab::review::StaffingSnapshot>,
-    bundles: usize,
-    raw_flags: usize,
-    deduped_flags: usize,
-    confirmed: usize,
-    needs_check: usize,
-    archived: usize,
-    degenerate: bool,
+    pub(crate) staffing: Option<darkmux_lab::lab::review::StaffingSnapshot>,
+    pub(crate) bundles: usize,
+    pub(crate) raw_flags: usize,
+    pub(crate) deduped_flags: usize,
+    pub(crate) confirmed: usize,
+    pub(crate) needs_check: usize,
+    pub(crate) archived: usize,
+    pub(crate) degenerate: bool,
     /// `scores.json` exists — the run reached its terminal artifact write.
     /// The viewer's live/finished badge keys on this.
-    finished: bool,
-    has_funnels: bool,
-    has_events: bool,
+    pub(crate) finished: bool,
+    pub(crate) has_funnels: bool,
+    pub(crate) has_events: bool,
 }
 
 /// GET /lab/runs — every run cluster under the lab observer's scan root,
@@ -1574,7 +1617,11 @@ async fn lab_runs_handler(State(state): State<AppState>) -> impl IntoResponse {
     axum::Json(serde_json::json!({ "configured": true, "runs": runs })).into_response()
 }
 
-fn scan_lab_runs(lab_dir: &StdPath) -> Vec<LabRunSummary> {
+/// `pub(crate)` (was private until #1508 step 3) — the `/runs` aggregator
+/// calls this directly (`runs::build_runs`) to fold lab-bench runs into the
+/// flat cross-source view-model, the SAME scan `/lab/runs` uses. No
+/// behavior change to `/lab/runs` itself.
+pub(crate) fn scan_lab_runs(lab_dir: &StdPath) -> Vec<LabRunSummary> {
     let mut out = Vec::new();
     scan_lab_dir_rec(lab_dir, lab_dir, 0, &mut out);
     // Newest-first — the series/history view wants the latest run of each
@@ -2483,7 +2530,12 @@ fn is_valid_catalog_id(id: &str) -> bool {
 /// visitor returns `ControlFlow::Break` to stop early (e.g. once a fetch hits its
 /// record cap). Shared cross-day scan primitive the catalog endpoints filter over
 /// (#691) — factored from the same read_dir + line-parse loop as scan_flow_days.
-fn for_each_flow_record_across_days(
+///
+/// `pub(crate)` (was private until #1508 step 3): the `/runs` aggregator's
+/// `runs` module scans the flow stream ONCE with this same primitive (to
+/// resolve route/role/model + synthesize untracked ghost runs) rather than
+/// re-implementing the day-file walk — see that module's `build_flow_session_index`.
+pub(crate) fn for_each_flow_record_across_days(
     flows_dir: &std::path::Path,
     mut visit: impl FnMut(&str, &serde_json::Value) -> std::ops::ControlFlow<()>,
 ) {
