@@ -351,6 +351,56 @@
         assert!(props.get("line").is_none(), "finding schema must NOT carry `line` (replaced by anchor, #1053)");
     }
 
+    /// (concise-review pass) The pr-reviewer finding shape folds the old
+    /// `detail` + `advice` pair into ONE `detail` field — two separate prose
+    /// fields were redundant with each other and with the mechanical
+    /// `suggestion` fix, and were the bulk of a finding's length. A
+    /// regression that re-adds `advice` (or drops `detail`) would silently
+    /// bring back the verbosity this pass removed, so both the schema
+    /// (`pr-reviewer.json`) and the prompt (`pr-reviewer.md`) are pinned
+    /// here — schema-declared fields, `required`, and the prompt's own field
+    /// list must all agree.
+    #[test]
+    fn pr_reviewer_finding_shape_folds_detail_and_advice() {
+        let role_json = BUILTIN_ROLES
+            .iter()
+            .find(|(id, _)| *id == "pr-reviewer")
+            .map(|(_, c)| *c)
+            .expect("pr-reviewer manifest must be embedded");
+        let role: Role = serde_json::from_str(role_json).expect("pr-reviewer manifest parses");
+        let schema = role.output_schema.expect("pr-reviewer has an output_schema");
+        let props = schema["properties"]["findings"]["items"]["properties"]
+            .as_object()
+            .expect("finding schema properties must be an object");
+        assert!(props.contains_key("detail"), "finding schema must carry `detail` (the folded field)");
+        assert!(
+            !props.contains_key("advice"),
+            "finding schema must NOT carry a separate `advice` — folded into `detail`"
+        );
+        let required: Vec<&str> = schema["properties"]["findings"]["items"]["required"]
+            .as_array()
+            .expect("finding schema must declare `required`")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&"detail"), "`detail` must be required: {required:?}");
+        assert!(!required.contains(&"advice"), "`advice` must not be required (field retired): {required:?}");
+
+        let prompt = BUILTIN_ROLE_PROMPTS
+            .iter()
+            .find(|(id, _)| *id == "pr-reviewer")
+            .map(|(_, c)| *c)
+            .expect("pr-reviewer prompt must be embedded");
+        assert!(
+            prompt.contains("**`detail`**"),
+            "pr-reviewer.md must document the `detail` field"
+        );
+        assert!(
+            !prompt.contains("**`advice`**"),
+            "pr-reviewer.md must not document a separate `advice` field (folded into `detail`)"
+        );
+    }
+
     /// (#1119 free-form mode) `pr-reviewer-freeform` must NOT carry an
     /// `output_schema` — the whole point of the sibling role is no grammar
     /// lock on the output. A future edit that added one back would silently

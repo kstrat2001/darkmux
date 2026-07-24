@@ -316,12 +316,17 @@ fn path_from_bundle_id(bundle_id: &str) -> &str {
     bundle_id.split_once('@').map(|(_, p)| p).unwrap_or(bundle_id)
 }
 
-/// (#1222 Phase B packet 5) The fixed marker every `Tier::Confirmed`
-/// finding carries. A local judge's double-confirm is real signal (the
-/// CLAUDE.md "recheck vs rethink" doctrine's cross-context re-thinking, at
-/// judge scale) — but it is not the frontier review the same doctrine
-/// reserves for invariant/security-bearing diffs. The marker keeps that
-/// distinction visible to whoever reads the posted comment.
+/// (#1222 Phase B packet 5; moved to the review header, not repeated per
+/// finding, in the concise-review pass) The fixed marker surfaced ONCE, on
+/// the review's verdict line, whenever at least one `Tier::Confirmed`
+/// finding in the run has no `verified` adjudication. A local judge's
+/// double-confirm is real signal (the CLAUDE.md "recheck vs rethink"
+/// doctrine's cross-context re-thinking, at judge scale) — but it is not
+/// the frontier review the same doctrine reserves for invariant/security-
+/// bearing diffs. Individual findings that DO carry a verify adjudication
+/// show [`verified_line`] instead, inline with that finding — this marker
+/// itself never repeats per finding; see `any_unverified` in
+/// [`synthesize_review`].
 const CONFIRMED_MARKER: &str =
     "⚠ needs frontier verification — confirmed by a local judge, not yet frontier-verified";
 
@@ -336,7 +341,10 @@ const CONFIRMED_MARKER: &str =
 ///   NON-blocking `COMMENT` by default (#1302 — advisory, matching the
 ///   footer's claim; the inline comments are still carried), or blocking
 ///   `REQUEST_CHANGES` when the crew opts in via `request_changes: true`
-///   (read here from `env.staffing`).
+///   (read here from `env.staffing`). When one or more confirmed findings
+///   lack a `verified` adjudication, [`CONFIRMED_MARKER`] renders ONCE, on
+///   the verdict line — never repeated per finding (a verified finding
+///   instead names its adjudicator inline, via [`verified_line`]).
 /// - [`Tier::NeedsCheck`] (a pass-2 demotion already folds into this tier —
 ///   `judge_one_flag` never leaves a demoted flag `Confirmed`) -> one
 ///   non-blocking bullet in a "worth a double check" section: in the
@@ -373,18 +381,25 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
     let mut inline: Vec<Value> = Vec::new();
     let mut confirmed_general: Vec<String> = Vec::new();
     let mut needs_check_lines: Vec<String> = Vec::new();
+    // (#1521-adjacent UX) Whether any confirmed finding in this run lacks a
+    // `verified` adjudication — drives the ONE header-level [`CONFIRMED_MARKER`]
+    // line, replacing what used to be a per-finding repeat.
+    let mut any_unverified = false;
 
     for j in &env.judged {
         let path = path_from_bundle_id(&j.flag.bundle_id);
         match j.tier {
             Tier::Confirmed => {
                 let record = j.pass2.as_ref().unwrap_or(&j.pass1);
-                // (#1260) A verify-seat `verified` ruling replaces the
-                // manual-verification marker with the adjudication line;
-                // `uncertain`/`unparsed`/`error` (or no verify seat at all)
-                // keep the marker — an inconclusive adjudication never
+                // (#1260) A verify-seat `verified` ruling names the
+                // adjudicator inline on this finding; `uncertain`/
+                // `unparsed`/`error` (or no verify seat at all) leave the
+                // finding unverified — an inconclusive adjudication never
                 // promotes. `refuted` never reaches here (tier = Archived).
                 let verified = j.verify.as_ref().filter(|v| v.ruling == VerifyRuling::Verified);
+                if verified.is_none() {
+                    any_unverified = true;
+                }
                 match resolve_anchor(Some(path), j.flag.anchor.as_deref(), &index) {
                     Some(line) => inline.push(json!({
                         "path": norm_path(path),
@@ -431,16 +446,18 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
                 member_summary(env)
             ));
         } else {
+            // "(not merge-blocking)" lives on the section header just below,
+            // not repeated here too.
             lines.push(format!(
                 "review ran: {} flags investigated across {} bundles, none confirmed — \
-                 {} worth a double check (not merge-blocking). _{}_",
+                 {} worth a double check. _{}_",
                 env.deduped_flags,
                 env.bundles,
                 needs_check_count,
                 member_summary(env)
             ));
             lines.push(String::new());
-            lines.push("**Worth a double check:**".to_string());
+            lines.push("**Worth a double check** (not merge-blocking):".to_string());
             lines.extend(needs_check_section.iter().cloned());
         }
         lines.extend(run_warnings_block(env));
@@ -458,6 +475,13 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
         inline.len(),
         confirmed_general.len()
     ));
+    // (#1521-adjacent UX) ONE header-level marker line when any confirmed
+    // finding lacks a `verified` adjudication — replaces the old per-finding
+    // repeat. A run where every confirmed finding IS verified emits nothing
+    // here (each finding already names its adjudicator inline instead).
+    if any_unverified {
+        body.push(format!("_{CONFIRMED_MARKER}_"));
+    }
     if !confirmed_general.is_empty() {
         body.push(String::new());
         body.push("**Confirmed findings not anchored to a diff line:**".to_string());
@@ -513,9 +537,12 @@ fn run_warnings_block(env: &ReviewEnvelope) -> Vec<String> {
 }
 
 /// (#1260) The frontier-verified line a `verified` adjudication earns —
-/// replaces [`CONFIRMED_MARKER`] and names the adjudicating model, so the
-/// posted comment says WHERE the verification came from (operator
-/// sovereignty: the reader never wonders which tier signed off).
+/// names the adjudicating model on THIS finding, so the posted comment says
+/// WHERE the verification came from (operator sovereignty: the reader never
+/// wonders which tier signed off). An unverified finding renders no
+/// per-finding counterpart — the header-level [`CONFIRMED_MARKER`] covers
+/// it once for the whole run instead (see `any_unverified` in
+/// [`synthesize_review`]).
 fn verified_line(v: &VerifyRecord) -> String {
     format!("✓ verified by {} adjudication", v.model)
 }
@@ -532,9 +559,8 @@ fn confirmed_comment_body(
     if !evidence.is_empty() {
         lines.push(format!("Evidence: {evidence}"));
     }
-    match verified {
-        Some(v) => lines.push(verified_line(v)),
-        None => lines.push(CONFIRMED_MARKER.to_string()),
+    if let Some(v) = verified {
+        lines.push(verified_line(v));
     }
     // (#1299) Surface the "aggregate, never discard" safety net: any
     // same-location duplicate framings this finding absorbed at dedup are
@@ -561,9 +587,8 @@ fn confirmed_general_bullet(
     if !evidence.is_empty() {
         line.push_str(&format!(" _Evidence: {evidence}_"));
     }
-    match verified {
-        Some(v) => line.push_str(&format!(" ({})", verified_line(v))),
-        None => line.push_str(&format!(" ({CONFIRMED_MARKER})")),
+    if let Some(v) = verified {
+        line.push_str(&format!(" ({})", verified_line(v)));
     }
     if let Some(also) = also_flagged_line(also_flagged) {
         line.push_str(&format!(" _{also}_"));
@@ -918,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_confirmed_resolves_inline_with_marker_and_comment_by_default() {
+    fn synthesize_confirmed_resolves_inline_with_header_marker_and_comment_by_default() {
         let j = confirmed_flag(
             "computeEnd@src/x.ts",
             Some("const b = 2;"),
@@ -940,12 +965,18 @@ mod tests {
         let body = comments[0]["body"].as_str().unwrap();
         assert!(body.contains("shadows the config default"), "{body}");
         assert!(body.contains("the clamp is bypassed"), "{body}");
-        assert!(body.contains(CONFIRMED_MARKER), "{body}");
-        // note_for_author must precede decisive_evidence must precede the marker.
+        // (#1521-adjacent UX) The marker is no longer repeated on each
+        // finding's own comment — only the review's top-level body carries it.
+        assert!(!body.contains(CONFIRMED_MARKER), "the marker moved to the header, not the finding: {body}");
         let note_at = body.find("shadows the config default").unwrap();
         let evidence_at = body.find("the clamp is bypassed").unwrap();
-        let marker_at = body.find(CONFIRMED_MARKER).unwrap();
-        assert!(note_at < evidence_at && evidence_at < marker_at, "{body}");
+        assert!(note_at < evidence_at, "{body}");
+
+        let top_body = review["body"].as_str().unwrap();
+        assert!(
+            top_body.contains(CONFIRMED_MARKER),
+            "the run has one unverified confirm, so the header marker fires once: {top_body}"
+        );
     }
 
     /// (#1302) Opt-in blocking: `request_changes: true` on the crew (carried
@@ -1309,7 +1340,9 @@ mod tests {
         let body = confirmed_comment_body(&record, None, &[]);
         assert!(body.contains("(no note from the judge)"), "{body}");
         assert!(!body.contains("Evidence:"), "empty evidence must not render a line: {body}");
-        assert!(body.contains(CONFIRMED_MARKER), "{body}");
+        // (#1521-adjacent UX) An unverified finding's own body no longer
+        // carries the marker — that now lives on the review header only.
+        assert!(!body.contains(CONFIRMED_MARKER), "{body}");
     }
 
     // ─── the verify seat's tier mechanics (#1260) ─────────────────────
@@ -1350,10 +1383,11 @@ mod tests {
         assert!(!body.contains(CONFIRMED_MARKER), "{body}");
     }
 
-    /// (#1260) An `uncertain` adjudication keeps the EXISTING marker —
-    /// inconclusive never promotes; the posted bytes match a no-seat crew.
+    /// (#1260) An `uncertain` adjudication keeps the finding unverified —
+    /// inconclusive never promotes; the posted bytes match a no-seat crew,
+    /// and the header-level marker still fires for both.
     #[test]
-    fn synthesize_uncertain_verify_keeps_the_marker() {
+    fn synthesize_uncertain_verify_keeps_the_header_marker() {
         let mut j = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "note", "evidence");
         j.verify = Some(verify_record(VerifyRuling::Uncertain));
         let env = healthy_envelope(vec![j]);
@@ -1366,22 +1400,26 @@ mod tests {
         let a = with_uncertain.review.unwrap();
         let b = without_seat.review.unwrap();
         assert_eq!(a, b, "an uncertain adjudication renders byte-identically to no seat at all");
-        assert!(a["comments"][0]["body"].as_str().unwrap().contains(CONFIRMED_MARKER));
+        assert!(
+            a["body"].as_str().unwrap().contains(CONFIRMED_MARKER),
+            "the sole finding is unverified, so the header marker fires once"
+        );
     }
 
     /// (FIX 3 / #1260, ruling applied) A verify budget that exhausts
     /// MID-STAGE degrades the STAGE, not the run: verified findings still post
-    /// as frontier-verified, each skipped adjudication (recorded per-flag as
-    /// `VerifyRuling::Error`, tier still Confirmed) keeps the
-    /// manual-verification marker, and the posted review carries the loud
-    /// "verify budget exhausted after N of M adjudications" warning. The
-    /// envelope is NOT degenerate — never routed to "produced no signal".
+    /// as frontier-verified, the skipped adjudication (recorded per-flag as
+    /// `VerifyRuling::Error`, tier still Confirmed) leaves the run with an
+    /// unverified confirm — so the header-level marker fires once — and the
+    /// posted review carries the loud "verify budget exhausted after N of M
+    /// adjudications" warning. The envelope is NOT degenerate — never routed
+    /// to "produced no signal".
     #[test]
-    fn synthesize_verify_exhaustion_posts_verified_plus_markered_plus_warning() {
+    fn synthesize_verify_exhaustion_posts_verified_plus_header_marker_plus_warning() {
         let mut verified = confirmed_flag("a@src/x.ts", Some("const b = 2;"), "verified note", "e");
         verified.verify = Some(verify_record(VerifyRuling::Verified));
         // A skipped adjudication: recorded per-flag as Error, stays Confirmed
-        // — synthesize must keep its manual-verification marker.
+        // — leaves the run with an unverified confirm.
         let mut skipped = confirmed_flag("b@src/x.ts", Some("const d = 5;"), "skipped note", "e");
         skipped.verify = Some(VerifyRecord {
             ruling: VerifyRuling::Error,
@@ -1403,8 +1441,11 @@ mod tests {
         let review = r.review.unwrap();
         let comments = serde_json::to_string(&review["comments"]).unwrap();
         assert!(comments.contains("verified by gpt-5.1 adjudication"), "the verified one posts verified: {comments}");
-        assert!(comments.contains(CONFIRMED_MARKER), "the skipped adjudication keeps the marker: {comments}");
         let body = review["body"].as_str().unwrap();
+        assert!(
+            body.contains(CONFIRMED_MARKER),
+            "the skipped adjudication leaves an unverified confirm, firing the header marker once: {body}"
+        );
         assert!(body.contains("Run warnings"), "the warnings block renders on the review: {body}");
         assert!(body.contains("verify budget exhausted after 1 of 2 adjudications"), "{body}");
     }
@@ -1433,7 +1474,8 @@ mod tests {
         let line = confirmed_general_bullet("src/x.ts", &record, None, &[]);
         assert!(line.contains("(no note from the judge)"), "{line}");
         assert!(!line.contains("_Evidence:"), "empty evidence must not render a line: {line}");
-        assert!(line.contains(CONFIRMED_MARKER), "{line}");
+        // (#1521-adjacent UX) The per-bullet marker moved to the review header.
+        assert!(!line.contains(CONFIRMED_MARKER), "{line}");
     }
 
     #[test]
@@ -1458,7 +1500,11 @@ mod tests {
         let body = comments[0]["body"].as_str().unwrap();
         assert!(body.contains("(no note from the judge)"), "{body}");
         assert!(!body.contains("Evidence:"), "{body}");
-        assert!(body.contains(CONFIRMED_MARKER), "{body}");
+        // (#1521-adjacent UX) The per-finding marker moved to the review
+        // header; the top-level body still carries it once.
+        assert!(!body.contains(CONFIRMED_MARKER), "{body}");
+        let top_body = review["body"].as_str().unwrap();
+        assert!(top_body.contains(CONFIRMED_MARKER), "{top_body}");
     }
 
     #[test]

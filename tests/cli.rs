@@ -1704,9 +1704,13 @@ fn pr_review_run_from_envelope_synthesizes_confirmed_review_to_stdout() {
     assert_eq!(comments[0]["line"], 2);
     let body = comments[0]["body"].as_str().unwrap();
     assert!(body.contains("shadows the config default"), "{body}");
+    // (#1521-adjacent UX) The local-judge marker is no longer repeated on
+    // each finding's own comment — it renders once, on the review's
+    // top-level body, alongside the verdict line.
+    let top_body = v["review"]["body"].as_str().unwrap();
     assert!(
-        body.contains("needs frontier verification"),
-        "confirmed comments carry the local-judge marker: {body}"
+        top_body.contains("needs frontier verification"),
+        "the review header carries the local-judge marker once: {top_body}"
     );
 }
 
