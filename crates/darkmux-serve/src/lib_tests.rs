@@ -3416,7 +3416,12 @@
         // Zero phases -> not the crew-of-one shape -> kind "mission" (see
         // `runs::classify_mission`'s doc).
         assert_eq!(run["kind"], "mission");
-        assert_eq!(run["status"], "running"); // MissionStatus::Active default
+        // MissionStatus::Active is the default, but `minimal_mission` here
+        // leaves `started_ts: None` (never actually started) — `/runs`
+        // maps that to "planned", not "running" (#1523 gate CONSIDER 4:
+        // the dead `Planned` variant, made reachable — see
+        // `runs::mission_run_status`'s doc).
+        assert_eq!(run["status"], "planned");
         assert_eq!(run["tracked"], true);
     }
 

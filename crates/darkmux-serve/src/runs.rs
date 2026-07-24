@@ -28,36 +28,54 @@
 //! ## The mission_id gap (a load-bearing finding, not a redesign)
 //!
 //! The obvious join key from a flow session back to its owning mission is
-//! `FlowRecord.mission_id`. That field is populated correctly for genuine
-//! multi-phase missions (coder-phase, review) — their dispatches pass a
-//! REAL `--phase-id` naming their own phase (see `src/mission_launch.rs`),
-//! which `resolve_mission_for_phase` resolves back to the mission.
+//! `FlowRecord.mission_id`. Two GENUINELY DIFFERENT gaps in how that field
+//! gets populated both surfaced during review (fresh-context gate, #1523) —
+//! neither is a flow-emission bug worth fixing at the source for THIS PR;
+//! both are closed read-side here instead.
 //!
-//! It is **NOT** populated for a default `darkmux dispatch <role>`
-//! (crew-of-one, #1509): `dispatch_as_crew_of_one::build_graph` only sets
-//! `Step.config["phase_id"]` when the CLI's OWN `--phase-id` flag names some
-//! OTHER, pre-existing mission's phase (external attribution) — never for
-//! the crew-of-one's own internally-minted phase. With no `phase_id` in the
-//! step config, `crew::dispatch::resolve_mission_for_phase(None)` returns
-//! `None`, so the dispatch's `dispatch start`/`dispatch complete` flow
-//! records carry `mission_id: null`.
+//! **Gap 1 — crew-of-one dispatches (fixed read-side).**
+//! `dispatch_as_crew_of_one::build_graph` only sets `Step.config["phase_id"]`
+//! when the CLI's OWN `--phase-id` flag names some OTHER, pre-existing
+//! mission's phase (external attribution) — never for the crew-of-one's own
+//! internally-minted phase. With no `phase_id` in the step config,
+//! `crew::dispatch::resolve_mission_for_phase(None)` returns `None`, so the
+//! dispatch's `dispatch start`/`dispatch complete` flow records carry
+//! `mission_id: null`.
 //!
-//! The fix here is NOT to change dispatch's flow-emission behavior (out of
-//! scope for a read-side aggregator) — it's to use a join key that's
-//! reliably present for the crew-of-one case: **`session_id`**. A
-//! crew-of-one mission's lone `Step` carries the exact minted `session_id`
-//! in `Step.config["session_id"]` (`build_graph` always sets it), and every
-//! flow record that dispatch emits carries that SAME `session_id` — that
-//! relationship holds regardless of `mission_id`. So: `Dispatch`-kind runs
-//! join to their flow session by `session_id`; `Mission`-kind runs join by
-//! `mission_id` (which works for them today). Both are named as valid join
-//! keys in the design brief this module implements ("session_id / mission_id").
+//! **Gap 2 — generic config-launched missions (fixed read-side).**
+//! `mission_config::interpret::push_step` (the generic `mission launch
+//! <config>` graph builder — NOT the Tier-3 bespoke coder-phase/review
+//! launchers) never injects `phase_id` into a `dispatch.internal` or
+//! `dispatch.single_shot` step's config either. Any config-launched mission
+//! whose steps don't explicitly set `config.phase_id` hits the exact same
+//! `resolve_mission_for_phase(None) -> None` gap as gap 1, for every one of
+//! its steps.
+//!
+//! **The fix for both is the SAME read-side mechanism: join by
+//! `session_id`, not `mission_id`.** Every `Step` — crew-of-one OR
+//! generic-config — dispatches under a KNOWN session_id: the explicit
+//! `Step.config["session_id"]` when the step sets one, else the exact
+//! default its own step kind falls back to at dispatch time
+//! (`DispatchInternalStepKind` -> `session_id::step(&step.id)`;
+//! `DispatchSingleShotStepKind`'s hosted branch -> `session_id::task(&step.task_id)`
+//! — see `crates/darkmux-crew/src/step_kinds/builtins.rs`).
+//! [`collect_mission_step_sessions`] reconstructs that same session_id for
+//! EVERY step of EVERY loaded mission (not just the crew-of-one case), so a
+//! mission's own dispatches are always recognized and never double-listed
+//! as untracked ghosts — regardless of which gap (or neither, e.g.
+//! coder-phase/review, which DO pass a real `--phase-id` and so already
+//! carry `mission_id` correctly) produced its flow records.
+//!
+//! `Mission`-kind runs ALSO still join by `mission_id` (works today for
+//! coder-phase/review) — [`mission_to_run`] unions BOTH join keys per
+//! mission, so whichever mechanism actually stamped a session lands the
+//! same Run row exactly once.
 
 use crate::LabRunSummary;
 use darkmux_crew::envelope::MissionOutcomeStatus;
 use darkmux_crew::types::{Mission, MissionStatus, Phase, Step, Task};
 use std::collections::{HashMap, HashSet};
-use std::path::Path as StdPath;
+use std::path::{Path as StdPath, PathBuf};
 
 /// Which of the three sources a [`Run`] came from, and — for a durable run
 /// record — whether it's a standalone dispatch or a real multi-phase
@@ -84,7 +102,7 @@ pub(crate) enum RunKind {
 
 /// The run's flat lifecycle status. See each source's own mapping:
 /// [`mission_run_status`] (missions/dispatches), [`lab_run_status`] (lab
-/// runs), [`ghost_status`] (untracked flow-only sessions).
+/// runs), [`ghost_runs`] (untracked flow-only sessions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RunStatus {
@@ -133,6 +151,11 @@ pub(crate) struct Run {
 /// `crate::scan_lab_runs` is already resilient (best-effort scan, #1247).
 pub(crate) fn build_runs(flows_dir: &StdPath, lab_dir: Option<&StdPath>) -> Vec<Run> {
     let flow_index = build_flow_session_index(flows_dir);
+    // (#1523 gate CONSIDER 2) Pre-group flow sessions by `mission_id` ONCE
+    // — an O(sessions) pass — rather than filtering the whole `flow_index`
+    // per mission (O(missions × sessions), the shape a Studio-scale flow
+    // archive with many missions would make genuinely slow).
+    let mission_id_index = build_mission_id_index(&flow_index);
 
     let missions = darkmux_crew::loader::load_missions().unwrap_or_default();
     let phases_by_id: HashMap<String, Phase> = darkmux_crew::loader::load_phases()
@@ -144,26 +167,33 @@ pub(crate) fn build_runs(flows_dir: &StdPath, lab_dir: Option<&StdPath>) -> Vec<
     let mut runs: Vec<Run> = Vec::with_capacity(missions.len());
     // Dedup bookkeeping (see the module doc's "mission_id gap" section):
     // a session already accounted for by a tracked run — either because its
-    // `mission_id` matches a loaded mission (the Mission-kind join) or
-    // because its `session_id` IS a Dispatch-kind mission's own minted
-    // session (the Dispatch-kind join) — must never ALSO produce an
-    // untracked ghost for the same underlying work.
+    // `mission_id` matches a loaded mission, or because it's one of that
+    // mission's OWN step sessions (reconstructed structurally, covering
+    // BOTH gap 1 and gap 2) — must never ALSO produce an untracked ghost
+    // for the same underlying work.
     let mut known_mission_ids: HashSet<String> = HashSet::new();
     let mut known_session_ids: HashSet<String> = HashSet::new();
 
     for mission in &missions {
         known_mission_ids.insert(mission.id.clone());
         let (kind, shape) = classify_mission(mission, &phases_by_id);
-        let (run, dispatch_session_id) = mission_to_run(mission, kind, shape.as_ref(), &flow_index);
-        if let Some(sid) = dispatch_session_id {
-            known_session_ids.insert(sid);
-        }
+        // (#1523 gate must-fix 2) Registered for EVERY mission, not just
+        // Dispatch-kind — a generic config-launched Mission-kind mission's
+        // `dispatch.internal`/`dispatch.single_shot` steps hit the SAME
+        // mission_id gap crew-of-one dispatches do (see module doc, gap 2).
+        let step_sessions = collect_mission_step_sessions(mission);
+        known_session_ids.extend(step_sessions.iter().cloned());
+        let run = mission_to_run(mission, kind, shape.as_ref(), &step_sessions, &mission_id_index, &flow_index);
         runs.push(run);
     }
 
+    // (#1523 gate CONSIDER 7) Resolved ONCE — every lab run is
+    // machine-local by the SAME construction, so there's no reason to
+    // re-read config for each one.
+    let lab_machine = darkmux_types::config_access::machine_id();
     if let Some(dir) = lab_dir {
         for summary in crate::scan_lab_runs(dir) {
-            runs.push(lab_summary_to_run(&summary));
+            runs.push(lab_summary_to_run(&summary, lab_machine.clone()));
         }
     }
 
@@ -175,9 +205,9 @@ pub(crate) fn build_runs(flows_dir: &StdPath, lab_dir: Option<&StdPath>) -> Vec<
 // ─── Mission / dispatch normalization ──────────────────────────────────────
 
 /// Decide a loaded `Mission`'s [`RunKind`] and, for a `Dispatch`, its
-/// structural `(Task, Step)` pair (source of `role_id` + the join
-/// `session_id` — see the module doc). See [`RunKind`]'s own doc for the
-/// marker-first, counts-as-fallback rule this implements.
+/// structural `(Task, Step)` pair (source of `role_id` — see the module
+/// doc). See [`RunKind`]'s own doc for the marker-first, counts-as-fallback
+/// rule this implements.
 fn classify_mission(mission: &Mission, phases_by_id: &HashMap<String, Phase>) -> (RunKind, Option<(Task, Step)>) {
     let shape = crew_of_one_shape(mission, phases_by_id);
     let kind = match &mission.spec {
@@ -226,73 +256,117 @@ fn crew_of_one_shape(mission: &Mission, phases_by_id: &HashMap<String, Phase>) -
     Some((task, step))
 }
 
-/// Normalize one loaded `Mission` into a [`Run`]. Returns the Dispatch-kind
-/// session_id alongside it (when applicable) so the caller can register it
-/// in the dedup set — see [`build_runs`].
+/// Every session_id this mission's OWN steps dispatch under (#1523 gate
+/// must-fix 2) — read from `Step.config["session_id"]` when explicit, else
+/// the SAME per-kind default the step kind itself falls back to at
+/// dispatch time. Walks every phase in `mission.phase_ids`; a phase whose
+/// steps can't be loaded (deleted, malformed) contributes nothing rather
+/// than erroring — best-effort, matching this module's posture everywhere
+/// else. Bounded by the mission's own phase count, the same per-mission I/O
+/// shape `crew_of_one_shape` and `mission_graph::build_mission_graph`
+/// already pay.
+fn collect_mission_step_sessions(mission: &Mission) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for phase_id in &mission.phase_ids {
+        let Ok(steps) = darkmux_crew::lifecycle::load_steps_for_phase(&mission.id, phase_id) else {
+            continue;
+        };
+        for step in steps {
+            if let Some(sid) = step_session_id(&step) {
+                out.insert(sid);
+            }
+        }
+    }
+    out
+}
+
+/// A `Step`'s dispatch session_id: the explicit `config["session_id"]` when
+/// present, else the default ITS OWN step kind falls back to at dispatch
+/// time (see `crates/darkmux-crew/src/step_kinds/builtins.rs`:
+/// `DispatchInternalStepKind::run` -> `session_id::step(&step.id)` when no
+/// `config.session_id`; `DispatchSingleShotStepKind::run`'s hosted branch ->
+/// `session_id::task(&step.task_id)`). `None` for a step kind with no known
+/// session-id convention (e.g. a purely procedural kind that never
+/// dispatches at all) — nothing to register for those.
+fn step_session_id(step: &Step) -> Option<String> {
+    if let Some(sid) = step.config.get("session_id").and_then(|v| v.as_str()) {
+        if !sid.is_empty() {
+            return Some(sid.to_string());
+        }
+    }
+    match step.kind.as_str() {
+        "dispatch.internal" => Some(darkmux_types::session_id::step(&step.id)),
+        "dispatch.single_shot" => Some(darkmux_types::session_id::task(&step.task_id)),
+        _ => None,
+    }
+}
+
+/// Pre-group the flow session index by `mission_id` (#1523 gate CONSIDER
+/// 2) — one O(sessions) pass, read back in O(1) per mission by
+/// [`mission_to_run`] instead of a linear `flow_index` scan per mission.
+fn build_mission_id_index(flow_index: &HashMap<String, SessionAgg>) -> HashMap<String, Vec<String>> {
+    let mut idx: HashMap<String, Vec<String>> = HashMap::new();
+    for (session_id, agg) in flow_index {
+        if let Some(mid) = &agg.mission_id {
+            idx.entry(mid.clone()).or_default().push(session_id.clone());
+        }
+    }
+    idx
+}
+
+/// Normalize one loaded `Mission` into a [`Run`]. Joins to its flow
+/// session(s) by the UNION of `step_sessions` (structural — covers both
+/// mission_id gaps, see the module doc) and `mission_id_index`'s lookup
+/// (covers the paths that already stamp `mission_id` correctly, e.g.
+/// coder-phase/review) — whichever mechanism produced the session, this
+/// finds it exactly once.
 fn mission_to_run(
     mission: &Mission,
     kind: RunKind,
     shape: Option<&(Task, Step)>,
+    step_sessions: &HashSet<String>,
+    mission_id_index: &HashMap<String, Vec<String>>,
     flow_index: &HashMap<String, SessionAgg>,
-) -> (Run, Option<String>) {
-    let dispatch_session_id = shape.and_then(|(_, step)| {
-        step.config
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-    });
+) -> Run {
+    // Prefer the structural Task.role_id (the operator's REQUESTED role,
+    // always present by construction for a Dispatch-kind mission) over the
+    // flow-derived `handle` (present only once a dispatch record actually
+    // landed) — same value in practice, but the structural source never
+    // depends on flow retention. `shape` (and therefore `dispatch_role`) is
+    // always `None` for a Mission-kind run (see `classify_mission`), so
+    // this falls through to the flow-derived role there, same as before.
+    let dispatch_role = shape.and_then(|(task, _)| task.role_id.clone());
 
-    let (role, model, machine, route, start_ts_str, terminal_ts_str) = if kind == RunKind::Dispatch {
-        // Dispatch join: by session_id (the mission_id gap — see module doc).
-        let dispatch_role = shape.and_then(|(task, _)| task.role_id.clone());
-        let session = dispatch_session_id
-            .as_deref()
-            .and_then(|sid| flow_index.get(sid));
-        (
-            // Prefer the structural Task.role_id (the operator's REQUESTED
-            // role, always present by construction) over the flow-derived
-            // `handle` (present only once a dispatch record actually
-            // landed) — same value in practice, but the structural source
-            // never depends on flow retention.
-            dispatch_role.or_else(|| session.and_then(|s| s.role.clone())),
-            session.and_then(|s| s.model.clone()),
-            session.and_then(|s| s.machine.clone()),
-            session.and_then(|s| s.endpoint.clone()),
-            session.and_then(|s| s.start_ts.clone()),
-            session.and_then(|s| s.terminal_ts.clone()),
-        )
-    } else {
-        // Mission join: by mission_id (works today for coder-phase/review —
-        // see module doc). A multi-phase mission may have many sessions;
-        // pick representatives rather than trying to carry all of them in
-        // this flat row.
-        let sessions: Vec<&SessionAgg> = flow_index
-            .values()
-            .filter(|s| s.mission_id.as_deref() == Some(mission.id.as_str()))
-            .collect();
-        let representative = earliest_by_start(&sessions);
-        // TODO(step-4): a mission whose dispatches span MULTIPLE distinct
-        // endpoints (mixed local/remote seats across phases) collapses to
-        // one representative endpoint here — the Runs lens can't yet show
-        // per-seat routing. Picking the first remote session is a
-        // reasonable single-value summary for a flat row; don't overbuild
-        // this for a view-model step 4 will replace with a richer render.
-        let remote = earliest_by_start(
-            &sessions
-                .iter()
-                .copied()
-                .filter(|s| s.endpoint.is_some())
-                .collect::<Vec<_>>(),
-        );
-        (
-            representative.and_then(|s| s.role.clone()),
-            representative.and_then(|s| s.model.clone()),
-            representative.and_then(|s| s.machine.clone()),
-            remote.and_then(|s| s.endpoint.clone()),
-            representative.and_then(|s| s.start_ts.clone()),
-            sessions.iter().filter_map(|s| s.terminal_ts.clone()).max(),
-        )
-    };
+    let mut candidate_ids: HashSet<&str> = step_sessions.iter().map(String::as_str).collect();
+    if let Some(ids) = mission_id_index.get(&mission.id) {
+        candidate_ids.extend(ids.iter().map(String::as_str));
+    }
+    let sessions: Vec<&SessionAgg> = candidate_ids
+        .into_iter()
+        .filter_map(|sid| flow_index.get(sid))
+        .collect();
+
+    let representative = earliest_by_start(&sessions);
+    // TODO(step-4): a mission whose dispatches span MULTIPLE distinct
+    // endpoints (mixed local/remote seats across phases) collapses to one
+    // representative endpoint here — the Runs lens can't yet show per-seat
+    // routing. Picking the first remote session is a reasonable
+    // single-value summary for a flat row; don't overbuild this for a
+    // view-model step 4 will replace with a richer render.
+    let remote = earliest_by_start(
+        &sessions
+            .iter()
+            .copied()
+            .filter(|s| s.endpoint.is_some())
+            .collect::<Vec<_>>(),
+    );
+
+    let role = dispatch_role.or_else(|| representative.and_then(|s| s.role.clone()));
+    let model = representative.and_then(|s| s.model.clone());
+    let machine = representative.and_then(|s| s.machine.clone());
+    let route = remote.and_then(|s| s.endpoint.clone());
+    let start_ts_str = representative.and_then(|s| s.start_ts.clone());
+    let terminal_ts_str = sessions.iter().filter_map(|s| s.terminal_ts.clone()).max();
 
     let started_ts = mission
         .started_ts
@@ -301,10 +375,10 @@ fn mission_to_run(
         .finalized_ts
         .or_else(|| terminal_ts_str.as_deref().and_then(parse_flow_ts));
 
-    let run = Run {
+    Run {
         id: mission.id.clone(),
         kind,
-        status: mission_run_status(mission),
+        status: mission_run_status(mission, &sessions),
         machine,
         route,
         role,
@@ -312,24 +386,57 @@ fn mission_to_run(
         started_ts,
         completed_ts,
         tracked: true,
-    };
-    (run, dispatch_session_id)
+    }
 }
 
-/// Map a `Mission`'s own lifecycle status to the flat [`RunStatus`].
+/// Map a `Mission`'s own lifecycle status to the flat [`RunStatus`],
+/// cross-checked against its joined flow `sessions` for two cases the
+/// mission record alone can't see (#1523 gate CONSIDERs 3 + 4).
 ///
 /// `MissionStatus` has no separate `Abandoned` variant — `mission abort`
 /// and `mission finalize` both drive a mission to `Finalized` (terminal);
-/// they're told apart only by the mission's [`MissionEnvelope`]'s outcome
+/// they're told apart only by the mission's `MissionEnvelope`'s outcome
 /// (`Error`/`Degenerate` for an abort-shaped close, `Clean`/`Degraded` for a
 /// happy finalize — see `darkmux_crew::envelope`'s own doc). So a
 /// `Finalized` mission's flat status is read off its envelope; a mission
 /// with no envelope at all (pre-#1284, or a mint that never reached
 /// finalization's write) degrades to `Complete` rather than guessing —
 /// `Finalized` is itself the durable, higher-confidence signal here.
-fn mission_run_status(mission: &Mission) -> RunStatus {
+///
+/// **CONSIDER 4 — the dead `Planned` variant.** An `Active` mission
+/// (`MissionStatus`'s own default) with `started_ts: None` was minted but
+/// never actually started (`darkmux mission start` — or the launcher's own
+/// equivalent — hasn't run yet). Mapping that to `Planned` makes the
+/// variant reachable and distinguishes "queued" from "genuinely running".
+///
+/// **CONSIDER 3 — a crashed mission can't stay `Running` forever.** A hard
+/// process kill (host crash, OOM) before `finalize_mission` ever runs
+/// leaves a mission record permanently `Active` — the record itself can't
+/// see that. Its dispatch's flow session CAN: when every session this
+/// mission is known to have dispatched has ALREADY reached a terminal, the
+/// mission is not genuinely still running. Reports the worst observed
+/// session outcome (`Abandoned` > `Error`) rather than eternal `Running`;
+/// deliberately does NOT report `Complete` in that case (a `Complete`
+/// mission implies a real finalize happened, which — by construction of
+/// this branch — it didn't; staying `Running` there matches `mission
+/// status`'s existing "drift, needs `mission finalize`" framing rather than
+/// claiming a success that was never recorded).
+fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg]) -> RunStatus {
     match mission.status {
-        MissionStatus::Active | MissionStatus::Paused => RunStatus::Running,
+        MissionStatus::Active | MissionStatus::Paused => {
+            if mission.started_ts.is_none() {
+                return RunStatus::Planned;
+            }
+            if !sessions.is_empty() && sessions.iter().all(|s| s.terminal_status.is_some()) {
+                if sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Abandoned)) {
+                    return RunStatus::Abandoned;
+                }
+                if sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Error)) {
+                    return RunStatus::Error;
+                }
+            }
+            RunStatus::Running
+        }
         MissionStatus::Finalized => {
             let envelope = darkmux_crew::lifecycle::load_envelope(&mission.id)
                 .ok()
@@ -345,19 +452,16 @@ fn mission_run_status(mission: &Mission) -> RunStatus {
 // ─── Lab normalization ──────────────────────────────────────────────────────
 
 /// Normalize one `LabRunSummary` (the SAME row `/lab/runs` returns) into a
-/// [`Run`].
-fn lab_summary_to_run(summary: &LabRunSummary) -> Run {
+/// [`Run`]. `machine` is resolved ONCE by the caller ([`build_runs`]) and
+/// passed in — every lab run shares the same daemon-declared machine
+/// (#1523 gate CONSIDER 7).
+fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>) -> Run {
     let (role, model, route) = lab_staffing_role_model_route(summary.staffing.as_ref());
     Run {
         id: summary.dir.clone(),
         kind: RunKind::Lab,
         status: lab_run_status(summary),
-        // Lab runs are machine-local by construction (#1247: no
-        // federation, ever) — name the daemon's own declared machine
-        // rather than leaving the field silently absent for an entire
-        // source. `None` only when the operator hasn't set
-        // `machine_id`/`DARKMUX_MACHINE_ID` at all.
-        machine: darkmux_types::config_access::machine_id(),
+        machine,
         route,
         role,
         model,
@@ -418,6 +522,21 @@ fn lab_staffing_role_model_route(
 
 // ─── Flow scan: session index + untracked ghosts ───────────────────────────
 
+/// (#1523 gate scale-cap CONSIDER) How far back the flow scan looks when
+/// building the session index for route resolution + ghost synthesis.
+/// Every darkmux install accumulates flow history indefinitely — without a
+/// bound, `/runs` would re-parse a machine's ENTIRE flow archive on every
+/// request (a real #925-style per-request-timeout risk on a Studio-scale
+/// install with months of history), and every dispatch that predates the
+/// #1508/#1509 unification would become a PERMANENT untracked ghost.
+/// Tracked runs (missions, lab runs) are UNAFFECTED — they're durable
+/// records, read in full regardless of age; only the flow-derived
+/// route/role/model resolution and ghost synthesis are windowed. A
+/// discoverable knob (a named const, not a magic number scattered inline)
+/// rather than adaptive-silent, per CLAUDE.md's "cadence is a recorded
+/// knob" observability doctrine.
+const RUNS_FLOW_SCAN_WINDOW_DAYS: i64 = 14;
+
 /// Per-session_id rollup built by ONE pass over the flow stream
 /// ([`build_flow_session_index`]) — the shared substrate both the
 /// tracked-run route/role/model resolution (above) and the untracked-ghost
@@ -449,13 +568,11 @@ struct SessionAgg {
     terminal_ts: Option<String>,
 }
 
-/// One pass over every flow record across all day files, building a
-/// per-`session_id` rollup. Reuses `crate::for_each_flow_record_across_days`
-/// (the SAME primitive `/flow-missions`/`/flow-mission/:id` already scan
-/// over) rather than re-implementing the JSONL walk.
+/// One pass over every flow record within [`RUNS_FLOW_SCAN_WINDOW_DAYS`],
+/// building a per-`session_id` rollup.
 fn build_flow_session_index(flows_dir: &StdPath) -> HashMap<String, SessionAgg> {
     let mut idx: HashMap<String, SessionAgg> = HashMap::new();
-    crate::for_each_flow_record_across_days(flows_dir, |_date, v| {
+    for_each_recent_flow_record(flows_dir, |v| {
         let Some(session_id) = v.get("session_id").and_then(|s| s.as_str()) else {
             return std::ops::ControlFlow::Continue(());
         };
@@ -577,7 +694,10 @@ fn earliest_by_start<'a>(sessions: &[&'a SessionAgg]) -> Option<&'a SessionAgg> 
 /// dispatch (`has_start`) but isn't accounted for by an already-listed
 /// tracked run — see the module doc's dedup rationale. `kind` is always
 /// `Dispatch`: a raw flow session with no mission ever minted for it is,
-/// structurally, exactly what a standalone dispatch is.
+/// structurally, exactly what a standalone dispatch is. Bounded to
+/// [`RUNS_FLOW_SCAN_WINDOW_DAYS`] because `flow_index` itself is (built by
+/// [`build_flow_session_index`]) — a session older than the window was
+/// never indexed at all, so it can't reach this function to begin with.
 fn ghost_runs(
     flow_index: &HashMap<String, SessionAgg>,
     known_mission_ids: &HashSet<String>,
@@ -612,6 +732,79 @@ fn ghost_runs(
         });
     }
     out
+}
+
+// ─── Bounded day-file scan (#1523 gate scale-cap) ──────────────────────────
+
+/// Like `crate::for_each_flow_record_across_days`, but bounded to day files
+/// whose date is within [`RUNS_FLOW_SCAN_WINDOW_DAYS`] of now. A SEPARATE,
+/// smaller day-file walk rather than extending the shared primitive —
+/// that primitive's OTHER callers (`/flow-mission/:id`, `/flow-session/:id`,
+/// the full-history catalog endpoints) must keep seeing a run's COMPLETE
+/// history; bounding is specific to THIS module's route-resolution/
+/// ghost-synthesis use, not a general flow-reading behavior change that
+/// would ripple into those unrelated endpoints.
+fn for_each_recent_flow_record(
+    flows_dir: &StdPath,
+    mut visit: impl FnMut(&serde_json::Value) -> std::ops::ControlFlow<()>,
+) {
+    use std::io::BufRead;
+    let Ok(entries) = std::fs::read_dir(flows_dir) else {
+        return;
+    };
+    let cutoff = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS);
+    let mut day_files: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else { continue };
+        let Some(date) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        // A plain length + lexical-compare check — not full calendar
+        // validation (`is_valid_date`'s job elsewhere) — is enough here:
+        // the goal is bounding which files get OPENED, and a malformed
+        // name that happens to compare >= cutoff just gets read (harmless,
+        // same as any other unreadable/malformed file below) while one
+        // that doesn't compare is skipped either way.
+        if date.len() != 10 || date < cutoff.as_str() {
+            continue;
+        }
+        day_files.push(entry.path());
+    }
+    day_files.sort();
+    for path in day_files {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file).lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
+                continue;
+            }
+            if visit(&v).is_break() {
+                return;
+            }
+        }
+    }
+}
+
+/// `YYYY-MM-DD` for `window_days` before today (UTC) — the day-file-name
+/// cutoff [`for_each_recent_flow_record`] filters on.
+fn cutoff_date_string(window_days: i64) -> String {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff_days = now_secs.div_euclid(86_400) - window_days;
+    let (y, m, d) = civil_from_days(cutoff_days);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 // ─── Timestamp parsing ──────────────────────────────────────────────────────
@@ -666,6 +859,24 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// The inverse of [`days_from_civil`] — a UTC civil date from days since
+/// the Unix epoch (same Howard Hinnant algorithm, public domain). Used only
+/// by [`cutoff_date_string`] to format the scan-window boundary as a
+/// `YYYY-MM-DD` day-file-name prefix.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,7 +885,7 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
-    // ── parse_flow_ts ───────────────────────────────────────────────────
+    // ── parse_flow_ts / civil calendar round-trip ───────────────────────
 
     #[test]
     fn parse_flow_ts_epoch_zero() {
@@ -706,6 +917,29 @@ mod tests {
         assert_eq!(parse_flow_ts("not-a-timestamp"), None);
         assert_eq!(parse_flow_ts("2026-07-24T12:34:56"), None); // missing Z
         assert_eq!(parse_flow_ts("2026-13-01T00:00:00Z"), None); // bad month
+    }
+
+    #[test]
+    fn civil_from_days_is_the_exact_inverse_of_days_from_civil() {
+        // Round-trip across a range spanning leap years, month-length
+        // boundaries, and both eras (#1523 gate scale-cap knob's own
+        // machinery) — every date must map to itself through both
+        // directions.
+        let cases: &[(i64, i64, i64)] = &[
+            (1970, 1, 1),
+            (2000, 1, 1),
+            (2000, 2, 29), // leap day
+            (2024, 2, 29), // leap day
+            (2023, 3, 1),  // day after a non-leap Feb
+            (2026, 7, 24),
+            (2026, 12, 31),
+            (2027, 1, 1),
+        ];
+        for &(y, m, d) in cases {
+            let days = days_from_civil(y, m, d);
+            let (ry, rm, rd) = civil_from_days(days);
+            assert_eq!((ry, rm as i64, rd as i64), (y, m, d), "round-trip failed for {y:04}-{m:02}-{d:02}");
+        }
     }
 
     // ── crew dir test harness (mirrors dispatch_as_crew_of_one's RunGuard) ─
@@ -740,6 +974,16 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    /// Today's `YYYY-MM-DD`, UTC — the SAME function real flow records are
+    /// day-filed under. Tests must use this (not a hardcoded literal date)
+    /// so they stay valid regardless of when they actually run, now that
+    /// `build_flow_session_index` bounds itself to a recent window
+    /// (`RUNS_FLOW_SCAN_WINDOW_DAYS`) — a hardcoded past date would
+    /// eventually age out of the window and start silently failing.
+    fn today() -> String {
+        darkmux_flow::day_utc_now()
     }
 
     fn write_day_file(dir: &StdPath, date: &str, lines: &[serde_json::Value]) {
@@ -878,14 +1122,91 @@ mod tests {
         assert!(shape.is_none());
     }
 
+    // ── step_session_id / collect_mission_step_sessions ─────────────────
+
+    #[test]
+    fn step_session_id_prefers_explicit_config_over_the_kind_default() {
+        let step = minimal_step("s1", "t1", Some("explicit-sid"));
+        assert_eq!(step_session_id(&step), Some("explicit-sid".to_string()));
+    }
+
+    #[test]
+    fn step_session_id_defaults_dispatch_internal_to_the_step_scoped_session() {
+        // (#1523 gate must-fix 2) `interpret::push_step` never injects a
+        // session_id — this default is what `DispatchInternalStepKind::run`
+        // itself falls back to when `config.session_id` is absent.
+        let mut step = minimal_step("s-generic", "t1", None);
+        step.kind = "dispatch.internal".to_string();
+        assert_eq!(step_session_id(&step), Some(darkmux_types::session_id::step("s-generic")));
+    }
+
+    #[test]
+    fn step_session_id_defaults_dispatch_single_shot_to_the_task_scoped_session() {
+        let mut step = minimal_step("s-single", "t-owner", None);
+        step.kind = "dispatch.single_shot".to_string();
+        assert_eq!(step_session_id(&step), Some(darkmux_types::session_id::task("t-owner")));
+    }
+
+    #[test]
+    fn step_session_id_unknown_kind_has_no_default() {
+        let mut step = minimal_step("s-proc", "t1", None);
+        step.kind = "procedural.noop".to_string();
+        assert_eq!(step_session_id(&step), None);
+    }
+
     // ── mission_run_status ──────────────────────────────────────────────
 
     #[test]
     fn mission_run_status_active_and_paused_are_running() {
         let mut m = minimal_mission("m5", vec![], None);
-        assert_eq!(mission_run_status(&m), RunStatus::Running);
+        assert_eq!(mission_run_status(&m, &[]), RunStatus::Running);
         m.status = MissionStatus::Paused;
-        assert_eq!(mission_run_status(&m), RunStatus::Running);
+        assert_eq!(mission_run_status(&m, &[]), RunStatus::Running);
+    }
+
+    #[test]
+    fn mission_run_status_active_with_no_started_ts_is_planned() {
+        // (#1523 gate CONSIDER 4) Minted but never actually started — the
+        // dead `Planned` variant made reachable.
+        let mut m = minimal_mission("m5b", vec![], None);
+        m.started_ts = None;
+        assert_eq!(mission_run_status(&m, &[]), RunStatus::Planned);
+    }
+
+    #[test]
+    fn mission_run_status_active_with_every_session_terminal_reports_the_terminal_not_running() {
+        // (#1523 gate CONSIDER 3) A crashed mission: every dispatch it's
+        // known to have made already reached a terminal, yet the mission
+        // record itself never got finalized (the process died first).
+        let m = minimal_mission("m5c", vec![], None);
+        let abandoned = SessionAgg { terminal_status: Some(RunStatus::Abandoned), ..Default::default() };
+        assert_eq!(mission_run_status(&m, &[&abandoned]), RunStatus::Abandoned);
+
+        let errored = SessionAgg { terminal_status: Some(RunStatus::Error), ..Default::default() };
+        assert_eq!(mission_run_status(&m, &[&errored]), RunStatus::Error);
+    }
+
+    #[test]
+    fn mission_run_status_active_with_a_still_running_session_stays_running() {
+        // A partially-complete multi-session mission (one phase done, one
+        // still dispatching) must NOT be flagged as crashed just because
+        // ONE of its sessions has a terminal.
+        let m = minimal_mission("m5d", vec![], None);
+        let done = SessionAgg { terminal_status: Some(RunStatus::Complete), ..Default::default() };
+        let still_running = SessionAgg { terminal_status: None, has_start: true, ..Default::default() };
+        assert_eq!(mission_run_status(&m, &[&done, &still_running]), RunStatus::Running);
+    }
+
+    #[test]
+    fn mission_run_status_active_all_complete_stays_running_not_a_fabricated_complete() {
+        // Every session finished cleanly, but the mission was never
+        // ACTUALLY finalized (no crash — just a `mission finalize` the
+        // operator hasn't run yet). Reporting `Complete` here would
+        // fabricate a finalize that never happened; `Running` matches
+        // `mission status`'s existing "drift" framing.
+        let m = minimal_mission("m5e", vec![], None);
+        let done = SessionAgg { terminal_status: Some(RunStatus::Complete), ..Default::default() };
+        assert_eq!(mission_run_status(&m, &[&done]), RunStatus::Running);
     }
 
     #[test]
@@ -898,11 +1219,11 @@ mod tests {
         m.status = MissionStatus::Finalized;
 
         // No envelope written yet -> degrades to Complete.
-        assert_eq!(mission_run_status(&m), RunStatus::Complete);
+        assert_eq!(mission_run_status(&m, &[]), RunStatus::Complete);
 
         let clean_env = MissionEnvelope::new("m6", MissionOutcomeStatus::Clean, &[]);
         darkmux_crew::envelope::finalize_mission(&clean_env);
-        assert_eq!(mission_run_status(&m), RunStatus::Complete);
+        assert_eq!(mission_run_status(&m, &[]), RunStatus::Complete);
     }
 
     #[test]
@@ -915,7 +1236,7 @@ mod tests {
 
         let err_env = MissionEnvelope::new("m7", MissionOutcomeStatus::Error, &[]);
         darkmux_crew::envelope::finalize_mission(&err_env);
-        assert_eq!(mission_run_status(&m), RunStatus::Error);
+        assert_eq!(mission_run_status(&m, &[]), RunStatus::Error);
     }
 
     // ── lab normalization ───────────────────────────────────────────────
@@ -952,12 +1273,13 @@ mod tests {
     #[test]
     fn lab_summary_to_run_uses_dir_as_id_and_kind_lab() {
         let summary = minimal_lab_summary("live/case-1", true, false);
-        let run = lab_summary_to_run(&summary);
+        let run = lab_summary_to_run(&summary, Some("studio".to_string()));
         assert_eq!(run.id, "live/case-1");
         assert_eq!(run.kind, RunKind::Lab);
         assert_eq!(run.status, RunStatus::Complete);
         assert!(run.tracked);
         assert_eq!(run.completed_ts, Some(1_700_000_000));
+        assert_eq!(run.machine.as_deref(), Some("studio"));
     }
 
     // ── flow session index + route (#1518 start-OR-complete) ────────────
@@ -967,7 +1289,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_day_file(
             tmp.path(),
-            "2026-07-24",
+            &today(),
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
@@ -997,7 +1319,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_day_file(
             tmp.path(),
-            "2026-07-24",
+            &today(),
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
@@ -1014,6 +1336,29 @@ mod tests {
         );
         let idx = build_flow_session_index(tmp.path());
         assert_eq!(idx["sess-2"].terminal_status, Some(RunStatus::Abandoned));
+    }
+
+    #[test]
+    fn build_flow_session_index_never_indexes_a_session_from_beyond_the_scan_window() {
+        // (#1523 gate scale-cap) 2000-01-01 is always more than
+        // RUNS_FLOW_SCAN_WINDOW_DAYS in the past, whenever this test
+        // actually runs.
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            "2000-01-01",
+            &[serde_json::json!({
+                "ts": "2000-01-01T09:00:00Z",
+                "action": "dispatch start",
+                "session_id": "ancient-orphan-sess",
+                "handle": "coder",
+            })],
+        );
+        let idx = build_flow_session_index(tmp.path());
+        assert!(
+            !idx.contains_key("ancient-orphan-sess"),
+            "a session older than the scan window must never be indexed at all"
+        );
     }
 
     // ── dedup: a mission-internal session is never ALSO a ghost ─────────
@@ -1088,6 +1433,11 @@ mod tests {
     }
 
     // ── build_runs end to end: mission + ghost, no double-listing ───────
+    //
+    // One test per launch path (#1523 gate — the miss the fresh-context
+    // review found: confirmatory tests only covered the crew-of-one and
+    // implicit coder-phase shapes; the review-shaped and generic-config
+    // paths were never independently exercised).
 
     #[test]
     #[serial_test::serial]
@@ -1128,7 +1478,7 @@ mod tests {
         // (the mission_id gap), joined only by session_id.
         write_day_file(
             flows.path(),
-            "2026-07-24",
+            &today(),
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
@@ -1155,6 +1505,170 @@ mod tests {
         assert_eq!(runs[0].model.as_deref(), Some("qwen3.6-35b-a3b"));
     }
 
+    /// Launch path 2/4: a GENERIC `mission launch <config>` mission whose
+    /// `dispatch.internal` step config carries NO explicit `session_id` —
+    /// mirrors `interpret::push_step`'s real behavior (must-fix 2). The
+    /// step's flow records use the step kind's own default session_id
+    /// (`session_id::step(step.id)`) and carry `mission_id: null`, exactly
+    /// as the real emitter does.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_generic_config_mission_dispatch_step_is_not_also_listed_as_a_ghost() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mission = minimal_mission(
+            "generic-config-1",
+            vec!["p-generic".to_string()],
+            Some(MissionSpec { config_id: "some-custom-config".to_string(), inputs_fingerprint: "fpg".to_string() }),
+        );
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase("p-generic", "generic-config-1", vec!["t-generic".to_string()]);
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task = minimal_task("t-generic", "p-generic", vec!["s-generic".to_string()], Some("coder"));
+        darkmux_crew::lifecycle::save_task("generic-config-1", &task).unwrap();
+        // NO explicit session_id — the real `interpret::push_step` gap.
+        let step = minimal_step("s-generic", "t-generic", None);
+        darkmux_crew::lifecycle::save_step("generic-config-1", "p-generic", &step).unwrap();
+
+        let default_session = darkmux_types::session_id::step("s-generic");
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-01-01T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": default_session,
+                    "handle": "coder",
+                    // mission_id DELIBERATELY absent — matches
+                    // resolve_mission_for_phase(None)'s real gap.
+                }),
+                serde_json::json!({
+                    "ts": "2026-01-01T09:05:00Z",
+                    "action": "dispatch complete",
+                    "session_id": default_session,
+                    "handle": "coder",
+                    "model": "qwen3.6-35b-a3b",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None);
+        assert_eq!(runs.len(), 1, "exactly one Run for the generic-config mission, no per-step ghost: {runs:?}");
+        assert_eq!(runs[0].id, "generic-config-1");
+        assert_eq!(runs[0].kind, RunKind::Mission);
+        assert!(runs[0].tracked);
+        assert_eq!(runs[0].model.as_deref(), Some("qwen3.6-35b-a3b"));
+    }
+
+    /// Launch path 1/4 (the flagship path): a review-shaped mission whose
+    /// run-level bookend session is keyed on the CASE STRING (not any
+    /// step's structural session_id) — proves the `mission_id`-index join
+    /// (must-fix 1: `review_bookend_record` now stamps `mission_id`, so
+    /// this session is findable via `mission_id_index`, not `step_sessions`).
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_review_shaped_mission_case_bookend_session_is_not_also_listed_as_a_ghost() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mission = minimal_mission(
+            "review-1700000000-abcdef",
+            vec!["p-investigate".to_string()],
+            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpr".to_string() }),
+        );
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase("p-investigate", "review-1700000000-abcdef", vec![]);
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+
+        // The run-level case-string bookend session — post-fix, carries
+        // mission_id (see `review_bookend_record`'s doc in
+        // `src/mission_launch_review.rs`).
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-01-01T08:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "owner/repo@deadbeef",
+                    "handle": "review-probe-mid,review-judge",
+                    "mission_id": "review-1700000000-abcdef",
+                }),
+                serde_json::json!({
+                    "ts": "2026-01-01T08:20:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "owner/repo@deadbeef",
+                    "handle": "review-probe-mid,review-judge",
+                    "model": "gpt-4o",
+                    "mission_id": "review-1700000000-abcdef",
+                    "payload": { "endpoint": "azure:myorg.cognitiveservices.azure.com/gpt-4o" },
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None);
+        assert_eq!(
+            runs.len(),
+            1,
+            "exactly one Run for the review mission, no ghost from the case-bookend session: {runs:?}"
+        );
+        assert_eq!(runs[0].id, "review-1700000000-abcdef");
+        assert_eq!(runs[0].kind, RunKind::Mission);
+        assert!(runs[0].tracked);
+        assert_eq!(runs[0].route.as_deref(), Some("azure:myorg.cognitiveservices.azure.com/gpt-4o"));
+        assert_eq!(runs[0].model.as_deref(), Some("gpt-4o"));
+    }
+
+    /// Launch path 5: a mission whose process crashed mid-dispatch — the
+    /// mission record is stuck `Active` forever, but its dispatch's
+    /// `session.end` close-edge tells the true story (#1523 gate
+    /// CONSIDER 3).
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_crashed_active_mission_reports_abandoned_not_eternal_running() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mission = minimal_mission(
+            "dispatch-crashed-1",
+            vec!["p-crash".to_string()],
+            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fpc".to_string() }),
+        );
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase("p-crash", "dispatch-crashed-1", vec!["t-crash".to_string()]);
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task = minimal_task("t-crash", "p-crash", vec!["s-crash".to_string()], Some("coder"));
+        darkmux_crew::lifecycle::save_task("dispatch-crashed-1", &task).unwrap();
+        let step = minimal_step("s-crash", "t-crash", Some("crew-dispatch-coder-crashed"));
+        darkmux_crew::lifecycle::save_step("dispatch-crashed-1", "p-crash", &step).unwrap();
+        // mission.json is never touched again — it stays Active forever,
+        // exactly as it would after a hard host crash mid-dispatch.
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-01-01T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "crew-dispatch-coder-crashed",
+                    "handle": "coder",
+                }),
+                serde_json::json!({
+                    "ts": "2026-01-01T09:05:00Z",
+                    "action": "session.end",
+                    "session_id": "crew-dispatch-coder-crashed",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].status, RunStatus::Abandoned, "a crashed session must not read as eternal Running");
+    }
+
     #[test]
     #[serial_test::serial]
     fn build_runs_includes_an_untracked_ghost_alongside_a_tracked_mission() {
@@ -1176,7 +1690,7 @@ mod tests {
 
         write_day_file(
             flows.path(),
-            "2026-07-24",
+            &today(),
             &[
                 // The tracked mission's own session.
                 serde_json::json!({
