@@ -1706,12 +1706,20 @@ pub fn cluster_needs_check(judged: &[JudgedFlag]) -> Vec<NeedsCheckCluster> {
 
 // ─── judge prompt + ruling parser ────────────────────────────────────────
 
-/// The frozen one-fenced-JSON instruction tail — byte-identical to
-/// `judge-runner.py`'s `judge_one` f-string tail (Phase A parity, #1256).
+/// The frozen one-fenced-JSON instruction tail. Originated byte-identical to
+/// `judge-runner.py`'s `judge_one` f-string tail (Phase A parity, #1256);
+/// `judge-runner.py` was the historical Python prototype this Rust
+/// implementation superseded and no longer exists in the tree, so that
+/// parity is a provenance fact, not a live constraint. The tail's own
+/// byte-lock is now the Rust golden tests below (contract 6) — a deliberate
+/// text change here (e.g. the `note_for_author` length guidance, tightened
+/// in the concise-review pass) is expected to move those goldens WITH it,
+/// same as any other frozen-text edit.
+///
 /// No leading blank line of its own; callers that need one add it (see
 /// [`judge_prompt`]'s assembly, which needs a bare `\n` before this, not
 /// `\n\n`).
-const JUDGE_TAIL_INSTRUCTION: &str = "Investigate the flagged item against the code above. End your reply with exactly one fenced JSON block:\n```json\n{\"ruling\": \"confirmed\" | \"needs_check\" | \"false_positive\", \"decisive_evidence\": \"<the specific code line or checked claim that decided it>\", \"note_for_author\": \"<one or two sentences the author reads>\"}\n```";
+const JUDGE_TAIL_INSTRUCTION: &str = "Investigate the flagged item against the code above. End your reply with exactly one fenced JSON block:\n```json\n{\"ruling\": \"confirmed\" | \"needs_check\" | \"false_positive\", \"decisive_evidence\": \"<the specific code line or checked claim that decided it>\", \"note_for_author\": \"<one terse sentence naming the defect and the fix direction, ~25 words max — lean on decisive_evidence for the specifics>\"}\n```";
 
 /// Build the judge's prompt — byte-identical to `judge-runner.py`'s
 /// `judge_one`'s `user` f-string assembly, given the same inputs (#1256):
@@ -1743,6 +1751,15 @@ pub fn judge_prompt(intent_title: &str, intent_body: &str, code: &str, facts: &[
 /// identical structure to [`JUDGE_TAIL_INSTRUCTION`], with the adjudication
 /// ruling vocabulary ({verified, refuted, uncertain}). Byte-locked by
 /// `verify_prompt_matches_frozen_golden` (contract 6).
+///
+/// (concise-review pass) Deliberately NOT given the same `note_for_author`
+/// length tightening as [`JUDGE_TAIL_INSTRUCTION`]: `VerifyRecord
+/// ::note_for_author` is stored on the envelope but never rendered to the
+/// author — `src/pr_review.rs`'s `verified_line` names only the adjudicating
+/// model, and every other verify-path render reads `decisive_evidence`, not
+/// this note. Tightening prose the operator never sees would be a no-op
+/// change wearing a doctrine label; leave it until a render path actually
+/// surfaces it.
 const VERIFY_TAIL_INSTRUCTION: &str = "Adjudicate the confirmed finding against the code above. End your reply with exactly one fenced JSON block:\n```json\n{\"ruling\": \"verified\" | \"refuted\" | \"uncertain\", \"decisive_evidence\": \"<the specific code line or checked claim that decided it>\", \"note_for_author\": \"<one or two sentences the author reads>\"}\n```";
 
 /// (#1260) Build the verify seat's prompt — the SAME evidence assembly the
