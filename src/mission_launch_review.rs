@@ -332,12 +332,25 @@ fn crew_model_summary(roles: &ResolvedReviewRoles) -> Option<String> {
 /// overridden from the builder's hardcoded `"crew_dispatch"` to `"review"`
 /// — the SAME provenance tag every sibling `step result` record the review
 /// driver emits in this session carries.
+///
+/// `mission_id` (#1508 /runs gate finding, must-fix 1): threaded through
+/// from the call site — `None` for the `--charges-file` judge-only path
+/// (which mints no Mission at all, so there's genuinely nothing to join
+/// to), `Some(&mission_id)` for a real review launch. Before this fix it
+/// was hardcoded `None` unconditionally, matching neither the container
+/// dispatch path (`dispatch_internal.rs`'s bookends DO stamp `mission_id`)
+/// nor what a real review launch actually has available — every review
+/// run's case-string-keyed bookend session was structurally unrecoverable
+/// from its own Mission record's read side, which is exactly the gap
+/// `/runs` (#1508 step 3) needs closed to avoid double-listing every review
+/// run.
 fn review_bookend_record(
     level: darkmux_flow::Level,
     action: &str,
     crew_name: &str,
     case_id: &str,
     model: Option<&str>,
+    mission_id: Option<&str>,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
     let mut record = build_dispatch_record_with_payload(
@@ -346,7 +359,7 @@ fn review_bookend_record(
         crew_name,
         case_id,
         model,
-        None,
+        mission_id,
         None,
         Some(payload),
     );
@@ -383,11 +396,16 @@ impl ReviewEmitter for EmitterSink<'_> {
 /// text) on `Err`. Same shape `dispatch` emits around every dispatch,
 /// so a production review dispatch opens/closes the SAME liveness edge the
 /// viewer's fleet/machine surfaces key on.
+///
+/// `mission_id`: see [`review_bookend_record`]'s doc — `None` for the
+/// `--charges-file` judge-only path (mints no Mission), `Some(&mission_id)`
+/// for a real review launch (minted just before this is called).
 fn with_dispatch_bookends(
     emitter: &mut dyn ReviewEmitter,
     case_id: &str,
     crew_name: &str,
     model: Option<&str>,
+    mission_id: Option<&str>,
     start_extra: serde_json::Value,
     f: impl FnOnce(&mut dyn ReviewEmitter) -> Result<ReviewEnvelope>,
 ) -> Result<ReviewEnvelope> {
@@ -395,6 +413,7 @@ fn with_dispatch_bookends(
     let case_id_owned = case_id.to_string();
     let crew_owned = crew_name.to_string();
     let model_owned = model.map(str::to_string);
+    let mission_id_owned = mission_id.map(str::to_string);
     let on_abort = move |_id: &str, _kind: &str| {
         review_bookend_record(
             darkmux_flow::Level::Error,
@@ -402,6 +421,7 @@ fn with_dispatch_bookends(
             &crew_owned,
             &case_id_owned,
             model_owned.as_deref(),
+            mission_id_owned.as_deref(),
             json!({
                 "runtime": "review",
                 "result_class": "error",
@@ -419,6 +439,7 @@ fn with_dispatch_bookends(
             crew_name,
             case_id,
             model,
+            mission_id,
             merge_json_object(json!({ "runtime": "review" }), start_extra),
         ),
     );
@@ -456,6 +477,7 @@ fn with_dispatch_bookends(
                     crew_name,
                     case_id,
                     model,
+                    mission_id,
                     payload,
                 ),
             );
@@ -470,6 +492,7 @@ fn with_dispatch_bookends(
                     crew_name,
                     case_id,
                     model,
+                    mission_id,
                     json!({
                         "runtime": "review",
                         "result_class": "error",
@@ -862,6 +885,11 @@ fn run_dispatch(
             &case_id_for_bookends,
             &crew_name_for_bookends,
             model_for_bookends.as_deref(),
+            // No Mission is minted on the `--charges-file` judge-only path —
+            // there's genuinely nothing to join this dispatch's flow session
+            // to, so `None` here is honest, not a gap (see
+            // `review_bookend_record`'s doc).
+            None,
             dispatch_start_extra,
             move |emitter| run_judge_only(flags, &inputs, &mut chat, &mut cycler, emitter),
         )
@@ -1044,6 +1072,13 @@ fn run_dispatch(
             &case_id_for_bookends,
             &crew_name_for_bookends,
             model_for_bookends.as_deref(),
+            // (#1508 /runs gate finding, must-fix 1) Stamp the freshly-
+            // minted `mission_id` onto this run's dispatch bookends — a
+            // default review launch previously carried `mission_id: None`
+            // here, making the review's own case-string-keyed flow session
+            // unrecoverable from the Mission record's read side (`/runs`
+            // synthesized a spurious untracked ghost for every review run).
+            Some(mission_id.as_str()),
             dispatch_start_extra,
             move |emitter| {
                 run_review_graph(
@@ -1273,7 +1308,7 @@ mod tests {
     #[test]
     fn with_dispatch_bookends_start_precedes_review_records_with_exactly_one_terminal_on_success() {
         let mut emitter = RecordingEmitter::default();
-        let result = with_dispatch_bookends(&mut emitter, "case-1", "test-crew", Some("darkmux:judge-model"), json!({}), |em| {
+        let result = with_dispatch_bookends(&mut emitter, "case-1", "test-crew", Some("darkmux:judge-model"), None, json!({}), |em| {
             // (#1434) The review driver emits the generic `step result`
             // vocabulary; the bookend wrapper brackets whatever inner records
             // it emits, so these stand in for a real run's step results.
@@ -1295,6 +1330,9 @@ mod tests {
         assert_eq!(start.handle, "test-crew");
         assert_eq!(start.model.as_deref(), Some("darkmux:judge-model"));
         assert_eq!(start.source.as_deref(), Some("review"));
+        // The `--charges-file` judge-only path (and this test, standing in
+        // for it) mints no Mission — `None` here is honest, not a gap.
+        assert_eq!(start.mission_id, None);
 
         let terminal = emitter.records.last().unwrap();
         assert_eq!(terminal.action, "dispatch complete");
@@ -1302,10 +1340,93 @@ mod tests {
         assert_eq!(terminal.payload.as_ref().unwrap()["result_class"], "ok");
     }
 
+    /// (#1508 /runs gate finding, must-fix 1) A real review launch mints a
+    /// Mission before calling `with_dispatch_bookends` and now threads that
+    /// id through — every bookend record (start AND terminal) must carry it,
+    /// closing the gap that made `/runs` double-list every review run
+    /// (the tracked Mission row joined zero sessions; the case-string
+    /// session became a spurious untracked ghost carrying the real route).
+    #[test]
+    fn with_dispatch_bookends_stamps_mission_id_on_start_and_terminal_when_provided() {
+        let mut emitter = RecordingEmitter::default();
+        let result = with_dispatch_bookends(
+            &mut emitter,
+            "owner/repo@deadbeef",
+            "test-crew",
+            Some("darkmux:judge-model"),
+            Some("review-1700000000-abcdef"),
+            json!({}),
+            |em| {
+                em.emit(fake_review_record("step result"));
+                Ok(ReviewEnvelope::default())
+            },
+        );
+        assert!(result.is_ok());
+
+        let start = &emitter.records[0];
+        assert_eq!(start.action, "dispatch start");
+        assert_eq!(start.mission_id.as_deref(), Some("review-1700000000-abcdef"));
+
+        let terminal = emitter.records.last().unwrap();
+        assert_eq!(terminal.action, "dispatch complete");
+        assert_eq!(terminal.mission_id.as_deref(), Some("review-1700000000-abcdef"));
+    }
+
+    /// The error terminal (a hard `Err` from the review driver, not the
+    /// abort/panic guard) must ALSO carry `mission_id` — a partial fix that
+    /// stamped only the happy path would still leave failed review runs
+    /// double-listing in `/runs`.
+    #[test]
+    fn with_dispatch_bookends_stamps_mission_id_on_the_error_terminal_too() {
+        let mut emitter = RecordingEmitter::default();
+        let result = with_dispatch_bookends(
+            &mut emitter,
+            "owner/repo@baddeed",
+            "test-crew",
+            None,
+            Some("review-1700000001-fedcba"),
+            json!({}),
+            |_em| Err(anyhow!("probe dispatch failed: connection refused")),
+        );
+        assert!(result.is_err());
+
+        let terminal = emitter.records.last().unwrap();
+        assert_eq!(terminal.action, "dispatch error");
+        assert_eq!(terminal.mission_id.as_deref(), Some("review-1700000001-fedcba"));
+    }
+
+    /// The abort/panic path's `on_abort` closure builds its own terminal
+    /// record independently of the `Ok`/`Err` match arms above — it needs
+    /// its own assertion that `mission_id` survives the `move` closure
+    /// capture (`mission_id_owned`).
+    #[test]
+    fn with_dispatch_bookends_stamps_mission_id_on_the_panic_abort_terminal_too() {
+        let mut emitter = RecordingEmitter::default();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_dispatch_bookends(
+                &mut emitter,
+                "owner/repo@panicky",
+                "test-crew",
+                None,
+                Some("review-1700000002-111222"),
+                json!({}),
+                |_em| panic!("simulated crash mid-dispatch"),
+            )
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err());
+
+        let terminal = emitter.records.last().unwrap();
+        assert_eq!(terminal.action, "dispatch error");
+        assert_eq!(terminal.mission_id.as_deref(), Some("review-1700000002-111222"));
+    }
+
     #[test]
     fn with_dispatch_bookends_error_path_emits_dispatch_error_terminal_with_the_real_message() {
         let mut emitter = RecordingEmitter::default();
-        let result = with_dispatch_bookends(&mut emitter, "case-2", "test-crew", None, json!({}), |em| {
+        let result = with_dispatch_bookends(&mut emitter, "case-2", "test-crew", None, None, json!({}), |em| {
             em.emit(fake_review_record("step result"));
             Err(anyhow!("probe dispatch failed: connection refused"))
         });
@@ -1325,7 +1446,7 @@ mod tests {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_dispatch_bookends(&mut emitter, "case-3", "test-crew", None, json!({}), |_em| {
+            with_dispatch_bookends(&mut emitter, "case-3", "test-crew", None, None, json!({}), |_em| {
                 panic!("simulated crash mid-dispatch");
             })
         }));
@@ -1345,7 +1466,7 @@ mod tests {
     #[test]
     fn with_dispatch_bookends_stamps_endpoint_and_remote_tokens_for_a_remote_member() {
         let mut emitter = RecordingEmitter::default();
-        let result = with_dispatch_bookends(&mut emitter, "case-4", "test-crew", Some("darkmux:judge-model"), json!({}), |em| {
+        let result = with_dispatch_bookends(&mut emitter, "case-4", "test-crew", Some("darkmux:judge-model"), None, json!({}), |em| {
             em.emit(fake_review_record("step result"));
             Ok(ReviewEnvelope {
                 members: vec![
@@ -1384,7 +1505,7 @@ mod tests {
     #[test]
     fn with_dispatch_bookends_omits_endpoint_and_remote_tokens_when_fully_local() {
         let mut emitter = RecordingEmitter::default();
-        let result = with_dispatch_bookends(&mut emitter, "case-5", "test-crew", None, json!({}), |_em| {
+        let result = with_dispatch_bookends(&mut emitter, "case-5", "test-crew", None, None, json!({}), |_em| {
             Ok(ReviewEnvelope {
                 members: vec![MemberRecord {
                     model: "darkmux:probe-model".into(),
