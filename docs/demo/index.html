@@ -677,7 +677,7 @@
 </div>
 <div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
-  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a><a class="lens" id="lens-lab" data-act="lab">lab</a><a class="lens" id="lens-machine" data-act="machinemem">machine</a></span>
+  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a><a class="lens" id="lens-lab" data-act="lab">lab</a><a class="lens" id="lens-machine" data-act="machine">machine</a></span>
   <span class="crumb" id="crumb"></span>
   <span class="meta" id="meta"></span>
 </div>
@@ -904,6 +904,16 @@ recompute();
 // via state.recentAll. Keeps a busy machine's panel from scrolling unbounded.
 const RECENT_CAP=20;
 let state={level:"fleet",machine:null,session:null,missionId:null,labRunDir:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,activityWindowMin:1440,
+  // (#1508) Navigational INTENT for the unified machine page's local-vs-
+  // remote health-region gate — true only via goMachine() (the nav tab /
+  // `#lens=machine` deep-link, which always means "my own page" even before
+  // the separate /machine/specs probe has resolved: a live daemon serves it
+  // eventually, but an offline/static context may never). A fleet-card drill
+  // leaves it false; renderMachine() ALSO re-derives locality live via
+  // isLocalMachine(state.machine), so a drill into what turns out to be your
+  // OWN machine still gets the health region once specs resolve and match —
+  // this flag only needs to force the answer for the "always mine" entry.
+  machineIsLocal:false,
   filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),act:new Set(FACTS),q:""},
   rawOpen:false,
   // (#expand) Open-state of `<details data-expand="<key>">` blocks, keyed so it
@@ -1501,24 +1511,6 @@ function renderFleet(){
     : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
   $("stage").innerHTML=savingsHero()+`<div class="fleet">${cards}</div>`+tl;
 }
-// New-run tracking for the recent-runs list. Keyed per machine so switching
-// machines starts a fresh baseline; the FIRST paint of a machine marks every
-// existing row as already-seen (ts 0 → no animation, no accent) so entering
-// the view doesn't fire a wall of slide-ins. A run's first-seen timestamp
-// drives two affordances with different lifetimes: the slide-in class (only
-// the single render tick where the run first appears — the wholesale ~1/sec
-// stage rebuild would otherwise replay the animation forever) and the fresh
-// accent bar (any render within 60s of first sight).
-const RECENT_SEEN=new Map(); let RECENT_SEEN_KEY=null;
-function recentFreshCls(sid,firstPaint){
-  const now=Date.now();
-  let ts=RECENT_SEEN.get(sid);
-  const isNew=ts===undefined;
-  if(isNew){ts=firstPaint?0:now;RECENT_SEEN.set(sid,ts);}
-  if(!ts)return '';
-  const age=now-ts;
-  return (isNew?' rrnew':'')+(age<60000?' rrfresh':'');
-}
 // (#691) One expandable row in the recent-runs LIST. Collapsed: ordinal ·
 // status · role · model · mission · completed-time/duration · turns/tools —
 // scannable, so the operator can tell runs apart. `ord` is the run's per-day
@@ -1565,16 +1557,36 @@ function recentRow(n,ord,freshCls){
     +`<span class="rrtime">${when}${dur?' · '+dur:''}</span></summary>`
     +`<div class="rrdetail">${detail}</div></details>`;
 }
+// (#1508) The unified machine page — ONE lightweight "separate room" (the
+// #1286 posture the retired machinemem lens pioneered: no scrubber, no
+// event-log pane, no flow chrome — render() early-returns for this level the
+// same way machinemem's did). Two regions: a probe-fed HEALTH region on top
+// (residency / RAM / pressure, LOCAL-PROBE ONLY — #1286's observer-must-not-
+// join-the-observed boundary means /machine/resources always describes THIS
+// daemon's own host, so a remote machine's page says so honestly instead of
+// showing figures that would actually be this daemon's own), and a plain
+// RUNS list below (deliberately interim — step 4 of #1508 replaces it with
+// the full Runs lens, machine-pinned).
+//
+// THREE entry points converge here: the nav tab (goMachine — local), a
+// fleet-card drill (drillMachine(uid) — local OR remote), and the
+// `#lens=machine` deep-link (goMachine — local).
 function renderMachine(){
-  const m=state.machine; $("logscope").textContent=nameOf(m); state.stageScope=r=>uidOf(r)===m;
+  const m=state.machine;
+  state.stageScope=r=>uidOf(r)===m;
+  $("logscope").textContent=m!=null?nameOf(m):"machine";
   // (#1008) The utility role — compaction + utility-tier tasks. Renders OBSERVED
   // state from the local daemon's /machine/specs (MACHINE_SPECS.utility_model)
   // instead of a hardcoded "resident": for THIS machine the pill shows whether
   // the configured `internal.utility` model is resident / registered-not-loaded /
   // not-configured; for a remote machine (no specs probe — presence beats don't
   // carry the binding) it reads "not reported" rather than implying residency.
-  const isLocalMach = MACHINE_SPECS && nameOf(m)===MACHINE_SPECS.machine_id;
-  const um = isLocalMach ? MACHINE_SPECS.utility_model : undefined; // {id,loaded} | null | undefined
+  // (#1508) This is the STRICT specs-confirmed check (unchanged #1008
+  // semantics) — distinct from the health region's isLocalMach below, which
+  // ALSO trusts the nav-tab/deep-link's explicit "always mine" intent even
+  // before /machine/specs has resolved.
+  const isLocalSpecs = isLocalMachine(m);
+  const um = isLocalSpecs ? MACHINE_SPECS.utility_model : undefined; // {id,loaded} | null | undefined
   let utilState, utilPill;
   // (#1071) utility-model residency is NOT a dispatch verdict — use neutral
   // (muted) for unknown/not-configured/not-loaded, green only for resident (ready).
@@ -1586,75 +1598,113 @@ function renderMachine(){
     <div class="s">${utilState}</div>
     <div class="s">compaction · mission-compile · estimate · scribe</div>
     ${utilPill}</div>`;
-  // Specialist roles dispatched on this machine. Defensive against missing
-  // dispatch.start records: real flow streams contain telemetry-only sessions,
-  // test-fixture sessions emitting dispatch.tool/turn without a proper
-  // start record, and isolated records that don't fit the dispatch lifecycle.
-  // For each session we render whatever metadata we can recover from the first
-  // visible record on that session, rather than throwing if dispatch.start is
-  // missing (which silently broke the entire machine-detail panel).
-  // (#638 Slice 3) A role can't be "running" on a machine that's absent at the
-  // scrubber — when the machine went offline, its dispatches went with it. So
-  // an absent machine caps its roles to terminal status (consistency guard;
-  // the session.end edges usually already bookend them at the same instant).
+  // (#1286) Residency/RAM/pressure — fed by THIS daemon's /machine/resources
+  // (kernel counters + lms metadata, zero model dispatches, own cost stamped
+  // in gather_ms). Genuinely local-only data: showing it under a REMOTE
+  // machine's name would silently mislabel this host's own figures as the
+  // drilled machine's — the local-vs-remote honesty line (#1508 decision 2).
+  // isLocalMach ORs the explicit nav-tab/deep-link intent (state.machineIsLocal)
+  // with the specs-confirmed check: goMachine() always counts (even before
+  // /machine/specs resolves), and a fleet-card drill into what turns out to
+  // be your OWN machine self-corrects live once specs load and match.
+  const isLocalMach = state.machineIsLocal || isLocalSpecs;
+  const b=MACHINE_MEM;
+  let healthBody;
+  if(!isLocalMach){
+    healthBody=`<div class="memcard"><div class="memhdr"><span class="memname">residency / RAM</span></div>
+      <div class="none">residency / RAM not reported from here — local-probe only. View the machine page on ${m!=null?escN(m):'that machine'} directly for live figures.</div></div>`;
+  } else if(MACHINE_MEM_ERR&&!b){
+    healthBody=`<div class="none">daemon not reachable — the machine lens reads live probes via <code>/machine/resources</code> (CLI twin: <code>darkmux machine resources</code>).</div>`;
+  } else if(!b){
+    healthBody=`<div class="none">loading…</div>`;
+  } else {
+    // Cached payload but the daemon stopped answering: keep showing the last
+    // snapshot, but SAY it's stale — a silently frozen gauge would be the
+    // exact observability failure this lens exists to prevent.
+    const stale=MACHINE_MEM_ERR?`<div class="memwarn">⚠ daemon unreachable — showing the last snapshot; the figures below are stale</div>`:"";
+    const models=Array.isArray(b.models)?b.models:[];
+    const machine=b.machine||{};
+    const pressure=b.pressure||{};
+    const pool=b.pool||null;
+    const limit=b.limit_bytes!=null?Number(b.limit_bytes):null;
+    const poolCap=pool&&pool.capacity_bytes!=null?Number(pool.capacity_bytes):null;
+    // Per-model bars scale to the largest per-model figure so small models
+    // stay readable; the machine bar scales to the full physical pool (or the
+    // limit when the pool is unreadable) so BOTH the #1243 budget line and the
+    // pool line mean something and headroom is visible at a glance.
+    const perScale=Math.max(1,...models.map(mm=>Math.max(Number(mm.potential_bytes)||0, Number(mm.current_bytes)||0)));
+    const mPot=machine.potential_bytes!=null?Number(machine.potential_bytes):null;
+    const mCur=machine.current_bytes!=null?Number(machine.current_bytes):null;
+    const mScale=Math.max(limit||0, poolCap||0, mPot||0, mCur||0, 1);
+    const mState=memStateCls(machine.state);
+    const limitDesc=b.limit_source==="budget"?"#1243 budget":b.limit_source==="physical_pool"?"physical pool (no budget configured)":"no limit readable";
+    const unpriced=Number(machine.unpriced_models)||0;
+    const machineCard=`<div class="memcard ${mState}">
+      <div class="memhdr"><span class="memname">machine total</span><span class="memstate ${mState}">${esc(machine.state||"unknown")}</span></div>
+      ${memBar(mCur, mPot, mScale, mState, limit, poolCap)}
+      <div class="memmeta">Σ potential ${memBytes(mPot)}${unpriced?` (+${unpriced} unpriced)`:""} · Σ current ${memBytes(mCur)} · limit ${memBytes(limit)} (${esc(limitDesc)})${pool?` · pool ${memBytes(pool.capacity_bytes)} / free ${memBytes(pool.available_bytes)}`:""}</div>
+      ${machine.shrink_hint?`<div class="memhint">↳ ${esc(machine.shrink_hint)}</div>`:""}
+    </div>`;
+    const modelCards=models.length
+      ? models.map(mm=>renderMachineMemModel(mm, perScale, null)).join("")
+      : `<div class="none">no models loaded.</div>`;
+    const freePct=pressure.memory_free_percent!=null?`${Number(pressure.memory_free_percent)}%`:"—";
+    const pressureCard=`<div class="memcard${pressure.red?" red":""}">
+      <div class="memhdr"><span class="memname">pressure</span>${pressure.red?`<span class="memstate red">red</span>`:""}</div>
+      <div class="memrow"><span class="k">swap used</span><span class="v${pressure.red?" bad":""}">${memBytes(pressure.swap_used_bytes)}</span></div>
+      <div class="memrow"><span class="k">compressor</span><span class="v">${memBytes(pressure.compressor_bytes)}</span></div>
+      <div class="memrow"><span class="k">memory free</span><span class="v${pressure.red?" bad":""}">${esc(freePct)}</span></div>
+    </div>`;
+    const warns=Array.isArray(b.warnings)&&b.warnings.length
+      ? `<div class="memcard"><div class="memhdr"><span class="memname">warnings</span></div>${b.warnings.map(w=>`<div class="memwarn">⚠ ${esc(w)}</div>`).join("")}</div>`
+      : "";
+    const attribution=`attribution: ${b.attribution_note||b.attribution||"—"}`;
+    healthBody=`${stale}${machineCard}${modelCards}${pressureCard}${warns}
+      <div class="memfoot">${esc(attribution)}</div>
+      <div class="memfoot" id="memstamp">${esc(memStampText(b))}</div>`;
+  }
+  const health=`${util}<div class="memwrap">${healthBody}</div>`;
+
+  // ── Runs list (interim — step 4 of #1508 replaces this with the full Runs
+  // lens, machine-pinned). Same per-session status computation the old
+  // flow-scoped crew view used (#638/#647/#720/#1071) — that logic is real
+  // information (what's running, what just finished) and carries over
+  // unchanged; only the PRESENTATION changes: this page has no scrubber to
+  // give live-mode running sessions their own prominent-card treatment, so
+  // every session (running or completed) is one row in a single plain list,
+  // reusing recentRow() (#691) for the row itself — full detail on expand
+  // (tokens/turns/mission/result), "open →" to drill into the run.
   const machAbsent=machPresent(m)===false;
   const liveSet=liveSessionSet(); // (#1007) Redis presence, or flow-derived when Redis is down
   const nodeObjs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
     const s=dispatch(sid,"start");
-    // (#638/#647) Session status at the scrubber time `state.t`, from the
-    // edge pair — NOT "no dispatch.complete = running" (the old false-running
-    // bug). Close-edge = the earliest of dispatch.complete (clean) or the
-    // reconciler's session.end (abandoned). Priority:
-    //   closed by state.t → "complete" (clean) / "ended" (abandoned)
-    //   else live heartbeat now (live mode)            → "running"
-    //   else a close-edge exists but is AFTER state.t  → "running"
-    //        (playback: the session was running at the scrubber, its bracket
-    //         just hasn't been reached yet)
-    //   else started, no close evidence, not live      → "ended"
-    //        (crashed before the reconciler shipped, or capture truncated —
-    //         honest default; never a phantom "running")
-    // (#720) `dispatchEnd` finds EITHER terminal (clean complete or
-    // error/killed); without the error edge a failed run never closes here.
+    // (#638/#647) Session status at the scrubber time `state.t` (frozen at
+    // "now" on this scrubber-less page — see drillMachine/goMachine), from
+    // the edge pair — NOT "no dispatch.complete = running" (the old
+    // false-running bug). (#720) `dispatchEnd` finds EITHER terminal (clean
+    // complete or error/killed); without the error edge a failed run never
+    // closes here.
     const c=dispatchEnd(sid), e=sessEnd(sid);
     const closeCands=[c&&T(c.ts), e&&T(e.ts)].filter(x=>x);
     const closeTs=closeCands.length?Math.min(...closeCands):null;
     const closedBy=closeTs!=null&&closeTs<=state.t;
     const cleanClose=c&&T(c.ts)===closeTs&&!dispatchErrored(c);  // clean complete is the (or tied) earliest close
     const errClose=c&&T(c.ts)===closeTs&&dispatchErrored(c);     // failed/killed terminal closed it
-    // (#720) Caveat: closeTs = min(terminal, session.end). If a redundant
-    // session.end lands EARLIER than the error terminal, both cleanClose and
-    // errClose are false → renders 'ended', masking 'killed'. Same min()-masking
-    // the clean path already has; suppressed in practice because the session
-    // emitter's stop() pre-claims session-end on the normal return path
-    // regardless of exit code. Only leaks on a Redis-outage-spans-TTL window.
     const liveNow=liveSet.has(sid);
-    // (#1071) map this card's detected state to the shared status convention.
-    // open = running now (live beat) or running at the scrubber (close is later);
-    // an absent machine can't be running. errored/killed → failed (red); a clean
-    // complete → green; anything else terminal → canceled (orange).
+    // (#1071) open = running now (live beat) or running at the scrubber
+    // (close is later); an absent machine can't be running. errored/killed →
+    // failed (red); a clean complete → green; anything else terminal →
+    // canceled (orange).
     const {cls,lbl}=statusVisual({
       open:!closedBy&&!machAbsent&&(liveNow||closeTs!=null),
       errored:closedBy&&errClose, killed:dispatchKilled(c), clean:closedBy&&cleanClose });
-    // (#691) Card timestamp line so recent runs are dated + identifiable at a
-    // glance: completed cards show the close time, running cards show start time.
     const startTs=s?T(s.ts):null;
-    const tsLine=closeTs!=null
-      ? `<div class="s tsline">${stamp('completed',closeTs)}</div>`
-      : startTs!=null
-        ? `<div class="s tsline">${stamp('started',startTs)}</div>`
-        : '';
-    // (#691) Rich fields so the recent-runs LIST can render an expandable row
-    // (collapsed summary + full dispatch info) instead of a shallow card.
     const donePayload=c?c.payload:null;
     const errored=!!(c&&dispatchErrored(c)), killed=!!(c&&dispatchKilled(c));
     if(s){
       return {cls, lbl, pill:cls, closeTs, startTs, sid, handle:s.handle, model:s.model||'?',
         mission:s.mission_id||null, phase:s.phase_id||null,
-        startPayload:s.payload||null, donePayload, errored, killed, hasStart:true,
-        html:`<div class="node" data-act="session" data-arg="${esc(sid)}"><div class="h"><span class="nico">${ICON.worker}</span>${esc(s.handle)}</div>
-        <div class="s">specialist role · ${esc(s.model||'?')}</div>
-        <div class="s">session ${esc(sid)} · mission ${esc(s.mission_id)}</div>
-        ${tsLine}<span class="pill ${cls}">${lbl}</span></div>`};
+        startPayload:s.payload||null, donePayload, errored, killed, hasStart:true};
     }
     // Fallback: no dispatch.start — pull handle/model/mission from the first
     // record we have for this session, surface honestly that the lifecycle
@@ -1662,67 +1712,34 @@ function renderMachine(){
     const first=visible().find(r=>r.session_id===sid)||{};
     const handle=first.handle||("session "+sid);
     const model=first.model||'?';
-    const mission=first.mission_id?`mission ${first.mission_id}`:'no mission scope';
     const fbTs=closeTs??(first.ts?T(first.ts):null);
-    const fbLine=fbTs!=null?`<div class="s tsline">${stamp(closeTs!=null?'completed':'seen',fbTs)}</div>`:'';
-    return {cls:'ended', lbl:'no start', pill:'warn', closeTs, startTs:first.ts?T(first.ts):null,
+    return {cls:'ended', lbl:'no start', pill:'warn', closeTs, startTs:fbTs,
       sid, handle, model, mission:first.mission_id||null, phase:null,
-      startPayload:null, donePayload, errored, killed, hasStart:false,
-      html:`<div class="node" data-act="session" data-arg="${esc(sid)}"><div class="h"><span class="nico">${ICON.worker}</span>${esc(handle)}</div>
-      <div class="s">role · ${esc(model)}</div>
-      <div class="s">session ${esc(sid)} · ${esc(mission)}</div>
-      ${fbLine}<span class="pill warn">no dispatch.start</span></div>`};
-  });
-  // (#691 Slice 2) In live mode, separate RUNNING-now from completed: completed
-  // dispatches from earlier today shouldn't sit in the live crew looking
-  // current. Running stay prominent; the rest collapse into a dimmed "recent
-  // runs" section (still one click to drill / playback). Playback shows all.
-  const liveMode=document.body.classList.contains('live-mode');
-  // (#691) Most-recent-first: order completed cards by close time (falling back
-  // to start time) descending, so the operator scans newest → oldest and clicks
-  // the right run without hunting.
-  const byRecent=(a,b)=>((b.closeTs??b.startTs??0)-(a.closeTs??a.startTs??0));
-  let specs;
-  if(liveMode){
-    // Running stay as prominent cards; completed collapse into an expandable
-    // LIST (#691) — each row carries far more than a card (role · model ·
-    // mission · completed-time · duration · turns/tools) and expands to the
-    // full dispatch info so the operator can tell what a run was about and pick
-    // the right one. Newest-first.
-    const running=nodeObjs.filter(n=>n.cls==='run').map(n=>n.html).join("");
-    const recentObjs=nodeObjs.filter(n=>n.cls!=='run').sort(byRecent);
-    const recentCount=recentObjs.length;
-    // New-run baseline: first paint of a machine seeds the seen-set silently
-    // (no wall of slide-ins on entry); runs appearing on LATER renders are
-    // genuinely new and animate in.
-    const seenKey=nameOf(m);
-    const firstPaint=RECENT_SEEN_KEY!==seenKey;
-    if(firstPaint){RECENT_SEEN.clear();RECENT_SEEN_KEY=seenKey;}
-    // (#691) Cap the list — a busy machine accumulates unbounded completed runs,
-    // so show the newest RECENT_CAP by default with a show-all/fewer toggle
-    // rather than an ever-growing scroll. state.recentAll persists across live
-    // re-renders; reset on machine entry (drillMachine).
-    const shown=state.recentAll?recentObjs:recentObjs.slice(0,RECENT_CAP);
-    // Per-day ordinal: newest-first list, so row i is run #(count - i) of the
-    // day — the growing identifier that keeps visually-identical rows apart.
-    const recent=shown.map((n,i)=>recentRow(n,recentCount-i,recentFreshCls(n.sid,firstPaint))).join("");
-    const more=recentCount>RECENT_CAP
-      ? `<div class="rrmore" data-act="recentall">${state.recentAll?'show fewer':`show all ${recentCount} →`}</div>`
-      : '';
-    specs=(running||'<span class="hint">no dispatches running right now</span>')
-      +(recentCount?`<div class="rglbl rgdim">recent runs · ${recentCount} today${state.recentAll||recentCount<=RECENT_CAP?'':` · newest ${RECENT_CAP}`}</div><div class="rrlist">${recent}</div>${more}`:'');
-  } else {
-    specs=nodeObjs.slice().sort(byRecent).map(n=>n.html).join("");
-  }
+      startPayload:null, donePayload, errored, killed, hasStart:false};
+  // (#691) Most-recent-first: order by close time (falling back to start
+  // time) descending, so the operator scans newest → oldest and clicks the
+  // right run without hunting.
+  }).sort((a,b)=>((b.closeTs??b.startTs??0)-(a.closeTs??a.startTs??0)));
+  const total=nodeObjs.length;
+  // (#691) Cap the list — a busy machine accumulates unbounded runs, so show
+  // the newest RECENT_CAP by default with a show-all/fewer toggle rather than
+  // an ever-growing scroll. state.recentAll persists across live re-renders;
+  // reset on machine entry (drillMachine).
+  const shown=state.recentAll?nodeObjs:nodeObjs.slice(0,RECENT_CAP);
+  // Per-day ordinal: newest-first list, so row i is run #(count - i) — the
+  // growing identifier that keeps visually-identical rows apart.
+  const rows=shown.map((n,i)=>recentRow(n,total-i,'')).join("");
+  const more=total>RECENT_CAP
+    ? `<div class="rrmore" data-act="recentall">${state.recentAll?'show fewer':`show all ${total} →`}</div>`
+    : '';
+  const runsList=total
+    ? `<div class="rrlist">${rows}</div>${more}`
+    : `<span class="hint">no runs recorded for this machine at this point in the timeline</span>`;
   // Loose records — records on this machine that don't have a session_id and
-  // therefore don't show up in any session card above (flow notes, free-floating
+  // therefore don't show up in the runs list above (flow notes, free-floating
   // telemetry, anything written outside a dispatch). Surface them as a count
   // with a click-through so the operator can still inspect them.
   const loose=visible().filter(r=>uidOf(r)===m&&!r.session_id);
-  // (#691) Unscoped records get their OWN section with a header, not an extra
-  // card tacked onto the crew — they're a different KIND of thing (records
-  // without a dispatch session: flow notes, ambient telemetry), so they read
-  // better as a separate block than as a sibling of the role cards.
   const looseSection=loose.length
     ? `<div class="rglbl rgdim">unscoped records · ${loose.length} today</div>
         <div class="node" data-act="loose" data-arg="${esc(m)}"><div class="h">unscoped records</div>
@@ -1731,8 +1748,11 @@ function renderMachine(){
         <span class="pill">loose</span></div>`
     : '';
   const spec=specOf(m);
-  $("stage").innerHTML=`<div><div class="stagehdr"><a data-act="fleet">fleet</a> › machine · ${escN(m)}${spec?' — '+esc(spec):''}</div>
-    <div class="rglbl">crew on ${escN(m)}</div>${util}${specs||(looseSection?'':'<span class="hint">no specialist runs at this point in the timeline</span>')}${looseSection}</div>`;
+  const label=m!=null?escN(m):'this machine';
+  $("stage").innerHTML=`<div><div class="stagehdr"><a data-act="fleet">fleet</a> › machine · ${label}${spec?' — '+esc(spec):''}</div>
+    ${health}
+    <div class="rglbl rgdim" style="margin-top:16px">runs on ${label}</div>
+    ${runsList}${looseSection}</div>`;
 }
 // (#691) Render the loose-records panel — records on a machine that don't have
 // a session_id (flow notes, ambient telemetry). A FIRST-CLASS render path (not
@@ -2227,28 +2247,30 @@ function renderCrumb(){
   // level survives only as the daemon-less static summary (renderMissionStatic).
   const inMissions = state.level==="missions"||state.level==="mission";
   const inLab = state.level==="lab"||state.level==="lab-run";
-  // (#1286) The machine memory lens — live probes (kernel counters + lms
-  // metadata via /machine/resources), a third source class distinct from run
-  // artifacts (lab) and flow records (fleet/missions).
-  const inMachineMem = state.level==="machinemem";
+  // (#1508) The unified machine page — live probes (kernel counters + lms
+  // metadata via /machine/resources) for the health region plus a plain runs
+  // list, a third source class distinct from run artifacts (lab) and flow
+  // records (fleet/missions). Absorbed the retired `machinemem` level.
+  const inMachine = state.level==="machine";
   const lf=$("lens-fleet"), lm=$("lens-missions"), ll=$("lens-lab"), lmm=$("lens-machine");
-  if(lf)lf.className="lens"+((inMissions||inLab||inMachineMem)?"":" on");
+  if(lf)lf.className="lens"+((inMissions||inLab||inMachine)?"":" on");
   if(lm)lm.className="lens"+(inMissions?" on":"");
   if(ll)ll.className="lens"+(inLab?" on":"");
-  if(lmm)lmm.className="lens"+(inMachineMem?" on":"");
+  if(lmm)lmm.className="lens"+(inMachine?" on":"");
   // (#1247 Part 3) The lab lens is a SEPARATE machine-local room, not a rung
   // of the fleet drill ladder ("two doors, one viewer, distinct questions" —
   // operator direction) — it has no time-scrubbing story, so the flow-record
   // chrome (event log, detail pane, playback scrub bar) is irrelevant and
   // hidden via this class (see the `.lab-mode` CSS block).
   document.body.classList.toggle("lab-mode", inLab);
-  // (#1286) Same reflow for the machine lens — its own class, same rules.
-  document.body.classList.toggle("machine-mode", inMachineMem);
+  // (#1508) Same reflow for the unified machine page — its own class, same rules.
+  document.body.classList.toggle("machine-mode", inMachine);
   // (#1247 deep-link) Every navigation path lands here, so this is the ONE
   // place the address bar is kept in sync with the lab/machine view.
-  syncLabHash(inLab, inMachineMem);
-  if(inMachineMem){
-    $("crumb").innerHTML=`<a data-act="machinemem">machine</a>`; return;
+  syncLabHash(inLab, inMachine);
+  if(inMachine){
+    $("crumb").innerHTML=`<a data-act="fleet">fleet</a><span class="sep">›</span>${state.machine!=null?escN(state.machine):"this machine"}`;
+    return;
   }
   if(inLab){
     let lc=`<a data-act="lab">lab</a>`;
@@ -2267,8 +2289,9 @@ function renderCrumb(){
   let c=hasMission?`<a class="misslink" data-act="mission">◆ ${esc(pm)}</a>`:``;
   c+=(hasMission?`<span class="sep">›</span>`:``)+`<a data-act="fleet">fleet</a>`;
   // (#1094) loose included so the crumb carries the machine link there too —
-  // it's the up-nav now that the back button is gone (loose drills from a machine).
-  if(state.level==="machine"||state.level==="subsystem"||state.level==="loose") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`;
+  // it's the up-nav now that the back button is gone (loose drills from a
+  // machine). `machine` itself is handled in the early-return above.
+  if(state.level==="subsystem"||state.level==="loose") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`;
   if(state.level==="subsystem") c+=`<span class="sep">›</span>${esc(state.session)}`;
   $("crumb").innerHTML=c;
 }
@@ -2290,19 +2313,73 @@ function render(){
     renderLab();
     return;
   }
-  // (#1286) The machine memory lens skips the flow-scoped machinery the
-  // same way — probe-fed, no time axis, no filters.
-  if(state.level==="machinemem"){
+  // (#1508) The unified machine page skips the flow-scoped machinery the
+  // same way — a probe-fed health region + a plain runs list, no time axis,
+  // no filters, no event-log pane. Absorbs the retired `machinemem` level.
+  if(state.level==="machine"){
     renderCrumb();
-    renderMachineMem();
+    renderMachine();
     return;
   }
-  if(state.level==="missions")renderMissionsIndex(); else if(state.level==="mission")renderMissionStatic(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
+  if(state.level==="missions")renderMissionsIndex(); else if(state.level==="mission")renderMissionStatic(); else if(state.level==="fleet")renderFleet(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
   syncTransport();
 }
-window.drillMachine=m=>{state.level="machine";state.machine=m;state.session=null;state.follow=true;state.recentAll=false;render();};
+// (#1508) True iff `m` is THIS daemon's own machine, PER THE /machine/specs
+// PROBE specifically — the strict specs-confirmed identity check the
+// pre-existing #1008 utility-tier card uses (unchanged semantics). NOT the
+// general local/remote gate for the health region — see state.machineIsLocal
+// above and its use in renderMachine/pollMachineMem, which OR this in so a
+// drill into what turns out to be your own machine still self-corrects once
+// specs load, but don't REQUIRE this to have resolved for the "always mine"
+// nav-tab/deep-link entry (goMachine) to count as local.
+const isLocalMachine=m=>!!(MACHINE_SPECS && m!=null && nameOf(m)===MACHINE_SPECS.machine_id);
+// (#1508) The health region's actual local/remote gate — ORs the explicit
+// nav-tab/deep-link intent (state.machineIsLocal, set by goMachine/
+// drillMachine) with the specs-confirmed check above. Shared by
+// renderMachine (what to show) and pollMachineMem (whether to keep polling)
+// so the two can never disagree about which page is "mine".
+const machineIsLocalNow=()=>state.machineIsLocal||isLocalMachine(state.machine);
+// (#1508) Which machine uid IS this daemon, for the nav-tab/deep-link entry
+// into the unified machine page. MACHINE_SPECS.machine_id is a NAME, not the
+// stable hardware uid state.machine keys on — match it against the known
+// machines() the same way isLocalMachine does. Falls back to the raw name
+// string when no uid has produced a matching record/beat yet (a freshly-
+// booted daemon with no flow records of its own): nameOf() on that string
+// returns it unchanged, so isLocalMachine still resolves true against it.
+function localMachineUid(){
+  if(!MACHINE_SPECS||!MACHINE_SPECS.machine_id) return null;
+  return machines().find(x=>nameOf(x)===MACHINE_SPECS.machine_id) || MACHINE_SPECS.machine_id;
+}
+// (#1508) Drill into the unified machine page for a SPECIFIC machine uid —
+// the fleet-card entry point (local OR remote). `local` is the explicit
+// intent flag (see state.machineIsLocal); omitted/false for a plain
+// fleet-card drill. `goMachine` below is the sibling entry for "the local
+// machine" (nav tab + `#lens=machine` deep link) and passes `local=true`.
+window.drillMachine=(m,local)=>{
+  state.level="machine";state.machine=m;state.session=null;state.follow=true;state.recentAll=false;
+  state.machineIsLocal=!!local;
+  MACHINE_MEM_SIG=null; // force a fresh paint of the health region on this visit
+  render();
+  if(!MACHINE_MEM_POLLING) pollMachineMem();
+};
+// (#1508) The nav-tab / deep-link entry point — always "the local machine"
+// (passes local=true to drillMachine regardless of whether the specs fetch
+// below succeeds). /machine/specs is a probe capability, not a flow-record
+// one (same posture as /machine/resources), so this fetches it directly
+// rather than waiting on the live-only 5s specs poll (pollMachineSpecs) —
+// playback mode never starts that poll, and even in live mode the operator
+// can land here before its first tick.
+window.goMachine=async function(){
+  if(!MACHINE_SPECS){
+    try{
+      const r=await fetch("/machine/specs",{headers:{accept:"application/json"}});
+      if(r.ok) MACHINE_SPECS=await r.json();
+    }catch(_){/* best-effort — the health region still renders via the explicit local=true intent below */}
+  }
+  drillMachine(localMachineUid(), true);
+};
 // (#691) Expand/collapse the recent-runs list past RECENT_CAP.
 window.toggleRecentAll=()=>{state.recentAll=!state.recentAll;render();};
 // (#1151) Activity-timeline window preset in MINUTES (10m/1h/4h/24h). Live-only
@@ -2539,7 +2616,9 @@ $("imodalbg").onclick=e=>{if(e.target===$("imodalbg"))closeInfo();}; // (#1132) 
 // every click. The companion invariant (zero inline handlers in this file) is
 // enforced by `viewer_has_no_inline_event_handlers` in the serve crate.
 const ACTIONS={
-  machine:a=>drillMachine(a),
+  // (#1508) An explicit uid (fleet-card drill, crumb link) drills that
+  // machine; no arg (the nav tab) means "the local machine" — goMachine.
+  machine:a=>a?drillMachine(a):goMachine(),
   session:a=>drillSession(a),
   loose:a=>drillLoose(a),
   query:a=>setQuery(a||""),
@@ -2566,8 +2645,6 @@ const ACTIONS={
   // (#1247 Part 3) The lab observer lens.
   lab:()=>goLab(),
   labrun:a=>drillLabRun(a),
-  // (#1286) The machine memory lens.
-  machinemem:()=>goMachineMem(),
   // (#1387) Copy the worktree path from the what-changed summary.
   copywt:a=>copyWtPath(a),
 };
@@ -2828,12 +2905,13 @@ function labQuery(){
 // untouched; a bare `#<date>` hash (not key=value shaped — URLSearchParams
 // would mangle it to `<date>=`) is dropped rather than corrupted, per the
 // boot-only-input note on labQuery.
-// (#1286) `inMachineMem` rides the same chokepoint: the machine lens writes
-// `lens=machine` (no `run` param) so the phone view is bookmarkable too.
-function syncLabHash(inLab, inMachineMem){
+// (#1508) `inMachine` rides the same chokepoint: the unified machine page
+// writes `lens=machine` (no `run` param) so the phone view is bookmarkable
+// too — for both the local nav-tab visit and a remote fleet-card drill.
+function syncLabHash(inLab, inMachine){
   const raw=(location.hash||"").replace(/^#/,"");
   const isBareDate=/^\d{4}-\d{2}-\d{2}$/.test(raw);
-  if(!inLab&&!inMachineMem){
+  if(!inLab&&!inMachine){
     // Outside the lab/machine lenses, only touch the hash when it carries
     // lens params to REMOVE — a bare-date or #mission=/#session= hash the
     // operator arrived with stays put (renderCrumb repaints every view; an
@@ -2848,7 +2926,7 @@ function syncLabHash(inLab, inMachineMem){
     return;
   }
   const p=isBareDate?new URLSearchParams():new URLSearchParams(raw);
-  if(inMachineMem){
+  if(inMachine){
     p.set("lens","machine");p.delete("run");
   }else{
     p.set("lens","lab");
@@ -2859,9 +2937,9 @@ function syncLabHash(inLab, inMachineMem){
   if(next===raw)return;
   history.replaceState(null,"","#"+next);
 }
-// (#1286 deep-link) `#lens=machine` (or `?lens=machine`) boots straight into
-// the machine memory lens — same URLSearchParams-over-hash parsing as
-// labQuery. `lens` is a single value, so lab/machine can't conflict; a
+// (#1508 deep-link) `#lens=machine` (or `?lens=machine`) boots straight into
+// the unified machine page (local) — same URLSearchParams-over-hash parsing
+// as labQuery. `lens` is a single value, so lab/machine can't conflict; a
 // `#mission=`/`#session=` replay query alongside is contradictory and the
 // lens half is honored (same precedence rule as the lab lens).
 function machineQuery(){
@@ -2987,10 +3065,6 @@ function stageSig(){
     return "s|"+state.machine+"|"+state.session+"|"+sd;
   }
   if(state.level==="loose")return null;  // (#691) live records list: full-render each tick
-  // (#1286) The machine lens is probe-fed on its own 5s poll — flow-record
-  // ticks must never rebuild it (its own poll gates re-renders on a
-  // structural signature; see pollMachineMem).
-  if(state.level==="machinemem")return "machinemem";
   return "mission";
 }
 // (#691) Fetch yesterday + today's flow records and keep only the last
@@ -3332,8 +3406,8 @@ async function boot(){
   // that run's detail; an unresolvable run falls back to the run list with a
   // notice inside drillLabRun.
   if(lq){ if(lq.run!=null) drillLabRun(lq.run); else goLab(); }
-  // (#1286 deep-link) Boot straight into the machine memory lens.
-  else if(mq){ goMachineMem(); }
+  // (#1508 deep-link) Boot straight into the unified machine page (local).
+  else if(mq){ goMachine(); }
 }
 // ── Lab observer lens (#1247 Part 3) ────────────────────────────────────
 //
@@ -3719,24 +3793,25 @@ let MACHINE_MEM_SIG=null;    // structural signature — the re-render gate
 let MACHINE_MEM_POLLING=false;
 const MACHINE_MEM_POLL_MS=5000; // client cadence (server caches ~2s; both recorded)
 
-window.goMachineMem=()=>{
-  state.level="machinemem"; state.machine=null; state.session=null;
-  MACHINE_MEM_SIG=null; // force the first paint of this visit
-  render();
-  if(!MACHINE_MEM_POLLING) pollMachineMem();
-};
+// (#1508) The entry points (goMachine for local, drillMachine for a specific
+// uid) live earlier in the file, near render()/drillMachine — both call
+// pollMachineMem() unconditionally on entry; this loop's own level+identity
+// guard below is what decides whether it actually does anything.
+//
 // Poll-based (NEVER SSE — the #1227 stuck-stream lesson), self-rescheduling
-// like pollLabEvents: each tick checks it's still the current lens before
-// fetching and before scheduling, so navigating away cleanly stops the loop.
+// like pollLabEvents: each tick checks it's still the current LOCAL machine
+// page before fetching and before scheduling, so navigating away — including
+// to a REMOTE machine's page, which the local-vs-remote honesty rule (#1508
+// decision 2) never feeds real figures — cleanly stops the loop.
 async function pollMachineMem(){
-  if(state.level!=="machinemem"){ MACHINE_MEM_POLLING=false; return; }
+  if(state.level!=="machine"||!machineIsLocalNow()){ MACHINE_MEM_POLLING=false; return; }
   MACHINE_MEM_POLLING=true;
   try{
     const r=await fetch("/machine/resources",{headers:{accept:"application/json"}});
     if(r.ok){ MACHINE_MEM=await r.json(); MACHINE_MEM_ERR=false; }
     else MACHINE_MEM_ERR=true;
   }catch(_){ MACHINE_MEM_ERR=true; }
-  if(state.level!=="machinemem"){ MACHINE_MEM_POLLING=false; return; } // navigated away mid-fetch
+  if(state.level!=="machine"||!machineIsLocalNow()){ MACHINE_MEM_POLLING=false; return; } // navigated away mid-fetch
   // The stageSig()/re-render-gap discipline: the structural signature
   // EXCLUDES the always-changing stamps (generated_at_ms / gather_ms), so a
   // poll that changes nothing rebuilds nothing — the volatile stamp line
@@ -3747,7 +3822,7 @@ async function pollMachineMem(){
   const b=MACHINE_MEM||{};
   const sig=MACHINE_MEM_ERR&&!MACHINE_MEM ? "err"
     : JSON.stringify([MACHINE_MEM_ERR,b.models,b.machine,b.pressure,b.pool,b.limit_bytes,b.limit_source,b.attribution,b.attribution_note,b.warnings]);
-  if(sig!==MACHINE_MEM_SIG){ MACHINE_MEM_SIG=sig; renderMachineMem(); }
+  if(sig!==MACHINE_MEM_SIG){ MACHINE_MEM_SIG=sig; renderMachine(); }
   else refreshMachineMemStamp();
   setTimeout(pollMachineMem, MACHINE_MEM_POLL_MS);
 }
@@ -3796,69 +3871,12 @@ function renderMachineMemModel(m, scale, limit){
     ${hint}
   </div>`;
 }
-function renderMachineMem(){
-  $("logscope").textContent="machine";
-  const hdr=`<div class="stagehdr">machine resources · potential vs current</div>`;
-  const b=MACHINE_MEM;
-  if(MACHINE_MEM_ERR&&!b){
-    $("stage").innerHTML=hdr+`<div class="none">daemon not reachable — the machine lens reads live probes via <code>/machine/resources</code> (CLI twin: <code>darkmux machine resources</code>).</div>`;
-    return;
-  }
-  if(!b){
-    $("stage").innerHTML=hdr+`<div class="none">loading…</div>`;
-    return;
-  }
-  // Cached payload but the daemon stopped answering: keep showing the last
-  // snapshot, but SAY it's stale — a silently frozen gauge would be the
-  // exact observability failure this lens exists to prevent.
-  const stale=MACHINE_MEM_ERR?`<div class="memwarn">⚠ daemon unreachable — showing the last snapshot; the figures below are stale</div>`:"";
-  const models=Array.isArray(b.models)?b.models:[];
-  const machine=b.machine||{};
-  const pressure=b.pressure||{};
-  const pool=b.pool||null;
-  const limit=b.limit_bytes!=null?Number(b.limit_bytes):null;
-  const poolCap=pool&&pool.capacity_bytes!=null?Number(pool.capacity_bytes):null;
-  // Per-model bars scale to the largest per-model figure so small models
-  // stay readable; the machine bar scales to the full physical pool (or the
-  // limit when the pool is unreadable) so BOTH the #1243 budget line and the
-  // pool line mean something and headroom is visible at a glance.
-  const perScale=Math.max(1,...models.map(m=>Math.max(Number(m.potential_bytes)||0, Number(m.current_bytes)||0)));
-  const mPot=machine.potential_bytes!=null?Number(machine.potential_bytes):null;
-  const mCur=machine.current_bytes!=null?Number(machine.current_bytes):null;
-  const mScale=Math.max(limit||0, poolCap||0, mPot||0, mCur||0, 1);
-  const mState=memStateCls(machine.state);
-  const limitDesc=b.limit_source==="budget"?"#1243 budget":b.limit_source==="physical_pool"?"physical pool (no budget configured)":"no limit readable";
-  const unpriced=Number(machine.unpriced_models)||0;
-  const machineCard=`<div class="memcard ${mState}">
-    <div class="memhdr"><span class="memname">machine total</span><span class="memstate ${mState}">${esc(machine.state||"unknown")}</span></div>
-    ${memBar(mCur, mPot, mScale, mState, limit, poolCap)}
-    <div class="memmeta">Σ potential ${memBytes(mPot)}${unpriced?` (+${unpriced} unpriced)`:""} · Σ current ${memBytes(mCur)} · limit ${memBytes(limit)} (${esc(limitDesc)})${pool?` · pool ${memBytes(pool.capacity_bytes)} / free ${memBytes(pool.available_bytes)}`:""}</div>
-    ${machine.shrink_hint?`<div class="memhint">↳ ${esc(machine.shrink_hint)}</div>`:""}
-  </div>`;
-  const modelCards=models.length
-    ? models.map(m=>renderMachineMemModel(m, perScale, null)).join("")
-    : `<div class="none">no models loaded.</div>`;
-  const freePct=pressure.memory_free_percent!=null?`${Number(pressure.memory_free_percent)}%`:"—";
-  const pressureCard=`<div class="memcard${pressure.red?" red":""}">
-    <div class="memhdr"><span class="memname">pressure</span>${pressure.red?`<span class="memstate red">red</span>`:""}</div>
-    <div class="memrow"><span class="k">swap used</span><span class="v${pressure.red?" bad":""}">${memBytes(pressure.swap_used_bytes)}</span></div>
-    <div class="memrow"><span class="k">compressor</span><span class="v">${memBytes(pressure.compressor_bytes)}</span></div>
-    <div class="memrow"><span class="k">memory free</span><span class="v${pressure.red?" bad":""}">${esc(freePct)}</span></div>
-  </div>`;
-  const warns=Array.isArray(b.warnings)&&b.warnings.length
-    ? `<div class="memcard"><div class="memhdr"><span class="memname">warnings</span></div>${b.warnings.map(w=>`<div class="memwarn">⚠ ${esc(w)}</div>`).join("")}</div>`
-    : "";
-  const attribution=`attribution: ${b.attribution_note||b.attribution||"—"}`;
-  $("stage").innerHTML=hdr+`<div class="memwrap">
-    ${stale}
-    ${machineCard}
-    ${modelCards}
-    ${pressureCard}
-    ${warns}
-    <div class="memfoot">${esc(attribution)}</div>
-    <div class="memfoot" id="memstamp">${esc(memStampText(b))}</div>
-  </div>`;
-}
+// (#1508) renderMachineMem() retired — its body now lives inline in the
+// unified renderMachine()'s health-region assembly (near the top of the
+// file), gated by isLocalMach so a remote machine's page never shows this
+// daemon's own figures under the wrong name. renderMachineMemModel() above
+// and the memBytes/memPct/memStateCls/memBar/memStampText/refreshMachineMemStamp
+// helpers stay — still called from there.
 
 boot();
 </script>
