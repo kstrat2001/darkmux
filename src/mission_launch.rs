@@ -88,9 +88,11 @@ use std::sync::{Arc, Mutex};
 /// construct in Packet 4a. See the module doc's scope boundary.
 const CODER_PHASE_TIER3_KINDS: &[&str] = &["mission.worktree", "mission.coder", "mission.verify"];
 
-/// The six Tier 3 step kinds `crates/darkmux-lab/src/lab/review.rs` defines
-/// for `review`'s graph (#1352) — wired through as of Packet 4b, but via a
-/// DEDICATED launcher ([`crate::mission_launch_review::launch`]), not this
+/// The five Tier 3 step kinds `crates/darkmux-lab/src/lab/review.rs` defines
+/// for `review`'s graph (#1352; `review.probe`/`review.verify` retired in
+/// #1442 — the probe/verify stages ride the generic Tier-1 `dispatch.map`) —
+/// wired through via a DEDICATED launcher
+/// ([`crate::mission_launch_review::launch`]), not this
 /// module's generic `mission_config::interpret` + `crew::scheduler::
 /// run_step_graph` path. `build_review_graph`/`run_review_graph` already
 /// carry real, working, tested cross-step behavior (a shared remote-token
@@ -187,7 +189,16 @@ pub fn launch(
     // workflow parses byte-for-byte on `--param emit=-`, so nothing
     // decorative may land on stdout ahead of it — `mission_launch_review::
     // launch` prints its own (stderr-only) diagnostics instead.
-    if config.id == "review" {
+    //
+    // (#1530) Routed STRUCTURALLY (does the graph use review kinds?), not by
+    // the literal id `"review"` — the same shape `coder-phase` already uses
+    // via `config_uses_coder_phase_kinds`. This is what lets a differently-
+    // NAMED review variant (e.g. a stored `review-lean` with fewer probe
+    // draws) launch through the same dedicated driver: the driver is already
+    // config-driven (`build_review_graph`/`resolve_review_roles` read the
+    // graph + every declared `role_id` off the document), so the only thing
+    // the old id-literal gated was the NAME, never a capability.
+    if config_uses_review_kinds(config) {
         return crate::mission_launch_review::launch(config, input_file, params, timeout_seconds);
     }
 
@@ -862,6 +873,21 @@ fn config_uses_coder_phase_kinds(config: &MissionConfig) -> bool {
         p.tasks
             .iter()
             .any(|t| t.steps.iter().any(|s| CODER_PHASE_TIER3_KINDS.contains(&s.kind.as_str())))
+    })
+}
+
+/// (#1530) True when the config's graph uses any review-pipeline step kind —
+/// the structural test that routes a review config to its dedicated launcher
+/// (`crate::mission_launch_review::launch`) regardless of the config's `id`.
+/// Mirrors [`config_uses_coder_phase_kinds`]: a config carrying any
+/// `REVIEW_TIER3_KINDS` step is a review-pipeline config and must go through
+/// the driver that owns review bundling/staffing/side-paths, whether it is
+/// named `review`, `review-lean`, or anything else the operator stored.
+fn config_uses_review_kinds(config: &MissionConfig) -> bool {
+    config.phases.iter().any(|p| {
+        p.tasks
+            .iter()
+            .any(|t| t.steps.iter().any(|s| REVIEW_TIER3_KINDS.contains(&s.kind.as_str())))
     })
 }
 
@@ -2336,6 +2362,38 @@ mod tests {
         let missing = missing_required_inputs(&cfg, &BTreeMap::new());
         let names: Vec<&str> = missing.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["workdir"], "mission_id (launcher-supplied) and image (optional) must not appear");
+    }
+
+    // ── #1530: review routes STRUCTURALLY (by its kinds), not by id ──
+
+    fn config_with_kind(id: &str, kind: &str) -> MissionConfig {
+        // Minimal graph carrying one step of `kind`; other fields default.
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": id,
+            "phases": [{
+                "id": "p1",
+                "name": "p1",
+                "tasks": [{ "id": "t1", "steps": [{ "id": "s1", "kind": kind }] }]
+            }]
+        }))
+        .expect("minimal config deserializes")
+    }
+
+    #[test]
+    fn review_routes_by_kind_not_by_the_literal_id() {
+        // The canonical `review` config still routes (kinds present).
+        assert!(config_uses_review_kinds(&config_with_kind("review", "review.judge")));
+        // The whole point of #1530: a differently-NAMED review variant
+        // (`review-lean`) routes to the same dedicated driver — the old
+        // `id == "review"` literal would have missed it and dropped it onto
+        // the generic path, which cannot construct the review kinds.
+        assert!(config_uses_review_kinds(&config_with_kind("review-lean", "review.synthesis")));
+        // A non-review graph does NOT route to the review driver.
+        assert!(!config_uses_review_kinds(&config_with_kind("something", "dispatch.internal")));
+        // And a config named "review" with no review kinds is NOT forced to
+        // the review driver — routing is the graph's shape, never the name.
+        assert!(!config_uses_review_kinds(&config_with_kind("review", "dispatch.single_shot")));
     }
 
     // ── #1400: lazy phase start ("phase 2 stays planned until reached") ──
