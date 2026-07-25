@@ -12,29 +12,11 @@
     /// each kind returns.
     #[test]
     fn mission_step_kind_display_names_match_this_crates_static_table() {
-        let worktree = MissionWorktreeStepKind {
-            repo_root: std::path::PathBuf::new(),
-            wt_path: std::path::PathBuf::new(),
-            branch: String::new(),
-            base: String::new(),
-            mission_id: String::new(),
-            phase_id: String::new(),
-            session_id: String::new(),
-            role: String::new(),
-        };
-        let coder = MissionCoderStepKind {
-            opts: Mutex::new(None),
-            wt_path: std::path::PathBuf::new(),
-            mission_id: String::new(),
-            phase_id: String::new(),
-            session_id: String::new(),
-            role_id: String::new(),
-        };
-        let verify = MissionVerifyStepKind {
-            wt_path: std::path::PathBuf::new(),
-            base: String::new(),
-            phase_id: String::new(),
-        };
+        // (#1530 Packet 3b-1) All three kinds are now stateless unit
+        // structs — no per-run fields to fill in.
+        let worktree = MissionWorktreeStepKind;
+        let coder = MissionCoderStepKind;
+        let verify = MissionVerifyStepKind;
         for (id, display) in [
             (worktree.id(), worktree.display_name()),
             (coder.id(), coder.display_name()),
@@ -1161,7 +1143,13 @@ edit loop detected on src/widget.rs in an earlier dispatch
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
 
         let wt_path = tmp.path().join("worktrees").join("s1");
-        let kind = MissionWorktreeStepKind {
+        // (#1530 Packet 3b-1) `MissionWorktreeStepKind` is now a stateless
+        // unit struct — the run's identity comes off the run-scoped
+        // `ArtifactBus` (`CODER_CONTEXT_ARTIFACT`), read via `run_streaming`.
+        // Hand-build a bus seeded with the context, exactly the seam
+        // `StepRunCtx::new`'s own doc names for out-of-scheduler unit tests.
+        let kind = MissionWorktreeStepKind;
+        let ctx = Arc::new(CoderPhaseContext {
             repo_root: main_repo.clone(),
             wt_path: wt_path.clone(),
             branch: "darkmux/s1".to_string(),
@@ -1170,7 +1158,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
             phase_id: "s1".to_string(),
             session_id: "mission-run-m1-s1".to_string(),
             role: "coder".to_string(),
-        };
+        });
+        let mut bus = crew::step_kinds::ArtifactBus::new();
+        bus.seed(CODER_CONTEXT_ARTIFACT, ctx as Arc<dyn std::any::Any + Send + Sync>);
+        let run_ctx = crew::step_kinds::StepRunCtx::new(None, None, None, Arc::new(bus));
         let step = crew::types::Step {
             id: "s1-worktree-step".to_string(),
             task_id: "s1-worktree".to_string(),
@@ -1183,14 +1174,18 @@ edit loop detected on src/widget.rs in an earlier dispatch
         };
         let task = test_task("s1-worktree");
 
-        let outcome = kind.run(&step, &task, &std::collections::BTreeMap::new()).unwrap();
+        let outcome = kind
+            .run_streaming(&step, &task, &std::collections::BTreeMap::new(), &run_ctx)
+            .unwrap();
         assert!(wt_path.is_dir(), "worktree dir must exist after a clean run");
         assert_eq!(outcome.output, wt_path.display().to_string());
 
         // A second run against the SAME phase (the resumed-run case) must
         // fail loud, not silently clobber — same contract `add_worktree`
         // always had.
-        let err = kind.run(&step, &task, &std::collections::BTreeMap::new()).unwrap_err();
+        let err = kind
+            .run_streaming(&step, &task, &std::collections::BTreeMap::new(), &run_ctx)
+            .unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
     }
 
@@ -1223,25 +1218,34 @@ edit loop detected on src/widget.rs in an earlier dispatch
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows.path()) };
 
-        // (#1530 Packet 2) `MissionVerifyStepKind` now writes its result
+        // (#1530 Packets 2/3b-1) `MissionVerifyStepKind` writes its result
         // onto the run-scoped `ArtifactBus` (via `run_streaming`), not a
-        // constructor-field slot — hand-build a bus seeded with `slot` (the
-        // same `ArtifactBus::seed` caller-seed path `register_coder_phase_kinds`
-        // uses in production) and a `StepRunCtx` around it, exactly the seam
-        // `StepRunCtx::new`'s own doc names for out-of-scheduler unit tests.
+        // constructor-field slot, and is now a stateless unit struct — the
+        // run's identity comes off the SAME bus via `CODER_CONTEXT_ARTIFACT`.
+        // Hand-build a bus seeded with both (the same `ArtifactBus::seed`
+        // caller-seed path `register_coder_phase_kinds` uses in production)
+        // and a `StepRunCtx` around it, exactly the seam `StepRunCtx::new`'s
+        // own doc names for out-of-scheduler unit tests.
         let slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>> =
             Arc::new(Mutex::new(None));
+        let ctx = Arc::new(CoderPhaseContext {
+            repo_root: repo.clone(),
+            wt_path: repo.clone(),
+            branch: "darkmux/s1".to_string(),
+            base: "main".to_string(),
+            mission_id: "m1".to_string(),
+            phase_id: "s1".to_string(),
+            session_id: "mission-run-m1-s1".to_string(),
+            role: "coder".to_string(),
+        });
         let mut bus = crew::step_kinds::ArtifactBus::new();
         bus.seed(
             CODER_VERIFY_RESULT_ARTIFACT,
             slot.clone() as Arc<dyn std::any::Any + Send + Sync>,
         );
+        bus.seed(CODER_CONTEXT_ARTIFACT, ctx as Arc<dyn std::any::Any + Send + Sync>);
         let run_ctx = crew::step_kinds::StepRunCtx::new(None, None, None, Arc::new(bus));
-        let kind = MissionVerifyStepKind {
-            wt_path: repo.clone(),
-            base: "main".to_string(),
-            phase_id: "s1".to_string(),
-        };
+        let kind = MissionVerifyStepKind;
         let step = crew::types::Step {
             id: "s1-verify-step".to_string(),
             task_id: "s1-verify".to_string(),
