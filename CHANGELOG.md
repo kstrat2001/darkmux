@@ -9,6 +9,19 @@ without deprecation shims). Roadmap **milestones** (`M1`/`M2`/`M3`…) are
 intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 `FLOW_SCHEMA` data-shape contracts version on their own cadence (see `CLAUDE.md`).
 
+## [2.2.0] - 2026-07-25
+
+### Added
+- **`/runs` aggregator** (#1523) — one flat, kind-tagged read-model unioning missions + lab runs + flow into a single per-request view (the data layer for the upcoming Runs lens). Read-side union only; no new persistence.
+- **Unified machine page** (#1522) — the machine tab and fleet-drill converge on one lightweight page: a live residency/RAM health region plus a runs list, honest about local-vs-remote ("not reported from here" for a machine probed elsewhere).
+
+### Fixed
+- **Remote runs render honestly** (#1518) — a run served off-fleet on a hosted endpoint (e.g. Azure) no longer shows the box's incidental local LMStudio residency as the run's model; route + model resolve from the run's endpoint.
+- **Concise review comments** (#1528) — the per-finding "needs frontier verification" note now renders once on the verdict line instead of repeating on every finding.
+- **Review runs stamp `mission_id`** (#1523) — the review pipeline's dispatch bookends now carry their mission id, so a review appears as exactly one row in `/runs` (no spurious untracked-ghost duplicate) with its route on the right row.
+
+[2.2.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.2.0
+
 ## [Unreleased]
 
 ## [2.1.0] - 2026-07-22
