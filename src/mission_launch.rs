@@ -403,6 +403,7 @@ pub fn launch(
             &real_phase_ids,
             &collected,
             timeout_seconds,
+            &mut steps,
         ) {
             Ok(h) => Some(h),
             Err(e) => {
@@ -429,16 +430,16 @@ pub fn launch(
     // (#1400) Tracks which phases this dispatch has already lazy-started —
     // see `lazy_start_phase_for_step`'s doc.
     let mut started_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // (#1530 Packet 2) The coder-phase kinds' two structured-result slots,
-    // seeded onto the run-scoped `ArtifactBus` via `run_step_graph`'s
-    // caller-seed path — `coder_handles` already OWNS the `Arc` clones
-    // (`CoderPhaseHandles::coder_slot`/`verify_slot`, minted in
-    // `register_coder_phase_kinds`), so this is a pure hand-off: the SAME
-    // instance the kinds write into (via `StepRunCtx::artifact`) is what
-    // `coder_phase_gate_outcome` reads back below, directly off `handles`,
-    // once the graph returns. Empty (`&[]`) on every non-coder-phase graph —
-    // zero behavior change there, mirroring `run_review_graph`'s own
-    // `seed_artifacts` shape (#1530 Packet 1).
+    // (#1530 Packets 2/3b-1) The coder-phase kinds' two structured-result
+    // slots, plus the run's identity context, seeded onto the run-scoped
+    // `ArtifactBus` via `run_step_graph`'s caller-seed path — `coder_handles`
+    // already OWNS the `Arc` clones (`CoderPhaseHandles::coder_slot`/
+    // `verify_slot`/`context`, minted in `register_coder_phase_kinds`), so
+    // this is a pure hand-off: the SAME instance the kinds write into (via
+    // `StepRunCtx::artifact`) is what `coder_phase_gate_outcome` reads back
+    // below, directly off `handles`, once the graph returns. Empty (`&[]`) on
+    // every non-coder-phase graph — zero behavior change there, mirroring
+    // `run_review_graph`'s own `seed_artifacts` shape (#1530 Packet 1).
     let seed_artifacts: Vec<(&'static str, Arc<dyn Any + Send + Sync>)> = match &coder_handles {
         Some(h) => vec![
             (coder_phase::CODER_RESULT_ARTIFACT, h.coder_slot.clone() as Arc<dyn Any + Send + Sync>),
@@ -446,6 +447,7 @@ pub fn launch(
                 coder_phase::CODER_VERIFY_RESULT_ARTIFACT,
                 h.verify_slot.clone() as Arc<dyn Any + Send + Sync>,
             ),
+            (coder_phase::CODER_CONTEXT_ARTIFACT, h.context.clone() as Arc<dyn Any + Send + Sync>),
         ],
         None => Vec::new(),
     };
@@ -907,19 +909,25 @@ fn launch_session_id(mission_id: &str, real_phase_id: &str) -> String {
 /// contract can't carry the rich verdict/verifier detail), plus the
 /// launch-resolved identifiers the gate banners print.
 ///
-/// (#1530 Packet 2) `coder_slot`/`verify_slot` are the SAME `Arc`s `launch`
-/// seeds onto the run-scoped `ArtifactBus` (`coder_phase::
-/// CODER_RESULT_ARTIFACT`/`CODER_VERIFY_RESULT_ARTIFACT`) before calling
-/// `run_step_graph` — `MissionCoderStepKind`/`MissionVerifyStepKind` write
-/// into them via `StepRunCtx::artifact` inside `run_streaming`, and this
-/// struct's fields are simply the caller's own clone of that hand-off, read
-/// directly (no bus access needed post-run — `run_step_graph` exposes none;
-/// see `coder_phase.rs`'s artifact-name doc for the full reasoning). The
-/// field TYPES/NAMES are unchanged from the pre-#1530-Packet-2 bespoke-slot
-/// shape; only WHERE the writing kinds reach the slot moved.
+/// (#1530 Packets 2/3b-1) `coder_slot`/`verify_slot`/`context` are the SAME
+/// `Arc`s `launch` seeds onto the run-scoped `ArtifactBus` (`coder_phase::
+/// CODER_RESULT_ARTIFACT`/`CODER_VERIFY_RESULT_ARTIFACT`/
+/// `CODER_CONTEXT_ARTIFACT`) before calling `run_step_graph` —
+/// `MissionWorktreeStepKind`/`MissionCoderStepKind`/`MissionVerifyStepKind`
+/// read/write them via `StepRunCtx::artifact` inside `run_streaming` (and,
+/// for `context`, `residency()` too), and this struct's fields are simply
+/// the caller's own clone of that hand-off, read directly (no bus access
+/// needed post-run — `run_step_graph` exposes none; see `coder_phase.rs`'s
+/// artifact-name doc for the full reasoning). `coder_slot`/`verify_slot`'s
+/// TYPES/NAMES are unchanged from the pre-#1530-Packet-2 bespoke-slot shape;
+/// `context` is new in Packet 3b-1 — the three kinds no longer hold
+/// `workdir`/`branch`/`real_phase_id`/`role` etc. as constructor fields, so
+/// nothing else keeps that data alive for `launch`'s `seed_artifacts` call
+/// except this handle.
 pub(crate) struct CoderPhaseHandles {
     coder_slot: Arc<Mutex<Option<coder_phase::CoderStepResult>>>,
     verify_slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>,
+    context: Arc<coder_phase::CoderPhaseContext>,
     workdir: std::path::PathBuf,
     branch: String,
     real_phase_id: String,
@@ -935,6 +943,16 @@ pub(crate) struct CoderPhaseHandles {
 /// `run_step_graph` to decide the gate outcome — and also, since #1530
 /// Packet 2, seeds onto the `ArtifactBus` via `run_step_graph`'s
 /// `seed_artifacts` parameter (see `launch`'s own call site).
+///
+/// (#1530 Packet 3b-1) The three kinds registered below are now stateless
+/// singletons — the run's identity (repo_root/wt_path/branch/base/
+/// mission_id/phase_id/session_id/role) is stamped onto `CoderPhaseContext`
+/// instead of onto per-kind constructor fields, and `steps` (the SAME
+/// interpreted graph `launch` is about to run) is mutated in place to stamp
+/// the coder step's own `message`/`timeout_seconds`/`image` onto its
+/// `Step.config` — the same "compute once, stamp, read back in
+/// `run_streaming`" pattern `darkmux-lab`'s `build_review_graph_from_config`
+/// uses for the review judge seat's staffing (#1530 Packet 3a).
 fn register_coder_phase_kinds(
     registry: &crew::step_kinds::StepKindRegistry,
     mission_id: &str,
@@ -942,6 +960,7 @@ fn register_coder_phase_kinds(
     real_phase_ids: &BTreeMap<String, String>,
     collected: &BTreeMap<String, serde_json::Value>,
     timeout_seconds: u32,
+    steps: &mut BTreeMap<String, crew::types::Step>,
 ) -> Result<CoderPhaseHandles> {
     let require = |name: &str| -> Result<String> {
         collected
@@ -986,68 +1005,55 @@ fn register_coder_phase_kinds(
 
     let repo_root = coder_phase::repo_root()?;
     registry
-        .register(Arc::new(coder_phase::MissionWorktreeStepKind {
-            repo_root,
-            wt_path: workdir.clone(),
-            branch: branch.clone(),
-            base: base.clone(),
-            mission_id: mission_id.to_string(),
-            phase_id: real_phase_id.clone(),
-            session_id: session_id.clone(),
-            role: role.clone(),
-        }))
+        .register(Arc::new(coder_phase::MissionWorktreeStepKind))
         .map_err(|e| anyhow!("registering mission.worktree: {e}"))?;
-
-    let opts = crew::dispatch::DispatchOpts {
-        role_id: role.clone(),
-        // (#1426 ship-4) The coder brief carries the same injected context the
-        // retired `mission run` gathered — prior adjudication corrections
-        // (#849), detector cautions (#994), engagement lessons — ranked and
-        // budgeted (#1011), with the operator-facing provenance lines. The
-        // collapse makes launch the only coder path, so this is where the
-        // doom-loop fix now lives.
-        message: coder_phase::coder_brief_with_injected_context(
-            mission_id, &mission, &phase, &workdir,
-        )?,
-        session_id: Some(session_id.clone()),
-        timeout_seconds,
-        skip_preflight: false,
-        json: true,
-        workdir: Some(workdir.clone()),
-        phase_id: Some(real_phase_id.clone()),
-        machine: None,
-        wait: true,
-        compaction: crew::dispatch::CompactionDispatchArgs::default(),
-        profile_name: None,
-        config_path: None,
-        force_container: false,
-        max_completion_tokens: None,
-        image: image.clone(),
-        model_base_url_override: None,
-        step_id: None, // (#1483) set on the graph-step path only
-    };
     registry
-        .register(Arc::new(coder_phase::MissionCoderStepKind {
-            opts: Mutex::new(Some(opts)),
-            wt_path: workdir.clone(),
-            mission_id: mission_id.to_string(),
-            phase_id: real_phase_id.clone(),
-            session_id: session_id.clone(),
-            role_id: role,
-        }))
+        .register(Arc::new(coder_phase::MissionCoderStepKind))
         .map_err(|e| anyhow!("registering mission.coder: {e}"))?;
-
     registry
-        .register(Arc::new(coder_phase::MissionVerifyStepKind {
-            wt_path: workdir.clone(),
-            base,
-            phase_id: real_phase_id.clone(),
-        }))
+        .register(Arc::new(coder_phase::MissionVerifyStepKind))
         .map_err(|e| anyhow!("registering mission.verify: {e}"))?;
+
+    // (#1530 Packet 3b-1) The coder brief carries the same injected context
+    // the retired `mission run` gathered — prior adjudication corrections
+    // (#849), detector cautions (#994), engagement lessons — ranked and
+    // budgeted (#1011), with the operator-facing provenance lines (#1426
+    // ship-4). Computed here, exactly ONCE, at the same point in the
+    // sequence it always was (before the graph runs) — `MissionCoderStepKind
+    // ::run_streaming` reads the result back off `Step.config` rather than
+    // recomputing it, which would double-print the provenance lines and
+    // re-walk disk for no behavior change.
+    let message =
+        coder_phase::coder_brief_with_injected_context(mission_id, &mission, &phase, &workdir)?;
+    let coder_step_id = format!("{real_phase_id}-coder-step");
+    let coder_step = steps.get_mut(&coder_step_id).ok_or_else(|| {
+        anyhow!(
+            "mission launch: internal error — no `{coder_step_id}` step in the interpreted \
+             `{}` graph",
+            config.id
+        )
+    })?;
+    coder_step.config = serde_json::json!({
+        "message": message,
+        "timeout_seconds": timeout_seconds,
+        "image": image,
+    });
+
+    let context = Arc::new(coder_phase::CoderPhaseContext {
+        repo_root,
+        wt_path: workdir.clone(),
+        branch: branch.clone(),
+        base,
+        mission_id: mission_id.to_string(),
+        phase_id: real_phase_id.clone(),
+        session_id: session_id.clone(),
+        role,
+    });
 
     Ok(CoderPhaseHandles {
         coder_slot,
         verify_slot,
+        context,
         workdir,
         branch,
         real_phase_id,
@@ -1870,10 +1876,40 @@ mod tests {
         let mission_id = mint_run_id("coder-phase").unwrap();
         let real_phase_ids = ensure_mission_and_phases_with_provenance(&mission_id, config, None, None).unwrap();
 
+        // (#1530 Packet 3b-1) `register_coder_phase_kinds` now stamps the
+        // coder step's own `message`/`timeout_seconds`/`image` onto
+        // `Step.config` — it needs `steps` to contain the interpreted
+        // graph's `<real-phase-id>-coder-step` entry, the same convention
+        // `coder_phase_gate_outcome` already assumes. The built-in
+        // `coder-phase` config's only phase doc id is `"build"`.
+        let real_phase_id = real_phase_ids["build"].clone();
+        let coder_step_id = format!("{real_phase_id}-coder-step");
+        let mut steps = BTreeMap::new();
+        steps.insert(
+            coder_step_id.clone(),
+            crew::types::Step {
+                id: coder_step_id,
+                task_id: format!("{real_phase_id}-coder"),
+                kind: "mission.coder".to_string(),
+                status: NodeStatus::Planned,
+                config: serde_json::Value::Null,
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
+        );
+
         let registry = crew::step_kinds::StepKindRegistry::with_builtins();
-        let handles =
-            register_coder_phase_kinds(&registry, &mission_id, config, &real_phase_ids, &collected, 600)
-                .expect("registration must succeed against a real repo + valid inputs");
+        let handles = register_coder_phase_kinds(
+            &registry,
+            &mission_id,
+            config,
+            &real_phase_ids,
+            &collected,
+            600,
+            &mut steps,
+        )
+        .expect("registration must succeed against a real repo + valid inputs");
 
         for kind in CODER_PHASE_TIER3_KINDS {
             assert!(registry.get(kind).is_ok(), "kind `{kind}` must be registered");
@@ -1899,8 +1935,19 @@ mod tests {
         let mission_id = mint_run_id("coder-phase").unwrap();
         let real_phase_ids = ensure_mission_and_phases_with_provenance(&mission_id, config, None, None).unwrap();
         let registry = crew::step_kinds::StepKindRegistry::with_builtins();
-        let err = match register_coder_phase_kinds(&registry, &mission_id, config, &real_phase_ids, &collected, 600)
-        {
+        // (#1530 Packet 3b-1) The missing-input bail fires before
+        // `register_coder_phase_kinds` ever touches `steps` — an empty map
+        // is sufficient here.
+        let mut steps = BTreeMap::new();
+        let err = match register_coder_phase_kinds(
+            &registry,
+            &mission_id,
+            config,
+            &real_phase_ids,
+            &collected,
+            600,
+            &mut steps,
+        ) {
             Err(e) => e,
             Ok(_) => panic!("must bail without workdir/branch/base supplied"),
         };
@@ -1939,6 +1986,11 @@ mod tests {
                 tokens_total: 123,
             }))),
             verify_slot: Arc::new(Mutex::new(None)),
+            // (#1530 Packet 3b-1) `coder_phase_gate_outcome` (the only
+            // consumer of `scripted_gate_fixture`'s output) never reads
+            // `context` — it's scripted here purely to satisfy the struct's
+            // field list.
+            context: Arc::new(coder_phase::CoderPhaseContext::default()),
             workdir: std::path::PathBuf::from("/tmp/gate-test-worktree"),
             branch: "gate-test-branch".to_string(),
             real_phase_id: phase_id.to_string(),

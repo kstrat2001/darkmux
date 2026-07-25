@@ -473,6 +473,59 @@ fn make_coder_verify_result_artifact() -> Arc<dyn Any + Send + Sync> {
     ))
 }
 
+// ─── #1530 Packet 3b-1: run-scoped ArtifactBus context artifact ───────────
+//
+// `MissionWorktreeStepKind`/`MissionCoderStepKind`/`MissionVerifyStepKind`
+// USED to hold the run's identity (repo_root/wt_path/branch/base/mission_id/
+// phase_id/session_id/role) as plain constructor fields, minted fresh by
+// `register_coder_phase_kinds` on every `mission launch coder-phase` call —
+// the ONLY reason those kinds couldn't yet register into a single global,
+// process-lifetime registry (`darkmux-lab`'s review pipeline had the exact
+// same shape before #1530 Packet 3a; see that packet's `ReviewStepContext`
+// doc for the identical reasoning). Packet 3b-1 closes the same gap here:
+// the run's identity now lives on the run-scoped `ArtifactBus` under
+// [`CODER_CONTEXT_ARTIFACT`], and all three kinds are stateless (unit)
+// structs that read it via `StepRunCtx::artifact` inside `run_streaming`
+// (and `residency()`, which gained a `&StepRunCtx` parameter in Packet 3a
+// for exactly this kind of read).
+//
+// Data used by only ONE of the three kinds does NOT move onto this shared
+// context — it moves to THAT kind's own `Step.config` instead, stamped once
+// by `register_coder_phase_kinds` at build time and read back in
+// `run_streaming`, mirroring how #1530 Packet 3a stamped the review judge
+// seat's model/passes/max_tokens onto `review-judge-step`'s own config
+// rather than widening `ReviewStepContext`. The coder step's `DispatchOpts`
+// is the one genuine wrinkle here (see `MissionCoderStepKind::run_streaming`'s
+// own doc): `message`/`timeout_seconds`/`image` are stamped onto the coder
+// step's config instead of surviving as a `Mutex<Option<DispatchOpts>>`
+// take-once constructor field — `DispatchOpts` itself isn't `Clone`, so
+// `run_streaming` rebuilds it fresh from context + config on every call
+// (only ever once per step in production) rather than caching a pre-built
+// instance.
+pub(crate) const CODER_CONTEXT_ARTIFACT: &str = "coder.context";
+
+/// (#1530 Packet 3b-1) Context-free default for [`CODER_CONTEXT_ARTIFACT`] —
+/// ALWAYS overwritten by `register_coder_phase_kinds`'s caller-seed (via
+/// `launch`'s `seed_artifacts` call) before any step reads it — see this
+/// constant's module-doc note above. `Clone`/`Default` are new derives added
+/// FOR this purpose (every field is itself `Default`); nothing about the
+/// per-field semantics changes from the constructor fields they replace.
+#[derive(Clone, Default)]
+pub(crate) struct CoderPhaseContext {
+    pub(crate) repo_root: PathBuf,
+    pub(crate) wt_path: PathBuf,
+    pub(crate) branch: String,
+    pub(crate) base: String,
+    pub(crate) mission_id: String,
+    pub(crate) phase_id: String,
+    pub(crate) session_id: String,
+    pub(crate) role: String,
+}
+
+fn make_coder_context_artifact() -> Arc<dyn Any + Send + Sync> {
+    Arc::new(CoderPhaseContext::default())
+}
+
 /// Wraps the worktree-creation half of the old hand-written sequence
 /// (moved here verbatim from the pre-migration `add_worktree` free
 /// function, deleted below — this was its only caller). Printing + the
@@ -500,16 +553,10 @@ fn make_coder_verify_result_artifact() -> Arc<dyn Any + Send + Sync> {
 // near-identical struct) keeps the `mission.worktree` flow-record shape and
 // `darkmux-serve`'s `/diff` contract (see this struct's own doc above)
 // byte-identical across both launchers.
-pub(crate) struct MissionWorktreeStepKind {
-    pub(crate) repo_root: PathBuf,
-    pub(crate) wt_path: PathBuf,
-    pub(crate) branch: String,
-    pub(crate) base: String,
-    pub(crate) mission_id: String,
-    pub(crate) phase_id: String,
-    pub(crate) session_id: String,
-    pub(crate) role: String,
-}
+/// (#1530 Packet 3b-1) A stateless singleton — no per-run constructor
+/// fields. It reads the run's identity off the run-scoped `ArtifactBus`
+/// instead (see [`CODER_CONTEXT_ARTIFACT`]'s module-doc note).
+pub(crate) struct MissionWorktreeStepKind;
 
 impl StepKind for MissionWorktreeStepKind {
     fn id(&self) -> &'static str {
@@ -520,48 +567,69 @@ impl StepKind for MissionWorktreeStepKind {
         "Worktree"
     }
 
-    /// (#1530 Packet 2) Declares the `Data` port the downstream
+    /// (#1530 Packets 2/3b-1) Declares the `Data` port the downstream
     /// `mission.coder`/`mission.verify` steps conceptually depend on — the
-    /// worktree this kind creates. Annotation only (`Port::data`'s doc): the
-    /// REAL dependency is `Task::depends_on` (the graph's linear chain), and
-    /// the downstream kinds read the worktree path from their own
-    /// constructor field (`wt_path`), not through `Step.output`/`input`
-    /// wiring. No `Artifact` port — this kind shares no run-scoped mutable
-    /// state with any other step.
+    /// worktree this kind creates — plus [`CODER_CONTEXT_ARTIFACT`]: this is
+    /// the pipeline's EARLIEST consumer of the run-scoped context (the
+    /// graph's first step), so declaring `provides()` here is sufficient
+    /// regardless of which wave the other two consumers land in (mirrors
+    /// `darkmux-lab`'s `ReviewBundleStepKind::provides()`'s own reasoning).
+    /// `register_coder_phase_kinds`'s caller-seed always overwrites this
+    /// factory's context-free default with the real, run-stamped value
+    /// before any step reads it. `Port::data("worktree")` is annotation
+    /// only (`Port::data`'s doc): the REAL dependency is `Task::depends_on`
+    /// (the graph's linear chain).
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data("worktree")];
+        const PORTS: [Port; 2] =
+            [Port::data("worktree"), Port::artifact(CODER_CONTEXT_ARTIFACT, make_coder_context_artifact)];
         &PORTS
     }
 
     fn run(
         &self,
-        step: &crew::types::Step,
+        _step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
     ) -> Result<StepOutcome> {
-        add_worktree(&self.repo_root, &self.wt_path, &self.branch, &self.base)?;
+        panic!(
+            "MissionWorktreeStepKind only runs through `run_streaming` — it reads the run-scoped \
+             ArtifactBus (#1530 Packet 3b-1)"
+        )
+    }
+
+    fn run_streaming(
+        &self,
+        step: &crew::types::Step,
+        _task: &crew::types::Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        run_ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let ctx = run_ctx
+            .artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)
+            .expect("register_coder_phase_kinds seeds the coder.context artifact before the graph runs");
+        add_worktree(&ctx.repo_root, &ctx.wt_path, &ctx.branch, &ctx.base)?;
 
         println!(
             "{}",
-            style::success(&format!("✓ worktree ready at {}", self.wt_path.display()))
+            style::success(&format!("✓ worktree ready at {}", ctx.wt_path.display()))
         );
         emit_step_result(
             flow::Level::Info,
             "mission.worktree",
             &step.id,
-            &self.mission_id,
-            &self.phase_id,
-            &self.session_id,
+            &ctx.mission_id,
+            &ctx.phase_id,
+            &ctx.session_id,
             serde_json::json!({
-                "role": self.role,
-                "base": self.base,
-                "branch": self.branch,
-                "worktree": self.wt_path.display().to_string(),
+                "role": ctx.role,
+                "base": ctx.base,
+                "branch": ctx.branch,
+                "worktree": ctx.wt_path.display().to_string(),
             }),
         );
 
         Ok(StepOutcome {
-            output: self.wt_path.display().to_string(),
+            output: ctx.wt_path.display().to_string(),
             flow_records: Vec::new(),
         })
     }
@@ -613,15 +681,24 @@ pub(crate) struct CoderStepResult {
 /// rich detail back through are all real behavior/envelope differences a
 /// collapse would have to change or drop — outside this packet's
 /// pure-refactor scope. Left documented, not forced.
+///
+/// (#1530 Packet 3b-1) A stateless singleton — no `Mutex<Option<DispatchOpts>>`
+/// take-once constructor field, no `wt_path`/`mission_id`/`phase_id`/
+/// `session_id`/`role_id`. The run's identity comes off the `ArtifactBus`
+/// ([`CODER_CONTEXT_ARTIFACT`]); `DispatchOpts`'s three remaining
+/// step-specific fields (`message`/`timeout_seconds`/`image`) come off this
+/// step's own `Step.config`, stamped once by `register_coder_phase_kinds`
+/// (which still computes `message` via `coder_brief_with_injected_context`
+/// exactly ONCE, at the same point in the sequence it always did — before
+/// the graph runs — so the operator-facing provenance lines it prints keep
+/// their pre-#1530 console ordering). `run_streaming` below rebuilds
+/// `DispatchOpts` fresh from context + config on every call — `DispatchOpts`
+/// itself isn't `Clone`, so there's no instance to cache; this kind's
+/// `run_streaming` only ever runs once per step in production anyway, so a
+/// take-once `Mutex` slot bought nothing here that a plain rebuild doesn't
+/// already give for free.
 // (#1284 Packet 4a) `pub(crate)` — see `MissionWorktreeStepKind`'s doc.
-pub(crate) struct MissionCoderStepKind {
-    pub(crate) opts: Mutex<Option<crew::dispatch::DispatchOpts>>,
-    pub(crate) wt_path: PathBuf,
-    pub(crate) mission_id: String,
-    pub(crate) phase_id: String,
-    pub(crate) session_id: String,
-    pub(crate) role_id: String,
-}
+pub(crate) struct MissionCoderStepKind;
 
 impl StepKind for MissionCoderStepKind {
     fn id(&self) -> &'static str {
@@ -632,13 +709,16 @@ impl StepKind for MissionCoderStepKind {
         "Coder"
     }
 
-    /// (#1530 Packet 2) Consumes the worktree the `mission.worktree` step
-    /// creates (annotation only — see `MissionWorktreeStepKind::provides`'s
-    /// doc); provides its own plain-text `Step.output` summary AND the
-    /// [`CODER_RESULT_ARTIFACT`] handle `register_coder_phase_kinds` reads
-    /// back after the run.
+    /// (#1530 Packets 2/3b-1) Consumes the worktree the `mission.worktree`
+    /// step creates (annotation only — see `MissionWorktreeStepKind::
+    /// provides`'s doc) and reads `CODER_CONTEXT_ARTIFACT` which that same
+    /// step's `provides()` declares — so it does not need to declare it
+    /// again here (`Port::artifact`'s factory is never invoked for a
+    /// `requires()` port — see `ReviewJudgeStepKind::requires()`'s doc in
+    /// `darkmux-lab` for the identical reasoning).
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data("worktree")];
+        const PORTS: [Port; 2] =
+            [Port::data("worktree"), Port::artifact(CODER_CONTEXT_ARTIFACT, make_coder_context_artifact)];
         &PORTS
     }
 
@@ -655,8 +735,8 @@ impl StepKind for MissionCoderStepKind {
         _input: &std::collections::BTreeMap<String, String>,
     ) -> Result<StepOutcome> {
         panic!(
-            "MissionCoderStepKind only runs through `run_streaming` — it writes the run-scoped \
-             ArtifactBus (#1530 Packet 2)"
+            "MissionCoderStepKind only runs through `run_streaming` — it reads/writes the \
+             run-scoped ArtifactBus (#1530 Packet 3b-1)"
         )
     }
 
@@ -665,28 +745,70 @@ impl StepKind for MissionCoderStepKind {
         step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
-        ctx: &StepRunCtx,
+        run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        let result_slot = ctx
+        let result_slot = run_ctx
             .artifact::<Mutex<Option<CoderStepResult>>>(CODER_RESULT_ARTIFACT)
             .expect("register_coder_phase_kinds seeds the coder.result artifact before the graph runs");
-        let mut opts = self
-            .opts
-            .lock()
-            .expect("mission.coder opts mutex poisoned")
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("mission.coder step ran more than once"))?;
-        // (#1483) Stamp the graph step id so the live trajectory tailer can
-        // attribute this AGENTIC seat's per-turn / per-tool / per-token flow
-        // records to the coder seat card. The coder dispatch runs under the
-        // shared `mission-run-<…>` session (NOT the `step-<id>` default the
-        // viewer's session->step map resolves), so without the step id its
-        // live turn+tool climb was unattributable and the seat never ticked.
-        opts.step_id = Some(step.id.clone());
+        let ctx = run_ctx
+            .artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)
+            .expect("register_coder_phase_kinds seeds the coder.context artifact before the graph runs");
+
+        // (#1530 Packet 3b-1) Rebuild `DispatchOpts` fresh from the run-scoped
+        // context plus this step's own stamped config — see this struct's
+        // own doc for why a rebuild replaces the former take-once `Mutex`
+        // slot. `message`/`timeout_seconds`/`image` are the three fields
+        // `register_coder_phase_kinds` computed once at build time and
+        // can't be cheaply re-derived here (the brief assembly prints
+        // operator-facing provenance lines — recomputing would double-print
+        // and re-walk disk); everything else is either a constant every
+        // coder-phase dispatch has always used, or comes straight off the
+        // context.
+        let message = step
+            .config
+            .get("message")
+            .and_then(|v| v.as_str())
+            .expect("register_coder_phase_kinds always stamps \"message\" onto the coder step's config")
+            .to_string();
+        let timeout_seconds = step
+            .config
+            .get("timeout_seconds")
+            .and_then(|v| v.as_u64())
+            .expect("register_coder_phase_kinds always stamps \"timeout_seconds\" onto the coder step's config")
+            as u32;
+        let image = step.config.get("image").and_then(|v| v.as_str()).map(String::from);
+
+        let opts = crew::dispatch::DispatchOpts {
+            role_id: ctx.role.clone(),
+            message,
+            session_id: Some(ctx.session_id.clone()),
+            timeout_seconds,
+            skip_preflight: false,
+            json: true,
+            workdir: Some(ctx.wt_path.clone()),
+            phase_id: Some(ctx.phase_id.clone()),
+            machine: None,
+            wait: true,
+            compaction: crew::dispatch::CompactionDispatchArgs::default(),
+            profile_name: None,
+            config_path: None,
+            force_container: false,
+            max_completion_tokens: None,
+            image,
+            model_base_url_override: None,
+            // (#1483) Stamp the graph step id so the live trajectory tailer
+            // can attribute this AGENTIC seat's per-turn / per-tool /
+            // per-token flow records to the coder seat card. The coder
+            // dispatch runs under the shared `mission-run-<…>` session (NOT
+            // the `step-<id>` default the viewer's session->step map
+            // resolves), so without the step id its live turn+tool climb
+            // was unattributable and the seat never ticked.
+            step_id: Some(step.id.clone()),
+        };
         let result = crew::dispatch::dispatch(opts)?;
         eprintln!(
             "{}",
-            style::dim(&format!("darkmux coder-phase: session id `{}`", self.session_id))
+            style::dim(&format!("darkmux coder-phase: session id `{}`", ctx.session_id))
         );
 
         let tokens = result
@@ -704,9 +826,9 @@ impl StepKind for MissionCoderStepKind {
                      Running and the worktree is left at {} for inspection. Re-launching \
                      `darkmux mission launch coder-phase` will refuse until you tear it down: \
                      `darkmux mission abort {} --phase {}`.",
-                    self.wt_path.display(),
-                    self.mission_id,
-                    self.phase_id,
+                    ctx.wt_path.display(),
+                    ctx.mission_id,
+                    ctx.phase_id,
                 ))
             );
             print_token_line(&tokens);
@@ -714,9 +836,9 @@ impl StepKind for MissionCoderStepKind {
                 flow::Level::Error,
                 "mission.coder",
                 &step.id,
-                &self.mission_id,
-                &self.phase_id,
-                &self.session_id,
+                &ctx.mission_id,
+                &ctx.phase_id,
+                &ctx.session_id,
                 serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total() }),
             );
             *result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
@@ -738,9 +860,9 @@ impl StepKind for MissionCoderStepKind {
             },
             "mission.coder",
             &step.id,
-            &self.mission_id,
-            &self.phase_id,
-            &self.session_id,
+            &ctx.mission_id,
+            &ctx.phase_id,
+            &ctx.session_id,
             serde_json::json!({
                 "failed_verifiers": failed_verifiers,
                 "count": failed_verifiers.len(),
@@ -766,9 +888,10 @@ impl StepKind for MissionCoderStepKind {
         _step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
-        _ctx: &StepRunCtx,
+        run_ctx: &StepRunCtx,
     ) -> Option<crew::step_kinds::Placement> {
-        resolve_local_placement(&self.role_id, None, None, &format!("mission-coder:{}", self.phase_id))
+        let ctx = run_ctx.artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)?;
+        resolve_local_placement(&ctx.role, None, None, &format!("mission-coder:{}", ctx.phase_id))
     }
 }
 
@@ -784,12 +907,14 @@ impl StepKind for MissionCoderStepKind {
 /// CLI/`ArtifactBus`-result plumbing (#1530 Packet 2). No second consumer
 /// visible today — stays physically co-located with the mission module
 /// that owns it.
+///
+/// (#1530 Packet 3b-1) A stateless singleton — no `wt_path`/`base`/
+/// `phase_id` constructor fields. The run's identity comes off the
+/// `ArtifactBus` (`CODER_CONTEXT_ARTIFACT`, readable from BOTH
+/// `run_streaming` and `residency()` — see `StepKind::residency`'s own doc,
+/// #1530 Packet 3a).
 // (#1284 Packet 4a) `pub(crate)` — see `MissionWorktreeStepKind`'s doc.
-pub(crate) struct MissionVerifyStepKind {
-    pub(crate) wt_path: PathBuf,
-    pub(crate) base: String,
-    pub(crate) phase_id: String,
-}
+pub(crate) struct MissionVerifyStepKind;
 
 impl StepKind for MissionVerifyStepKind {
     fn id(&self) -> &'static str {
@@ -800,13 +925,17 @@ impl StepKind for MissionVerifyStepKind {
         "Verify (QA)"
     }
 
-    /// (#1530 Packet 2) Consumes the worktree the `mission.worktree` step
-    /// creates and the `mission.coder` step's output (annotation only — see
-    /// `MissionWorktreeStepKind::provides`'s doc); provides the
-    /// [`CODER_VERIFY_RESULT_ARTIFACT`] handle `register_coder_phase_kinds`
-    /// reads back after the run.
+    /// (#1530 Packets 2/3b-1) Consumes the worktree the `mission.worktree`
+    /// step creates and the `mission.coder` step's output (annotation only
+    /// — see `MissionWorktreeStepKind::provides`'s doc), and reads
+    /// `CODER_CONTEXT_ARTIFACT` which that same step's `provides()`
+    /// declares — so it does not need to declare it again here.
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 2] = [Port::data("worktree"), Port::data("coder-output")];
+        const PORTS: [Port; 3] = [
+            Port::data("worktree"),
+            Port::data("coder-output"),
+            Port::artifact(CODER_CONTEXT_ARTIFACT, make_coder_context_artifact),
+        ];
         &PORTS
     }
 
@@ -832,8 +961,8 @@ impl StepKind for MissionVerifyStepKind {
         _input: &std::collections::BTreeMap<String, String>,
     ) -> Result<StepOutcome> {
         panic!(
-            "MissionVerifyStepKind only runs through `run_streaming` — it writes the run-scoped \
-             ArtifactBus (#1530 Packet 2)"
+            "MissionVerifyStepKind only runs through `run_streaming` — it reads/writes the \
+             run-scoped ArtifactBus (#1530 Packet 3b-1)"
         )
     }
 
@@ -842,19 +971,22 @@ impl StepKind for MissionVerifyStepKind {
         _step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
-        ctx: &StepRunCtx,
+        run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        let result_slot = ctx
+        let result_slot = run_ctx
             .artifact::<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>(
                 CODER_VERIFY_RESULT_ARTIFACT,
             )
             .expect("register_coder_phase_kinds seeds the coder.verify-result artifact before the graph runs");
+        let ctx = run_ctx
+            .artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)
+            .expect("register_coder_phase_kinds seeds the coder.context artifact before the graph runs");
         println!(
             "\n{}",
             style::header("▶ local QA — dispatching `code-reviewer` against the worktree diff…")
         );
 
-        match crate::phase_cli::phase_review_output_at(&self.wt_path, Some(&self.base), Some(&self.phase_id)) {
+        match crate::phase_cli::phase_review_output_at(&ctx.wt_path, Some(&ctx.base), Some(&ctx.phase_id)) {
             Ok(review) => {
                 print_review_summary(&review);
                 let verdict = review.verdict.clone();
@@ -884,9 +1016,10 @@ impl StepKind for MissionVerifyStepKind {
         _step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
-        _ctx: &StepRunCtx,
+        run_ctx: &StepRunCtx,
     ) -> Option<crew::step_kinds::Placement> {
-        resolve_local_placement("code-reviewer", None, None, &format!("mission-verify:{}", self.phase_id))
+        let ctx = run_ctx.artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)?;
+        resolve_local_placement("code-reviewer", None, None, &format!("mission-verify:{}", ctx.phase_id))
     }
 }
 
