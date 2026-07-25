@@ -3225,11 +3225,56 @@ pub fn run_judge_only(
 use darkmux_crew::scheduler::run_step_graph;
 use darkmux_crew::single_shot::{single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest, SingleShotRequest};
 use darkmux_crew::step_kinds::{
-    MapDispatchOverride, MapItemResult, OverrideDispatchCall, StepKind, StepKindRegistry,
-    StepOutcome, MAP_BUDGET_SKIP_ERROR,
+    MapDispatchOverride, MapItemResult, OverrideDispatchCall, Port, StepKind, StepKindRegistry,
+    StepOutcome, StepRunCtx, MAP_BUDGET_SKIP_ERROR,
 };
 use darkmux_crew::types::{Step, Task};
+use std::any::Any;
 use std::sync::Mutex as StdMutex;
+
+// ─── #1530 Packet 1: run-scoped ArtifactBus artifact names ────────────────
+//
+// The review pipeline's three cross-cutting accumulators — historically
+// bespoke `Arc<Mutex<_>>` handles threaded by hand into `ReviewDedupStepKind`
+// /`ReviewJudgeStepKind`/`ReviewVerifyRenderStepKind`/`ReviewSynthesisStepKind`
+// (built once in `build_review_graph`, read back after `run_step_graph`
+// returns in `run_review_graph`) — now ride the generic run-scoped
+// `ArtifactBus` (#1530 Packet 0) instead. `ReviewDedupStepKind::provides()`
+// declares all three (it is the pipeline's earliest of the four consumers,
+// and the scheduler's `provides()` pre-scan runs before ANY wave, so
+// declaring them there is sufficient regardless of wave order — see
+// `scheduler::run_step_graph`'s own pre-scan doc); the const factories build
+// EMPTY defaults. `run_review_graph` then SEEDS the real, run-stamped values
+// over those defaults via `run_step_graph`'s caller-seed path (#1530 Packet
+// 1) — the envelope needs to carry this run's case_id/crew/mode/fingerprint/
+// staffing (plus the interpret-time warnings `build_review_graph` already
+// collected) before any step reads it, which a context-free `Port::artifact`
+// factory structurally cannot produce (see `Port`'s own doc). The context
+// (`ReviewStepContext`, diff/prompts/bundles/…) deliberately STAYS a plain
+// constructor field on every kind below, NOT a fourth bus artifact:
+// `ReviewJudgeStepKind::residency()` reads `ctx.bundles` to decide whether
+// to skip loading a model (#1426 ship-2), and `StepKind::residency` has no
+// `StepRunCtx` parameter at all — it runs before/outside the bus's
+// `run_streaming` seam — so a bus-only context would silently break that
+// optimization. Moving env/members/warnings (data ONLY ever read inside
+// `run_streaming`) captures the packet's real goal — retiring the bespoke
+// `Arc<Mutex<_>>` wiring — without forcing context through a seam that
+// can't reach every reader.
+const REVIEW_ENVELOPE_ARTIFACT: &str = "review.envelope";
+const REVIEW_MEMBERS_ARTIFACT: &str = "review.members";
+const REVIEW_WARNINGS_ARTIFACT: &str = "review.warnings";
+
+fn make_review_envelope_artifact() -> Arc<dyn Any + Send + Sync> {
+    Arc::new(StdMutex::new(ReviewEnvelope::default()))
+}
+
+fn make_review_members_artifact() -> Arc<dyn Any + Send + Sync> {
+    Arc::new(StdMutex::new(Vec::<MemberRecord>::new()))
+}
+
+fn make_review_warnings_artifact() -> Arc<dyn Any + Send + Sync> {
+    Arc::new(StdMutex::new(Vec::<String>::new()))
+}
 
 /// Everything a review Step kind needs, OWNED (not borrowed) and
 /// `Send + Sync` so it can cross the `run_bounded` worker-thread boundary —
@@ -3463,6 +3508,15 @@ impl StepKind for ReviewBundleStepKind {
 
     fn display_name(&self) -> &'static str {
         "Bundle"
+    }
+
+    /// (#1530 Packet 1) Declares only the ordinary `Step.output`
+    /// `Data` port — this kind touches none of the run-scoped `Artifact`
+    /// accumulators (`ReviewDedupStepKind::provides()`'s doc), so it needs
+    /// no `run_streaming` override; `run` below is unchanged.
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data("bundles")];
+        &PORTS
     }
 
     fn run(&self, step: &Step, _task: &Task, _input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
@@ -3720,17 +3774,6 @@ pub(crate) fn reconstruct_probe_stage(
 /// `dedup_flags`'s own doc.
 pub struct ReviewDedupStepKind {
     pub ctx: Arc<ReviewStepContext>,
-    /// (#1373 gate e) Shared cross-cutting envelope this step writes the
-    /// TRUE pre-dedup flag count into (`env.raw_flags`) the moment it's
-    /// known. `ReviewSynthesisStepKind` only ever sees THIS step's OWN
-    /// `StepOutcome.output` (the already-deduped list, since that's the
-    /// data judge/verify need to consume), so without this write it has no
-    /// way to recover the true raw count — the field silently read the
-    /// deduped count instead (`raw_flags == deduped_flags` always).
-    /// (#1442 ship-2b) This step ALSO pushes the probe stage's
-    /// reconstructed remote-budget row + all-draws-failed degenerate reason
-    /// here — the reconstruction boundary (see `probe_specs` below).
-    pub env: SharedReviewEnvelope,
     /// (#1442 ship-2b, #1512) The mint-time per-seat specs `build_review_graph`
     /// computed while claiming each staffing against its declared probe
     /// task — this step's `input`
@@ -3739,11 +3782,6 @@ pub struct ReviewDedupStepKind {
     /// aligns them back into domain results against these specs before the
     /// (unchanged) dedup algorithm runs.
     pub(crate) probe_specs: Vec<ProbeSeatSpec>,
-    /// The run-wide member/warning accumulators (the same handles the
-    /// judge/verify contributors use), merged into `shared_env` by
-    /// `run_review_graph` once `run_step_graph` returns.
-    pub(crate) members: Arc<StdMutex<Vec<MemberRecord>>>,
-    pub(crate) warnings: Arc<StdMutex<Vec<String>>>,
     /// The probe stage's per-execution remote allowance
     /// (`ReviewStepContext::remote_max_tokens_per_execution`) — the SAME
     /// value stamped into every probe step's `bucket_budget` config, used
@@ -3760,24 +3798,63 @@ impl StepKind for ReviewDedupStepKind {
         "Dedup"
     }
 
-    fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+    /// (#1530 Packet 1) Declares the three run-scoped `Artifact` handles
+    /// this pipeline's dispatching kinds share — this is the EARLIEST of
+    /// the four consumers (dedup/judge/verify-render/synthesis), and the
+    /// scheduler's `provides()` pre-scan runs once, before ANY wave, for
+    /// every kind actually present in the graph (see `scheduler::
+    /// run_step_graph`'s pre-scan doc) — so declaring them here is
+    /// sufficient regardless of which wave each consumer lands in.
+    /// `run_review_graph` overwrites these context-free defaults with the
+    /// run-stamped values via the caller-seed path (module-level doc note
+    /// above `REVIEW_ENVELOPE_ARTIFACT`). Also declares the `Data` port
+    /// this step's own `Step.output` satisfies — the ordinary wiring is
+    /// unchanged; this is annotation only (`Port::data`'s doc).
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 4] = [
+            Port::data("deduped-flags"),
+            Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
+            Port::artifact(REVIEW_MEMBERS_ARTIFACT, make_review_members_artifact),
+            Port::artifact(REVIEW_WARNINGS_ARTIFACT, make_review_warnings_artifact),
+        ];
+        &PORTS
+    }
+
+    fn run(&self, _s: &Step, _t: &Task, _i: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        panic!(
+            "ReviewDedupStepKind only runs through `run_streaming` — it reads/writes the \
+             run-scoped ArtifactBus (#1530 Packet 1)"
+        )
+    }
+
+    fn run_streaming(
+        &self,
+        step: &Step,
+        _task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+        ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let env = ctx
+            .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
+            .expect("run_review_graph seeds the envelope artifact before the graph runs");
+        let members = ctx
+            .artifact::<StdMutex<Vec<MemberRecord>>>(REVIEW_MEMBERS_ARTIFACT)
+            .expect("run_review_graph seeds the members artifact before the graph runs");
+        let warnings = ctx
+            .artifact::<StdMutex<Vec<String>>>(REVIEW_WARNINGS_ARTIFACT)
+            .expect("run_review_graph seeds the warnings artifact before the graph runs");
+
         let t0 = Instant::now();
         // (#1442 ship-2b) Reconstruction boundary: raw flags + per-seat
         // member accounting + warnings + the probe budget row, rebuilt from
         // the seats x k map steps' per-item results.
         let recon = reconstruct_probe_stage(&self.probe_specs, input, self.remote_budget)?;
-        self.members
-            .lock()
-            .expect("probe members mutex poisoned")
-            .extend(recon.members);
-        self.warnings
-            .lock()
-            .expect("probe warnings mutex poisoned")
-            .extend(recon.warnings);
+        members.lock().expect("probe members mutex poisoned").extend(recon.members);
+        warnings.lock().expect("probe warnings mutex poisoned").extend(recon.warnings);
         let raw = recon.flags;
         let raw_count = raw.len();
         {
-            let mut env = self.env.lock().expect("shared review envelope mutex poisoned");
+            let mut env = env.lock().expect("shared review envelope mutex poisoned");
             env.raw_flags = env.raw_flags.max(raw_count);
             if let Some(row) = recon.budget_row {
                 env.remote_budgets.push(row);
@@ -3835,19 +3912,15 @@ impl StepKind for ReviewDedupStepKind {
 /// `darkmux_crew::step_kinds::patterns::multi_pass_confirm` pattern — see
 /// that function's own doc.
 pub struct ReviewJudgeStepKind {
+    /// Kept a plain constructor field, NOT migrated onto the `ArtifactBus`
+    /// (#1530 Packet 1) — `residency()` below reads `ctx.bundles` to decide
+    /// whether to skip loading a model, and `StepKind::residency` has no
+    /// `StepRunCtx` parameter (it runs outside `run_streaming`'s bus seam),
+    /// so this field is the only way that hook can see it. See the
+    /// module-level doc note above `REVIEW_ENVELOPE_ARTIFACT` for the full
+    /// reasoning.
     pub ctx: Arc<ReviewStepContext>,
     pub judge: ResolvedSeatStaffing,
-    /// (#1354 follow-up) The same shared accumulator `ReviewProbeStepKind`
-    /// writes its `MemberRecord`s to — one collector for every dispatching
-    /// step kind, merged into `shared_env` once `run_step_graph` returns.
-    pub members: Arc<StdMutex<Vec<MemberRecord>>>,
-    /// (#1373 gates a/b/c) Shared cross-cutting envelope this step writes
-    /// its remote-budget rows, the #1329 dispatch-error warning, and (when
-    /// this stage is itself doomed) the run's `degenerate` reason into —
-    /// the SAME handle `ReviewSynthesisStepKind` reads at the end and
-    /// `ReviewVerifyStepKind` reads BEFORE dispatching (gate d — no
-    /// frontier spend on a run this stage already doomed, CONSIDER g).
-    pub env: SharedReviewEnvelope,
 }
 
 /// One deduped flag's judged outcome, in dispatch order — the shared
@@ -3873,7 +3946,49 @@ impl StepKind for ReviewJudgeStepKind {
         "Judge"
     }
 
-    fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+    /// (#1530 Packet 1) `requires()` only — this kind writes into the
+    /// `Artifact` handles `ReviewDedupStepKind::provides()` already
+    /// declares (materialized once, before any wave; see that method's
+    /// doc), so it does not need to declare them again as `provides()`
+    /// itself. `Port::artifact`'s factory is never invoked for a
+    /// `requires()` port (only `provides()` ports are scanned — see
+    /// `scheduler::run_step_graph`'s pre-scan doc); it's supplied only to
+    /// satisfy `Port::artifact`'s constructor signature.
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 3] = [
+            Port::data("deduped-flags"),
+            Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
+            Port::artifact(REVIEW_MEMBERS_ARTIFACT, make_review_members_artifact),
+        ];
+        &PORTS
+    }
+
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data("judged-flags")];
+        &PORTS
+    }
+
+    fn run(&self, _s: &Step, _t: &Task, _i: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        panic!(
+            "ReviewJudgeStepKind only runs through `run_streaming` — it reads/writes the \
+             run-scoped ArtifactBus (#1530 Packet 1)"
+        )
+    }
+
+    fn run_streaming(
+        &self,
+        step: &Step,
+        _task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+        run_ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let env = run_ctx
+            .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
+            .expect("run_review_graph seeds the envelope artifact before the graph runs");
+        let members = run_ctx
+            .artifact::<StdMutex<Vec<MemberRecord>>>(REVIEW_MEMBERS_ARTIFACT)
+            .expect("run_review_graph seeds the members artifact before the graph runs");
+
         let dedup_output = input.values().next().cloned().unwrap_or_default();
         let deduped: Vec<ProbeFlag> = if dedup_output.is_empty() {
             Vec::new()
@@ -4028,7 +4143,7 @@ impl StepKind for ReviewJudgeStepKind {
             self.ctx.remote_max_tokens_per_execution,
         );
         {
-            let mut env = self.env.lock().expect("shared review envelope mutex poisoned");
+            let mut env = env.lock().expect("shared review envelope mutex poisoned");
             env.remote_budgets.extend(gate.remote_budget_rows);
             if let Some(w) = gate.dispatch_error_warning {
                 env.warnings.push(w);
@@ -4064,7 +4179,7 @@ impl StepKind for ReviewJudgeStepKind {
         // the loop above never ran, so there's nothing to credit "judged
         // by" with.
         if judge_calls > 0 {
-            self.members.lock().expect("members mutex poisoned").push(MemberRecord {
+            members.lock().expect("members mutex poisoned").push(MemberRecord {
                 model: judge_identifier,
                 seat: "review-judge".to_string(),
                 draws: judge_calls,
@@ -4137,7 +4252,6 @@ impl StepKind for ReviewJudgeStepKind {
 pub struct ReviewVerifyRenderStepKind {
     pub ctx: Arc<ReviewStepContext>,
     pub verify: Option<ResolvedSeatStaffing>,
-    pub env: SharedReviewEnvelope,
 }
 
 impl StepKind for ReviewVerifyRenderStepKind {
@@ -4149,7 +4263,39 @@ impl StepKind for ReviewVerifyRenderStepKind {
         "Verify prompts"
     }
 
-    fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+    /// (#1530 Packet 1) `requires()` only — see `ReviewJudgeStepKind::
+    /// requires()`'s doc for why a downstream consumer of
+    /// `ReviewDedupStepKind::provides()`'s artifacts declares `requires()`
+    /// rather than re-`provides()`ing them.
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 2] =
+            [Port::data("judged-flags"), Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact)];
+        &PORTS
+    }
+
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data("verify-prompts")];
+        &PORTS
+    }
+
+    fn run(&self, _s: &Step, _t: &Task, _i: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        panic!(
+            "ReviewVerifyRenderStepKind only runs through `run_streaming` — it reads the \
+             run-scoped ArtifactBus (#1530 Packet 1)"
+        )
+    }
+
+    fn run_streaming(
+        &self,
+        step: &Step,
+        _task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+        run_ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let env = run_ctx
+            .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
+            .expect("run_review_graph seeds the envelope artifact before the graph runs");
+
         let judge_output = input.values().next().cloned().unwrap_or_default();
         let judged: Vec<JudgedFlag> = if judge_output.is_empty() {
             Vec::new()
@@ -4160,8 +4306,7 @@ impl StepKind for ReviewVerifyRenderStepKind {
         let confirmed: Vec<&JudgedFlag> = judged.iter().filter(|j| j.tier == Tier::Confirmed).collect();
         let skip_reason: Option<&str> = if self.verify.is_none() {
             Some("no verify seat staffed — judged flags pass through unchanged")
-        } else if self
-            .env
+        } else if env
             .lock()
             .expect("shared review envelope mutex poisoned")
             .degenerate
@@ -4355,7 +4500,6 @@ pub(crate) fn apply_verify_results(
 /// here.
 pub struct ReviewSynthesisStepKind {
     pub ctx: Arc<ReviewStepContext>,
-    pub env: SharedReviewEnvelope,
     /// (#1341) `gather_inputs` now keys a Step's `input` map by the
     /// DEPENDENCY TASK's id (dependency/data-flow lives at Task level) —
     /// so this step reads its upstream contributions by TASK id, not
@@ -4372,9 +4516,6 @@ pub struct ReviewSynthesisStepKind {
     /// the confirmed docket, and contributing the seat's member row +
     /// budget row + exhaustion warning (see [`apply_verify_results`]).
     pub(crate) verify: Option<ResolvedSeatStaffing>,
-    /// Same run-wide accumulator every dispatching contributor uses,
-    /// merged into `shared_env` by `run_review_graph` post-run.
-    pub(crate) members: Arc<StdMutex<Vec<MemberRecord>>>,
     pub(crate) remote_budget: u64,
 }
 
@@ -4387,7 +4528,48 @@ impl StepKind for ReviewSynthesisStepKind {
         "Synthesis"
     }
 
-    fn run(&self, step: &Step, _task: &Task, input: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+    /// (#1530 Packet 1) `requires()` only — see `ReviewJudgeStepKind::
+    /// requires()`'s doc.
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 5] = [
+            Port::data("deduped-flags"),
+            Port::data("judged-flags"),
+            Port::data("verify-results"),
+            Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
+            Port::artifact(REVIEW_MEMBERS_ARTIFACT, make_review_members_artifact),
+        ];
+        &PORTS
+    }
+
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data("envelope")];
+        &PORTS
+    }
+
+    fn run(&self, _s: &Step, _t: &Task, _i: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        panic!(
+            "ReviewSynthesisStepKind only runs through `run_streaming` — it reads/writes the \
+             run-scoped ArtifactBus (#1530 Packet 1)"
+        )
+    }
+
+    fn run_streaming(
+        &self,
+        step: &Step,
+        _task: &Task,
+        input: &std::collections::BTreeMap<String, String>,
+        run_ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        // (named `shared_env`, not `env` — the function body below rebinds
+        // `env` to an owned, cloned-out `ReviewEnvelope` value partway
+        // through; this handle is what that clone gets written BACK onto.)
+        let shared_env = run_ctx
+            .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
+            .expect("run_review_graph seeds the envelope artifact before the graph runs");
+        let members = run_ctx
+            .artifact::<StdMutex<Vec<MemberRecord>>>(REVIEW_MEMBERS_ARTIFACT)
+            .expect("run_review_graph seeds the members artifact before the graph runs");
+
         let t0 = Instant::now();
         let dedup_output = input.get(&self.dedup_task_id).cloned().unwrap_or_default();
         let judge_output = input.get(&self.judge_task_id).cloned().unwrap_or_default();
@@ -4424,10 +4606,10 @@ impl StepKind for ReviewSynthesisStepKind {
                     &self.ctx.case_id,
                 );
                 if let Some(member) = outcome.member {
-                    self.members.lock().expect("members mutex poisoned").push(member);
+                    members.lock().expect("members mutex poisoned").push(member);
                 }
                 if outcome.warning.is_some() || outcome.budget_row.is_some() {
-                    let mut env = self.env.lock().expect("shared review envelope mutex poisoned");
+                    let mut env = shared_env.lock().expect("shared review envelope mutex poisoned");
                     if let Some(w) = outcome.warning {
                         env.warnings.push(w);
                     }
@@ -4438,7 +4620,7 @@ impl StepKind for ReviewSynthesisStepKind {
             }
         }
 
-        let mut env = self.env.lock().expect("shared review envelope mutex poisoned").clone();
+        let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();
         env.raw_flags = env.raw_flags.max(flags.len());
         env.deduped_flags = flags.len();
         env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
@@ -4502,7 +4684,7 @@ impl StepKind for ReviewSynthesisStepKind {
             }
         }
 
-        *self.env.lock().expect("shared review envelope mutex poisoned") = env.clone();
+        *shared_env.lock().expect("shared review envelope mutex poisoned") = env.clone();
 
         let wall_ms = t0.elapsed().as_millis() as u64;
         emit_review_step_result(
@@ -4534,25 +4716,31 @@ pub type SharedReviewEnvelope = Arc<StdMutex<ReviewEnvelope>>;
 /// (for the caller to persist via `darkmux_crew::lifecycle::save_task`/
 /// `save_step` under real Phase ids it creates — this module has no
 /// `mission_id`/`lifecycle` dependency of its own, see the module doc's
-/// crate-boundary note), the resolved [`StepKindRegistry`], the shared
-/// cross-cutting envelope state, and a `step_id -> Task.phase_id` map (so
-/// the caller can persist each Step under the SAME Phase its owning Task
-/// belongs to without re-deriving the lookup).
+/// crate-boundary note), the resolved [`StepKindRegistry`], the envelope's
+/// BUILD-TIME contents, and a `step_id -> Task.phase_id` map (so the caller
+/// can persist each Step under the SAME Phase its owning Task belongs to
+/// without re-deriving the lookup).
+///
+/// (#1530 Packet 1) `initial_env` replaces the pre-Packet-1
+/// `shared_env: SharedReviewEnvelope` field — this pipeline's cross-cutting
+/// accumulators (the envelope, the run-wide member/warning accumulators) now
+/// live on the run-scoped `ArtifactBus` instead of a bespoke `Arc<Mutex<_>>`
+/// threaded by hand from `build_review_graph` into `run_review_graph` (see
+/// the module-level doc note above `REVIEW_ENVELOPE_ARTIFACT`). `initial_env`
+/// is the PLAIN, unwrapped envelope value this function assembles at build
+/// time (case_id/bundle count/interpret-time warnings, e.g. the "pruned an
+/// unclaimed probe task" warning) — `run_review_graph` pre-stamps it further
+/// (case_id/crew/mode/fingerprint/staffing) and SEEDS the wrapped
+/// `Arc<StdMutex<_>>` result onto the bus via `run_step_graph`'s caller-seed
+/// path, exactly where the Arc gets minted now (previously minted here,
+/// before the run even started).
 pub struct BuiltReviewGraph {
     pub tasks: Vec<Task>,
     pub steps: std::collections::BTreeMap<String, Step>,
     pub registry: StepKindRegistry,
-    pub shared_env: SharedReviewEnvelope,
+    pub initial_env: ReviewEnvelope,
     pub synthesis_step_id: String,
     pub phase_id_of_step: std::collections::BTreeMap<String, String>,
-    /// The probe stage's accumulated `MemberRecord`s + reduced-coverage
-    /// warnings + shared remote-token bucket — still EMPTY/unspent at
-    /// return time (every probe step is registered, not yet run);
-    /// [`run_review_graph`] reads them back through these SAME `Arc` handles
-    /// AFTER `run_step_graph` completes, when every probe step kind has
-    /// actually written into them.
-    probe_members: Arc<StdMutex<Vec<MemberRecord>>>,
-    probe_warnings: Arc<StdMutex<Vec<String>>>,
 }
 
 /// (#1402) Pure kind-id → display-name lookup for review's six Tier 3
@@ -4848,16 +5036,21 @@ fn build_review_graph_from_config(
         }
     }
 
-    // (#1373) Built EARLY (moved up from its former place right before
-    // `ReviewSynthesisStepKind`'s construction) so `ReviewDedupStepKind`/
-    // `ReviewJudgeStepKind`/`ReviewVerifyStepKind` can ALSO hold a clone —
-    // see each kind's own doc for what it reads/writes here (gates a-e).
-    let shared_env: SharedReviewEnvelope = Arc::new(StdMutex::new(ReviewEnvelope {
+    // (#1373; #1530 Packet 1 — this became `initial_env`, no longer
+    // wrapped in `Arc<Mutex<_>>` here) Built EARLY (moved up from its
+    // former place right before `ReviewSynthesisStepKind`'s construction)
+    // so it's ready alongside every other build-time value this function
+    // hands back. `run_review_graph` pre-stamps it further (case_id is
+    // re-stamped there too — this run-launch's `ctx.case_id`, not a stale
+    // build-time snapshot — plus crew/mode/fingerprint/staffing) and SEEDS
+    // the wrapped `Arc<StdMutex<_>>` result onto the run's `ArtifactBus` —
+    // see `BuiltReviewGraph::initial_env`'s own doc for the full handoff.
+    let initial_env = ReviewEnvelope {
         case_id: ctx.case_id.clone(),
         bundles: ctx.bundles.len(),
         warnings: interpret_warnings,
         ..Default::default()
-    }));
+    };
 
     // (#1442 ship-2b) The probe/verify stages ride the GENERIC
     // `dispatch.map` builtin, so the registry starts from the Tier-1
@@ -4877,12 +5070,6 @@ fn build_review_graph_from_config(
     registry
         .register_alias("funnel.bundle", bundle_kind)
         .expect("funnel.bundle legacy alias registered once");
-
-    // (#1354 follow-up) One accumulator for every dispatching contributor
-    // (probe reconstruction at dedup, judge, verify apply at synthesis),
-    // merged into `shared_env` once `run_step_graph` returns.
-    let probe_members = Arc::new(StdMutex::new(Vec::new()));
-    let probe_warnings = Arc::new(StdMutex::new(Vec::new()));
 
     // (#1512) Stamp each CLAIMED probe task's single step with its FULL
     // dispatch config — the pre-rendered `probe_user_message` collection
@@ -4998,26 +5185,14 @@ fn build_review_graph_from_config(
         step.config = config;
     }
 
-    let dedup_kind = Arc::new(ReviewDedupStepKind {
-        ctx: ctx.clone(),
-        env: shared_env.clone(),
-        probe_specs,
-        members: probe_members.clone(),
-        warnings: probe_warnings.clone(),
-        remote_budget,
-    });
+    let dedup_kind = Arc::new(ReviewDedupStepKind { ctx: ctx.clone(), probe_specs, remote_budget });
     registry.register(dedup_kind.clone()).expect("review.dedup registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
     registry
         .register_alias("funnel.dedup", dedup_kind)
         .expect("funnel.dedup legacy alias registered once");
 
-    let judge_kind = Arc::new(ReviewJudgeStepKind {
-        ctx: ctx.clone(),
-        judge,
-        members: probe_members.clone(),
-        env: shared_env.clone(),
-    });
+    let judge_kind = Arc::new(ReviewJudgeStepKind { ctx: ctx.clone(), judge });
     registry.register(judge_kind.clone()).expect("review.judge registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
     registry
@@ -5027,11 +5202,7 @@ fn build_review_graph_from_config(
     // (#1442 ship-2b) The render step — the Tier-3 half of the verify
     // stage that stayed bespoke (frozen `verify_prompt` assembly against
     // this pipeline's own types); the dispatch half is the generic map.
-    let verify_render_kind = Arc::new(ReviewVerifyRenderStepKind {
-        ctx: ctx.clone(),
-        verify: verify.clone(),
-        env: shared_env.clone(),
-    });
+    let verify_render_kind = Arc::new(ReviewVerifyRenderStepKind { ctx: ctx.clone(), verify: verify.clone() });
     registry
         .register(verify_render_kind)
         .expect("review.verify-render registered once");
@@ -5065,12 +5236,10 @@ fn build_review_graph_from_config(
 
     let synthesis_kind = Arc::new(ReviewSynthesisStepKind {
         ctx: ctx.clone(),
-        env: shared_env.clone(),
         dedup_task_id,
         judge_task_id,
         verify_task_id,
         verify,
-        members: probe_members.clone(),
         remote_budget,
     });
     registry.register(synthesis_kind.clone()).expect("review.synthesis registered once");
@@ -5083,11 +5252,9 @@ fn build_review_graph_from_config(
         tasks,
         steps,
         registry,
-        shared_env,
+        initial_env,
         synthesis_step_id,
         phase_id_of_step,
-        probe_members,
-        probe_warnings,
     })
 }
 
@@ -5203,27 +5370,37 @@ pub fn run_review_graph(
     emitter: &mut dyn ReviewEmitter,
     persist: &mut dyn FnMut(&Step),
 ) -> Result<(ReviewEnvelope, std::collections::BTreeMap<String, Step>)> {
-    let BuiltReviewGraph {
-        tasks,
-        mut steps,
-        registry,
-        shared_env,
-        synthesis_step_id,
-        probe_members,
-        probe_warnings,
-        ..
-    } = graph;
+    let BuiltReviewGraph { tasks, mut steps, registry, initial_env, synthesis_step_id, .. } = graph;
     let tasks_by_id: std::collections::BTreeMap<String, Task> =
         tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
 
-    {
-        let mut env = shared_env.lock().expect("shared review envelope mutex poisoned");
-        env.case_id = ctx.case_id.clone();
-        env.crew = crew_name.to_string();
-        env.mode = mode_label(mode).to_string();
-        env.fingerprint = fingerprint_val;
-        env.staffing = Some(staffing);
-    }
+    // (#1530 Packet 1) The run-scoped state this pipeline's dispatching
+    // step kinds share, now minted HERE (at RUN time, not build time — see
+    // `BuiltReviewGraph::initial_env`'s doc for why that's the more honest
+    // home) and handed to `run_step_graph` via its caller-seed path, which
+    // MERGES them onto the `ArtifactBus` over whatever default
+    // `ReviewDedupStepKind::provides()`'s factories would otherwise
+    // materialize (`ArtifactBus::seed`'s own doc). `shared_env` starts from
+    // `initial_env` (already carrying the interpret-time warnings/bundle
+    // count from `build_review_graph`) plus this run's own
+    // case_id/crew/mode/fingerprint/staffing — exactly the same pre-stamp
+    // this function applied in place before #1530 Packet 1, just built
+    // fresh here instead of mutated through an `Arc` built earlier.
+    let shared_env: SharedReviewEnvelope = Arc::new(StdMutex::new(ReviewEnvelope {
+        case_id: ctx.case_id.clone(),
+        crew: crew_name.to_string(),
+        mode: mode_label(mode).to_string(),
+        fingerprint: fingerprint_val,
+        staffing: Some(staffing),
+        ..initial_env
+    }));
+    let probe_members: Arc<StdMutex<Vec<MemberRecord>>> = Arc::new(StdMutex::new(Vec::new()));
+    let probe_warnings: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let seed_artifacts: [(&'static str, Arc<dyn Any + Send + Sync>); 3] = [
+        (REVIEW_ENVELOPE_ARTIFACT, shared_env.clone() as Arc<dyn Any + Send + Sync>),
+        (REVIEW_MEMBERS_ARTIFACT, probe_members.clone() as Arc<dyn Any + Send + Sync>),
+        (REVIEW_WARNINGS_ARTIFACT, probe_warnings.clone() as Arc<dyn Any + Send + Sync>),
+    ];
 
     // (#1349) Host telemetry only — no bookend struct. The caller already
     // owns the run's liveness bookend (see this function's doc); this
@@ -5272,6 +5449,9 @@ pub fn run_review_graph(
         // mocked test's probe/verify `dispatch.map` items dispatch through
         // the same `chat_override` every bespoke review kind uses.
         review_dispatch_override(ctx),
+        // (#1530 Packet 1) The caller-seed path — the run-stamped envelope
+        // + fresh member/warning accumulators, minted above.
+        &seed_artifacts,
     );
 
     // Merge the probe stage's NOW-populated accumulators (every probe step

@@ -461,6 +461,7 @@ pub fn launch(
             }
         },
         None,
+        &[],
     );
 
     // (#1406, F4) A scheduler-level `Err` mid-run would otherwise `?`-return

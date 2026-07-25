@@ -345,6 +345,17 @@ pub fn run_step_graph(
     // caller's mock ON THE WORKER THREAD (see `MapDispatchOverride`'s doc
     // for why a thread-local seam structurally cannot serve here).
     dispatch_override: Option<crate::step_kinds::MapDispatchOverride>,
+    // (#1530 Packet 1) The CALLER-SEED path onto the run-scoped
+    // `ArtifactBus`: named values the caller already owns (a pre-stamped
+    // envelope, a run-level context) that no `Port::artifact` factory can
+    // produce, because a factory is a plain context-free `fn` (see
+    // `Port`'s doc). Applied AFTER the `provides()` pre-scan below
+    // materializes every declared `Artifact` port's default — a caller
+    // seed OVERWRITES that default for its name (`ArtifactBus::seed`),
+    // never the reverse, so a migrated `StepKind` still gets a valid
+    // (if unstamped) artifact even when a caller seeds nothing. Every
+    // pre-#1530-Packet-1 caller passes `&[]` here — zero behavior change.
+    seed_artifacts: &[(&'static str, std::sync::Arc<dyn std::any::Any + Send + Sync>)],
 ) -> Result<SchedulerReport> {
     detect_cycles(tasks)?;
 
@@ -418,6 +429,12 @@ pub fn run_step_graph(
                 }
             }
         }
+    }
+    // (#1530 Packet 1) Merge the caller's seeds OVER the `provides()`
+    // defaults just materialized — see `seed_artifacts`'s own doc on this
+    // parameter for why a caller-seed always wins.
+    for (name, value) in seed_artifacts {
+        bus.seed(name, value.clone());
     }
     let bus = std::sync::Arc::new(bus);
 
@@ -1135,6 +1152,7 @@ mod tests {
             &mut |r| emitted.push(r),
             &mut |_step| {},
             None,
+            &[],
         )
         .unwrap()
     }
@@ -1251,6 +1269,7 @@ mod tests {
             &mut |_r| {},
             &mut |_s| {},
             None,
+            &[],
         )
         .expect("the scheduler returns Ok even when a step panics — the panic is a per-step error");
 
@@ -1311,6 +1330,7 @@ mod tests {
             &mut |r| emitted.push(r),
             &mut |_step| {},
             None,
+            &[],
         )
         .unwrap_err();
         assert!(err.to_string().contains("cycle detected"));
@@ -1339,6 +1359,7 @@ mod tests {
             &mut |r| emitted.push(r),
             &mut |_step| {},
             None,
+            &[],
         )
         .unwrap();
 
@@ -1386,6 +1407,7 @@ mod tests {
             &mut |r| emitted.push(r),
             &mut |step| persisted.push(step.clone()),
             None,
+            &[],
         )
         .unwrap();
 
@@ -1420,6 +1442,7 @@ mod tests {
             &mut |r| emitted.push(r),
             &mut |step| persisted.push(step.clone()),
             None,
+            &[],
         )
         .unwrap();
 
@@ -1514,6 +1537,7 @@ mod tests {
             &mut |r| emitted.push(r),
             &mut |_step| {},
             None,
+            &[],
         )
         .unwrap();
         emitted
@@ -1665,6 +1689,7 @@ mod tests {
             &mut |_r| {},
             &mut |_step| {},
             None,
+            &[],
         )
         .unwrap();
 
@@ -1825,6 +1850,7 @@ mod tests {
             &mut |_r| {},
             &mut |_s| {},
             Some(override_fn),
+            &[],
         )
         .unwrap();
 
@@ -1999,7 +2025,7 @@ mod tests {
         kinds.register(Arc::new(EmitCollectionKind)).unwrap();
         let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}, None).unwrap();
+        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}, None, &[]).unwrap();
 
         assert!(loads.lock().unwrap().is_empty(), "empty-collection dispatch.map loads no model");
         assert_eq!(steps["map-step"].status, NodeStatus::Complete, "the empty map short-circuits to Complete");
@@ -2043,7 +2069,7 @@ mod tests {
         kinds.register(Arc::new(EmitCollectionKind)).unwrap();
         let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}, None).unwrap();
+        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}, None, &[]).unwrap();
 
         unsafe {
             match prev_url {
