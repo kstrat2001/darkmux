@@ -5458,10 +5458,19 @@ fn build_review_graph_from_config(
         let task = tasks.iter().find(|t| &t.id == task_id).unwrap_or_else(|| {
             panic!("the claimed probe task `{task_id}` must survive pruning")
         });
+        // (#1530) A user-tier `~/.darkmux/mission-configs/review.json` may
+        // still declare the pre-#1530 one-step probe task. That is an
+        // operator-config shape mismatch, not an internal invariant break —
+        // contract 7 puts loud validation at the consumption point and keeps
+        // panics off the hot path, so this bails with the fix named rather
+        // than aborting the process.
         if task.step_ids.len() != 2 {
-            panic!(
-                "claimed probe task `{task_id}` must have exactly two steps (render, dispatch.map), \
-                 got {}",
+            anyhow::bail!(
+                "darkmux: \"review\" mission config's probe task `{task_id}` declares {} step(s), \
+                 but a probe task needs exactly two: a `review.probe-render` step followed by a \
+                 `dispatch.map` step. A user-tier copy at \
+                 ~/.darkmux/mission-configs/review.json predating the render-step split needs the \
+                 render step added (or delete the copy to fall back to the built-in document).",
                 task.step_ids.len()
             );
         }

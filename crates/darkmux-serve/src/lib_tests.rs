@@ -4174,9 +4174,12 @@
             .filter(|n| n["kind"] == "task")
             .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
             .sum();
-        assert_eq!(total_step_rows, 9, "verify carries two rows (render + map): {nodes:?}");
+        // (#1530) Each of the three probe tasks and the verify task carries
+        // TWO rows (a bespoke render step + the generic `dispatch.map`), so
+        // 8 tasks yield 12 step rows.
+        assert_eq!(total_step_rows, 12, "probe + verify tasks carry two rows each (render + map): {nodes:?}");
         assert_eq!(tasks.len(), 8);
-        assert_eq!(steps.len(), 9);
+        assert_eq!(steps.len(), 12);
 
         // (#1402) Every row's label resolves through the real StepKind
         // display-name fallback chain — the probe/verify dispatch rows are
@@ -4189,7 +4192,9 @@
             .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
             .filter_map(|row| row["label"].as_str().map(String::from))
             .collect();
-        for expected in ["Bundle", "Dispatch (map)", "Dedup", "Judge", "Verify prompts", "Synthesis"] {
+        for expected in
+            ["Bundle", "Dispatch (map)", "Dedup", "Judge", "Probe prompts", "Verify prompts", "Synthesis"]
+        {
             assert!(
                 all_labels.iter().any(|l| l == expected),
                 "expected a \"{expected}\" row label among {all_labels:?}"

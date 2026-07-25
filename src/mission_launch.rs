@@ -109,8 +109,9 @@ const REVIEW_TIER3_KINDS: &[&str] = &[
     "review.judge",
     // (#1442 ship-2b) `review.probe` / `review.verify` retired — the
     // probe/verify stages ride the generic Tier-1 `dispatch.map` (already
-    // in the builtin known set); the verify task's bespoke half is the
+    // in the builtin known set); each stage's bespoke half is a
     // frozen-prompt render step.
+    "review.probe-render",
     "review.verify-render",
     "review.synthesis",
 ];
@@ -2362,6 +2363,63 @@ mod tests {
         let missing = missing_required_inputs(&cfg, &BTreeMap::new());
         let names: Vec<&str> = missing.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["workdir"], "mission_id (launcher-supplied) and image (optional) must not appear");
+    }
+
+    /// (#1530) Structural conformance: every step kind the SHIPPED mission
+    /// configs declare must be in the known-kind union `launch` feeds to
+    /// `MissionConfig::validate` — the Tier-1 builtins plus
+    /// `CODER_PHASE_TIER3_KINDS` plus `REVIEW_TIER3_KINDS`. A kind missing
+    /// from that union doesn't fail: it emits a `Warning` per step, so every
+    /// launch of that config prints a spurious "unknown step kind" line and
+    /// erodes a loud-validation surface. Adding `review.probe-render` hit
+    /// exactly that, caught only by review; this pins the lists against the
+    /// documents instead of against a reviewer noticing. Reads the embedded
+    /// templates directly (never `mission_config::load`, which would prefer a
+    /// user-tier copy and make the test machine-dependent).
+    #[test]
+    fn every_builtin_config_step_kind_is_in_the_launchers_known_set() {
+        const BUILTIN_CONFIG_DOCS: &[(&str, &str)] = &[
+            (
+                "review",
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/templates/builtin/mission-configs/review.json"
+                )),
+            ),
+            (
+                "coder-phase",
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/templates/builtin/mission-configs/coder-phase.json"
+                )),
+            ),
+        ];
+
+        let mut known: Vec<String> = crew::step_kinds::StepKindRegistry::with_builtins().ids();
+        known.extend(CODER_PHASE_TIER3_KINDS.iter().map(|s| (*s).to_string()));
+        known.extend(REVIEW_TIER3_KINDS.iter().map(|s| (*s).to_string()));
+
+        for (config_id, doc) in BUILTIN_CONFIG_DOCS {
+            let cfg: MissionConfig = serde_json::from_str(doc)
+                .unwrap_or_else(|e| panic!("built-in config \"{config_id}\" must parse: {e}"));
+            for phase in &cfg.phases {
+                for task in &phase.tasks {
+                    for step in &task.steps {
+                        assert!(
+                            known.contains(&step.kind),
+                            "built-in config \"{config_id}\" declares step kind `{}` (step \
+                             `{}`), which is absent from the launcher's known-kind union \
+                             (Tier-1 builtins + CODER_PHASE_TIER3_KINDS + \
+                             REVIEW_TIER3_KINDS) — every `mission launch {config_id}` would \
+                             print a spurious \"unknown step kind\" warning. Add it to the \
+                             matching list.",
+                            step.kind,
+                            step.id
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ── #1530: review routes STRUCTURALLY (by its kinds), not by id ──
