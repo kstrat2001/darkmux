@@ -2817,4 +2817,37 @@ mod tests {
             }
         }
     }
+
+    // ─── #1530 Packet 0: every Tier 1 kind declares no ports ──────────
+    //
+    // The binding constraint on this packet is ZERO behavior change: adding
+    // `StepKind::provides`/`StepKind::requires` must not alter what any
+    // EXISTING kind does. Since every Tier 1 builtin here predates the
+    // trait methods and none of their `impl StepKind` blocks override them,
+    // this test is really pinning the DEFAULT (`&[]`) rather than each
+    // kind's own choice — but pinning it here, against the real kinds a
+    // production graph runs, is what would catch a future packet
+    // accidentally giving one of these a port it shouldn't have.
+    #[test]
+    fn tier1_kinds_declare_no_ports_by_default() {
+        let kinds: Vec<Arc<dyn StepKind>> = vec![
+            Arc::new(DispatchInternalStepKind),
+            Arc::new(DispatchSingleShotStepKind),
+            Arc::new(DispatchMapStepKind),
+            Arc::new(ProceduralShellStepKind),
+            Arc::new(ProceduralNoopStepKind),
+        ];
+        for kind in kinds {
+            assert!(
+                kind.provides().is_empty(),
+                "`{}` should declare no `provides` ports (Tier 1 backward-compat)",
+                kind.id()
+            );
+            assert!(
+                kind.requires().is_empty(),
+                "`{}` should declare no `requires` ports (Tier 1 backward-compat)",
+                kind.id()
+            );
+        }
+    }
 }
