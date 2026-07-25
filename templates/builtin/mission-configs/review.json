@@ -154,10 +154,18 @@
           ],
           "steps": [
             {
+              "id": "review-probe-high-render-step",
+              "kind": "review.probe-render",
+              "config": null
+            },
+            {
               "id": "review-probe-high-step",
               "kind": "dispatch.map",
               "config": null
             }
+          ],
+          "notes": [
+            "always two steps (#1530 follow-on, Packet A1), mirroring the verify task's render/dispatch.map split: the render step (review.probe-render) reads this seat's selector + role id from its OWN config (stamped by build_review_graph_from_config) and this run's bundles off the ArtifactBus, renders the probe_user_message collection AT RUN TIME, and the dispatch.map step resolves that collection from the render step's output via resolve_map_collection's single-dependency fallback (config.collection is no longer stamped)."
           ]
         },
         {
@@ -169,6 +177,11 @@
             "review-bundle-task"
           ],
           "steps": [
+            {
+              "id": "review-probe-mid-render-step",
+              "kind": "review.probe-render",
+              "config": null
+            },
             {
               "id": "review-probe-mid-step",
               "kind": "dispatch.map",
@@ -185,6 +198,11 @@
             "review-bundle-task"
           ],
           "steps": [
+            {
+              "id": "review-probe-low-render-step",
+              "kind": "review.probe-render",
+              "config": null
+            },
             {
               "id": "review-probe-low-step",
               "kind": "dispatch.map",

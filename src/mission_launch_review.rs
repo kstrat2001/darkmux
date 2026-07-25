@@ -822,6 +822,22 @@ fn run_dispatch(
         )
     })?;
 
+    // (#1530 follow-on) Per-seat probe prompt resolution: each staffed
+    // probe role resolves its OWN `role_prompt()` (`review-probe-high.md`/
+    // `-mid`/`-low`), falling back to the shared `probe_system` above when
+    // a seat's specific role has no `.md` of its own. Editing a per-seat
+    // `.md` was previously a SILENT no-op (only the single shared
+    // `probe_system` above was ever dispatched) — this map is what makes
+    // that edit take effect. A no-op by default: the three shipped
+    // per-seat `.md` files are byte-copies of `review-probe.md` today.
+    let mut probe_role_prompts: BTreeMap<String, String> = BTreeMap::new();
+    for seat in &crew.probes {
+        if let Some(role_id) = &seat.role_id {
+            let prompt = darkmux_crew::loader::role_prompt(role_id).unwrap_or_else(|| probe_system.clone());
+            probe_role_prompts.insert(role_id.clone(), prompt);
+        }
+    }
+
     let case_id_for_bookends = case.clone();
     let crew_name_for_bookends = crew.distinct_profile_names();
     let model_for_bookends = crew_model_summary(&crew);
@@ -909,6 +925,7 @@ fn run_dispatch(
             intent_body: intent,
             diff: diff_text.to_string(),
             probe_system,
+            probe_role_prompts,
             judge_system,
             verify_system,
             bundles,

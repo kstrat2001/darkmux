@@ -966,8 +966,14 @@ mod tests {
                 "task `{task_id}` depends only on the bundle task"
             );
             assert!(task.expand.is_none(), "no `expand` template — every probe task is explicit (#1512)");
-            assert_eq!(task.steps.len(), 1);
-            assert_eq!(task.steps[0].kind, "dispatch.map");
+            // (#1530 follow-on, Packet A1) Each probe task is now TWO
+            // sequential steps — the Tier-3 `review.probe-render` step
+            // (renders this seat's prompt collection AT RUN TIME), then
+            // the generic `dispatch.map` — mirroring the verify task's own
+            // render/dispatch.map split (asserted below).
+            assert_eq!(task.steps.len(), 2);
+            assert_eq!(task.steps[0].kind, "review.probe-render");
+            assert_eq!(task.steps[1].kind, "dispatch.map");
         }
         let dedup = investigate.tasks.iter().find(|t| t.id == "review-dedup-task").unwrap();
         assert_eq!(
