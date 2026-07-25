@@ -361,10 +361,65 @@ pub fn run_step_graph(
     // fresh full allowance, multiplying the effective stage ceiling by the
     // step count. A step that names no group gets a step-scoped bucket
     // inside its own kind, so ungrouped behavior is unchanged.
+    //
+    // (#1530 Packet 0) Deliberately NOT unified with the `ArtifactBus`
+    // materialized below, even though both are "scheduler-owned shared
+    // state keyed by a name". `bucket_group` is CONFIG-DRIVEN: its name
+    // comes from a Step's own `config.bucket_group` (resolved per-step,
+    // inline in the wave loop below, because a group can first appear in
+    // ANY wave) and its budget is a runtime value read from that same
+    // config or `config_access::remote_max_tokens_per_execution()`. An
+    // `ArtifactBus` entry's factory is a plain `fn() -> Arc<dyn Any + Send
+    // + Sync>` chosen specifically for `Port` to stay `const`-constructible
+    // (see `Port`'s doc) — it cannot capture a runtime budget value, so
+    // retrofitting `MapRemoteBucket` onto it would need either a captured-
+    // closure factory (abandoning the const-array ergonomics `Port` is
+    // built around) or resolving the bucket_group's budget BEFORE the
+    // artifact-bus pre-scan below (which does not know per-step config,
+    // only the STATIC ports a `StepKind` impl declares). Either path is a
+    // real design change for zero behavior gain in a zero-behavior-change
+    // packet, so `bucket_groups` keeps its own dedicated map — the BINDING
+    // requirement is that `dispatch.map`'s allowance-sharing stays byte-
+    // identical, and leaving its proven mechanism untouched is how this
+    // packet guarantees that.
     let mut bucket_groups: std::collections::BTreeMap<
         String,
         std::sync::Arc<std::sync::Mutex<crate::step_kinds::MapRemoteBucket>>,
     > = std::collections::BTreeMap::new();
+
+    // (#1530 Packet 0) Materialize the run-scoped `ArtifactBus` ONCE, on
+    // this main thread, BEFORE the wave loop below ever spawns a worker —
+    // the same "build fully, then treat as read-only across the thread
+    // boundary" discipline `bucket_groups` above uses per-step, applied
+    // here up front since a `Port::Artifact` declaration is STATIC (a
+    // property of the `StepKind` impl, not of any one step's config), so
+    // every artifact this graph could ever need is knowable before the
+    // first step runs. Scans only the KINDS ACTUALLY USED by steps in
+    // THIS graph (not every kind in the registry) — a registry can hold
+    // kinds this particular graph never references, and those should
+    // never pay to materialize an artifact nothing here will read.
+    let mut bus = crate::step_kinds::ArtifactBus::new();
+    {
+        let mut seen_kind_ids: HashSet<&str> = HashSet::new();
+        for step in steps.values() {
+            if !seen_kind_ids.insert(step.kind.as_str()) {
+                continue;
+            }
+            // A step whose `kind` isn't registered is a real error, but
+            // this pre-scan isn't the place to raise it — the ordinary
+            // `kinds.get(...)` lookup inside the wave loop below already
+            // does that with full step-id context (`with_context_step`).
+            // Here, an unresolvable kind simply contributes no ports.
+            if let Ok(kind) = kinds.get(&step.kind) {
+                for port in kind.provides() {
+                    if let crate::step_kinds::PortKind::Artifact(factory) = port.kind {
+                        bus.materialize(port.name, factory);
+                    }
+                }
+            }
+        }
+    }
+    let bus = std::sync::Arc::new(bus);
 
     loop {
         let ready_ids: Vec<String> = steps
@@ -473,6 +528,7 @@ pub fn run_step_graph(
                 Some(tx.clone()),
                 remote_bucket,
                 dispatch_override.clone(),
+                bus.clone(),
             );
             // (#1483 Bug 3) The job wrapper's OWN handle on the wave channel,
             // used to stream this step's terminal transition the instant its
@@ -1514,6 +1570,110 @@ mod tests {
         let entries = log.lock().unwrap().clone();
         let solo = entries.iter().find(|e| e.0 == "solo-step").expect("ran");
         assert!(!solo.1, "ungrouped step receives no scheduler-shared bucket (step-scoped instead)");
+    }
+
+    // ─── #1530 Packet 0: the run-scoped `ArtifactBus` ──────────────────
+
+    /// (#1530 Packet 0) Declares ONE `Artifact` port (`"test.shared-log"`,
+    /// a `Mutex<Vec<String>>`) and appends its own step id to it when run.
+    /// Proves the scheduler materializes the artifact from `provides()`
+    /// before the wave loop starts.
+    struct ArtifactWriterKind;
+    impl StepKind for ArtifactWriterKind {
+        fn id(&self) -> &'static str {
+            "test.artifact-writer"
+        }
+        fn provides(&self) -> &'static [crate::step_kinds::Port] {
+            const PORTS: [crate::step_kinds::Port; 1] = [crate::step_kinds::Port::artifact(
+                "test.shared-log",
+                || Arc::new(Mutex::new(Vec::<String>::new())),
+            )];
+            &PORTS
+        }
+        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            panic!("ArtifactWriterKind is only ever exercised through run_streaming in this test");
+        }
+        fn run_streaming(
+            &self,
+            step: &Step,
+            _t: &Task,
+            _i: &BTreeMap<String, String>,
+            ctx: &StepRunCtx,
+        ) -> Result<StepOutcome> {
+            let log = ctx
+                .artifact::<Mutex<Vec<String>>>("test.shared-log")
+                .expect("the scheduler materialized this port from `provides()` before the wave ran");
+            log.lock().unwrap().push(step.id.clone());
+            Ok(StepOutcome { output: "wrote".to_string(), flow_records: vec![] })
+        }
+    }
+
+    /// (#1530 Packet 0) Reads the SAME `"test.shared-log"` artifact (it
+    /// declares no `provides` of its own — only the writer's declaration
+    /// materializes it) and returns its current contents as `StepOutcome
+    /// ::output`, so the test can assert on what step B saw via the
+    /// completed step's persisted output.
+    struct ArtifactReaderKind;
+    impl StepKind for ArtifactReaderKind {
+        fn id(&self) -> &'static str {
+            "test.artifact-reader"
+        }
+        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            panic!("ArtifactReaderKind is only ever exercised through run_streaming in this test");
+        }
+        fn run_streaming(
+            &self,
+            _s: &Step,
+            _t: &Task,
+            _i: &BTreeMap<String, String>,
+            ctx: &StepRunCtx,
+        ) -> Result<StepOutcome> {
+            let log = ctx
+                .artifact::<Mutex<Vec<String>>>("test.shared-log")
+                .expect("the writer step's `provides()` materialized this port for the whole run");
+            let seen = log.lock().unwrap().join(",");
+            Ok(StepOutcome { output: seen, flow_records: vec![] })
+        }
+    }
+
+    #[test]
+    fn artifact_bus_shares_one_instance_across_steps_in_a_run() {
+        // Two CHAINED steps (B depends on A, so they land in distinct
+        // waves, exactly like the bucket_group test above) of DIFFERENT
+        // kinds: A writes its id into the shared artifact, B reads the
+        // artifact back. B seeing A's write proves the scheduler
+        // materialized ONE artifact instance (from A's `provides()`) and
+        // shared the SAME `Arc` into both steps' `StepRunCtx` — not a
+        // fresh instance per step.
+        let kinds = StepKindRegistry::new();
+        kinds.register(Arc::new(ArtifactWriterKind)).unwrap();
+        kinds.register(Arc::new(ArtifactReaderKind)).unwrap();
+        let (ta, sa) = kinded_step("a", "test.artifact-writer", json!({}), &[]);
+        let (tb, sb) = kinded_step("b", "test.artifact-reader", json!({}), &["a"]);
+        let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb)]);
+
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_step| {},
+            None,
+        )
+        .unwrap();
+
+        let b_output = steps.get("b-step").expect("b ran").output.clone();
+        assert_eq!(
+            b_output,
+            Some("a-step".to_string()),
+            "step B's artifact read should see step A's write through the ONE shared bus instance"
+        );
     }
 
     /// (#1483 Bug 3) A step kind that sleeps `config.sleep_ms` before

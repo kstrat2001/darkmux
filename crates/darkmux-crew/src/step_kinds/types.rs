@@ -3,6 +3,7 @@
 use crate::types::{Step, Task};
 use anyhow::Result;
 use darkmux_flow::FlowRecord;
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -136,10 +137,172 @@ pub struct OverrideDispatchCall<'a> {
 pub type MapDispatchOverride =
     Arc<dyn for<'a> Fn(&OverrideDispatchCall<'a>) -> Result<crate::single_shot::SingleShotReply> + Send + Sync>;
 
-/// (#1442) The execution context the SCHEDULER supplies to each step's
-/// [`StepKind::run_streaming`] — two seams that must originate OUTSIDE the
-/// step (so the step kind holds no caller `Arc` of its own and stays
-/// tier-pure):
+// ─── Port declarations + the run-scoped artifact bus (#1530 Packet 0) ─────
+//
+// The foundation for the "pure building-block graphs" arc: a `StepKind`
+// declares what it PRODUCES and CONSUMES beyond the ordinary Step-input/
+// output wiring, and the scheduler materializes the declared shared state
+// once per graph run. Nothing in this block changes what any EXISTING kind
+// does — every kind's `provides`/`requires` default to empty (see
+// `StepKind::provides`/`StepKind::requires`), so a Tier 1 graph with no
+// ports declared behaves byte-identically to before this packet.
+
+/// One named declaration a [`StepKind`] makes against the run's data flow —
+/// what it hands off ([`StepKind::provides`]) or expects available
+/// ([`StepKind::requires`]). This is the contract future `StepKind`
+/// implementations (Packets 1/2 of #1530: the review pipeline's dedup/judge
+/// accumulators, the coder-phase pipeline's shared worktree state, …)
+/// declare against, so read this doc before adding a new port.
+///
+/// **Typing is by-convention (name matching), not a schema system.** A
+/// `Port` carries a `&'static str` name and nothing else that constrains
+/// shape — two kinds agree on a port by using the SAME name and (for an
+/// [`Artifact`](PortKind::Artifact) port) the same concrete Rust type `T`
+/// on both ends of [`StepRunCtx::artifact::<T>`]. There is no registry
+/// that validates a `requires` name resolves to a matching `provides`, and
+/// no runtime type tag beyond `std::any::Any`'s own — a name collision
+/// between two UNRELATED kinds that happen to pick the same string is a
+/// caller bug (a downcast miss from [`ArtifactBus::get`] returns `None`,
+/// never panics), the same discipline `Step.config`'s dotted-key lookups
+/// already use throughout this crate. Do NOT build a type registry on top
+/// of this — see the module-level `CLAUDE.md` "KISS for local-AI
+/// infrastructure" note; a name-matching convention is the right amount of
+/// structure for a single-binary, single-operator system.
+///
+/// Two shapes, named by [`PortKind`]:
+///
+/// - [`PortKind::Data`] — a value that flows step→step through the
+///   ORDINARY wiring already in place: a `StepKind::run`'s returned
+///   [`StepOutcome::output`] becomes the downstream step's `input` entry
+///   keyed by the producing step's id (`scheduler::gather_inputs`). A
+///   `Data` port declares INTENT — "this kind's output is meant to satisfy
+///   a port of this name" — for a future consumer (a graph validator, a
+///   viewer annotation) to read; the scheduler does nothing extra with it
+///   today. Needs only a `name`.
+/// - [`PortKind::Artifact`] — a RUN-SCOPED SHARED HANDLE, materialized once
+///   per graph run (not once per step) and handed to every step by
+///   reference through [`StepRunCtx::artifact`]. Use this for state that
+///   must be visible to and mutated by MULTIPLE steps across the same run
+///   — an accumulator, a shared counter, a scratch collection — the same
+///   shape `MapRemoteBucket`'s `bucket_group` already proves out for the
+///   one case that exists today (see the module doc note on why that
+///   mechanism is NOT retrofitted onto this bus in this packet). Carries a
+///   `factory` the scheduler calls (at most once per name, per run) to
+///   MATERIALIZE the artifact without needing to know its concrete type —
+///   see [`ArtifactBus::materialize`].
+///
+/// The `factory` field is a plain `fn() -> Arc<dyn Any + Send + Sync>` —
+/// NOT a boxed closure (`Box<dyn Fn() -> _>`) — specifically so `Port`
+/// stays `Copy` and fully `const`-constructible: a `StepKind` impl can
+/// declare its ports as a `const` `'static` array literal (mirroring
+/// `id()`/`display_name()`'s own `&'static str` returns) with no
+/// allocation at declaration time, and the default `&[]` on
+/// [`StepKind::provides`]/[`StepKind::requires`] stays a zero-cost empty
+/// slice rather than an allocated empty `Vec`. A future artifact that
+/// genuinely needs a runtime-captured factory (e.g. a budget value read
+/// from config, the shape `MapRemoteBucket` needs) is exactly the case
+/// that stays OUTSIDE this mechanism — see the module doc note below.
+#[derive(Clone, Copy)]
+pub struct Port {
+    pub name: &'static str,
+    pub kind: PortKind,
+}
+
+impl Port {
+    /// A `Data`-kind port — flows through the ordinary `Step.output` →
+    /// `gather_inputs` wiring; declares intent only.
+    pub const fn data(name: &'static str) -> Self {
+        Port { name, kind: PortKind::Data }
+    }
+
+    /// An `Artifact`-kind port — a run-scoped shared handle the scheduler
+    /// materializes once (via `factory`) and hands to every step by
+    /// reference through [`StepRunCtx::artifact`].
+    pub const fn artifact(name: &'static str, factory: fn() -> Arc<dyn Any + Send + Sync>) -> Self {
+        Port { name, kind: PortKind::Artifact(factory) }
+    }
+}
+
+/// What kind of contract a [`Port`] declares. See [`Port`]'s doc for the
+/// full picture; this enum only distinguishes the two shapes.
+#[derive(Clone, Copy)]
+pub enum PortKind {
+    /// Flows through the ordinary `Step.output` → `gather_inputs` wiring.
+    /// A declaration of intent; the scheduler does nothing extra with it.
+    Data,
+    /// A run-scoped shared handle, materialized once per graph run by
+    /// calling this `factory`, then shared by reference into every step
+    /// via [`StepRunCtx::artifact`]. The factory returns a type-erased
+    /// `Arc<dyn Any + Send + Sync>` so the SCHEDULER (which materializes
+    /// ports from a `dyn StepKind` it holds no concrete type for) never
+    /// needs to know the concrete artifact type — only the `StepKind`
+    /// implementations reading/writing it (via [`StepRunCtx::artifact::<T>`])
+    /// need to agree on `T`.
+    Artifact(fn() -> Arc<dyn Any + Send + Sync>),
+}
+
+/// The run-scoped named-artifact bus (#1530 Packet 0). Materialized ONCE
+/// per graph run, on the scheduler's MAIN thread, BEFORE any wave's workers
+/// spawn — `run_step_graph` scans every step kind actually present in the
+/// graph, calls [`Port::artifact`]'s factory for each declared
+/// [`PortKind::Artifact`] port (get-or-create by name, mirroring the
+/// proven `bucket_groups` discipline that same function already uses for
+/// `dispatch.map`'s `bucket_group` — see that call site), and wraps the
+/// result in an `Arc` shared by reference into every step's [`StepRunCtx`]
+/// for the WHOLE run.
+///
+/// **Thread-safety discipline: build-then-freeze.** Every `materialize`
+/// call happens on the main thread before the first `run_bounded` worker
+/// spawns; from that point on the bus is read-only — a worker thread only
+/// ever calls [`Self::get`] (a lookup + clone + downcast), never inserts.
+/// This is why `ArtifactBus` itself needs no internal locking: the
+/// `BTreeMap`'s key set is closed before it ever crosses a thread
+/// boundary, and each entry's own concurrency (if any — e.g. an
+/// `Arc<Mutex<Vec<_>>>` artifact) is the CONCRETE type's own concern, not
+/// the bus's. Contrast with `MapRemoteBucket`'s `bucket_group` map, which
+/// stays mutable across the whole run (a NEW group name can appear in a
+/// later wave) and is therefore resolved per-step, inline in the main
+/// loop, rather than pre-scanned like this bus — see the module doc note
+/// for why that mechanism is not unified with this one in this packet.
+#[derive(Default)]
+pub struct ArtifactBus {
+    entries: BTreeMap<&'static str, Arc<dyn Any + Send + Sync>>,
+}
+
+impl ArtifactBus {
+    /// An empty bus — the default for any graph run whose step kinds
+    /// declare no `Artifact` ports (every kind shipped before #1530
+    /// Packet 0, and every Tier 1 builtin as of this packet).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get-or-create the named artifact, calling `factory` only the FIRST
+    /// time `name` is seen (idempotent re-registration — two step kinds
+    /// that happen to declare the SAME `Artifact` port name share the one
+    /// instance, the same "first declaration wins" semantics
+    /// `bucket_groups`' `.entry(...).or_insert_with(...)` already
+    /// establishes for bucket groups). Intended to be called only from the
+    /// scheduler's pre-wave-loop scan, on the main thread.
+    pub fn materialize(&mut self, name: &'static str, factory: fn() -> Arc<dyn Any + Send + Sync>) {
+        self.entries.entry(name).or_insert_with(factory);
+    }
+
+    /// Look up a named artifact and downcast it to `T`. Returns `None`
+    /// when no port materialized `name` in this run, OR when it did but at
+    /// a different concrete type than `T` — a caller/kind naming mismatch
+    /// (see [`Port`]'s doc on why typing here is by-convention, not
+    /// schema-checked). A downcast miss is a bug to catch during
+    /// development, never a panic.
+    pub fn get<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
+        self.entries.get(name)?.clone().downcast::<T>().ok()
+    }
+}
+
+/// (#1442, bus seam added #1530 Packet 0) The execution context the
+/// SCHEDULER supplies to each step's [`StepKind::run_streaming`] — seams
+/// that must originate OUTSIDE the step (so the step kind holds no caller
+/// `Arc` of its own and stays tier-pure):
 ///
 /// 1. **Live emitter (#1442 gate C3, "no blind runs").** A channel back to
 ///    the scheduler's own emission seam. A step that produces per-item
@@ -153,11 +316,22 @@ pub type MapDispatchOverride =
 ///    names a `bucket_group`, the scheduler resolves the group's shared
 ///    [`MapRemoteBucket`] and hands it here; sibling steps of the same group
 ///    meter one allowance BETWEEN them. `None` when the step named no group
-///    (the kind falls back to a step-scoped bucket).
+///    (the kind falls back to a step-scoped bucket). Deliberately NOT
+///    unified with seam 4 below — see [`ArtifactBus`]'s doc for why.
+/// 3. **The caller-supplied dispatch interceptor** for `dispatch.map` items
+///    (`None` on every production path — see [`MapDispatchOverride`]).
+/// 4. **The run-scoped [`ArtifactBus`] (#1530 Packet 0).** Materialized
+///    once by the scheduler before the graph's wave loop starts, shared by
+///    reference into every step for the WHOLE run. A step reads its
+///    declared [`PortKind::Artifact`] ports through [`StepRunCtx::artifact`].
+///    Always present (an empty bus when no kind in the graph declares an
+///    `Artifact` port), so no `Option` wrapping is needed at this layer —
+///    a lookup by name is the "is it there" check.
 pub struct StepRunCtx {
     emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
     remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
     dispatch_override: Option<MapDispatchOverride>,
+    artifacts: Arc<ArtifactBus>,
 }
 
 /// (#1483 Bug 3) One message on a wave's live streaming channel from a
@@ -204,8 +378,9 @@ impl StepRunCtx {
         emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
         remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
         dispatch_override: Option<MapDispatchOverride>,
+        artifacts: Arc<ArtifactBus>,
     ) -> Self {
-        Self { emitter, remote_bucket, dispatch_override }
+        Self { emitter, remote_bucket, dispatch_override, artifacts }
     }
 
     /// Emit one flow record LIVE through the scheduler's emission seam
@@ -234,6 +409,18 @@ impl StepRunCtx {
     /// `None` on every production path (see [`MapDispatchOverride`]).
     pub fn dispatch_override(&self) -> Option<&MapDispatchOverride> {
         self.dispatch_override.as_ref()
+    }
+
+    /// Look up this run's shared artifact by `name`, downcast to `T`
+    /// (#1530 Packet 0). `None` when no [`PortKind::Artifact`] port in this
+    /// graph materialized `name` under this concrete type — see
+    /// [`ArtifactBus::get`]'s doc for the by-convention-naming caveat. The
+    /// returned `Arc<T>` is a clone of the SAME instance every other step
+    /// of this run sees for `name` — a kind wanting mutation typically
+    /// declares its artifact as `Arc<Mutex<_>>` (or another interior-
+    /// mutable shape) so `T` here is that wrapper, not the raw payload.
+    pub fn artifact<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
+        self.artifacts.get::<T>(name)
     }
 }
 
@@ -361,5 +548,34 @@ pub trait StepKind: Send + Sync {
     ) -> Option<darkmux_gestalt::Placement> {
         let _ = (step, task, input);
         None
+    }
+
+    /// (#1530 Packet 0) The [`Port`]s this kind PRODUCES — what a future
+    /// consumer (a graph validator, the viewer's port-wiring annotation)
+    /// can expect available after this step runs. For an
+    /// [`PortKind::Artifact`] port, this is ALSO what `run_step_graph`
+    /// scans to know which artifacts to materialize onto the run's
+    /// [`ArtifactBus`] before its wave loop starts (see that scan's own
+    /// doc in `scheduler::run_step_graph`).
+    ///
+    /// Defaults to `&[]` — every kind's behavior before this hook existed,
+    /// and every Tier 1 builtin as of this packet (`dispatch.internal`,
+    /// `dispatch.map`, `dispatch.single_shot`, `procedural.shell`,
+    /// `procedural.noop`): none of them declare ports, so nothing about
+    /// their execution changes by this method's mere existence. A kind
+    /// that shares state across steps overrides this — see [`Port`]'s doc
+    /// for the two port shapes and when to use each.
+    fn provides(&self) -> &'static [Port] {
+        &[]
+    }
+
+    /// (#1530 Packet 0) The [`Port`]s this kind CONSUMES — the mirror of
+    /// [`StepKind::provides`]. Declares intent for a future consumer
+    /// (validator/viewer); the scheduler does not enforce that a
+    /// `requires` name resolves to a matching `provides` anywhere in the
+    /// graph — see [`Port`]'s doc on why typing here is by-convention, not
+    /// schema-checked. Defaults to `&[]`, same rationale as `provides`.
+    fn requires(&self) -> &'static [Port] {
+        &[]
     }
 }

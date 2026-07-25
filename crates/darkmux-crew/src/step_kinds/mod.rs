@@ -49,8 +49,8 @@ pub use builtins::{
 pub use builtins::MAP_BUDGET_SKIP_ERROR;
 pub use registry::StepKindRegistry;
 pub use types::{
-    MapDispatchOverride, MapRemoteBucket, OverrideDispatchCall, StepKind, StepOutcome, StepRunCtx,
-    WaveSignal,
+    ArtifactBus, MapDispatchOverride, MapRemoteBucket, OverrideDispatchCall, Port, PortKind,
+    StepKind, StepOutcome, StepRunCtx, WaveSignal,
 };
 
 /// Re-exported so callers OUTSIDE this crate (e.g. `darkmux`'s own
