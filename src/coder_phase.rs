@@ -815,6 +815,15 @@ impl StepKind for MissionVerifyStepKind {
         &PORTS
     }
 
+    /// (#1530 Packet 2) THE sign-off gate of the coder-phase pipeline — see
+    /// `StepKind::is_gate`'s own doc for the full mechanism.
+    /// `coder_phase_gate_outcome` (`mission_launch.rs`) discovers this step
+    /// via this declaration rather than a hardcoded `"<phase>-verify-step"`
+    /// id convention.
+    fn is_gate(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         _step: &crew::types::Step,

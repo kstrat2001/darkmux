@@ -607,4 +607,30 @@ pub trait StepKind: Send + Sync {
     fn requires(&self) -> &'static [Port] {
         &[]
     }
+
+    /// (#1530 Packet 2) Declares whether this kind is a SIGN-OFF GATE — a
+    /// step whose completion should hold the owning Task/Phase/Mission at a
+    /// human/frontier-reviewable checkpoint rather than letting the graph's
+    /// caller finalize automatically. Defaults to `false` — every kind's
+    /// behavior before this hook existed, and every Tier 1 builtin today
+    /// (none of them gate anything; gating is a judgment-boundary concern,
+    /// never a generic config-driven kind's job).
+    ///
+    /// This is the property `darkmux`'s coder-phase launcher
+    /// (`coder_phase_gate_outcome`) reads to find WHICH step in a graph is
+    /// its gate, rather than hardcoding a step-id naming convention
+    /// (`"<phase>-verify-step"`) — a caller scans the graph's steps for the
+    /// one whose registered kind reports `is_gate() == true`. Today exactly
+    /// one kind overrides this (`darkmux`'s own
+    /// `coder_phase::MissionVerifyStepKind`), and exactly one caller reads
+    /// it (`coder_phase_gate_outcome`) — but the declaration lives here, on
+    /// the trait, specifically so a FUTURE generic runner (#1530 Packet 3)
+    /// can apply the same gate-holding behavior to ANY graph purely from
+    /// this property, with no coder-phase-specific knowledge baked into the
+    /// runner itself. A graph may have zero or one gate step today (this
+    /// crate does not enforce "at most one" — a caller that finds more than
+    /// one is a config/kind-authoring bug to surface, not silently resolve).
+    fn is_gate(&self) -> bool {
+        false
+    }
 }
