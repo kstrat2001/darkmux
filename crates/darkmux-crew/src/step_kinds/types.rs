@@ -297,6 +297,24 @@ impl ArtifactBus {
     pub fn get<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
         self.entries.get(name)?.clone().downcast::<T>().ok()
     }
+
+    /// Unconditionally set a named artifact to a CALLER-SUPPLIED value
+    /// (#1530 Packet 1), overwriting whatever a kind's `provides()` factory
+    /// may already have materialized for `name` — the caller-seed path
+    /// `run_step_graph` merges AFTER its own `provides()` pre-scan (see
+    /// that function's doc), so a caller wins over a factory default for
+    /// any name it names. Use this for run-scoped state only the CALLER
+    /// knows the real value of (a pre-stamped envelope, a value read from
+    /// the run's own inputs) — a `Port::artifact` factory can only ever
+    /// build a context-free default (see `Port`'s doc on why its factory is
+    /// a plain `fn`, not a capturing closure). Like [`Self::materialize`],
+    /// intended to be called only from the scheduler's pre-wave-loop setup
+    /// (or, symmetrically, from the CALLER assembling `seed_artifacts`
+    /// before that call), never after the bus has crossed into a worker
+    /// thread.
+    pub fn seed(&mut self, name: &'static str, value: Arc<dyn Any + Send + Sync>) {
+        self.entries.insert(name, value);
+    }
 }
 
 /// (#1442, bus seam added #1530 Packet 0) The execution context the
@@ -374,7 +392,18 @@ pub enum WaveSignal {
 }
 
 impl StepRunCtx {
-    pub(crate) fn new(
+    /// `pub` (not `pub(crate)`) since #1530 Packet 1 — a `StepKind` that
+    /// migrated its bespoke `Arc<Mutex<_>>` handles onto the [`ArtifactBus`]
+    /// (e.g. `darkmux-lab`'s review pipeline) now needs its OWN unit tests,
+    /// outside this crate, to exercise `StepKind::run_streaming` directly
+    /// with a hand-built context rather than only through a full
+    /// `run_step_graph` call — the same reason `ArtifactBus`/`Port` were
+    /// already `pub`. Every production caller still goes through
+    /// `run_step_graph`, which is the only place that assembles the OTHER
+    /// scheduler-owned seams (the live emitter, a `bucket_group`'s shared
+    /// bucket) correctly; a hand-built `StepRunCtx` in a test typically
+    /// passes `None`/`None` for those two and only a real `ArtifactBus`.
+    pub fn new(
         emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
         remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
         dispatch_override: Option<MapDispatchOverride>,

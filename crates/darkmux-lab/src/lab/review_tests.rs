@@ -6,6 +6,12 @@
     use darkmux_crew::types::NodeStatus;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    // (#1530 Packet 1) Only test code hand-builds an `ArtifactBus` — a
+    // production `run_review_graph` call always builds its bus through
+    // `run_step_graph`'s own pre-scan + caller-seed path. Imported here
+    // (not review.rs's production `use` block) so a non-test build never
+    // warns about it going unused.
+    use darkmux_crew::step_kinds::ArtifactBus;
 
     // ── fixtures ────────────────────────────────────────────────────
 
@@ -2666,7 +2672,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // unclaimed declared probe task — that pruning must be LOUD, not
         // silent, since a production run pruning a declared task is exactly
         // the reduced-coverage failure mode a Studio hand-edit can trigger.
-        let warnings = graph.shared_env.lock().expect("shared env mutex poisoned").warnings.clone();
+        // (#1530 Packet 1) `BuiltReviewGraph` now carries the envelope's
+        // build-time contents as a plain value (`initial_env`), not an
+        // `Arc<Mutex<_>>` — the Arc is minted inside `run_review_graph`,
+        // not here (see `BuiltReviewGraph::initial_env`'s doc).
+        let warnings = graph.initial_env.warnings.clone();
         assert!(
             warnings.iter().any(|w| w.contains("pruned")),
             "pruning an unclaimed declared probe task must warn: {warnings:?}"
@@ -3569,6 +3579,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             // threads — the verify dispatch.map step dispatches through the
             // test's `chat_override` on the worker thread.
             review_dispatch_override(ctx),
+            // (#1530 Packet 1) This test drives `run_step_graph` directly
+            // (bypassing `run_review_graph`) to inspect `RecordingHost`'s
+            // loads, so it never seeds the envelope/context artifacts —
+            // `ReviewDedupStepKind::provides()`'s context-free defaults
+            // cover every step's `ctx.artifact` lookup here, which is fine:
+            // this test asserts on `loads`/`steps`, never envelope content.
+            &[],
         )
         .expect("graph run completes");
         let recorded = loads.lock().unwrap().clone();
@@ -3711,6 +3728,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             &mut |_record| {},
             &mut |_step| {},
             review_dispatch_override(&ctx),
+            // (#1530 Packet 1) Bypasses `run_review_graph`, same as the
+            // sibling test above — every probe step errors before dedup
+            // (the first bus consumer) ever runs, so there's nothing to
+            // seed.
+            &[],
         )
         .expect("graph run completes even when every probe step errors");
 
@@ -3881,9 +3903,19 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 j.passes = 1;
                 j
             },
-            members: StdArc::new(TestMutex::new(Vec::new())),
-            env: StdArc::new(TestMutex::new(ReviewEnvelope::default())),
         };
+        // (#1530 Packet 1) `members`/`env` moved off `ReviewJudgeStepKind`'s
+        // own fields onto the run-scoped `ArtifactBus` — a direct
+        // `run_streaming` call (bypassing the full scheduler) hand-seeds the
+        // same bus a real `run_review_graph` call would build, via
+        // `ArtifactBus::seed` + a bare `StepRunCtx` (no emitter/bucket/
+        // override needed for this test).
+        let members: StdArc<TestMutex<Vec<MemberRecord>>> = StdArc::new(TestMutex::new(Vec::new()));
+        let env: StdArc<TestMutex<ReviewEnvelope>> = StdArc::new(TestMutex::new(ReviewEnvelope::default()));
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as StdArc<dyn Any + Send + Sync>);
+        bus.seed(REVIEW_MEMBERS_ARTIFACT, members.clone() as StdArc<dyn Any + Send + Sync>);
+        let run_ctx = StepRunCtx::new(None, None, None, StdArc::new(bus));
         let step = darkmux_crew::types::Step {
             id: "judge-step".to_string(),
             task_id: "judge-task".to_string(),
@@ -3910,7 +3942,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         input.insert("dedup".to_string(), serde_json::to_string(&flags).unwrap());
 
         use darkmux_crew::step_kinds::StepKind as _;
-        let outcome = kind.run(&step, &task, &input).expect("judge step completes");
+        let outcome = kind.run_streaming(&step, &task, &input, &run_ctx).expect("judge step completes");
         let judged: Vec<JudgedFlag> = serde_json::from_str(&outcome.output).expect("judged parses");
         let order: Vec<&str> = judged.iter().map(|j| j.flag.charge_text.as_str()).collect();
         assert_eq!(
@@ -5100,11 +5132,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             mk("b.ts", Tier::Confirmed, "charge two"),
         ];
 
-        let kind = ReviewVerifyRenderStepKind {
-            ctx: ctx.clone(),
-            verify: ctx.roles.verify.clone(),
-            env: Arc::new(StdMutex::new(ReviewEnvelope::default())),
-        };
+        let kind = ReviewVerifyRenderStepKind { ctx: ctx.clone(), verify: ctx.roles.verify.clone() };
+        // (#1530 Packet 1) `env` moved off this kind's own field onto the
+        // run-scoped `ArtifactBus` — see the judge test above for the same
+        // hand-seeded-bus pattern.
+        let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as Arc<dyn Any + Send + Sync>);
+        let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
         let step = darkmux_crew::types::Step {
             id: "review-verify-render-step".to_string(),
             task_id: "review-verify-task".to_string(),
@@ -5131,7 +5166,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         input.insert("review-judge-task".to_string(), serde_json::to_string(&judged).unwrap());
 
         use darkmux_crew::step_kinds::StepKind as _;
-        let out = kind.run(&step, &task, &input).expect("render completes");
+        let out = kind.run_streaming(&step, &task, &input, &run_ctx).expect("render completes");
         let prompts: Vec<String> = serde_json::from_str(&out.output).expect("collection parses");
 
         // Direct calls to the SAME #1256-frozen assembler, in confirmed
