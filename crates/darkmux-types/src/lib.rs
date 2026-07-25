@@ -95,11 +95,17 @@ pub struct ProfileModel {
     /// at what relative weights (code / reasoning / instruction_following
     /// / agentic_tool_use). The operator populates it from lab results
     /// (which models run well on their machine, at what context). Empty
-    /// by default. `select_model` (phase 2, #450) WILL match a role's
-    /// requested capabilities against this — treating a wholly-unvectored
-    /// model as a 0.5-everywhere generalist — with no machine tier in the
-    /// decision, only capability + lab-vetted fit (#322). Additive today:
-    /// nothing scores against it until that slice lands.
+    /// by default. **This is LIVE, not additive** (#450 phase 2 landed):
+    /// `darkmux_crew::select::select_model` matches a role's requested
+    /// capabilities against this vector — treating a wholly-unvectored model
+    /// as a 0.5-everywhere generalist — with no machine tier in the decision,
+    /// only capability + lab-vetted fit (#322). Reached from both dispatch
+    /// paths, so populating this on ONE model in a profile can change WHICH
+    /// model a role's dispatch runs on. Scoring is a no-op only while the
+    /// role requests no capabilities or no model in the profile carries an
+    /// offer vector. (#1530: this doc previously claimed "nothing scores
+    /// against it," which read as an inert field and made a live selection
+    /// knob look safe to populate blindly.)
     #[serde(default)]
     pub capabilities: CapabilityProfile,
     /// The OpenAI-compatible endpoint this model is served from. Absent ⇒

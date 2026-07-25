@@ -36,6 +36,23 @@ const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
         "tool-bench",
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/tool-bench.json")),
     ),
+    // (#1530) The quickstart workload the onboarding path names by id
+    // (`skills/darkmux-lab-run` → `scripts/lab-init.sh` then `darkmux lab run
+    // demo-quickstart`). It was shipped under templates/ but never listed
+    // here, so it resolved only via the cwd-relative on-disk fallback — i.e.
+    // from a source checkout and nowhere else, leaving every brew /
+    // `cargo install` operator's first documented run failing "not found".
+    // It embeds cleanly under `parse_str`'s rules: no `promptFile`, and
+    // although it is `provider: coding-task` it declares NO `sandboxSeed`
+    // (it binds a registered fixture + external sandbox instead), exactly
+    // like the already-embedded `long-agentic`.
+    (
+        "demo-quickstart",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../templates/builtin/workloads/demo-quickstart.json"
+        )),
+    ),
 ];
 
 fn find_embedded(id: &str) -> Option<&'static str> {
@@ -461,5 +478,37 @@ mod tests {
         let loaded = result.expect("quick-q should load from the embedded const");
         assert_eq!(loaded.manifest.workload.id, "quick-q");
         assert_eq!(loaded.source, WorkloadSource::Builtin);
+    }
+
+    /// (#1530) The ONBOARDING workload specifically — `skills/darkmux-lab-run`
+    /// tells a brand-new operator to run `darkmux lab run demo-quickstart`,
+    /// and a brew / `cargo install` operator has no source checkout, so the
+    /// cwd-relative on-disk fallback can't save it. It shipped under
+    /// templates/ but was absent from `EMBEDDED_WORKLOADS`, making the first
+    /// documented command fail "not found" for exactly the audience following
+    /// the docs. This pins the binary-only resolution rather than the const's
+    /// membership, so it fails for the reason an operator would feel.
+    #[serial_test::serial]
+    #[test]
+    fn onboarding_demo_quickstart_resolves_with_no_on_disk_templates() {
+        let tmp = TempDir::new().unwrap();
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+        unsafe { env::set_var("DARKMUX_TEMPLATES_DIR", tmp.path().join("nope")) };
+        let result = load("demo-quickstart", None);
+        unsafe { env::remove_var("DARKMUX_TEMPLATES_DIR") };
+        env::set_current_dir(prev).unwrap();
+        let loaded = result.expect(
+            "demo-quickstart is the documented first run — it must resolve from the binary \
+             on a machine with no source checkout",
+        );
+        assert_eq!(loaded.manifest.workload.id, "demo-quickstart");
+        assert_eq!(loaded.source, WorkloadSource::Builtin);
+        // It binds the built-in fixture rather than a sandbox seed — the
+        // property that makes it embeddable under `parse_str`'s rules.
+        assert!(
+            loaded.manifest.workload.sandbox_seed.is_none(),
+            "demo-quickstart must not declare a sandboxSeed, or it can't be embedded"
+        );
     }
 }
