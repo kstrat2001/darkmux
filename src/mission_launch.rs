@@ -78,6 +78,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::{self, FindingSeverity, LaunchParams, MissionConfig, TaskOverride};
 use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus};
 use darkmux_types::style;
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -428,6 +429,26 @@ pub fn launch(
     // (#1400) Tracks which phases this dispatch has already lazy-started —
     // see `lazy_start_phase_for_step`'s doc.
     let mut started_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // (#1530 Packet 2) The coder-phase kinds' two structured-result slots,
+    // seeded onto the run-scoped `ArtifactBus` via `run_step_graph`'s
+    // caller-seed path — `coder_handles` already OWNS the `Arc` clones
+    // (`CoderPhaseHandles::coder_slot`/`verify_slot`, minted in
+    // `register_coder_phase_kinds`), so this is a pure hand-off: the SAME
+    // instance the kinds write into (via `StepRunCtx::artifact`) is what
+    // `coder_phase_gate_outcome` reads back below, directly off `handles`,
+    // once the graph returns. Empty (`&[]`) on every non-coder-phase graph —
+    // zero behavior change there, mirroring `run_review_graph`'s own
+    // `seed_artifacts` shape (#1530 Packet 1).
+    let seed_artifacts: Vec<(&'static str, Arc<dyn Any + Send + Sync>)> = match &coder_handles {
+        Some(h) => vec![
+            (coder_phase::CODER_RESULT_ARTIFACT, h.coder_slot.clone() as Arc<dyn Any + Send + Sync>),
+            (
+                coder_phase::CODER_VERIFY_RESULT_ARTIFACT,
+                h.verify_slot.clone() as Arc<dyn Any + Send + Sync>,
+            ),
+        ],
+        None => Vec::new(),
+    };
     // (#1397) `persist` durably saves each step at ITS OWN transition
     // (Running at dispatch, Complete/Error at completion), not just at the
     // end of the whole run — see `run_step_graph`'s own doc. The phase id
@@ -461,7 +482,7 @@ pub fn launch(
             }
         },
         None,
-        &[],
+        &seed_artifacts,
     );
 
     // (#1406, F4) A scheduler-level `Err` mid-run would otherwise `?`-return
@@ -885,6 +906,17 @@ fn launch_session_id(mission_id: &str, real_phase_id: &str) -> String {
 /// the step kinds populate (the generic `StepOutcome.output: String`
 /// contract can't carry the rich verdict/verifier detail), plus the
 /// launch-resolved identifiers the gate banners print.
+///
+/// (#1530 Packet 2) `coder_slot`/`verify_slot` are the SAME `Arc`s `launch`
+/// seeds onto the run-scoped `ArtifactBus` (`coder_phase::
+/// CODER_RESULT_ARTIFACT`/`CODER_VERIFY_RESULT_ARTIFACT`) before calling
+/// `run_step_graph` — `MissionCoderStepKind`/`MissionVerifyStepKind` write
+/// into them via `StepRunCtx::artifact` inside `run_streaming`, and this
+/// struct's fields are simply the caller's own clone of that hand-off, read
+/// directly (no bus access needed post-run — `run_step_graph` exposes none;
+/// see `coder_phase.rs`'s artifact-name doc for the full reasoning). The
+/// field TYPES/NAMES are unchanged from the pre-#1530-Packet-2 bespoke-slot
+/// shape; only WHERE the writing kinds reach the slot moved.
 pub(crate) struct CoderPhaseHandles {
     coder_slot: Arc<Mutex<Option<coder_phase::CoderStepResult>>>,
     verify_slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>,
@@ -900,7 +932,9 @@ pub(crate) struct CoderPhaseHandles {
 /// (naming the missing input) rather than constructing a kind with an
 /// empty path if the graph needs these kinds but the operator didn't
 /// supply them. Returns the [`CoderPhaseHandles`] the caller reads after
-/// `run_step_graph` to decide the gate outcome.
+/// `run_step_graph` to decide the gate outcome — and also, since #1530
+/// Packet 2, seeds onto the `ArtifactBus` via `run_step_graph`'s
+/// `seed_artifacts` parameter (see `launch`'s own call site).
 fn register_coder_phase_kinds(
     registry: &crew::step_kinds::StepKindRegistry,
     mission_id: &str,
@@ -1000,7 +1034,6 @@ fn register_coder_phase_kinds(
             phase_id: real_phase_id.clone(),
             session_id: session_id.clone(),
             role_id: role,
-            result_slot: coder_slot.clone(),
         }))
         .map_err(|e| anyhow!("registering mission.coder: {e}"))?;
 
@@ -1009,7 +1042,6 @@ fn register_coder_phase_kinds(
             wt_path: workdir.clone(),
             base,
             phase_id: real_phase_id.clone(),
-            result_slot: verify_slot.clone(),
         }))
         .map_err(|e| anyhow!("registering mission.verify: {e}"))?;
 
