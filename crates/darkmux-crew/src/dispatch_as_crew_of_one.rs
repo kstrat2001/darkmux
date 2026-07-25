@@ -595,6 +595,7 @@ mod tests {
             _step: &crate::types::Step,
             _task: &crate::types::Task,
             _input: &BTreeMap<String, String>,
+            _ctx: &crate::step_kinds::StepRunCtx,
         ) -> Option<Placement> {
             Some(self.placement.clone())
         }

@@ -569,13 +569,30 @@ pub trait StepKind: Send + Sync {
     /// ship-2 operator decision — the review verify seat with an empty
     /// confirmed docket is the first consumer). Kinds with static needs
     /// ignore it.
+    ///
+    /// `ctx` (#1530 Packet 3a) is the SAME [`StepRunCtx`] `run_streaming`
+    /// receives — most callers ignore it (every Tier 1 builtin's residency
+    /// hint resolves purely from `step`/`task`), but a kind whose residency
+    /// decision depends on run-scoped [`ArtifactBus`] state can read it here
+    /// via [`StepRunCtx::artifact`]. The review pipeline's judge kind is the
+    /// first consumer: its skip-load optimization (no wave load when the
+    /// probe stage's bundle set is empty — see `darkmux-lab`'s
+    /// `ReviewJudgeStepKind::residency`) used to read a constructor-held
+    /// `Arc<ReviewStepContext>`; now that context lives on the bus (the
+    /// `Arc<ReviewStepContext>` constructor field this hook once justified is
+    /// gone), so residency needs the SAME bus access `run_streaming` already
+    /// has to keep that optimization alive. The scheduler passes the
+    /// run-scoped bus materialized before its wave loop starts (see
+    /// `scheduler::run_step_graph`'s pre-scan) — `residency()` runs on the
+    /// main thread, one call ahead of `run_streaming`'s own ctx.
     fn residency(
         &self,
         step: &Step,
         task: &Task,
         input: &std::collections::BTreeMap<String, String>,
+        ctx: &StepRunCtx,
     ) -> Option<darkmux_gestalt::Placement> {
-        let _ = (step, task, input);
+        let _ = (step, task, input, ctx);
         None
     }
 

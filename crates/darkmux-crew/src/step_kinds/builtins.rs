@@ -483,6 +483,7 @@ impl StepKind for DispatchInternalStepKind {
         step: &Step,
         task: &Task,
         _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
     ) -> Option<darkmux_gestalt::Placement> {
         let role_id = task_or_config_str(task.role_id.as_ref(), step, "role_id")?;
         let profile_name = task_or_config_str(task.profile_name.as_ref(), step, "profile_name");
@@ -1508,6 +1509,7 @@ impl StepKind for DispatchMapStepKind {
         step: &Step,
         _task: &Task,
         input: &BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
     ) -> Option<darkmux_gestalt::Placement> {
         if step.config.get("endpoint").is_some() {
             return None;
@@ -1662,6 +1664,15 @@ mod tests {
             workdir: None,
             image: None,
         }
+    }
+
+    /// (#1530 Packet 3a) A bare `StepRunCtx` — no emitter/bucket/override,
+    /// an empty `ArtifactBus` — for tests that call `residency()` directly
+    /// (bypassing the scheduler, which is the only production caller that
+    /// materializes a real bus). None of `residency()`'s Tier 1 builtin
+    /// implementations read the bus, so an empty one is sufficient here.
+    fn bare_ctx() -> StepRunCtx {
+        StepRunCtx::new(None, None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
     }
 
     #[test]
@@ -1977,7 +1988,7 @@ mod tests {
             "collection": [],
         }));
         assert!(
-            DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new()).is_none(),
+            DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()).is_none(),
             "an empty collection must declare no residency need (no load)"
         );
     }
@@ -1990,7 +2001,7 @@ mod tests {
             "n_ctx": 8192,
             "collection": ["a"],
         }));
-        let placement = DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let placement = DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()).unwrap();
         assert_eq!(placement.model_key, "qwen3.6-35b-a3b");
         assert_eq!(placement.min_ctx, 8192);
         assert!(placement.identifier.starts_with("darkmux:"), "default identifier is namespaced: {}", placement.identifier);
@@ -2009,14 +2020,14 @@ mod tests {
             "collection": ["a"],
             "endpoint": { "url": "https://example.com" },
         }));
-        assert!(DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new()).is_none());
+        assert!(DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()).is_none());
     }
 
     #[test]
     fn dispatch_map_residency_none_without_n_ctx_fails_open() {
         let s = map_step(json!({ "model": "m", "user_template": "u {item}", "collection": ["a"] }));
         assert!(
-            DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new()).is_none(),
+            DispatchMapStepKind.residency(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()).is_none(),
             "no n_ctx hint -> None (fail open to Remote scheduling), never a hard failure"
         );
     }

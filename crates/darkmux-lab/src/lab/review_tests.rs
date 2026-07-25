@@ -3565,6 +3565,19 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let est = darkmux_gestalt::FixedEstimator(
             [(verify.pm.id.clone(), 1_000_000_000u64)].into_iter().collect(),
         );
+        // (#1530 Packet 3a) This test drives `run_step_graph` directly
+        // (bypassing `run_review_graph`) to inspect `RecordingHost`'s loads —
+        // it used to rely on `ReviewDedupStepKind::provides()`'s context-free
+        // ENVELOPE default (fine, since this test never asserts on envelope
+        // content), but now that the review CONTEXT also lives on the bus
+        // (`REVIEW_CONTEXT_ARTIFACT`), the judge/verify-render kinds' own
+        // logic (bundle lookups, the judge's `residency()` skip-load check)
+        // needs the REAL context, not `ReviewStepContext::default()`'s empty
+        // bundles/diff — an empty default silently changes what this test
+        // measures (residency wrongly reports no local need, dedup runs
+        // against an empty diff). Seed it explicitly with the real `ctx`.
+        let seed_artifacts: [(&'static str, Arc<dyn Any + Send + Sync>); 1] =
+            [(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>)];
         darkmux_crew::scheduler::run_step_graph(
             &mut steps,
             &tasks_by_id,
@@ -3579,13 +3592,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             // threads — the verify dispatch.map step dispatches through the
             // test's `chat_override` on the worker thread.
             review_dispatch_override(ctx),
-            // (#1530 Packet 1) This test drives `run_step_graph` directly
-            // (bypassing `run_review_graph`) to inspect `RecordingHost`'s
-            // loads, so it never seeds the envelope/context artifacts —
-            // `ReviewDedupStepKind::provides()`'s context-free defaults
-            // cover every step's `ctx.artifact` lookup here, which is fine:
-            // this test asserts on `loads`/`steps`, never envelope content.
-            &[],
+            &seed_artifacts,
         )
         .expect("graph run completes");
         let recorded = loads.lock().unwrap().clone();
@@ -3896,32 +3903,45 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
             Ok(reply(CONFIRM_JSON))
         });
-        let kind = ReviewJudgeStepKind {
-            ctx,
-            judge: {
-                let mut j = staffing("fast", "judge-model", 1);
-                j.passes = 1;
-                j
-            },
+        let kind = ReviewJudgeStepKind;
+        let judge = {
+            let mut j = staffing("fast", "judge-model", 1);
+            j.passes = 1;
+            j
         };
-        // (#1530 Packet 1) `members`/`env` moved off `ReviewJudgeStepKind`'s
-        // own fields onto the run-scoped `ArtifactBus` — a direct
-        // `run_streaming` call (bypassing the full scheduler) hand-seeds the
-        // same bus a real `run_review_graph` call would build, via
-        // `ArtifactBus::seed` + a bare `StepRunCtx` (no emitter/bucket/
-        // override needed for this test).
+        // (#1530 Packets 1/3a) `members`/`env`/the run-scoped `ctx` (context)
+        // moved off `ReviewJudgeStepKind`'s own fields onto the run-scoped
+        // `ArtifactBus` — a direct `run_streaming` call (bypassing the full
+        // scheduler) hand-seeds the same bus a real `run_review_graph` call
+        // would build, via `ArtifactBus::seed` + a bare `StepRunCtx` (no
+        // emitter/bucket/override needed for this test). The judge seat's
+        // staffing (model/passes/max_tokens) is likewise stamped onto the
+        // step's own `config`, mirroring `build_review_graph_from_config`'s
+        // production stamp.
         let members: StdArc<TestMutex<Vec<MemberRecord>>> = StdArc::new(TestMutex::new(Vec::new()));
         let env: StdArc<TestMutex<ReviewEnvelope>> = StdArc::new(TestMutex::new(ReviewEnvelope::default()));
         let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as StdArc<dyn Any + Send + Sync>);
         bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as StdArc<dyn Any + Send + Sync>);
         bus.seed(REVIEW_MEMBERS_ARTIFACT, members.clone() as StdArc<dyn Any + Send + Sync>);
         let run_ctx = StepRunCtx::new(None, None, None, StdArc::new(bus));
+        let mut judge_config = serde_json::json!({
+            "concurrency": 2,
+            "model": seat_identifier(&judge.pm),
+            "passes": judge.passes,
+            "max_tokens": resolve_seat_max_tokens(&judge, DEFAULT_JUDGE_MAX_TOKENS),
+        });
+        judge_config["model_key"] = serde_json::json!(judge.pm.id);
+        judge_config["identifier"] = serde_json::json!(seat_identifier(&judge.pm));
+        if let Some(n_ctx) = judge.pm.n_ctx {
+            judge_config["n_ctx"] = serde_json::json!(n_ctx);
+        }
         let step = darkmux_crew::types::Step {
             id: "judge-step".to_string(),
             task_id: "judge-task".to_string(),
             kind: "review.judge".to_string(),
             status: NodeStatus::default(),
-            config: serde_json::json!({ "concurrency": 2 }),
+            config: judge_config,
             started_ts: None,
             completed_ts: None,
             output: None,
@@ -5132,12 +5152,16 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             mk("b.ts", Tier::Confirmed, "charge two"),
         ];
 
-        let kind = ReviewVerifyRenderStepKind { ctx: ctx.clone(), verify: ctx.roles.verify.clone() };
-        // (#1530 Packet 1) `env` moved off this kind's own field onto the
-        // run-scoped `ArtifactBus` — see the judge test above for the same
-        // hand-seeded-bus pattern.
+        let kind = ReviewVerifyRenderStepKind;
+        // (#1530 Packets 1/3a) `env`/the run-scoped `ctx` (context) moved off
+        // this kind's own fields onto the run-scoped `ArtifactBus` — see the
+        // judge test above for the same hand-seeded-bus pattern. The verify
+        // seat's ONLY thing this kind reads (`.is_none()`) is stamped onto
+        // the step's own config as `verify_seat_staffed`, mirroring
+        // `build_review_graph_from_config`'s production stamp.
         let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
         let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
         bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as Arc<dyn Any + Send + Sync>);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
         let step = darkmux_crew::types::Step {
@@ -5145,7 +5169,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             task_id: "review-verify-task".to_string(),
             kind: "review.verify-render".to_string(),
             status: NodeStatus::default(),
-            config: serde_json::Value::Null,
+            config: serde_json::json!({ "verify_seat_staffed": ctx.roles.verify.is_some() }),
             started_ts: None,
             completed_ts: None,
             output: None,

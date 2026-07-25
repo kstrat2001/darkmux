@@ -74,7 +74,16 @@ impl StaffingProvenance {
 
 /// A seat staffing resolved to a concrete model — the resolver's per-seat
 /// output. The review driver + envelope snapshot consume it unchanged.
-#[derive(Debug, Clone)]
+///
+/// (#1530 Packet 3a) `Default` derives cleanly (every field is itself
+/// `Default` — `ProfileModel`, `BundleSelector`, and every `Option`/`Vec`/
+/// primitive here already are) and is used ONLY by
+/// `darkmux-lab::lab::review`'s context-free `ArtifactBus` factory default
+/// for `ReviewStepContext::roles` — a value ALWAYS overwritten by
+/// `run_review_graph`'s caller-seed before any step reads it (see
+/// `Port::artifact`'s doc on why a factory can only build a context-free
+/// default). Never constructed as a real staffing anywhere else.
+#[derive(Debug, Clone, Default)]
 pub struct ResolvedSeatStaffing {
     /// The [`Profile`](darkmux_types::Profile) name this seat's role resolved to
     /// (via the role→profile flip) and dispatches through.
@@ -112,7 +121,11 @@ pub struct ResolvedSeatStaffing {
 /// This is simply the concrete return shape [`resolve_review_roles`]
 /// produces and [`crate::mission_config`]-driven callers thread straight
 /// into `build_review_graph`/`staffing_snapshot`/`run_review_graph`.
-#[derive(Debug, Clone)]
+///
+/// (#1530 Packet 3a) `Default` derives cleanly — see
+/// [`ResolvedSeatStaffing`]'s own doc on why and its one consumer
+/// (`ReviewStepContext`'s context-free `ArtifactBus` factory default).
+#[derive(Debug, Clone, Default)]
 pub struct ResolvedReviewRoles {
     pub probes: Vec<ResolvedSeatStaffing>,
     pub judge: ResolvedSeatStaffing,

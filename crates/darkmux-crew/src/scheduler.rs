@@ -499,14 +499,6 @@ pub fn run_step_graph(
             let kind = kinds
                 .get(&step_snapshot.kind)
                 .with_context_step(&step_snapshot)?;
-            // (#1230 Packet 3) Per-step residency classification — see the
-            // trait doc on `StepKind::residency` and the module doc above.
-            // Best-effort: `None` (every kind's behavior before this hook
-            // existed, and every non-dispatch kind today) schedules Remote.
-            let residency = match kind.residency(&step_snapshot, &task_snapshot, &input) {
-                Some(placement) => crate::concurrent_dispatch::Residency::Local(placement),
-                None => crate::concurrent_dispatch::Residency::Remote,
-            };
             // (#1442) Resolve the step's `bucket_group` to the scheduler-owned
             // shared bucket (get-or-create), so grouped siblings share ONE
             // allowance. Ungrouped steps carry `None` and fall back to a
@@ -547,6 +539,19 @@ pub fn run_step_graph(
                 dispatch_override.clone(),
                 bus.clone(),
             );
+            // (#1230 Packet 3) Per-step residency classification — see the
+            // trait doc on `StepKind::residency` and the module doc above.
+            // Best-effort: `None` (every kind's behavior before this hook
+            // existed, and every non-dispatch kind today) schedules Remote.
+            // (#1530 Packet 3a) `ctx` is built ABOVE this call (moved up from
+            // its original place after residency) so `residency()` can read
+            // the same run-scoped `ArtifactBus` `run_streaming` uses below —
+            // see `StepKind::residency`'s doc. The borrow here ends before
+            // `ctx` moves into the job closure past this point.
+            let residency = match kind.residency(&step_snapshot, &task_snapshot, &input, &ctx) {
+                Some(placement) => crate::concurrent_dispatch::Residency::Local(placement),
+                None => crate::concurrent_dispatch::Residency::Remote,
+            };
             // (#1483 Bug 3) The job wrapper's OWN handle on the wave channel,
             // used to stream this step's terminal transition the instant its
             // dispatch finishes. Distinct from the `ctx` clone (which carries
