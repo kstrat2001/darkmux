@@ -416,13 +416,62 @@ fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> R
 //
 // Rich per-step results (the full `DispatchResult`, the full
 // `PhaseReviewOutput`) don't fit the generic `StepOutcome.output: String`
-// contract, so each kind stashes its structured result into a side-channel
-// `Arc<Mutex<Option<T>>>` slot the caller reads after `run_step_graph`
-// returns — `Step.output` still carries a plain-text summary for
-// consistency with every other step kind's convention.
+// contract, so each kind stashes its structured result on the run-scoped
+// `ArtifactBus` (#1530 Packet 2 — migrated off a bespoke constructor-field
+// `Arc<Mutex<Option<T>>>` slot, the same collapse `darkmux-lab`'s review
+// pipeline proved out in #1530 Packet 1; see the artifact-name consts below)
+// that `register_coder_phase_kinds` (`mission_launch.rs`) reads back after
+// `run_step_graph` returns — `Step.output` still carries a plain-text
+// summary for consistency with every other step kind's convention.
 
-use crew::step_kinds::{resolve_local_placement, StepKind, StepOutcome};
+use crew::step_kinds::{resolve_local_placement, Port, StepKind, StepOutcome, StepRunCtx};
+use std::any::Any;
 use std::sync::{Arc, Mutex};
+
+// ─── #1530 Packet 2: run-scoped ArtifactBus artifact names ────────────────
+//
+// `MissionCoderStepKind`/`MissionVerifyStepKind`'s structured results —
+// historically bespoke `Arc<Mutex<Option<T>>>` constructor fields threaded by
+// hand (built in `register_coder_phase_kinds`, read back after
+// `run_step_graph` returns in `coder_phase_gate_outcome`) — now ride the
+// generic run-scoped `ArtifactBus` (#1530 Packet 0) instead, mirroring
+// `darkmux-lab`'s review pipeline migration (#1530 Packet 1 — see that
+// module's `REVIEW_ENVELOPE_ARTIFACT` doc for the shared reasoning). Each
+// kind's own `provides()` declares the ONE artifact it writes — the
+// scheduler's `provides()` pre-scan (see `scheduler::run_step_graph`'s own
+// doc) materializes both names from the const-fn defaults below regardless
+// of wave order, since coder-phase's graph is a strict linear chain and
+// every kind that provides an artifact here is ALSO the kind that runs
+// first among the graph's steps that could reference it — no kind in this
+// graph merely `requires()`s an artifact without another kind in the SAME
+// graph `provides()`-ing it (`coder_phase_gate_outcome`, the one artifact
+// *reader* besides the writing kind itself, sits OUTSIDE the graph
+// entirely — see the note below).
+//
+// `register_coder_phase_kinds` mints its OWN `Arc` clone of each slot
+// (`CoderPhaseHandles::coder_slot`/`verify_slot`, unchanged in shape) and
+// seeds it onto the bus via `run_step_graph`'s caller-seed path BEFORE the
+// graph runs — the const factories below only matter as a safety-net
+// default (a hand-built `StepRunCtx` in a unit test, or a future caller
+// that forgets to seed). Because the caller keeps its own `Arc` clone, it
+// reads the SAME instance the kind wrote into directly after
+// `run_step_graph` returns — `run_step_graph` itself exposes no post-run
+// bus handle (see `ArtifactBus`'s doc: "build-then-freeze", scoped to the
+// scheduler's own call), so this is the only way a caller reads a bus
+// artifact back out. Exactly the shape `run_review_graph`'s `shared_env`
+// already proves out.
+pub(crate) const CODER_RESULT_ARTIFACT: &str = "coder.result";
+pub(crate) const CODER_VERIFY_RESULT_ARTIFACT: &str = "coder.verify-result";
+
+fn make_coder_result_artifact() -> Arc<dyn Any + Send + Sync> {
+    Arc::new(Mutex::new(None::<CoderStepResult>))
+}
+
+fn make_coder_verify_result_artifact() -> Arc<dyn Any + Send + Sync> {
+    Arc::new(Mutex::new(
+        None::<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>,
+    ))
+}
 
 /// Wraps the worktree-creation half of the old hand-written sequence
 /// (moved here verbatim from the pre-migration `add_worktree` free
@@ -471,6 +520,19 @@ impl StepKind for MissionWorktreeStepKind {
         "Worktree"
     }
 
+    /// (#1530 Packet 2) Declares the `Data` port the downstream
+    /// `mission.coder`/`mission.verify` steps conceptually depend on — the
+    /// worktree this kind creates. Annotation only (`Port::data`'s doc): the
+    /// REAL dependency is `Task::depends_on` (the graph's linear chain), and
+    /// the downstream kinds read the worktree path from their own
+    /// constructor field (`wt_path`), not through `Step.output`/`input`
+    /// wiring. No `Artifact` port — this kind shares no run-scoped mutable
+    /// state with any other step.
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data("worktree")];
+        &PORTS
+    }
+
     fn run(
         &self,
         step: &crew::types::Step,
@@ -505,11 +567,12 @@ impl StepKind for MissionWorktreeStepKind {
     }
 }
 
-/// The coder-dispatch step's rich result — stashed into
-/// `MissionCoderStepKind::result_slot` since it doesn't fit the generic
-/// `StepOutcome.output: String` contract. `run()` reads it after
-/// `run_step_graph` returns to reconstruct the exact detail the
-/// pre-migration inline code had at hand.
+/// The coder-dispatch step's rich result — stashed onto the run-scoped
+/// `ArtifactBus` under [`CODER_RESULT_ARTIFACT`] (#1530 Packet 2) since it
+/// doesn't fit the generic `StepOutcome.output: String` contract.
+/// `register_coder_phase_kinds` reads it back (via its own `coder_slot` `Arc`
+/// clone, seeded onto the same bus entry) after `run_step_graph` returns to
+/// reconstruct the exact detail the pre-migration inline code had at hand.
 // (#1284 Packet 4a) `pub(crate)` — read back by `mission_launch.rs` after
 // `run_step_graph` returns, same as `run()` does below, to build its own
 // `MissionEnvelope` summary.
@@ -546,10 +609,10 @@ pub(crate) struct CoderStepResult {
 /// text), the `mission.coder` flow-record vocabulary + `mission_id`/
 /// `phase_id`/`session_id` fields (a DIFFERENT shape from
 /// `dispatch.internal`'s own `"step result"`/`kind: "dispatch.internal"`
-/// record), and the `result_slot` mechanism `run()` reads back rich detail
-/// through are all real behavior/envelope differences a collapse would
-/// have to change or drop — outside this packet's pure-refactor scope.
-/// Left documented, not forced.
+/// record), and the `ArtifactBus` result mechanism (#1530 Packet 2) it reads
+/// rich detail back through are all real behavior/envelope differences a
+/// collapse would have to change or drop — outside this packet's
+/// pure-refactor scope. Left documented, not forced.
 // (#1284 Packet 4a) `pub(crate)` — see `MissionWorktreeStepKind`'s doc.
 pub(crate) struct MissionCoderStepKind {
     pub(crate) opts: Mutex<Option<crew::dispatch::DispatchOpts>>,
@@ -558,7 +621,6 @@ pub(crate) struct MissionCoderStepKind {
     pub(crate) phase_id: String,
     pub(crate) session_id: String,
     pub(crate) role_id: String,
-    pub(crate) result_slot: Arc<Mutex<Option<CoderStepResult>>>,
 }
 
 impl StepKind for MissionCoderStepKind {
@@ -570,12 +632,44 @@ impl StepKind for MissionCoderStepKind {
         "Coder"
     }
 
+    /// (#1530 Packet 2) Consumes the worktree the `mission.worktree` step
+    /// creates (annotation only — see `MissionWorktreeStepKind::provides`'s
+    /// doc); provides its own plain-text `Step.output` summary AND the
+    /// [`CODER_RESULT_ARTIFACT`] handle `register_coder_phase_kinds` reads
+    /// back after the run.
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data("worktree")];
+        &PORTS
+    }
+
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 2] =
+            [Port::data("coder-output"), Port::artifact(CODER_RESULT_ARTIFACT, make_coder_result_artifact)];
+        &PORTS
+    }
+
     fn run(
+        &self,
+        _step: &crew::types::Step,
+        _task: &crew::types::Task,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Result<StepOutcome> {
+        panic!(
+            "MissionCoderStepKind only runs through `run_streaming` — it writes the run-scoped \
+             ArtifactBus (#1530 Packet 2)"
+        )
+    }
+
+    fn run_streaming(
         &self,
         step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
+        ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
+        let result_slot = ctx
+            .artifact::<Mutex<Option<CoderStepResult>>>(CODER_RESULT_ARTIFACT)
+            .expect("register_coder_phase_kinds seeds the coder.result artifact before the graph runs");
         let mut opts = self
             .opts
             .lock()
@@ -625,7 +719,7 @@ impl StepKind for MissionCoderStepKind {
                 &self.session_id,
                 serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total() }),
             );
-            *self.result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
+            *result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
                 failed_verifiers: Vec::new(),
                 tokens_total: tokens.total(),
             });
@@ -656,7 +750,7 @@ impl StepKind for MissionCoderStepKind {
 
         let stdout = result.stdout.clone();
         let tokens_total = tokens.total();
-        *self.result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
+        *result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
             failed_verifiers,
             tokens_total,
         });
@@ -686,14 +780,14 @@ impl StepKind for MissionCoderStepKind {
 /// **Tier 3 (#1352), on purpose.** Wraps the whole `phase_cli`
 /// mechanical-review pipeline (a multi-step process of its own, not a
 /// single dispatch), with a hardcoded role and coder-phase-specific
-/// CLI/result-slot plumbing. No second consumer visible today — stays
-/// physically co-located with the mission module that owns it.
+/// CLI/`ArtifactBus`-result plumbing (#1530 Packet 2). No second consumer
+/// visible today — stays physically co-located with the mission module
+/// that owns it.
 // (#1284 Packet 4a) `pub(crate)` — see `MissionWorktreeStepKind`'s doc.
 pub(crate) struct MissionVerifyStepKind {
     pub(crate) wt_path: PathBuf,
     pub(crate) base: String,
     pub(crate) phase_id: String,
-    pub(crate) result_slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>,
 }
 
 impl StepKind for MissionVerifyStepKind {
@@ -705,12 +799,55 @@ impl StepKind for MissionVerifyStepKind {
         "Verify (QA)"
     }
 
+    /// (#1530 Packet 2) Consumes the worktree the `mission.worktree` step
+    /// creates and the `mission.coder` step's output (annotation only — see
+    /// `MissionWorktreeStepKind::provides`'s doc); provides the
+    /// [`CODER_VERIFY_RESULT_ARTIFACT`] handle `register_coder_phase_kinds`
+    /// reads back after the run.
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 2] = [Port::data("worktree"), Port::data("coder-output")];
+        &PORTS
+    }
+
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] =
+            [Port::artifact(CODER_VERIFY_RESULT_ARTIFACT, make_coder_verify_result_artifact)];
+        &PORTS
+    }
+
+    /// (#1530 Packet 2) THE sign-off gate of the coder-phase pipeline — see
+    /// `StepKind::is_gate`'s own doc for the full mechanism.
+    /// `coder_phase_gate_outcome` (`mission_launch.rs`) discovers this step
+    /// via this declaration rather than a hardcoded `"<phase>-verify-step"`
+    /// id convention.
+    fn is_gate(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         _step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
     ) -> Result<StepOutcome> {
+        panic!(
+            "MissionVerifyStepKind only runs through `run_streaming` — it writes the run-scoped \
+             ArtifactBus (#1530 Packet 2)"
+        )
+    }
+
+    fn run_streaming(
+        &self,
+        _step: &crew::types::Step,
+        _task: &crew::types::Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let result_slot = ctx
+            .artifact::<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>(
+                CODER_VERIFY_RESULT_ARTIFACT,
+            )
+            .expect("register_coder_phase_kinds seeds the coder.verify-result artifact before the graph runs");
         println!(
             "\n{}",
             style::header("▶ local QA — dispatching `code-reviewer` against the worktree diff…")
@@ -720,7 +857,7 @@ impl StepKind for MissionVerifyStepKind {
             Ok(review) => {
                 print_review_summary(&review);
                 let verdict = review.verdict.clone();
-                *self.result_slot.lock().expect("mission.verify result mutex poisoned") = Some(Ok(review));
+                *result_slot.lock().expect("mission.verify result mutex poisoned") = Some(Ok(review));
                 Ok(StepOutcome {
                     output: verdict,
                     flow_records: Vec::new(),
@@ -735,7 +872,7 @@ impl StepKind for MissionVerifyStepKind {
                          the diff manually before shipping."
                     ))
                 );
-                *self.result_slot.lock().expect("mission.verify result mutex poisoned") = Some(Err(msg.clone()));
+                *result_slot.lock().expect("mission.verify result mutex poisoned") = Some(Err(msg.clone()));
                 Err(anyhow::anyhow!(msg))
             }
         }

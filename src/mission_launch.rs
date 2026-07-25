@@ -78,6 +78,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::{self, FindingSeverity, LaunchParams, MissionConfig, TaskOverride};
 use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus};
 use darkmux_types::style;
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -428,6 +429,26 @@ pub fn launch(
     // (#1400) Tracks which phases this dispatch has already lazy-started —
     // see `lazy_start_phase_for_step`'s doc.
     let mut started_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // (#1530 Packet 2) The coder-phase kinds' two structured-result slots,
+    // seeded onto the run-scoped `ArtifactBus` via `run_step_graph`'s
+    // caller-seed path — `coder_handles` already OWNS the `Arc` clones
+    // (`CoderPhaseHandles::coder_slot`/`verify_slot`, minted in
+    // `register_coder_phase_kinds`), so this is a pure hand-off: the SAME
+    // instance the kinds write into (via `StepRunCtx::artifact`) is what
+    // `coder_phase_gate_outcome` reads back below, directly off `handles`,
+    // once the graph returns. Empty (`&[]`) on every non-coder-phase graph —
+    // zero behavior change there, mirroring `run_review_graph`'s own
+    // `seed_artifacts` shape (#1530 Packet 1).
+    let seed_artifacts: Vec<(&'static str, Arc<dyn Any + Send + Sync>)> = match &coder_handles {
+        Some(h) => vec![
+            (coder_phase::CODER_RESULT_ARTIFACT, h.coder_slot.clone() as Arc<dyn Any + Send + Sync>),
+            (
+                coder_phase::CODER_VERIFY_RESULT_ARTIFACT,
+                h.verify_slot.clone() as Arc<dyn Any + Send + Sync>,
+            ),
+        ],
+        None => Vec::new(),
+    };
     // (#1397) `persist` durably saves each step at ITS OWN transition
     // (Running at dispatch, Complete/Error at completion), not just at the
     // end of the whole run — see `run_step_graph`'s own doc. The phase id
@@ -461,7 +482,7 @@ pub fn launch(
             }
         },
         None,
-        &[],
+        &seed_artifacts,
     );
 
     // (#1406, F4) A scheduler-level `Err` mid-run would otherwise `?`-return
@@ -491,7 +512,7 @@ pub fn launch(
     // the loop from here (#1463). See [`gate_outcome_reached_no_gate`] for the one
     // exception class (failure exits that never reached a reviewable gate).
     if let Some(handles) = &coder_handles {
-        let outcome = coder_phase_gate_outcome(&mission_id, handles, &steps);
+        let outcome = coder_phase_gate_outcome(&mission_id, handles, &steps, &registry);
         if gate_outcome_reached_no_gate(&outcome) {
             let e = match &outcome {
                 Err(e) => anyhow!("{e:#}"),
@@ -885,6 +906,17 @@ fn launch_session_id(mission_id: &str, real_phase_id: &str) -> String {
 /// the step kinds populate (the generic `StepOutcome.output: String`
 /// contract can't carry the rich verdict/verifier detail), plus the
 /// launch-resolved identifiers the gate banners print.
+///
+/// (#1530 Packet 2) `coder_slot`/`verify_slot` are the SAME `Arc`s `launch`
+/// seeds onto the run-scoped `ArtifactBus` (`coder_phase::
+/// CODER_RESULT_ARTIFACT`/`CODER_VERIFY_RESULT_ARTIFACT`) before calling
+/// `run_step_graph` — `MissionCoderStepKind`/`MissionVerifyStepKind` write
+/// into them via `StepRunCtx::artifact` inside `run_streaming`, and this
+/// struct's fields are simply the caller's own clone of that hand-off, read
+/// directly (no bus access needed post-run — `run_step_graph` exposes none;
+/// see `coder_phase.rs`'s artifact-name doc for the full reasoning). The
+/// field TYPES/NAMES are unchanged from the pre-#1530-Packet-2 bespoke-slot
+/// shape; only WHERE the writing kinds reach the slot moved.
 pub(crate) struct CoderPhaseHandles {
     coder_slot: Arc<Mutex<Option<coder_phase::CoderStepResult>>>,
     verify_slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>,
@@ -900,7 +932,9 @@ pub(crate) struct CoderPhaseHandles {
 /// (naming the missing input) rather than constructing a kind with an
 /// empty path if the graph needs these kinds but the operator didn't
 /// supply them. Returns the [`CoderPhaseHandles`] the caller reads after
-/// `run_step_graph` to decide the gate outcome.
+/// `run_step_graph` to decide the gate outcome — and also, since #1530
+/// Packet 2, seeds onto the `ArtifactBus` via `run_step_graph`'s
+/// `seed_artifacts` parameter (see `launch`'s own call site).
 fn register_coder_phase_kinds(
     registry: &crew::step_kinds::StepKindRegistry,
     mission_id: &str,
@@ -1000,7 +1034,6 @@ fn register_coder_phase_kinds(
             phase_id: real_phase_id.clone(),
             session_id: session_id.clone(),
             role_id: role,
-            result_slot: coder_slot.clone(),
         }))
         .map_err(|e| anyhow!("registering mission.coder: {e}"))?;
 
@@ -1009,7 +1042,6 @@ fn register_coder_phase_kinds(
             wt_path: workdir.clone(),
             base,
             phase_id: real_phase_id.clone(),
-            result_slot: verify_slot.clone(),
         }))
         .map_err(|e| anyhow!("registering mission.verify: {e}"))?;
 
@@ -1036,6 +1068,34 @@ fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
     matches!(outcome, Err(_) | Ok(1))
 }
 
+/// (#1530 Packet 2) Resolve WHICH step in `steps` is the graph's declared
+/// sign-off gate (`StepKind::is_gate`) by asking `registry` for each step's
+/// registered kind, rather than a hardcoded step-id naming convention. This
+/// is the declaration-driven half of the gate mechanism — see
+/// `StepKind::is_gate`'s own doc for the full reasoning, and
+/// `coder_phase_gate_outcome`'s doc for the one production consumer today.
+///
+/// Falls back to `default_id` (the historical `"<phase>-verify-step"`
+/// convention) when no step's kind resolves to `is_gate() == true` —
+/// best-effort, fails open, the same shape `StepKind::residency`'s own doc
+/// documents for a structurally analogous lookup. This covers a
+/// hand-scripted test graph that never registers a real kind (this
+/// module's own `scripted_gate_fixture` uses a placeholder `"mission.test"`
+/// kind id) without forcing every test to stand up a full registry just to
+/// exercise the gate-outcome MAP, which is what those tests are actually
+/// pinning.
+fn resolve_gate_step_id(
+    registry: &crew::step_kinds::StepKindRegistry,
+    steps: &BTreeMap<String, crew::types::Step>,
+    default_id: String,
+) -> String {
+    steps
+        .values()
+        .find(|s| registry.get(&s.kind).map(|k| k.is_gate()).unwrap_or(false))
+        .map(|s| s.id.clone())
+        .unwrap_or(default_id)
+}
+
 /// The post-scheduler gate decision for a coder-phase graph — a faithful
 /// mirror of `coder_phase::run`'s own post-graph sequence (#1284 review
 /// round 1, must-fix 1), same outcome map, same banners, same records:
@@ -1051,14 +1111,26 @@ fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
 /// Never transitions the phase or the mission: the phase stays `Running`
 /// and `mission finalize <mission-id>` (or `mission abort <mission-id>`)
 /// is the operator's next move, after the frontier ships the git work by hand.
+///
+/// (#1530 Packet 2) The VERIFY step — the row this table calls "the gate" —
+/// is located via [`resolve_gate_step_id`] against `registry`'s
+/// `StepKind::is_gate()` declaration (`MissionVerifyStepKind` is the one
+/// kind that returns `true`), not a hardcoded `"<phase>-verify-step"` id.
+/// The worktree/coder step ids stay convention-derived — they are
+/// PRE-gate stages whose errors bypass the gate entirely, not the gate
+/// itself. Packet 3's generic runner is expected to apply this SAME
+/// declaration-driven lookup to hold ANY graph's declared gate step,
+/// rather than reimplementing coder-phase's own hardcoded logic.
 fn coder_phase_gate_outcome(
     mission_id: &str,
     handles: &CoderPhaseHandles,
     steps: &BTreeMap<String, crew::types::Step>,
+    registry: &crew::step_kinds::StepKindRegistry,
 ) -> Result<i32> {
     let worktree_step_id = format!("{}-worktree-step", handles.real_phase_id);
     let coder_step_id = format!("{}-coder-step", handles.real_phase_id);
-    let verify_step_id = format!("{}-verify-step", handles.real_phase_id);
+    let verify_step_id =
+        resolve_gate_step_id(registry, steps, format!("{}-verify-step", handles.real_phase_id));
     let phase_id = &handles.real_phase_id;
     let session_id = &handles.session_id;
 
@@ -1935,7 +2007,12 @@ mod tests {
             scripted_gate_fixture(phase_id, NodeStatus::Complete, NodeStatus::Complete, NodeStatus::Complete);
         *handles.verify_slot.lock().unwrap() = Some(Ok(review_output(2, 1, "blockers")));
 
-        let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps).unwrap();
+        // (#1530 Packet 2) A fixture-scripted registry — `scripted_step`'s
+        // placeholder `"mission.test"` kind resolves to nothing real, so
+        // `resolve_gate_step_id` falls back to the `"<phase>-verify-step"`
+        // convention (its own doc's best-effort clause).
+        let registry = crew::step_kinds::StepKindRegistry::new();
+        let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps, &registry).unwrap();
         assert_eq!(exit, 2, "QA blockers must exit 2, mirroring `mission run`"); // drift-guard:allow mission run — test names the retired verb whose exit code this preserves (#1469)
         assert_eq!(
             phase_status_on_disk("gate-test-mission", phase_id),
@@ -1958,7 +2035,8 @@ mod tests {
         let (handles, steps) =
             scripted_gate_fixture(phase_id, NodeStatus::Complete, NodeStatus::Error, NodeStatus::Planned);
 
-        let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps).unwrap();
+        let registry = crew::step_kinds::StepKindRegistry::new();
+        let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps, &registry).unwrap();
         assert_eq!(exit, 1, "a failed coder dispatch must exit 1, never read Degraded/0");
         assert_eq!(phase_status_on_disk("gate-test-mission", phase_id), PhaseStatus::Running);
         assert_eq!(mission_status_on_disk("gate-test-mission"), MissionStatus::Active);
@@ -1974,7 +2052,8 @@ mod tests {
             scripted_gate_fixture(phase_id, NodeStatus::Complete, NodeStatus::Complete, NodeStatus::Error);
         *handles.verify_slot.lock().unwrap() = Some(Err("reviewer image pull failed".to_string()));
 
-        let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps).unwrap();
+        let registry = crew::step_kinds::StepKindRegistry::new();
+        let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps, &registry).unwrap();
         assert_eq!(exit, 3, "QA-unavailable must exit 3, mirroring `mission run`"); // drift-guard:allow mission run — test names the retired verb whose exit code this preserves (#1469)
         assert_eq!(phase_status_on_disk("gate-test-mission", phase_id), PhaseStatus::Running);
     }
@@ -1989,7 +2068,8 @@ mod tests {
             scripted_gate_fixture(phase_id, NodeStatus::Complete, NodeStatus::Complete, NodeStatus::Complete);
         *handles.verify_slot.lock().unwrap() = Some(Ok(review_output(0, 1, "flags-only")));
 
-        let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps).unwrap();
+        let registry = crew::step_kinds::StepKindRegistry::new();
+        let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps, &registry).unwrap();
         assert_eq!(exit, 0);
         assert_eq!(
             phase_status_on_disk("gate-test-mission", phase_id),
@@ -2014,7 +2094,8 @@ mod tests {
         steps.get_mut(&format!("{phase_id}-worktree-step")).unwrap().output =
             Some("worktree already exists".to_string());
 
-        let err = coder_phase_gate_outcome("gate-test-mission", &handles, &steps).unwrap_err();
+        let registry = crew::step_kinds::StepKindRegistry::new();
+        let err = coder_phase_gate_outcome("gate-test-mission", &handles, &steps, &registry).unwrap_err();
         assert!(err.to_string().contains("worktree already exists"), "{err}");
     }
 

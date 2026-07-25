@@ -29,13 +29,11 @@
             phase_id: String::new(),
             session_id: String::new(),
             role_id: String::new(),
-            result_slot: Arc::new(Mutex::new(None)),
         };
         let verify = MissionVerifyStepKind {
             wt_path: std::path::PathBuf::new(),
             base: String::new(),
             phase_id: String::new(),
-            result_slot: Arc::new(Mutex::new(None)),
         };
         for (id, display) in [
             (worktree.id(), worktree.display_name()),
@@ -1225,13 +1223,24 @@ edit loop detected on src/widget.rs in an earlier dispatch
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows.path()) };
 
+        // (#1530 Packet 2) `MissionVerifyStepKind` now writes its result
+        // onto the run-scoped `ArtifactBus` (via `run_streaming`), not a
+        // constructor-field slot — hand-build a bus seeded with `slot` (the
+        // same `ArtifactBus::seed` caller-seed path `register_coder_phase_kinds`
+        // uses in production) and a `StepRunCtx` around it, exactly the seam
+        // `StepRunCtx::new`'s own doc names for out-of-scheduler unit tests.
         let slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>> =
             Arc::new(Mutex::new(None));
+        let mut bus = crew::step_kinds::ArtifactBus::new();
+        bus.seed(
+            CODER_VERIFY_RESULT_ARTIFACT,
+            slot.clone() as Arc<dyn std::any::Any + Send + Sync>,
+        );
+        let run_ctx = crew::step_kinds::StepRunCtx::new(None, None, None, Arc::new(bus));
         let kind = MissionVerifyStepKind {
             wt_path: repo.clone(),
             base: "main".to_string(),
             phase_id: "s1".to_string(),
-            result_slot: slot.clone(),
         };
         let step = crew::types::Step {
             id: "s1-verify-step".to_string(),
@@ -1244,7 +1253,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             output: None,
         };
         let task = test_task("s1-verify");
-        let outcome = kind.run(&step, &task, &std::collections::BTreeMap::new());
+        let outcome = kind.run_streaming(&step, &task, &std::collections::BTreeMap::new(), &run_ctx);
 
         unsafe {
             match prev {
