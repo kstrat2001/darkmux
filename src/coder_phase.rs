@@ -766,6 +766,7 @@ impl StepKind for MissionCoderStepKind {
         _step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
     ) -> Option<crew::step_kinds::Placement> {
         resolve_local_placement(&self.role_id, None, None, &format!("mission-coder:{}", self.phase_id))
     }
@@ -883,6 +884,7 @@ impl StepKind for MissionVerifyStepKind {
         _step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
+        _ctx: &StepRunCtx,
     ) -> Option<crew::step_kinds::Placement> {
         resolve_local_placement("code-reviewer", None, None, &format!("mission-verify:{}", self.phase_id))
     }

@@ -16,7 +16,14 @@
     },
     "review-judge-step": {
       "config": {
-        "concurrency": 3
+        "concurrency": 3,
+        "endpoint_host": null,
+        "identifier": "darkmux:judge-model",
+        "max_tokens": 20000,
+        "model": "darkmux:judge-model",
+        "model_key": "judge-model",
+        "n_ctx": 32000,
+        "passes": 2
       },
       "id": "review-judge-step",
       "kind": "review.judge",
@@ -94,7 +101,9 @@
       "task_id": "review-synthesis-task"
     },
     "review-verify-render-step": {
-      "config": null,
+      "config": {
+        "verify_seat_staffed": false
+      },
       "id": "review-verify-render-step",
       "kind": "review.verify-render",
       "status": "planned",
