@@ -88,9 +88,11 @@ use std::sync::{Arc, Mutex};
 /// construct in Packet 4a. See the module doc's scope boundary.
 const CODER_PHASE_TIER3_KINDS: &[&str] = &["mission.worktree", "mission.coder", "mission.verify"];
 
-/// The six Tier 3 step kinds `crates/darkmux-lab/src/lab/review.rs` defines
-/// for `review`'s graph (#1352) — wired through as of Packet 4b, but via a
-/// DEDICATED launcher ([`crate::mission_launch_review::launch`]), not this
+/// The five Tier 3 step kinds `crates/darkmux-lab/src/lab/review.rs` defines
+/// for `review`'s graph (#1352; `review.probe`/`review.verify` retired in
+/// #1442 — the probe/verify stages ride the generic Tier-1 `dispatch.map`) —
+/// wired through via a DEDICATED launcher
+/// ([`crate::mission_launch_review::launch`]), not this
 /// module's generic `mission_config::interpret` + `crew::scheduler::
 /// run_step_graph` path. `build_review_graph`/`run_review_graph` already
 /// carry real, working, tested cross-step behavior (a shared remote-token
