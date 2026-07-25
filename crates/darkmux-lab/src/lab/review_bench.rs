@@ -16,6 +16,7 @@ use crate::providers::prompt::extract_reply_text;
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_profiles::profiles::RoleBinding;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -752,6 +753,12 @@ struct FunnelCtx {
     roles: darkmux_crew::resourcing::ResolvedReviewRoles,
     exec_mode: super::review::ExecMode,
     probe_system: String,
+    /// (#1530 follow-on) Per-seat probe prompt resolution, mirroring
+    /// `src/mission_launch_review.rs`'s own map — keeps the bench's
+    /// dispatch parity with production (a bench measuring the SAME engine
+    /// production uses, per this file's module doc, must resolve prompts
+    /// the same way production does or the two would silently diverge).
+    probe_role_prompts: BTreeMap<String, String>,
     judge_system: String,
     /// (#1260) The verify seat's persona — resolved unconditionally (the
     /// role is embedded); only dispatched when the crew declares the seat.
@@ -861,10 +868,23 @@ fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
     let verify_system = darkmux_crew::loader::role_prompt("review-verify").ok_or_else(|| {
         anyhow!("darkmux: role \"review-verify\" has no system prompt (missing review-verify.md)")
     })?;
+    // (#1530 follow-on) Per-seat probe prompt resolution — mirrors
+    // `src/mission_launch_review.rs`'s own map exactly (same fallback to
+    // `probe_system` when a seat's specific role has no `.md` of its own),
+    // so the bench dispatches through the SAME prompt-resolution rule
+    // production uses.
+    let mut probe_role_prompts: BTreeMap<String, String> = BTreeMap::new();
+    for seat in &roles.probes {
+        if let Some(role_id) = &seat.role_id {
+            let prompt = darkmux_crew::loader::role_prompt(role_id).unwrap_or_else(|| probe_system.clone());
+            probe_role_prompts.insert(role_id.clone(), prompt);
+        }
+    }
     Ok(FunnelCtx {
         roles,
         exec_mode,
         probe_system,
+        probe_role_prompts,
         judge_system,
         verify_system,
         bundler_cmd: opts.bundler_cmd.clone(),
@@ -1063,6 +1083,7 @@ fn run_funnel_case(
         intent_body: c.label.intent_body.clone(),
         diff: c.diff.clone(),
         probe_system: ctx.probe_system.clone(),
+        probe_role_prompts: ctx.probe_role_prompts.clone(),
         judge_system: ctx.judge_system.clone(),
         verify_system: ctx.verify_system.clone(),
         bundles,

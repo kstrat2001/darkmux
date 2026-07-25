@@ -3343,6 +3343,20 @@ pub struct ReviewStepContext {
     pub intent_body: String,
     pub diff: String,
     pub probe_system: String,
+    /// (#1530 follow-on, Packet A1) Per-PROBE-ROLE resolved system prompt —
+    /// `role_id` (`"review-probe-high"`/`-mid`/`-low`) -> that role's OWN
+    /// `role_prompt()` text, resolved once by the launcher
+    /// (`src/mission_launch_review.rs`, `review_bench.rs`'s
+    /// `resolve_funnel_ctx`), already falling back to `probe_system` above
+    /// when a seat's specific role has no `.md` of its own. A key ABSENT
+    /// from this map (every hand-built test fixture, which never
+    /// populates it) makes [`ReviewProbeRenderStepKind::run_streaming`]'s
+    /// own lookup fall through to `probe_system` too — the exact
+    /// pre-fix behavior, byte-identical, since the three shipped
+    /// `review-probe-high/-mid/-low.md` files are byte-copies of
+    /// `review-probe.md` today (this map is a capability fix for when an
+    /// operator diverges one of them, not a behavior change on its own).
+    pub probe_role_prompts: std::collections::BTreeMap<String, String>,
     pub judge_system: String,
     pub verify_system: String,
     pub bundles: Vec<BundleInput>,
@@ -3594,6 +3608,132 @@ impl StepKind for ReviewBundleStepKind {
             &ctx.case_id,
             json!({ "items_out": ctx.bundles.len() }),
         );
+        Ok(StepOutcome { output, flow_records: Vec::new() })
+    }
+}
+
+// ─── investigate: probe render (prompt render → generic dispatch.map) ───
+
+/// (#1530 follow-on, Packet A1) Phase "investigate", step 1 of EACH probe
+/// TASK: render one seat's `probe_user_message` collection AT RUN TIME —
+/// the probe stage's own version of the render → generic `dispatch.map`
+/// split [`ReviewVerifyRenderStepKind`] already established for the verify
+/// stage (see that kind's doc for the shared shape this mirrors exactly:
+/// a Tier-3 render step mints a JSON array as its `Step.output`, and the
+/// task's SECOND step, a generic `dispatch.map` with no `config.collection`
+/// stamped, resolves that array as its collection via
+/// `resolve_map_collection`'s single-dependency fallback).
+///
+/// **Why this exists.** Before this kind, `build_review_graph_from_config`
+/// called `select_bundles_for_staffing` + `probe_user_message` ONCE, at
+/// graph-BUILD time, and stamped the rendered collection directly into the
+/// probe seat's `dispatch.map` step (`config.collection`) — frozen before
+/// the graph ever ran. That blocked extending the graph upstream of the
+/// probe stage: nothing could feed a runtime-computed bundle set in: the
+/// selection was already baked into static config by the time any step
+/// executed. Moving the SAME two calls into a run-time step, over
+/// byte-identical inputs, makes the probe stage's data flow through the
+/// graph like every other stage's instead of being computed ahead of it —
+/// `probe_user_message`/`select_bundles_for_staffing` themselves are
+/// UNCHANGED; only WHERE they're called moves.
+///
+/// **Tier 3 (#1352), on purpose** — same reasoning as
+/// `ReviewVerifyRenderStepKind`: this renders against THIS pipeline's own
+/// `BundleInput`/`BundleSelector` types; the probe's dispatch half stays on
+/// the generic `dispatch.map` builtin.
+///
+/// **Stateless singleton (#1530 Packet 3a discipline), one shared instance
+/// across every probe task.** No `Arc<ReviewStepContext>`, no
+/// `ResolvedSeatStaffing` constructor field, and (unlike the retired
+/// per-instance-suffixed `review.probe:<seat>` kind) no per-seat id either
+/// — every probe task's render step resolves through the SAME registered
+/// `"review.probe-render"` kind. Which seat a given run is rendering for
+/// comes entirely from `step.config`, stamped per-seat by
+/// `build_review_graph_from_config`'s probe loop: `selector` (this seat's
+/// [`BundleSelector`], `null` for "no restriction") and `role_id` (for the
+/// per-seat prompt lookup below).
+pub struct ReviewProbeRenderStepKind;
+
+impl StepKind for ReviewProbeRenderStepKind {
+    fn id(&self) -> &'static str {
+        "review.probe-render"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Probe prompts"
+    }
+
+    /// `requires()` only — this kind consumes `REVIEW_CONTEXT_ARTIFACT`
+    /// (for `ctx.bundles`/`ctx.probe_system`/`ctx.probe_role_prompts`) but
+    /// produces none of the three shared accumulators; `ReviewDedupStepKind::
+    /// provides()`'s doc explains why a downstream consumer declares
+    /// `requires()` rather than re-`provides()`ing an artifact another kind
+    /// already does.
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact)];
+        &PORTS
+    }
+
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data("probe-prompts")];
+        &PORTS
+    }
+
+    fn run(&self, _s: &Step, _t: &Task, _i: &std::collections::BTreeMap<String, String>) -> Result<StepOutcome> {
+        panic!(
+            "ReviewProbeRenderStepKind only runs through `run_streaming` — it reads the \
+             run-scoped ArtifactBus (#1530 follow-on)"
+        )
+    }
+
+    fn run_streaming(
+        &self,
+        step: &Step,
+        _task: &Task,
+        _input: &std::collections::BTreeMap<String, String>,
+        run_ctx: &StepRunCtx,
+    ) -> Result<StepOutcome> {
+        let ctx = run_ctx
+            .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
+            .expect("run_review_graph seeds the context artifact before the graph runs");
+
+        // Stamped by `build_review_graph_from_config`'s probe loop at build
+        // time — this seat's bundle selector (absent/null when the seat
+        // runs unrestricted over every bundle, matching
+        // `select_bundles_for_staffing`'s own `None` contract) and role id
+        // (for the per-seat prompt lookup below). Both are known at build
+        // time; only the SELECTION ITSELF (which needs `ctx.bundles`, only
+        // stable once the run seeds the context artifact) moves to run
+        // time — see this kind's own doc.
+        let selector: Option<BundleSelector> = match step.config.get("selector") {
+            None => None,
+            Some(v) if v.is_null() => None,
+            Some(v) => {
+                Some(serde_json::from_value(v.clone()).context("deserializing probe-render selector")?)
+            }
+        };
+        let role_id = step.config.get("role_id").and_then(|v| v.as_str());
+
+        // (#1530 follow-on) Per-seat prompt resolution: this seat's OWN
+        // role prompt when the launcher resolved one for it, else the
+        // shared `probe_system` fallback — see `ReviewStepContext::
+        // probe_role_prompts`'s doc for why this is a no-op by default.
+        let prior: &str = role_id
+            .and_then(|r| ctx.probe_role_prompts.get(r))
+            .map(String::as_str)
+            .unwrap_or(ctx.probe_system.as_str());
+
+        let selected = select_bundles_for_staffing(&ctx.bundles, selector.as_ref());
+        let collection: Vec<String> = selected.iter().map(|b| probe_user_message(prior, b)).collect();
+
+        emit_review_step_result(
+            "review.probe-render",
+            &step.id,
+            &ctx.case_id,
+            json!({ "items_out": collection.len() }),
+        );
+
+        let output = serde_json::to_string(&collection).context("serializing probe prompts")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 }
@@ -4949,6 +5089,11 @@ pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
     if kind == "review.probe" || kind.starts_with("review.probe:") {
         return Some("Probe");
     }
+    // (#1530 follow-on, Packet A1) `review.probe-render` — the probe
+    // stage's render step, mirroring `review.verify-render` below.
+    if kind == "review.probe-render" {
+        return Some("Probe prompts");
+    }
     if kind == "review.dedup" {
         return Some("Dedup");
     }
@@ -5252,17 +5397,30 @@ fn build_review_graph_from_config(
         .register_alias("funnel.bundle", bundle_kind)
         .expect("funnel.bundle legacy alias registered once");
 
-    // (#1512) Stamp each CLAIMED probe task's single step with its FULL
-    // dispatch config — the pre-rendered `probe_user_message` collection
-    // (byte parity by construction: `user_template: "{item}"` substitutes
-    // each rendered prompt verbatim), the seat's dispatch identity, the
-    // shared `bucket_group: "probe"` allowance (+ its resolved budget, so
-    // the artifact is self-describing), `retry_on_empty: 1` (the
-    // historical single empty-content retry), and the residency hints for
-    // local seats. NOTE: a hosted seat's `endpoint` block carries only the
-    // URL / auth MECHANICS (Keychain item name / env-var NAME — never a
-    // secret value; see `EndpointAuth`), the same material `profiles.json`
-    // already persists on disk.
+    // (#1530 follow-on Packet A1) The probe render step — the Tier-3 half
+    // of the probe stage that stays bespoke (rendering against this
+    // pipeline's own `BundleInput`/`BundleSelector` types); the dispatch
+    // half is the generic map, exactly mirroring the verify stage's own
+    // render/dispatch split below. One shared registered instance for
+    // every probe task (stateless singleton — see the kind's own doc).
+    let probe_render_kind = Arc::new(ReviewProbeRenderStepKind);
+    registry
+        .register(probe_render_kind)
+        .expect("review.probe-render registered once");
+
+    // (#1512, #1530 follow-on Packet A1) Each CLAIMED probe task now has
+    // TWO steps — a `review.probe-render` step (this seat's selector +
+    // role id, resolved into a rendered prompt collection AT RUN TIME) then
+    // a generic `dispatch.map` (this seat's dispatch identity, the shared
+    // `bucket_group: "probe"` allowance, `retry_on_empty: 1`, residency
+    // hints — everything the OLD single-step probe task carried, MINUS
+    // `collection`, which the map step now resolves at runtime from the
+    // render step's `Step.output` via `resolve_map_collection`'s
+    // single-dependency fallback, the exact mechanism
+    // `review-verify-step` already exercises). NOTE: a hosted seat's
+    // `endpoint` block carries only the URL / auth MECHANICS (Keychain item
+    // name / env-var NAME — never a secret value; see `EndpointAuth`), the
+    // same material `profiles.json` already persists on disk.
     //
     // One role, one task, one dispatch (#1512) — the old (seat, draw) fan-
     // out (`ResolvedSeatStaffing::k` multiplying a seat into several sibling
@@ -5271,6 +5429,21 @@ fn build_review_graph_from_config(
     // back-compat/bench reporting) but is no longer read here — probe
     // recall breadth is a config edit (add another probe role/task to
     // review.json), never a per-run draw multiplier.
+    //
+    // `probe_specs.bundles` below is STILL computed here, at build time,
+    // via the SAME `select_bundles_for_staffing(&ctx.bundles, ...)` call
+    // the render step now ALSO makes at run time — safe because both calls
+    // are the identical pure function over the identical `ctx.bundles`
+    // (the same `Arc<ReviewStepContext>` this whole function was handed,
+    // later seeded verbatim onto the run's `ArtifactBus`), so the two
+    // computations are guaranteed to agree; `ProbeSeatSpec` is a genuine
+    // build-time TOPOLOGY value (which bundles this seat's draw covers, for
+    // the dedup boundary's flag reconstruction), not run-scoped
+    // `ReviewStepContext`/`ResolvedSeatStaffing` state, so it staying a
+    // `ReviewDedupStepKind` constructor field is unaffected by the #1530
+    // Packet 3a stateless-singleton discipline (mirrors
+    // `ReviewSynthesisStepKind`'s own `dedup_task_id`/`judge_task_id`/
+    // `verify_task_id` constructor fields).
     let remote_budget = ctx.remote_max_tokens_per_execution;
     let mut probe_specs: Vec<ProbeSeatSpec> = Vec::new();
     for (staffing, task_id) in probes.iter().zip(claims.iter()) {
@@ -5279,28 +5452,61 @@ fn build_review_graph_from_config(
         let endpoint_host = seat_endpoint_host(&staffing.pm);
         let max_tokens = resolve_seat_max_tokens(staffing, DEFAULT_PROBE_MAX_TOKENS);
         let selected = select_bundles_for_staffing(&ctx.bundles, staffing.selector.as_ref());
-        let collection: Vec<String> =
-            selected.iter().map(|b| probe_user_message(&ctx.probe_system, b)).collect();
         let bundles: Vec<(String, String)> =
             selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
 
         let task = tasks.iter().find(|t| &t.id == task_id).unwrap_or_else(|| {
             panic!("the claimed probe task `{task_id}` must survive pruning")
         });
-        let step_id = task.step_ids.first().cloned().unwrap_or_else(|| {
-            panic!("claimed probe task `{task_id}` must have exactly one step")
-        });
-        let step = steps.get_mut(&step_id).unwrap_or_else(|| {
+        // (#1530) A user-tier `~/.darkmux/mission-configs/review.json` may
+        // still declare the pre-#1530 one-step probe task. That is an
+        // operator-config shape mismatch, not an internal invariant break —
+        // contract 7 puts loud validation at the consumption point and keeps
+        // panics off the hot path, so this bails with the fix named rather
+        // than aborting the process.
+        if task.step_ids.len() != 2 {
+            anyhow::bail!(
+                "darkmux: \"review\" mission config's probe task `{task_id}` declares {} step(s), \
+                 but a probe task needs exactly two: a `review.probe-render` step followed by a \
+                 `dispatch.map` step. A user-tier copy at \
+                 ~/.darkmux/mission-configs/review.json predating the render-step split needs the \
+                 render step added (or delete the copy to fall back to the built-in document).",
+                task.step_ids.len()
+            );
+        }
+        let render_step_id = task.step_ids[0].clone();
+        let map_step_id = task.step_ids[1].clone();
+
+        // The render step's config: this seat's selector (data — WHICH
+        // bundles) and role id (WHICH prior text) — both known at build
+        // time; only the selection ITSELF moves to run time (see
+        // `ReviewProbeRenderStepKind`'s doc).
+        let selector_val: Option<serde_json::Value> = staffing
+            .selector
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .context("serializing probe seat selector")?;
+        let render_step = steps.get_mut(&render_step_id).unwrap_or_else(|| {
             // (#1284 review round 2, consider 3) Hard assert posture
             // preserved: a release build must not silently mint a spec no
             // interpreted step backs.
-            panic!("the interpreted graph must have a step `{step_id}` for probe task `{task_id}`")
+            panic!(
+                "the interpreted graph must have a step `{render_step_id}` for probe task `{task_id}`"
+            )
+        });
+        render_step.config = json!({
+            "selector": selector_val,
+            "role_id": staffing.role_id,
+        });
+
+        let map_step = steps.get_mut(&map_step_id).unwrap_or_else(|| {
+            panic!("the interpreted graph must have a step `{map_step_id}` for probe task `{task_id}`")
         });
         let mut config = json!({
             "model": identifier,
             "system": "",
             "user_template": "{item}",
-            "collection": collection,
             "temperature": PROBE_TEMPERATURE,
             "max_tokens": max_tokens,
             "timeout_seconds": ctx.timeout_seconds,
@@ -5319,7 +5525,7 @@ fn build_review_graph_from_config(
                 config["n_ctx"] = json!(n_ctx);
             }
         }
-        step.config = config;
+        map_step.config = config;
 
         probe_specs.push(ProbeSeatSpec {
             name: staffing.name.clone(),

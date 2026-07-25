@@ -30,11 +30,20 @@
       "status": "planned",
       "task_id": "review-judge-task"
     },
+    "review-probe-high-render-step": {
+      "config": {
+        "role_id": "review-probe-high",
+        "selector": null
+      },
+      "id": "review-probe-high-render-step",
+      "kind": "review.probe-render",
+      "status": "planned",
+      "task_id": "review-probe-high-task"
+    },
     "review-probe-high-step": {
       "config": {
         "bucket_budget": 500000,
         "bucket_group": "probe",
-        "collection": [],
         "identifier": "darkmux:probe-model-a",
         "max_tokens": 4000,
         "model": "darkmux:probe-model-a",
@@ -51,32 +60,20 @@
       "status": "planned",
       "task_id": "review-probe-high-task"
     },
-    "review-probe-mid-step": {
+    "review-probe-low-render-step": {
       "config": {
-        "bucket_budget": 500000,
-        "bucket_group": "probe",
-        "collection": [],
-        "identifier": "darkmux:probe-model-b",
-        "max_tokens": 4000,
-        "model": "darkmux:probe-model-b",
-        "model_key": "probe-model-b",
-        "n_ctx": 32000,
-        "retry_on_empty": 1,
-        "system": "",
-        "temperature": 0.20000000298023224,
-        "timeout_seconds": 30,
-        "user_template": "{item}"
+        "role_id": "review-probe-low",
+        "selector": null
       },
-      "id": "review-probe-mid-step",
-      "kind": "dispatch.map",
+      "id": "review-probe-low-render-step",
+      "kind": "review.probe-render",
       "status": "planned",
-      "task_id": "review-probe-mid-task"
+      "task_id": "review-probe-low-task"
     },
     "review-probe-low-step": {
       "config": {
         "bucket_budget": 500000,
         "bucket_group": "probe",
-        "collection": [],
         "identifier": "darkmux:probe-model-c",
         "max_tokens": 4000,
         "model": "darkmux:probe-model-c",
@@ -92,6 +89,36 @@
       "kind": "dispatch.map",
       "status": "planned",
       "task_id": "review-probe-low-task"
+    },
+    "review-probe-mid-render-step": {
+      "config": {
+        "role_id": "review-probe-mid",
+        "selector": null
+      },
+      "id": "review-probe-mid-render-step",
+      "kind": "review.probe-render",
+      "status": "planned",
+      "task_id": "review-probe-mid-task"
+    },
+    "review-probe-mid-step": {
+      "config": {
+        "bucket_budget": 500000,
+        "bucket_group": "probe",
+        "identifier": "darkmux:probe-model-b",
+        "max_tokens": 4000,
+        "model": "darkmux:probe-model-b",
+        "model_key": "probe-model-b",
+        "n_ctx": 32000,
+        "retry_on_empty": 1,
+        "system": "",
+        "temperature": 0.20000000298023224,
+        "timeout_seconds": 30,
+        "user_template": "{item}"
+      },
+      "id": "review-probe-mid-step",
+      "kind": "dispatch.map",
+      "status": "planned",
+      "task_id": "review-probe-mid-task"
     },
     "review-synthesis-step": {
       "config": null,
@@ -137,6 +164,7 @@
       "id": "review-probe-high-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
+        "review-probe-high-render-step",
         "review-probe-high-step"
       ],
       "role_id": "review-probe-high"
@@ -150,6 +178,7 @@
       "id": "review-probe-mid-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
+        "review-probe-mid-render-step",
         "review-probe-mid-step"
       ],
       "role_id": "review-probe-mid"
@@ -163,6 +192,7 @@
       "id": "review-probe-low-task",
       "phase_id": "pr-review-golden-investigate",
       "step_ids": [
+        "review-probe-low-render-step",
         "review-probe-low-step"
       ],
       "role_id": "review-probe-low"

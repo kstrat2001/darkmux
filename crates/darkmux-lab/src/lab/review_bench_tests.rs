@@ -1501,6 +1501,7 @@
             roles: valid_funnel_crew(),
             exec_mode,
             probe_system: "probe system prompt".into(),
+            probe_role_prompts: std::collections::BTreeMap::new(),
             judge_system: "judge system prompt".into(),
             verify_system: "verify system prompt".into(),
             bundler_cmd,
