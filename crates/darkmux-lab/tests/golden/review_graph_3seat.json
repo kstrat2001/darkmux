@@ -15,7 +15,32 @@
       "task_id": "review-bundle-task"
     },
     "review-dedup-step": {
-      "config": null,
+      "config": {
+        "probe_specs": [
+          {
+            "draw_task_ids": ["review-probe-high-task"],
+            "endpoint_host": null,
+            "identifier": "darkmux:probe-model-a",
+            "name": "phigh",
+            "remote": false
+          },
+          {
+            "draw_task_ids": ["review-probe-mid-task"],
+            "endpoint_host": null,
+            "identifier": "darkmux:probe-model-b",
+            "name": "pmid",
+            "remote": false
+          },
+          {
+            "draw_task_ids": ["review-probe-low-task"],
+            "endpoint_host": null,
+            "identifier": "darkmux:probe-model-c",
+            "name": "plow",
+            "remote": false
+          }
+        ],
+        "remote_budget": 500000
+      },
       "id": "review-dedup-step",
       "kind": "review.dedup",
       "status": "planned",
@@ -128,7 +153,12 @@
       "task_id": "review-probe-mid-task"
     },
     "review-synthesis-step": {
-      "config": null,
+      "config": {
+        "dedup_task_id": "review-dedup-task",
+        "judge_task_id": "review-judge-task",
+        "remote_budget": 500000,
+        "verify_task_id": "review-verify-task"
+      },
       "id": "review-synthesis-step",
       "kind": "review.synthesis",
       "status": "planned",
