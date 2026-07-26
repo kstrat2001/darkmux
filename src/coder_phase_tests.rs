@@ -1279,6 +1279,194 @@ edit loop detected on src/widget.rs in an earlier dispatch
         }
     }
 
+    // ─── (#1546) brief composition moves into the graph ──────────────────
+
+    /// THE faithfulness pin this packet's PR is built on, mirroring #1545's
+    /// `review_bundle_step_run_time_output_matches_the_retired_prelude_computation`.
+    /// Before #1546, `mission_launch.rs::register_coder_phase_kinds` called
+    /// `coder_brief_with_injected_context(mission_id, &mission, &phase,
+    /// &workdir)` BEFORE the graph ran — the mission/phase records were
+    /// already loaded, and the function resolved its own budget. This test
+    /// proves relocating that composition into `MissionCoderStepKind::
+    /// run_streaming` (which now calls the SAME function with only the
+    /// build-time-known SPEC — mission id / phase id / worktree path /
+    /// a pre-resolved budget — and lets the function load the records +
+    /// walk corrections/cautions/lessons itself) computes BYTE-IDENTICAL
+    /// output: the REFERENCE side below is the retired call site's own
+    /// inline computation, invoked directly against the SAME mission/phase/
+    /// worktree/budget this test wrote to disk (`mission_adjudication_notes`/
+    /// `mission_cautions`/`engagement_lessons`/`allocate_injected_context`/
+    /// `coder_brief` — the same private collectors the pre-#1546 function
+    /// body called, unchanged by this packet); the RUN-TIME side is the
+    /// actual `coder_brief_with_injected_context` call
+    /// `MissionCoderStepKind::run_streaming` now makes. `#[serial]` —
+    /// mutates DARKMUX_HOME/DARKMUX_CREW_DIR/DARKMUX_FLOWS_DIR.
+    #[test]
+    #[serial_test::serial]
+    fn coder_brief_with_injected_context_matches_the_retired_prelude_computation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let flows_dir = tmp.path().join("flows");
+        std::fs::create_dir_all(&flows_dir).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path().join("crew"));
+            std::env::set_var("DARKMUX_FLOWS_DIR", &flows_dir);
+        }
+
+        // A REAL worktree with real content — the staleness check
+        // (`mission_cautions`) reads it, mirroring the graph's real order
+        // (the worktree step runs before the coder step, so by the time
+        // composition runs the worktree genuinely exists).
+        let wt_path = tmp.path().join("worktree");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        std::fs::write(wt_path.join("widget.rs"), b"fn widget() {}\n").unwrap();
+        let fresh_hash = blake3::hash(b"fn widget() {}\n").to_hex().to_string();
+
+        let mission_id = "m-brief-1546";
+        let phase_id = "s1";
+        let session_id = darkmux_types::session_id::mission_run(mission_id, phase_id);
+
+        // One recorded adjudication correction (#849) + one detector
+        // caution (#994), scoped to this mission's exact session id — the
+        // SAME flow-record shapes `mission_adjudication_notes_reads_family_
+        // and_filters` / `mission_cautions_filters_scopes_and_ranks` pin.
+        std::fs::write(
+            flows_dir.join("2026-07-26.jsonl"),
+            format!(
+                concat!(
+                    r#"{{"ts":"2026-07-26T10:00:00Z","action":"note","source":"adjudication","session_id":"{sid}","handle":"Do not rename the widget config field."}}"#, "\n",
+                    r#"{{"ts":"2026-07-26T10:05:00Z","category":"telemetry","source":"detector","session_id":"{sid}","payload":{{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{{"files":["widget.rs"],"code_hash":"{hash}"}}}}}}"#, "\n",
+                ),
+                sid = session_id,
+                hash = fresh_hash,
+            ),
+        )
+        .unwrap();
+
+        // One engagement lesson.
+        {
+            let conn = crew::lessons::open_at(&crew::lessons::repo_db_path()).unwrap();
+            crew::lessons::add(&conn, "American English", "house style across all work", None, None)
+                .unwrap();
+        }
+
+        // The mission/phase records — the SAME disk records
+        // `coder_brief_with_injected_context` now loads for itself.
+        let mut m = mission(mission_id, "improve the widget pipeline");
+        m.phase_ids = vec![phase_id.to_string()];
+        m.source_input = Some("Operator: make the widget faster.".to_string());
+        crew::lifecycle::save_mission(&m).unwrap();
+        let p = phase(phase_id, mission_id, PhaseStatus::Running);
+        crew::lifecycle::save_phase(&p).unwrap();
+
+        let budget = injected_budget_chars(Some(32_768));
+
+        // REFERENCE: the retired pre-#1546 call site's own inline
+        // computation, invoked directly against the SAME inputs.
+        let mission_session_ids: std::collections::HashSet<String> =
+            m.phase_ids.iter().map(|pid| darkmux_types::session_id::mission_run(mission_id, pid)).collect();
+        let intent = intent_files(&p.description);
+        let corrections = mission_adjudication_notes(&mission_session_ids);
+        let cautions = mission_cautions(&mission_session_ids, &intent, &wt_path);
+        let authored = engagement_lessons(&intent);
+        let (prior_corrections, detected_cautions, lessons) =
+            allocate_injected_context(corrections, cautions, authored, budget);
+        let expected = coder_brief(&p, &m, &lessons, &prior_corrections, &detected_cautions);
+
+        // RUN-TIME PATH: the exact call `MissionCoderStepKind::run_streaming`
+        // now makes — mission id / phase id / worktree path / a
+        // pre-resolved budget only (the SPEC #1546 stamps).
+        let actual = coder_brief_with_injected_context(mission_id, phase_id, &wt_path, budget).unwrap();
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_crew {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        assert!(!expected.is_empty(), "the fixture must produce a real brief, or this test proves nothing");
+        assert!(expected.contains("<lessons>"), "fixture lesson must land: {expected:?}");
+        assert!(
+            expected.contains("<prior-adjudication-corrections>"),
+            "fixture correction must land: {expected:?}"
+        );
+        assert!(expected.contains("<detected-cautions>"), "fixture caution must land: {expected:?}");
+        assert_eq!(
+            actual, expected,
+            "the run-time step's composed brief must be byte-identical to the retired \
+             pre-#1546 call site's own inline computation for the same inputs — that \
+             equality IS this packet's faithfulness claim"
+        );
+    }
+
+    /// The degenerate no-context-to-inject case is unchanged: a mission with
+    /// no recorded corrections/cautions/lessons still composes cleanly
+    /// through the new run-time entry point, reducing to the bare
+    /// `coder_brief` (plus the operator-source-input block when present) —
+    /// same as calling `coder_brief` directly with empty slices.
+    #[test]
+    #[serial_test::serial]
+    fn coder_brief_with_injected_context_with_no_sources_is_the_bare_brief() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path().join("crew"));
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path().join("flows"));
+        }
+
+        let mission_id = "m-brief-1546-bare";
+        let phase_id = "s1";
+        let mut m = mission(mission_id, "improve the widget pipeline");
+        m.phase_ids = vec![phase_id.to_string()];
+        crew::lifecycle::save_mission(&m).unwrap();
+        let p = phase(phase_id, mission_id, PhaseStatus::Running);
+        crew::lifecycle::save_phase(&p).unwrap();
+
+        // No worktree at all — the staleness check must tolerate a
+        // not-yet-existing dir the same way it always has (see
+        // `current_file_blake3`'s doc: a missing file reads "unknown
+        // freshness", never an error).
+        let wt_path = tmp.path().join("nonexistent-worktree");
+
+        let actual =
+            coder_brief_with_injected_context(mission_id, phase_id, &wt_path, injected_budget_chars(Some(32_768)))
+                .unwrap();
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_crew {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        assert_eq!(actual, coder_brief(&p, &m, &[], &[], &[]), "no sources → the bare description: {actual:?}");
+    }
+
     /// `resolve_local_placement` — the best-effort role→profile→model
     /// classification `StepKind::residency` implementations use. A local
     /// model resolves to `Some(Placement)`; a remote (endpoint-bearing)
