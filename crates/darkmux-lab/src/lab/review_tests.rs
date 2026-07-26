@@ -2539,6 +2539,72 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         }
     }
 
+    /// (#1530 Packet 3a follow-on) `ReviewDedupStepKind`/
+    /// `ReviewSynthesisStepKind` gained NO constructor fields — the
+    /// mint-time `probe_specs`/`remote_budget` (dedup) and
+    /// `dedup_task_id`/`judge_task_id`/`verify_task_id`/`remote_budget`
+    /// (synthesis) are stamped onto EACH step's own `Step.config` by
+    /// `build_review_graph_from_config` and read back by
+    /// [`dedup_config_from_step`]/[`synthesis_task_ids_from_step`] — two
+    /// hand-written call sites (the stamper, the reader) with no compiler
+    /// check keeping them in sync, exactly the risk
+    /// `bundle_spec_stamp_and_reader_agree_for_every_source_shape` guards
+    /// against on the bundle step. Covers both the no-verify-seat and
+    /// verify-seat-staffed shapes (the synthesis step's config gains three
+    /// extra keys only in the latter — see `build_review_graph_from_config`'s
+    /// own doc), and a two-probe crew (so `probe_specs` round-trips more
+    /// than one entry, in claim order).
+    #[test]
+    fn dedup_and_synthesis_config_stamp_and_reader_agree_with_and_without_verify_seat() {
+        let probes = vec![graph_staffing("phigh", "probe-model-a", 1), graph_staffing("plow", "probe-model-b", 1)];
+        for verify in [None, Some(graph_staffing("careful", "verify-model", 1))] {
+            let graph = build_review_graph(
+                std::sync::Arc::new(ReviewStepContext::default()),
+                &dummy_bundle_spec(),
+                graph_staffing("fast", "judge-model", 1),
+                verify.clone(),
+                &probes,
+                "investigate",
+                "adjudicate",
+                "report",
+                1,
+            )
+            .expect("graph builds");
+
+            let dedup_config =
+                &graph.steps.get("review-dedup-step").expect("the dedup step exists").config;
+            let (probe_specs, dedup_remote_budget) = dedup_config_from_step(dedup_config)
+                .unwrap_or_else(|e| panic!("the dedup step's reader rejected the stamper's own config: {e:#}"));
+            assert_eq!(probe_specs.len(), probes.len(), "every claimed probe seat must round-trip a spec");
+            assert_eq!(
+                probe_specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+                vec!["phigh", "plow"],
+                "probe spec identity must survive the stamp, in claim order"
+            );
+
+            let synthesis_config =
+                &graph.steps.get("review-synthesis-step").expect("the synthesis step exists").config;
+            let (dedup_task_id, judge_task_id, verify_task_id, synth_remote_budget) =
+                synthesis_task_ids_from_step(synthesis_config).unwrap_or_else(|e| {
+                    panic!("the synthesis step's reader rejected the stamper's own config: {e:#}")
+                });
+            assert_eq!(dedup_task_id, "review-dedup-task", "task ids are FIXED, unaffected by phase-id args");
+            assert_eq!(judge_task_id, "review-judge-task");
+            assert_eq!(verify_task_id, "review-verify-task");
+            assert_eq!(
+                synth_remote_budget, dedup_remote_budget,
+                "both steps stamp the SAME per-execution remote budget"
+            );
+
+            assert_eq!(
+                synthesis_config.get("verify_identifier").is_some(),
+                verify.is_some(),
+                "verify_identifier (and its remote/endpoint_host siblings) is present iff a \
+                 verify seat was staffed"
+            );
+        }
+    }
+
     /// `staffing()`'s graph-test twin: a LOCAL seat whose `ProfileModel`
     /// carries NO `n_ctx`. Every `StepKind::residency()` in this module
     /// (probe/judge/verify) reports `None` — i.e. `Residency::Remote` —

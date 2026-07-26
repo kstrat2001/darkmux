@@ -4105,7 +4105,14 @@ impl StepKind for ReviewProbeRenderStepKind {
 /// published by the render step and read back by
 /// [`reconstruct_probe_stage`] keyed on `draw_task_ids` below — so this
 /// struct no longer needs its own copy.
-#[derive(Debug, Clone)]
+///
+/// (#1530 Packet 3a follow-on) `Serialize`/`Deserialize` are new derives —
+/// every field is a plain `String`/`bool`/`Option<String>`/`Vec<String>`, so
+/// this round-trips losslessly through JSON. Added so `ReviewDedupStepKind`
+/// can stamp the mint-time `Vec<ProbeSeatSpec>` onto `review-dedup-step`'s
+/// own `Step.config` instead of holding it as a constructor field — see that
+/// kind's own doc for why `Step.config` won over a bus artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProbeSeatSpec {
     pub(crate) name: String,
     /// The seat's dispatch identity (`seat_identifier` — namespaced for a
@@ -4388,20 +4395,44 @@ pub(crate) fn reconstruct_probe_stage(
 /// (`MechanismFamilyDedup`) over the generic Tier 2
 /// `darkmux_crew::step_kinds::patterns::dedup` procedure — see
 /// `dedup_flags`'s own doc.
-pub struct ReviewDedupStepKind {
-    /// (#1442 ship-2b, #1512) The mint-time per-seat specs `build_review_graph`
-    /// computed while claiming each staffing against its declared probe
-    /// task — this step's `input`
-    /// map (keyed by probe TASK id) is raw `MapItemResult` arrays from the
-    /// generic `dispatch.map` fan-out, and [`reconstruct_probe_stage`]
-    /// aligns them back into domain results against these specs before the
-    /// (unchanged) dedup algorithm runs.
-    pub(crate) probe_specs: Vec<ProbeSeatSpec>,
-    /// The probe stage's per-execution remote allowance
-    /// (`ReviewStepContext::remote_max_tokens_per_execution`) — the SAME
-    /// value stamped into every probe step's `bucket_budget` config, used
-    /// here to reconstruct the stage's budget row.
-    pub(crate) remote_budget: u64,
+///
+/// (#1530 Packet 3a follow-on) A stateless singleton — no `probe_specs`/
+/// `remote_budget` constructor fields. Both are mint-time values
+/// `build_review_graph_from_config` computes once (while claiming each
+/// staffing against its declared probe task) and stamps onto THIS step's
+/// own `Step.config` (`"probe_specs"`/`"remote_budget"`), read back in
+/// `run_streaming`. `Step.config` won over a bus artifact here because
+/// `probe_specs` is genuinely per-STEP build-time wiring, not per-RUN
+/// mutable state shared across kinds (the bus's actual job — see
+/// `REVIEW_CONTEXT_ARTIFACT`'s doc): it's computed once, never mutated,
+/// consumed by exactly one step, and — since [`ProbeSeatSpec`] dropped its
+/// `bundles` snapshot (#1541) — small and losslessly JSON-serializable
+/// (`ProbeSeatSpec` gained `Serialize`/`Deserialize` for exactly this). The
+/// judge/verify-render/synthesis kinds' own build-time staffing values
+/// already established this "compute once, stamp `Step.config`, read back"
+/// precedent; this is the same pattern, not a new one.
+pub struct ReviewDedupStepKind;
+
+/// (#1530 Packet 3a follow-on) Reads `"probe_specs"`/`"remote_budget"` off
+/// `review-dedup-step`'s config — stamped by `build_review_graph_from_config`
+/// (see [`ReviewDedupStepKind`]'s own doc). Extracted into its own function,
+/// called from BOTH `run_streaming` below and the stamp/read agreement test
+/// (`dedup_and_synthesis_config_stamp_and_reader_agree`), so a key-name or
+/// shape mismatch between the stamper and the reader surfaces at TEST time
+/// instead of only inside a live graph run — mirrors
+/// `file_source_from_step_config`'s own shape.
+fn dedup_config_from_step(config: &serde_json::Value) -> Result<(Vec<ProbeSeatSpec>, u64)> {
+    let probe_specs: Vec<ProbeSeatSpec> = config
+        .get("probe_specs")
+        .cloned()
+        .map(|v| serde_json::from_value(v).context("deserializing \"probe_specs\" from step config"))
+        .transpose()?
+        .context("darkmux: review-dedup-step config is missing \"probe_specs\"")?;
+    let remote_budget = config
+        .get("remote_budget")
+        .and_then(|v| v.as_u64())
+        .context("darkmux: review-dedup-step config is missing \"remote_budget\" (or it is not a u64)")?;
+    Ok((probe_specs, remote_budget))
 }
 
 impl StepKind for ReviewDedupStepKind {
@@ -4481,7 +4512,7 @@ impl StepKind for ReviewDedupStepKind {
             .expect("run_review_graph seeds the warnings artifact before the graph runs");
         // (#1541) The render step's published per-task selection — `None`
         // only when NO `review.probe-render` step is present anywhere in
-        // this graph (so `self.probe_specs` is empty too and the lookup
+        // this graph (so `probe_specs` below is empty too and the lookup
         // below is a no-op either way); `unwrap_or_default` treats that the
         // same as "materialized but still empty" rather than panicking on a
         // legitimately probe-less graph.
@@ -4492,11 +4523,18 @@ impl StepKind for ReviewDedupStepKind {
             .map(|s| s.lock().expect("probe selection mutex poisoned").clone())
             .unwrap_or_default();
 
+        // (#1530 Packet 3a follow-on) `probe_specs`/`remote_budget` now
+        // arrive via `step.config` — stamped once by
+        // `build_review_graph_from_config` — rather than constructor
+        // fields; see [`dedup_config_from_step`]'s own doc for why the read
+        // is a shared function rather than inlined here.
+        let (probe_specs, remote_budget) = dedup_config_from_step(&step.config)?;
+
         let t0 = Instant::now();
         // (#1442 ship-2b) Reconstruction boundary: raw flags + per-seat
         // member accounting + warnings + the probe budget row, rebuilt from
         // the seats x k map steps' per-item results.
-        let recon = reconstruct_probe_stage(&self.probe_specs, input, &selection, self.remote_budget)?;
+        let recon = reconstruct_probe_stage(&probe_specs, input, &selection, remote_budget)?;
         members.lock().expect("probe members mutex poisoned").extend(recon.members);
         warnings.lock().expect("probe warnings mutex poisoned").extend(recon.warnings);
         let raw = recon.flags;
@@ -5269,22 +5307,51 @@ pub(crate) fn apply_verify_results(
 /// identity (`identifier`/`remote`/`endpoint_host`, the only three things
 /// this step's [`apply_verify_results`] call ever read off the staffing)
 /// moved to `step.config`, stamped by `build_review_graph_from_config` at
-/// build time. `dedup_task_id`/`judge_task_id`/`verify_task_id`/
-/// `remote_budget` stay plain constructor fields — graph-wiring state, not
-/// one of the two patterns this packet retires (see the module-level doc
-/// note above `REVIEW_ENVELOPE_ARTIFACT`).
-pub struct ReviewSynthesisStepKind {
-    /// (#1341) `gather_inputs` now keys a Step's `input` map by the
-    /// DEPENDENCY TASK's id (dependency/data-flow lives at Task level) —
-    /// so this step reads its upstream contributions by TASK id, not
-    /// step id.
-    pub dedup_task_id: String,
-    /// (#1442 ship-2b) The judge task's id — the judged docket arrives
-    /// directly from the judge now: the verify task's own output is the
-    /// generic `dispatch.map`'s per-item result array, not a judged list.
-    pub judge_task_id: String,
-    pub verify_task_id: String,
-    pub(crate) remote_budget: u64,
+/// build time.
+///
+/// (#1530 Packet 3a follow-on) A stateless singleton — `dedup_task_id`/
+/// `judge_task_id`/`verify_task_id`/`remote_budget` ALSO moved to
+/// `step.config` (`"dedup_task_id"`/`"judge_task_id"`/`"verify_task_id"`/
+/// `"remote_budget"`), always stamped by `build_review_graph_from_config`
+/// (unconditionally, unlike the `verify_*` trio above which is present only
+/// when a verify seat is staffed). Packet 3a's own note above once kept
+/// these as plain constructor fields — "graph-wiring state, not one of the
+/// two patterns this packet retires" — but a global step-kind registry (the
+/// next packet in the #1530 arc) registers each kind ONCE as a shared
+/// singleton, so even build-time-only wiring like these task ids can't
+/// survive as a constructor field on a kind meant to be process-lifetime
+/// and mission-independent. All four are plain `String`/`u64` values,
+/// trivially round-tripped through JSON.
+pub struct ReviewSynthesisStepKind;
+
+/// (#1530 Packet 3a follow-on) Reads `"dedup_task_id"`/`"judge_task_id"`/
+/// `"verify_task_id"`/`"remote_budget"` off `review-synthesis-step`'s
+/// config — stamped unconditionally by `build_review_graph_from_config`
+/// (see [`ReviewSynthesisStepKind`]'s own doc). Extracted into its own
+/// function for the same reason [`dedup_config_from_step`] is — a
+/// key-name mismatch between stamper and reader surfaces at TEST time,
+/// not only inside a live graph run.
+fn synthesis_task_ids_from_step(config: &serde_json::Value) -> Result<(String, String, String, u64)> {
+    let dedup_task_id = config
+        .get("dedup_task_id")
+        .and_then(|v| v.as_str())
+        .context("darkmux: review-synthesis-step config is missing \"dedup_task_id\" (or it is not a string)")?
+        .to_string();
+    let judge_task_id = config
+        .get("judge_task_id")
+        .and_then(|v| v.as_str())
+        .context("darkmux: review-synthesis-step config is missing \"judge_task_id\" (or it is not a string)")?
+        .to_string();
+    let verify_task_id = config
+        .get("verify_task_id")
+        .and_then(|v| v.as_str())
+        .context("darkmux: review-synthesis-step config is missing \"verify_task_id\" (or it is not a string)")?
+        .to_string();
+    let remote_budget = config
+        .get("remote_budget")
+        .and_then(|v| v.as_u64())
+        .context("darkmux: review-synthesis-step config is missing \"remote_budget\" (or it is not a u64)")?;
+    Ok((dedup_task_id, judge_task_id, verify_task_id, remote_budget))
 }
 
 impl StepKind for ReviewSynthesisStepKind {
@@ -5342,10 +5409,20 @@ impl StepKind for ReviewSynthesisStepKind {
             .artifact::<StdMutex<Vec<MemberRecord>>>(REVIEW_MEMBERS_ARTIFACT)
             .expect("run_review_graph seeds the members artifact before the graph runs");
 
+        // (#1530 Packet 3a follow-on) `dedup_task_id`/`judge_task_id`/
+        // `verify_task_id`/`remote_budget` now arrive via `step.config` —
+        // stamped once by `build_review_graph_from_config`, unconditionally
+        // (unlike the `verify_*` trio below, which is present only when a
+        // verify seat is staffed) — rather than constructor fields; see
+        // [`synthesis_task_ids_from_step`]'s own doc for why the read is a
+        // shared function rather than inlined here.
+        let (dedup_task_id, judge_task_id, verify_task_id, remote_budget) =
+            synthesis_task_ids_from_step(&step.config)?;
+
         let t0 = Instant::now();
-        let dedup_output = input.get(&self.dedup_task_id).cloned().unwrap_or_default();
-        let judge_output = input.get(&self.judge_task_id).cloned().unwrap_or_default();
-        let verify_output = input.get(&self.verify_task_id).cloned().unwrap_or_default();
+        let dedup_output = input.get(&dedup_task_id).cloned().unwrap_or_default();
+        let judge_output = input.get(&judge_task_id).cloned().unwrap_or_default();
+        let verify_output = input.get(&verify_task_id).cloned().unwrap_or_default();
         let flags: Vec<ProbeFlag> = if dedup_output.is_empty() {
             Vec::new()
         } else {
@@ -5386,7 +5463,7 @@ impl StepKind for ReviewSynthesisStepKind {
                     identifier,
                     remote,
                     endpoint_host,
-                    self.remote_budget,
+                    remote_budget,
                     &ctx.case_id,
                 );
                 if let Some(member) = outcome.member {
@@ -6108,7 +6185,26 @@ fn build_review_graph_from_config(
         }
     }
 
-    let dedup_kind = Arc::new(ReviewDedupStepKind { probe_specs, remote_budget });
+    // (#1530 Packet 3a follow-on) Stamp the mint-time `probe_specs`/
+    // `remote_budget` onto `review-dedup-step`'s own config — the SAME
+    // "compute at build time, stamp, read back in run_streaming" pattern
+    // the judge seat's staffing above already uses — so `ReviewDedupStepKind`
+    // needs no constructor fields (see that kind's own doc for why
+    // `Step.config` won over a bus artifact). UNLIKE the judge step, this
+    // step's pre-interpret config is `null` (see review.json's
+    // `review-dedup-task`), so this overwrites wholesale rather than
+    // merging into an existing object.
+    {
+        let dedup_step = steps
+            .get_mut("review-dedup-step")
+            .expect("interpreted \"review\" graph must have a review-dedup-step");
+        dedup_step.config = json!({
+            "probe_specs": probe_specs,
+            "remote_budget": remote_budget,
+        });
+    }
+
+    let dedup_kind = Arc::new(ReviewDedupStepKind);
     registry.register(dedup_kind.clone()).expect("review.dedup registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
     registry
@@ -6174,26 +6270,39 @@ fn build_review_graph_from_config(
     // step's own config (present iff a verify seat was staffed, mirroring
     // the `if let Some(vstaff) = &self.verify` test this replaces) instead
     // of cloning the whole staffing into a constructor field.
-    if let Some(vstaff) = &verify {
-        let identifier = seat_identifier(&vstaff.pm);
-        let remote = vstaff.pm.is_remote();
-        let endpoint_host = seat_endpoint_host(&vstaff.pm);
+    //
+    // (#1530 Packet 3a follow-on) ALSO stamp `dedup_task_id`/`judge_task_id`/
+    // `verify_task_id`/`remote_budget` here, unconditionally (this step's
+    // pre-interpret config is `null` — see review.json's
+    // `review-synthesis-task` — so the first write below always establishes
+    // the config object; the verify-seat block afterward MERGES into it,
+    // mirroring the judge step's stamp above) — so `ReviewSynthesisStepKind`
+    // needs no constructor fields at all.
+    {
         let synthesis_step = steps
             .get_mut("review-synthesis-step")
             .expect("interpreted \"review\" graph must have a review-synthesis-step");
         synthesis_step.config = json!({
-            "verify_identifier": identifier,
-            "verify_remote": remote,
-            "verify_endpoint_host": endpoint_host,
+            "dedup_task_id": dedup_task_id,
+            "judge_task_id": judge_task_id,
+            "verify_task_id": verify_task_id,
+            "remote_budget": remote_budget,
         });
+        if let Some(vstaff) = &verify {
+            let identifier = seat_identifier(&vstaff.pm);
+            let remote = vstaff.pm.is_remote();
+            let endpoint_host = seat_endpoint_host(&vstaff.pm);
+            let config_obj = synthesis_step
+                .config
+                .as_object_mut()
+                .expect("review-synthesis-step config is always an object (stamped just above)");
+            config_obj.insert("verify_identifier".to_string(), json!(identifier));
+            config_obj.insert("verify_remote".to_string(), json!(remote));
+            config_obj.insert("verify_endpoint_host".to_string(), json!(endpoint_host));
+        }
     }
 
-    let synthesis_kind = Arc::new(ReviewSynthesisStepKind {
-        dedup_task_id,
-        judge_task_id,
-        verify_task_id,
-        remote_budget,
-    });
+    let synthesis_kind = Arc::new(ReviewSynthesisStepKind);
     registry.register(synthesis_kind.clone()).expect("review.synthesis registered once");
     // (#1349) Legacy alias — see the bundle step's registration above.
     registry
