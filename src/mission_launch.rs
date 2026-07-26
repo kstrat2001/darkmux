@@ -817,43 +817,58 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
 }
 
 /// Build the [`LaunchParams`] `mission_config::interpret` needs: every
-/// phase's composed real id (generic, always safe), plus — ONLY for the
-/// `coder-phase` task ids `default_phase_graph` itself already hardcodes
-/// (`build-coder`/`build-verify`, see that function's own doc) — the
-/// role/workdir/image/description overrides `collected` supplies. A config
-/// that isn't `coder-phase`-shaped gets no task_overrides here (pure
-/// pass-through of its own document defaults); Packet 4b is where a
-/// genuinely generic per-config override mapping would need to be invented,
-/// per the module doc's scope boundary.
+/// phase's composed real id (generic, always safe), plus the
+/// role/workdir/image/description overrides `collected` supplies for a
+/// coder-phase-shaped graph. A graph that uses none of the coder-phase kinds
+/// gets no task_overrides (pure pass-through of its own document defaults).
+///
+/// (#1549) Routed STRUCTURALLY — by which tasks declare the coder-phase step
+/// kinds — not by `config.id == "coder-phase"` and not by the literal task
+/// ids `build-coder`/`build-verify`. Both literals were live bugs, because
+/// EXECUTION already routes structurally (`config_uses_coder_phase_kinds`):
+/// a copied config under any other id ran correctly but skipped this block,
+/// so its `Task.workdir` was never persisted — and `resolve_run_workdir`
+/// (`src/coder_phase.rs`) then falls back to the DERIVED worktree path,
+/// pointing `mission finalize`/`mission abort` at the wrong directory. That
+/// function exists precisely "so finalize/abort target the ACTUAL worktree
+/// even when the operator launched into a non-default location," which the
+/// id gate silently broke for every config not literally named
+/// `coder-phase`. Same treatment review's own id gate got in #1538.
 fn build_launch_params(
     config: &MissionConfig,
     real_phase_ids: &BTreeMap<String, String>,
     collected: &BTreeMap<String, serde_json::Value>,
 ) -> LaunchParams {
     let mut task_overrides = BTreeMap::new();
-    if config.id == "coder-phase" {
+    if config_uses_coder_phase_kinds(config) {
         let role = collected.get("role").and_then(|v| v.as_str());
         let image = collected.get("image").and_then(|v| v.as_str());
         let workdir = collected.get("workdir").and_then(|v| v.as_str()).map(std::path::PathBuf::from);
-        if let Some(role) = role {
-            task_overrides.insert(
-                "build-coder".to_string(),
-                TaskOverride {
-                    role_id: Some(role.to_string()),
-                    workdir: workdir.clone(),
-                    image: image.map(String::from),
-                    description: Some(format!("dispatch `{role}` into the worktree")),
-                    ..Default::default()
-                },
-            );
-        } else if workdir.is_some() || image.is_some() {
-            task_overrides.insert(
-                "build-coder".to_string(),
-                TaskOverride { workdir: workdir.clone(), image: image.map(String::from), ..Default::default() },
-            );
+        // The tasks are identified by what they DO (their step kinds), so a
+        // renamed task in a copied config still receives its overrides.
+        let coder_task = task_id_declaring_step_kind(config, "mission.coder");
+        let verify_task = task_id_declaring_step_kind(config, "mission.verify");
+        if let Some(coder_task) = coder_task {
+            if let Some(role) = role {
+                task_overrides.insert(
+                    coder_task,
+                    TaskOverride {
+                        role_id: Some(role.to_string()),
+                        workdir: workdir.clone(),
+                        image: image.map(String::from),
+                        description: Some(format!("dispatch `{role}` into the worktree")),
+                        ..Default::default()
+                    },
+                );
+            } else if workdir.is_some() || image.is_some() {
+                task_overrides.insert(
+                    coder_task,
+                    TaskOverride { workdir: workdir.clone(), image: image.map(String::from), ..Default::default() },
+                );
+            }
         }
-        if let Some(workdir) = workdir {
-            task_overrides.insert("build-verify".to_string(), TaskOverride { workdir: Some(workdir), ..Default::default() });
+        if let (Some(workdir), Some(verify_task)) = (workdir, verify_task) {
+            task_overrides.insert(verify_task, TaskOverride { workdir: Some(workdir), ..Default::default() });
         }
     }
 
@@ -863,6 +878,20 @@ fn build_launch_params(
         step_config_overrides: BTreeMap::new(),
         expansions: BTreeMap::new(),
     }
+}
+
+/// (#1549) The id of the first task whose graph declares a step of `kind`.
+/// Lets [`build_launch_params`] attach its overrides to what a task DOES
+/// rather than to what it — or its config — is NAMED, so a copied config
+/// with renamed tasks still gets its `workdir`/`role`/`image` persisted onto
+/// the right `Task` records.
+fn task_id_declaring_step_kind(config: &MissionConfig, kind: &str) -> Option<String> {
+    config
+        .phases
+        .iter()
+        .flat_map(|p| p.tasks.iter())
+        .find(|t| t.steps.iter().any(|s| s.kind == kind))
+        .map(|t| t.id.clone())
 }
 
 /// True when any step in the config's graph names one of the coder-phase
@@ -2420,6 +2449,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// (#1549) The overrides must reach a coder-phase-shaped graph even when
+    /// the config is NOT named `coder-phase` and its tasks are NOT named
+    /// `build-coder`/`build-verify`. Both literals used to gate this, while
+    /// EXECUTION already routed structurally — so a copied config ran fine
+    /// but persisted no `Task.workdir`, and `resolve_run_workdir` then sent
+    /// `mission finalize`/`abort` to the derived path instead of the
+    /// operator's actual worktree. Silent, and worse for `abort`.
+    #[test]
+    fn task_overrides_reach_a_renamed_coder_phase_config() {
+        let cfg: MissionConfig = serde_json::from_value(serde_json::json!({
+            "id": "coder-phase-lean",
+            "name": "Lean coder phase",
+            "phases": [{
+                "id": "build",
+                "name": "build",
+                "tasks": [
+                    { "id": "wt",  "steps": [{ "id": "s-wt",  "kind": "mission.worktree" }] },
+                    { "id": "code", "depends_on": ["wt"],
+                      "steps": [{ "id": "s-code", "kind": "mission.coder" }] },
+                    { "id": "qa",  "depends_on": ["code"],
+                      "steps": [{ "id": "s-qa",  "kind": "mission.verify" }] }
+                ]
+            }]
+        }))
+        .expect("config parses");
+
+        let mut collected = BTreeMap::new();
+        collected.insert("workdir".to_string(), serde_json::json!("/tmp/some-other-tree"));
+        collected.insert("role".to_string(), serde_json::json!("coder"));
+
+        let params = build_launch_params(&cfg, &BTreeMap::new(), &collected);
+
+        let coder = params.task_overrides.get("code").expect(
+            "the task declaring `mission.coder` must receive the overrides, whatever it is named",
+        );
+        assert_eq!(coder.workdir.as_deref(), Some(std::path::Path::new("/tmp/some-other-tree")));
+        assert_eq!(coder.role_id.as_deref(), Some("coder"));
+
+        // The verify task's workdir is the one `resolve_run_workdir` reads
+        // back, so finalize/abort target the real worktree.
+        let verify = params
+            .task_overrides
+            .get("qa")
+            .expect("the task declaring `mission.verify` must receive the workdir override");
+        assert_eq!(verify.workdir.as_deref(), Some(std::path::Path::new("/tmp/some-other-tree")));
+
+        // And a graph with none of the coder-phase kinds still gets nothing.
+        let plain = config_with_kind("something", "dispatch.internal");
+        assert!(build_launch_params(&plain, &BTreeMap::new(), &collected).task_overrides.is_empty());
     }
 
     // ── #1530: review routes STRUCTURALLY (by its kinds), not by id ──
