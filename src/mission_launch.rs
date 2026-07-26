@@ -1005,10 +1005,22 @@ pub(crate) struct CoderPhaseHandles {
 /// mission_id/phase_id/session_id/role) is stamped onto `CoderPhaseContext`
 /// instead of onto per-kind constructor fields, and `steps` (the SAME
 /// interpreted graph `launch` is about to run) is mutated in place to stamp
-/// the coder step's own `message`/`timeout_seconds`/`image` onto its
-/// `Step.config` — the same "compute once, stamp, read back in
+/// the coder step's own `timeout_seconds`/`image`/`injected_budget_chars`
+/// onto its `Step.config` — the same "compute once, stamp, read back in
 /// `run_streaming`" pattern `darkmux-lab`'s `build_review_graph_from_config`
 /// uses for the review judge seat's staffing (#1530 Packet 3a).
+///
+/// (#1546) `message` is no longer among the stamped fields — composing the
+/// brief text itself (the mission/phase disk load, the corrections/
+/// cautions/lessons walk, the rank + budget, the provenance printing) is no
+/// longer this function's job at all. It moved into `MissionCoderStepKind::
+/// run_streaming`, which now calls `coder_phase::
+/// coder_brief_with_injected_context` itself, reading `injected_budget_chars`
+/// back off `Step.config` and `mission_id`/`phase_id`/`wt_path` off the SAME
+/// `CoderPhaseContext` this function already stamps — mirroring #1545's
+/// bundling-becomes-runtime migration for the review pipeline: no
+/// domain data (a composed, model-facing brief) is produced before graph
+/// execution, only the pointer + a build-time-knowable budget number are.
 fn register_coder_phase_kinds(
     registry: &crew::step_kinds::StepKindRegistry,
     mission_id: &str,
@@ -1051,9 +1063,11 @@ fn register_coder_phase_kinds(
     let real_phase_id = real_phase_ids[&phase_doc_id].clone();
     let session_id = launch_session_id(mission_id, &real_phase_id);
 
-    let mission = load_mission_for_brief(mission_id)?;
-    let phase = load_phase_for_brief(mission_id, &real_phase_id)?;
-
+    // (#1546) Mission/phase records are no longer loaded here — that disk
+    // read is composition's own run-time work now (see the
+    // `injected_budget_chars` note below), done by `MissionCoderStepKind::
+    // run_streaming` itself off the `mission_id`/`phase_id` `CoderPhaseContext`
+    // already carries.
     let coder_slot: Arc<Mutex<Option<coder_phase::CoderStepResult>>> = Arc::new(Mutex::new(None));
     let verify_slot: Arc<
         Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>,
@@ -1070,17 +1084,32 @@ fn register_coder_phase_kinds(
         .register(Arc::new(coder_phase::MissionVerifyStepKind))
         .map_err(|e| anyhow!("registering mission.verify: {e}"))?;
 
-    // (#1530 Packet 3b-1) The coder brief carries the same injected context
-    // the retired `mission run` gathered — prior adjudication corrections
-    // (#849), detector cautions (#994), engagement lessons — ranked and
-    // budgeted (#1011), with the operator-facing provenance lines (#1426
-    // ship-4). Computed here, exactly ONCE, at the same point in the
-    // sequence it always was (before the graph runs) — `MissionCoderStepKind
-    // ::run_streaming` reads the result back off `Step.config` rather than
-    // recomputing it, which would double-print the provenance lines and
-    // re-walk disk for no behavior change.
-    let message =
-        coder_phase::coder_brief_with_injected_context(mission_id, &mission, &phase, &workdir)?;
+    // (#1546, mirroring #1545's bundling-becomes-runtime migration for the
+    // review pipeline) The coder brief's INPUTS are the build-time-known
+    // SPEC: mission id / phase id / worktree path already ride
+    // `CoderPhaseContext` below, and the one coder-step-specific value is
+    // this — the injected-context char budget (#1011). It's genuinely
+    // knowable here: a pure function of the default profile's context
+    // window (config, not graph output) and the operator's configured
+    // fraction, with no dependency on the mission/phase records or the
+    // worktree the composition itself needs. Stamped onto the coder step's
+    // OWN `Step.config`, mirroring how `timeout_seconds`/`image` already
+    // are. Composition ITSELF — loading the mission/phase records, walking
+    // flow records for prior adjudication corrections (#849) and detector
+    // cautions (#994), reading the engagement lessons store, ranking +
+    // budgeting those sources (#1011), printing the operator-facing
+    // provenance lines (#1426 ship-4), and assembling the final brief text
+    // — moves into `MissionCoderStepKind::run_streaming`, the pipeline's
+    // ONE call site for it now (never called from here), so there is no
+    // double-print/double-disk-walk hazard to guard against by computing it
+    // early: it happens exactly once, when the coder step actually runs.
+    let injected_budget_chars = coder_phase::injected_budget_chars(
+        // (#1282) `Err` = the default profile is quarantined; the coder
+        // dispatch itself would hard-fail with the same error, so fail
+        // loud here, at registration — the same point in the sequence the
+        // retired eager call used to fail at.
+        crew::dispatch_internal::resolve_context_window_internal(None, None)?,
+    );
     let coder_step_id = format!("{real_phase_id}-coder-step");
     let coder_step = steps.get_mut(&coder_step_id).ok_or_else(|| {
         anyhow!(
@@ -1090,9 +1119,9 @@ fn register_coder_phase_kinds(
         )
     })?;
     coder_step.config = serde_json::json!({
-        "message": message,
         "timeout_seconds": timeout_seconds,
         "image": image,
+        "injected_budget_chars": injected_budget_chars,
     });
 
     let context = Arc::new(coder_phase::CoderPhaseContext {
@@ -1352,6 +1381,13 @@ fn coder_phase_gate_outcome(
     Ok(0)
 }
 
+// (#1546) No longer called by production code — brief composition (the
+// mission/phase disk load it used to feed) moved into `coder_phase.rs`'s own
+// `load_mission_record`, called from `MissionCoderStepKind::run_streaming`.
+// Kept `#[cfg(test)]`-only: this module's own tests still use it as a
+// read-back helper (`mission_status_on_disk`, the source_input/ticket
+// hydration test) unrelated to brief composition.
+#[cfg(test)]
 fn load_mission_for_brief(mission_id: &str) -> Result<Mission> {
     let text = std::fs::read_to_string(crew::lifecycle::mission_path(mission_id))
         .with_context(|| format!("reading mission.json for `{mission_id}`"))?;

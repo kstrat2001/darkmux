@@ -685,18 +685,33 @@ pub(crate) struct CoderStepResult {
 /// (#1530 Packet 3b-1) A stateless singleton — no `Mutex<Option<DispatchOpts>>`
 /// take-once constructor field, no `wt_path`/`mission_id`/`phase_id`/
 /// `session_id`/`role_id`. The run's identity comes off the `ArtifactBus`
-/// ([`CODER_CONTEXT_ARTIFACT`]); `DispatchOpts`'s three remaining
-/// step-specific fields (`message`/`timeout_seconds`/`image`) come off this
-/// step's own `Step.config`, stamped once by `register_coder_phase_kinds`
-/// (which still computes `message` via `coder_brief_with_injected_context`
-/// exactly ONCE, at the same point in the sequence it always did — before
-/// the graph runs — so the operator-facing provenance lines it prints keep
-/// their pre-#1530 console ordering). `run_streaming` below rebuilds
-/// `DispatchOpts` fresh from context + config on every call — `DispatchOpts`
-/// itself isn't `Clone`, so there's no instance to cache; this kind's
-/// `run_streaming` only ever runs once per step in production anyway, so a
-/// take-once `Mutex` slot bought nothing here that a plain rebuild doesn't
-/// already give for free.
+/// ([`CODER_CONTEXT_ARTIFACT`]); `DispatchOpts`'s `timeout_seconds`/`image`
+/// fields come off this step's own `Step.config`, stamped once by
+/// `register_coder_phase_kinds`. `run_streaming` below rebuilds `DispatchOpts`
+/// fresh from context + config on every call — `DispatchOpts` itself isn't
+/// `Clone`, so there's no instance to cache; this kind's `run_streaming` only
+/// ever runs once per step in production anyway, so a take-once `Mutex` slot
+/// bought nothing here that a plain rebuild doesn't already give for free.
+///
+/// (#1546) `message` is no longer among those stamped config fields —
+/// composing the coder brief (the mission/phase disk load, the prior-
+/// adjudication-corrections/detected-cautions/engagement-lessons walk, the
+/// rank + budget allocation (#1011), the operator-facing provenance
+/// printing (#1426 ship-4), and the final [`coder_brief`] assembly) is now
+/// this `run_streaming`'s OWN first step, not something
+/// `register_coder_phase_kinds` hands it pre-composed. What IS still
+/// stamped at build time is `injected_budget_chars` — the one genuinely
+/// build-time-knowable input (the default profile's context window +
+/// operator fraction, no dependency on anything the graph produces) — plus
+/// `mission_id`/`phase_id`/`wt_path`, which already ride
+/// `CoderPhaseContext`. `run_streaming` is this composition's ONE call
+/// site (`register_coder_phase_kinds` never calls it), so the
+/// "recomputing it would double-print the provenance lines and re-walk
+/// disk" hazard the pre-#1546 design worried about can't arise structurally
+/// — there's nowhere else it could be called from. Mirrors #1545's
+/// `ReviewBundleStepKind::run_streaming`, which made the SAME move (bundle
+/// resolution out of the launcher's pre-graph prelude, into the bundle
+/// step's own `run_streaming`) for the review pipeline.
 // (#1284 Packet 4a) `pub(crate)` — see `MissionWorktreeStepKind`'s doc.
 pub(crate) struct MissionCoderStepKind;
 
@@ -754,22 +769,38 @@ impl StepKind for MissionCoderStepKind {
             .artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)
             .expect("register_coder_phase_kinds seeds the coder.context artifact before the graph runs");
 
+        // (#1546) Compose the brief HERE — the pipeline's ONE call site for
+        // it (see this struct's own doc for the full reasoning: no other
+        // caller exists, so there's no double-print/double-disk-walk hazard
+        // to guard against). `mission_id`/`phase_id`/`wt_path` are the SPEC
+        // already on `ctx`; `injected_budget_chars` is the one
+        // coder-step-specific SPEC value, stamped onto this step's own
+        // config at build time (`register_coder_phase_kinds`) since it's
+        // genuinely knowable then — everything else `coder_brief_with_injected_context`
+        // needs (the mission/phase records, the corrections/cautions/lessons
+        // walk) is data this composition itself has to produce, so it stays
+        // run-time work rather than something a build-time stamp could carry.
+        let injected_budget_chars = step
+            .config
+            .get("injected_budget_chars")
+            .and_then(|v| v.as_u64())
+            .expect(
+                "register_coder_phase_kinds always stamps \"injected_budget_chars\" onto the coder step's config",
+            ) as usize;
+        let message = coder_brief_with_injected_context(
+            &ctx.mission_id,
+            &ctx.phase_id,
+            &ctx.wt_path,
+            injected_budget_chars,
+        )?;
+
         // (#1530 Packet 3b-1) Rebuild `DispatchOpts` fresh from the run-scoped
         // context plus this step's own stamped config — see this struct's
         // own doc for why a rebuild replaces the former take-once `Mutex`
-        // slot. `message`/`timeout_seconds`/`image` are the three fields
-        // `register_coder_phase_kinds` computed once at build time and
-        // can't be cheaply re-derived here (the brief assembly prints
-        // operator-facing provenance lines — recomputing would double-print
-        // and re-walk disk); everything else is either a constant every
-        // coder-phase dispatch has always used, or comes straight off the
-        // context.
-        let message = step
-            .config
-            .get("message")
-            .and_then(|v| v.as_str())
-            .expect("register_coder_phase_kinds always stamps \"message\" onto the coder step's config")
-            .to_string();
+        // slot. `timeout_seconds`/`image` are the two remaining fields
+        // `register_coder_phase_kinds` computed once at build time; everything
+        // else is either a constant every coder-phase dispatch has always
+        // used, or comes straight off the context.
         let timeout_seconds = step
             .config
             .get("timeout_seconds")
@@ -1590,22 +1621,59 @@ fn append_injected_blocks(
     out
 }
 
+/// (#1546) Load a mission record by id — the same read
+/// `mission_launch.rs::load_mission_for_brief` does, kept as this module's
+/// OWN small copy rather than reaching back into the launcher: composition
+/// now lives here, and `mission_launch.rs` keeps its own copy for its own
+/// unrelated uses (e.g. `lazy_start_phase_for_step`'s status check).
+fn load_mission_record(mission_id: &str) -> Result<crew::types::Mission> {
+    let text = std::fs::read_to_string(crew::lifecycle::mission_path(mission_id))
+        .with_context(|| format!("reading mission.json for `{mission_id}`"))?;
+    serde_json::from_str(&text).context("parsing mission.json")
+}
+
+/// (#1546) Load a phase record by (mission id, phase id) — see
+/// [`load_mission_record`]'s doc.
+fn load_phase_record(mission_id: &str, phase_id: &str) -> Result<crew::types::Phase> {
+    let text = std::fs::read_to_string(crew::lifecycle::phase_path(mission_id, phase_id))
+        .with_context(|| format!("reading phase JSON for `{phase_id}`"))?;
+    serde_json::from_str(&text).context("parsing phase JSON")
+}
+
 /// (#1426 ship-4) Build the coder brief for `phase` WITH the injected context
 /// the retired `mission run` gathered before every coder dispatch: prior
 /// adjudication corrections (#849), detector cautions (#994), and engagement
 /// lessons, ranked and budgeted against the dispatch model's context window
 /// (#1011). Prints the SAME operator-facing provenance lines `mission run`
 /// printed — what's carried into the brief, and why — then returns the
-/// assembled brief. Moved out of the deleted `run()` in the ship-4 collapse so
-/// `mission launch coder-phase` (now the ONLY coder path) keeps the doom-loop
-/// fix instead of dispatching a bare brief. `wt_path` is the phase worktree the
-/// staleness check reads.
+/// assembled brief.
+///
+/// (#1546) This function IS the composition — the graph's ONE call site is
+/// `MissionCoderStepKind::run_streaming`, which calls it with the coder
+/// step's SPEC (`mission_id`/`phase_id`/`wt_path`, already on
+/// `CoderPhaseContext`, plus `budget`, the one value genuinely knowable at
+/// build time — see that struct's own doc). Everything this function itself
+/// needs beyond the spec — the mission/phase records, the flow-record walk
+/// for corrections + cautions, the lessons-store read — is loaded HERE, at
+/// call time, mirroring #1545's `ReviewBundleStepKind::run_streaming`
+/// reconstructing a `FileSource` from a build-time-stamped spec rather than
+/// receiving pre-resolved bundles. Before #1546 this function took pre-loaded
+/// `&Mission`/`&Phase` and resolved its OWN budget by calling
+/// `resolve_context_window_internal` — both moved out (the mission/phase
+/// load became this function's own job instead of the caller's; the budget
+/// resolution moved the OTHER way, to `register_coder_phase_kinds`, since
+/// it's pure config data with no dependency on anything this function's own
+/// disk walk produces) so the caller stamps only genuinely build-time-known
+/// data, never the composed payload itself.
 pub(crate) fn coder_brief_with_injected_context(
     mission_id: &str,
-    mission: &crew::types::Mission,
-    phase: &crew::types::Phase,
+    phase_id: &str,
     wt_path: &Path,
+    budget: usize,
 ) -> Result<String> {
+    let mission = load_mission_record(mission_id)?;
+    let phase = load_phase_record(mission_id, phase_id)?;
+
     // The mission's EXACT dispatch session ids (built from its real phase
     // ids), so the collectors scope to THIS mission's sessions — an exact-set
     // match, never a `mission-run-<id>-` prefix that would bleed a sibling
@@ -1628,13 +1696,10 @@ pub(crate) fn coder_brief_with_injected_context(
     let cautions = mission_cautions(&mission_session_ids, &intent, wt_path);
     let authored = engagement_lessons(&intent);
 
-    // (#1011) Distribute a single budget — a fraction of THIS dispatch model's
-    // context window — across the blocks with per-authority floors.
-    let budget = injected_budget_chars(
-        // (#1282) `Err` = the default profile is quarantined; the coder
-        // dispatch below would hard-fail with the same error, so fail early.
-        crew::dispatch_internal::resolve_context_window_internal(None, None)?,
-    );
+    // (#1011) Distribute the caller-resolved budget — a fraction of the
+    // dispatch model's context window (see this function's own doc for why
+    // that resolution now happens at the caller, before the graph runs, not
+    // here) — across the blocks with per-authority floors.
     let (prior_corrections, detected_cautions, lessons) =
         allocate_injected_context(corrections, cautions, authored, budget);
 
@@ -1683,8 +1748,8 @@ pub(crate) fn coder_brief_with_injected_context(
     }
 
     Ok(coder_brief(
-        phase,
-        mission,
+        &phase,
+        &mission,
         &lessons,
         &prior_corrections,
         &detected_cautions,
@@ -1860,7 +1925,13 @@ fn current_file_blake3(workspace_root: &Path, file: &str) -> Option<String> {
 /// `deep` profile's headroom nor over-feeds a `fast` one. Falls back to a
 /// default window when the profile can't resolve, and floors at a minimum so a
 /// pathologically small window still leaves the per-category floors meaningful.
-fn injected_budget_chars(n_ctx: Option<u32>) -> usize {
+// (#1546) `pub(crate)` — `mission_launch.rs`'s `register_coder_phase_kinds`
+// calls this directly to resolve the injected-context budget at BUILD time
+// (the one coder-step-specific value genuinely knowable before the graph
+// runs — see that function's own doc), stamping the result onto the coder
+// step's `Step.config` rather than letting `coder_brief_with_injected_context`
+// resolve it itself at run time.
+pub(crate) fn injected_budget_chars(n_ctx: Option<u32>) -> usize {
     budget_chars_for(n_ctx, darkmux_types::config_access::injected_context_fraction())
 }
 
