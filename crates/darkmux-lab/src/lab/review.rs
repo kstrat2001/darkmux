@@ -6194,10 +6194,21 @@ fn build_review_graph_from_config(
     // step's pre-interpret config is `null` (see review.json's
     // `review-dedup-task`), so this overwrites wholesale rather than
     // merging into an existing object.
+    //
+    // (#1530) Located by KIND, not by the literal step id. A hand-edited
+    // user-tier review.json that renames this step still builds and runs —
+    // routing on what a step IS rather than what it's named is the same
+    // principle #1538 applied to config ids, and it keeps a rename from
+    // aborting the process here.
     {
+        let dedup_step_id = steps
+            .values()
+            .find(|s| s.kind == "review.dedup")
+            .map(|s| s.id.clone())
+            .context("darkmux: the interpreted \"review\" graph declares no `review.dedup` step")?;
         let dedup_step = steps
-            .get_mut("review-dedup-step")
-            .expect("interpreted \"review\" graph must have a review-dedup-step");
+            .get_mut(&dedup_step_id)
+            .expect("the step id was just read out of this same map");
         dedup_step.config = json!({
             "probe_specs": probe_specs,
             "remote_budget": remote_budget,
@@ -6279,9 +6290,13 @@ fn build_review_graph_from_config(
     // mirroring the judge step's stamp above) — so `ReviewSynthesisStepKind`
     // needs no constructor fields at all.
     {
+        // (#1530) Reuses `synthesis_step_id`, already resolved BY KIND just
+        // above — so this stamp, which now runs unconditionally (it used to
+        // happen only when a verify seat was staffed), can't turn a renamed
+        // step in a user-tier config into a process abort.
         let synthesis_step = steps
-            .get_mut("review-synthesis-step")
-            .expect("interpreted \"review\" graph must have a review-synthesis-step");
+            .get_mut(&synthesis_step_id)
+            .expect("the step id was just read out of this same map");
         synthesis_step.config = json!({
             "dedup_task_id": dedup_task_id,
             "judge_task_id": judge_task_id,

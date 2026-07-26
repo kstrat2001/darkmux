@@ -2559,7 +2559,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let probes = vec![graph_staffing("phigh", "probe-model-a", 1), graph_staffing("plow", "probe-model-b", 1)];
         for verify in [None, Some(graph_staffing("careful", "verify-model", 1))] {
             let graph = build_review_graph(
-                std::sync::Arc::new(ReviewStepContext::default()),
+                // (#1530) A DISTINCTIVE budget, not `default()`'s 0 — otherwise
+                // `synth == dedup` is `0 == 0` and would still pass if a future
+                // change stamped a literal zero or read the wrong field.
+                std::sync::Arc::new(ReviewStepContext {
+                    remote_max_tokens_per_execution: 12_345,
+                    ..Default::default()
+                }),
                 &dummy_bundle_spec(),
                 graph_staffing("fast", "judge-model", 1),
                 verify.clone(),
@@ -2591,6 +2597,20 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             assert_eq!(dedup_task_id, "review-dedup-task", "task ids are FIXED, unaffected by phase-id args");
             assert_eq!(judge_task_id, "review-judge-task");
             assert_eq!(verify_task_id, "review-verify-task");
+            assert_eq!(dedup_remote_budget, 12_345, "the dedup stamp must carry the ctx's real budget");
+            assert_eq!(synth_remote_budget, 12_345, "the synthesis stamp must carry the same real budget");
+            // (#1530) The join key attribution depends on (#1541) and the
+            // seat identity the envelope reports — pinned here so the
+            // round-trip is self-contained rather than leaning on the golden.
+            assert_eq!(
+                probe_specs.iter().map(|s| s.identifier.as_str()).collect::<Vec<_>>(),
+                probes.iter().map(|p| seat_identifier(&p.pm)).collect::<Vec<_>>(),
+                "each seat's dispatch identifier must survive the round trip"
+            );
+            assert!(
+                probe_specs.iter().all(|s| s.draw_task_ids.len() == 1 && !s.draw_task_ids[0].is_empty()),
+                "draw_task_ids is the key reconstruct_probe_stage joins on — it must survive: {probe_specs:?}"
+            );
             assert_eq!(
                 synth_remote_budget, dedup_remote_budget,
                 "both steps stamp the SAME per-execution remote budget"
