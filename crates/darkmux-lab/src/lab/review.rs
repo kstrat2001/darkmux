@@ -3275,9 +3275,36 @@ const REVIEW_ENVELOPE_ARTIFACT: &str = "review.envelope";
 const REVIEW_MEMBERS_ARTIFACT: &str = "review.members";
 const REVIEW_WARNINGS_ARTIFACT: &str = "review.warnings";
 const REVIEW_CONTEXT_ARTIFACT: &str = "review.context";
+/// (#1541) Per-seat probe bundle ATTRIBUTION, published by
+/// [`ReviewProbeRenderStepKind::run_streaming`] and consumed by
+/// [`reconstruct_probe_stage`] via [`ReviewDedupStepKind::run_streaming`].
+/// Keyed by the probe TASK id (the same key `gather_inputs` already uses for
+/// that task's dispatch results — see `ProbeSeatSpec::draw_task_ids`'s doc),
+/// mapping to the ORDERED `(bundle_id, fact_family)` pairs the render step
+/// selected for that task, index-aligned with the prompt collection it
+/// emitted as `Step.output`. Before this artifact, `reconstruct_probe_stage`
+/// aligned a probe seat's `dispatch.map` results back to bundles
+/// POSITIONALLY against a build-time snapshot (`ProbeSeatSpec.bundles`,
+/// retired — see git history) that only agreed with the run-time selection
+/// because both sides called the same pure function over the same bundles.
+/// Publishing the render step's ACTUAL selection onto the bus makes
+/// attribution travel through the graph instead of relying on that
+/// coincidence — see #1541 for the full failure mode this closes.
+const REVIEW_PROBE_SELECTION_ARTIFACT: &str = "review.probe-selection";
 
 fn make_review_envelope_artifact() -> Arc<dyn Any + Send + Sync> {
     Arc::new(StdMutex::new(ReviewEnvelope::default()))
+}
+
+/// (#1541) Context-free default for [`REVIEW_PROBE_SELECTION_ARTIFACT`] — an
+/// empty map, populated in place by every claimed probe seat's
+/// `review.probe-render` step as it runs (one `insert` per seat, keyed by
+/// that seat's probe task id). Unlike [`REVIEW_CONTEXT_ARTIFACT`] this is
+/// never caller-seeded — genuinely run-time data with no build-time
+/// equivalent — so the empty default here is the REAL starting state, not a
+/// placeholder `run_review_graph` overwrites.
+fn make_review_probe_selection_artifact() -> Arc<dyn Any + Send + Sync> {
+    Arc::new(StdMutex::new(std::collections::BTreeMap::<String, Vec<(String, String)>>::new()))
 }
 
 /// (#1530 Packet 3a) Context-free default for [`REVIEW_CONTEXT_ARTIFACT`] —
@@ -3674,8 +3701,21 @@ impl StepKind for ReviewProbeRenderStepKind {
         &PORTS
     }
 
+    /// (#1541) Declares [`REVIEW_PROBE_SELECTION_ARTIFACT`] — this kind is
+    /// the one and only PRODUCER (every claimed probe seat's render step
+    /// `insert`s its own entry as it runs; `ReviewDedupStepKind::requires()`
+    /// reads the finished map back at the dedup boundary). Declaring the
+    /// `provides()` here, on the actual producer, rather than "the earliest
+    /// consumer" (the convention the three older accumulators use, per
+    /// `ReviewDedupStepKind::provides()`'s doc) is deliberate: this artifact
+    /// has no build-time equivalent for `run_review_graph` to caller-seed,
+    /// so the factory default genuinely IS the run's starting state, and the
+    /// producer is the natural, honest owner of that declaration.
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data("probe-prompts")];
+        const PORTS: [Port; 2] = [
+            Port::data("probe-prompts"),
+            Port::artifact(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact),
+        ];
         &PORTS
     }
 
@@ -3689,7 +3729,7 @@ impl StepKind for ReviewProbeRenderStepKind {
     fn run_streaming(
         &self,
         step: &Step,
-        _task: &Task,
+        task: &Task,
         _input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
@@ -3726,6 +3766,25 @@ impl StepKind for ReviewProbeRenderStepKind {
         let selected = select_bundles_for_staffing(&ctx.bundles, selector.as_ref());
         let collection: Vec<String> = selected.iter().map(|b| probe_user_message(prior, b)).collect();
 
+        // (#1541) Publish THIS run's actual selection — index-aligned with
+        // `collection` above — onto the bus, keyed by this render step's OWN
+        // task id (the same key `gather_inputs` hands the dedup step's
+        // `input` for this task's dispatch results, since a probe task is
+        // exactly one role / one task / one dispatch — #1512). This is what
+        // lets `reconstruct_probe_stage` attribute results by data that
+        // actually flowed through the graph instead of a build-time
+        // snapshot; see `REVIEW_PROBE_SELECTION_ARTIFACT`'s own doc.
+        let pairs: Vec<(String, String)> =
+            selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
+        run_ctx
+            .artifact::<StdMutex<std::collections::BTreeMap<String, Vec<(String, String)>>>>(
+                REVIEW_PROBE_SELECTION_ARTIFACT,
+            )
+            .expect("run_step_graph materializes review.probe-selection via this kind's own provides()")
+            .lock()
+            .expect("probe selection mutex poisoned")
+            .insert(task.id.clone(), pairs);
+
         emit_review_step_result(
             "review.probe-render",
             &step.id,
@@ -3753,6 +3812,20 @@ impl StepKind for ReviewProbeRenderStepKind {
 /// (one role, one task, one dispatch) — kept plural for the dedup step's
 /// existing per-draw iteration shape, not because more than one entry is
 /// ever produced.
+///
+/// (#1541) NO LONGER carries a `bundles` field. It used to hold a
+/// build-time snapshot of `(bundle_id, fact_family)` pairs
+/// (`select_bundles_for_staffing(&ctx.bundles, ...)`, computed once in
+/// `build_review_graph_from_config`) that [`reconstruct_probe_stage`] used
+/// to attribute each `dispatch.map` result back to its bundle POSITIONALLY.
+/// That snapshot only agreed with the run-time render step's own selection
+/// because both called the identical pure function over the identical
+/// bundles — a coincidence that would silently break once bundling itself
+/// becomes run-time work (#1541's own filing). Attribution now travels
+/// through the graph instead, via [`REVIEW_PROBE_SELECTION_ARTIFACT`],
+/// published by the render step and read back by
+/// [`reconstruct_probe_stage`] keyed on `draw_task_ids` below — so this
+/// struct no longer needs its own copy.
 #[derive(Debug, Clone)]
 pub(crate) struct ProbeSeatSpec {
     pub(crate) name: String,
@@ -3765,11 +3838,11 @@ pub(crate) struct ProbeSeatSpec {
     /// This seat's claimed probe task id, wrapped in a `Vec` for the dedup
     /// step's `input`-key iteration (`gather_inputs` keys a first-step
     /// input by dependency TASK id, #1341) — always exactly one entry as of
-    /// #1512 (one role, one task).
+    /// #1512 (one role, one task). Also the key
+    /// [`REVIEW_PROBE_SELECTION_ARTIFACT`] uses per draw (#1541) — the same
+    /// task id names both this seat's `dispatch.map` results (`input`) and
+    /// its render step's published selection.
     pub(crate) draw_task_ids: Vec<String>,
-    /// The selected bundles, in the exact order the pre-rendered prompt
-    /// collection was minted: `(bundle_id, fact_family)` per item index.
-    pub(crate) bundles: Vec<(String, String)>,
 }
 
 /// Everything the dedup boundary reconstructs from the probe fan-out's raw
@@ -3818,9 +3891,22 @@ pub(crate) struct ProbeReconstruction {
 ///   credit work that never happened;
 /// - the probe stage's ONE remote budget row (`stage: "probe"`) and the
 ///   exhaustion warning reconstruct from the same items.
+///
+/// (#1541) Attribution (WHICH bundle a flag came from) now keys on
+/// `selection` — the render step's OWN published `(bundle_id,
+/// fact_family)` pairs, per draw task id, off [`REVIEW_PROBE_SELECTION_ARTIFACT`]
+/// — rather than a build-time snapshot. A draw whose task id is absent from
+/// `selection` (the render step never ran or never published for that
+/// task), or whose published pair count doesn't match the `dispatch.map`
+/// result count for the same task (a desync between what the render step
+/// selected and what actually dispatched), is a loud, named warning and
+/// that draw's flags are DROPPED rather than risk attributing a real
+/// finding to the wrong bundle — see this function's own history for the
+/// silent-`continue` bug this replaces.
 pub(crate) fn reconstruct_probe_stage(
     specs: &[ProbeSeatSpec],
     input: &std::collections::BTreeMap<String, String>,
+    selection: &std::collections::BTreeMap<String, Vec<(String, String)>>,
     budget: u64,
 ) -> Result<ProbeReconstruction> {
     let mut flags = Vec::new();
@@ -3847,10 +3933,38 @@ pub(crate) fn reconstruct_probe_stage(
             per_draw.push(results);
         }
 
-        // Flags in the historical seat → bundle → draw order.
-        for (b_idx, (bundle_id, fact_family)) in spec.bundles.iter().enumerate() {
-            for (draw, results) in per_draw.iter().enumerate() {
-                let Some(item) = results.get(b_idx) else { continue };
+        // Flags in the historical seat → bundle → draw order — with only
+        // one draw task id per seat (#1512), draw-major and bundle-major
+        // iteration produce an IDENTICAL sequence, so nesting draw outside
+        // bundle here (rather than the retired bundle-outside-draw order)
+        // is a byte-identical reordering, not a behavior change.
+        for (draw, task_id) in spec.draw_task_ids.iter().enumerate() {
+            let results = per_draw.get(draw).map(Vec::as_slice).unwrap_or(&[]);
+            let pairs = match selection.get(task_id) {
+                Some(pairs) if pairs.len() == results.len() => pairs,
+                Some(pairs) => {
+                    warnings.push(format!(
+                        "probe seat \"{}\" draw {draw} (task `{task_id}`): render step selected \
+                         {} bundle(s) but dispatch returned {} result(s) — attribution desync, \
+                         this draw's flags are DROPPED rather than risk attributing them to the \
+                         wrong bundle (#1541)",
+                        spec.name,
+                        pairs.len(),
+                        results.len()
+                    ));
+                    continue;
+                }
+                None => {
+                    warnings.push(format!(
+                        "probe seat \"{}\" draw {draw} (task `{task_id}`): no bundle selection \
+                         published by the render step — attribution unavailable, this draw's \
+                         flags are DROPPED (#1541)",
+                        spec.name
+                    ));
+                    continue;
+                }
+            };
+            for (item, (bundle_id, fact_family)) in results.iter().zip(pairs.iter()) {
                 if item.ok && !item.content.trim().is_empty() {
                     flags.push(ProbeFlag {
                         bundle_id: bundle_id.clone(),
@@ -4033,9 +4147,14 @@ impl StepKind for ReviewDedupStepKind {
 
     /// (#1530 Packet 3a) `requires()` only — see `ReviewBundleStepKind::
     /// provides()`'s doc for why the context artifact's `provides()`
-    /// declaration lives there instead.
+    /// declaration lives there instead. (#1541) Also `requires()`s
+    /// `REVIEW_PROBE_SELECTION_ARTIFACT` — `ReviewProbeRenderStepKind::
+    /// provides()`'s doc explains why the PRODUCER declares that one.
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact)];
+        const PORTS: [Port; 2] = [
+            Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
+            Port::artifact(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact),
+        ];
         &PORTS
     }
 
@@ -4065,12 +4184,24 @@ impl StepKind for ReviewDedupStepKind {
         let warnings = run_ctx
             .artifact::<StdMutex<Vec<String>>>(REVIEW_WARNINGS_ARTIFACT)
             .expect("run_review_graph seeds the warnings artifact before the graph runs");
+        // (#1541) The render step's published per-task selection — `None`
+        // only when NO `review.probe-render` step is present anywhere in
+        // this graph (so `self.probe_specs` is empty too and the lookup
+        // below is a no-op either way); `unwrap_or_default` treats that the
+        // same as "materialized but still empty" rather than panicking on a
+        // legitimately probe-less graph.
+        let selection: std::collections::BTreeMap<String, Vec<(String, String)>> = run_ctx
+            .artifact::<StdMutex<std::collections::BTreeMap<String, Vec<(String, String)>>>>(
+                REVIEW_PROBE_SELECTION_ARTIFACT,
+            )
+            .map(|s| s.lock().expect("probe selection mutex poisoned").clone())
+            .unwrap_or_default();
 
         let t0 = Instant::now();
         // (#1442 ship-2b) Reconstruction boundary: raw flags + per-seat
         // member accounting + warnings + the probe budget row, rebuilt from
         // the seats x k map steps' per-item results.
-        let recon = reconstruct_probe_stage(&self.probe_specs, input, self.remote_budget)?;
+        let recon = reconstruct_probe_stage(&self.probe_specs, input, &selection, self.remote_budget)?;
         members.lock().expect("probe members mutex poisoned").extend(recon.members);
         warnings.lock().expect("probe warnings mutex poisoned").extend(recon.warnings);
         let raw = recon.flags;
@@ -5430,20 +5561,16 @@ fn build_review_graph_from_config(
     // recall breadth is a config edit (add another probe role/task to
     // review.json), never a per-run draw multiplier.
     //
-    // `probe_specs.bundles` below is STILL computed here, at build time,
-    // via the SAME `select_bundles_for_staffing(&ctx.bundles, ...)` call
-    // the render step now ALSO makes at run time — safe because both calls
-    // are the identical pure function over the identical `ctx.bundles`
-    // (the same `Arc<ReviewStepContext>` this whole function was handed,
-    // later seeded verbatim onto the run's `ArtifactBus`), so the two
-    // computations are guaranteed to agree; `ProbeSeatSpec` is a genuine
-    // build-time TOPOLOGY value (which bundles this seat's draw covers, for
-    // the dedup boundary's flag reconstruction), not run-scoped
-    // `ReviewStepContext`/`ResolvedSeatStaffing` state, so it staying a
-    // `ReviewDedupStepKind` constructor field is unaffected by the #1530
-    // Packet 3a stateless-singleton discipline (mirrors
-    // `ReviewSynthesisStepKind`'s own `dedup_task_id`/`judge_task_id`/
-    // `verify_task_id` constructor fields).
+    // (#1541) `ProbeSeatSpec` no longer computes or carries a build-time
+    // `bundles` snapshot — the OLD `select_bundles_for_staffing(&ctx.bundles,
+    // ...)` call that used to live here duplicated the render step's own
+    // run-time call, and the two were only guaranteed to agree because both
+    // were the identical pure function over the identical `ctx.bundles`. The
+    // dedup boundary now reads the render step's PUBLISHED selection off
+    // `REVIEW_PROBE_SELECTION_ARTIFACT` instead (see that constant's doc and
+    // `reconstruct_probe_stage`'s), so `ProbeSeatSpec` only needs this seat's
+    // TOPOLOGY (identity, remote-ness, its one claimed task id) — never a
+    // second copy of WHICH bundles it covers.
     let remote_budget = ctx.remote_max_tokens_per_execution;
     let mut probe_specs: Vec<ProbeSeatSpec> = Vec::new();
     for (staffing, task_id) in probes.iter().zip(claims.iter()) {
@@ -5451,9 +5578,6 @@ fn build_review_graph_from_config(
         let endpoint = seat_endpoint(&staffing.pm);
         let endpoint_host = seat_endpoint_host(&staffing.pm);
         let max_tokens = resolve_seat_max_tokens(staffing, DEFAULT_PROBE_MAX_TOKENS);
-        let selected = select_bundles_for_staffing(&ctx.bundles, staffing.selector.as_ref());
-        let bundles: Vec<(String, String)> =
-            selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
 
         let task = tasks.iter().find(|t| &t.id == task_id).unwrap_or_else(|| {
             panic!("the claimed probe task `{task_id}` must survive pruning")
@@ -5533,7 +5657,6 @@ fn build_review_graph_from_config(
             remote: endpoint.is_some(),
             endpoint_host,
             draw_task_ids: vec![task_id.clone()],
-            bundles,
         });
     }
 
