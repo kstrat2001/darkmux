@@ -3938,6 +3938,22 @@ pub(crate) fn reconstruct_probe_stage(
         // iteration produce an IDENTICAL sequence, so nesting draw outside
         // bundle here (rather than the retired bundle-outside-draw order)
         // is a byte-identical reordering, not a behavior change.
+        //
+        // (#1541) Scope of that equivalence, stated precisely: it holds for
+        // every spec GRAPH CONSTRUCTION can mint, because `build_review_graph
+        // _from_config` gives each seat exactly one draw task (#1512). This
+        // function itself still SUPPORTS multi-draw specs — `reconstruct_
+        // probe_stage_accounts_skips_errors_and_flags` hand-builds a two-draw
+        // spec as the retained coverage for per-seat summing across sibling
+        // draws — and for such a spec draw-major and bundle-major iteration
+        // yield DIFFERENT flag orders. That is unreachable from any real
+        // graph today, but dedup downstream is first-survivor-wins over this
+        // vector's order, so anything that re-introduces multi-draw seats at
+        // graph-construction time must restore bundle-major nesting here
+        // first, or it will silently change which flag survives. (Asserting
+        // single-draw here would be wrong: the multi-draw path is supported
+        // and tested — the constraint belongs to graph construction, not to
+        // this function.)
         for (draw, task_id) in spec.draw_task_ids.iter().enumerate() {
             let results = per_draw.get(draw).map(Vec::as_slice).unwrap_or(&[]);
             let pairs = match selection.get(task_id) {
@@ -5600,6 +5616,23 @@ fn build_review_graph_from_config(
         }
         let render_step_id = task.step_ids[0].clone();
         let map_step_id = task.step_ids[1].clone();
+
+        // (#1541) The FIRST step must actually be the render kind, not just
+        // present. A hand-edited user-tier review.json whose probe task leads
+        // with some other step would otherwise build a graph where nothing
+        // publishes the seat's bundle selection — every seat would then hit
+        // the attribution-desync warning at run time and DROP its flags. Fail
+        // here, at the consumption point, naming the fix (contract 7).
+        if steps.get(&render_step_id).map(|s| s.kind.as_str()) != Some("review.probe-render") {
+            anyhow::bail!(
+                "darkmux: \"review\" mission config's probe task `{task_id}` must lead with a \
+                 `review.probe-render` step (its first step is `{}`), because that step is what \
+                 publishes the seat's bundle selection for attribution. A user-tier copy at \
+                 ~/.darkmux/mission-configs/review.json needs the render step first (or delete \
+                 the copy to fall back to the built-in document).",
+                steps.get(&render_step_id).map(|s| s.kind.as_str()).unwrap_or("<missing>")
+            );
+        }
 
         // The render step's config: this seat's selector (data — WHICH
         // bundles) and role id (WHICH prior text) — both known at build

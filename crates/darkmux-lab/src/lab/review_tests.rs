@@ -3028,6 +3028,21 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(env.raw_flags, 1, "exactly one probe dispatch fired — the document declares exactly one");
         assert_eq!(env.judged.len(), 1);
         assert_eq!(env.confirmed, 1);
+        // (#1541) NEGATIVE guard: a HEALTHY run must emit ZERO attribution
+        // warnings. The desync warning replaced a silent `continue`, so the
+        // risk it introduces is the mirror of the bug it fixes — a spurious
+        // warning on the release-gated path. Today the loud path is
+        // unreachable on a healthy run (`dispatch.map` emits exactly one
+        // result per collection item, and a short vector means the map step
+        // never completed, in which case dedup never runs). This pins that as
+        // a REGRESSION GUARD rather than a proof-by-reasoning — which matters
+        // precisely when bundling becomes run-time work and the two sides
+        // stop being the same pure function over the same input.
+        assert!(
+            !env.warnings.iter().any(|w| w.contains("#1541")),
+            "a healthy run must emit no attribution-desync warnings, got: {:?}",
+            env.warnings
+        );
     }
 
     /// A five-probe config also builds and runs cleanly — the issue's other
