@@ -1024,25 +1024,29 @@ fn run_funnel_case(
     timeout_seconds: u32,
     emitter: &mut dyn super::review::ReviewEmitter,
 ) -> Result<(Review, super::review::ReviewEnvelope)> {
-    use super::bundle;
     use super::review;
 
-    let source = bundle::FileSource::worktree(workdir);
-    let set = match ctx.bundler_cmd.as_deref() {
-        Some(cmd) => {
-            let diff_path = write_temp_diff(&c.id, &c.diff)?;
-            let result = bundle::external_bundles(cmd, Some(workdir), &diff_path);
-            let _ = fs::remove_file(&diff_path);
-            result.with_context(|| format!("external bundler for case {}", c.id))?
-        }
-        None => bundle::build_bundles(&source, &c.diff)
-            .with_context(|| format!("building bundles for case {}", c.id))?,
-    };
-    // (#1530) `review::bundle_inputs_from_set` — moved out of this file
-    // (`src/mission_launch_review.rs`, before this packet) into
-    // `darkmux-lab`'s own `review` module, so both callers share ONE copy.
-    let bundles: Vec<review::BundleInput> = review::bundle_inputs_from_set(&set, &source)
-        .with_context(|| format!("slicing bundle code for case {}", c.id))?;
+    // (#1530) Bench does NOT bundle eagerly. It stamps the same
+    // `BundleBuildSpec` production stamps and lets `ReviewBundleStepKind`
+    // do the work inside the graph — so the bundling code bench measures IS
+    // the bundling code production runs, reconstruction and all.
+    //
+    // Bench is the release gate for review recall/FP parity, which makes it
+    // the LAST place that should take a shortcut around a production path:
+    // a bench that skips production's bundling can't catch a regression in
+    // it, and the numbers would silently stop describing production. This
+    // also keeps this function's own #1355 promise ("what bench measures is
+    // finally what production actually executes") true for data production,
+    // not just for orchestration.
+    //
+    // The temp diff file must OUTLIVE the graph run (the external bundler
+    // reads it at step-run time, not here), so it is cleaned up after
+    // `run_review_graph` returns rather than immediately. Written
+    // unconditionally so the stamped spec is VALID even on the built-in
+    // bundler path, where the step reads `ctx.diff` instead — a spec whose
+    // fields are only conditionally meaningful is how a "never read" dummy
+    // value becomes a live bug the day something does read it.
+    let diff_path = write_temp_diff(&c.id, &c.diff)?;
 
     // (#1355 follow-up) Dispatches through the SAME `build_review_graph` +
     // `run_review_graph` engine `darkmux mission launch review` uses in
@@ -1059,22 +1063,11 @@ fn run_funnel_case(
     let verify = ctx.roles.verify.clone();
     let judge_identifier = review::seat_identifier(&judge.pm);
 
-    // (#1530) Bench keeps its EAGER bundling (the real `build_bundles`/
-    // `external_bundles`/`slice_code*` calls above, unchanged) and hands the
-    // result to the graph through `bundle_override` instead of
-    // `ReviewStepContext::bundles` (retired — see that field's removal note).
-    // Bench is a per-run-local measurement tool, not the `mission launch
-    // review` launcher #1530's "no data production before graph execution"
-    // invariant targets, so this is a deliberate out-of-scope choice — see
-    // `bundle_override`'s own doc for the full reasoning (same shape as the
-    // `charges_file` side path's exemption).
-    let bundles_for_override = bundles.clone();
+    // (#1530) The same spec production stamps — every field real and read.
     let bundle_spec = review::BundleBuildSpec {
         source: review::BundleSourceSpec::Worktree { path: workdir.to_path_buf() },
         bundler: ctx.bundler_cmd.clone(),
-        // Never read — `bundle_override` short-circuits before `Step.config`
-        // is touched — but `BundleBuildSpec` always needs a value.
-        diff_file: std::path::PathBuf::new(),
+        diff_file: diff_path.clone(),
     };
     let step_ctx = std::sync::Arc::new(review::ReviewStepContext {
         case_id: c.id.clone(),
@@ -1095,7 +1088,9 @@ fn run_funnel_case(
         remote_max_tokens_per_execution: darkmux_types::config_access::remote_max_tokens_per_execution(),
         timeout_seconds,
         chat_override: None,
-        bundle_override: Some(std::sync::Arc::new(move || Ok(bundles_for_override.clone()))),
+        // (#1530) None — bench bundles through the step, like production.
+        // The override survives for HERMETIC UNIT TESTS only.
+        bundle_override: None,
     });
 
     let graph = review::build_review_graph(
@@ -1118,7 +1113,7 @@ fn run_funnel_case(
     // (#1397) A bench run mints no real Mission — lab-vs-fleet boundary —
     // so there is nothing to persist a Step to; `persist` is a no-op here,
     // same as `run_review_graph`'s own tests.
-    let (mut env, _steps) = review::run_review_graph(
+    let graph_run = review::run_review_graph(
         &step_ctx,
         &crew_name,
         ctx.exec_mode,
@@ -1127,8 +1122,34 @@ fn run_funnel_case(
         graph,
         emitter,
         &mut |_step| {},
-    )
-    .with_context(|| format!("running review graph for case {}", c.id))?;
+    );
+    // (#1530) The bundle step read this inside the graph, so cleanup waits
+    // until the run is over — and happens on the error path too, before the
+    // `?`, so a failed case doesn't leak a temp diff per retry.
+    let _ = fs::remove_file(&diff_path);
+    let (mut env, steps) = graph_run.with_context(|| format!("running review graph for case {}", c.id))?;
+
+    // (#1530) BUNDLING FAILURE IS STILL A LOUD PER-CASE ERROR.
+    //
+    // Moving bundling into the graph changed its failure SHAPE: a bundler
+    // that errors now fails a step, which the graph reports as a DEGENERATE
+    // envelope rather than an `Err`. For production that is the right
+    // behavior (an honest degraded review gets posted). For the BENCH it is
+    // not: a degenerate case still scores, so a misconfigured `--bundler`
+    // would quietly land as a zero-recall row and corrupt the corpus numbers
+    // instead of stopping the run. A measurement tool must never silently
+    // absorb a setup failure into its own score.
+    //
+    // So the bench re-raises exactly this one class, restoring the loud
+    // per-case failure the eager call used to give (same `external bundler
+    // for case <id>` context), while everything else keeps the graph's
+    // degenerate semantics untouched.
+    if let Some(bundle_step) = steps.get("review-bundle-step") {
+        if bundle_step.status == darkmux_crew::types::NodeStatus::Error {
+            let detail = bundle_step.output.as_deref().unwrap_or("(no error detail recorded)");
+            anyhow::bail!("external bundler for case {}: {detail}", c.id);
+        }
+    }
     // (#1513 review C3) Fold `resolve_review_roles`'s own resolution-time
     // warnings (today, just the "verify task present but roleless" case)
     // into the case envelope — resolved once in `resolve_funnel_ctx` and

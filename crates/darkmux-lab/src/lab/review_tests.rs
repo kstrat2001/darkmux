@@ -2475,6 +2475,70 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         }
     }
 
+    /// (#1530) The launcher's `BundleBuildSpec` -> `Step.config` STAMP and the
+    /// step's `file_source_from_step_config` READER agree only by two
+    /// hand-written `json!`/`get()` literals in the same file. Nothing else
+    /// pins them together, so a rename on one side is a silent break — and it
+    /// breaks at RUN time, inside the graph, after the mission has minted.
+    ///
+    /// Covers the `github` shape specifically: that is what the real CI
+    /// review uses (`--param github=<repo> --param head_sha=<sha>`), and it
+    /// was the one source shape with ZERO coverage on the reconstruction path
+    /// — the bench and the other new tests only ever build `worktree` specs.
+    #[test]
+    fn bundle_spec_stamp_and_reader_agree_for_every_source_shape() {
+        for spec in [
+            BundleBuildSpec {
+                source: BundleSourceSpec::Github {
+                    repo: "kstrat2001/darkmux".to_string(),
+                    head_sha: "deadbeefcafe".to_string(),
+                },
+                bundler: None,
+                diff_file: PathBuf::from("/tmp/some-diff.patch"),
+            },
+            BundleBuildSpec {
+                source: BundleSourceSpec::Worktree { path: PathBuf::from("/tmp/some-worktree") },
+                bundler: Some("my-bundler".to_string()),
+                diff_file: PathBuf::from("/tmp/some-diff.patch"),
+            },
+        ] {
+            let graph = build_review_graph(
+                std::sync::Arc::new(ReviewStepContext::default()),
+                &spec,
+                graph_staffing("fast", "judge-model", 1),
+                None,
+                &[graph_staffing("fast", "probe-model", 1)],
+                "investigate",
+                "adjudicate",
+                "report",
+                1,
+            )
+            .expect("graph builds");
+            let config = &graph
+                .steps
+                .get("review-bundle-step")
+                .expect("the bundle step exists")
+                .config;
+
+            // The reader must accept what the stamper wrote — key names,
+            // nesting, and all. A mismatch surfaces here instead of at run
+            // time on a real review.
+            file_source_from_step_config(config).unwrap_or_else(|e| {
+                panic!("the bundle step's reader rejected the launcher's own stamp: {e:#}")
+            });
+            assert_eq!(
+                config.get("bundler").and_then(|v| v.as_str()),
+                spec.bundler.as_deref(),
+                "the bundler command must survive the stamp verbatim"
+            );
+            assert_eq!(
+                config.get("diff_file").and_then(|v| v.as_str()),
+                Some(spec.diff_file.display().to_string().as_str()),
+                "the diff path must survive the stamp verbatim (the external bundler reads it)"
+            );
+        }
+    }
+
     /// `staffing()`'s graph-test twin: a LOCAL seat whose `ProfileModel`
     /// carries NO `n_ctx`. Every `StepKind::residency()` in this module
     /// (probe/judge/verify) reports `None` — i.e. `Residency::Remote` —
