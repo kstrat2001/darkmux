@@ -5652,6 +5652,80 @@ pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
     None
 }
 
+/// Register every review-pipeline Tier 3 step kind (#1352) — plus the
+/// pre-#1349-rename `funnel.*` legacy aliases — onto `registry`.
+///
+/// (#1530 — one global step-kind registry) Extracted out of what used to be
+/// inline registrations inside `build_review_graph_from_config`, so
+/// `src/`'s cross-family assembly point (`all_step_kinds`, `src/
+/// mission_launch.rs`) can build ONE registry that resolves both `review.*`
+/// and `mission.*` (coder-phase) kinds at once — a capability that was
+/// structurally impossible while each launcher only ever populated its OWN
+/// partial registry. `build_review_graph_from_config` still builds a
+/// `StepKindRegistry::with_builtins()` and calls this function immediately
+/// after (see its own call site) — the SAME two-call sequence
+/// `all_step_kinds` performs — so `build_review_graph`'s existing callers
+/// (`review_bench`, `mission_launch_review::launch`) see byte-identical
+/// behavior. This is a pure extraction, not a behavior change.
+///
+/// Every kind registered here is a stateless unit struct (#1536/#1537/
+/// #1553), so ONE shared `Arc` instance per kind is registered — never
+/// per-graph-per-call construction — which is exactly what makes sharing a
+/// single registry across callers safe.
+///
+/// **Registration ownership:** this function is the ONE place review's
+/// Tier 3 kinds get registered. A caller must not also hand-register any
+/// of these ids onto the same `registry` — `StepKindRegistry::register`
+/// errors loud on a duplicate id, so a double-call surfaces immediately
+/// rather than silently overwriting.
+pub fn register_review_kinds(registry: &StepKindRegistry) -> Result<()> {
+    let bundle_kind = Arc::new(ReviewBundleStepKind);
+    registry.register(bundle_kind.clone()).context("registering review.bundle")?;
+    // (#1349) Legacy alias — a `Step.kind` persisted before the funnel->review
+    // rename must still resolve if anything ever re-reads it back through a
+    // fresh registry (see `StepKindRegistry::register_alias`'s doc).
+    registry
+        .register_alias("funnel.bundle", bundle_kind)
+        .context("registering funnel.bundle legacy alias")?;
+
+    // (#1530 follow-on Packet A1) The probe render step — the Tier-3 half
+    // of the probe stage that stays bespoke; no legacy alias (new as of the
+    // render/dispatch split, not a renamed `funnel.*` kind).
+    registry
+        .register(Arc::new(ReviewProbeRenderStepKind))
+        .context("registering review.probe-render")?;
+
+    let dedup_kind = Arc::new(ReviewDedupStepKind);
+    registry.register(dedup_kind.clone()).context("registering review.dedup")?;
+    // (#1349) Legacy alias — see the bundle kind's registration above.
+    registry
+        .register_alias("funnel.dedup", dedup_kind)
+        .context("registering funnel.dedup legacy alias")?;
+
+    let judge_kind = Arc::new(ReviewJudgeStepKind);
+    registry.register(judge_kind.clone()).context("registering review.judge")?;
+    // (#1349) Legacy alias — see the bundle kind's registration above.
+    registry
+        .register_alias("funnel.judge", judge_kind)
+        .context("registering funnel.judge legacy alias")?;
+
+    // (#1442 ship-2b) The verify render step — the Tier-3 half of the
+    // verify stage that stays bespoke; no legacy alias, same reason as the
+    // probe render step above.
+    registry
+        .register(Arc::new(ReviewVerifyRenderStepKind))
+        .context("registering review.verify-render")?;
+
+    let synthesis_kind = Arc::new(ReviewSynthesisStepKind);
+    registry.register(synthesis_kind.clone()).context("registering review.synthesis")?;
+    // (#1349) Legacy alias — see the bundle kind's registration above.
+    registry
+        .register_alias("funnel.synthesis", synthesis_kind)
+        .context("registering funnel.synthesis legacy alias")?;
+
+    Ok(())
+}
+
 /// Build the review's complete Task/Step graph across three Phases
 /// (investigate / adjudicate / report — see the module doc) PLUS the
 /// registry every step kind resolves through — see [`BuiltReviewGraph`].
@@ -5926,10 +6000,17 @@ fn build_review_graph_from_config(
     // (#1442 ship-2b) The probe/verify stages ride the GENERIC
     // `dispatch.map` builtin, so the registry starts from the Tier-1
     // builtin set instead of empty.
+    //
+    // (#1530 — one global step-kind registry) Every review Tier 3 kind
+    // (bundle/probe-render/dedup/judge/verify-render/synthesis) plus their
+    // legacy `funnel.*` aliases registers in ONE call now
+    // ([`register_review_kinds`]) instead of six inline blocks scattered
+    // through this function — see that function's own doc for why the
+    // extraction matters (it's what lets `src/mission_launch.rs`'s
+    // `all_step_kinds` build one registry spanning review AND coder-phase).
     let registry = StepKindRegistry::with_builtins();
+    register_review_kinds(&registry).context("registering review step kinds")?;
 
-    let bundle_kind = Arc::new(ReviewBundleStepKind);
-    registry.register(bundle_kind.clone()).expect("review.bundle registered once");
     // (#1530) Stamp `review-bundle-step`'s config from the caller's already-
     // resolved `bundle_spec` — see [`BundleBuildSpec`]'s own doc for why
     // this is DATA the launcher/bench caller already had, not new work.
@@ -5951,29 +6032,20 @@ fn build_review_graph_from_config(
             "diff_file": bundle_spec.diff_file.display().to_string(),
         });
     }
-    // (#1349) Legacy alias — a `Step.kind` persisted before the funnel->review
-    // rename must still resolve if anything ever re-reads it back through a
-    // fresh registry (see `StepKindRegistry::register_alias`'s doc).
     // (#1442 ship-2b) The probe/verify legacy aliases (`funnel.probe:<seat>`,
     // `funnel.verify`) retired WITH their kinds — there is no live
     // implementation left to alias to (pre-1.0, no compat baggage); the
     // read-path labeling of persisted historical steps lives in
-    // `review_step_kind_display_name` instead.
-    registry
-        .register_alias("funnel.bundle", bundle_kind)
-        .expect("funnel.bundle legacy alias registered once");
-
-    // (#1530 follow-on Packet A1) The probe render step — the Tier-3 half
+    // `review_step_kind_display_name` instead. `funnel.bundle`/
+    // `review.probe-render` (below) are registered by [`register_review_kinds`]
+    // above.
+    //
+    // (#1530 follow-on Packet A1) The probe render step is the Tier-3 half
     // of the probe stage that stays bespoke (rendering against this
     // pipeline's own `BundleInput`/`BundleSelector` types); the dispatch
     // half is the generic map, exactly mirroring the verify stage's own
-    // render/dispatch split below. One shared registered instance for
-    // every probe task (stateless singleton — see the kind's own doc).
-    let probe_render_kind = Arc::new(ReviewProbeRenderStepKind);
-    registry
-        .register(probe_render_kind)
-        .expect("review.probe-render registered once");
-
+    // render/dispatch split below.
+    //
     // (#1512, #1530 follow-on Packet A1) Each CLAIMED probe task now has
     // TWO steps — a `review.probe-render` step (this seat's selector +
     // role id, resolved into a rendered prompt collection AT RUN TIME) then
@@ -6215,23 +6287,13 @@ fn build_review_graph_from_config(
         });
     }
 
-    let dedup_kind = Arc::new(ReviewDedupStepKind);
-    registry.register(dedup_kind.clone()).expect("review.dedup registered once");
-    // (#1349) Legacy alias — see the bundle step's registration above.
-    registry
-        .register_alias("funnel.dedup", dedup_kind)
-        .expect("funnel.dedup legacy alias registered once");
-
-    let judge_kind = Arc::new(ReviewJudgeStepKind);
-    registry.register(judge_kind.clone()).expect("review.judge registered once");
-    // (#1349) Legacy alias — see the bundle step's registration above.
-    registry
-        .register_alias("funnel.judge", judge_kind)
-        .expect("funnel.judge legacy alias registered once");
+    // (`review.dedup`/`review.judge` registered by [`register_review_kinds`]
+    // above, alongside their `funnel.*` legacy aliases.)
 
     // (#1442 ship-2b) The render step — the Tier-3 half of the verify
     // stage that stayed bespoke (frozen `verify_prompt` assembly against
     // this pipeline's own types); the dispatch half is the generic map.
+    // (`review.verify-render` registered by [`register_review_kinds`] above.)
     //
     // (#1530 Packet 3a) `ReviewVerifyRenderStepKind`'s only use of the
     // verify staffing was `.is_none()` — stamp just that bit onto its own
@@ -6243,10 +6305,6 @@ fn build_review_graph_from_config(
             .expect("interpreted \"review\" graph must have a review-verify-render-step");
         render_step.config = json!({ "verify_seat_staffed": verify.is_some() });
     }
-    let verify_render_kind = Arc::new(ReviewVerifyRenderStepKind);
-    registry
-        .register(verify_render_kind)
-        .expect("review.verify-render registered once");
 
     // The interpreted graph's fixed ids for the upstream tasks
     // `ReviewSynthesisStepKind` reads from — derived from the ACTUAL
@@ -6316,13 +6374,8 @@ fn build_review_graph_from_config(
             config_obj.insert("verify_endpoint_host".to_string(), json!(endpoint_host));
         }
     }
-
-    let synthesis_kind = Arc::new(ReviewSynthesisStepKind);
-    registry.register(synthesis_kind.clone()).expect("review.synthesis registered once");
-    // (#1349) Legacy alias — see the bundle step's registration above.
-    registry
-        .register_alias("funnel.synthesis", synthesis_kind)
-        .expect("funnel.synthesis legacy alias registered once");
+    // (`review.synthesis` registered by [`register_review_kinds`] above,
+    // alongside its `funnel.synthesis` legacy alias.)
 
     Ok(BuiltReviewGraph {
         tasks,

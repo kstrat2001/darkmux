@@ -84,8 +84,19 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// The three Tier 3 step kinds `coder_phase.rs` defines for `coder-phase`'s
-/// graph (#1352) — the only Tier 3 kinds this launcher knows how to
-/// construct in Packet 4a. See the module doc's scope boundary.
+/// graph (#1352).
+///
+/// **Structural-routing use ONLY (#1530 — one global step-kind registry).**
+/// Before this packet, this list did double duty: it also fed the
+/// known-kind VALIDATION set and the EXECUTION registry — both of those
+/// now resolve against [`all_step_kinds`]'s single shared registry instead
+/// (`registry.ids()`), so a config naming a kind this launcher can actually
+/// construct is never rejected just because two separate hand-maintained
+/// lists drifted apart. What's left is [`config_uses_coder_phase_kinds`]'s
+/// structural test — "does this graph declare any of these kinds" decides
+/// which task-override / precheck / gate-outcome machinery applies, a
+/// question `registry.ids()` alone can't answer (knowing a kind CAN be
+/// constructed doesn't say whether coder-phase-specific wiring should run).
 const CODER_PHASE_TIER3_KINDS: &[&str] = &["mission.worktree", "mission.coder", "mission.verify"];
 
 /// The five Tier 3 step kinds `crates/darkmux-lab/src/lab/review.rs` defines
@@ -100,9 +111,14 @@ const CODER_PHASE_TIER3_KINDS: &[&str] = &["mission.worktree", "mission.coder", 
 /// collapse would either lose or have to re-derive — an audited non-collapse
 /// per `CLAUDE.md`'s StepKind tiering section ("a collapse that changes
 /// observable behavior isn't a tiering fix, it's a feature change wearing a
-/// tiering fix's clothes"). Named here purely so `known_kinds`'s
-/// doctor-style `validate()` pass never warns "unknown kind" on review's own
-/// document.
+/// tiering fix's clothes").
+///
+/// **Structural-routing use ONLY (#1530 — one global step-kind registry).**
+/// Mirrors [`CODER_PHASE_TIER3_KINDS`]'s doc: this list no longer feeds
+/// validation or any execution registry (both now read [`all_step_kinds`]'s
+/// `registry.ids()` instead) — it exists purely so
+/// [`config_uses_review_kinds`] can decide, structurally, whether a config's
+/// graph is a review pipeline that must route to the dedicated launcher.
 const REVIEW_TIER3_KINDS: &[&str] = &[
     "review.bundle",
     "review.dedup",
@@ -115,6 +131,39 @@ const REVIEW_TIER3_KINDS: &[&str] = &[
     "review.verify-render",
     "review.synthesis",
 ];
+
+/// The ONE registry every step kind darkmux can construct resolves through:
+/// Tier 1 builtins, `darkmux-lab`'s review Tier 3 kinds, and this crate's own
+/// coder-phase Tier 3 kinds (#1530 — one global step-kind registry).
+///
+/// **Why assembly happens here, in the binary, and not in either library
+/// crate.** `darkmux-lab` depends on `darkmux-crew` — never the reverse
+/// (see `CLAUDE.md`'s crate layout) — so `StepKindRegistry` (which lives in
+/// `darkmux-crew`) structurally cannot know about `review.*` kinds (defined
+/// in `darkmux-lab`), and the coder-phase `mission.*` kinds are launch-owned
+/// (defined right here in `src/coder_phase.rs`, per `CLAUDE.md`'s StepKind
+/// tiering section — Tier 3 kinds live beside the mission module that owns
+/// them, never in `darkmux-crew`). This binary is the only place all three
+/// families are visible at once, so it's the only place a SINGLE registry
+/// spanning all of them can be built. Every step kind here is a stateless
+/// unit struct (#1536/#1537/#1553), so registering each once into a shared
+/// registry — rather than per-graph-per-call — is safe.
+///
+/// [`launch`] uses this registry for BOTH the known-kind validation pass
+/// (replacing the old `CODER_PHASE_TIER3_KINDS` + `REVIEW_TIER3_KINDS`
+/// hand-maintained unions) and the real execution registry. The payoff: a
+/// config whose graph names BOTH a `mission.coder` step and a `review.judge`
+/// step resolves every kind against this ONE registry — a capability that
+/// was structurally impossible while `review`'s dedicated launcher and this
+/// module's coder-phase path each built their own PARTIAL registry (see
+/// `both_families_resolve_against_one_registry` in this module's tests).
+fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
+    let registry = crew::step_kinds::StepKindRegistry::with_builtins();
+    darkmux_lab::lab::review::register_review_kinds(&registry)
+        .context("registering review step kinds")?;
+    register_coder_phase_step_kinds(&registry).context("registering coder-phase step kinds")?;
+    Ok(registry)
+}
 
 /// `darkmux mission launch <config-id>` entry point. Returns the process
 /// exit code — the coder-phase rows mirror `coder_phase::run`'s own exit
@@ -160,15 +209,23 @@ pub fn launch(
     let config = &loaded.config;
 
     // (contract 7) Semantic validation is a SEPARATE, explicit pass — this
-    // IS the consumption point. `known_step_kinds` is everything this
-    // launcher can actually run today (Tier 1 builtins + the coder-phase
-    // Tier 3 set); anything else warns rather than errors (#1284 Packet 1's
-    // own rule — a step kind this call site doesn't recognize isn't
-    // necessarily wrong, just not yet reachable through THIS launcher).
-    let tier1_ids = crew::step_kinds::StepKindRegistry::with_builtins().ids();
-    let mut known_kinds: Vec<&str> = tier1_ids.iter().map(String::as_str).collect();
-    known_kinds.extend(CODER_PHASE_TIER3_KINDS.iter().copied());
-    known_kinds.extend(REVIEW_TIER3_KINDS.iter().copied());
+    // IS the consumption point. `known_kinds` is everything this launcher
+    // can actually construct today; anything else warns rather than errors
+    // (#1284 Packet 1's own rule — a step kind this call site doesn't
+    // recognize isn't necessarily wrong, just not yet reachable through
+    // THIS launcher).
+    //
+    // (#1530 — one global step-kind registry) `registry` is built ONCE here
+    // via [`all_step_kinds`] and reused for the rest of this function — both
+    // this validation pass AND, further down, the real execution registry
+    // `run_step_graph` dispatches through (see the `all_known` check and the
+    // `run_step_graph` call site below). Previously each of those three
+    // places (validation, the "is this graph executable" check, the
+    // execution registry) built or consulted its OWN partial view; now they
+    // all resolve against the SAME instance.
+    let registry = all_step_kinds()?;
+    let known_ids = registry.ids();
+    let known_kinds: Vec<&str> = known_ids.iter().map(String::as_str).collect();
     let findings = config.validate(&known_kinds);
     let errors: Vec<_> = findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();
     if !errors.is_empty() {
@@ -364,7 +421,11 @@ pub fn launch(
         return Ok(0);
     }
 
-    let all_known: Vec<&str> = tier1_ids.iter().map(String::as_str).chain(CODER_PHASE_TIER3_KINDS.iter().copied()).collect();
+    // (#1530 — one global step-kind registry) `known_kinds`, from the SAME
+    // `registry` this function validated `config` against above, is reused
+    // here (as `all_known`) rather than re-deriving a second hand-maintained
+    // "what can this launcher construct" list.
+    let all_known: &[&str] = &known_kinds;
     let executable = steps.values().all(|s| all_known.contains(&s.kind.as_str()));
     if !executable {
         for task in &tasks {
@@ -393,15 +454,16 @@ pub fn launch(
         return Ok(4);
     }
 
-    // Real execution — build the registry (Tier 1 always, plus the
-    // coder-phase Tier 3 kinds when the graph actually uses them), start
-    // every real phase that has tasks, run the scheduler.
+    // Real execution — start every real phase that has tasks, run the
+    // scheduler against `registry` (built once, at the top of this function,
+    // via `all_step_kinds` — see its own doc; the coder-phase kinds it
+    // registers unconditionally are only ever CONSTRUCTED when the graph
+    // actually names them, gated by `uses_coder_phase_kinds` below).
     //
     // Generic/coder-phase timeout default: `None` -> 600, matching
     // `mission run`'s own default (see `launch`'s doc — `review` resolves
     // its own 3600 default in `mission_launch_review::launch` instead).
     let timeout_seconds = timeout_seconds.unwrap_or(600);
-    let registry = crew::step_kinds::StepKindRegistry::with_builtins();
     let uses_coder_phase_kinds = steps.values().any(|s| CODER_PHASE_TIER3_KINDS.contains(&s.kind.as_str()));
     let coder_handles = if uses_coder_phase_kinds {
         // (#1433 follow-up) Still inside the strand window — a registration
@@ -990,25 +1052,66 @@ pub(crate) struct CoderPhaseHandles {
     session_id: String,
 }
 
-/// Register `coder_phase.rs`'s three `coder-phase` Tier 3 kinds against
-/// `registry`, using the operator-collected `workdir`/`branch`/`base`/
-/// `role`/`image` inputs plus a launcher-resolved `repo_root`. Bails loud
-/// (naming the missing input) rather than constructing a kind with an
-/// empty path if the graph needs these kinds but the operator didn't
-/// supply them. Returns the [`CoderPhaseHandles`] the caller reads after
-/// `run_step_graph` to decide the gate outcome — and also, since #1530
-/// Packet 2, seeds onto the `ArtifactBus` via `run_step_graph`'s
-/// `seed_artifacts` parameter (see `launch`'s own call site).
+/// Register `coder_phase.rs`'s three `coder-phase` Tier 3 kinds
+/// (`mission.worktree`/`mission.coder`/`mission.verify`) onto `registry` —
+/// the KIND-REGISTRATION half of what was, before #1530 ("one global
+/// step-kind registry"), inlined directly into [`register_coder_phase_kinds`]
+/// below. Extracted so [`all_step_kinds`] can register these three kinds
+/// once, unconditionally, alongside Tier 1 builtins and `darkmux-lab`'s
+/// review kinds — the MINTING half (resolving `workdir`/`branch`/`base`/
+/// `role`/`image`, stamping `Step.config`, building [`CoderPhaseHandles`])
+/// stays in `register_coder_phase_kinds`, which now ASSUMES these three ids
+/// are already present on `registry` rather than registering them itself
+/// (see that function's own doc).
 ///
-/// (#1530 Packet 3b-1) The three kinds registered below are now stateless
-/// singletons — the run's identity (repo_root/wt_path/branch/base/
+/// Every kind here is a stateless unit struct (#1536/#1537/#1553), so this
+/// is a one-time registration of shared `Arc` instances, not per-call
+/// construction.
+fn register_coder_phase_step_kinds(registry: &crew::step_kinds::StepKindRegistry) -> Result<()> {
+    registry
+        .register(Arc::new(coder_phase::MissionWorktreeStepKind))
+        .map_err(|e| anyhow!("registering mission.worktree: {e}"))?;
+    registry
+        .register(Arc::new(coder_phase::MissionCoderStepKind))
+        .map_err(|e| anyhow!("registering mission.coder: {e}"))?;
+    registry
+        .register(Arc::new(coder_phase::MissionVerifyStepKind))
+        .map_err(|e| anyhow!("registering mission.verify: {e}"))?;
+    Ok(())
+}
+
+/// Mint a [`CoderPhaseHandles`] for a `coder-phase`-shaped graph, using the
+/// operator-collected `workdir`/`branch`/`base`/`role`/`image` inputs plus a
+/// launcher-resolved `repo_root`. Bails loud (naming the missing input)
+/// rather than proceeding with an empty path if the graph needs these kinds
+/// but the operator didn't supply them. Returns the [`CoderPhaseHandles`]
+/// the caller reads after `run_step_graph` to decide the gate outcome — and
+/// also, since #1530 Packet 2, seeds onto the `ArtifactBus` via
+/// `run_step_graph`'s `seed_artifacts` parameter (see `launch`'s own call
+/// site).
+///
+/// **Precondition (#1530 — one global step-kind registry):** `registry`
+/// must already carry `mission.worktree`/`mission.coder`/`mission.verify` —
+/// this function no longer registers them itself (see
+/// [`register_coder_phase_step_kinds`], which [`all_step_kinds`] calls
+/// unconditionally when building the registry `launch` passes in here).
+/// Before this packet, this function registered the three kinds directly
+/// against a registry `launch` built fresh (`StepKindRegistry::
+/// with_builtins()`) just for this call; now `launch` passes in the SAME
+/// registry it already validated `config`'s step kinds against, which
+/// `all_step_kinds` populated with these ids unconditionally — registering
+/// them again here would hit `StepKindRegistry::register`'s duplicate-id
+/// guard.
+///
+/// (#1530 Packet 3b-1) The run's identity (repo_root/wt_path/branch/base/
 /// mission_id/phase_id/session_id/role) is stamped onto `CoderPhaseContext`
-/// instead of onto per-kind constructor fields, and `steps` (the SAME
-/// interpreted graph `launch` is about to run) is mutated in place to stamp
-/// the coder step's own `timeout_seconds`/`image`/`injected_budget_chars`
-/// onto its `Step.config` — the same "compute once, stamp, read back in
-/// `run_streaming`" pattern `darkmux-lab`'s `build_review_graph_from_config`
-/// uses for the review judge seat's staffing (#1530 Packet 3a).
+/// (never onto per-kind constructor fields — the kinds stay stateless
+/// singletons), and `steps` (the SAME interpreted graph `launch` is about to
+/// run) is mutated in place to stamp the coder step's own
+/// `timeout_seconds`/`image`/`injected_budget_chars` onto its `Step.config`
+/// — the same "compute once, stamp, read back in `run_streaming`" pattern
+/// `darkmux-lab`'s `build_review_graph_from_config` uses for the review
+/// judge seat's staffing (#1530 Packet 3a).
 ///
 /// (#1546) `message` is no longer among the stamped fields — composing the
 /// brief text itself (the mission/phase disk load, the corrections/
@@ -1030,6 +1133,21 @@ fn register_coder_phase_kinds(
     timeout_seconds: u32,
     steps: &mut BTreeMap<String, crew::types::Step>,
 ) -> Result<CoderPhaseHandles> {
+    // (#1530 — one global step-kind registry) Loud precondition check —
+    // see this function's own doc. `all_step_kinds` always registers these
+    // three ids, so this only ever fires if a future caller passes in a
+    // registry built some OTHER way; failing here, by name, beats a later
+    // "unknown step kind" surfacing from deep inside `run_step_graph`.
+    for kind in CODER_PHASE_TIER3_KINDS {
+        registry.get(kind).with_context(|| {
+            format!(
+                "internal error: register_coder_phase_kinds called against a registry missing \
+                 `{kind}` — the caller must build it via `all_step_kinds` (or otherwise call \
+                 `register_coder_phase_step_kinds` first)"
+            )
+        })?;
+    }
+
     let require = |name: &str| -> Result<String> {
         collected
             .get(name)
@@ -1074,15 +1192,6 @@ fn register_coder_phase_kinds(
     > = Arc::new(Mutex::new(None));
 
     let repo_root = coder_phase::repo_root()?;
-    registry
-        .register(Arc::new(coder_phase::MissionWorktreeStepKind))
-        .map_err(|e| anyhow!("registering mission.worktree: {e}"))?;
-    registry
-        .register(Arc::new(coder_phase::MissionCoderStepKind))
-        .map_err(|e| anyhow!("registering mission.coder: {e}"))?;
-    registry
-        .register(Arc::new(coder_phase::MissionVerifyStepKind))
-        .map_err(|e| anyhow!("registering mission.verify: {e}"))?;
 
     // (#1546, mirroring #1545's bundling-becomes-runtime migration for the
     // review pipeline) The coder brief's INPUTS are the build-time-known
@@ -1992,6 +2101,11 @@ mod tests {
         );
 
         let registry = crew::step_kinds::StepKindRegistry::with_builtins();
+        // (#1530 — one global step-kind registry) `register_coder_phase_kinds`
+        // no longer registers the three kinds itself — it now assumes the
+        // caller already did, exactly what `all_step_kinds` does in
+        // production. Mirror that here.
+        register_coder_phase_step_kinds(&registry).unwrap();
         let handles = register_coder_phase_kinds(
             &registry,
             &mission_id,
@@ -2043,6 +2157,11 @@ mod tests {
         let mission_id = mint_run_id("coder-phase").unwrap();
         let real_phase_ids = ensure_mission_and_phases_with_provenance(&mission_id, config, None, None).unwrap();
         let registry = crew::step_kinds::StepKindRegistry::with_builtins();
+        // (#1530 — one global step-kind registry) The precondition check
+        // this function now runs first needs these ids present — see the
+        // sibling test above — so the missing-input bail (what this test
+        // actually pins) is the one that fires, not the precondition one.
+        register_coder_phase_step_kinds(&registry).unwrap();
         // (#1530 Packet 3b-1) The missing-input bail fires before
         // `register_coder_phase_kinds` ever touches `steps` — an empty map
         // is sufficient here.
@@ -2476,9 +2595,17 @@ mod tests {
             ),
         ];
 
-        let mut known: Vec<String> = crew::step_kinds::StepKindRegistry::with_builtins().ids();
-        known.extend(CODER_PHASE_TIER3_KINDS.iter().map(|s| (*s).to_string()));
-        known.extend(REVIEW_TIER3_KINDS.iter().map(|s| (*s).to_string()));
+        // (#1530 — one global step-kind registry) `known` now comes straight
+        // from `all_step_kinds`'s real registry — the SAME one `launch`
+        // validates every config against — rather than a hand-maintained
+        // union of `CODER_PHASE_TIER3_KINDS`/`REVIEW_TIER3_KINDS` that could
+        // silently drift from what the registry can actually construct.
+        // This makes the test STRICTLY stronger: it now also fails if a kind
+        // is listed in one of those consts but was never actually
+        // registered (previously invisible to this test, since the old
+        // `known` list was built from the consts directly, not the registry).
+        let registry = all_step_kinds().expect("all_step_kinds must build cleanly in a test process");
+        let known: Vec<String> = registry.ids();
 
         for (config_id, doc) in BUILTIN_CONFIG_DOCS {
             let cfg: MissionConfig = serde_json::from_str(doc)
@@ -2489,11 +2616,10 @@ mod tests {
                         assert!(
                             known.contains(&step.kind),
                             "built-in config \"{config_id}\" declares step kind `{}` (step \
-                             `{}`), which is absent from the launcher's known-kind union \
-                             (Tier-1 builtins + CODER_PHASE_TIER3_KINDS + \
-                             REVIEW_TIER3_KINDS) — every `mission launch {config_id}` would \
-                             print a spurious \"unknown step kind\" warning. Add it to the \
-                             matching list.",
+                             `{}`), which is absent from `all_step_kinds`'s registry (Tier-1 \
+                             builtins + darkmux-lab's review kinds + this crate's coder-phase \
+                             kinds) — every `mission launch {config_id}` would print a spurious \
+                             \"unknown step kind\" warning. Register it.",
                             step.kind,
                             step.id
                         );
@@ -2501,6 +2627,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// (#1530 — one global step-kind registry) The payoff this packet
+    /// exists to deliver: a config whose GRAPH names BOTH a coder-phase step
+    /// (`mission.coder`) and a review step (`review.judge`) resolves EVERY
+    /// kind against `all_step_kinds`'s single shared registry — never a real
+    /// built-in document shape (each pipeline's dedicated launcher owns its
+    /// own document), but exactly the capability that was structurally
+    /// impossible before this packet: `review`'s dedicated launcher built
+    /// its own registry via `StepKindRegistry::with_builtins()` +
+    /// `register_review_kinds` (nothing of `mission.*`), and this module's
+    /// execution registry built its own via `with_builtins()` +
+    /// `register_coder_phase_kinds` (nothing of `review.*`) — no single
+    /// registry instance could ever have resolved a graph naming both
+    /// families at once.
+    #[test]
+    fn both_families_resolve_against_one_registry() {
+        let cfg: MissionConfig = serde_json::from_value(serde_json::json!({
+            "id": "mixed-families-test",
+            "name": "mixed families",
+            "phases": [{
+                "id": "p1",
+                "name": "p1",
+                "tasks": [
+                    { "id": "t1", "steps": [{ "id": "s1", "kind": "mission.coder" }] },
+                    { "id": "t2", "steps": [{ "id": "s2", "kind": "review.judge" }] },
+                ]
+            }]
+        }))
+        .expect("minimal mixed-family config deserializes");
+
+        let registry = all_step_kinds().expect("all_step_kinds must build cleanly in a test process");
+        let known_ids = registry.ids();
+        let known_kinds: Vec<&str> = known_ids.iter().map(String::as_str).collect();
+
+        // The SAME validation pass `launch` runs on every config: a step
+        // whose kind isn't in `known_kinds` produces an "unknown step kind"
+        // warning (`mission_config::validate`'s own doc). Neither
+        // `mission.coder` nor `review.judge` should trigger one — both
+        // resolve against this ONE registry.
+        let findings = cfg.validate(&known_kinds);
+        let kind_warnings: Vec<_> =
+            findings.iter().filter(|f| f.message.contains("unknown step kind")).collect();
+        assert!(
+            kind_warnings.is_empty(),
+            "a graph naming both a coder-phase kind and a review kind must produce no \
+             \"unknown step kind\" warnings against ONE shared registry — got: {kind_warnings:?}"
+        );
+
+        // And each kind resolves to a real, constructible `StepKind` through
+        // that SAME registry instance (not merely absent from the warning
+        // list — actually gettable).
+        assert!(registry.get("dispatch.internal").is_ok(), "dispatch.internal must resolve");
+        assert!(registry.get("mission.coder").is_ok(), "mission.coder must resolve");
+        assert!(registry.get("review.judge").is_ok(), "review.judge must resolve");
+        // The legacy funnel.* alias review registers alongside review.judge.
+        assert!(registry.get("funnel.judge").is_ok(), "funnel.judge legacy alias must resolve");
     }
 
     /// (#1549) The overrides must reach a coder-phase-shaped graph even when
