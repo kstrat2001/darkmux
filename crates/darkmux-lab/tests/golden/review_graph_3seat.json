@@ -1,7 +1,14 @@
 {
   "steps": {
     "review-bundle-step": {
-      "config": null,
+      "config": {
+        "bundler": null,
+        "diff_file": "/nonexistent-test-diff",
+        "source": {
+          "kind": "worktree",
+          "path": "/nonexistent-test-worktree"
+        }
+      },
       "id": "review-bundle-step",
       "kind": "review.bundle",
       "status": "planned",

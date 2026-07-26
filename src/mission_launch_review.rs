@@ -93,13 +93,11 @@ use darkmux_crew::single_shot::{
     single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest, SingleShotReply,
     SingleShotRequest,
 };
-use darkmux_lab::lab::bundle::{
-    build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, FileSource,
-};
+use darkmux_lab::lab::bundle::{build_bundles, external_bundles, FileSource};
 use darkmux_lab::lab::review::{
-    build_review_graph, fingerprint, run_judge_only, run_review_graph, seat_identifier,
-    staffing_snapshot, BundleInput, ChatCall, ExecMode, LmsCycler, ProbeFlag, ReviewEmitter,
-    ReviewEnvelope, ReviewInputs, ReviewStepContext,
+    build_review_graph, bundle_inputs_from_set, fingerprint, run_judge_only, run_review_graph,
+    seat_identifier, staffing_snapshot, BundleBuildSpec, BundleInput, BundleSourceSpec, ChatCall,
+    ExecMode, LmsCycler, ProbeFlag, ReviewEmitter, ReviewEnvelope, ReviewInputs, ReviewStepContext,
 };
 use darkmux_crew::resourcing::{resolve_review_roles, ResolvedReviewRoles, ResolvedSeatStaffing, ReviewRoleStaffing};
 use darkmux_profiles::profiles::load_registry;
@@ -253,31 +251,6 @@ fn parse_exec_mode(mode: &str) -> Result<ExecMode> {
             "mission launch review: `mode` must be one of sequential|parallel|auto (got \"{other}\")"
         ),
     }
-}
-
-/// `Bundle` (`darkmux_lab::lab::bundle`) -> `BundleInput` (`darkmux_lab::
-/// lab::review`'s shape). Each bundle's line-span pointers are rendered PER
-/// SEAT (#1256): `slice_code` (the judge's `// path` raw format) into
-/// `code`, `slice_code_probe` (the probe's fenced-code format) into
-/// `probe_code`.
-fn bundle_inputs_from_set(set: &BundleSet, source: &FileSource) -> Result<Vec<BundleInput>> {
-    set.bundles
-        .iter()
-        .map(|b| {
-            let code = slice_code(source, &b.code)
-                .with_context(|| format!("slicing code for bundle \"{}\"", b.id))?;
-            let probe_code = slice_code_probe(source, &b.code)
-                .with_context(|| format!("probe-slicing code for bundle \"{}\"", b.id))?;
-            Ok(BundleInput {
-                id: b.id.clone(),
-                fact_family: b.fact_family.clone(),
-                code,
-                probe_code,
-                facts: b.facts.clone(),
-                manifest: b.manifest.clone(),
-            })
-        })
-        .collect()
 }
 
 /// (#1247 Part 1) Production wiring of `review::ReviewEmitter` — writes
@@ -628,8 +601,12 @@ const REVIEW_DEFAULT_TIMEOUT_SECONDS: u32 = 3600;
 /// The `#[1311]` liveness floor's `process-start` marker fires in
 /// `mission_launch::launch` (before the config load's user-tier dir I/O —
 /// C7 of the Packet 4b review gate), not here; this function picks the
-/// trail up with `run_dispatch`'s own `config-resolved`/`crew-resolved`/
-/// bundling markers and closes it with `synthesis`/`done` below.
+/// trail up with `run_dispatch`'s own `config-resolved`/`crew-resolved`
+/// markers (#1530: the `bundling-start`/`bundling-done` pair that used to
+/// follow them now fires only on the `charges_file` side path — the graph
+/// path's own bundling runs INSIDE the dispatch, observed instead through
+/// `review-bundle-step`'s ordinary `step result` flow record) and closes it
+/// with `synthesis`/`done` below.
 pub(crate) fn launch(
     config: &MissionConfig,
     input_file: Option<&Path>,
@@ -723,10 +700,29 @@ pub(crate) fn launch(
     Ok(code)
 }
 
-/// Everything but `from_envelope`: resolve the source + crew, build real
-/// bundles, and dispatch either the review graph (`build_review_graph` +
-/// `run_review_graph`) or `run_judge_only` (`charges_file` — re-judge a
-/// saved flag list without re-running the probe).
+/// Everything but `from_envelope`: resolve the source + crew, then dispatch
+/// either the review graph (`build_review_graph` + `run_review_graph`) or
+/// `run_judge_only` (`charges_file` — re-judge a saved flag list without
+/// re-running the probe).
+///
+/// (#1530: "no graph does data-producing work before graph execution — every
+/// graph runs the same way") Bundling itself (resolving the diff source's
+/// file content and running the built-in or external bundler) is NO LONGER
+/// done here for the graph path — it used to run in this function's own
+/// prelude, so nothing upstream of the graph (a coder step, say) could ever
+/// feed review: by the time any step ran, the bundles were already required
+/// launch input. It now runs INSIDE the graph, as `review-bundle-step`'s own
+/// `run_streaming` (`ReviewBundleStepKind`, `crates/darkmux-lab/src/lab/
+/// review.rs`) — this function only resolves + VALIDATES the diff source
+/// (`resolve_source`, pure — no I/O) and stamps that already-known data into
+/// a [`BundleBuildSpec`] the graph builder writes onto the bundle step's
+/// `Step.config`.
+///
+/// The `charges_file` (re-judge) side path is the ONE exception, and
+/// deliberately so: it mints no Mission and runs no graph at all (see this
+/// launcher's own module doc), so it is OUT OF SCOPE for the "no data
+/// production before graph execution" invariant — a graph is exactly what
+/// it isn't. It still bundles eagerly, right here, exactly as before.
 fn run_dispatch(
     config: &MissionConfig,
     collected: &BTreeMap<String, Value>,
@@ -784,15 +780,45 @@ fn run_dispatch(
     })?;
     liveness_detail("crew-resolved", &case, &crew_detail(&crew));
 
-    liveness_case("bundling-start", &case);
     let worktree = path_input(collected, "worktree");
-    let bundle_set = match str_input(collected, "bundler") {
-        Some(cmd) => external_bundles(cmd, worktree.as_deref(), diff_file)?,
-        None => build_bundles(&source, diff_text)?,
+    let bundler_cmd = str_input(collected, "bundler").map(str::to_string);
+
+    // (#1530) Eager bundling survives ONLY for the `charges_file` re-judge
+    // side path — it mints no Mission and runs no graph, so it is out of
+    // scope for the "no data production before graph execution" invariant
+    // (see this function's own doc). The graph path builds a
+    // `BundleBuildSpec` instead (below) and lets `review-bundle-step`
+    // resolve the real bundles at run time.
+    let charges_bundles: Option<Vec<BundleInput>> = if path_input(collected, "charges_file").is_some() {
+        liveness_case("bundling-start", &case);
+        let bundle_set = match bundler_cmd.as_deref() {
+            Some(cmd) => external_bundles(cmd, worktree.as_deref(), diff_file)?,
+            None => build_bundles(&source, diff_text)?,
+        };
+        let bundles = bundle_inputs_from_set(&bundle_set, &source)?;
+        liveness_detail("bundling-done", &case, &format!("bundles={}", bundles.len()));
+        Some(bundles)
+    } else {
+        None
     };
-    let bundles = bundle_inputs_from_set(&bundle_set, &source)?;
-    liveness_detail("bundling-done", &case, &format!("bundles={}", bundles.len()));
-    let bundle_count = bundles.len();
+
+    // (#1530) The bundle step's own `Step.config` source — everything
+    // `ReviewBundleStepKind::run_streaming` needs to reconstruct a
+    // `FileSource` and run the bundler at RUN TIME, carried as plain data
+    // (see `BundleBuildSpec`'s own doc). Built unconditionally (cheap, no
+    // I/O) even on the `charges_file` path, which never reads it — simpler
+    // than threading an `Option` through `build_review_graph`'s signature
+    // for a branch that never calls it.
+    let bundle_spec = BundleBuildSpec {
+        source: match &source {
+            FileSource::Worktree(path) => BundleSourceSpec::Worktree { path: path.clone() },
+            FileSource::GithubApi { repo, head_sha, .. } => {
+                BundleSourceSpec::Github { repo: repo.clone(), head_sha: head_sha.clone() }
+            }
+        },
+        bundler: bundler_cmd,
+        diff_file: diff_file.to_path_buf(),
+    };
 
     let intent = match path_input(collected, "intent_file") {
         Some(p) => std::fs::read_to_string(&p).with_context(|| format!("reading intent_file {}", p.display()))?,
@@ -801,7 +827,15 @@ fn run_dispatch(
 
     let mode_str = str_input(collected, "mode").unwrap_or("auto").to_string();
     let mode = parse_exec_mode(&mode_str)?;
-    let dispatch_start_extra = json!({ "exec_mode": mode_str, "bundles": bundle_count });
+    // (#1530) `bundles` is stamped onto the "dispatch start" payload only
+    // when it's genuinely already known (the `charges_file` path, which
+    // still bundles eagerly, above) — the graph path doesn't know the real
+    // count until `review-bundle-step` runs, which is AFTER this record
+    // fires, so it's honestly omitted rather than reporting a stale 0.
+    let mut dispatch_start_extra = json!({ "exec_mode": mode_str });
+    if let Some(bundles) = &charges_bundles {
+        dispatch_start_extra["bundles"] = json!(bundles.len());
+    }
 
     let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
         anyhow!(
@@ -866,7 +900,9 @@ fn run_dispatch(
             probe_system: &probe_system,
             judge_system: &judge_system,
             verify_system: &verify_system,
-            bundles: Some(bundles),
+            bundles: Some(charges_bundles.expect(
+                "charges_bundles is always Some when input `charges_file` is set (computed above)",
+            )),
             remote_max_tokens_per_execution,
         };
         let timeout = timeout_seconds;
@@ -928,10 +964,14 @@ fn run_dispatch(
             probe_role_prompts,
             judge_system,
             verify_system,
-            bundles,
             remote_max_tokens_per_execution,
             timeout_seconds,
             chat_override: None,
+            // (#1530) Production dispatch always reconstructs a real
+            // `FileSource` from `review-bundle-step`'s own `Step.config`
+            // (stamped from `bundle_spec` below) — the test-only seam stays
+            // `None` here (see `ReviewStepContext::bundle_override`'s doc).
+            bundle_override: None,
         });
 
         // (#1503) The run id is minted fresh — never derived from
@@ -984,6 +1024,7 @@ fn run_dispatch(
 
         let graph = build_review_graph(
             ctx.clone(),
+            &bundle_spec,
             judge.clone(),
             verify.clone(),
             &probes,
