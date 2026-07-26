@@ -3190,6 +3190,60 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// synthesis — with zero Rust changes. This is the Studio 32GB case the
     /// issue names: dropping from three probe tasks to one is purely the
     /// document edit `one_probe_review_config` performs.
+    /// (#1538 follow-up) THE regression guard for silent wrong execution.
+    ///
+    /// #1538 made routing structural, so a differently-NAMED variant reaches
+    /// the review launcher — but both consumers downstream still resolved the
+    /// built-in by id (`mission_config::load("review")`). A `review-lean`
+    /// launch therefore routed correctly and then executed the BUILT-IN
+    /// three-probe graph, with its own probe tasks ignored and no warning
+    /// anywhere. Before #1538 the same launch failed loudly on an unknown
+    /// kind, so the change turned a loud refusal into a silent wrong answer.
+    ///
+    /// Routing tests can't catch this — `config_uses_review_kinds` was true
+    /// the whole time. Only asserting on the BUILT GRAPH does. This is the
+    /// review-side analogue of `task_overrides_reach_a_renamed_coder_phase_
+    /// config`, which #1551 added for the coder-phase half.
+    #[test]
+    fn a_named_variant_builds_its_own_graph_not_the_builtin() {
+        // A one-probe document under a DIFFERENT id, exactly what an operator
+        // stores as `~/.darkmux/mission-configs/review-lean.json`.
+        let mut doc = one_probe_review_config();
+        doc.id = "review-lean".to_string();
+
+        let probes = vec![{
+            let mut s = graph_staffing("fast", "probe-model", 1);
+            s.role_id = Some("review-probe-only".to_string());
+            s
+        }];
+        let graph = build_review_graph_from_config(
+            &doc,
+            "the launched config `review-lean`",
+            std::sync::Arc::new(ReviewStepContext::default()),
+            &dummy_bundle_spec(),
+            graph_staffing("fast", "judge-model", 1),
+            None,
+            &probes,
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("a named variant must build its own graph");
+
+        let probe_render_steps = graph
+            .steps
+            .values()
+            .filter(|s| s.kind == "review.probe-render")
+            .count();
+        assert_eq!(
+            probe_render_steps, 1,
+            "the variant declares ONE probe task — building the built-in's three would mean the \
+             launched document was ignored; got {probe_render_steps} render steps: {:?}",
+            graph.steps.values().map(|s| (&s.id, &s.kind)).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn build_review_graph_runs_a_config_driven_one_probe_review_json() {
         let config = one_probe_review_config();
@@ -3226,7 +3280,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // precisely when bundling becomes run-time work and the two sides
         // stop being the same pure function over the same input.
         assert!(
-            !env.warnings.iter().any(|w| w.contains("#1541")),
+            !env.warnings.iter().any(|w| w.contains("attribution desync")),
             "a healthy run must emit no attribution-desync warnings, got: {:?}",
             env.warnings
         );

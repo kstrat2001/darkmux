@@ -854,13 +854,16 @@ pub fn seat_identifier(pm: &ProfileModel) -> String {
 fn seat_endpoint_host(pm: &ProfileModel) -> Option<String> {
     let ep = pm.endpoint.as_ref().filter(|e| e.is_remote())?;
     let url = ep.base_url();
-    Some(
-        url.split("://")
-            .nth(1)
-            .and_then(|s| s.split('/').next())
-            .unwrap_or("remote")
-            .to_string(),
-    )
+    let authority = url.split("://").nth(1).and_then(|s| s.split('/').next()).unwrap_or("remote");
+    // (#1530) Strip URL userinfo before the `@`. This function's contract is
+    // HOST ONLY, NEVER CREDENTIALS — and its output is stamped into step
+    // config, `MemberRecord.endpoint`, and the run envelope, which CI uploads
+    // as a public artifact. The sanctioned way to carry a key is
+    // `EndpointAuth` (a Keychain item name or an env-var name, never a
+    // value), but nothing stops an operator pasting `https://tok@proxy/v1`
+    // into a profile's `url` — some LiteLLM/proxy setups document exactly
+    // that form. Without this, that token would ride to a public surface.
+    Some(authority.rsplit('@').next().unwrap_or(authority).to_string())
 }
 
 /// (#1260) The endpoint a seat's chat calls should route through — `Some`
@@ -4249,7 +4252,7 @@ pub(crate) fn reconstruct_probe_stage(
                         "probe seat \"{}\" draw {draw} (task `{task_id}`): render step selected \
                          {} bundle(s) but dispatch returned {} result(s) — attribution desync, \
                          this draw's flags are DROPPED rather than risk attributing them to the \
-                         wrong bundle (#1541)",
+                         wrong bundle",
                         spec.name,
                         pairs.len(),
                         results.len()
@@ -4260,7 +4263,7 @@ pub(crate) fn reconstruct_probe_stage(
                     warnings.push(format!(
                         "probe seat \"{}\" draw {draw} (task `{task_id}`): no bundle selection \
                          published by the render step — attribution unavailable, this draw's \
-                         flags are DROPPED (#1541)",
+                         flags are DROPPED",
                         spec.name
                     ));
                     continue;
@@ -5815,7 +5818,7 @@ pub fn build_review_graph(
 /// the `interpret` error context (mirrors what `loaded.source`/
 /// `loaded.manifest_path` gave the caller before this split).
 #[allow(clippy::too_many_arguments)]
-fn build_review_graph_from_config(
+pub fn build_review_graph_from_config(
     config: &darkmux_crew::mission_config::MissionConfig,
     source_detail: &str,
     ctx: Arc<ReviewStepContext>,
@@ -6683,6 +6686,22 @@ pub fn run_review_graph(
         // running work, never a silent Clean.
         if env.degenerate.is_none() {
             env.degenerate = Some(errored_steps_degenerate_reason(&report.errored, &steps));
+        }
+        // (#1530) Say it on STDERR too, not only in the envelope. Since
+        // bundling moved into the graph, a launch MISCONFIGURATION (a typo'd
+        // `--bundler`, a `source.path` that doesn't exist) is no longer an
+        // `Err` out of `launch` that `main` prints as an anyhow chain — it is
+        // a step error, and the scheduler prints nothing. Without this the
+        // operator at a terminal sees a `{"mode":"degraded",…}` object scroll
+        // past and `echo $?` print 0, with the actual cause only inside the
+        // JSON. The coder path got this treatment when its composition moved
+        // in (#1546); bundling is the likelier thing to be misconfigured, so
+        // it needs it more. The exit code is deliberately unchanged here —
+        // `launch`'s documented contract is "0 on any produced review output;
+        // CI-facing pass/fail comes from `mode`", and darkmux-review.yml
+        // reads `mode` — but silence was never part of that contract.
+        if let Some(reason) = &env.degenerate {
+            eprintln!("{}", darkmux_types::style::error(&format!("✗ review: {reason}")));
         }
         env
     };

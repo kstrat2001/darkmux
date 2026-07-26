@@ -330,6 +330,36 @@ fn path_from_bundle_id(bundle_id: &str) -> &str {
 const CONFIRMED_MARKER: &str =
     "⚠ needs frontier verification — confirmed by a local judge, not yet frontier-verified";
 
+/// (#1530) Bound what a degenerate note may carry into a PUBLIC PR comment.
+///
+/// `env.degenerate` is composed from each errored step's own `Step.output` —
+/// an anyhow chain. Since bundling moved into the graph, that chain can carry
+/// the runner's absolute home path, the operator's worktree layout, and (for
+/// `--bundler`) arbitrary stderr from a third-party plugin, including a panic
+/// backtrace. `synthesize_review`'s output is posted with `gh pr comment` on
+/// a repo that may be public, so this is the one boundary in the pipeline
+/// where an internal error string crosses into the open.
+///
+/// The FULL chain is deliberately preserved everywhere it's useful and not
+/// public — the step's persisted `output`, the envelope, the flow records,
+/// and the local stderr line. Only the comment is trimmed: first line,
+/// home-redacted, length-capped.
+fn public_safe_note(note: &str) -> String {
+    let first = note.lines().next().unwrap_or("").trim();
+    let redacted = match dirs::home_dir() {
+        Some(home) => first.replace(&home.display().to_string(), "~"),
+        None => first.to_string(),
+    };
+    const MAX: usize = 300;
+    if redacted.chars().count() > MAX {
+        let mut clipped: String = redacted.chars().take(MAX).collect();
+        clipped.push_str("… (full detail in the run's envelope and logs)");
+        clipped
+    } else {
+        redacted
+    }
+}
+
 /// Three-tier synthesis of a [`ReviewEnvelope`] into the [`Rendered`]
 /// `{mode, review, comment}` contract:
 ///
@@ -372,7 +402,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
         // (#1298) Even a degenerate run posts the envelope-derived footer, so a
         // remote crew that produced no signal never claims "no cloud API".
         return degraded_with_footer(
-            &format!("The review produced no signal: {note}."),
+            &format!("The review produced no signal: {}.", public_safe_note(note)),
             &review_footer(env, attribution),
         );
     }
