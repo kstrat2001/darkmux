@@ -3028,6 +3028,21 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(env.raw_flags, 1, "exactly one probe dispatch fired — the document declares exactly one");
         assert_eq!(env.judged.len(), 1);
         assert_eq!(env.confirmed, 1);
+        // (#1541) NEGATIVE guard: a HEALTHY run must emit ZERO attribution
+        // warnings. The desync warning replaced a silent `continue`, so the
+        // risk it introduces is the mirror of the bug it fixes — a spurious
+        // warning on the release-gated path. Today the loud path is
+        // unreachable on a healthy run (`dispatch.map` emits exactly one
+        // result per collection item, and a short vector means the map step
+        // never completed, in which case dedup never runs). This pins that as
+        // a REGRESSION GUARD rather than a proof-by-reasoning — which matters
+        // precisely when bundling becomes run-time work and the two sides
+        // stop being the same pure function over the same input.
+        assert!(
+            !env.warnings.iter().any(|w| w.contains("#1541")),
+            "a healthy run must emit no attribution-desync warnings, got: {:?}",
+            env.warnings
+        );
     }
 
     /// A five-probe config also builds and runs cleanly — the issue's other
@@ -5294,6 +5309,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let selector = BundleSelector { fact_families: vec!["auth".to_string()], ..Default::default() };
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
+        // (#1541) Mirrors the scheduler's own `provides()` pre-scan for a
+        // graph containing a `review.probe-render` step — this test calls
+        // `run_streaming` directly, bypassing the scheduler, so it
+        // materializes the artifact by hand the same way.
+        bus.materialize(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
         let step = darkmux_crew::types::Step {
             id: "review-probe-high-render-step".to_string(),
@@ -5364,6 +5384,9 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
         let mut bus = ArtifactBus::new();
         bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
+        // (#1541) Mirrors the scheduler's own `provides()` pre-scan — see
+        // the sibling test above for why this test needs it too.
+        bus.materialize(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact);
         let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
         let step = darkmux_crew::types::Step {
             id: "review-probe-high-render-step".to_string(),
@@ -5427,7 +5450,6 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             remote: true,
             endpoint_host: Some("example.com".to_string()),
             draw_task_ids: vec!["t-draw0".to_string(), "t-draw1".to_string()],
-            bundles: vec![("b1".to_string(), "unscoped".to_string()), ("b2".to_string(), "unscoped".to_string())],
         };
         let item = |index: usize, ok: bool, content: &str, error: Option<&str>, tokens: Option<u64>| MapItemResult {
             index,
@@ -5448,8 +5470,21 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let mut input = BTreeMap::new();
         input.insert("t-draw0".to_string(), serde_json::to_string(&draw0).unwrap());
         input.insert("t-draw1".to_string(), serde_json::to_string(&draw1).unwrap());
+        // (#1541) The render step's published selection — one entry per
+        // draw task id, replacing the retired `ProbeSeatSpec.bundles`
+        // build-time snapshot.
+        let mut selection: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        selection.insert(
+            "t-draw0".to_string(),
+            vec![("b1".to_string(), "unscoped".to_string()), ("b2".to_string(), "unscoped".to_string())],
+        );
+        selection.insert(
+            "t-draw1".to_string(),
+            vec![("b1".to_string(), "unscoped".to_string()), ("b2".to_string(), "unscoped".to_string())],
+        );
 
-        let recon = reconstruct_probe_stage(std::slice::from_ref(&spec), &input, 120).expect("parses");
+        let recon =
+            reconstruct_probe_stage(std::slice::from_ref(&spec), &input, &selection, 120).expect("parses");
 
         assert_eq!(recon.flags.len(), 1, "only the non-empty ok item flags");
         assert_eq!(recon.flags[0].bundle_id, "b1");
@@ -5491,7 +5526,6 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             remote: false,
             endpoint_host: None,
             draw_task_ids: vec!["t-draw0".to_string()],
-            bundles: vec![("b1".to_string(), "unscoped".to_string())],
         };
         let items = vec![MapItemResult {
             index: 0,
@@ -5504,10 +5538,202 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         }];
         let mut input = BTreeMap::new();
         input.insert("t-draw0".to_string(), serde_json::to_string(&items).unwrap());
-        let recon = reconstruct_probe_stage(std::slice::from_ref(&spec), &input, 500_000).expect("parses");
+        let mut selection: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        selection.insert("t-draw0".to_string(), vec![("b1".to_string(), "unscoped".to_string())]);
+        let recon =
+            reconstruct_probe_stage(std::slice::from_ref(&spec), &input, &selection, 500_000).expect("parses");
         assert!(recon.flags.is_empty());
         let reason = recon.all_draws_failed.expect("every fired draw errored");
         assert!(reason.contains("errored"), "{reason}");
         assert!(reason.contains("network down"), "the first error is named: {reason}");
         assert!(recon.budget_row.is_none(), "local-only stage carries no budget row");
+    }
+
+    /// (#1541) THE no-op proof: what `ReviewProbeRenderStepKind::run_streaming`
+    /// PUBLISHES onto `REVIEW_PROBE_SELECTION_ARTIFACT` is byte-identical to
+    /// what the RETIRED build-time `ProbeSeatSpec.bundles` snapshot used to
+    /// hold for the same inputs (`select_bundles_for_staffing(&ctx.bundles,
+    /// selector).map(|b| (b.id, b.fact_family))` — the exact call
+    /// `build_review_graph_from_config`'s probe loop used to make before this
+    /// packet). Same selection, same order. Since attribution now keys
+    /// entirely on the published pairs (`reconstruct_probe_stage`'s own
+    /// `selection` parameter), this equality IS the claim that today's
+    /// behavior is unchanged — the bug #1541 fixes is a divergence that can
+    /// only appear once bundle selection itself becomes run-time work,
+    /// which this packet does not do.
+    #[test]
+    fn probe_render_step_publishes_the_same_selection_the_retired_build_time_snapshot_held() {
+        let bundles = vec![
+            BundleInput {
+                id: "a.ts".into(),
+                fact_family: "auth".into(),
+                code: "const a = 1".into(),
+                probe_code: "const a = 1 // probe".into(),
+                facts: vec![],
+                manifest: vec![],
+            },
+            BundleInput {
+                id: "b.ts".into(),
+                fact_family: "billing".into(),
+                code: "const b = 2".into(),
+                probe_code: "const b = 2 // probe".into(),
+                facts: vec![],
+                manifest: vec![],
+            },
+            BundleInput {
+                id: "c.ts".into(),
+                fact_family: "auth".into(),
+                code: "const c = 3".into(),
+                probe_code: "const c = 3 // probe".into(),
+                facts: vec![],
+                manifest: vec![],
+            },
+        ];
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+        ]);
+        let ctx = step_ctx(&crew, bundles.clone());
+
+        let selector = BundleSelector { fact_families: vec!["auth".to_string()], ..Default::default() };
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
+        // Mirrors exactly what the scheduler's `provides()` pre-scan does
+        // for a graph that contains a `review.probe-render` step — this
+        // test bypasses the scheduler, so it materializes the artifact by
+        // hand the same way.
+        bus.materialize(REVIEW_PROBE_SELECTION_ARTIFACT, make_review_probe_selection_artifact);
+        let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
+        let step = darkmux_crew::types::Step {
+            id: "review-probe-high-render-step".to_string(),
+            task_id: "review-probe-high-task".to_string(),
+            kind: "review.probe-render".to_string(),
+            status: NodeStatus::default(),
+            config: serde_json::json!({
+                "selector": serde_json::to_value(&selector).unwrap(),
+                "role_id": "review-probe-high",
+            }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = darkmux_crew::types::Task {
+            id: "review-probe-high-task".to_string(),
+            phase_id: "investigate".to_string(),
+            description: "probe high".to_string(),
+            display_name: None,
+            step_ids: vec!["review-probe-high-render-step".to_string(), "review-probe-high-step".to_string()],
+            depends_on: vec!["review-bundle-task".to_string()],
+            role_id: Some("review-probe-high".to_string()),
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let input = BTreeMap::new();
+
+        use darkmux_crew::step_kinds::StepKind as _;
+        let kind = ReviewProbeRenderStepKind;
+        kind.run_streaming(&step, &task, &input, &run_ctx).expect("probe render completes");
+
+        let published: BTreeMap<String, Vec<(String, String)>> = run_ctx
+            .artifact::<StdMutex<BTreeMap<String, Vec<(String, String)>>>>(REVIEW_PROBE_SELECTION_ARTIFACT)
+            .expect("the render step materializes this artifact via its own provides()")
+            .lock()
+            .expect("probe selection mutex poisoned")
+            .clone();
+        let published_pairs = published.get(&task.id).expect("the render step publishes under its own task id");
+
+        // The "old build-time stamping" reference: the SAME call
+        // `build_review_graph_from_config`'s probe loop used to make before
+        // #1541, invoked directly here as the retired snapshot's stand-in.
+        let selected = select_bundles_for_staffing(&bundles, Some(&selector));
+        let expected_pairs: Vec<(String, String)> =
+            selected.iter().map(|b| (b.id.clone(), b.fact_family.clone())).collect();
+
+        assert_eq!(expected_pairs.len(), 2, "selector restricts to the two \"auth\" bundles");
+        assert_eq!(
+            published_pairs, &expected_pairs,
+            "the render step's published selection is byte-identical (same bundles, same order) \
+             to the retired build-time snapshot for the same inputs"
+        );
+    }
+
+    /// (#1541) The "fail loudly instead of silently" half of the fix: a
+    /// draw whose published selection LENGTH doesn't match its dispatch
+    /// result count (the desync run-time bundling would introduce) is a
+    /// NAMED warning, and that draw's flags are DROPPED rather than
+    /// misattributed via the old bug's positional `results.get(b_idx)`
+    /// (which would have silently paired the wrong bundle to a result, or
+    /// silently skipped a result past the snapshot's length).
+    #[test]
+    fn reconstruct_probe_stage_desynced_selection_warns_loudly_and_drops_the_draws_flags() {
+        use darkmux_crew::step_kinds::MapItemResult;
+        let spec = ProbeSeatSpec {
+            name: "fast".to_string(),
+            identifier: "darkmux:probe-model".to_string(),
+            remote: false,
+            endpoint_host: None,
+            draw_task_ids: vec!["t-draw0".to_string()],
+        };
+        // Two dispatch results came back...
+        let items = vec![
+            MapItemResult {
+                index: 0,
+                ok: true,
+                content: "a real defect".to_string(),
+                error: None,
+                total_tokens: Some(10),
+                served_model: None,
+                wall_ms: 3,
+            },
+            MapItemResult {
+                index: 1,
+                ok: true,
+                content: "another defect".to_string(),
+                error: None,
+                total_tokens: Some(10),
+                served_model: None,
+                wall_ms: 3,
+            },
+        ];
+        let mut input = BTreeMap::new();
+        input.insert("t-draw0".to_string(), serde_json::to_string(&items).unwrap());
+        // ...but the render step only published ONE selected bundle for
+        // this task — a desync, exactly the shape run-time bundling could
+        // introduce without this fix.
+        let mut selection: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        selection.insert("t-draw0".to_string(), vec![("b1".to_string(), "unscoped".to_string())]);
+
+        let recon =
+            reconstruct_probe_stage(std::slice::from_ref(&spec), &input, &selection, 500_000).expect("parses");
+
+        assert!(
+            recon.flags.is_empty(),
+            "a desynced draw's flags are DROPPED rather than misattributed: {:?}",
+            recon.flags
+        );
+        assert!(
+            recon.warnings.iter().any(|w| {
+                w.contains("probe seat \"fast\"") && w.contains("desync") && w.contains("t-draw0")
+            }),
+            "the desync is named loudly, not swallowed: {:?}",
+            recon.warnings
+        );
+
+        // The absent-selection half of the same loud-failure path: no entry
+        // at all for the draw's task id (the render step never ran, or
+        // never published for it).
+        let empty_selection: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        let recon_absent =
+            reconstruct_probe_stage(std::slice::from_ref(&spec), &input, &empty_selection, 500_000)
+                .expect("parses");
+        assert!(recon_absent.flags.is_empty(), "no published selection ⇒ no attributable flags");
+        assert!(
+            recon_absent
+                .warnings
+                .iter()
+                .any(|w| w.contains("probe seat \"fast\"") && w.contains("no bundle selection published")),
+            "the absence is named loudly, not swallowed: {:?}",
+            recon_absent.warnings
+        );
     }
