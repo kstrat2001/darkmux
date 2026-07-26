@@ -772,7 +772,30 @@ impl StepKind for MissionCoderStepKind {
         // (#1546) Compose the brief HERE — the pipeline's ONE call site for
         // it (see this struct's own doc for the full reasoning: no other
         // caller exists, so there's no double-print/double-disk-walk hazard
-        // to guard against). `mission_id`/`phase_id`/`wt_path` are the SPEC
+        // to guard against).
+        //
+        // TWO consequences of composing here rather than in the launcher,
+        // both deliberate and both verified inert today:
+        //
+        // 1. CONSOLE ORDER. The provenance lines this prints now land AFTER
+        //    "✓ worktree ready at …" instead of before it. The retired
+        //    prelude's comment cited preserving the pre-#1530 ordering as a
+        //    reason to stamp early; that reason is retired with it. The new
+        //    position is the better one — provenance now sits immediately
+        //    adjacent to the dispatch it describes — and nothing
+        //    machine-parses this path's stdout (the `emit=-` contract
+        //    belongs to the review launcher, a different function).
+        // 2. CAUTION FRESHNESS. `mission_cautions` staleness-checks against
+        //    `wt_path`, which now EXISTS (the worktree step ran first) where
+        //    the prelude always saw a not-yet-created dir. Freshness feeds
+        //    only the caution sort key — never filtering, never bullet text
+        //    — so it can at most reorder cautions within the budget. Inert
+        //    today because mission ids are freshly minted per run (#1503),
+        //    so no pre-existing flow record carries this run's session ids
+        //    and the caution set is empty at composition time. Named here
+        //    because it stops being inert if mission-id reuse ever returns.
+        //
+        // `mission_id`/`phase_id`/`wt_path` are the SPEC
         // already on `ctx`; `injected_budget_chars` is the one
         // coder-step-specific SPEC value, stamped onto this step's own
         // config at build time (`register_coder_phase_kinds`) since it's
@@ -787,12 +810,25 @@ impl StepKind for MissionCoderStepKind {
             .expect(
                 "register_coder_phase_kinds always stamps \"injected_budget_chars\" onto the coder step's config",
             ) as usize;
+        // (#1546) Composition failure must stay AUDIBLE. Before this move it
+        // was a registration `Err` returned out of `launch`, which
+        // `fn main() -> Result<()>` printed as a full anyhow chain. Inside
+        // the graph, a step `Err`'s text reaches no console — the scheduler
+        // prints nothing — so without this the operator would see
+        // "✓ worktree ready at …", then silence, then exit 1, while the
+        // persisted envelope reason says "coder dispatch failed before a
+        // reviewable gate", MISATTRIBUTING a brief-composition failure to
+        // the dispatch. Print the real cause where the operator is looking;
+        // the error still propagates unchanged for the terminal state.
         let message = coder_brief_with_injected_context(
             &ctx.mission_id,
             &ctx.phase_id,
             &ctx.wt_path,
             injected_budget_chars,
-        )?;
+        )
+        .inspect_err(|e| {
+            eprintln!("{}", style::error(&format!("✗ composing the coder brief failed: {e:#}")));
+        })?;
 
         // (#1530 Packet 3b-1) Rebuild `DispatchOpts` fresh from the run-scoped
         // context plus this step's own stamped config — see this struct's

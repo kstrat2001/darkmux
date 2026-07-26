@@ -2014,6 +2014,22 @@ mod tests {
             "session id must carry the viewer's mission-run- prefix, got {}",
             handles.session_id
         );
+        // (#1546) The build-time-stamp ↔ run-time-read seam. The launcher
+        // stamps `injected_budget_chars` here; `MissionCoderStepKind::
+        // run_streaming` `.expect()`s it. Nothing else pins the two sides to
+        // the same key, so a rename on either one is a worker-thread panic
+        // inside a live mission — after the worktree exists and the mission
+        // has minted. Pin the key at the point it's written.
+        assert!(
+            steps[&format!("{real_phase_id}-coder-step")]
+                .config
+                .get("injected_budget_chars")
+                .and_then(|v| v.as_u64())
+                .is_some(),
+            "the launcher must stamp the `injected_budget_chars` key that run_streaming reads back; \
+             got config {:?}",
+            steps[&format!("{real_phase_id}-coder-step")].config
+        );
         let _ = guard;
     }
 
