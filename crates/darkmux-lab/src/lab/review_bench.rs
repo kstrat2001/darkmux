@@ -1038,23 +1038,10 @@ fn run_funnel_case(
         None => bundle::build_bundles(&source, &c.diff)
             .with_context(|| format!("building bundles for case {}", c.id))?,
     };
-    let bundles: Vec<review::BundleInput> = set
-        .bundles
-        .iter()
-        .map(|b| -> Result<review::BundleInput> {
-            Ok(review::BundleInput {
-                id: b.id.clone(),
-                fact_family: b.fact_family.clone(),
-                // Per-seat code formats (#1256): the judge reads
-                // slice_code's `// path` raw format; the probe reads
-                // slice_code_probe's Phase A fenced format.
-                code: bundle::slice_code(&source, &b.code)?,
-                probe_code: bundle::slice_code_probe(&source, &b.code)?,
-                facts: b.facts.clone(),
-                manifest: b.manifest.clone(),
-            })
-        })
-        .collect::<Result<_>>()
+    // (#1530) `review::bundle_inputs_from_set` — moved out of this file
+    // (`src/mission_launch_review.rs`, before this packet) into
+    // `darkmux-lab`'s own `review` module, so both callers share ONE copy.
+    let bundles: Vec<review::BundleInput> = review::bundle_inputs_from_set(&set, &source)
         .with_context(|| format!("slicing bundle code for case {}", c.id))?;
 
     // (#1355 follow-up) Dispatches through the SAME `build_review_graph` +
@@ -1072,6 +1059,23 @@ fn run_funnel_case(
     let verify = ctx.roles.verify.clone();
     let judge_identifier = review::seat_identifier(&judge.pm);
 
+    // (#1530) Bench keeps its EAGER bundling (the real `build_bundles`/
+    // `external_bundles`/`slice_code*` calls above, unchanged) and hands the
+    // result to the graph through `bundle_override` instead of
+    // `ReviewStepContext::bundles` (retired — see that field's removal note).
+    // Bench is a per-run-local measurement tool, not the `mission launch
+    // review` launcher #1530's "no data production before graph execution"
+    // invariant targets, so this is a deliberate out-of-scope choice — see
+    // `bundle_override`'s own doc for the full reasoning (same shape as the
+    // `charges_file` side path's exemption).
+    let bundles_for_override = bundles.clone();
+    let bundle_spec = review::BundleBuildSpec {
+        source: review::BundleSourceSpec::Worktree { path: workdir.to_path_buf() },
+        bundler: ctx.bundler_cmd.clone(),
+        // Never read — `bundle_override` short-circuits before `Step.config`
+        // is touched — but `BundleBuildSpec` always needs a value.
+        diff_file: std::path::PathBuf::new(),
+    };
     let step_ctx = std::sync::Arc::new(review::ReviewStepContext {
         case_id: c.id.clone(),
         roles: ctx.roles.clone(),
@@ -1086,16 +1090,17 @@ fn run_funnel_case(
         probe_role_prompts: ctx.probe_role_prompts.clone(),
         judge_system: ctx.judge_system.clone(),
         verify_system: ctx.verify_system.clone(),
-        bundles,
         // (#1260) Per-execution remote token allowance, resolved through the
         // one precedence home (`env > config.remote.* > 500000`).
         remote_max_tokens_per_execution: darkmux_types::config_access::remote_max_tokens_per_execution(),
         timeout_seconds,
         chat_override: None,
+        bundle_override: Some(std::sync::Arc::new(move || Ok(bundles_for_override.clone()))),
     });
 
     let graph = review::build_review_graph(
         step_ctx.clone(),
+        &bundle_spec,
         judge.clone(),
         verify.clone(),
         &probes,

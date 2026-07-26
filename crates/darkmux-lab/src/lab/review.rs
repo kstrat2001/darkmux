@@ -3231,6 +3231,11 @@ use darkmux_crew::step_kinds::{
 use darkmux_crew::types::{Step, Task};
 use std::any::Any;
 use std::sync::Mutex as StdMutex;
+// (#1530) The real bundler — `review-bundle-step`'s `run_streaming` now
+// calls these directly (moved out of `src/mission_launch_review.rs`'s
+// pre-graph prelude); see `ReviewBundleStepKind`'s doc.
+use super::bundle::{build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, FileSource};
+use std::path::{Path, PathBuf};
 
 // ─── #1530 Packets 0/1/3a: run-scoped ArtifactBus artifact names ──────────
 //
@@ -3271,6 +3276,17 @@ use std::sync::Mutex as StdMutex;
 // `build_review_graph_from_config` the same way it already stamps the probe
 // seats' `dispatch.map` config; see that function's own doc) as a
 // constructor field; everything comes from `step.config` or this bus.
+//
+// (#1530, bundling-becomes-runtime-work follow-on) The paragraph above
+// describes why `residency()` gained a `&StepRunCtx` — at the time, THAT
+// was the only reason: `ctx.bundles` was a build-time snapshot, resolved
+// before the graph ever ran, that just needed a bus seam to reach a trait
+// method with no `StepRunCtx` parameter yet. `ReviewStepContext` no longer
+// carries `bundles` at all — bundling itself is now `review-bundle-step`'s
+// own run-time work (`ReviewBundleStepKind::run_streaming`), published onto
+// its OWN artifact ([`REVIEW_BUNDLES_ARTIFACT`]) rather than folded into the
+// context. `ReviewJudgeStepKind::residency()` now reads that artifact
+// directly instead of `ctx.bundles`.
 const REVIEW_ENVELOPE_ARTIFACT: &str = "review.envelope";
 const REVIEW_MEMBERS_ARTIFACT: &str = "review.members";
 const REVIEW_WARNINGS_ARTIFACT: &str = "review.warnings";
@@ -3291,9 +3307,35 @@ const REVIEW_CONTEXT_ARTIFACT: &str = "review.context";
 /// attribution travel through the graph instead of relying on that
 /// coincidence — see #1541 for the full failure mode this closes.
 const REVIEW_PROBE_SELECTION_ARTIFACT: &str = "review.probe-selection";
+/// (#1530) The resolved bundle set — published by
+/// [`ReviewBundleStepKind::run_streaming`], the pipeline's new EARLIEST
+/// data-producing step, and read by every downstream kind that used to read
+/// `ReviewStepContext::bundles` directly: [`ReviewProbeRenderStepKind`]'s
+/// selection, [`ReviewJudgeStepKind`]'s per-flag bundle lookup AND its
+/// `residency()` skip-load check, and [`ReviewVerifyRenderStepKind`]'s
+/// per-finding bundle lookup. Genuinely run-time data with no build-time
+/// equivalent now (the whole point of this packet — bundling used to run in
+/// `src/mission_launch_review.rs`'s pre-graph prelude; see
+/// `ReviewBundleStepKind`'s doc), so [`make_review_bundles_artifact`]'s empty
+/// default is the REAL starting state, mirroring
+/// [`REVIEW_PROBE_SELECTION_ARTIFACT`]'s own "never caller-seeded" shape —
+/// never [`REVIEW_CONTEXT_ARTIFACT`]'s "caller always overwrites the
+/// default" one. `ReviewJudgeStepKind`'s task depends (transitively, via
+/// dedup + the probe tasks) on `review-bundle-task`, so by the time its wave
+/// runs — the ONLY place this artifact is read on a production path — the
+/// bundle step's wave has already completed and this is populated; see
+/// `build_review_graph_from_config`'s own doc for the depends_on chain.
+const REVIEW_BUNDLES_ARTIFACT: &str = "review.bundles";
 
 fn make_review_envelope_artifact() -> Arc<dyn Any + Send + Sync> {
     Arc::new(StdMutex::new(ReviewEnvelope::default()))
+}
+
+/// (#1530) Context-free default for [`REVIEW_BUNDLES_ARTIFACT`] — see that
+/// constant's own doc for why empty is the real starting state, not a
+/// placeholder some caller-seed later overwrites.
+fn make_review_bundles_artifact() -> Arc<dyn Any + Send + Sync> {
+    Arc::new(StdMutex::new(Vec::<BundleInput>::new()))
 }
 
 /// (#1541) Context-free default for [`REVIEW_PROBE_SELECTION_ARTIFACT`] — an
@@ -3386,7 +3428,6 @@ pub struct ReviewStepContext {
     pub probe_role_prompts: std::collections::BTreeMap<String, String>,
     pub judge_system: String,
     pub verify_system: String,
-    pub bundles: Vec<BundleInput>,
     pub remote_max_tokens_per_execution: u64,
     pub timeout_seconds: u32,
     /// (#1355 follow-up) Test-only dispatch seam for [`dispatch_chat`] —
@@ -3413,6 +3454,36 @@ pub struct ReviewStepContext {
     /// scheduler's own `host_factory` parameter too.
     #[allow(clippy::type_complexity)]
     pub chat_override: Option<Arc<dyn for<'a> Fn(&ChatCall<'a>) -> Result<SingleShotReply> + Send + Sync>>,
+    /// (#1530) Test/bench-only seam for [`ReviewBundleStepKind::
+    /// run_streaming`] — `None` at the one PRODUCTION call site
+    /// (`src/mission_launch_review.rs`'s graph path), which always falls
+    /// through to reconstructing a real `FileSource` from `Step.config` and
+    /// calling the real `build_bundles`/`external_bundles` — the whole point
+    /// of this packet (#1530: "no data-producing work before graph
+    /// execution"). When `Some`, the bundle step publishes this closure's
+    /// result onto [`REVIEW_BUNDLES_ARTIFACT`] directly instead of touching
+    /// the filesystem/network/an external command — the same "no seam for
+    /// real I/O" problem [`chat_override`]'s own doc names for dispatch,
+    /// applied to bundling.
+    ///
+    /// Two callers use it, deliberately: hermetic graph tests (synthetic
+    /// `BundleInput`s, no real worktree or GitHub API call needed) AND
+    /// `review_bench.rs`'s bench harness, which keeps its EAGER bundling
+    /// (same real `build_bundles`/`external_bundles`/`slice_code*` calls, run
+    /// before the graph starts — unchanged from before this packet) and
+    /// hands the result through this seam. Bench is a per-run-local
+    /// measurement tool, not the `mission launch review` launcher this
+    /// packet's invariant targets — same out-of-scope reasoning as the
+    /// `charges_file` re-judge side path (see `run_dispatch`'s own doc in
+    /// `src/mission_launch_review.rs`), so this is a deliberate scope
+    /// decision, not an oversight.
+    ///
+    /// Every downstream reader (probe-render/judge/verify-render) still
+    /// reads ONLY [`REVIEW_BUNDLES_ARTIFACT`] off the bus, never this field
+    /// directly — the override only changes how the bundle STEP fills that
+    /// artifact, not who reads it.
+    #[allow(clippy::type_complexity)]
+    pub bundle_override: Option<Arc<dyn Fn() -> Result<Vec<BundleInput>> + Send + Sync>>,
 }
 
 /// The production dispatch primitive every review step kind below calls —
@@ -3568,21 +3639,136 @@ fn emit_review_step_result(kind: &str, step_id: &str, case_id: &str, payload: se
 
 // ─── investigate: bundle ────────────────────────────────────────────────
 
-/// Phase "investigate", step 1: hands back the already-resolved bundle list
-/// (`ReviewStepContext::bundles` — resolved once by the orchestrator before
-/// the graph starts, since bundling needs `&ReviewInputs<'a>`'s borrow,
-/// which can't cross into a `'static` step kind). Procedural — no dispatch.
+/// `Bundle` (`darkmux_lab::lab::bundle`) -> `BundleInput` (this module's own
+/// shape). Each bundle's line-span pointers are rendered PER SEAT (#1256):
+/// `slice_code` (the judge's `// path` raw format) into `code`,
+/// `slice_code_probe` (the probe's fenced-code format) into `probe_code`.
+///
+/// (#1530) Moved here from `src/mission_launch_review.rs` — the ONLY caller
+/// left in that file is the `charges_file` re-judge side path (not a graph;
+/// see `run_dispatch`'s doc), which still needs it directly. The main
+/// dispatch path's own call now lives in [`ReviewBundleStepKind::
+/// run_streaming`], right next to `build_bundles`/`external_bundles`.
+pub fn bundle_inputs_from_set(set: &BundleSet, source: &FileSource) -> Result<Vec<BundleInput>> {
+    set.bundles
+        .iter()
+        .map(|b| {
+            let code = slice_code(source, &b.code)
+                .with_context(|| format!("slicing code for bundle \"{}\"", b.id))?;
+            let probe_code = slice_code_probe(source, &b.code)
+                .with_context(|| format!("probe-slicing code for bundle \"{}\"", b.id))?;
+            Ok(BundleInput {
+                id: b.id.clone(),
+                fact_family: b.fact_family.clone(),
+                code,
+                probe_code,
+                facts: b.facts.clone(),
+                manifest: b.manifest.clone(),
+            })
+        })
+        .collect()
+}
+
+/// (#1530) Which diff SOURCE `review-bundle-step` reconstructs a
+/// [`FileSource`] from at run time — the launcher's already-validated
+/// `--param worktree=<dir>` / `--param github=<repo> --param head_sha=<sha>`
+/// resolution (`mission_launch_review::resolve_source`), carried as plain
+/// data instead of the un-serializable `FileSource` itself (which holds a
+/// `RefCell` fetch cache). Constructed by the launcher/bench caller, never
+/// by the graph itself — see [`BundleBuildSpec`].
+pub enum BundleSourceSpec {
+    Worktree { path: PathBuf },
+    Github { repo: String, head_sha: String },
+}
+
+/// (#1530) Everything `review-bundle-step`'s config needs to reconstruct a
+/// [`FileSource`] and run the bundler AT RUN TIME — the launcher's
+/// already-resolved diff source, optional external `--bundler` command, and
+/// the diff file path (`external_bundles` shells out `<cmd> --worktree <dir>
+/// --diff <file>`, so it needs a real path, not just the diff TEXT already
+/// on [`ReviewStepContext::diff`]). Stamped once, at build time, into
+/// `review-bundle-step`'s `Step.config` by [`build_review_graph_from_config`]
+/// — the same "compute at build time, stamp, read back in `run_streaming`"
+/// pattern every other per-seat config on this graph already uses. This is
+/// the packet's whole point: everything here is DATA the launcher already
+/// had before the graph ever ran; only the bundler INVOCATION itself (the
+/// file reads / `gh api` calls / external-command shell-out) moves to run
+/// time, inside [`ReviewBundleStepKind::run_streaming`].
+pub struct BundleBuildSpec {
+    pub source: BundleSourceSpec,
+    pub bundler: Option<String>,
+    pub diff_file: PathBuf,
+}
+
+/// Reconstruct the [`FileSource`] `review-bundle-step`'s own `Step.config`
+/// declares (stamped by `build_review_graph_from_config` from a
+/// [`BundleBuildSpec`] — see that type's doc). A malformed shape here is a
+/// BUILD-TIME bug (the launcher/bench caller mis-stamped the config), not an
+/// operator input mistake, so this errors loudly rather than defaulting —
+/// contract 7 (loud validation at the consumption point).
+fn file_source_from_step_config(config: &serde_json::Value) -> Result<FileSource> {
+    let source = config
+        .get("source")
+        .context("darkmux: review-bundle-step config is missing \"source\"")?;
+    let kind = source
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .context("darkmux: review-bundle-step config \"source.kind\" is missing or not a string")?;
+    match kind {
+        "worktree" => {
+            let path = source.get("path").and_then(|v| v.as_str()).context(
+                "darkmux: review-bundle-step config \"source.path\" is missing (worktree source)",
+            )?;
+            Ok(FileSource::worktree(path))
+        }
+        "github" => {
+            let repo = source.get("repo").and_then(|v| v.as_str()).context(
+                "darkmux: review-bundle-step config \"source.repo\" is missing (github source)",
+            )?;
+            let head_sha = source.get("head_sha").and_then(|v| v.as_str()).context(
+                "darkmux: review-bundle-step config \"source.head_sha\" is missing (github source)",
+            )?;
+            Ok(FileSource::github_api(repo, head_sha))
+        }
+        other => bail!(
+            "darkmux: review-bundle-step config \"source.kind\" = \"{other}\" is not recognized \
+             (expected \"worktree\" or \"github\")"
+        ),
+    }
+}
+
+/// Phase "investigate", step 1: resolves the review's bundle set AT RUN
+/// TIME — the pipeline's own earliest data-producing step (#1530: "no graph
+/// does data-producing work before graph execution — every graph runs the
+/// same way"). Before this packet, `src/mission_launch_review.rs::
+/// run_dispatch` resolved the diff source and called `build_bundles`/
+/// `external_bundles` in a PRE-GRAPH prelude, then handed the finished
+/// `Vec<BundleInput>` to `build_review_graph` as `ReviewStepContext::
+/// bundles` — meaning nothing upstream of the graph (a coder step, say)
+/// could ever feed review, because by the time ANY step ran, the bundles
+/// were already required launch input. This kind does the SAME work
+/// (`build_bundles`/`external_bundles` + `bundle_inputs_from_set` are
+/// UNCHANGED — only WHERE they're called moved), reconstructing a
+/// [`FileSource`] from `Step.config` (stamped by
+/// [`build_review_graph_from_config`] from a [`BundleBuildSpec`] — see that
+/// type's doc for why everything it needs is build-time-known data) and
+/// publishing the result onto [`REVIEW_BUNDLES_ARTIFACT`] for every
+/// downstream step.
 ///
 /// **Tier 3 (#1352), on purpose.** Diff-parsing/bundle-resolution is
 /// genuinely specific to the review pipeline — no second consumer is
 /// visible today, and its whole job is unwrapping THIS module's own
-/// `ReviewStepContext`. Stays physically co-located here, not moved to
+/// `Step.config` shape. Stays physically co-located here, not moved to
 /// `darkmux-crew`'s `step_kinds` — see that crate's `step_kinds::patterns`
 /// module doc for the three-tier picture this classification follows.
 ///
 /// (#1530 Packet 3a) A stateless singleton — no `Arc<ReviewStepContext>`
 /// constructor field. It reads the run-scoped context off the `ArtifactBus`
-/// instead (see [`REVIEW_CONTEXT_ARTIFACT`]'s module-doc note).
+/// instead (see [`REVIEW_CONTEXT_ARTIFACT`]'s module-doc note) — needed here
+/// only for `ctx.case_id` (step-result logging) and `ctx.diff` (the diff
+/// TEXT `build_bundles` needs; `external_bundles` instead needs the diff
+/// FILE path, carried on `Step.config` since it shells a real command out to
+/// it) and the `bundle_override` test seam.
 pub struct ReviewBundleStepKind;
 
 impl StepKind for ReviewBundleStepKind {
@@ -3594,20 +3780,38 @@ impl StepKind for ReviewBundleStepKind {
         "Bundle"
     }
 
-    /// (#1530 Packet 3a) The ordinary `Step.output` `Data` port, plus
-    /// `REVIEW_CONTEXT_ARTIFACT` — this is the pipeline's EARLIEST consumer
-    /// of the run-scoped context (investigate phase, step 1), so declaring
-    /// `provides()` here is sufficient for the scheduler's pre-scan
-    /// regardless of which wave the other four consumers land in (mirrors
-    /// `ReviewDedupStepKind::provides()`'s own reasoning for the three
-    /// accumulators). `run_review_graph`'s caller-seed always overwrites
-    /// this factory's context-free default with the real, run-stamped value
-    /// before any step reads it.
+    /// (#1530) `REVIEW_BUNDLES_ARTIFACT` is new here — this kind is its ONLY
+    /// writer. The ordinary `Step.output` `Data` port and
+    /// `REVIEW_CONTEXT_ARTIFACT` are unchanged from before this packet; this
+    /// is still the pipeline's EARLIEST consumer of the run-scoped context
+    /// (investigate phase, step 1), so declaring `provides()` here is
+    /// sufficient for the scheduler's pre-scan regardless of which wave the
+    /// other consumers land in (mirrors `ReviewDedupStepKind::provides()`'s
+    /// own reasoning for its three accumulators). `run_review_graph`'s
+    /// caller-seed always overwrites the context factory's context-free
+    /// default with the real, run-stamped value before any step reads it;
+    /// `REVIEW_BUNDLES_ARTIFACT`'s empty default is never caller-seeded —
+    /// this kind is what fills it, at run time (see that constant's doc).
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 2] = [
+        const PORTS: [Port; 3] = [
             Port::data("bundles"),
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
+            Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
         ];
+        &PORTS
+    }
+
+    /// (#1530) `requires()` only for `REVIEW_ENVELOPE_ARTIFACT` — this kind
+    /// WRITES the resolved bundle count onto it (mirroring the pattern every
+    /// other artifact-writing kind in this file uses: declare `requires()`
+    /// for an artifact some OTHER kind's `provides()` already materializes,
+    /// per `ReviewJudgeStepKind::requires()`'s own doc). `ReviewDedupStepKind::
+    /// provides()` already declares `REVIEW_ENVELOPE_ARTIFACT`, and the
+    /// scheduler's pre-scan runs across every step kind present in the
+    /// graph before ANY wave (review-dedup-task is always present), so this
+    /// is materialized before `review-bundle-step`'s wave runs regardless.
+    fn requires(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact)];
         &PORTS
     }
 
@@ -3628,12 +3832,70 @@ impl StepKind for ReviewBundleStepKind {
         let ctx = run_ctx
             .artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)
             .expect("run_review_graph seeds the context artifact before the graph runs");
-        let output = serde_json::to_string(&ctx.bundles).context("serializing bundles")?;
+
+        // (#1530) The REAL work — resolve the diff source, run the bundler,
+        // slice the code per seat — all UNCHANGED from what
+        // `src/mission_launch_review.rs`'s pre-graph prelude used to do; it
+        // just runs HERE now, at run time, instead of before the graph was
+        // even built. `bundle_override` (`None` on the production
+        // `mission launch review` path — see its own doc) skips all of it
+        // for a hermetic graph test, or lets `review_bench.rs` hand in
+        // bundles it still computes eagerly for its own reasons.
+        let bundle_inputs: Vec<BundleInput> = if let Some(over) = &ctx.bundle_override {
+            over()?
+        } else {
+            let source = file_source_from_step_config(&step.config)?;
+            let bundler = step.config.get("bundler").and_then(|v| v.as_str());
+            let bundle_set = match bundler {
+                Some(cmd) => {
+                    let diff_file = step
+                        .config
+                        .get("diff_file")
+                        .and_then(|v| v.as_str())
+                        .context("darkmux: review-bundle-step config is missing \"diff_file\"")?;
+                    let worktree = match &source {
+                        FileSource::Worktree(p) => Some(p.as_path()),
+                        FileSource::GithubApi { .. } => None,
+                    };
+                    external_bundles(cmd, worktree, Path::new(diff_file))?
+                }
+                None => build_bundles(&source, &ctx.diff)?,
+            };
+            bundle_inputs_from_set(&bundle_set, &source)?
+        };
+
+        // Publish for every downstream reader (probe-render's selection,
+        // judge's per-flag lookup + residency skip-load check,
+        // verify-render's per-finding lookup — see `REVIEW_BUNDLES_ARTIFACT`'s
+        // own doc for the full reader list).
+        *run_ctx
+            .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
+            .expect("this kind's own provides() materializes review.bundles")
+            .lock()
+            .expect("review bundles mutex poisoned") = bundle_inputs.clone();
+
+        // (#1530) The envelope's `bundles` count used to be stamped once at
+        // BUILD time (`ctx.bundles.len()` in `build_review_graph_from_config`'s
+        // `initial_env`) — now that the real count isn't known until this
+        // step runs, it's written here instead, into the SAME shared
+        // envelope every other step reads/writes through
+        // `REVIEW_ENVELOPE_ARTIFACT`. This runs in the graph's FIRST wave,
+        // well before `ReviewSynthesisStepKind` reads `env.bundles` (the
+        // "no bundles produced from the diff" degenerate gate) or serializes
+        // its own envelope snapshot, so both see the real count.
+        run_ctx
+            .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
+            .expect("review-dedup-task's provides() materializes review.envelope")
+            .lock()
+            .expect("shared review envelope mutex poisoned")
+            .bundles = bundle_inputs.len();
+
+        let output = serde_json::to_string(&bundle_inputs).context("serializing bundles")?;
         emit_review_step_result(
             "review.bundle",
             &step.id,
             &ctx.case_id,
-            json!({ "items_out": ctx.bundles.len() }),
+            json!({ "items_out": bundle_inputs.len() }),
         );
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
@@ -3690,14 +3952,20 @@ impl StepKind for ReviewProbeRenderStepKind {
         "Probe prompts"
     }
 
-    /// `requires()` only — this kind consumes `REVIEW_CONTEXT_ARTIFACT`
-    /// (for `ctx.bundles`/`ctx.probe_system`/`ctx.probe_role_prompts`) but
-    /// produces none of the three shared accumulators; `ReviewDedupStepKind::
+    /// `requires()` only — this kind consumes `REVIEW_CONTEXT_ARTIFACT` (for
+    /// `ctx.probe_system`/`ctx.probe_role_prompts`) and, since #1530,
+    /// `REVIEW_BUNDLES_ARTIFACT` (the bundle set, published by
+    /// `ReviewBundleStepKind::run_streaming` — this task depends directly on
+    /// `review-bundle-task`, so it's always populated by the time this runs)
+    /// but produces none of the three shared accumulators; `ReviewDedupStepKind::
     /// provides()`'s doc explains why a downstream consumer declares
     /// `requires()` rather than re-`provides()`ing an artifact another kind
     /// already does.
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact)];
+        const PORTS: [Port; 2] = [
+            Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
+            Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
+        ];
         &PORTS
     }
 
@@ -3742,9 +4010,10 @@ impl StepKind for ReviewProbeRenderStepKind {
         // runs unrestricted over every bundle, matching
         // `select_bundles_for_staffing`'s own `None` contract) and role id
         // (for the per-seat prompt lookup below). Both are known at build
-        // time; only the SELECTION ITSELF (which needs `ctx.bundles`, only
-        // stable once the run seeds the context artifact) moves to run
-        // time — see this kind's own doc.
+        // time; only the SELECTION ITSELF (which needs the run's bundle
+        // set, only stable once `review-bundle-task` has run — see
+        // `REVIEW_BUNDLES_ARTIFACT`'s doc) moves to run time — see this
+        // kind's own doc.
         let selector: Option<BundleSelector> = match step.config.get("selector") {
             None => None,
             Some(v) if v.is_null() => None,
@@ -3763,7 +4032,17 @@ impl StepKind for ReviewProbeRenderStepKind {
             .map(String::as_str)
             .unwrap_or(ctx.probe_system.as_str());
 
-        let selected = select_bundles_for_staffing(&ctx.bundles, selector.as_ref());
+        // (#1530) The bundle set — published by `review-bundle-task`'s own
+        // step, which this task depends on directly (`review.json`'s
+        // `review-probe-*-task.depends_on: ["review-bundle-task"]`).
+        let bundles = run_ctx
+            .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
+            .expect("review-bundle-task's step must run before any probe task's own")
+            .lock()
+            .expect("review bundles mutex poisoned")
+            .clone();
+
+        let selected = select_bundles_for_staffing(&bundles, selector.as_ref());
         let collection: Vec<String> = selected.iter().map(|b| probe_user_message(prior, b)).collect();
 
         // (#1541) Publish THIS run's actual selection — index-aligned with
@@ -4323,11 +4602,16 @@ impl StepKind for ReviewJudgeStepKind {
     /// — see `scheduler::run_step_graph`'s pre-scan doc); it's supplied only
     /// to satisfy `Port::artifact`'s constructor signature.
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 4] = [
+        const PORTS: [Port; 5] = [
             Port::data("deduped-flags"),
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
             Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
             Port::artifact(REVIEW_MEMBERS_ARTIFACT, make_review_members_artifact),
+            // (#1530) The bundle set, published by `ReviewBundleStepKind::
+            // run_streaming` — `review-judge-task` depends (transitively, via
+            // dedup + the probe tasks) on `review-bundle-task`, so it's
+            // always populated by the time this kind's wave runs.
+            Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
         ];
         &PORTS
     }
@@ -4417,6 +4701,14 @@ impl StepKind for ReviewJudgeStepKind {
                 pass2: RemoteBucket::new("judge-pass2", ctx.remote_max_tokens_per_execution),
             })
         });
+        // (#1530) The bundle set — published by `review-bundle-task`'s own
+        // step, well before this kind's wave runs (see `requires()`'s doc).
+        let bundles = run_ctx
+            .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
+            .expect("review-bundle-task's step must run before review-judge-task's own")
+            .lock()
+            .expect("review bundles mutex poisoned")
+            .clone();
 
         let t0 = Instant::now();
         let results: StdMutex<Vec<JudgeChunkResult>> = StdMutex::new(Vec::with_capacity(deduped.len()));
@@ -4433,7 +4725,7 @@ impl StepKind for ReviewJudgeStepKind {
         for chunk in deduped.chunks(concurrency) {
             std::thread::scope(|scope| {
                 for (offset, flag) in chunk.iter().enumerate() {
-                    let bundle = ctx.bundles.iter().find(|b| b.id == flag.bundle_id);
+                    let bundle = bundles.iter().find(|b| b.id == flag.bundle_id);
                     let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
                     let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
                     let prompt = judge_prompt(&ctx.intent_title, &ctx.intent_body, code, facts, &flag.charge_text);
@@ -4598,23 +4890,34 @@ impl StepKind for ReviewJudgeStepKind {
         Ok(StepOutcome { output, flow_records: Vec::new() })
     }
 
-    /// (#1530 Packet 3a) Now reads `step.config` (the judge seat's stamped
+    /// (#1530 Packet 3a) Reads `step.config` (the judge seat's stamped
     /// staffing, per `run_streaming`'s own doc note above) instead of a
-    /// `self.judge` constructor field, and the run-scoped context off the
-    /// bus `run_ctx` now carries (instead of a `self.ctx` constructor
-    /// field) — the ONLY reason this hook gained a `&StepRunCtx` parameter
-    /// in #1530 Packet 3a (see `StepKind::residency`'s own doc). The
-    /// skip-load decision logic below is otherwise BYTE-IDENTICAL to the
-    /// pre-Packet-3a version: same two early-outs, same order, same
-    /// `Placement` fields — see this method's original doc (preserved
-    /// below) for the empty-bundle-set reasoning.
+    /// `self.judge` constructor field, and the run-scoped bus `run_ctx`
+    /// carries instead of a `self.ctx` constructor field — the ONLY reason
+    /// this hook gained a `&StepRunCtx` parameter in #1530 Packet 3a (see
+    /// `StepKind::residency`'s own doc). The skip-load decision logic below
+    /// is otherwise BYTE-IDENTICAL to the pre-Packet-3a version: same two
+    /// early-outs, same order, same `Placement` fields — see this method's
+    /// original doc (preserved below) for the empty-bundle-set reasoning.
+    ///
+    /// (#1530 bundling-becomes-runtime-work follow-on) The empty-bundle-set
+    /// check now reads [`REVIEW_BUNDLES_ARTIFACT`] directly instead of
+    /// `ctx.bundles` (retired — see that field's removal note on
+    /// `ReviewStepContext`), so the `ReviewStepContext` fetch this method
+    /// used to need is gone too. Safe by construction, not by luck:
+    /// `review-judge-task` depends (transitively, via dedup + the probe
+    /// tasks) on `review-bundle-task`, so by the time THIS step's wave
+    /// runs — the only time `residency()` is ever called for it — the
+    /// bundle step has already run and populated the artifact for real (see
+    /// `REVIEW_BUNDLES_ARTIFACT`'s own doc for why this ordering is
+    /// guaranteed, not assumed).
     ///
     /// (#1360 follow-up, preserved) Unlike probe, judge can't know upfront
     /// whether dedup will hand it any flags — that's genuinely data-dependent
     /// on an earlier step's real output, not knowable at graph-build time.
     /// But a TRULY empty bundle set is a safe, conservative exception: every
-    /// probe seat's selector operates on `ctx.bundles`, so if that set is
-    /// empty, dedup's output is guaranteed empty too, transitively — no
+    /// probe seat's selector operates on the same bundle set, so if that set
+    /// is empty, dedup's output is guaranteed empty too, transitively — no
     /// seat's selector matters. Skips loading a model this step is certain
     /// not to use.
     fn residency(
@@ -4627,8 +4930,8 @@ impl StepKind for ReviewJudgeStepKind {
         if step.config.get("endpoint").is_some() {
             return None;
         }
-        let ctx = run_ctx.artifact::<ReviewStepContext>(REVIEW_CONTEXT_ARTIFACT)?;
-        if ctx.bundles.is_empty() {
+        let bundles = run_ctx.artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)?;
+        if bundles.lock().expect("review bundles mutex poisoned").is_empty() {
             return None;
         }
         let model_key = step.config.get("model_key").and_then(|v| v.as_str())?;
@@ -4694,10 +4997,14 @@ impl StepKind for ReviewVerifyRenderStepKind {
     /// provides()`'s artifacts declares `requires()` rather than
     /// re-`provides()`ing them.
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 3] = [
+        const PORTS: [Port; 4] = [
             Port::data("judged-flags"),
             Port::artifact(REVIEW_CONTEXT_ARTIFACT, make_review_context_artifact),
             Port::artifact(REVIEW_ENVELOPE_ARTIFACT, make_review_envelope_artifact),
+            // (#1530) The bundle set — always populated by this point:
+            // `review-verify-task` depends on `review-judge-task`, which
+            // itself depends (transitively) on `review-bundle-task`.
+            Port::artifact(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact),
         ];
         &PORTS
     }
@@ -4759,10 +5066,19 @@ impl StepKind for ReviewVerifyRenderStepKind {
         let prompts: Vec<String> = if skip_reason.is_some() {
             Vec::new()
         } else {
+            // (#1530) The bundle set — published by `review-bundle-task`'s
+            // own step; see `requires()`'s doc for why it's guaranteed
+            // populated by this point.
+            let bundles = run_ctx
+                .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
+                .expect("review-bundle-task's step must run before review-verify-task's own")
+                .lock()
+                .expect("review bundles mutex poisoned")
+                .clone();
             confirmed
                 .iter()
                 .map(|j| {
-                    let bundle = ctx.bundles.iter().find(|b| b.id == j.flag.bundle_id);
+                    let bundle = bundles.iter().find(|b| b.id == j.flag.bundle_id);
                     let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
                     let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
                     verify_prompt(&ctx.intent_title, &ctx.intent_body, code, facts, &j.flag.charge_text)
@@ -5302,6 +5618,7 @@ pub fn review_step_kind_display_name(kind: &str) -> Option<&'static str> {
 #[allow(clippy::too_many_arguments)]
 pub fn build_review_graph(
     ctx: Arc<ReviewStepContext>,
+    bundle_spec: &BundleBuildSpec,
     judge: ResolvedSeatStaffing,
     verify: Option<ResolvedSeatStaffing>,
     probes: &[ResolvedSeatStaffing],
@@ -5325,6 +5642,7 @@ pub fn build_review_graph(
         &loaded.config,
         &format!("resolved from the {} tier at {}", loaded.source, loaded.manifest_path.display()),
         ctx,
+        bundle_spec,
         judge,
         verify,
         probes,
@@ -5350,6 +5668,7 @@ fn build_review_graph_from_config(
     config: &darkmux_crew::mission_config::MissionConfig,
     source_detail: &str,
     ctx: Arc<ReviewStepContext>,
+    bundle_spec: &BundleBuildSpec,
     judge: ResolvedSeatStaffing,
     verify: Option<ResolvedSeatStaffing>,
     probes: &[ResolvedSeatStaffing],
@@ -5518,12 +5837,14 @@ fn build_review_graph_from_config(
     // build-time snapshot — plus crew/mode/fingerprint/staffing) and SEEDS
     // the wrapped `Arc<StdMutex<_>>` result onto the run's `ArtifactBus` —
     // see `BuiltReviewGraph::initial_env`'s own doc for the full handoff.
-    let initial_env = ReviewEnvelope {
-        case_id: ctx.case_id.clone(),
-        bundles: ctx.bundles.len(),
-        warnings: interpret_warnings,
-        ..Default::default()
-    };
+    //
+    // (#1530) `bundles` starts at 0 now, not `ctx.bundles.len()` — the real
+    // bundle set isn't resolved until `review-bundle-step` runs (the whole
+    // point of this packet). `ReviewBundleStepKind::run_streaming` writes
+    // the real count onto the shared envelope artifact once it knows it,
+    // well before `ReviewSynthesisStepKind` (the only other reader) runs.
+    let initial_env =
+        ReviewEnvelope { case_id: ctx.case_id.clone(), warnings: interpret_warnings, ..Default::default() };
 
     // (#1442 ship-2b) The probe/verify stages ride the GENERIC
     // `dispatch.map` builtin, so the registry starts from the Tier-1
@@ -5532,6 +5853,27 @@ fn build_review_graph_from_config(
 
     let bundle_kind = Arc::new(ReviewBundleStepKind);
     registry.register(bundle_kind.clone()).expect("review.bundle registered once");
+    // (#1530) Stamp `review-bundle-step`'s config from the caller's already-
+    // resolved `bundle_spec` — see [`BundleBuildSpec`]'s own doc for why
+    // this is DATA the launcher/bench caller already had, not new work.
+    {
+        let bundle_step = steps
+            .get_mut("review-bundle-step")
+            .expect("interpreted \"review\" graph must have a review-bundle-step");
+        let source = match &bundle_spec.source {
+            BundleSourceSpec::Worktree { path } => {
+                json!({ "kind": "worktree", "path": path.display().to_string() })
+            }
+            BundleSourceSpec::Github { repo, head_sha } => {
+                json!({ "kind": "github", "repo": repo, "head_sha": head_sha })
+            }
+        };
+        bundle_step.config = json!({
+            "source": source,
+            "bundler": bundle_spec.bundler,
+            "diff_file": bundle_spec.diff_file.display().to_string(),
+        });
+    }
     // (#1349) Legacy alias — a `Step.kind` persisted before the funnel->review
     // rename must still resolve if anything ever re-reads it back through a
     // fresh registry (see `StepKindRegistry::register_alias`'s doc).
