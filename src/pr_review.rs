@@ -340,10 +340,20 @@ const CONFIRMED_MARKER: &str =
 /// a repo that may be public, so this is the one boundary in the pipeline
 /// where an internal error string crosses into the open.
 ///
-/// The FULL chain is deliberately preserved everywhere it's useful and not
-/// public — the step's persisted `output`, the envelope, the flow records,
-/// and the local stderr line. Only the comment is trimmed: first line,
-/// home-redacted, length-capped.
+/// The full chain is preserved where it's useful for diagnosis — the step's
+/// persisted `output`, the envelope, the flow records, and the local stderr
+/// line. Only the comment is trimmed: first line, home-redacted, capped.
+///
+/// Two honest limits, so this isn't mistaken for a guarantee:
+///
+/// - This is NOT the only path to a public surface. `darkmux-review.yml`
+///   uploads `envelope.json` — which carries `degenerate` verbatim — as an
+///   `actions/upload-artifact` on `if: always()`. That predates this
+///   function and is unchanged by it; sanitizing here narrows the most-read
+///   surface (the comment), it does not close the class.
+/// - Redaction covers `$HOME` only. A path under `/tmp`, a macOS
+///   `/private/var/folders/…` tempdir, or another user's home survives
+///   inside the first 300 characters. Mitigation, not elimination.
 fn public_safe_note(note: &str) -> String {
     let first = note.lines().next().unwrap_or("").trim();
     let redacted = match dirs::home_dir() {

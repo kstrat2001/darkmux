@@ -2024,6 +2024,90 @@ mod tests {
         );
     }
 
+    /// (#1538 follow-up) THE regression guard: a differently-NAMED variant
+    /// must execute ITS OWN document, not the built-in.
+    ///
+    /// #1538 made routing structural, so a variant reaches this launcher —
+    /// but `run_dispatch` still resolved the built-in by id
+    /// (`mission_config::load("review")`). A `review-lean` launch therefore
+    /// routed correctly and then ran the built-in THREE-probe graph, with the
+    /// variant's own probe tasks ignored and no warning anywhere.
+    ///
+    /// This must exercise `run_dispatch` — the function that CHOOSES the
+    /// document. An earlier version of this guard called the graph builder
+    /// directly with the renamed doc, which cannot fail: the builder never
+    /// reads `config.id`, so it passed against the buggy code too. Testing
+    /// the choice means calling the chooser.
+    ///
+    /// Pruned to ONE probe task, so the seat count in the envelope's own
+    /// staffing snapshot distinguishes the documents: 1 (the variant, correct)
+    /// vs 3 (the built-in, the bug).
+    #[test]
+    #[serial_test::serial]
+    fn run_dispatch_uses_the_launched_variant_document_not_the_builtin() {
+        let _guard = CrewDirGuard::new();
+
+        let profiles_dir = tempfile::TempDir::new().unwrap();
+        let profiles_path = profiles_dir.path().join("profiles.json");
+        std::fs::write(
+            &profiles_path,
+            r#"{
+                "schema_version": "1.5",
+                "profiles": {
+                    "test-profile": { "models": [ { "id": "test-model", "n_ctx": 8000 } ] }
+                },
+                "default_profile": "test-profile"
+            }"#,
+        )
+        .unwrap();
+
+        let worktree_dir = tempfile::TempDir::new().unwrap();
+
+        // A stored variant: the embedded document under a DIFFERENT id, with
+        // two of its three probe tasks removed.
+        let mut config = crew::mission_config::load("review").expect("review is embedded").config;
+        config.id = "review-lean".to_string();
+        let investigate = &mut config.phases[0];
+        assert_eq!(investigate.id, "investigate", "test assumes the embedded phase order");
+        let keep = "review-probe-high-task";
+        investigate
+            .tasks
+            .retain(|t| !t.id.starts_with("review-probe-") || t.id == keep);
+        // The dedup task fans in from the probe tasks; drop the pruned edges
+        // so the document stays internally consistent.
+        for t in investigate.tasks.iter_mut() {
+            if t.id == "review-dedup-task" {
+                t.depends_on.retain(|d| !d.starts_with("review-probe-") || d == keep);
+            }
+        }
+        assert_eq!(
+            investigate.tasks.iter().filter(|t| t.id.starts_with("review-probe-")).count(),
+            1,
+            "the variant must declare exactly one probe task"
+        );
+
+        let mut collected: BTreeMap<String, Value> = BTreeMap::new();
+        collected.insert("case_id".to_string(), Value::String("owner/repo@lean".to_string()));
+        collected.insert("worktree".to_string(), Value::String(worktree_dir.path().display().to_string()));
+        collected.insert("profiles".to_string(), Value::String(profiles_path.display().to_string()));
+
+        let diff_file = worktree_dir.path().join("unused.diff");
+        // Empty diff -> empty bundle set -> a degenerate run with zero model
+        // dispatches. The staffing snapshot is still resolved and recorded,
+        // which is all this assertion needs.
+        let env = run_dispatch(&config, &collected, &diff_file, "", 60)
+            .expect("an empty-diff variant run still produces an envelope");
+
+        let staffing = env.staffing.as_ref().expect("a dispatching run records its staffing");
+        assert_eq!(
+            staffing.probes.len(),
+            1,
+            "the LAUNCHED variant declares one probe seat; resolving three means `run_dispatch` \
+             loaded the built-in document instead of the one that was launched (#1538). Seats: {:?}",
+            staffing.probes.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+    }
+
     /// (#1504) The COMPLEMENTARY strand window #1417 didn't close: a
     /// failure AFTER `ensure_mission_and_phases_with_provenance` has
     /// already written `mission.json` (a partial mint — a later
