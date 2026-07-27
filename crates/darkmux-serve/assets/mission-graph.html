@@ -841,6 +841,16 @@ function indexGraph(g){
 // dedup, mission.worktree) show none.
 function isAiKind(kind){
   if (!kind) return false;
+  // (#1530) The `*-render` kinds are PROMPT BUILDERS, not dispatchers — they
+  // emit `items_out` and never a token or turn record. They must be excluded
+  // BEFORE the prefix tests below, because "review.probe-render" starts with
+  // "review.probe" and "review.verify-render" with "review.verify". Without
+  // this they inherit the idle `· tok` placeholder, whose whole purpose is to
+  // assert "this step IS AI-dispatching, it just hasn't spent yet" — so a
+  // step that can never spend sits at `· tok` for the entire run beside a
+  // sibling climbing real tokens. One row before this release
+  // (review.verify-render); four after it, one per probe seat.
+  if (kind.indexOf("-render") === kind.length - 7) return false;
   if (kind.indexOf("dispatch.") === 0) return true;
   if (kind === "mission.coder" || kind === "mission.verify") return true;
   if (kind.indexOf("review.probe") === 0 || kind.indexOf("review.judge") === 0

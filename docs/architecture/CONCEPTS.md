@@ -339,8 +339,11 @@ and coordination substrate. The schema version is **`1.9.0`**
   `DARKMUX_MACHINE_ID`), `orchestrator` (from `DARKMUX_ORCHESTRATOR`). *(The
   `machine_tier` provenance field was removed in schema 1.9.0, #587: the
   {inference/hub/client} machine-capacity tier is retired; see #590.)*
-- **Audit chain (`AuditFileSink` only):** `prev_hash`, `hash` — a BLAKE3
-  chain-of-custody verified by `darkmux flow integrity-check` (#163).
+- **Audit chain (`AuditFileSink` only):** `prev_hash`, `hash` — a BLAKE3 hash
+  chain whose post-hoc edits are detectable via `darkmux flow integrity-check`
+  (#163). Deliberately *not* "chain-of-custody": that claim needs external
+  timestamping and custodial controls darkmux does not provide, as
+  `skills/darkmux-enable-audit` already states plainly.
 - **Parallel-dispatch (#246, schema 1.8):** `work_id`, `attempt`.
 - **Extension point:** **`payload`**: an optional `serde_json::Value` map (added
   in schema 1.6.0, #204) that gives new event types

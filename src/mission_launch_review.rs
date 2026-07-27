@@ -95,7 +95,7 @@ use darkmux_crew::single_shot::{
 };
 use darkmux_lab::lab::bundle::{build_bundles, external_bundles, FileSource};
 use darkmux_lab::lab::review::{
-    build_review_graph, bundle_inputs_from_set, fingerprint, run_judge_only, run_review_graph,
+    build_review_graph_from_config, bundle_inputs_from_set, fingerprint, run_judge_only, run_review_graph,
     seat_identifier, staffing_snapshot, BundleBuildSpec, BundleInput, BundleSourceSpec, ChatCall,
     ExecMode, LmsCycler, ProbeFlag, ReviewEmitter, ReviewEnvelope, ReviewInputs, ReviewStepContext,
 };
@@ -652,20 +652,17 @@ pub(crate) fn launch(
             // continue with whatever the static check above already found,
             // rather than hard-failing on a check that only ever produces a
             // warning anyway.
-            match darkmux_crew::mission_config::load("review") {
-                Ok(review_config) => {
-                    for key in declared_role_ids(&review_config.config) {
-                        if collected.contains_key(&key) {
-                            ignored.push(key);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "mission launch review: could not load mission config \"review\" to check \
-                         for ignored per-run role overrides — continuing the `from_envelope` \
-                         replay without that check: {e:#}"
-                    );
+            // (#1538 follow-up) Read the role ids off the LAUNCHED document,
+            // which `launch` already holds — not a hardcoded `load("review")`.
+            // Same correctness reason as `run_dispatch`'s own switch (a
+            // `review-lean` replay must be told about ITS ignored overrides,
+            // not the built-in's), and it happens to delete the best-effort
+            // load + its failure branch entirely: there is no longer a second
+            // file read here that could fail, so the #1513-C4 hazard this
+            // block was written to survive no longer exists.
+            for key in declared_role_ids(config) {
+                if collected.contains_key(&key) {
+                    ignored.push(key);
                 }
             }
             if !ignored.is_empty() {
@@ -745,8 +742,18 @@ fn run_dispatch(
     // `build_review_graph` separately needs the INTERPRETED graph to stamp
     // dispatch config — two different representations of the same
     // document, not a second interpretation.
-    let review_config = darkmux_crew::mission_config::load("review")
-        .context("loading mission config \"review\"")?;
+    // (#1538 follow-up) Use the LAUNCHED document, not a hardcoded
+    // `load("review")`. Routing became structural in #1538 — any config whose
+    // graph names the review kinds reaches this launcher — but both consumers
+    // downstream still resolved the built-in by id, so a named variant
+    // (`review-lean`) routed here and then silently executed the BUILT-IN
+    // three-probe graph: its own probe tasks ignored, its `--param
+    // <role>=<profile>` overrides never looked up (and never warned about),
+    // and `config-snapshot.json` recording a document that did not run. Before
+    // #1538 that launch failed LOUDLY on an unknown kind; the structural
+    // routing turned a loud refusal into silent wrong execution, which is the
+    // inversion operator sovereignty and contract 7 both forbid.
+    let review_config_doc: &MissionConfig = config;
     // (#1475, #1512, #1513 review) Review staffing is the role→profile
     // rollup. Every review role (however many probe roles review.json
     // declares, plus review-judge, plus the optional review-verify)
@@ -760,7 +767,7 @@ fn run_dispatch(
     // and the blocking-vs-advisory render choice. The envelope snapshot
     // records what role→profile actually resolved AND from which tier
     // (operator sovereignty #44).
-    let role_ids = declared_role_ids(&review_config.config);
+    let role_ids = declared_role_ids(review_config_doc);
     let overrides = collect_role_overrides(collected, &role_ids);
     let resourcing = ReviewRoleStaffing {
         // (#1266) `None` => the resolver's double-confirm default; validated
@@ -768,7 +775,7 @@ fn run_dispatch(
         passes: u32_input(collected, "passes")?,
         request_changes: bool_input(collected, "request_changes"),
     };
-    let crew = resolve_review_roles(&loaded.registry, &review_config.config, &resourcing, &|role| {
+    let crew = resolve_review_roles(&loaded.registry, review_config_doc, &resourcing, &|role| {
         // Precedence: launch override > role_profiles map > unmapped (default).
         if let Some(p) = overrides.get(role).map(|s| s.trim()).filter(|s| !s.is_empty()) {
             darkmux_profiles::profiles::RoleBinding::Overridden(p.to_string())
@@ -1022,7 +1029,14 @@ fn run_dispatch(
         let adjudicate_phase_id = real_phase("adjudicate")?;
         let report_phase_id = real_phase("report")?;
 
-        let graph = build_review_graph(
+        // (#1538 follow-up) Build from the LAUNCHED document. `build_review_graph`
+        // resolves `load("review")` by id, so calling it here would interpret the
+        // built-in no matter what was launched — the silent-wrong-execution bug
+        // this fix exists to close. `build_review_graph_from_config` is the same
+        // function minus that hardcoded load.
+        let graph = build_review_graph_from_config(
+            review_config_doc,
+            &format!("the launched config `{}`", config.id),
             ctx.clone(),
             &bundle_spec,
             judge.clone(),
@@ -2010,6 +2024,90 @@ mod tests {
         );
     }
 
+    /// (#1538 follow-up) THE regression guard: a differently-NAMED variant
+    /// must execute ITS OWN document, not the built-in.
+    ///
+    /// #1538 made routing structural, so a variant reaches this launcher —
+    /// but `run_dispatch` still resolved the built-in by id
+    /// (`mission_config::load("review")`). A `review-lean` launch therefore
+    /// routed correctly and then ran the built-in THREE-probe graph, with the
+    /// variant's own probe tasks ignored and no warning anywhere.
+    ///
+    /// This must exercise `run_dispatch` — the function that CHOOSES the
+    /// document. An earlier version of this guard called the graph builder
+    /// directly with the renamed doc, which cannot fail: the builder never
+    /// reads `config.id`, so it passed against the buggy code too. Testing
+    /// the choice means calling the chooser.
+    ///
+    /// Pruned to ONE probe task, so the seat count in the envelope's own
+    /// staffing snapshot distinguishes the documents: 1 (the variant, correct)
+    /// vs 3 (the built-in, the bug).
+    #[test]
+    #[serial_test::serial]
+    fn run_dispatch_uses_the_launched_variant_document_not_the_builtin() {
+        let _guard = CrewDirGuard::new();
+
+        let profiles_dir = tempfile::TempDir::new().unwrap();
+        let profiles_path = profiles_dir.path().join("profiles.json");
+        std::fs::write(
+            &profiles_path,
+            r#"{
+                "schema_version": "1.5",
+                "profiles": {
+                    "test-profile": { "models": [ { "id": "test-model", "n_ctx": 8000 } ] }
+                },
+                "default_profile": "test-profile"
+            }"#,
+        )
+        .unwrap();
+
+        let worktree_dir = tempfile::TempDir::new().unwrap();
+
+        // A stored variant: the embedded document under a DIFFERENT id, with
+        // two of its three probe tasks removed.
+        let mut config = crew::mission_config::load("review").expect("review is embedded").config;
+        config.id = "review-lean".to_string();
+        let investigate = &mut config.phases[0];
+        assert_eq!(investigate.id, "investigate", "test assumes the embedded phase order");
+        let keep = "review-probe-high-task";
+        investigate
+            .tasks
+            .retain(|t| !t.id.starts_with("review-probe-") || t.id == keep);
+        // The dedup task fans in from the probe tasks; drop the pruned edges
+        // so the document stays internally consistent.
+        for t in investigate.tasks.iter_mut() {
+            if t.id == "review-dedup-task" {
+                t.depends_on.retain(|d| !d.starts_with("review-probe-") || d == keep);
+            }
+        }
+        assert_eq!(
+            investigate.tasks.iter().filter(|t| t.id.starts_with("review-probe-")).count(),
+            1,
+            "the variant must declare exactly one probe task"
+        );
+
+        let mut collected: BTreeMap<String, Value> = BTreeMap::new();
+        collected.insert("case_id".to_string(), Value::String("owner/repo@lean".to_string()));
+        collected.insert("worktree".to_string(), Value::String(worktree_dir.path().display().to_string()));
+        collected.insert("profiles".to_string(), Value::String(profiles_path.display().to_string()));
+
+        let diff_file = worktree_dir.path().join("unused.diff");
+        // Empty diff -> empty bundle set -> a degenerate run with zero model
+        // dispatches. The staffing snapshot is still resolved and recorded,
+        // which is all this assertion needs.
+        let env = run_dispatch(&config, &collected, &diff_file, "", 60)
+            .expect("an empty-diff variant run still produces an envelope");
+
+        let staffing = env.staffing.as_ref().expect("a dispatching run records its staffing");
+        assert_eq!(
+            staffing.probes.len(),
+            1,
+            "the LAUNCHED variant declares one probe seat; resolving three means `run_dispatch` \
+             loaded the built-in document instead of the one that was launched (#1538). Seats: {:?}",
+            staffing.probes.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+    }
+
     /// (#1504) The COMPLEMENTARY strand window #1417 didn't close: a
     /// failure AFTER `ensure_mission_and_phases_with_provenance` has
     /// already written `mission.json` (a partial mint — a later
@@ -2078,10 +2176,25 @@ mod tests {
             Some(&rest[..end])
         }
 
-        let build_needle = concat!("build_review", "_graph(");
+        // (#1538 follow-up) TWO accepted entry points, one shared core.
+        // `build_review_graph` is the convenience wrapper that resolves the
+        // BUILT-IN document by id and then calls `build_review_graph_from_
+        // config`; the bench uses it because it always benches the built-in.
+        // Production cannot: it must build from the document the operator
+        // actually LAUNCHED (a `review-lean` variant must run its own graph,
+        // not the built-in's), so it calls the shared core directly. Both
+        // still reach the same builder — which is the invariant this test
+        // exists for. The real teeth are the `bespoke_graph_fns` check below:
+        // neither file may define a graph-builder of its own.
+        let build_needles =
+            [concat!("build_review", "_graph("), concat!("build_review", "_graph_from_config(")];
         let run_needle = concat!("run_review", "_graph(");
         for (label, src) in [("mission_launch_review.rs", THIS_SRC), ("review_bench.rs", REVIEW_BENCH_SRC)] {
-            assert!(src.contains(build_needle), "{label} must dispatch through review::build_review_graph");
+            assert!(
+                build_needles.iter().any(|n| src.contains(n)),
+                "{label} must dispatch through review::build_review_graph or its \
+                 build_review_graph_from_config core"
+            );
             assert!(src.contains(run_needle), "{label} must dispatch through review::run_review_graph");
             let bespoke_graph_fns: Vec<&str> = src
                 .lines()
