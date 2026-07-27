@@ -4565,7 +4565,20 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(env.members.is_empty(), "no seat ever placed a call");
         assert_eq!(env.confirmed, 0);
         let note = env.degenerate.expect("zero draws across every seat must never read as Clean");
-        assert!(note.contains("no probe seat matched any bundle"), "{note}");
+        assert!(note.contains("no probe seat placed a call"), "{note}");
+        // (#1530) The message must name causes that CAN be true. It used to
+        // send the operator after a per-seat `selector` (hardcoded `None` by
+        // the only production constructor) and a "probe expansion" (retired
+        // in #1512) — two knobs that cannot exist, costing a debugging
+        // session at exactly the moment a review produced nothing.
+        assert!(
+            !note.contains("selector") && !note.contains("expansion"),
+            "the degenerate note must not name unreachable causes: {note}"
+        );
+        assert!(
+            note.contains("bundle(s)") && note.contains("staffed seat(s)"),
+            "it should report the counts that distinguish the real causes: {note}"
+        );
     }
 
     // ── remote seats: routing + provenance (#1260/#1177/#1355) ─────────

@@ -6663,11 +6663,23 @@ pub fn run_review_graph(
         let total_draws: u32 = env.members.iter().map(|m| m.draws).sum();
         if env.bundles > 0 && total_draws == 0 {
             env.degenerate = Some(
-                "no probe seat matched any bundle: zero draws across every staffed seat \
-                 (check each seat's selector against the diff's bundles, and that the \
-                 crew's probe expansion actually staffed a seat); a review that examined \
-                 nothing is never a clean pass"
-                    .to_string(),
+                // (#1530) Both causes this used to name were DEAD: per-seat
+                // `selector` is hardcoded `None` by the only production
+                // constructor of `ResolvedSeatStaffing`, and the "crew's probe
+                // expansion" retired in #1512 when the probe stage became
+                // static tasks in the document. A diagnostic that sends the
+                // operator hunting two knobs that cannot exist is worse than a
+                // terse one — it costs them the debugging session. Name what
+                // can actually be true instead.
+                format!(
+                    "no probe seat placed a call: zero draws across {} staffed seat(s), though \
+                     the diff produced {} bundle(s). Check that the review config declares a \
+                     probe task per staffed role and that each carries a `role_id` (any pruned \
+                     task is named in a warning above), and that each probe seat's model \
+                     resolved and loaded; a review that examined nothing is never a clean pass",
+                    env.members.len(),
+                    env.bundles
+                ),
             );
         }
         env

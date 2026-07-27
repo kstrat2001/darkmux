@@ -9,6 +9,65 @@ without deprecation shims). Roadmap **milestones** (`M1`/`M2`/`M3`…) are
 intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 `FLOW_SCHEMA` data-shape contracts version on their own cadence (see `CLAUDE.md`).
 
+## [Unreleased]
+
+**Composable mission graphs.** Step kinds are now stateless singletons in one
+registry, launchers route on what a graph *declares* rather than what it is
+*named*, and every pipeline produces its own input inside the graph instead of
+in a bespoke pre-launch prelude. The practical upshot: you can store review
+variants and launch them by name, and a graph can be extended from either end.
+
+### Added
+- **Named mission-config variants launch by name.** Store
+  `~/.darkmux/mission-configs/review-lean.json` (fewer probe seats, different
+  judge passes, different models per role) and run `darkmux mission launch
+  review-lean`. Launch routes on the step kinds a config declares, not on a
+  hardcoded id, and the launched document is the one that executes.
+- **Per-seat probe prompts are live.** `review-probe-high.md` / `-mid.md` /
+  `-low.md` now drive their own seats, each falling back to `review-probe.md`.
+  Previously all three files existed and were silently ignored — editing one
+  did nothing. Byte-identical by default, so this changes nothing until you
+  edit one.
+- **Graph composition is checked before anything runs.** A graph whose step
+  kinds require a run-scoped artifact nothing supplies now fails up front,
+  naming the artifact, the kinds that need it, and how one is supplied —
+  instead of panicking mid-run after the mission had already minted.
+- **`demo-quickstart` ships in the binary.** The first command the quickstart
+  documents (`darkmux lab run demo-quickstart`) previously failed "not found"
+  for anyone who installed via Homebrew or `cargo install`.
+
+### Changed
+- **Errors on the composition surface name the fix.** A coder-phase graph
+  missing one of its three required steps, a review config whose probe task
+  doesn't lead with its render step, or a renamed step the launcher locates by
+  id — each now reports what is wrong, which id it looked for, and the template
+  to copy, rather than aborting with a bare panic.
+- **The review pipeline's degenerate-run message names reachable causes.** It
+  previously told you to check a per-seat `selector` and a "probe expansion" —
+  both of which had become unreachable, sending you after knobs that no longer
+  exist.
+- **`darkmux doctor`'s mission-config finding** no longer says these documents
+  don't execute. They do; a finding there is a config that will fail at launch.
+
+### Fixed
+- **`mission finalize` / `mission abort` targeted the wrong worktree** for a
+  coder-phase config launched under any id other than `coder-phase` with a
+  custom `workdir` — the run itself was correct, but no `Task.workdir` was
+  persisted, so the terminals fell back to the derived path.
+- **Posted PR review comments no longer carry local absolute paths** or raw
+  stderr from an external `--bundler` plugin. The full detail stays in the
+  envelope, flow records, and local output.
+- **A bundling failure is no longer silent** — it previously printed nothing
+  and exited 0, leaving the cause only inside the emitted JSON.
+- **Prompt-building steps no longer show a token meter** in the mission graph.
+  They dispatch no model, so the idle `· tok` placeholder — which means "this
+  step spends tokens, just not yet" — was a false signal on every probe seat.
+- **A URL with inline credentials no longer leaks its userinfo** through a
+  seat's recorded endpoint host.
+- **`ProfileModel.capabilities` was documented as inert; it is not.** Model
+  selection scores against it, so populating it changes which model a role
+  dispatches to.
+
 ## [2.2.0] - 2026-07-25
 
 ### Added
@@ -21,8 +80,6 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 - **Review runs stamp `mission_id`** (#1523) — the review pipeline's dispatch bookends now carry their mission id, so a review appears as exactly one row in `/runs` (no spurious untracked-ghost duplicate) with its route on the right row.
 
 [2.2.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.2.0
-
-## [Unreleased]
 
 ## [2.1.0] - 2026-07-22
 

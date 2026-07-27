@@ -298,6 +298,21 @@ impl ArtifactBus {
         self.entries.get(name)?.clone().downcast::<T>().ok()
     }
 
+    /// Is `name` on the bus at all, whatever its concrete type?
+    ///
+    /// (#1530) The scheduler's composition check needs presence WITHOUT
+    /// knowing `T` — it validates a graph's declared `requires()` ports
+    /// against what was materialized or seeded, and it holds only
+    /// `dyn StepKind`, so the concrete artifact type isn't available to it.
+    /// Deliberately distinct from [`ArtifactBus::get`]: `get` conflates
+    /// "absent" with "present at another type" (both `None`), which is the
+    /// right call for a reader picking up its own artifact but the wrong
+    /// one for a presence check that must not silently pass a type
+    /// mismatch off as a missing port.
+    pub fn has(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
+    }
+
     /// Unconditionally set a named artifact to a CALLER-SUPPLIED value
     /// (#1530 Packet 1), overwriting whatever a kind's `provides()` factory
     /// may already have materialized for `name` — the caller-seed path

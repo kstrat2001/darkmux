@@ -436,6 +436,55 @@ pub fn run_step_graph(
     for (name, value) in seed_artifacts {
         bus.seed(name, value.clone());
     }
+
+    // (#1530) COMPOSITION CHECK: every declared `requires()` Artifact port
+    // must actually be on the bus by now.
+    //
+    // Until this existed, `requires()` was declared by nine kinds and read
+    // by nothing — decorative. That is what made the kinds' own
+    // `.expect("… seeds this artifact before the graph runs")` calls
+    // load-bearing: a graph that composed a kind whose artifact nobody
+    // provides or seeds reached `run_streaming` and panicked mid-run, after
+    // the mission had minted and (for coder-phase) a worktree existed.
+    //
+    // Generalizing the graph is what made that reachable: an operator can
+    // now mix kinds across configs freely, so "this kind needs an artifact
+    // this graph never supplies" is an ordinary authoring mistake rather
+    // than an impossible one. Catch it HERE — before any step runs, naming
+    // the artifact, the kinds that need it, and how it gets supplied.
+    {
+        let mut unmet: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+        let mut seen_kind_ids: HashSet<&str> = HashSet::new();
+        for step in steps.values() {
+            if !seen_kind_ids.insert(step.kind.as_str()) {
+                continue;
+            }
+            if let Ok(kind) = kinds.get(&step.kind) {
+                for port in kind.requires() {
+                    if matches!(port.kind, crate::step_kinds::PortKind::Artifact(_))
+                        && !bus.has(port.name)
+                    {
+                        unmet.entry(port.name).or_default().push(step.kind.clone());
+                    }
+                }
+            }
+        }
+        if !unmet.is_empty() {
+            let detail = unmet
+                .iter()
+                .map(|(artifact, kinds)| format!("`{artifact}` (required by {})", kinds.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!(
+                "darkmux: this graph declares step kind(s) that require run-scoped artifact(s) \
+                 nothing in the graph provides or seeds: {detail}. An artifact reaches the bus \
+                 either from a step kind that declares it in `provides()` — so adding that kind's \
+                 step to the graph supplies it — or from the launcher's `seed_artifacts`. Add the \
+                 providing step, or launch this config through the launcher that seeds it."
+            );
+        }
+    }
+
     let bus = std::sync::Arc::new(bus);
 
     loop {
@@ -2085,4 +2134,81 @@ mod tests {
         let loaded = loads.lock().unwrap().clone();
         assert!(loaded.contains(&"map-model".to_string()), "the wave loader loaded the map's model: {loaded:?}");
     }
+    /// (#1530) A kind that REQUIRES an artifact no step in the graph
+    /// provides, and no caller seeds, must fail BEFORE any step runs —
+    /// naming the artifact and who needs it.
+    ///
+    /// Until this check existed `requires()` was declared by nine kinds and
+    /// read by nothing, so this composition reached `run_streaming` and
+    /// panicked mid-run — after the mission had minted. Generalizing the
+    /// graph is what made it reachable: mixing kinds across configs is now
+    /// an ordinary thing an operator does.
+    struct NeedsArtifactKind;
+    impl StepKind for NeedsArtifactKind {
+        fn id(&self) -> &'static str {
+            "test.needs-artifact"
+        }
+        fn requires(&self) -> &'static [crate::step_kinds::Port] {
+            const PORTS: [crate::step_kinds::Port; 1] = [crate::step_kinds::Port::artifact("test.absent", || {
+                std::sync::Arc::new(0u32) as std::sync::Arc<dyn std::any::Any + Send + Sync>
+            })];
+            &PORTS
+        }
+        fn run(
+            &self,
+            _s: &Step,
+            _t: &Task,
+            _i: &BTreeMap<String, String>,
+        ) -> anyhow::Result<StepOutcome> {
+            Ok(StepOutcome { output: String::new(), flow_records: Vec::new() })
+        }
+    }
+
+    #[test]
+    fn unmet_required_artifact_fails_before_any_step_runs() {
+        let (t, st) = kinded_step("needy", "test.needs-artifact", json!({}), &[]);
+        let (tasks, mut steps) = graph(vec![(t, st)]);
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(Arc::new(NeedsArtifactKind)).unwrap();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let factory = || -> Box<dyn ModelHost> { Box::new(RecordingHost::default()) };
+
+        let err = run_step_graph(
+            &mut steps, &tasks, &kinds, &facts, &est, 1, &factory,
+            &mut |_r| {}, &mut |_s| {}, None, &[],
+        )
+        .expect_err("an unmet required artifact must fail the run");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("test.absent"), "must name the missing artifact: {msg}");
+        assert!(msg.contains("test.needs-artifact"), "must name the kind that needs it: {msg}");
+        assert_eq!(
+            steps["needy-step"].status,
+            NodeStatus::Planned,
+            "the check must fire BEFORE any step runs — nothing should have executed"
+        );
+    }
+
+    #[test]
+    fn a_seeded_required_artifact_satisfies_the_composition_check() {
+        // The same graph, with the caller seeding what the kind requires —
+        // exactly how the review and coder-phase launchers supply theirs.
+        let (t, st) = kinded_step("needy", "test.needs-artifact", json!({}), &[]);
+        let (tasks, mut steps) = graph(vec![(t, st)]);
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(Arc::new(NeedsArtifactKind)).unwrap();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let factory = || -> Box<dyn ModelHost> { Box::new(RecordingHost::default()) };
+        let seed: Vec<(&'static str, std::sync::Arc<dyn std::any::Any + Send + Sync>)> =
+            vec![("test.absent", std::sync::Arc::new(7u32))];
+
+        run_step_graph(
+            &mut steps, &tasks, &kinds, &facts, &est, 1, &factory,
+            &mut |_r| {}, &mut |_s| {}, None, &seed,
+        )
+        .expect("a seeded artifact satisfies the requirement");
+        assert_eq!(steps["needy-step"].status, NodeStatus::Complete);
+    }
+
 }
