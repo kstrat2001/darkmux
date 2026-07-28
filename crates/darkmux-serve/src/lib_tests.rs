@@ -328,6 +328,99 @@
         assert!(!json["flow_schema_version"].as_str().unwrap().is_empty());
     }
 
+    /// (#1530 dogfood) The viewer document carries cache VALIDATORS. Serving
+    /// a ~256 KB page with no `ETag` and no `Cache-Control` left the browser
+    /// to pick between a full re-download every load and a heuristically
+    /// cached (stale) copy — the operator hit BOTH during the 2.3.0 release
+    /// dogfood.
+    #[tokio::test]
+    async fn html_documents_carry_cache_validators() {
+        for uri in ["/", "/play/2026-07-28", "/mission/m1/graph"] {
+            let app = build_router(PathBuf::new());
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{uri} did not 200");
+            let h = response.headers();
+            assert_eq!(
+                h.get("cache-control").and_then(|v| v.to_str().ok()),
+                Some("no-cache"),
+                "{uri} must revalidate — it changes on every darkmux build"
+            );
+            let etag = h
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(etag.starts_with('"') && etag.ends_with('"'), "{uri} etag `{etag}` is not quoted");
+        }
+    }
+
+    /// A matching `If-None-Match` gets a zero-body `304`, so the common
+    /// reload costs a validator round-trip instead of the whole document.
+    #[tokio::test]
+    async fn matching_if_none_match_gets_304_with_no_body() {
+        let first = build_router(PathBuf::new())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let etag = first.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+        let second = build_router(PathBuf::new())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 304, "matching etag should not re-send the document");
+        let bytes = to_bytes(second.into_body(), 1024).await.unwrap();
+        assert!(bytes.is_empty(), "304 must carry no body");
+    }
+
+    /// A STALE validator must still get the full document — otherwise the
+    /// fix would trade "always stale" for "never updates".
+    #[tokio::test]
+    async fn stale_if_none_match_gets_the_full_document() {
+        let response = build_router(PathBuf::new())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("if-none-match", "\"0000000000000000\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+        assert!(!bytes.is_empty(), "a stale validator must re-send the body");
+    }
+
+    /// `/` and `/play/:date` inject DIFFERENT mode metas into the same source
+    /// document, so they must not collide on one validator — otherwise a
+    /// browser that loaded one would be told the other is unchanged.
+    #[tokio::test]
+    async fn live_and_playback_documents_have_distinct_etags() {
+        let live = build_router(PathBuf::new())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let play = build_router(PathBuf::new())
+            .oneshot(Request::builder().uri("/play/2026-07-28").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(
+            live.headers().get("etag").unwrap(),
+            play.headers().get("etag").unwrap(),
+            "live and playback documents differ, so their validators must too"
+        );
+    }
+
     #[tokio::test]
     async fn root_serves_viewer_html() {
         // #554: GET / serves the observability viewer (same-origin host
