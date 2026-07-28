@@ -1272,10 +1272,6 @@ fn item_split_tokens(any_split: bool, sum: u64) -> Option<u64> {
     any_split.then_some(sum)
 }
 
-/// (#1530 dogfood) Fold one reply's usage split into the running per-item
-/// accumulators. Shared by the local and hosted arms so both report
-/// identically — the token-accounting parity [`map_local_item`] and
-/// [`map_hosted_item`] already keep for the total.
 /// (#1530 dogfood) Pure: one map item's `telemetry.tokens` payload, or
 /// `None` when the item reported no usage at all (no record is emitted then
 /// — pre-existing behavior). Split out from the emitter so the payload SHAPE
@@ -1283,9 +1279,25 @@ fn item_split_tokens(any_split: bool, sum: u64) -> Option<u64> {
 /// division `turn_tokens_payload` and `review_token_telemetry_payload` use.
 ///
 /// The split fields are omitted, never zeroed, when the provider didn't
-/// report them.
+/// report them. NOTE the sibling emitter `review_token_telemetry_payload`
+/// (`darkmux-lab`'s `review.rs`) takes the OPPOSITE approach and fabricates
+/// a split from the total; both feed the same `telemetry.tokens` family, and
+/// reconciling them onto one policy is deliberate follow-up, not an
+/// oversight — do not "fix" one to match the other without deciding which is
+/// right for both.
+///
+/// `total_tokens` falls back to `prompt + completion` when the provider
+/// reported a split but no total (`single_shot.rs` reads all three fields
+/// independently, so that combination is representable). That is ARITHMETIC
+/// on reported numbers, not fabrication, and it matches what the viewer's
+/// own `tokensOffMeter()` already does for the single-shot hosted path.
+/// Without it, a split the item genuinely had would be dropped entirely —
+/// the exact class of loss this function exists to close.
 fn map_item_token_payload(res: &MapItemResult) -> Option<serde_json::Value> {
-    let total = res.total_tokens?;
+    let total = res.total_tokens.or_else(|| match (res.prompt_tokens, res.completion_tokens) {
+        (None, None) => None,
+        (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
+    })?;
     let mut payload = serde_json::json!({ "total_tokens": total });
     let obj = payload.as_object_mut().expect("json! built an object");
     if let Some(p) = res.prompt_tokens {
@@ -1297,6 +1309,19 @@ fn map_item_token_payload(res: &MapItemResult) -> Option<serde_json::Value> {
     Some(payload)
 }
 
+/// (#1530 dogfood) Fold one reply's usage split into the running per-item
+/// accumulators. Shared by the local and hosted arms so both report
+/// identically — the token-accounting parity [`map_local_item`] and
+/// [`map_hosted_item`] already keep for the total.
+///
+/// ASSUMPTION worth naming: a provider is expected to report usage
+/// CONSISTENTLY across the attempts of one item. If attempt 1 returns a
+/// total with no split and attempt 2 returns both, the item's accumulated
+/// `total` covers both attempts while its split covers only the second, so
+/// the dashboard's `total == prompt + completion` identity drifts for that
+/// item. Nothing renders wrong (the unclassified bucket only ever adds), and
+/// no provider we dispatch to behaves this way — recorded so a future reader
+/// who hits it knows it was considered rather than missed.
 fn accumulate_split(
     reply_prompt: Option<u64>,
     reply_completion: Option<u64>,
@@ -2269,6 +2294,30 @@ mod tests {
         assert_eq!(payload["total_tokens"], 1521);
         assert!(payload.get("prompt_tokens").is_none(), "never fabricate a split");
         assert!(payload.get("completion_tokens").is_none());
+    }
+
+    /// (#1530 dogfood, gate C1) A provider that reports a SPLIT but no total
+    /// still emits — the total is summed from the parts. `extract_reply`
+    /// reads all three `usage` fields independently, so this combination is
+    /// representable, and the old `total_tokens?` gate would have dropped
+    /// the record entirely, losing a split the item genuinely had.
+    #[test]
+    fn map_item_token_telemetry_derives_a_missing_total_from_the_split() {
+        let res = MapItemResult {
+            index: 0,
+            ok: true,
+            content: "x".to_string(),
+            error: None,
+            total_tokens: None,
+            prompt_tokens: Some(30),
+            completion_tokens: Some(12),
+            served_model: None,
+            wall_ms: 0,
+        };
+        let payload = map_item_token_payload(&res).expect("a split alone still emits");
+        assert_eq!(payload["total_tokens"], 42, "arithmetic on reported parts, not fabrication");
+        assert_eq!(payload["prompt_tokens"], 30);
+        assert_eq!(payload["completion_tokens"], 12);
     }
 
     /// An item that reported no usage at all emits NO record (pre-existing
