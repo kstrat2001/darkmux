@@ -1331,6 +1331,38 @@ fn coder_phase_gate_outcome(
     let coder_step_id = format!("{}-coder-step", handles.real_phase_id);
     let verify_step_id =
         resolve_gate_step_id(registry, steps, format!("{}-verify-step", handles.real_phase_id));
+
+    // (#1530) These three ids are a NAMING CONTRACT, and until this check
+    // every read below was a raw `steps[&id]` — a bare `BTreeMap` panic with
+    // no step id, no config, and no fix. Two plausible compositions reached
+    // it, both newly expressible now that launching routes on step KINDS
+    // rather than a config id: a coder-phase graph that declares no
+    // `mission.verify` step at all (`resolve_gate_step_id` is documented as
+    // failing OPEN, so it hands back the fallback id that isn't in the map),
+    // and a worktree step named anything else.
+    //
+    // Generalizing the launcher is what made an operator's own graph able to
+    // be wrong here, so the error has to say what's wrong and how to fix it.
+    for (label, id) in [
+        ("worktree", &worktree_step_id),
+        ("coder", &coder_step_id),
+        ("verify (the sign-off gate)", &verify_step_id),
+    ] {
+        if !steps.contains_key(id) {
+            let declared: Vec<&str> = steps.keys().map(String::as_str).collect();
+            bail!(
+                "mission launch (`{mission_id}`): this coder-phase graph is missing its {label} \
+                 step — the launcher reads it at the fixed step id `{id}`, and the interpreted \
+                 graph has no such step (declared: {}). A coder-phase graph needs three steps \
+                 named `<phase-id>-worktree-step`, `<phase-id>-coder-step` and \
+                 `<phase-id>-verify-step`, carrying the kinds `mission.worktree`, `mission.coder` \
+                 and `mission.verify`. Copy templates/builtin/mission-configs/coder-phase.json as \
+                 a starting point, or rename the step to match.",
+                declared.join(", ")
+            );
+        }
+    }
+
     let phase_id = &handles.real_phase_id;
     let session_id = &handles.session_id;
 
@@ -2376,6 +2408,46 @@ mod tests {
         let registry = crew::step_kinds::StepKindRegistry::new();
         let err = coder_phase_gate_outcome("gate-test-mission", &handles, &steps, &registry).unwrap_err();
         assert!(err.to_string().contains("worktree already exists"), "{err}");
+    }
+
+    /// (#1530) A coder-phase graph that declares no verify step must ERROR
+    /// with the naming contract named — not panic.
+    ///
+    /// `resolve_gate_step_id` fails OPEN by design (no step declares
+    /// `is_gate()` -> it returns the `<phase>-verify-step` fallback), so
+    /// before this check the fallback id went straight into `steps[&id]` and
+    /// the operator got a bare `BTreeMap` panic: no step id, no config, no
+    /// fix. "A coder phase without QA" is an ordinary composition now that
+    /// launching routes on step KINDS rather than a config id.
+    #[test]
+    #[serial_test::serial]
+    fn gate_outcome_missing_verify_step_errors_with_the_naming_contract() {
+        let _guard = LaunchTestGuard::new();
+        let phase_id = "gate-noverify-build";
+        seed_running_instance("gate-noverify", phase_id);
+        let (handles, mut steps) = scripted_gate_fixture(
+            phase_id,
+            NodeStatus::Complete,
+            NodeStatus::Complete,
+            NodeStatus::Planned,
+        );
+        // The composition under test: the verify step simply isn't there.
+        steps.remove(&format!("{phase_id}-verify-step"));
+
+        let registry = crew::step_kinds::StepKindRegistry::new();
+        let err = coder_phase_gate_outcome("gate-noverify", &handles, &steps, &registry)
+            .expect_err("a coder-phase graph with no verify step must error, not panic");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("verify"), "must name which step is missing: {msg}");
+        assert!(
+            msg.contains(&format!("{phase_id}-verify-step")),
+            "must name the exact id the launcher looked for: {msg}"
+        );
+        assert!(
+            msg.contains("coder-phase.json"),
+            "must point at the template to copy — the naming convention is documented nowhere \
+             else: {msg}"
+        );
     }
 
     // ── source_input/ticket hydration (#1284 review round 1, must-fix 2) ─

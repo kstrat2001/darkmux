@@ -2605,8 +2605,11 @@ fn check_mission_config_registry() -> Check {
                 "fix the named document(s) under `~/.darkmux/mission-configs/<id>.json` (or the \
                  checked-out `templates/builtin/mission-configs/<id>.json` for a built-in) — a \
                  dangling depends_on, an empty id, or a schema_version your darkmux build \
-                 doesn't recognize. This packet only validates configs; nothing executes them \
-                 yet (#1284 Packet 3)."
+                 doesn't recognize. These documents DO execute — `darkmux mission launch <id>` \
+                 runs any config whose graph names step kinds this build can construct, so a \
+                 finding here is a config that MAY fail at launch, not a dormant one — an \
+                 Error-tier finding bails the launch, a Warning-tier one (a schema_version \
+                 drift, say) only prints."
                     .into(),
             ),
         }

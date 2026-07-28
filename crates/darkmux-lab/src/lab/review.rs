@@ -6663,11 +6663,29 @@ pub fn run_review_graph(
         let total_draws: u32 = env.members.iter().map(|m| m.draws).sum();
         if env.bundles > 0 && total_draws == 0 {
             env.degenerate = Some(
-                "no probe seat matched any bundle: zero draws across every staffed seat \
-                 (check each seat's selector against the diff's bundles, and that the \
-                 crew's probe expansion actually staffed a seat); a review that examined \
-                 nothing is never a clean pass"
-                    .to_string(),
+                // (#1530) Both causes this used to name were DEAD: per-seat
+                // `selector` is hardcoded `None` by the only production
+                // constructor of `ResolvedSeatStaffing`, and the "crew's probe
+                // expansion" retired in #1512 when the probe stage became
+                // static tasks in the document. A diagnostic that sends the
+                // operator hunting two knobs that cannot exist is worse than a
+                // terse one — it costs them the debugging session. Name what
+                // can actually be true instead.
+                format!(
+                    "no probe seat placed a call: zero draws across {} staffed probe seat(s), \
+                     though the diff produced {} bundle(s) — every seat returned nothing usable \
+                     rather than failing, so check the probe seats' own output (their model may \
+                     be replying in a shape the parser rejects); a review that examined nothing \
+                     is never a clean pass",
+                    // (#1530) `env.staffing`, NOT `env.members`: a member record
+                    // is pushed only `if draws > 0`, and this branch's guard is
+                    // `total_draws == 0` — so `members` is EMPTY by construction
+                    // here and would render "across 0 staffed seat(s)" on a run
+                    // that staffed three. The staffing snapshot is the count the
+                    // operator actually means.
+                    env.staffing.as_ref().map(|s| s.probes.len()).unwrap_or(0),
+                    env.bundles
+                ),
             );
         }
         env

@@ -4565,7 +4565,30 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(env.members.is_empty(), "no seat ever placed a call");
         assert_eq!(env.confirmed, 0);
         let note = env.degenerate.expect("zero draws across every seat must never read as Clean");
-        assert!(note.contains("no probe seat matched any bundle"), "{note}");
+        assert!(note.contains("no probe seat placed a call"), "{note}");
+        // (#1530) The message must name causes that CAN be true. It used to
+        // send the operator after a per-seat `selector` (hardcoded `None` by
+        // the only production constructor) and a "probe expansion" (retired
+        // in #1512) — two knobs that cannot exist, costing a debugging
+        // session at exactly the moment a review produced nothing.
+        assert!(
+            !note.contains("selector") && !note.contains("expansion"),
+            "the degenerate note must not name unreachable causes: {note}"
+        );
+        assert!(
+            note.contains("bundle(s)") && note.contains("staffed probe seat(s)"),
+            "it should report the counts that distinguish the real causes: {note}"
+        );
+        // (#1530) The seat count must be the REAL one. `env.members` is empty
+        // by construction in this branch (a member is pushed only when
+        // `draws > 0`, and the guard is `total_draws == 0`), so sourcing it
+        // there would render "across 0 staffed seat(s)" on a run that staffed
+        // several — the same misdirection this message was rewritten to stop.
+        assert!(
+            !note.contains("across 0 staffed"),
+            "the seat count must come from the staffing snapshot, not the (empty) member list: \
+             {note}"
+        );
     }
 
     // ── remote seats: routing + provenance (#1260/#1177/#1355) ─────────
