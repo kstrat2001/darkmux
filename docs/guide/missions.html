@@ -171,13 +171,13 @@ next: <code>darkmux mission launch draft-blog-post</code> to begin (or pass <cod
     <h3>Launching a config: <code>mission launch</code></h3>
     <pre><code>darkmux mission launch draft-blog-post</code></pre>
     <p>This resolves the config (user tier first, then any on-disk template, then an embedded built-in), validates it, and mints a running mission INSTANCE: <code>mission.json</code>, one <code>phases/&lt;id&gt;.json</code> per declared phase, and a <code>config-snapshot.json</code>, a frozen copy of the resolved config alongside the instance, so a later edit to the source config never orphans an already-running instance's own record of what it ran. For a config whose phases have no tasks (as above), <code>launch</code> mints the instance and starts the mission, then leaves the work to you: do each phase by hand (or via ad-hoc <code>darkmux dispatch</code> calls), and when the whole mission is done, close it out with <code>darkmux mission finalize draft-blog-post</code> (or <code>darkmux mission abort draft-blog-post</code> to kill it). The mission graph derives phase status; the whole-mission terminals reconcile the phases for you.</p>
-    <p>With no inputs supplied, the instance id IS the config id, so the follow-up commands use the same name you launched. When you pass <code>--input</code>/<code>--param</code> values, the instance id gets a short deterministic suffix derived from those values, so different inputs launch distinct instances; the launch output prints the exact id either way.</p>
+    <p>Every launch mints a fresh, unique instance id — <code>&lt;config-id&gt;-&lt;unix-secs&gt;-&lt;6-hex-token&gt;</code> — whether or not you pass <code>--input</code>/<code>--param</code> values (#1503: two launches of the same config are two <em>different</em> pieces of AI work, never collapsed onto one id). The launch output prints the exact id; use it verbatim for the follow-up commands. Launches of the same config sharing the same inputs are grouped for later comparison via a separate <code>spec</code> fingerprint recorded on the instance (a hash of the collected inputs) — useful for corpus analysis — but that fingerprint is never the instance id itself.</p>
     <p>A config can declare runtime-only <code>inputs</code> it needs from its launcher (see the built-in <code>coder-phase</code> config for a worked example: it needs a worktree path, a branch, and a base ref). Supply them with a JSON file or individual overrides:</p>
     <pre><code>darkmux mission launch coder-phase \
   --input inputs.json \
   --param role=coder \
   --param branch=my-feature</code></pre>
-    <p><code>--param</code> always wins over the same key in <code>--input</code>'s file. Launching a config with a missing required input bails loud, listing exactly what's missing plus a copy-pasteable example of both forms. Launching the SAME config with the SAME inputs twice is idempotent: it derives the same instance id both times and reopens a terminal (finalized) instance rather than minting a duplicate.</p>
+    <p><code>--param</code> always wins over the same key in <code>--input</code>'s file. Launching a config with a missing required input bails loud, listing exactly what's missing plus a copy-pasteable example of both forms. Launching the SAME config with the SAME inputs twice is <strong>not</strong> idempotent: each call mints a distinct fresh instance (#1503 removed the old reuse/reopen-by-derived-id path entirely — there's no terminal instance to silently reopen, and no way for a relaunch to collide with a prior run's id).</p>
     <p>Exit codes: <code>0</code> for a freeform mint, or a coder-phase run whose QA came back clean or flags-only (the run stops at the sign-off gate with the phase still Running); <code>1</code> for a coder dispatch error; <code>2</code> when QA found blockers to resolve before shipping; <code>3</code> when QA could not run and manual review is required; <code>4</code> when the instance was minted but the graph uses step kinds this launcher cannot execute yet.</p>
 
     <h3>Mission JSON shape</h3>
@@ -284,6 +284,77 @@ darkmux mission add-phase &lt;mission-id&gt; \
 
 <section>
   <div class="wrap">
+    <h2 id="task-step-graphs">Task/Step graphs: authoring an automated phase</h2>
+    <p>The freeform config shape above (a phase with no <code>tasks</code>) covers manual, hand-driven work. The <code>coder-phase</code> and <code>review</code> built-ins are the other end of the same schema: a phase whose <code>tasks</code> array declares a real dependency graph that <code>mission launch</code> executes end-to-end, no per-step dispatch required. This section documents that graph shape directly from the schema and the two shipped built-ins — read <code>templates/builtin/mission-configs/coder-phase.json</code> and <code>review.json</code> alongside this section; they're the canonical worked examples, and every claim below is grounded in them.</p>
+
+    <h3>Document shape: phases → tasks → steps</h3>
+    <p>A phase's <code>tasks</code> array holds task documents; each task's <code>steps</code> array holds step documents. The fields that matter for authoring a graph (the full struct shape lives in <code>crates/darkmux-crew/src/mission_config/mod.rs</code>):</p>
+    <ul>
+      <li><strong>Task:</strong> <code>id</code>, <code>description</code>, an optional <code>display_name</code> (a short operator-facing label; falls back to <code>id</code> when absent), <code>depends_on</code> (a list of other task ids — <em>document-wide</em>, not phase-scoped: a task can depend on a task from an earlier phase), an optional <code>role_id</code> (the default crew role this task dispatches, e.g. <code>"coder"</code> — a launcher's declared <code>inputs</code> may override it per launch), and its own <code>steps</code> array.</li>
+      <li><strong>Step:</strong> <code>id</code>, <code>kind</code> (a registered <code>StepKind</code> id — see below), and <code>config</code> (a step-kind-specific JSON object, opaque to the schema itself). Steps within one task run in document order, each depending on the one before it — there's no per-step <code>depends_on</code> field.</li>
+    </ul>
+    <pre><code>{
+  "id": "build",
+  "tasks": [
+    {
+      "id": "build-coder",
+      "description": "dispatch `coder` into the worktree",
+      "depends_on": ["build-worktree"],
+      "role_id": "coder",
+      "steps": [
+        { "id": "build-coder-step", "kind": "mission.coder", "config": null }
+      ]
+    }
+  ]
+}</code></pre>
+    <p>Both built-ins declare <code>"schema_version": "1.3"</code> (the current mission-config schema); a document that omits <code>schema_version</code> still loads and validates cleanly — absence isn't drift, just an unlabeled document.</p>
+
+    <h3>The phase-id prefix substitution rule</h3>
+    <p>A task/step id can be written with the OWNING phase's own config id as a literal prefix. The <code>coder-phase</code> built-in does exactly this: its phase is <code>"id": "build"</code>, its tasks are <code>build-worktree</code>/<code>build-coder</code>/<code>build-verify</code>, and their steps are <code>build-worktree-step</code>/<code>build-coder-step</code>/<code>build-verify-step</code>. At launch time, <code>mission launch</code> composes the REAL phase id for the running instance (e.g. <code>deploy-rewrite-s1-baseline</code>), and the interpreter (<code>mission_config::interpret</code>) substitutes that real id for the literal <code>build-</code> prefix everywhere it appears as a prefix — so what's persisted is <code>deploy-rewrite-s1-baseline-worktree</code>, never the document's own placeholder <code>build-worktree</code>. The substitution requires the literal <code>-</code> separator, so a phase id like <code>build</code> can't accidentally match an unrelated id like <code>buildup-task</code>.</p>
+    <p>A document whose ids carry NO such prefix passes through verbatim instead — this is the <code>review</code> built-in's convention: its phase is <code>"id": "investigate"</code>, but its tasks are fixed literals like <code>review-bundle-task</code>, never <code>investigate-bundle-task</code>. Both conventions are valid; a config's own top-level <code>description</code> should say which one it uses (both built-ins do, in their first sentence).</p>
+
+    <h3>Step-kind tiers</h3>
+    <p>A step's <code>kind</code> must resolve against a registered <code>StepKind</code> implementation. darkmux enforces a three-tier decision procedure for where a new kind's Rust implementation lives (see <code>CLAUDE.md</code>'s "StepKind tiering" section for the full rationale — the short version: is the CONTROL FLOW itself new?). As a config author, what matters is which kinds are available to write into a <code>config</code> block:</p>
+    <table>
+      <tr><th>Tier</th><th>Lives at</th><th>What</th></tr>
+      <tr>
+        <td>1 — generic builtins</td>
+        <td><code>crates/darkmux-crew/src/step_kinds/builtins.rs</code></td>
+        <td><code>dispatch.internal</code>, <code>dispatch.single_shot</code>, <code>dispatch.map</code>, <code>procedural.shell</code>, <code>procedural.noop</code> — config-driven, no mission-specific code behind them. Always available; check here first before assuming a new kind is needed.</td>
+      </tr>
+      <tr>
+        <td>2 — reusable patterns</td>
+        <td><code>crates/darkmux-crew/src/step_kinds/patterns/</code></td>
+        <td>Reusable control-flow SHAPES (<code>dedup</code>, <code>multi_pass_confirm</code>) with the domain-specific algorithm plugged in per caller. Not directly nameable in a <code>kind</code> field — they're Rust-level building blocks a Tier 3 kind wraps (e.g. <code>review.dedup</code>'s implementation calls the Tier 2 <code>dedup</code> pattern internally).</td>
+      </tr>
+      <tr>
+        <td>3 — bespoke</td>
+        <td>Co-located with the owning mission module: <code>crates/darkmux-lab/src/lab/review.rs</code> (review's <code>review.*</code> kinds) and <code>src/coder_phase.rs</code> (coder-phase's <code>mission.*</code> kinds)</td>
+        <td>Single-purpose, genuinely new control flow. Never lives in <code>darkmux-crew</code>.</td>
+      </tr>
+    </table>
+    <p><code>darkmux mission launch</code> resolves every kind it can construct — Tier 1 plus both pipelines' Tier 3 kinds — against one shared registry. A config naming a kind outside that set still loads and mints an instance (lenient-on-read), but the launch can't execute the step.</p>
+
+    <h3>Naming contracts that are load-bearing</h3>
+    <p>Both built-in graphs are located by their launchers before execution, and the two pipelines take different (and, as of the #1530 arc, converging) approaches — worth knowing before you copy either one.</p>
+
+    <h4>coder-phase</h4>
+    <p>The pre-gate steps are found by a fixed naming CONVENTION composed from the real phase id: <code>&lt;phase-id&gt;-worktree-step</code> (kind <code>mission.worktree</code>) and <code>&lt;phase-id&gt;-coder-step</code> (kind <code>mission.coder</code>). The sign-off gate step is instead resolved by DECLARATION: the launcher asks every registered kind whether it's the gate (<code>StepKind::is_gate()</code> — <code>mission.verify</code> is the one kind that answers yes today), falling back to the fixed <code>&lt;phase-id&gt;-verify-step</code> id only if no kind claims the role. Separately, the operator-facing overrides (<code>--param role=</code>/<code>image=</code>/<code>workdir=</code>) attach to whichever task DECLARES the <code>mission.coder</code>/<code>mission.verify</code> step kind, not to a literal task id — so a copied, renamed config still receives them. Net effect: match the built-in's step-id convention for the worktree/coder steps, give your coder/verify steps the right kinds, and a renamed copy keeps working end-to-end.</p>
+
+    <h4>review</h4>
+    <p>The launcher (<code>build_review_graph_from_config</code> in <code>crates/darkmux-lab/src/lab/review.rs</code>) locates four steps by FIXED id — <code>review-bundle-step</code>, <code>review-judge-step</code>, <code>review-verify-step</code>, <code>review-verify-render-step</code> — where it stamps run-time config (the bundle source, judge concurrency, the verify seat's identity). Rename any of these four and the launch fails outright. It locates two others STRUCTURALLY, by kind — the dedup step (kind <code>review.dedup</code>) and the synthesis step (kind <code>review.synthesis</code>) — specifically so a hand-edited user-tier <code>review.json</code> that renames those steps still builds and runs. Probe roles are discovered the same structural way: <em>any</em> role-bearing task the document declares is classified as a probe UNLESS its step kind marks it as the judge (<code>review.judge</code>) or verify (<code>review.verify-render</code>) task — so adding or removing a probe role is a config edit (a new task with its own <code>role_id</code>, depending only on the bundle task), never a Rust change.</p>
+
+    <h3>Named config variants</h3>
+    <p>Routing to a launcher is now structural — which step KINDS a graph declares, not what its <code>id</code> is — so you can save a differently-named variant of either built-in and launch it directly; darkmux dispatches it to the same launcher because it still carries the review (or coder-phase) kinds. Copy the built-in JSON to <code>~/.darkmux/mission-configs/&lt;new-id&gt;.json</code>, edit its <code>id</code> field and whatever else you're tuning (probe role count, a different coder role default, judge concurrency), then launch by the new name:</p>
+    <pre><code>cp templates/builtin/mission-configs/review.json ~/.darkmux/mission-configs/review-lean.json
+<span class="comment"># edit review-lean.json: trim to two probe tasks, set "id": "review-lean"</span>
+darkmux mission launch review-lean --param diff_file=...  <span class="comment"># routes to the review launcher — same kinds, different id</span></code></pre>
+    <p><code>darkmux doctor</code> validates every discoverable mission config (user tier, then on-disk templates, then the embedded built-ins) — structural findings (dangling <code>depends_on</code>, duplicate or empty ids) and schema-version drift surface there before you launch, not mid-run.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
     <h2>Standalone QA: the review funnel</h2>
     <p><code>darkmux mission launch review</code> runs a code review against the current branch's diff vs. base. It's a full funnel — bundle → probe → dedup → judge → verify → synthesis — that dispatches the <code>code-reviewer</code> role and emits a verdict. This is the standalone form of the same QA the <code>coder-phase</code> pipeline runs automatically at its sign-off gate.</p>
     <pre><code>darkmux mission launch review     <span class="comment"># review the current branch's diff vs. the base branch</span></code></pre>
@@ -308,8 +379,8 @@ darkmux mission add-phase &lt;mission-id&gt; \
     <h3><code>mission launch coder-phase</code>: worktree → coder → QA, then stop</h3>
     <pre><code>darkmux mission launch coder-phase --param workdir=&lt;path&gt; --param branch=&lt;name&gt; --param base=main
 darkmux mission launch coder-phase --param workdir=&lt;path&gt; --param branch=&lt;name&gt; --param base=main --param role=coder --timeout 600</code></pre>
-    <p>What happens: darkmux mints (or idempotently reuses) the mission instance, creates an isolated git worktree + branch off <code>base</code>, dispatches the coder role into it (default role: <code>coder</code>, override with <code>--param role=&lt;id&gt;</code>), then runs the local <code>code-reviewer</code> QA against the resulting diff: the same QA <code>mission launch review</code> runs standalone, but wired in automatically here. It surfaces the coder's result, the tokens-off-meter figure, and the QA findings, then <strong>stops</strong>: nothing is committed, pushed, or PR'd yet. The phase stays <code>Running</code> at the gate; adjudicating the findings is still your call (or the frontier orchestrator's). The launch gets you to a reviewed diff, not to a merged PR — the frontier ships the git work by hand and <code>mission finalize</code> (or <code>mission abort</code>) finishes the loop.</p>
-    <p>If a worktree already exists at the target path, the launch bails loud rather than guessing. Relaunching with the same params reuses the same instance rather than minting a duplicate.</p>
+    <p>What happens: darkmux mints a fresh mission instance (#1503 — every launch mints a new id; there's no reuse or reopen of a prior run), creates an isolated git worktree + branch off <code>base</code>, dispatches the coder role into it (default role: <code>coder</code>, override with <code>--param role=&lt;id&gt;</code>), then runs the local <code>code-reviewer</code> QA against the resulting diff: the same QA <code>mission launch review</code> runs standalone, but wired in automatically here. It surfaces the coder's result, the tokens-off-meter figure, and the QA findings, then <strong>stops</strong>: nothing is committed, pushed, or PR'd yet. The phase stays <code>Running</code> at the gate; adjudicating the findings is still your call (or the frontier orchestrator's). The launch gets you to a reviewed diff, not to a merged PR — the frontier ships the git work by hand and <code>mission finalize</code> (or <code>mission abort</code>) finishes the loop.</p>
+    <p>If a worktree already exists at the target path, the launch bails loud rather than guessing. Since relaunching always mints a brand-new instance (see above), relaunching with the same params does <strong>not</strong> reuse a prior run — an unfinalized prior run's worktree simply collides instead of being silently adopted. Finalize or abort the prior run (or remove its worktree with <code>git worktree remove</code>) before relaunching into the same path.</p>
 
     <h3><code>mission finalize</code>: ship the git work by hand, then close out</h3>
     <p>darkmux no longer runs git or gh for you. Once you've adjudicated the QA findings at the gate, your frontier orchestrator ships the change by hand, then <code>mission finalize</code> closes out the darkmux-side state:</p>
