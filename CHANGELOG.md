@@ -11,11 +11,17 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-07-28
+
 **Composable mission graphs.** Step kinds are now stateless singletons in one
 registry, launchers route on what a graph *declares* rather than what it is
 *named*, and every pipeline produces its own input inside the graph instead of
 in a bespoke pre-launch prelude. The practical upshot: you can store review
 variants and launch them by name, and a graph can be extended from either end.
+
+No schema-version bumps (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`, all
+lenient-on-read) — a 2.2 install upgrades in place, and a 2.2 peer stays
+wire-compatible.
 
 ### Added
 - **Named mission-config variants launch by name.** Store
@@ -67,6 +73,22 @@ variants and launch them by name, and a graph can be extended from either end.
 - **`ProfileModel.capabilities` was documented as inert; it is not.** Model
   selection scores against it, so populating it changes which model a role
   dispatches to.
+- **The dashboard was slow to load AND could show stale data** — the viewer is
+  now served with `Cache-Control: no-cache` plus an `ETag`, so a reload
+  revalidates in zero bytes instead of re-fetching ~256 KB, and can never serve
+  a stale page. Previously it carried no cache metadata at all, leaving the
+  browser to choose between the two.
+- **41% of local tokens were counted but never classified.** Map-dispatched
+  work (the review probe and verify seats) reported only a total, so the fleet
+  card's `generated` / `fresh input` / `re-read` chips silently under-reported
+  against their own headline. The per-call prompt/completion split now travels
+  with the result. Providers that report only a total still leave the split
+  absent rather than claiming a zero.
+- **The 24h activity window read `11:38:41–11:38:41`** — a time-only label
+  can't distinguish two instants exactly a day apart. The range now carries the
+  date when the window straddles a day boundary.
+
+[2.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.3.0
 
 ## [2.2.0] - 2026-07-25
 
