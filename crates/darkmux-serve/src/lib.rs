@@ -192,12 +192,67 @@ fn inject_mode_meta(html: &str, mode: &str, date: Option<&str>) -> String {
 /// `assets/viewer.html` by `scripts/build-demo.sh` and fed a committed flow
 /// file (`docs/demo/demo-flow.jsonl`) — identical to a local `/play`, not a
 /// separate fork.
-async fn root_html() -> impl IntoResponse {
+async fn root_html(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    html_response(&headers, inject_mode_meta(VIEWER_HTML, "live", None))
+}
+
+/// Strong validator for an HTML document, so a browser can revalidate
+/// cheaply instead of choosing between the two bad options it has when a
+/// response carries NO cache metadata at all: re-download the whole ~256 KB
+/// page on every load, or serve a heuristically-cached copy without asking.
+///
+/// Found by the 2.3.0 release dogfood — the operator's viewer was both slow
+/// to load AND showing stale data, and both symptoms trace to this one
+/// omission. The vendored-bundle comment below (`vendor_reactflow_js`)
+/// assumed "a stale browser cache is cleared by a normal page reload"; that
+/// assumption does not hold for a document served with no validator, since
+/// a heuristic cache is free to skip revalidation entirely.
+///
+/// FNV-1a rather than a hashing crate: the dep set is deliberately small
+/// (see CLAUDE.md — a short inline routine beats a crate for a one-off), and
+/// the daemon serves a fixed handful of documents whose bytes are fixed at
+/// compile time, so this is a change-detector, not a security primitive.
+fn html_etag(body: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in body.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("\"{h:016x}\"")
+}
+
+/// Serve an HTML document with `Cache-Control: no-cache` + an `ETag`, and
+/// answer a matching `If-None-Match` with `304 Not Modified`.
+///
+/// `no-cache` does NOT mean "don't cache" — it means "cache, but revalidate
+/// before reuse", which is exactly right for a document that changes on
+/// every darkmux build. Paired with the ETag, the common case costs a
+/// zero-byte 304 instead of a full re-download, so the page can never be
+/// stale AND is cheaper to reload than it was before.
+fn html_response(headers: &axum::http::HeaderMap, body: String) -> Response {
+    let etag = html_etag(&body);
+    // `If-None-Match` may carry a comma-separated list; match any member.
+    let unchanged = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|c| c.trim() == etag));
+    if unchanged {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [("cache-control", "no-cache"), ("etag", etag.as_str())],
+        )
+            .into_response();
+    }
     (
         StatusCode::OK,
-        [("content-type", "text/html; charset=utf-8")],
-        inject_mode_meta(VIEWER_HTML, "live", None),
+        [
+            ("content-type", "text/html; charset=utf-8"),
+            ("cache-control", "no-cache"),
+            ("etag", etag.as_str()),
+        ],
+        body,
     )
+        .into_response()
 }
 
 /// Serve the PLAYBACK observability viewer at `GET /play/:date`. Same HTML
@@ -207,14 +262,9 @@ async fn root_html() -> impl IntoResponse {
 /// playback view that isn't disrupted by today's incoming records.
 ///
 /// Returns 404 for malformed dates. The viewer expects UTC `YYYY-MM-DD`.
-async fn play_html(Path(date): Path<String>) -> impl IntoResponse {
+async fn play_html(Path(date): Path<String>, headers: axum::http::HeaderMap) -> impl IntoResponse {
     match is_valid_date(&date) {
-        Some(valid) => (
-            StatusCode::OK,
-            [("content-type", "text/html; charset=utf-8")],
-            inject_mode_meta(VIEWER_HTML, "play", Some(valid)),
-        )
-            .into_response(),
+        Some(valid) => html_response(&headers, inject_mode_meta(VIEWER_HTML, "play", Some(valid))),
         None => (
             StatusCode::NOT_FOUND,
             [("content-type", "text/plain; charset=utf-8")],
@@ -1359,12 +1409,8 @@ async fn phases_handler() -> axum::Json<serde_json::Value> {
 /// itself always loads and reports the fetch error inline (item 6's
 /// graceful-degradation posture extends to "id doesn't exist" too, not just
 /// "mission has no task/step data").
-async fn mission_graph_html() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("content-type", "text/html; charset=utf-8")],
-        MISSION_GRAPH_HTML,
-    )
+async fn mission_graph_html(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    html_response(&headers, MISSION_GRAPH_HTML.to_string())
 }
 
 /// `GET /mission/:id/graph.json` — the node/edge snapshot
@@ -1418,9 +1464,13 @@ async fn mission_graph_json_handler(
 /// bundle is content-addressed by the daemon's own build (a new darkmux
 /// version ships a new bundle at a byte-identical URL, but daemons are
 /// short-lived personal processes, not a CDN-fronted deploy — a stale
-/// browser cache is cleared by a normal page reload after upgrade, matching
-/// how `VIEWER_HTML` itself is served with no special caching headers
-/// either way).
+/// browser cache is cleared by a normal page reload after upgrade).
+///
+/// The HTML documents do NOT share this policy: they carry
+/// `Cache-Control: no-cache` + an `ETag` (see [`html_response`]), because
+/// unlike this bundle they change on every darkmux build, and the 2.3.0
+/// dogfood showed that serving them with no validator produces exactly the
+/// stale-page-on-reload failure this comment used to assume away.
 async fn vendor_reactflow_js() -> impl IntoResponse {
     (
         StatusCode::OK,

@@ -722,6 +722,28 @@ pub struct MapItemResult {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+    /// (#1530 dogfood) The `usage.prompt_tokens` / `usage.completion_tokens`
+    /// split alongside the total. `SingleShotReply` has carried both since
+    /// #1361 — added there specifically so callers could emit a
+    /// `telemetry.tokens` record the fleet dashboard's `tokensOffMeter()`
+    /// can classify, since that function reads the SPLIT fields and only
+    /// sums `total_tokens` into the headline.
+    ///
+    /// They were dropped on the way through this struct when the review
+    /// pipeline's probe/verify stages migrated onto `dispatch.map` (#1442),
+    /// which made every map-dispatched call headline-visible but
+    /// classification-invisible: the 2.3.0 dogfood measured 62,047 of
+    /// 152,271 local tokens (41%) landing in no chip at all, because
+    /// `GENERATED` reads `completion_tokens` and `fresh`/`re-read`/
+    /// `unclassified` read `prompt_tokens`, and both were null.
+    ///
+    /// Still `Option` — a provider that reports only a total leaves these
+    /// `None` and the emitter below omits them rather than inventing a
+    /// split (the no-fabrication rule that governed the original code).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_model: Option<String>,
     #[serde(default)]
@@ -1152,11 +1174,18 @@ impl DispatchMapStepKind {
             // source: tokens` records ONLY) stays sighted on map-dispatched
             // work — the review pipeline's probe/verify stages ride this
             // block now, and their per-call telemetry emission retired with
-            // their bespoke kinds. Only the honestly-known field is carried
-            // (the accumulated `total_tokens`); the per-reply prompt/
-            // completion split is not surfaced by [`MapItemResult`] and is
-            // NEVER fabricated here.
-            if let Some(total) = res.total_tokens {
+            // their bespoke kinds.
+            //
+            // (#1530 dogfood) The prompt/completion SPLIT rides along now
+            // that [`MapItemResult`] carries it. It is not decoration: the
+            // dashboard's `tokensOffMeter()` sums `total_tokens` into the
+            // headline but classifies via the split, so emitting the total
+            // alone made every map-dispatched call headline-visible and
+            // chip-invisible — 41% of the 2.3.0 dogfood's local tokens
+            // landed in no bucket. Still never FABRICATED: a provider that
+            // reported no split leaves both fields `None`, and the payload
+            // omits them entirely rather than claiming a zero.
+            if let Some(payload) = map_item_token_payload(&res) {
                 push(
                     crate::dispatch::build_telemetry_record(
                         darkmux_flow::Level::Info,
@@ -1167,7 +1196,7 @@ impl DispatchMapStepKind {
                         Some(model),
                         None,
                         None,
-                        serde_json::json!({ "total_tokens": total }),
+                        payload,
                     ),
                     &mut batched,
                 );
@@ -1229,6 +1258,85 @@ fn item_total_tokens(any_usage: bool, sum: u64) -> Option<u64> {
     any_usage.then_some(sum)
 }
 
+/// (#1530 dogfood) The `prompt_tokens`/`completion_tokens` sibling of
+/// [`item_total_tokens`], with the SAME honesty rule: accumulate across every
+/// attempt, but report `None` unless at least one attempt actually carried a
+/// split. A provider that returns only `usage.total_tokens` therefore leaves
+/// both fields absent rather than reporting a fabricated `0` — which the
+/// dashboard would read as "this dispatch generated nothing", a worse lie
+/// than "unknown".
+///
+/// Tracked separately from `any_usage` on purpose: a reply can carry a total
+/// without a split, so the two flags are genuinely independent.
+fn item_split_tokens(any_split: bool, sum: u64) -> Option<u64> {
+    any_split.then_some(sum)
+}
+
+/// (#1530 dogfood) Pure: one map item's `telemetry.tokens` payload, or
+/// `None` when the item reported no usage at all (no record is emitted then
+/// — pre-existing behavior). Split out from the emitter so the payload SHAPE
+/// is unit-testable without a flow sink, the same pure-payload/emitter
+/// division `turn_tokens_payload` and `review_token_telemetry_payload` use.
+///
+/// The split fields are omitted, never zeroed, when the provider didn't
+/// report them. NOTE the sibling emitter `review_token_telemetry_payload`
+/// (`darkmux-lab`'s `review.rs`) takes the OPPOSITE approach and fabricates
+/// a split from the total; both feed the same `telemetry.tokens` family, and
+/// reconciling them onto one policy is deliberate follow-up, not an
+/// oversight — do not "fix" one to match the other without deciding which is
+/// right for both.
+///
+/// `total_tokens` falls back to `prompt + completion` when the provider
+/// reported a split but no total (`single_shot.rs` reads all three fields
+/// independently, so that combination is representable). That is ARITHMETIC
+/// on reported numbers, not fabrication, and it matches what the viewer's
+/// own `tokensOffMeter()` already does for the single-shot hosted path.
+/// Without it, a split the item genuinely had would be dropped entirely —
+/// the exact class of loss this function exists to close.
+fn map_item_token_payload(res: &MapItemResult) -> Option<serde_json::Value> {
+    let total = res.total_tokens.or_else(|| match (res.prompt_tokens, res.completion_tokens) {
+        (None, None) => None,
+        (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
+    })?;
+    let mut payload = serde_json::json!({ "total_tokens": total });
+    let obj = payload.as_object_mut().expect("json! built an object");
+    if let Some(p) = res.prompt_tokens {
+        obj.insert("prompt_tokens".into(), serde_json::json!(p));
+    }
+    if let Some(c) = res.completion_tokens {
+        obj.insert("completion_tokens".into(), serde_json::json!(c));
+    }
+    Some(payload)
+}
+
+/// (#1530 dogfood) Fold one reply's usage split into the running per-item
+/// accumulators. Shared by the local and hosted arms so both report
+/// identically — the token-accounting parity [`map_local_item`] and
+/// [`map_hosted_item`] already keep for the total.
+///
+/// ASSUMPTION worth naming: a provider is expected to report usage
+/// CONSISTENTLY across the attempts of one item. If attempt 1 returns a
+/// total with no split and attempt 2 returns both, the item's accumulated
+/// `total` covers both attempts while its split covers only the second, so
+/// the dashboard's `total == prompt + completion` identity drifts for that
+/// item. Nothing renders wrong (the unclassified bucket only ever adds), and
+/// no provider we dispatch to behaves this way — recorded so a future reader
+/// who hits it knows it was considered rather than missed.
+fn accumulate_split(
+    reply_prompt: Option<u64>,
+    reply_completion: Option<u64>,
+    psum: &mut u64,
+    csum: &mut u64,
+    any_split: &mut bool,
+) {
+    if reply_prompt.is_none() && reply_completion.is_none() {
+        return;
+    }
+    *psum += reply_prompt.unwrap_or(0);
+    *csum += reply_completion.unwrap_or(0);
+    *any_split = true;
+}
+
 /// (#1442) One LOCAL map item — dispatch, with the generic `retry_on_empty`
 /// loop (default 0/off). Tokens accumulate across every attempt; the loop
 /// stops early on the first non-empty reply; a dispatch `Err` isolates as
@@ -1249,6 +1357,8 @@ fn map_local_item(
     use crate::single_shot::{single_shot_chat, SingleShotRequest};
     let mut sum = 0u64;
     let mut any_usage = false;
+    // (#1530 dogfood) Parallel to `sum`/`any_usage`, for the usage SPLIT.
+    let (mut psum, mut csum, mut any_split) = (0u64, 0u64, false);
     // (#1442) Cumulative dispatch wall-clock across every attempt — the same
     // per-attempt accumulation `sum` (tokens) uses. A LOCAL item's
     // `served_model` is ALWAYS `None` by construction (see [`MapItemResult`]'s
@@ -1288,6 +1398,13 @@ fn map_local_item(
                     sum += t;
                     any_usage = true;
                 }
+                accumulate_split(
+                    reply.prompt_tokens,
+                    reply.completion_tokens,
+                    &mut psum,
+                    &mut csum,
+                    &mut any_split,
+                );
                 if !reply.content.trim().is_empty() {
                     return MapItemResult {
                         index,
@@ -1295,6 +1412,8 @@ fn map_local_item(
                         content: reply.content,
                         error: None,
                         total_tokens: item_total_tokens(any_usage, sum),
+                        prompt_tokens: item_split_tokens(any_split, psum),
+                        completion_tokens: item_split_tokens(any_split, csum),
                         served_model: None,
                         wall_ms,
                     };
@@ -1309,6 +1428,8 @@ fn map_local_item(
                     content: String::new(),
                     error: Some(format!("{e:#}")),
                     total_tokens: item_total_tokens(any_usage, sum),
+                    prompt_tokens: item_split_tokens(any_split, psum),
+                    completion_tokens: item_split_tokens(any_split, csum),
                     served_model: None,
                     wall_ms,
                 }
@@ -1324,6 +1445,8 @@ fn map_local_item(
         content: String::new(),
         error: None,
         total_tokens: item_total_tokens(any_usage, sum),
+        prompt_tokens: item_split_tokens(any_split, psum),
+        completion_tokens: item_split_tokens(any_split, csum),
         served_model: None,
         wall_ms,
     }
@@ -1352,6 +1475,8 @@ fn map_hosted_item(
     use crate::single_shot::HostedSingleShotRequest;
     let mut sum = 0u64;
     let mut any_usage = false;
+    // (#1530 dogfood) Parallel to `sum`/`any_usage`, for the usage SPLIT.
+    let (mut psum, mut csum, mut any_split) = (0u64, 0u64, false);
     // (#1442) Cumulative dispatch wall-clock across every attempt (the same
     // shape as `sum`), and the ENDPOINT-reported served model — captured from
     // the reply body's `model` field (last non-`None` across attempts wins, so
@@ -1377,6 +1502,9 @@ fn map_hosted_item(
                     content: String::new(),
                     error: Some(MAP_BUDGET_SKIP_ERROR.to_string()),
                     total_tokens: None,
+                    // No call fired, so there is no split to report either.
+                    prompt_tokens: None,
+                    completion_tokens: None,
                     served_model: None,
                     wall_ms,
                 };
@@ -1418,6 +1546,13 @@ fn map_hosted_item(
                     sum += t;
                     any_usage = true;
                 }
+                accumulate_split(
+                    reply.prompt_tokens,
+                    reply.completion_tokens,
+                    &mut psum,
+                    &mut csum,
+                    &mut any_split,
+                );
                 if reply.model.is_some() {
                     served_model = reply.model.clone();
                 }
@@ -1428,6 +1563,8 @@ fn map_hosted_item(
                         content: reply.content,
                         error: None,
                         total_tokens: item_total_tokens(any_usage, sum),
+                        prompt_tokens: item_split_tokens(any_split, psum),
+                        completion_tokens: item_split_tokens(any_split, csum),
                         served_model,
                         wall_ms,
                     };
@@ -1445,6 +1582,8 @@ fn map_hosted_item(
                     content: String::new(),
                     error: Some(format!("{e:#}")),
                     total_tokens: item_total_tokens(any_usage, sum),
+                    prompt_tokens: item_split_tokens(any_split, psum),
+                    completion_tokens: item_split_tokens(any_split, csum),
                     served_model,
                     wall_ms,
                 }
@@ -1457,6 +1596,8 @@ fn map_hosted_item(
         content: String::new(),
         error: None,
         total_tokens: item_total_tokens(any_usage, sum),
+        prompt_tokens: item_split_tokens(any_split, psum),
+        completion_tokens: item_split_tokens(any_split, csum),
         served_model,
         wall_ms,
     }
@@ -2103,6 +2244,121 @@ mod tests {
         assert_eq!(conservative_hosted_spend(None, 0), 0);
     }
 
+    /// (#1530 dogfood) A map item's `telemetry.tokens` record carries the
+    /// prompt/completion SPLIT, not just the total.
+    ///
+    /// This is the regression the 2.3.0 dogfood caught in production. The
+    /// fleet dashboard's `tokensOffMeter()` sums `total_tokens` into the
+    /// headline but CLASSIFIES via `prompt_tokens`/`completion_tokens`, so a
+    /// total-only record is counted and then bucketed nowhere: 62,047 of
+    /// 152,271 local tokens (41%) were headline-visible and chip-invisible
+    /// after the review probe/verify stages moved onto `dispatch.map`
+    /// (#1442). `SingleShotReply` had carried the split since #1361; it was
+    /// `MapItemResult` that dropped it on the floor.
+    #[test]
+    fn map_item_token_telemetry_carries_the_prompt_completion_split() {
+        let res = MapItemResult {
+            index: 0,
+            ok: true,
+            content: "x".to_string(),
+            error: None,
+            total_tokens: Some(4547),
+            prompt_tokens: Some(2490),
+            completion_tokens: Some(2057),
+            served_model: None,
+            wall_ms: 0,
+        };
+        let payload = map_item_token_payload(&res).expect("a reply with usage emits a record");
+        assert_eq!(payload["total_tokens"], 4547);
+        assert_eq!(payload["prompt_tokens"], 2490, "GENERATED/fresh/re-read read the split");
+        assert_eq!(payload["completion_tokens"], 2057);
+    }
+
+    /// The no-fabrication rule survives the fix: a provider reporting only a
+    /// total leaves the split OFF the payload entirely rather than claiming
+    /// a zero, which the dashboard would read as "generated nothing".
+    #[test]
+    fn map_item_token_telemetry_omits_an_unreported_split() {
+        let res = MapItemResult {
+            index: 0,
+            ok: true,
+            content: "x".to_string(),
+            error: None,
+            total_tokens: Some(1521),
+            prompt_tokens: None,
+            completion_tokens: None,
+            served_model: None,
+            wall_ms: 0,
+        };
+        let payload = map_item_token_payload(&res).expect("a total alone still emits");
+        assert_eq!(payload["total_tokens"], 1521);
+        assert!(payload.get("prompt_tokens").is_none(), "never fabricate a split");
+        assert!(payload.get("completion_tokens").is_none());
+    }
+
+    /// (#1530 dogfood, gate C1) A provider that reports a SPLIT but no total
+    /// still emits — the total is summed from the parts. `extract_reply`
+    /// reads all three `usage` fields independently, so this combination is
+    /// representable, and the old `total_tokens?` gate would have dropped
+    /// the record entirely, losing a split the item genuinely had.
+    #[test]
+    fn map_item_token_telemetry_derives_a_missing_total_from_the_split() {
+        let res = MapItemResult {
+            index: 0,
+            ok: true,
+            content: "x".to_string(),
+            error: None,
+            total_tokens: None,
+            prompt_tokens: Some(30),
+            completion_tokens: Some(12),
+            served_model: None,
+            wall_ms: 0,
+        };
+        let payload = map_item_token_payload(&res).expect("a split alone still emits");
+        assert_eq!(payload["total_tokens"], 42, "arithmetic on reported parts, not fabrication");
+        assert_eq!(payload["prompt_tokens"], 30);
+        assert_eq!(payload["completion_tokens"], 12);
+    }
+
+    /// An item that reported no usage at all emits NO record (pre-existing
+    /// behavior, pinned here so the payload refactor didn't change it).
+    #[test]
+    fn map_item_with_no_usage_emits_no_token_record() {
+        let res = MapItemResult {
+            index: 0,
+            ok: false,
+            content: String::new(),
+            error: Some("boom".to_string()),
+            total_tokens: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            served_model: None,
+            wall_ms: 0,
+        };
+        assert!(map_item_token_payload(&res).is_none());
+    }
+
+    /// The accumulator folds multi-attempt usage and keeps `None` honest.
+    #[test]
+    fn split_accumulates_across_attempts_and_stays_absent_when_never_reported() {
+        let (mut p, mut c, mut any) = (0u64, 0u64, false);
+        accumulate_split(None, None, &mut p, &mut c, &mut any);
+        assert!(!any, "a reply with no split must not arm the flag");
+        assert_eq!(item_split_tokens(any, p), None);
+
+        accumulate_split(Some(10), Some(4), &mut p, &mut c, &mut any);
+        accumulate_split(Some(7), Some(3), &mut p, &mut c, &mut any);
+        assert_eq!(item_split_tokens(any, p), Some(17));
+        assert_eq!(item_split_tokens(any, c), Some(7));
+
+        // A half-reported split still counts, with the missing half as 0 —
+        // the same "partial is better than nothing" rule `total` uses.
+        let (mut p2, mut c2, mut any2) = (0u64, 0u64, false);
+        accumulate_split(Some(5), None, &mut p2, &mut c2, &mut any2);
+        assert_eq!(item_split_tokens(any2, p2), Some(5));
+        assert_eq!(item_split_tokens(any2, c2), Some(0));
+    }
+
     #[test]
     fn dispatch_map_aggregate_record_sums_tokens_and_counts_outcomes() {
         // (#1442 gate C1) The one step-level aggregate: items_in, ok_count,
@@ -2110,9 +2366,9 @@ mod tests {
         // mission graph's max-fold token meter reads as the step's true
         // spend (any per-item value is <= the sum).
         let results = vec![
-            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), served_model: None, wall_ms: 0 },
-            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, served_model: None, wall_ms: 0 },
-            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), served_model: None, wall_ms: 0 },
+            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0 },
+            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0 },
+            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0 },
         ];
         let s = map_step(json!({}));
         let rec = DispatchMapStepKind::aggregate_record(&s, "m", true, &results);
@@ -2128,7 +2384,7 @@ mod tests {
             "any failed item raises the level"
         );
 
-        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), served_model: None, wall_ms: 0 }];
+        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0 }];
         let rec = DispatchMapStepKind::aggregate_record(&s, "m", false, &clean);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
         assert_eq!(rec.payload.as_ref().unwrap()["remote"], false);

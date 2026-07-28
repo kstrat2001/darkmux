@@ -826,6 +826,17 @@ const fmt=ms=>{ms=Math.max(0,ms);return Math.floor(ms/60000)+":"+String(Math.flo
 //   lday  = local date            ldt   = full local datetime (title hovers)
 const clk=t=>new Date(t).toLocaleTimeString([],{hour12:false});
 const clkhm=t=>new Date(t).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",hour12:false});
+// (#1530 dogfood) Activity-window range label. A time-only formatter cannot
+// distinguish two instants exactly 24h apart, so the 24h preset rendered as
+// "11:38:41–11:38:41" — a range whose endpoints read identical. Prefix each
+// end with its short date whenever the window straddles a day boundary; the
+// 10m/1h/4h presets are same-day and keep the bare clock they had.
+const sameDay=(a,b)=>new Date(a).toDateString()===new Date(b).toDateString();
+const clkrange=(a,b)=>{
+  if(sameDay(a,b))return `${clk(a)}–${clk(b)}`;
+  const d=t=>new Date(t).toLocaleDateString([],{month:"short",day:"numeric"});
+  return `${d(a)} ${clk(a)}–${d(b)} ${clk(b)}`;
+};
 const lday=t=>new Date(t).toLocaleDateString();
 const ldt=t=>new Date(t).toLocaleString([],{hour12:false});
 // (#691) Coarse relative-time. Past only (recent runs are completed).
@@ -1502,7 +1513,7 @@ function renderFleet(){
   // the full day, so no control there. data-act routes through ACTIONS.actwin.
   const winCtl=liveMode?`<span class="twin">${[{l:'10m',m:10},{l:'1h',m:60},{l:'4h',m:240},{l:'24h',m:1440}].map(p=>`<button class="twinb${state.activityWindowMin===p.m?' on':''}" data-act="actwin" data-arg="${p.m}">${p.l}</button>`).join('')}</span>`:'';
   const tl = ms.length
-    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr"><span>${liveMode?'recent activity':'activity'} · ${clk(tlMin)}–${clk(tlMax)}</span>${winCtl}</div>${lanes}${ax}</div>`
+    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr"><span>${liveMode?'recent activity':'activity'} · ${clkrange(tlMin,tlMax)}</span>${winCtl}</div>${lanes}${ax}</div>`
     : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
   $("stage").innerHTML=savingsHero()+`<div class="fleet">${cards}</div>`+tl;
 }
