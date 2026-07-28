@@ -4576,8 +4576,18 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             "the degenerate note must not name unreachable causes: {note}"
         );
         assert!(
-            note.contains("bundle(s)") && note.contains("staffed seat(s)"),
+            note.contains("bundle(s)") && note.contains("staffed probe seat(s)"),
             "it should report the counts that distinguish the real causes: {note}"
+        );
+        // (#1530) The seat count must be the REAL one. `env.members` is empty
+        // by construction in this branch (a member is pushed only when
+        // `draws > 0`, and the guard is `total_draws == 0`), so sourcing it
+        // there would render "across 0 staffed seat(s)" on a run that staffed
+        // several — the same misdirection this message was rewritten to stop.
+        assert!(
+            !note.contains("across 0 staffed"),
+            "the seat count must come from the staffing snapshot, not the (empty) member list: \
+             {note}"
         );
     }
 

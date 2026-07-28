@@ -454,19 +454,31 @@ pub fn run_step_graph(
     // the artifact, the kinds that need it, and how it gets supplied.
     {
         let mut unmet: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+        let mut unregistered: Vec<String> = Vec::new();
         let mut seen_kind_ids: HashSet<&str> = HashSet::new();
         for step in steps.values() {
             if !seen_kind_ids.insert(step.kind.as_str()) {
                 continue;
             }
-            if let Ok(kind) = kinds.get(&step.kind) {
-                for port in kind.requires() {
-                    if matches!(port.kind, crate::step_kinds::PortKind::Artifact(_))
-                        && !bus.has(port.name)
-                    {
-                        unmet.entry(port.name).or_default().push(step.kind.clone());
+            match kinds.get(&step.kind) {
+                Ok(kind) => {
+                    for port in kind.requires() {
+                        if matches!(port.kind, crate::step_kinds::PortKind::Artifact(_))
+                            && !bus.has(port.name)
+                        {
+                            unmet.entry(port.name).or_default().push(step.kind.clone());
+                        }
                     }
                 }
+                // (#1530) An UNREGISTERED kind contributes no `provides()` to
+                // the pre-scan above, so it can make a sibling's requirement
+                // look unmet — e.g. a stale user-tier config still naming
+                // `review.probe` (retired in #1442) loses that kind's ports and
+                // the operator gets "nothing provides review.probe-selection"
+                // instead of "unknown step kind". Track them so the message can
+                // name the real cause rather than misdirecting — which is the
+                // whole point of this change.
+                Err(_) => unregistered.push(step.kind.clone()),
             }
         }
         if !unmet.is_empty() {
@@ -480,7 +492,18 @@ pub fn run_step_graph(
                  nothing in the graph provides or seeds: {detail}. An artifact reaches the bus \
                  either from a step kind that declares it in `provides()` — so adding that kind's \
                  step to the graph supplies it — or from the launcher's `seed_artifacts`. Add the \
-                 providing step, or launch this config through the launcher that seeds it."
+                 providing step, or launch this config through the launcher that seeds it.{}",
+                if unregistered.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " NOTE: this graph also names {} unregistered step kind(s) ({}) — an \
+                         unregistered kind contributes no `provides()`, so fixing those may \
+                         resolve the requirement(s) above.",
+                        unregistered.len(),
+                        unregistered.join(", ")
+                    )
+                }
             );
         }
     }
@@ -2200,8 +2223,15 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let factory = || -> Box<dyn ModelHost> { Box::new(RecordingHost::default()) };
+        // (#1530) Seeded at a DIFFERENT concrete type than the port's factory
+        // produces (`u32`). That is deliberate: the check uses
+        // `ArtifactBus::has` (presence, type-agnostic), not `get::<T>()`
+        // (which returns `None` for a type mismatch too). Seeding `u32` here
+        // would pass under either implementation and prove nothing; a
+        // `String` passes ONLY under `has`, so this pins the distinction the
+        // check is built on.
         let seed: Vec<(&'static str, std::sync::Arc<dyn std::any::Any + Send + Sync>)> =
-            vec![("test.absent", std::sync::Arc::new(7u32))];
+            vec![("test.absent", std::sync::Arc::new(String::from("seeded")))];
 
         run_step_graph(
             &mut steps, &tasks, &kinds, &facts, &est, 1, &factory,
