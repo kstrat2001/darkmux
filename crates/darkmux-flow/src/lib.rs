@@ -760,6 +760,37 @@ const REDIS_DISABLE_THRESHOLD: u32 = 3;
 /// to make the cap operator-configurable.
 pub const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Wall-clock bound on a single Redis COMMAND's response (#1570).
+///
+/// [`REDIS_CONNECT_TIMEOUT`] bounds only the CONNECT phase. That leaves the
+/// failure mode an operator actually hit on 2026-07-29: a peer whose TCP port
+/// accepts (so `nc -z` succeeds and any reachability probe passes) but which
+/// never answers the command. The read then blocks indefinitely, the HTTP
+/// route's own 30s timeout fires first and returns 408, and
+/// `aggregate_flow_records_for_date`'s local-file fallback — which is correct
+/// and already written — is NEVER REACHED, because a hang is not an `Err`.
+/// Measured: `GET /flow/<a date with no records>` took 30.00s and 408'd with
+/// Redis enabled, 0.5ms with it disabled.
+///
+/// Applied with `set_read_timeout`/`set_write_timeout` at every SERVE-SIDE
+/// call site that takes a connection. NOT yet applied on the WRITE path —
+/// `RedisSink::route_xadd` below and `darkmux-fleet`'s queue still issue
+/// commands on unbounded connections, so the same accepts-but-never-answers
+/// peer can wedge a flow-record `XADD` from a CLI dispatch. Worse there than
+/// here, because a hang is not an `Err`, so `REDIS_DISABLE_THRESHOLD` never
+/// trips and the sink never self-disables. Tracked separately; do not read
+/// this constant as meaning the whole codebase is bounded. This is load-bearing beyond latency: wrapping the call
+/// in `tokio::time::timeout` is NOT sufficient on its own, because a timeout
+/// does not cancel an in-flight `spawn_blocking` task — without a socket-level
+/// deadline the blocking thread stays wedged forever and repeated requests
+/// leak the blocking pool.
+///
+/// 1s rather than 500ms: a command's round-trip legitimately costs more than a
+/// connect handshake (an `XREVRANGE COUNT 10000` over a tailnet moves real
+/// bytes), and unlike the connect bound this one is not paid per-write on the
+/// hot path — it is a ceiling on pathology, not a budget for healthy work.
+pub const REDIS_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
 /// Test-only env scrubber (#278). Tests in `flow::tests` write flow
 /// records via the default sink path which respects `DARKMUX_REDIS_URL`.
 /// An operator running tests from their daily shell with that var pointing

@@ -2816,36 +2816,105 @@ async fn aggregate_flow_records_for_date(
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     let redis_url = darkmux_flow::redis_url();
 
-    if let Some(url) = redis_url {
-        let date_owned = date.to_string();
-        let url_owned = url.clone();
-        let redis_result = tokio::task::spawn_blocking(move || {
-            read_flow_records_from_redis(url_owned.expose_for_probe(), &date_owned)
-        })
-        .await;
-        match redis_result {
-            Ok(Ok(records)) => return records,
-            Ok(Err(e)) => {
-                eprintln!(
-                    "darkmux serve: GET /flow/{date} Redis aggregation failed ({e}); \
-                     falling back to local file"
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "darkmux serve: GET /flow/{date} blocking task join error ({e}); \
-                     falling back to local file"
-                );
-            }
+    let Some(url) = redis_url else {
+        return read_flow_records_from_file(date, flows_dir).await;
+    };
+
+    // (#1570) LOCAL-FIRST, Redis as a bounded enhancement — run both
+    // CONCURRENTLY rather than serialising Redis ahead of a file already on
+    // disk. Redis is the richer source (fleet-merged across peers), so its
+    // result still WINS when it lands; but the local read is authoritative for
+    // this machine, costs ~9ms, and no longer waits behind an optional network
+    // hop. Measured before this change: 450ms for a day whose local file read
+    // takes 9ms — a 50x tax paid on every request for a source that is merely
+    // optional. A degraded Redis now degrades the VIEW to local-only; it can
+    // never block it.
+    let date_owned = date.to_string();
+    let url_owned = url.clone();
+    let redis_task = tokio::task::spawn_blocking(move || {
+        read_flow_records_from_redis(url_owned.expose_for_probe(), &date_owned)
+    });
+    let (redis_result, local_records) = tokio::join!(redis_task, read_flow_records_from_file(date, flows_dir));
+
+    match redis_result {
+        Ok(Ok(records)) => union_flow_records(records, local_records),
+        Ok(Err(e)) => {
+            eprintln!(
+                "darkmux serve: GET /flow/{date} Redis aggregation failed ({e}); \
+                 serving local file only"
+            );
+            local_records
+        }
+        Err(e) => {
+            eprintln!(
+                "darkmux serve: GET /flow/{date} blocking task join error ({e}); \
+                 serving local file only"
+            );
+            local_records
         }
     }
-
-    read_flow_records_from_file(date, flows_dir).await
 }
 
 /// XRANGE the flow stream + filter by `record.ts` matching `<date>`.
 /// Synchronous (uses the sync `redis::Client`) — call site wraps in
 /// `spawn_blocking` so the daemon's async runtime stays responsive.
+/// (#1570) UNION the Redis view with the local file rather than letting Redis
+/// REPLACE it.
+///
+/// Redis is the fleet-merged source, but it is NOT a superset of local: it
+/// rides a `MAXLEN ~` cap, and — the case that matters — it is missing
+/// everything written while it was unreachable. Preferring it wholesale
+/// therefore ERASES the outage window from the view the moment Redis returns.
+///
+/// Measured live 2026-07-29, after a peer came back from an unplanned sleep:
+/// `GET /flow/<today>` served 4 records while the local file held 4, with 2
+/// present only locally — including the `machine.online` record emitted DURING
+/// the outage. The store was intact; only the read path lost it.
+///
+/// Keyed to match the viewer's own `recKey` convention (`assets/viewer.html`)
+/// so both layers agree on what "the same record" means; the payload is part
+/// of the identity because two records can otherwise share every scalar field.
+/// Redis order is preserved and local-only records append — callers sort by
+/// `ts` downstream, and the viewer dedups again on its own key regardless.
+fn union_flow_records(
+    redis_records: Vec<serde_json::Value>,
+    local_records: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    fn key(r: &serde_json::Value) -> String {
+        let f = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        [
+            f("ts"),
+            f("machine_uid"),
+            f("session_id"),
+            f("action"),
+            f("source"),
+            f("handle"),
+            f("level"),
+            f("stage"),
+            r.get("payload").map(|p| p.to_string()).unwrap_or_default(),
+        ]
+        .join("\u{1f}")
+    }
+    let seen: std::collections::HashSet<String> = redis_records.iter().map(key).collect();
+    let mut out = redis_records;
+    out.extend(local_records.into_iter().filter(|r| !seen.contains(&key(r))));
+    out
+}
+
+/// (#1570) Apply the per-command response deadline to a freshly obtained
+/// connection. `get_connection_with_timeout` bounds only the CONNECT; without
+/// this, a peer that accepts TCP but never answers blocks the caller until the
+/// HTTP route's own timeout fires — and because that is a hang rather than an
+/// `Err`, every local-file fallback in this file is skipped.
+///
+/// Best-effort by design: a backend that does not support socket deadlines
+/// (a non-TCP connection kind) must not turn a working read into a failure, so
+/// the error is swallowed. The bound is a safety net, not a correctness input.
+fn bound_redis_response(conn: &redis::Connection) {
+    let _ = conn.set_read_timeout(Some(darkmux_flow::REDIS_RESPONSE_TIMEOUT));
+    let _ = conn.set_write_timeout(Some(darkmux_flow::REDIS_RESPONSE_TIMEOUT));
+}
+
 fn read_flow_records_from_redis(
     url: &str,
     date: &str,
@@ -2861,6 +2930,9 @@ fn read_flow_records_from_redis(
     let mut conn = client
         .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for /flow aggregation (date {date})"))?;
+    // (#1570) The connect above is bounded; the XREVRANGE below was not. This
+    // is the exact read that took 30s and 408'd the viewer.
+    bound_redis_response(&conn);
     let stream = darkmux_types::config_access::redis_stream(); // (#875)
     // (#809) NEWEST-first read. The stream rides at its `MAXLEN ~` cap once
     // the fleet has been busy long enough (XLEN floats a little above the
@@ -3402,6 +3474,7 @@ fn resolve_current_last_id(
     let mut conn = client
         .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for XINFO on {stream_name}"))?;
+    bound_redis_response(&conn); // (#1570)
     let raw: redis::RedisResult<redis::Value> = redis::cmd("XINFO")
         .arg("STREAM")
         .arg(stream_name)
@@ -3448,6 +3521,12 @@ fn xread_block_once(
     let mut conn = client
         .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for XREAD on {stream_name}"))?;
+    // (#1570) Safe alongside the long-poll: REDIS_RESPONSE_TIMEOUT (1s) sits
+    // deliberately ABOVE the 500ms BLOCK budget below, so a healthy long-poll
+    // that legitimately waits its full budget never trips the socket deadline —
+    // only a server that has stopped answering entirely does. Without it a
+    // wedged peer strands this tail thread for the daemon's lifetime.
+    bound_redis_response(&conn);
     let raw: redis::Value = redis::cmd("XREAD")
         .arg("BLOCK")
         .arg(500u64)

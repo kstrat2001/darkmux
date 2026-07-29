@@ -2139,6 +2139,141 @@
             );
         }
 
+        /// (#1570) `REDIS_RESPONSE_TIMEOUT` bounds a peer that answers the
+        /// handshake but then stops answering COMMANDS — the pathology the hub
+        /// exhibited on 2026-07-29 (measured: `/flow/:date` 30s+408 -> 1.4s+200).
+        ///
+        /// SCOPE, stated honestly: this does NOT cover a total black hole that
+        /// accepts TCP and answers nothing at all, including the handshake.
+        /// There the block lands inside `get_connection_with_timeout` — before
+        /// `bound_redis_response` can run — so the socket deadline is never
+        /// applied. Verified the hard way: an earlier version of this test used
+        /// a black-hole listener and hung past 60s WITH the fix in place.
+        /// Widening to cover that is tracked separately; do not read this fix
+        /// as bounding every unreachable-Redis shape.
+        ///
+        /// The bound here is a WALL CLOCK the test enforces itself: the call
+        /// runs on its own thread and the test fails on deadline rather than
+        /// hanging. No test may ever wedge the suite — two did today.
+        #[test]
+        fn read_flow_records_from_redis_is_deadline_bounded_not_open_ended() {
+            // Refused port: connect fails fast, the caller gets an Err, and the
+            // local-file fallback above it becomes reachable. This is the
+            // property that matters to the caller — bounded, not indefinite.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let r = super::read_flow_records_from_redis("redis://127.0.0.1:1", "2026-08-15");
+                let _ = tx.send((r.is_err(), started.elapsed()));
+            });
+
+            match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                Ok((is_err, elapsed)) => {
+                    assert!(is_err, "an unreachable peer must yield Err, not Ok");
+                    assert!(
+                        elapsed < std::time::Duration::from_secs(10),
+                        "took {elapsed:?} — the Redis attempt is not bounded"
+                    );
+                }
+                Err(_) => panic!(
+                    "read_flow_records_from_redis did not return within 15s — it is \
+                     blocking indefinitely, which is exactly the wedge #1570 exists \
+                     to prevent"
+                ),
+            }
+        }
+
+        /// (#1570) Redis must UNION with the local file, never replace it.
+        ///
+        /// The erase-on-recovery half of the bug: Redis is fleet-merged but is
+        /// NOT a superset — it rides a MAXLEN cap and, critically, is missing
+        /// everything written while it was unreachable. Preferring it wholesale
+        /// erased the outage window from the view the moment Redis returned.
+        ///
+        /// Measured live 2026-07-29 after a peer woke from an unplanned sleep:
+        /// `/flow/<today>` served 4 records against 4 on disk, with 2 present
+        /// only locally — including the `machine.online` record emitted DURING
+        /// the outage. The store was intact; only the read path lost it.
+        #[test]
+        fn redis_records_union_with_local_rather_than_replacing_them() {
+            let rec = |ts: &str, action: &str| {
+                serde_json::json!({ "ts": ts, "action": action, "handle": "h" })
+            };
+            // Overlapping record + one each only-Redis / only-local.
+            let shared = rec("2026-07-29T01:00:00Z", "shared");
+            let redis = vec![shared.clone(), rec("2026-07-29T03:00:00Z", "redis-only")];
+            let local = vec![
+                shared.clone(),
+                // written while Redis was unreachable — the record that vanished
+                rec("2026-07-29T02:51:56Z", "machine.online"),
+            ];
+
+            let out = super::union_flow_records(redis, local);
+
+            let actions: Vec<&str> = out
+                .iter()
+                .filter_map(|r| r.get("action").and_then(|v| v.as_str()))
+                .collect();
+            assert_eq!(out.len(), 3, "expected union, got {actions:?}");
+            assert!(actions.contains(&"redis-only"), "lost a Redis-only record");
+            assert!(
+                actions.contains(&"machine.online"),
+                "LOST THE OUTAGE-WINDOW RECORD — this is the reported bug"
+            );
+            assert_eq!(
+                actions.iter().filter(|a| **a == "shared").count(),
+                1,
+                "the overlapping record must not be duplicated"
+            );
+        }
+
+        /// (#1570) A date with NO local file and an unusable Redis must return
+        /// `200 []` promptly — never hang until the route's 30s timeout and 408.
+        ///
+        /// This is the operator-visible shape of the reported bug. The viewer's
+        /// `loadLiveWindow()` fetches TWO days (yesterday + today), so the first
+        /// request of a fresh UTC day hits exactly this path; measured live at
+        /// 30.00s + 408 before the fix, which read as "the viewer won't load."
+        ///
+        /// The bound that makes this pass is a socket-level response deadline
+        /// (`REDIS_RESPONSE_TIMEOUT`) — `get_connection_with_timeout` covers
+        /// only the connect. Note this test uses a REFUSED port, which fails
+        /// fast at connect; the pathological case in the field was a port that
+        /// ACCEPTS and then never answers, which no reachability probe catches
+        /// and which only the response deadline bounds.
+        #[tokio::test]
+        #[serial]
+        async fn flow_endpoint_returns_empty_not_408_for_a_date_with_no_records() {
+            let tmp = TempDir::new().unwrap();
+            // No file written for this date at all.
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://127.0.0.1:1"); }
+
+            let started = std::time::Instant::now();
+            let app = build_router(tmp.path().to_path_buf());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/flow/2026-08-15")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let elapsed = started.elapsed();
+
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+
+            assert_eq!(response.status(), StatusCode::OK, "a recordless date must not error");
+            let arr = body_as_array(response).await;
+            assert!(arr.is_empty(), "expected an empty array, got {} records", arr.len());
+            // Generous, but far below the 30s route timeout the bug hit — the
+            // point is that the request COMPLETES rather than being killed.
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "took {elapsed:?} — the Redis attempt is not bounded"
+            );
+        }
+
         /// Fallback path: DARKMUX_REDIS_URL set but pointing at an
         /// unreachable endpoint → daemon serves the local file's records
         /// as a JSON array.
