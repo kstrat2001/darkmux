@@ -17,6 +17,18 @@ The release binary lands at `target/release/darkmux`. To install it on `$PATH`:
 cargo install --path .
 ```
 
+**Enable the repo's git hooks** (one-time, per clone):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This wires up `.githooks/pre-commit`, which regenerates `docs/demo/index.html`
+whenever you commit a change to `crates/darkmux-serve/assets/viewer.html`.
+darkmux.com/demo **is** that viewer in playback mode (see
+`scripts/build-demo.sh`), and CI fails on drift — the hook keeps you from
+having to remember. `git commit --no-verify` bypasses it.
+
 This produces a self-contained binary — built-in workloads (`templates/builtin/workloads/`) are embedded at compile time, so the binary works from any directory without the source tree.
 
 ## Development loop
@@ -30,6 +42,18 @@ cargo fmt                # format
 ```
 
 If you modify the embedded workload manifests under `templates/builtin/workloads/`, you must rebuild — `include_str!` resolves at compile time.
+
+**Testing:** `cargo nextest run -p <crate>` is the iteration loop (the
+`darkmux-serve` suite is ~5s); `cargo nextest run --workspace` is the pre-push
+gate (2600+ tests in ~75s, against ~10 minutes for `cargo test --workspace`).
+`.config/nextest.toml` sets a per-test `terminate-after`, so a test that HANGS
+fails loudly instead of wedging the run — install with
+`cargo install cargo-nextest --locked`.
+
+**Working on the viewer?** Verify it by reloading the page, not by running the
+suite: `viewer.html` is an `include_str!`'d asset, so the Rust tests never
+render it. `cargo build -p darkmux-serve` + restart the daemon is the loop —
+`cargo install --path .` is a full release build and far slower than you need.
 
 ## Code style
 
