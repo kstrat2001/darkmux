@@ -290,6 +290,25 @@
      the playback transport and reclaim its reserved 64px back into .wrap. */
   body.live-mode .scrub{display:none}
   body.live-mode .wrap{height:calc(100vh - 46px - 40px)}
+  /* (#1565) Assert NO mode until one is resolved. The static markup used to
+     default to playback — badge text "▣ playback" and a visible .scrub — so
+     every LIVE load flashed a scrubber it would never use, and the badge
+     claimed a mode the page did not yet know. `booting` is cleared by
+     setBadges(); until then the page shows neither claim. Defaulting the markup
+     to live-mode instead would only invert the bug (the static demo forces
+     playback), so the neutral boot state is the correct one. */
+  /* (#1480) Refetch control + a visible connection state. `stale` is the
+     honest middle: the page is rendering real data that has stopped updating. */
+  .rfbtn{background:none;border:1px solid var(--line);color:var(--muted);border-radius:4px;
+         cursor:pointer;font:12px 'JetBrains Mono',monospace;padding:2px 7px;line-height:1.4}
+  .rfbtn:hover{color:var(--text)}
+  .rfbtn.spin{animation:rfspin .8s linear infinite}
+  @keyframes rfspin{to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion:reduce){.rfbtn.spin{animation:none;opacity:.5}}
+  #modebadge.stale{opacity:.65}
+  body.booting .scrub{display:none}
+  body.booting .wrap{height:calc(100vh - 46px - 40px)}
+  body.booting #modebadge{visibility:hidden}
   input[type=range]{flex:1;accent-color:var(--amber)}
   .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
   .fleet{display:flex;gap:16px;flex-wrap:wrap;align-items:stretch}
@@ -662,12 +681,17 @@
   }
 </style>
 </head>
-<body>
+<body class="booting">
 <div class="top">
   <span class="brand"><a href="https://darkmux.com/" target="_blank" rel="noopener"><b>darkmux</b></a> · observability</span>
   <span class="ver" id="verbadge"></span>
   <span class="badge" id="srcbadge">Loading…</span>
   <span class="pb" id="modebadge">▣ playback</span>
+  <!-- (#1480 part 3) Manual refetch. The escape hatch for Add-to-Home-Screen
+       standalone mode, which has no address bar and no pull-to-refresh: before
+       this, the only in-app way to force a refetch was to tap an activity-window
+       preset and reselect it (a side effect, not an affordance). -->
+  <button class="rfbtn" id="refreshbtn" data-act="refetch" title="Refetch now" aria-label="Refetch now">⟳</button>
   <nav class="topnav">
     <a href="https://darkmux.com/" target="_blank" rel="noopener">home</a>
     <a href="https://darkmux.com/guide/" target="_blank" rel="noopener">guide</a>
@@ -1098,12 +1122,14 @@ function liveSubject(){
 // tail (last run Xm ago) when the window has a terminal record. No machines
 // beating → "waiting for fleet" (honest: daemon up, nothing has checked in).
 // (#789)
-// Only surface "last run Xm ago" when the last run is genuinely RECENT. The
-// live window spans LIVE_WINDOW_MS (24h), so an unguarded tail could read
-// "last run 18h ago" — honest but stale, and the opposite of the freshness
-// signal the tail is meant to give. Beyond this, drop the tail; "fleet ready ·
-// N machines" stands alone (still affirmatively healthy).
-const IDLE_LAST_RUN_RECENT_MS=60*60*1000; // 1h
+// (2026-07-29) The tail is ALWAYS surfaced when a last run is known. This
+// previously hid it past 1h, reasoning that "last run 18h ago" was "honest but
+// stale, and the opposite of the freshness signal." That inverted: at 17h the
+// headline read "● ready · 1 machine" with NO time reference, which is
+// indistinguishable from a fleet that has never dispatched — a false calm, and
+// the same failure class as a lens that suppresses the one signal worth seeing.
+// "Honest but stale" IS the freshness signal; hiding it is what made the page
+// lie. Operator-caught 2026-07-29 after a 17h-quiet overnight.
 function idleStatus(){
   const n=LIVE_MACHINES.size;
   // (#1105) No "fleet" wording — it reads wrong for a solo local machine
@@ -1120,8 +1146,8 @@ function idleStatus(){
   // the title spells it out. Returns HTML; renderMeta inserts it without esc() —
   // inputs are counts + safe strings + a static icon.
   const now=Date.now();
-  const recent=last!=null&&(now-last)>=0&&(now-last)<=IDLE_LAST_RUN_RECENT_MS;
-  const ago=recent?relAgoFrom(now,last):'';
+  const known=last!=null&&(now-last)>=0;
+  const ago=known?relAgoFrom(now,last):'';
   return `<span class="rdot ok">●</span> ready · <span class="mco" title="${n} machine${n===1?'':'s'} online">${n} ${ICON.machine}</span>${ago?` · last run ${ago}`:''}`;
 }
 function renderMeta(){
@@ -2640,6 +2666,7 @@ const ACTIONS={
   mission:()=>goMission(),
   recentall:()=>toggleRecentAll(),
   actwin:a=>setActivityWindow(Number(a)),
+  refetch:()=>refetchLive("manual"),
   filters:()=>openFilters(),
   closefilters:()=>closeFilters(),
   clearfilters:()=>clearFilters(),
@@ -3032,6 +3059,12 @@ function setBadges(mode,date){
   if(mb){ const live=mode==="live"; mb.textContent=live?"● live":"▣ playback"; mb.classList.toggle("live",live); }
   // Live mode hides the playback scrub bar (CSS keys off this class) — replay is /play/<date>.
   document.body.classList.toggle("live-mode", mode==="live");
+  // (#1565) A mode is now known — drop the neutral boot state so the badge and
+  // the transport (whichever this mode warrants) become visible for the first
+  // time. `setBadges` is boot()'s single mode-resolution point, so if boot
+  // throws before reaching it the page stays neutral — which is correct: a page
+  // that failed to boot should not claim a mode either.
+  document.body.classList.remove("booting");
 }
 
 // Structural signature of the current level's stage. In live mode the cards are
@@ -3131,6 +3164,32 @@ function applyLive(){
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderMeta();syncTransport();
 }
+// (#1480) One refetch path for all three triggers: the manual control, an SSE
+// reconnect, and returning to a backgrounded/slept tab. Reloads the rolling
+// window in place — same call `boot()` makes — so a gap self-heals without a
+// page reload (which standalone mode cannot perform at all).
+let REFETCHING=false;
+async function refetchLive(reason){
+  if(REFETCHING) return;
+  if(!document.body.classList.contains("live-mode")) return; // playback is a fixed capture
+  REFETCHING=true;
+  const btn=$("refreshbtn"); if(btn) btn.classList.add("spin");
+  try{
+    await loadLiveWindow(todayUTC());
+    applyLive();
+  }catch(_){ /* transient — the tail keeps running; the next trigger retries */ }
+  finally{
+    REFETCHING=false;
+    if(btn) btn.classList.remove("spin");
+  }
+}
+
+// Returning to a slept phone / backgrounded tab is the same gap as a reconnect:
+// the SSE may have died silently while hidden. Refetch on the way back in.
+document.addEventListener("visibilitychange",()=>{
+  if(document.visibilityState==="visible") refetchLive("visible");
+});
+
 function startLiveTail(date){
   if(typeof EventSource==="undefined")return;
   LIVE_ES_DATE=date; // record the day this stream was opened
@@ -3150,7 +3209,26 @@ function startLiveTail(date){
     RAW.push(rec);
     if(!pending){pending=true;requestAnimationFrame(()=>{pending=false;applyLive();});}
   };
-  LIVE_ES.onerror=()=>{const mb=$("modebadge");if(mb)mb.classList.remove("live");}; // reconnecting — drop the pulse
+  // (#1480 part 2) A DROP IS VISIBLE. Dropping the pulse alone left the page
+  // rendering pre-drop state that still read as live — "stale but looks live"
+  // is the worst state a dashboard can be in (#44). Say so in words.
+  LIVE_ES.onerror=()=>{
+    const mb=$("modebadge");
+    if(mb){ mb.classList.remove("live"); mb.classList.add("stale"); mb.textContent="◌ reconnecting"; }
+  };
+  // (#1480 part 1) SELF-HEAL on reconnect. EventSource reconnects on its own,
+  // but the records emitted DURING the gap are never re-sent — the tail is
+  // tail-from-now, so a daemon restart or a phone wake left the page silently
+  // missing everything in between (observed 2026-07-18: a mission minted 3min
+  // after a restart never appeared). The first `open` is the initial connect
+  // and needs no refetch; every LATER one closes a gap, so refetch the window.
+  let everOpened=false;
+  LIVE_ES.onopen=()=>{
+    const mb=$("modebadge");
+    if(mb){ mb.classList.remove("stale"); mb.textContent="● live"; mb.classList.add("live"); }
+    if(everOpened) refetchLive("reconnect");
+    everOpened=true;
+  };
   window.addEventListener("beforeunload",()=>{if(LIVE_ES)LIVE_ES.close();});
 }
 // (#638) Poll the live-session set on the heartbeat cadence (~5s, matching
