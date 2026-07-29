@@ -297,6 +297,11 @@
   .rfbtn{background:none;border:1px solid var(--line);color:var(--muted);border-radius:4px;
          cursor:pointer;font:12px 'JetBrains Mono',monospace;padding:2px 7px;line-height:1.4}
   .rfbtn:hover{color:var(--text)}
+  /* refetchLive() no-ops outside live mode (playback is a fixed capture), so
+     the control must not render there — a dead button is exactly the kind of
+     claim-you-cannot-back-up this batch exists to remove. Hidden while booting
+     too, since the mode is not yet known. */
+  body:not(.live-mode) .rfbtn{display:none}
   .rfbtn.spin{animation:rfspin .8s linear infinite}
   @keyframes rfspin{to{transform:rotate(360deg)}}
   @media (prefers-reduced-motion:reduce){.rfbtn.spin{animation:none;opacity:.5}}
@@ -3170,8 +3175,15 @@ async function refetchLive(reason){
   REFETCHING=true;
   const btn=$("refreshbtn"); if(btn) btn.classList.add("spin");
   try{
-    await loadLiveWindow(todayUTC());
-    applyLive();
+    // Only re-render if the fetch actually SUCCEEDED. `loadLiveWindow`
+    // REPLACES RAW and returns anyOk; ignoring that return blanks a populated
+    // dashboard whenever both day-fetches come back non-ok — and a non-ok
+    // response does NOT throw, so the catch below never sees it. Live case
+    // (gate CONSIDER-1): viewer via `tailscale serve`, daemon restarts (which
+    // is itself a reconnect trigger), proxy answers 502, RAW=[] and the page
+    // goes empty until the next successful trigger. boot() already checks
+    // anyOk; this path must too.
+    if(await loadLiveWindow(todayUTC())) applyLive();
   }catch(_){ /* transient — the tail keeps running; the next trigger retries */ }
   finally{
     REFETCHING=false;

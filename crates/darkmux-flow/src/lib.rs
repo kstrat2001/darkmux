@@ -772,8 +772,14 @@ pub const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// Measured: `GET /flow/<a date with no records>` took 30.00s and 408'd with
 /// Redis enabled, 0.5ms with it disabled.
 ///
-/// Applied with `set_read_timeout`/`set_write_timeout` at every call site that
-/// takes a connection. This is load-bearing beyond latency: wrapping the call
+/// Applied with `set_read_timeout`/`set_write_timeout` at every SERVE-SIDE
+/// call site that takes a connection. NOT yet applied on the WRITE path —
+/// `RedisSink::route_xadd` below and `darkmux-fleet`'s queue still issue
+/// commands on unbounded connections, so the same accepts-but-never-answers
+/// peer can wedge a flow-record `XADD` from a CLI dispatch. Worse there than
+/// here, because a hang is not an `Err`, so `REDIS_DISABLE_THRESHOLD` never
+/// trips and the sink never self-disables. Tracked separately; do not read
+/// this constant as meaning the whole codebase is bounded. This is load-bearing beyond latency: wrapping the call
 /// in `tokio::time::timeout` is NOT sufficient on its own, because a timeout
 /// does not cancel an in-flight `spawn_blocking` task — without a socket-level
 /// deadline the blocking thread stays wedged forever and repeated requests

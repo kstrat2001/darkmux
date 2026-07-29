@@ -1,0 +1,46 @@
+# cargo-nextest configuration.
+#
+# Added 2026-07-29 after two tests HUNG the darkmux-serve binary rather than
+# failing: one pointed DARKMUX_REDIS_URL (process-global) at a listener that
+# accepted and never answered, so concurrently-running tests blocked too; the
+# other blocked inside redis-rs's connection handshake. Under libtest they
+# simply sat there and a 6s suite ran past 10 minutes with no signal.
+#
+# The goal is ONLY to convert an infinite hang into a loud failure. It is not
+# a performance budget.
+
+[profile.default]
+# Tuned from evidence, not guessed. A first attempt at 30s/terminate-after-2
+# (60s) FAILED the workspace: nextest runs each test in its own process at
+# CPU-count parallelism, and `slow-timeout` is WALL CLOCK — so on a saturated
+# machine (2612 tests, plus LMStudio resident and the serve daemon running)
+# microsecond tests like darkmux-hardware's parsers sat in the run queue and
+# were terminated at 60s. Those same tests pass in 0.028s when their crate
+# runs alone.
+#
+# 60s warn / 300s terminate: a genuine hang is INFINITE, so 5 minutes still
+# catches it decisively, while never firing on scheduling delay. The slowest
+# legitimate test in this workspace is ~4.5s (the Redis tail backoff tests).
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Don't let one failure hide the rest. The first run skipped 1097 tests after
+# an early failure, which made the report useless for deciding whether the
+# failure was isolated or systemic.
+fail-fast = false
+
+# Surface flakes instead of hiding them. #1544 (dispatch_internal
+# handle_event_* / flow-record-sink pollution) is a KNOWN intermittent that
+# made a release gate report green on luck. A retry marks it FLAKY in the
+# summary rather than failing the run — but it is still reported, so it can't
+# quietly become the norm.
+retries = 1
+
+# Print the slowest tests so creeping slowness is visible before it bites.
+final-status-level = "slow"
+
+[profile.ci]
+# CI is the ship gate: no retries, so a flake fails the build instead of being
+# papered over. Same hang protection, same no-fail-fast reporting.
+slow-timeout = { period = "60s", terminate-after = 5 }
+retries = 0
+fail-fast = false

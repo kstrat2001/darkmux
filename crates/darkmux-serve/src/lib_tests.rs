@@ -2139,6 +2139,50 @@
             );
         }
 
+        /// (#1570) `REDIS_RESPONSE_TIMEOUT` bounds a peer that answers the
+        /// handshake but then stops answering COMMANDS — the pathology the hub
+        /// exhibited on 2026-07-29 (measured: `/flow/:date` 30s+408 -> 1.4s+200).
+        ///
+        /// SCOPE, stated honestly: this does NOT cover a total black hole that
+        /// accepts TCP and answers nothing at all, including the handshake.
+        /// There the block lands inside `get_connection_with_timeout` — before
+        /// `bound_redis_response` can run — so the socket deadline is never
+        /// applied. Verified the hard way: an earlier version of this test used
+        /// a black-hole listener and hung past 60s WITH the fix in place.
+        /// Widening to cover that is tracked separately; do not read this fix
+        /// as bounding every unreachable-Redis shape.
+        ///
+        /// The bound here is a WALL CLOCK the test enforces itself: the call
+        /// runs on its own thread and the test fails on deadline rather than
+        /// hanging. No test may ever wedge the suite — two did today.
+        #[test]
+        fn read_flow_records_from_redis_is_deadline_bounded_not_open_ended() {
+            // Refused port: connect fails fast, the caller gets an Err, and the
+            // local-file fallback above it becomes reachable. This is the
+            // property that matters to the caller — bounded, not indefinite.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let r = super::read_flow_records_from_redis("redis://127.0.0.1:1", "2026-08-15");
+                let _ = tx.send((r.is_err(), started.elapsed()));
+            });
+
+            match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                Ok((is_err, elapsed)) => {
+                    assert!(is_err, "an unreachable peer must yield Err, not Ok");
+                    assert!(
+                        elapsed < std::time::Duration::from_secs(10),
+                        "took {elapsed:?} — the Redis attempt is not bounded"
+                    );
+                }
+                Err(_) => panic!(
+                    "read_flow_records_from_redis did not return within 15s — it is \
+                     blocking indefinitely, which is exactly the wedge #1570 exists \
+                     to prevent"
+                ),
+            }
+        }
+
         /// (#1570) Redis must UNION with the local file, never replace it.
         ///
         /// The erase-on-recovery half of the bug: Redis is fleet-merged but is
