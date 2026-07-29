@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-crew"
-version = "2.3.0"
+version = "2.3.1"
 edition = "2021"
 description = "darkmux crew — Role/Crew/Mission/Phase schema, loaders, dispatch, and the SQLite-derived index"
 license = "MIT"

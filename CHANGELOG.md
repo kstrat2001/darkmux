@@ -11,6 +11,38 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-07-29
+
+**A degraded Redis can no longer take the dashboard down with it**, plus three
+fixes so the viewer stops claiming things it cannot back up. Patch release; no
+schema changes (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`).
+
+### Fixed
+- **An unhealthy Redis wedged the viewer.** Only the *connect* phase was
+  bounded, so a peer whose TCP port accepted but which never answered a command
+  blocked the read until the route's 30s timeout returned `408` — and the
+  local-file fallback was never reached, because a hang is not an error. A
+  response deadline now bounds the command itself. Measured on a real
+  unreachable-but-accepting hub: the viewer's two-day boot fetch went from
+  `0.45s + 30s/408` (hung) to `3.06s`, both `200`.
+- **A recovered Redis erased history.** Redis results replaced the local file
+  wholesale, but Redis is not a superset — it rides a `MAXLEN` cap and is
+  missing everything written while it was unreachable. So the outage window
+  vanished from the view the moment Redis came back. The two sources are now
+  unioned. Measured: 1080/1080 local records served, zero dropped.
+- **The viewer asserted PLAYBACK before it knew its mode**, flashing a scrubber
+  on every live load that it would never use.
+- **A dropped live connection was invisible and inescapable.** It now shows
+  `reconnecting`, refetches automatically when the connection returns or the
+  page wakes, and has a refresh control — the escape hatch for the
+  home-screen app, which has no address bar and no pull-to-refresh.
+- **The idle headline hid its own recency.** "last run 18h ago" was suppressed
+  past one hour to avoid looking stale, which inverted: the headline then read
+  "ready" with no time reference at all, indistinguishable from a fleet that
+  had never dispatched.
+
+[2.3.1]: https://github.com/kstrat2001/darkmux/releases/tag/v2.3.1
+
 ## [2.3.0] - 2026-07-28
 
 **Composable mission graphs.** Step kinds are now stateless singletons in one
