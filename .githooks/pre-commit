@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# darkmux pre-commit hook.
+#
+# Purpose: keep `docs/demo/index.html` in lockstep with the canonical viewer,
+# WITHOUT relying on anyone remembering to run the generator.
+#
+# darkmux.com/demo IS `crates/darkmux-serve/assets/viewer.html` in playback
+# mode, produced by `scripts/build-demo.sh`. CI enforces this (the "docs drift
+# guard" job regenerates and diffs), so a viewer edit committed without the
+# regeneration fails the build AND — until someone notices — ships a stale
+# public demo page.
+#
+# That guard is correct; the manual step in front of it is the problem. It was
+# missed twice in a single session on 2026-07-29/30 (once caught by a frontier
+# code review on #1558, once by CI on #1571). A step that must be remembered is
+# a step that will be forgotten; this makes it structural instead.
+#
+# Install (one-time, per clone):
+#     git config core.hooksPath .githooks
+#
+# Bypass (rare, e.g. committing a deliberate demo-only experiment):
+#     git commit --no-verify
+set -euo pipefail
+
+VIEWER="crates/darkmux-serve/assets/viewer.html"
+DEMO="docs/demo/index.html"
+GEN="scripts/build-demo.sh"
+
+# Nothing to do unless the viewer is part of THIS commit. Keeps the hook free
+# for the overwhelming majority of commits (Rust changes, docs, configs).
+if ! git diff --cached --name-only | grep -qx "$VIEWER"; then
+  exit 0
+fi
+
+if [ ! -x "$GEN" ] && [ ! -f "$GEN" ]; then
+  echo "pre-commit: $VIEWER is staged but $GEN is missing — cannot regenerate the demo." >&2
+  echo "            Commit with --no-verify only if you are certain the demo is correct." >&2
+  exit 1
+fi
+
+# CORRECTNESS EDGE CASE, worth the extra check: the generator reads the
+# WORKING TREE copy of the viewer, not the staged one. If those differ (a
+# partial `git add -p`, or an edit made after staging), regenerating would
+# produce a demo built from content that is NOT in this commit — the demo would
+# be wrong AND CI would still fail, which is the worst of both. Refuse instead
+# of silently producing a mismatch.
+if ! git diff --quiet -- "$VIEWER"; then
+  echo "pre-commit: $VIEWER has UNSTAGED changes." >&2
+  echo "            $GEN reads the working tree, so regenerating now would build the" >&2
+  echo "            demo from content that isn't in this commit. Stage the whole file" >&2
+  echo "            (git add $VIEWER) or commit the viewer change on its own." >&2
+  exit 1
+fi
+
+bash "$GEN" >/dev/null
+
+if ! git diff --quiet -- "$DEMO"; then
+  git add "$DEMO"
+  echo "pre-commit: regenerated $DEMO from the viewer and staged it."
+fi
+
+exit 0
