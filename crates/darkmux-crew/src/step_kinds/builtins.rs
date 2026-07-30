@@ -929,7 +929,7 @@ impl DispatchMapStepKind {
             action: "step result".to_string(),
             handle: step.id.clone(),
             phase_id: None,
-            session_id: Some(format!("task:{}", step.task_id)),
+            session_id: Some(darkmux_types::session_id::task(&step.task_id)),
             source: Some("scheduler".to_string()),
             model: Some(model.to_string()),
             reasoning: None,
@@ -987,7 +987,7 @@ impl DispatchMapStepKind {
             action: "step result".to_string(),
             handle: step.id.clone(),
             phase_id: None,
-            session_id: Some(format!("task:{}", step.task_id)),
+            session_id: Some(darkmux_types::session_id::task(&step.task_id)),
             source: Some("scheduler".to_string()),
             model: Some(model.to_string()),
             reasoning: None,
@@ -1024,7 +1024,7 @@ impl DispatchMapStepKind {
             action: "step result".to_string(),
             handle: step.id.clone(),
             phase_id: None,
-            session_id: Some(format!("task:{}", step.task_id)),
+            session_id: Some(darkmux_types::session_id::task(&step.task_id)),
             source: Some("scheduler".to_string()),
             model: config_str(step, "model").map(str::to_string),
             reasoning: None,
@@ -1192,7 +1192,7 @@ impl DispatchMapStepKind {
                         "telemetry.tokens",
                         "tokens",
                         &step.id,
-                        &format!("task:{}", step.task_id),
+                        &darkmux_types::session_id::task(&step.task_id),
                         Some(model),
                         None,
                         None,
@@ -2255,6 +2255,50 @@ mod tests {
     /// after the review probe/verify stages moved onto `dispatch.map`
     /// (#1442). `SingleShotReply` had carried the split since #1361; it was
     /// `MapItemResult` that dropped it on the floor.
+    /// (#1524) Every `dispatch.map` emit carries the CANONICAL hyphen-form
+    /// session id, not the pre-#1436 colon form.
+    ///
+    /// `mission_graph.rs` deliberately REFUSES colon-era ids (its own test
+    /// `fold_finals_colon_era_session_ids_do_not_fold` pins that refusal), so
+    /// a colon-form emit is silently invisible to the graph lens's token
+    /// meters — the #1445 blank-meter class, recurring on the dispatch.map
+    /// path. The sibling `dispatch.single_shot` emitter already used the
+    /// helper; these four sites had drifted to an inline `format!`.
+    ///
+    /// Asserting the SHAPE rather than a literal: the point is that the id
+    /// comes from `session_id::task`, so a future rename moves both producer
+    /// and consumer together instead of silently re-breaking the meters.
+    #[test]
+    fn map_emits_canonical_task_session_ids_not_colon_form() {
+        let expected = darkmux_types::session_id::task("t1");
+        assert!(
+            !expected.contains(':'),
+            "canonical form must not be colon-delimited, got {expected}"
+        );
+        assert_eq!(expected, "task-t1", "the hyphen form mission_graph folds on");
+
+        // The aggregate record is the one a reader can build without a live
+        // dispatch; the per-item emits use the identical expression.
+        let s = map_step(json!({}));
+        let results = vec![MapItemResult {
+            index: 0,
+            ok: true,
+            content: "x".to_string(),
+            error: None,
+            total_tokens: Some(10),
+            prompt_tokens: None,
+            completion_tokens: None,
+            served_model: None,
+            wall_ms: 0,
+        }];
+        let rec = DispatchMapStepKind::aggregate_record(&s, "m", false, &results);
+        assert_eq!(
+            rec.session_id.as_deref(),
+            Some(expected.as_str()),
+            "aggregate record must carry the canonical id or the graph meters stay blank"
+        );
+    }
+
     #[test]
     fn map_item_token_telemetry_carries_the_prompt_completion_split() {
         let res = MapItemResult {
