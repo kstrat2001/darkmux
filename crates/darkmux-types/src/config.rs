@@ -50,7 +50,14 @@ use std::path::Path;
 // map -> profile -> model, an unmapped role falling back to `default_profile`.
 // Minor bump — an older binary tolerates it (all-Option + `extras` overflow),
 // per the lenient-read doctrine.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.5";
+// 1.6 (#1585): additive `dirs.lab` field — the lab-run scan root, previously
+// the ONE directory setting with an env var (`DARKMUX_LAB_DIR`) and no config
+// tier, which is why unset resolved to nothing and 247 on-disk lab runs were
+// invisible to `/lab/runs` and `/runs`. Minor bump — `DirsConfig` carries its
+// own `extras` overflow, so an older binary shunts the key there and falls to
+// its own default. First FIELD-level add under this rule (the nine sibling
+// `dirs.*` entries predate it, landing in the 1.0 scaffold).
+pub const CONFIG_SCHEMA_VERSION: &str = "1.6";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent

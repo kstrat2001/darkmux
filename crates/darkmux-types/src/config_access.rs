@@ -506,11 +506,19 @@ pub fn lab_dir() -> std::path::PathBuf {
     )
 }
 
+/// Derived from the SAME root resolution lab runs are written through —
+/// `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a project-local
+/// `./.darkmux` before `~/.darkmux`.
+///
+/// Deliberately not a hardcoded `~/.darkmux/runs`: that would reintroduce this
+/// issue's own bug class one layer down. Under `DARKMUX_HOME=/x`, a lab run
+/// WRITES to `/x/runs` while a hardcoded reader scans `~/.darkmux/runs` — the
+/// run is invisible again, and now worse than before, because `/lab/runs`
+/// would report `configured: true, exists: true` and imply everything is
+/// wired. Sharing the resolver makes read and write incapable of disagreeing.
 #[cfg(not(any(test, feature = "test-support")))]
 fn lab_dir_default() -> std::path::PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".darkmux").join("runs"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/darkmux/runs"))
+    crate::paths::resolve(crate::paths::ResolveScope::Auto).runs
 }
 
 /// Test builds must never default onto the operator's real `~/.darkmux/runs`
