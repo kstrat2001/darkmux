@@ -1656,15 +1656,37 @@ pub(crate) struct LabRunSummary {
 /// newest-first. `configured: false` (empty `runs`) when the daemon started
 /// without `--lab-dir` — never a 404/500, so the viewer renders a clean
 /// "not configured" state instead of an error.
+/// (#1585) Reports WHY the run list is empty, not just that it is.
+///
+/// `configured` alone stopped being informative once `lab_dir` gained a
+/// default (it is now true for every real daemon), and it never distinguished
+/// the three ways this can come back empty: no scan root, a root that does not
+/// exist, or a root holding nothing the scanner recognizes. A consumer that
+/// cannot tell those apart renders "no lab runs" for all three — which is how
+/// 247 on-disk runs read as an empty lab tab.
+///
+/// So the response also carries the resolved `dir` and whether it `exists`.
+/// The viewer is expected to say which case it is rather than render silence.
 async fn lab_runs_handler(State(state): State<AppState>) -> impl IntoResponse {
     let Some(lab_dir) = state.lab_dir.clone() else {
-        return axum::Json(serde_json::json!({ "configured": false, "runs": [] }))
-            .into_response();
+        // Still reachable: `build_router` (test-only) threads `lab_dir: None`.
+        return axum::Json(serde_json::json!({
+            "configured": false, "dir": null, "exists": false, "runs": []
+        }))
+        .into_response();
     };
+    let shown = lab_dir.display().to_string();
+    let exists = lab_dir.is_dir();
     let runs = tokio::task::spawn_blocking(move || scan_lab_runs(&lab_dir))
         .await
         .unwrap_or_default();
-    axum::Json(serde_json::json!({ "configured": true, "runs": runs })).into_response()
+    axum::Json(serde_json::json!({
+        "configured": true,
+        "dir": shown,
+        "exists": exists,
+        "runs": runs,
+    }))
+    .into_response()
 }
 
 /// `pub(crate)` (was private until #1508 step 3) — the `/runs` aggregator

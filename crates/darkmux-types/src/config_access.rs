@@ -484,6 +484,42 @@ fn flows_dir_default() -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp/darkmux-test-isolated/flows")
 }
 
+/// (#1585) The lab-run scan root — `env(DARKMUX_LAB_DIR) > config.dirs.lab >
+/// ~/.darkmux/runs`, the same three-tier shape as its nine sibling dirs.
+///
+/// It has a real DEFAULT now, where before it had none and resolved to
+/// `None`. That absence was the bug: `/lab/runs` answered
+/// `{"configured": false}` and `/runs`' lab arm never ran, so 247 on-disk runs
+/// were invisible in every surface. Defaulting is safe here in a way a
+/// general "guess the operator's directory" would not be — `~/.darkmux/runs`
+/// is darkmux-owned by construction (the namespace convention), so reading it
+/// assumes nothing about user state.
+///
+/// A caller that wants "only if the operator named one" should compare against
+/// this default explicitly rather than reintroducing an `Option` — the point of
+/// #1585 is that unset must not silently mean absent.
+pub fn lab_dir() -> std::path::PathBuf {
+    pick_dir(
+        env_str("DARKMUX_LAB_DIR"),
+        config().dirs.as_ref().and_then(|d| d.lab.as_deref()),
+        lab_dir_default,
+    )
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn lab_dir_default() -> std::path::PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".darkmux").join("runs"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/darkmux/runs"))
+}
+
+/// Test builds must never default onto the operator's real `~/.darkmux/runs`
+/// — same isolation discipline as `flows_dir_default` (#994).
+#[cfg(any(test, feature = "test-support"))]
+fn lab_dir_default() -> std::path::PathBuf {
+    std::path::PathBuf::from("/tmp/darkmux-test-isolated/runs")
+}
+
 /// (#703) Host cache dir for the extracted static `darkmux-runtime` binary,
 /// bind-mounted into operator-named images (`dispatch --image <tag>`)
 /// so darkmux can inject its agent into ANY Linux image rather than ship a
@@ -822,6 +858,42 @@ mod tests {
         // ~/.darkmux/flows default, or the /tmp fallback if HOME is absent).
         assert!(flows_dir().ends_with("flows"), "resolves to a flows dir");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", v); } }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn lab_dir_defaults_when_unset_rather_than_resolving_to_nothing() {
+        // THE #1585 regression. `lab_dir` was the only directory setting with
+        // no config tier and no default, so unset resolved to `None`, the
+        // `/runs` lab arm never ran, and 247 on-disk runs were invisible with
+        // nothing reporting a missing source. Unset must yield a real path.
+        let prev = std::env::var("DARKMUX_LAB_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_LAB_DIR");
+        }
+        assert!(lab_dir().ends_with("runs"), "unset must resolve to a runs dir, not nothing");
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("DARKMUX_LAB_DIR", v);
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn lab_dir_env_overrides_the_default() {
+        // Env stays the top tier, same as its nine sibling dirs.
+        let prev = std::env::var("DARKMUX_LAB_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_LAB_DIR", "/custom/lab");
+        }
+        assert_eq!(lab_dir(), std::path::PathBuf::from("/custom/lab"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LAB_DIR", v),
+                None => std::env::remove_var("DARKMUX_LAB_DIR"),
+            }
+        }
     }
 
     #[serial_test::serial]
