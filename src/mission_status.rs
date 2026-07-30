@@ -199,21 +199,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
             }
         })
         .collect();
-    // Drifted first (attention leads), then most-recently-touched, then id for
-    // a stable tiebreak. Recency replaced an id-only sort because mission ids
-    // are largely machine-minted and sort arbitrarily with respect to what the
-    // operator actually worked on last.
-    //
-    // Drift-first is also what makes pagination below safe: truncating a
-    // section can only ever hide rows that need no attention, until a single
-    // section holds more drifted missions than the limit (which the footer
-    // then says out loud).
-    views.sort_by(|a, b| {
-        (b.drifts.is_empty() as u8)
-            .cmp(&(a.drifts.is_empty() as u8))
-            .then(last_activity(b.m).cmp(&last_activity(a.m)))
-            .then(a.m.id.cmp(&b.m.id))
-    });
+    views.sort_by(board_order);
 
     if json {
         return run_json(&views);
@@ -263,6 +249,10 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
         groups.iter().zip(&shown_counts).flat_map(|((_, g), n)| g.iter().take(*n).copied()),
         width,
     );
+
+    // Tracked across sections so the closing rollup can admit that some of the
+    // missions it counts had their suggestions paginated away.
+    let mut any_drift_hidden = false;
 
     for ((group, g), &shown) in groups.iter().zip(&shown_counts) {
         println!(
@@ -321,6 +311,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
                 println!("{}", style::dim(&line));
             }
             if hidden_drift > 0 {
+                any_drift_hidden = true;
                 // Never let a limit silently swallow an attention item.
                 let warn = format!(
                     "⚠ {} hidden mission{} need{} attention — run with `--all`",
@@ -341,11 +332,15 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
             println!("{}", style::success(&line));
         }
     } else {
+        // "above" is only true for the drifted missions that were PRINTED; a
+        // section limit can leave others unshown (each section warns), so the
+        // rollup admits it rather than pointing at commands that never appeared.
         let summary = format!(
-            "{} mission{} {} attention — run the suggested commands above to reconcile",
+            "{} mission{} {} attention — run the suggested commands above to reconcile{}",
             attention,
             if attention == 1 { "" } else { "s" },
-            if attention == 1 { "needs" } else { "need" }
+            if attention == 1 { "needs" } else { "need" },
+            if any_drift_hidden { " (some are hidden — `--all` to see them)" } else { "" }
         );
         for line in wrap_indented(&summary, 0, width) {
             println!("{}", style::warn(&line));
@@ -383,6 +378,31 @@ fn run_json(views: &[MissionView]) -> Result<i32> {
     Ok(0)
 }
 
+/// Board ordering: drifted first (attention leads), then most-recently-touched,
+/// then id as a stable tiebreak.
+///
+/// Extracted from an inline closure specifically so the DIRECTION is testable.
+/// It was previously written `(b.is_empty()).cmp(&(a.is_empty()))` under a
+/// comment claiming "drifted first", which sorts clean missions first — the
+/// exact inverse of both the comment and the intent. Nothing caught it because
+/// the comparator lived inside `run()`, which needs mission JSON on disk to
+/// exercise, so no unit test could reach it.
+///
+/// Direction, stated so it can't silently invert again: a mission WITH drift has
+/// `drifts.is_empty() == false == 0u8`, and `Ordering::Less` sorts first, so the
+/// drift key must be `a.cmp(b)` — NOT `b.cmp(a)`. Recency is the one key that IS
+/// reversed (`b.cmp(a)`), because newest-first means larger-timestamp-first.
+///
+/// This direction is load-bearing for pagination, not cosmetic: the per-section
+/// limit is only safe because truncation drops from the TAIL, so with drift
+/// sorted first a cap can only ever hide rows needing no attention.
+fn board_order(a: &MissionView, b: &MissionView) -> std::cmp::Ordering {
+    (a.drifts.is_empty() as u8)
+        .cmp(&(b.drifts.is_empty() as u8))
+        .then(last_activity(b.m).cmp(&last_activity(a.m)))
+        .then(a.m.id.cmp(&b.m.id))
+}
+
 /// Most recent state transition on a mission — the honest "last touched".
 ///
 /// A max over the present timestamps rather than a single field, because which
@@ -415,9 +435,19 @@ fn default_limit(group: MissionStatus) -> usize {
     }
 }
 
-/// Fixed per-row cost around the id column: `"  ◆ "` + the two 2-space gaps +
-/// the 5-wide progress field + the 4-wide bar.
+/// Fixed per-row cost of a row WITHOUT the mix column: `"  ◆ "` (4) + the two
+/// 2-space gaps + the 5-wide progress field + the 4-wide bar = 17.
+///
+/// Exactly this and no more: a row that also shows the mix pays one ADDITIONAL
+/// gap, which is `MIX_GAP_COLS`. Conflating the two let `plan_layout` judge a
+/// with-mix row 2 columns narrower than it renders, so at `COLUMNS=51` an
+/// id(12) + mix(22) row measured 51 and printed 53 — hard-wrapping on exactly
+/// the terminal width the adaptation exists to respect.
 const ROW_FIXED_COLS: usize = 17;
+
+/// The extra 2-space gap between the bar and the mix column, paid only when the
+/// mix is shown. See `ROW_FIXED_COLS`.
+const MIX_GAP_COLS: usize = 2;
 
 /// Never shrink the id column below this — a mission id truncated to a few
 /// characters identifies nothing, which defeats the point of keeping it.
@@ -456,7 +486,7 @@ fn plan_layout<'a>(
     let Some(w) = width else {
         return Layout { id_width: max_id, show_mix: true };
     };
-    if max_id + ROW_FIXED_COLS + max_mix <= w {
+    if max_id + ROW_FIXED_COLS + MIX_GAP_COLS + max_mix <= w {
         Layout { id_width: max_id, show_mix: true }
     } else if max_id + ROW_FIXED_COLS <= w {
         Layout { id_width: max_id, show_mix: false }
@@ -487,6 +517,13 @@ fn split_suggestion(s: &str) -> (&str, &str) {
 /// greppable. Words longer than the available room are left overlong rather
 /// than hard-split, since the long tokens here are file paths and commands
 /// that must survive intact.
+///
+/// One divergence between the two paths, harmless today but worth knowing: the
+/// wrapped path re-joins on `split_whitespace`, so it COLLAPSES internal
+/// whitespace runs, while the `None` path emits `text` verbatim. Every string
+/// this renders is single-spaced prose, so the paths agree; a future detail
+/// carrying deliberate alignment would render differently piped vs. in a
+/// terminal.
 fn wrap_indented(text: &str, indent: usize, width: Option<usize>) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
@@ -516,8 +553,13 @@ fn wrap_indented(text: &str, indent: usize, width: Option<usize>) -> Vec<String>
     out
 }
 
-/// Truncate to `max` display columns, eliding the MIDDLE with a `…` and
-/// counting chars (not bytes) so a multi-byte id can't be cut mid-character.
+/// Truncate to `max` CHARS, eliding the MIDDLE with a `…`.
+///
+/// Chars, not bytes (so a multi-byte id can't be cut mid-character) and not
+/// display columns: for the ASCII machine-minted ids this renders, one char is
+/// one column, but a double-width glyph would be counted as one and drawn as
+/// two. The same char-as-column assumption underlies `wrap_indented` and
+/// `plan_layout`; it holds for every string this module renders today.
 ///
 /// The elision is in the middle, not the tail, because darkmux's machine-minted
 /// ids carry their discriminator as a SUFFIX
@@ -706,15 +748,80 @@ mod tests {
         assert_eq!(last_activity(&m), 400);
     }
 
+    /// A `MissionView` with drift attached, for ordering tests.
+    fn drifted<'a>(m: &'a Mission) -> MissionView<'a> {
+        let mut v = view(m, 1, 0);
+        v.drifts.push(Drift { kind: "test", detail: "d".into(), suggest: vec![] });
+        v
+    }
+
     #[test]
-    fn recency_orders_missions_ahead_of_id() {
-        // Ids sort b < c, activity sorts c newer — recency must win, since
-        // mission ids are largely machine-minted and carry no work order.
+    fn board_order_puts_drifted_missions_first() {
+        // THE regression. The comparator previously read
+        // `(b.is_empty()).cmp(&(a.is_empty()))` under a "drifted first" comment,
+        // which sorted CLEAN first — inverting the one property that makes the
+        // per-section limit safe (truncation drops from the tail, so drift must
+        // lead or a cap hides exactly the rows that needed attention).
+        let (ma, mb, mc, md) = (
+            mission("m-clean-a", MissionStatus::Active),
+            mission("m-drift-b", MissionStatus::Active),
+            mission("m-clean-c", MissionStatus::Active),
+            mission("m-drift-d", MissionStatus::Active),
+        );
+        let mut views = [view(&ma, 1, 0), drifted(&mb), view(&mc, 1, 0), drifted(&md)];
+        views.sort_by(board_order);
+        let ids: Vec<&str> = views.iter().map(|v| v.m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m-drift-b", "m-drift-d", "m-clean-a", "m-clean-c"]);
+    }
+
+    #[test]
+    fn board_order_sorts_newest_first_within_equal_drift() {
+        // Ids sort ascending b < c, activity sorts c newer — recency must win,
+        // since mission ids are largely machine-minted and carry no work order.
         let mut older = mission("m-bbb", MissionStatus::Active);
         older.started_ts = Some(100);
         let mut newer = mission("m-ccc", MissionStatus::Active);
         newer.started_ts = Some(900);
-        assert!(last_activity(&newer) > last_activity(&older));
+        let mut views = [view(&older, 1, 0), view(&newer, 1, 0)];
+        views.sort_by(board_order);
+        assert_eq!(
+            views.iter().map(|v| v.m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m-ccc", "m-bbb"],
+            "newest-touched must lead despite sorting later by id"
+        );
+    }
+
+    #[test]
+    fn board_order_falls_back_to_id_when_drift_and_recency_tie() {
+        let mut a = mission("m-zzz", MissionStatus::Active);
+        let mut b = mission("m-aaa", MissionStatus::Active);
+        a.created_ts = 500;
+        b.created_ts = 500;
+        let mut views = [view(&a, 1, 0), view(&b, 1, 0)];
+        views.sort_by(board_order);
+        assert_eq!(
+            views.iter().map(|v| v.m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m-aaa", "m-zzz"],
+            "identical drift + timestamps must order stably by id"
+        );
+    }
+
+    #[test]
+    fn drift_leads_so_a_section_limit_cannot_hide_an_attention_item() {
+        // The pagination-safety property stated in run()'s docs, asserted
+        // directly: after sorting, taking the first N rows (what the limit
+        // does) retains every drifted mission while N >= the drift count.
+        let ms: Vec<Mission> =
+            (0..8).map(|i| mission(&format!("m-{i}"), MissionStatus::Finalized)).collect();
+        let mut views: Vec<MissionView> = ms
+            .iter()
+            .enumerate()
+            .map(|(i, m)| if i % 3 == 0 { drifted(m) } else { view(m, 1, 0) })
+            .collect();
+        let total_drift = views.iter().filter(|v| !v.drifts.is_empty()).count();
+        views.sort_by(board_order);
+        let kept = views.iter().take(total_drift).filter(|v| !v.drifts.is_empty()).count();
+        assert_eq!(kept, total_drift, "a tail-truncating limit must not drop drifted rows");
     }
 
     #[test]
@@ -740,19 +847,86 @@ mod tests {
         assert!(l.show_mix);
     }
 
+    /// Render one board row exactly as `run()` does, so tests can assert the
+    /// width of what is actually PRINTED rather than of the plan.
+    ///
+    /// Layout bugs here are off-by-N in a column budget, and a test that
+    /// recomputes the same budget it is checking will agree with a wrong one —
+    /// which is how a 2-column undercount survived its own unit test.
+    fn render_row(v: &MissionView, layout: &Layout) -> String {
+        let prog = format!("{}/{}", v.complete, v.total);
+        let bar = progress_bar(v.complete, v.total);
+        let id = ellipsize(&v.m.id, layout.id_width);
+        if layout.show_mix {
+            format!(
+                "  ◆ {:<width$}  {:>5}  {}  {}",
+                id,
+                prog,
+                bar,
+                phase_mix(v),
+                width = layout.id_width
+            )
+        } else {
+            format!("  ◆ {:<width$}  {:>5}  {}", id, prog, bar, width = layout.id_width)
+        }
+    }
+
+    /// The narrowest terminal a row can honor: the fixed columns plus the id
+    /// floor. Below this the row overflows BY DESIGN (see `MIN_ID_COLS`).
+    const NARROWEST_HONORABLE: usize = ROW_FIXED_COLS + MIN_ID_COLS;
+
+    #[test]
+    fn plan_layout_row_fits_every_width_it_can_honor() {
+        // THE off-by-two regression, asserted against the RENDERED string
+        // rather than a recomputed budget: at COLUMNS=51 an id(12) + mix(22)
+        // row used to measure 51 and print 53. Sweeping widths also pins the
+        // mix-shown/mix-dropped/id-truncated boundaries all at once.
+        let m = mission("m-0123456789", MissionStatus::Active);
+        for w in NARROWEST_HONORABLE..=90 {
+            let layout = plan_layout([view(&m, 2, 1)].iter(), Some(w));
+            let row = render_row(&view(&m, 2, 1), &layout);
+            let cols = row.chars().count();
+            assert!(
+                cols <= w,
+                "at COLUMNS={w} the row rendered {cols} cols (show_mix={}): {row:?}",
+                layout.show_mix
+            );
+        }
+    }
+
+    #[test]
+    fn below_the_id_floor_the_row_overflows_by_design_but_stays_bounded() {
+        // Deliberate, and worth pinning so it can't drift into unbounded
+        // overflow: under ~29 columns the id floor wins over fitting the row,
+        // because an id truncated to 3 chars identifies nothing. The row is
+        // still exactly the floor row — never wider.
+        let m = mission("m-0123456789-0123456789", MissionStatus::Active);
+        for w in 1..NARROWEST_HONORABLE {
+            let layout = plan_layout([view(&m, 2, 1)].iter(), Some(w));
+            assert_eq!(layout.id_width, MIN_ID_COLS, "at COLUMNS={w}");
+            assert!(!layout.show_mix, "at COLUMNS={w} the mix must be gone before this point");
+            let cols = render_row(&view(&m, 2, 1), &layout).chars().count();
+            assert_eq!(cols, NARROWEST_HONORABLE, "at COLUMNS={w} overflow must stay bounded");
+        }
+    }
+
     #[test]
     fn plan_layout_drops_the_mix_before_truncating_the_id() {
         let m = mission("m-0123456789", MissionStatus::Active);
-        let v = view(&m, 2, 1); // mix = "2 complete · 1 running" (22 cols)
+        let v = view(&m, 2, 1); // mix = "2 complete · 1 running"
         let mix_cols = phase_mix(&v).chars().count();
         let id_cols = m.id.chars().count();
 
         // One column short of fitting the mix: the mix goes, the id survives
         // intact — the fraction and bar already carry the mix's information.
-        let tight = id_cols + ROW_FIXED_COLS + mix_cols - 1;
+        let tight = id_cols + ROW_FIXED_COLS + MIX_GAP_COLS + mix_cols - 1;
         let l = plan_layout([view(&m, 2, 1)].iter(), Some(tight));
         assert_eq!(l.id_width, id_cols, "id must not shrink while a mix column is still droppable");
         assert!(!l.show_mix);
+
+        // And one column MORE than the widest with-mix row does fit it.
+        let exact = id_cols + ROW_FIXED_COLS + MIX_GAP_COLS + mix_cols;
+        assert!(plan_layout([view(&m, 2, 1)].iter(), Some(exact)).show_mix);
     }
 
     #[test]

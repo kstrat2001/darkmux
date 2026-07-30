@@ -70,8 +70,18 @@ pub fn terminal_width() -> Option<usize> {
     if !std::io::stdout().is_terminal() {
         return None;
     }
-    // SAFETY: `winsize` is a plain POD struct; we pass a valid mutable pointer
-    // to a zeroed local and only read it when the call reports success.
+    terminal_width_ioctl()
+}
+
+/// `TIOCGWINSZ` query, gated to unix to match this crate's convention for
+/// platform calls (`flock` in `lib.rs`, `libc::kill` in `residency_lease.rs`).
+/// A non-unix build resolves width from `COLUMNS` alone and otherwise reports
+/// `None`, which every caller already handles as "don't adapt".
+#[cfg(unix)]
+fn terminal_width_ioctl() -> Option<usize> {
+    // SAFETY: `winsize` is four `u16`s — plain POD, for which an all-zero bit
+    // pattern is a valid value. We pass a pointer to a live local and read the
+    // struct only when `ioctl` reports success.
     let cols = unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
@@ -80,7 +90,13 @@ pub fn terminal_width() -> Option<usize> {
             0
         }
     };
+    // A successful ioctl can still report 0 (e.g. a pty with no size set).
     (cols > 0).then_some(cols)
+}
+
+#[cfg(not(unix))]
+fn terminal_width_ioctl() -> Option<usize> {
+    None
 }
 
 /// Wrap `s` in green ANSI escape (success indicator).
