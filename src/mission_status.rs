@@ -163,7 +163,16 @@ fn unreachable_phase_drifts(m: &Mission, phases: &[&Phase]) -> Vec<Drift> {
 /// Entry from main.rs's dispatch. `--json` emits a structured board for the
 /// frontier / CI; otherwise a grouped, colorized human board ending with the
 /// aggregated suggested-next-steps.
-pub fn run(json: bool) -> Result<i32> {
+///
+/// `limit` caps rows PER SECTION (not per board) so a long finalized history
+/// can't push the active work off screen; `all` lifts the cap. `None` selects
+/// the per-section defaults (see `default_limit`) — an explicit `Some(n)`
+/// applies uniformly, because a number the operator typed outranks one the
+/// system derived (#44). `--json` is never paginated: a machine reader wants
+/// the whole board, and trimming it would make the structured output lie about
+/// what exists (#1569).
+pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
+    let unlimited = all || limit == Some(0);
     let missions = crew::loader::load_missions()?;
     let phases = crew::loader::load_phases()?;
     let now = now_unix();
@@ -190,10 +199,19 @@ pub fn run(json: bool) -> Result<i32> {
             }
         })
         .collect();
-    // Drifted first (so attention items lead), then by id for stability.
+    // Drifted first (attention leads), then most-recently-touched, then id for
+    // a stable tiebreak. Recency replaced an id-only sort because mission ids
+    // are largely machine-minted and sort arbitrarily with respect to what the
+    // operator actually worked on last.
+    //
+    // Drift-first is also what makes pagination below safe: truncating a
+    // section can only ever hide rows that need no attention, until a single
+    // section holds more drifted missions than the limit (which the footer
+    // then says out loud).
     views.sort_by(|a, b| {
         (b.drifts.is_empty() as u8)
             .cmp(&(a.drifts.is_empty() as u8))
+            .then(last_activity(b.m).cmp(&last_activity(a.m)))
             .then(a.m.id.cmp(&b.m.id))
     });
 
@@ -210,26 +228,108 @@ pub fn run(json: bool) -> Result<i32> {
             if views.len() == 1 { "" } else { "s" }
         ))
     );
+    // Resolved once, above the early return, so every prose line in this
+    // renderer — including the empty-board hint — wraps to the same width.
+    let width = style::terminal_width();
     if views.is_empty() {
-        println!("  {}", style::dim("no missions — propose one with `darkmux mission propose`"));
+        for line in
+            wrap_indented("no missions — propose one with `darkmux mission propose`", 2, width)
+        {
+            println!("{}", style::dim(&line));
+        }
         return Ok(0);
     }
 
-    for group in [MissionStatus::Active, MissionStatus::Paused, MissionStatus::Finalized] {
-        let g: Vec<&MissionView> = views.iter().filter(|v| v.m.status == group).collect();
-        if g.is_empty() {
-            continue;
-        }
-        println!("\n{}", style::dim(&format!("{} ({})", status_word(group).to_uppercase(), g.len())));
-        for v in g {
+    // Section membership first, so the layout can be planned from exactly the
+    // rows that will be printed (and stay aligned across every section).
+    let groups: Vec<(MissionStatus, Vec<&MissionView>)> =
+        [MissionStatus::Active, MissionStatus::Paused, MissionStatus::Finalized]
+            .into_iter()
+            .map(|group| (group, views.iter().filter(|v| v.m.status == group).collect()))
+            .filter(|(_, g): &(_, Vec<&MissionView>)| !g.is_empty())
+            .collect();
+
+    let shown_counts: Vec<usize> = groups
+        .iter()
+        .map(|(group, g)| {
+            if unlimited {
+                g.len()
+            } else {
+                limit.unwrap_or_else(|| default_limit(*group)).min(g.len())
+            }
+        })
+        .collect();
+    let layout = plan_layout(
+        groups.iter().zip(&shown_counts).flat_map(|((_, g), n)| g.iter().take(*n).copied()),
+        width,
+    );
+
+    for ((group, g), &shown) in groups.iter().zip(&shown_counts) {
+        println!(
+            "\n{}",
+            style::dim(&format!("{} ({})", status_word(*group).to_uppercase(), g.len()))
+        );
+        for v in g.iter().take(shown) {
             let prog = format!("{}/{}", v.complete, v.total);
             let bar = progress_bar(v.complete, v.total);
-            let mix = phase_mix(v);
-            println!("  ◆ {:30}  {:>5}  {}  {}", v.m.id, prog, bar, style::dim(&mix));
+            let id = ellipsize(&v.m.id, layout.id_width);
+            if layout.show_mix {
+                println!(
+                    "  ◆ {:<width$}  {:>5}  {}  {}",
+                    id,
+                    prog,
+                    bar,
+                    style::dim(&phase_mix(v)),
+                    width = layout.id_width
+                );
+            } else {
+                // Narrow terminal: the mix is dropped rather than the id or the
+                // progress, because it is the one column whose information the
+                // other two already carry.
+                println!("  ◆ {:<width$}  {:>5}  {}", id, prog, bar, width = layout.id_width);
+            }
             for d in &v.drifts {
-                println!("      {} {}", style::warn("⚠"), style::warn(&d.detail));
+                // The ⚠ marks the warning, not each of its lines — continuation
+                // lines get blank space in the marker column so one wrapped
+                // warning still reads as one warning.
+                for (i, line) in wrap_indented(&d.detail, 8, width).iter().enumerate() {
+                    let marker = if i == 0 { style::warn("⚠") } else { " ".to_string() };
+                    println!("      {} {}", marker, style::warn(line.trim_start()));
+                }
                 for cmd in &d.suggest {
-                    println!("        {} {}", style::dim("→"), cmd);
+                    // The command itself is printed verbatim and never wrapped
+                    // or truncated — it exists to be copy-pasted, and a command
+                    // broken across lines by a renderer is worse than one that
+                    // overflows. Only its trailing rationale is wrapped.
+                    let (command, note) = split_suggestion(cmd);
+                    println!("        {} {}", style::dim("→"), command);
+                    for line in wrap_indented(note, 10, width) {
+                        println!("{}", style::dim(&line));
+                    }
+                }
+            }
+        }
+        if shown < g.len() {
+            let hidden_drift = g.iter().skip(shown).filter(|v| !v.drifts.is_empty()).count();
+            let more = format!(
+                "… {} more ({} of {} shown) — `--all` for every mission",
+                g.len() - shown,
+                shown,
+                g.len()
+            );
+            for line in wrap_indented(&more, 2, width) {
+                println!("{}", style::dim(&line));
+            }
+            if hidden_drift > 0 {
+                // Never let a limit silently swallow an attention item.
+                let warn = format!(
+                    "⚠ {} hidden mission{} need{} attention — run with `--all`",
+                    hidden_drift,
+                    if hidden_drift == 1 { "" } else { "s" },
+                    if hidden_drift == 1 { "s" } else { "" }
+                );
+                for line in wrap_indented(&warn, 2, width) {
+                    println!("{}", style::warn(&line));
                 }
             }
         }
@@ -237,16 +337,19 @@ pub fn run(json: bool) -> Result<i32> {
 
     println!();
     if attention == 0 {
-        println!("{}", style::success("✓ board is clean — every mission's phases are reconciled"));
+        for line in wrap_indented("✓ board is clean — every mission's phases are reconciled", 0, width) {
+            println!("{}", style::success(&line));
+        }
     } else {
-        println!(
-            "{}",
-            style::warn(&format!(
-                "{} mission{} need attention — run the suggested commands above to reconcile",
-                attention,
-                if attention == 1 { "" } else { "s" }
-            ))
+        let summary = format!(
+            "{} mission{} {} attention — run the suggested commands above to reconcile",
+            attention,
+            if attention == 1 { "" } else { "s" },
+            if attention == 1 { "needs" } else { "need" }
         );
+        for line in wrap_indented(&summary, 0, width) {
+            println!("{}", style::warn(&line));
+        }
     }
     Ok(0)
 }
@@ -278,6 +381,166 @@ fn run_json(views: &[MissionView]) -> Result<i32> {
         }))?
     );
     Ok(0)
+}
+
+/// Most recent state transition on a mission — the honest "last touched".
+///
+/// A max over the present timestamps rather than a single field, because which
+/// field is newest depends on the mission's path through the state machine
+/// (`created` → maybe `started` → maybe `paused` → maybe `finalized`), and a
+/// mission can be paused after being started, or finalized without ever having
+/// started. Nothing is subtracted, so a mission with only `created_ts` still
+/// sorts by that.
+fn last_activity(m: &Mission) -> u64 {
+    m.created_ts
+        .max(m.started_ts.unwrap_or(0))
+        .max(m.paused_ts.unwrap_or(0))
+        .max(m.finalized_ts.unwrap_or(0))
+}
+
+/// Rows shown per section when the operator names no `--limit`.
+///
+/// FINALIZED gets a much smaller budget than the open sections on purpose:
+/// closed work is recent-history context, not the question the board answers,
+/// and on a real board it dominates by an order of magnitude (measured: 69
+/// finalized vs 1 active, 21 of them single-turn `dispatch-*` records minted one
+/// per `darkmux dispatch`). Spending equal screen space on both would let
+/// exhaust crowd out the work — the failure this pagination exists to fix.
+/// An explicit `--limit n` overrides this uniformly (#44: a typed number
+/// outranks a derived one).
+fn default_limit(group: MissionStatus) -> usize {
+    match group {
+        MissionStatus::Finalized => 3,
+        MissionStatus::Active | MissionStatus::Paused => 10,
+    }
+}
+
+/// Fixed per-row cost around the id column: `"  ◆ "` + the two 2-space gaps +
+/// the 5-wide progress field + the 4-wide bar.
+const ROW_FIXED_COLS: usize = 17;
+
+/// Never shrink the id column below this — a mission id truncated to a few
+/// characters identifies nothing, which defeats the point of keeping it.
+const MIN_ID_COLS: usize = 12;
+
+/// Below this much room for text, `wrap_indented` stops wrapping and emits one
+/// overlong line instead. Wrapping prose into a 3-column gutter produces
+/// something less readable than an overflowing line, not more.
+///
+/// Deliberately its OWN constant rather than reusing `MIN_ID_COLS`: the two
+/// happen to share a value but answer unrelated questions (how short an id may
+/// be truncated vs. how narrow a paragraph is worth wrapping), so tying them
+/// together would make one silently move when the other is tuned.
+const MIN_WRAP_ROOM: usize = 12;
+
+/// How one board row is laid out at the current terminal width.
+#[derive(Debug, PartialEq)]
+struct Layout {
+    id_width: usize,
+    show_mix: bool,
+}
+
+/// Plan the row layout from the rows that will actually be printed.
+///
+/// Degradation order is deliberate: the phase mix goes first (the progress
+/// fraction and bar already carry its information), and only then does the id
+/// get truncated. `width == None` means output isn't a terminal, so nothing is
+/// adapted and nothing is dropped — piped output stays complete.
+fn plan_layout<'a>(
+    rows: impl Iterator<Item = &'a MissionView<'a>>,
+    width: Option<usize>,
+) -> Layout {
+    let (max_id, max_mix) = rows.fold((0, 0), |(i, x), v| {
+        (i.max(v.m.id.chars().count()), x.max(phase_mix(v).chars().count()))
+    });
+    let Some(w) = width else {
+        return Layout { id_width: max_id, show_mix: true };
+    };
+    if max_id + ROW_FIXED_COLS + max_mix <= w {
+        Layout { id_width: max_id, show_mix: true }
+    } else if max_id + ROW_FIXED_COLS <= w {
+        Layout { id_width: max_id, show_mix: false }
+    } else {
+        Layout { id_width: w.saturating_sub(ROW_FIXED_COLS).max(MIN_ID_COLS), show_mix: false }
+    }
+}
+
+/// Split a suggested command from its trailing `#` rationale.
+///
+/// Drift suggestions are authored as `<command>   # <why + caveats>`, and the
+/// rationale is where nearly all the length lives (measured: 265-column lines
+/// against an 80-column terminal). Splitting lets the command stay verbatim
+/// while the prose wraps. A suggestion with no `#` comment yields an empty
+/// note, so callers print nothing extra.
+fn split_suggestion(s: &str) -> (&str, &str) {
+    match s.find("  #") {
+        Some(i) => (s[..i].trim_end(), s[i..].trim_start().trim_start_matches('#').trim_start()),
+        None => (s, ""),
+    }
+}
+
+/// Word-wrap `text` to `width` columns, prefixing every line with `indent`
+/// spaces. Returns empty for empty text (callers print nothing).
+///
+/// `width == None` (not a terminal) means no wrapping at all — piped output
+/// keeps each logical message on exactly one line, which is what makes it
+/// greppable. Words longer than the available room are left overlong rather
+/// than hard-split, since the long tokens here are file paths and commands
+/// that must survive intact.
+fn wrap_indented(text: &str, indent: usize, width: Option<usize>) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let pad = " ".repeat(indent);
+    let Some(w) = width.filter(|w| w.saturating_sub(indent) >= MIN_WRAP_ROOM) else {
+        return vec![format!("{pad}{text}")];
+    };
+    let room = w - indent;
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let add = if line.is_empty() { word.chars().count() } else { line.chars().count() + 1 + word.chars().count() };
+        if !line.is_empty() && add > room {
+            out.push(format!("{pad}{line}"));
+            line = word.to_string();
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        out.push(format!("{pad}{line}"));
+    }
+    out
+}
+
+/// Truncate to `max` display columns, eliding the MIDDLE with a `…` and
+/// counting chars (not bytes) so a multi-byte id can't be cut mid-character.
+///
+/// The elision is in the middle, not the tail, because darkmux's machine-minted
+/// ids carry their discriminator as a SUFFIX
+/// (`dispatch-code-reviewer-1785386551-4b71-0`): tail-truncating a screenful of
+/// those renders every row as the identical string
+/// `dispatch-code-reviewer-17853…`, which destroys exactly the identity the id
+/// column exists to preserve. Keeping both ends costs nothing and tells the
+/// rows apart. Observed directly at 46 columns while building #1569.
+fn ellipsize(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max || max == 0 {
+        return s.to_string();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    let keep = max - 1; // one column for the `…`
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let chars: Vec<char> = s.chars().collect();
+    let front: String = chars[..head].iter().collect();
+    let back: String = chars[n - tail..].iter().collect();
+    format!("{front}…{back}")
 }
 
 fn status_word(s: MissionStatus) -> &'static str {
@@ -352,6 +615,187 @@ mod tests {
             abandoned_ts: None,
             task_ids: Vec::new(),
         }
+    }
+
+    /// A `MissionView` carrying just enough to exercise the layout planner:
+    /// the id sets the identity column, the phase counts set the mix column.
+    fn view<'a>(m: &'a Mission, complete: usize, running: usize) -> MissionView<'a> {
+        MissionView {
+            m,
+            total: complete + running,
+            complete,
+            running,
+            planned: 0,
+            abandoned: 0,
+            drifts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn split_suggestion_separates_the_command_from_its_rationale() {
+        let (cmd, note) = split_suggestion(
+            "darkmux mission abort m1 --phase p2   # abandon just this blocked phase",
+        );
+        assert_eq!(cmd, "darkmux mission abort m1 --phase p2");
+        assert_eq!(note, "abandon just this blocked phase");
+    }
+
+    #[test]
+    fn split_suggestion_leaves_a_bare_command_whole() {
+        // No `#` rationale: the whole string is the command and the note is
+        // empty, so the renderer prints no extra line.
+        let (cmd, note) = split_suggestion("darkmux mission finalize m1");
+        assert_eq!(cmd, "darkmux mission finalize m1");
+        assert_eq!(note, "");
+    }
+
+    #[test]
+    fn split_suggestion_keeps_a_shell_comment_inside_the_command() {
+        // A single `#` with no preceding double-space is part of the command
+        // (e.g. a `--message '#1569'` argument), not a rationale separator.
+        let (cmd, note) = split_suggestion("darkmux flow note --text 'fixes #1569'");
+        assert_eq!(cmd, "darkmux flow note --text 'fixes #1569'");
+        assert_eq!(note, "");
+    }
+
+    #[test]
+    fn wrap_indented_wraps_to_width_and_indents_every_line() {
+        let lines = wrap_indented("alpha beta gamma delta", 4, Some(16));
+        // room = 16 - 4 = 12 columns of text per line.
+        assert_eq!(lines, vec!["    alpha beta".to_string(), "    gamma delta".to_string()]);
+        assert!(lines.iter().all(|l| l.chars().count() <= 16));
+    }
+
+    #[test]
+    fn wrap_indented_does_not_wrap_when_output_is_not_a_terminal() {
+        // Piped output keeps one logical message on one line so it stays
+        // greppable — the same reason plan_layout adapts nothing at None.
+        let long = "alpha beta gamma delta epsilon zeta eta theta";
+        assert_eq!(wrap_indented(long, 4, None), vec![format!("    {long}")]);
+    }
+
+    #[test]
+    fn wrap_indented_leaves_an_overlong_word_intact() {
+        // Long tokens here are paths and commands; hard-splitting one would
+        // corrupt it, so it overflows instead.
+        let path = "/very/long/path/that/exceeds/the/room";
+        let lines = wrap_indented(&format!("run {path} now"), 4, Some(20));
+        // The overlong word gets its OWN line (it can't share one), so assert
+        // it survives somewhere intact rather than assuming which line.
+        assert!(lines.iter().any(|l| l.contains(path)), "path was split: {lines:?}");
+        assert!(lines.iter().all(|l| l.starts_with("    ")));
+    }
+
+    #[test]
+    fn wrap_indented_is_empty_for_empty_text() {
+        assert!(wrap_indented("", 4, Some(80)).is_empty());
+    }
+
+    #[test]
+    fn last_activity_takes_the_newest_present_timestamp() {
+        let mut m = mission("m1", MissionStatus::Finalized);
+        m.created_ts = 100;
+        assert_eq!(last_activity(&m), 100, "created_ts alone is the floor");
+
+        m.started_ts = Some(200);
+        m.paused_ts = Some(400);
+        m.finalized_ts = Some(300);
+        // Deliberately out of chronological order: a mission can be paused
+        // after being finalized on hand-edited data, and the sort must still
+        // pick the newest stamp rather than trusting a field precedence.
+        assert_eq!(last_activity(&m), 400);
+    }
+
+    #[test]
+    fn recency_orders_missions_ahead_of_id() {
+        // Ids sort b < c, activity sorts c newer — recency must win, since
+        // mission ids are largely machine-minted and carry no work order.
+        let mut older = mission("m-bbb", MissionStatus::Active);
+        older.started_ts = Some(100);
+        let mut newer = mission("m-ccc", MissionStatus::Active);
+        newer.started_ts = Some(900);
+        assert!(last_activity(&newer) > last_activity(&older));
+    }
+
+    #[test]
+    fn plan_layout_shows_everything_when_output_is_not_a_terminal() {
+        // `None` = piped/redirected. Nothing adapts and nothing is dropped, so
+        // `mission status | grep` is byte-predictable regardless of the window
+        // it ran in.
+        let m = mission("a-very-long-machine-minted-mission-id-0001", MissionStatus::Active);
+        let v = view(&m, 3, 1);
+        let l = plan_layout([v].iter(), None);
+        assert_eq!(l.id_width, 42);
+        assert!(l.show_mix);
+    }
+
+    #[test]
+    fn plan_layout_sizes_the_id_column_to_the_widest_shown_row() {
+        let short = mission("m1", MissionStatus::Active);
+        let long = mission("m-longer-id", MissionStatus::Active);
+        let rows = [view(&short, 1, 0), view(&long, 1, 0)];
+        let l = plan_layout(rows.iter(), Some(200));
+        // Natural width, not the old hardcoded 30 — narrow boards stay narrow.
+        assert_eq!(l.id_width, "m-longer-id".len());
+        assert!(l.show_mix);
+    }
+
+    #[test]
+    fn plan_layout_drops_the_mix_before_truncating_the_id() {
+        let m = mission("m-0123456789", MissionStatus::Active);
+        let v = view(&m, 2, 1); // mix = "2 complete · 1 running" (22 cols)
+        let mix_cols = phase_mix(&v).chars().count();
+        let id_cols = m.id.chars().count();
+
+        // One column short of fitting the mix: the mix goes, the id survives
+        // intact — the fraction and bar already carry the mix's information.
+        let tight = id_cols + ROW_FIXED_COLS + mix_cols - 1;
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(tight));
+        assert_eq!(l.id_width, id_cols, "id must not shrink while a mix column is still droppable");
+        assert!(!l.show_mix);
+    }
+
+    #[test]
+    fn plan_layout_truncates_the_id_only_when_even_that_cannot_fit() {
+        let m = mission("m-0123456789-0123456789", MissionStatus::Active);
+        let l = plan_layout([view(&m, 1, 0)].iter(), Some(ROW_FIXED_COLS + 15));
+        assert_eq!(l.id_width, 15);
+        assert!(!l.show_mix);
+    }
+
+    #[test]
+    fn plan_layout_never_shrinks_the_id_below_the_legible_floor() {
+        // An absurdly narrow terminal overflows the row rather than rendering
+        // an id too short to identify anything.
+        let m = mission("m-0123456789-0123456789", MissionStatus::Active);
+        let l = plan_layout([view(&m, 1, 0)].iter(), Some(10));
+        assert_eq!(l.id_width, MIN_ID_COLS);
+    }
+
+    #[test]
+    fn ellipsize_preserves_short_ids_and_marks_truncated_ones() {
+        assert_eq!(ellipsize("m1", 10), "m1");
+        assert_eq!(ellipsize("m-0123456789", 12), "m-0123456789", "exact fit is untouched");
+        let cut = ellipsize("m-0123456789", 6);
+        assert_eq!(cut, "m-0…89");
+        assert_eq!(cut.chars().count(), 6, "must not exceed the budget");
+        // Char-counted, not byte-counted: a multi-byte id must not be cut
+        // mid-character (which would emit invalid UTF-8 to the terminal).
+        assert_eq!(ellipsize("mécanique", 4), "mé…e");
+        assert_eq!(ellipsize("m-0123456789", 1), "…");
+    }
+
+    #[test]
+    fn ellipsize_keeps_suffix_discriminated_ids_distinguishable() {
+        // The real regression this guards: darkmux's machine-minted ids differ
+        // only in their SUFFIX, so tail-truncation collapses a whole screenful
+        // into one indistinguishable string. Middle elision keeps them apart.
+        let a = ellipsize("dispatch-code-reviewer-1785386551-4b71-0", 20);
+        let b = ellipsize("dispatch-code-reviewer-1785384819-157-0", 20);
+        assert_ne!(a, b, "rows differing only by suffix must not render identically");
+        assert!(a.ends_with("4b71-0"), "the discriminating suffix survives: {a}");
+        assert!(a.starts_with("dispatch-"), "the identifying prefix survives: {a}");
+        assert_eq!(a.chars().count(), 20);
     }
 
     #[test]

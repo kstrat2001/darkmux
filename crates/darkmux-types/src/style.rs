@@ -41,6 +41,48 @@ pub fn set_colorize_override(val: Option<bool>) {
     }, Ordering::SeqCst);
 }
 
+/// Usable terminal width in columns, or `None` when stdout isn't a terminal.
+///
+/// `None` is meaningful, not a failure: when output is piped or redirected
+/// there is no width to adapt to, and a renderer should emit its stable full
+/// form. That keeps `darkmux ... | grep` byte-predictable regardless of the
+/// window the operator happened to run it in — a narrow terminal must never
+/// silently truncate what a script reads.
+///
+/// Resolution order: `COLUMNS` → the TTY check → `ioctl(TIOCGWINSZ)` → `None`.
+///
+/// `COLUMNS` is consulted BEFORE the TTY check, and deliberately: a caller who
+/// exports it has stated a width on purpose, and honoring that even when output
+/// is piped is what makes the adaptive rendering observable and scriptable
+/// (`COLUMNS=80 darkmux mission status | cat` renders as an 80-column terminal
+/// would). Its mere absence says nothing either way, since most shells keep it
+/// as a shell variable and never export it — which is why it can't be the only
+/// source, and why `ioctl` is still what answers for a real terminal.
+///
+/// That env tier doubles as the testing/override seam, which is why there is no
+/// separate `set_width_override` global: renderers here take the width as a
+/// parameter, so they are already testable at any width without process state.
+#[must_use]
+pub fn terminal_width() -> Option<usize> {
+    if let Some(c) = std::env::var("COLUMNS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|c| *c > 0) {
+        return Some(c);
+    }
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    // SAFETY: `winsize` is a plain POD struct; we pass a valid mutable pointer
+    // to a zeroed local and only read it when the call reports success.
+    let cols = unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+            ws.ws_col as usize
+        } else {
+            0
+        }
+    };
+    (cols > 0).then_some(cols)
+}
+
 /// Wrap `s` in green ANSI escape (success indicator).
 #[must_use]
 pub fn success(s: &str) -> String { colorize("32", s) }
