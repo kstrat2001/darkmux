@@ -50,7 +50,14 @@ use std::path::Path;
 // map -> profile -> model, an unmapped role falling back to `default_profile`.
 // Minor bump — an older binary tolerates it (all-Option + `extras` overflow),
 // per the lenient-read doctrine.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.5";
+// 1.6 (#1585): additive `dirs.lab` field — the lab-run scan root, previously
+// the ONE directory setting with an env var (`DARKMUX_LAB_DIR`) and no config
+// tier, which is why unset resolved to nothing and 247 on-disk lab runs were
+// invisible to `/lab/runs` and `/runs`. Minor bump — `DirsConfig` carries its
+// own `extras` overflow, so an older binary shunts the key there and falls to
+// its own default. First FIELD-level add under this rule (the nine sibling
+// `dirs.*` entries predate it, landing in the 1.0 scaffold).
+pub const CONFIG_SCHEMA_VERSION: &str = "1.6";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -129,6 +136,19 @@ pub struct DirsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub ack: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub fleet_file: Option<String>,
+    /// (#1585) Where lab-run artifacts live — the scan root behind `/lab/runs`
+    /// and the lab arm of `/runs`.
+    ///
+    /// Added late, and for a reason worth keeping: this was the ONE directory
+    /// setting with an env var (`DARKMUX_LAB_DIR`) and no config tier, because
+    /// #1247 made the lab lens deliberately opt-in while lab was a SEPARATE
+    /// side-lens — unset then honestly meant "you aren't using the lab lens."
+    /// #1508 promoted lab into `/runs`, the unified read-model, which silently
+    /// changed what unset MEANS: one of three sources missing from the primary
+    /// view, with nothing saying so. 247 real runs went invisible. An
+    /// optionality that is fine for a side-lens is a data-completeness hole
+    /// once the same source feeds a consolidated view.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub lab: Option<String>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 

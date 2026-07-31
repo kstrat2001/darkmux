@@ -110,6 +110,12 @@ const KEYS: &[(&str, Ty)] = &[
     ("dirs.ack", Ty::Str),
     ("dirs.identity", Ty::Str),
     ("dirs.fleet_file", Ty::Str),
+    // (#1585) The drift guard `every_with_defaults_key_is_settable` cannot
+    // catch an omission here: it walks `with_defaults()`, where `dirs` is
+    // `None`, so no `dirs.*` key is ever checked. Adding a `DirsConfig` field
+    // means adding it HERE by hand, or the tier exists in the resolver and is
+    // unreachable from `config set`/`get`.
+    ("dirs.lab", Ty::Str),
 ];
 
 /// Keys that are deliberately NOT config — a secret that lives in the macOS

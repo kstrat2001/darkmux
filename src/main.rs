@@ -156,11 +156,20 @@ fn run(cmd: Cmd) -> Result<i32> {
             lab_dir,
         } => {
             let flows_dir = flows_dir.unwrap_or_else(crate::flow::flows_dir);
-            // (#1247 Part 3) `--lab-dir` > `DARKMUX_LAB_DIR` > unset. No
-            // config.json tier and no built-in default — see the flag's doc
-            // comment: the lab lens only ever reads a directory the operator
-            // explicitly named.
-            let lab_dir = lab_dir.or_else(|| std::env::var("DARKMUX_LAB_DIR").ok().map(std::path::PathBuf::from));
+            // (#1585) `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` >
+            // `~/.darkmux/runs`. The flag still wins; the tiers beneath it are
+            // new, and `Some(...)` is now unconditional.
+            //
+            // This REPLACES #1247's opt-in ("no config tier and no built-in
+            // default — the lab lens only ever reads a directory the operator
+            // explicitly named"). That was right while lab was a separate
+            // side-lens: unset meant "not using it." #1508 made lab one of the
+            // three sources feeding `/runs`, at which point unset stopped
+            // meaning that and started meaning "a source of your primary run
+            // view is silently missing" — measured: 247 lab runs on disk, zero
+            // visible anywhere. Optionality is part of a subsystem's contract,
+            // and promoting it into a shared read-model changes that contract.
+            let lab_dir = Some(lab_dir.unwrap_or_else(darkmux_types::config_access::lab_dir));
             serve::run(port, bind, flows_dir, lab_dir)?;
             Ok(0)
         }

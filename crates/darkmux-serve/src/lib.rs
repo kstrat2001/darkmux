@@ -66,12 +66,22 @@ pub(crate) struct AppState {
     /// gates new streams on `MAX_CONCURRENT_SSE` and an `SseSlot` guard
     /// decrements this on disconnect.
     sse_open: Arc<AtomicUsize>,
-    /// (#1247 Part 3) The lab observer lens's scan root — `--lab-dir` /
-    /// `DARKMUX_LAB_DIR`. `None` when the daemon started without it: the
-    /// `/lab/*` routes then answer `configured: false` / 404 rather than
-    /// scanning anything. Deliberately NO default scan path — machine-local
-    /// lab data is only read when the operator names the directory (operator
-    /// sovereignty; see the lab-vs-fleet scope boundary project memory).
+    /// (#1585, was #1247 Part 3) The lab-run scan root — `--lab-dir` >
+    /// `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/runs`.
+    ///
+    /// **In production this is always `Some`.** It stays an `Option` only
+    /// because the test-only `build_router` threads `None`; the `/lab/*`
+    /// routes' `configured: false` arm is unreachable from `run()`.
+    ///
+    /// This previously read "deliberately NO default scan path — lab data is
+    /// only read when the operator names the directory." That was true while
+    /// lab was a separate side-lens, and false once #1508 made it one of the
+    /// three sources feeding `/runs`: unset stopped meaning "not using the lab
+    /// lens" and started meaning "a source of the primary run view is missing,
+    /// silently." 247 runs went invisible. Defaulting is compatible with the
+    /// sovereignty argument that motivated the opt-in, because the default is
+    /// darkmux-owned by the namespace convention rather than a guess at
+    /// operator state.
     lab_dir: Option<PathBuf>,
 }
 
@@ -799,10 +809,10 @@ fn build_startup_banner(
         )));
     }
 
-    // (#1247 Part 3) Lab observer scan root — absent by design (no default
-    // scanning of arbitrary paths; the operator names it via `--lab-dir` /
-    // `DARKMUX_LAB_DIR`), so surface whichever state is true rather than
-    // silently leaving the lab lens unexplained.
+    // (#1585) Lab-run scan root. Always resolved in production now (flag > env
+    // > config > `~/.darkmux/runs`); the `None` arm below survives only for
+    // the test-only router. Printed either way so the resolved path is never
+    // something the operator has to guess at.
     match lab_dir {
         Some(dir) => lines.push(format!(
             "  lab dir:        {}",
@@ -1541,9 +1551,10 @@ fn current_millis() -> u64 {
 // ─── Lab observer lens (#1247 Part 3) ──────────────────────────────────────
 //
 // "Two doors, one viewer, distinct questions" (operator direction, #1247):
-// these routes read ONLY `AppState::lab_dir` — the operator-named scan root
-// passed via `--lab-dir` / `DARKMUX_LAB_DIR` — and never touch the flow
-// stream, Redis, or any other machine's data. Machine-local by construction;
+// these routes read ONLY `AppState::lab_dir` — the scan root resolved as
+// `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/runs`
+// (#1585; it was operator-named-or-nothing until that default landed) — and
+// never touch the flow stream, Redis, or any other machine's data. Machine-local by construction;
 // no federation, ever. A "run" is any directory directly containing
 // `funnels.json`, `funnel-events.jsonl`, or `scores.json` (the artifacts
 // `review-bench --funnel` writes per-run-local, #1247 Parts 1-2, plus
@@ -1656,15 +1667,42 @@ pub(crate) struct LabRunSummary {
 /// newest-first. `configured: false` (empty `runs`) when the daemon started
 /// without `--lab-dir` — never a 404/500, so the viewer renders a clean
 /// "not configured" state instead of an error.
+/// (#1585) Reports WHY the run list is empty, not just that it is.
+///
+/// `configured` alone stopped being informative once `lab_dir` gained a
+/// default (it is now true for every real daemon), and it never distinguished
+/// the three ways this can come back empty: no scan root, a root that does not
+/// exist, or a root holding nothing the scanner recognizes. A consumer that
+/// cannot tell those apart renders "no lab runs" for all three — which is how
+/// 247 on-disk runs read as an empty lab tab.
+///
+/// So the response also carries the resolved `dir` and whether it `exists`.
+///
+/// **No consumer reads them yet** — the viewer still keys only on `configured`
+/// and `runs`. Wiring the lens to distinguish the cases (and retiring its now
+/// half-stale "restart with `--lab-dir`" copy, which production can no longer
+/// trigger) is #1584. These fields land first so that work has something
+/// truthful to render.
 async fn lab_runs_handler(State(state): State<AppState>) -> impl IntoResponse {
     let Some(lab_dir) = state.lab_dir.clone() else {
-        return axum::Json(serde_json::json!({ "configured": false, "runs": [] }))
-            .into_response();
+        // Still reachable: `build_router` (test-only) threads `lab_dir: None`.
+        return axum::Json(serde_json::json!({
+            "configured": false, "dir": null, "exists": false, "runs": []
+        }))
+        .into_response();
     };
+    let shown = lab_dir.display().to_string();
+    let exists = lab_dir.is_dir();
     let runs = tokio::task::spawn_blocking(move || scan_lab_runs(&lab_dir))
         .await
         .unwrap_or_default();
-    axum::Json(serde_json::json!({ "configured": true, "runs": runs })).into_response()
+    axum::Json(serde_json::json!({
+        "configured": true,
+        "dir": shown,
+        "exists": exists,
+        "runs": runs,
+    }))
+    .into_response()
 }
 
 /// `pub(crate)` (was private until #1508 step 3) — the `/runs` aggregator
