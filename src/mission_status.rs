@@ -112,12 +112,24 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
             "mission has been Active for {age_days} day(s) with zero phases complete \
              (staleness threshold: {stale_days} day(s))"
         ),
-        suggest: vec![format!(
-            "darkmux mission status --json   # inspect phase details — then \
-             `darkmux mission abort {id}` to tear the stalled mission down, or \
-             `darkmux mission finalize {id}` if the work is actually done",
-            id = m.id
-        )],
+        // (#1582) One entry PER COMMAND, not one entry whose rationale
+        // mentions two more commands in prose. Only the pre-`#` segment gets
+        // the never-wrapped verbatim treatment, so an `abort`/`finalize`
+        // buried in the rationale was word-wrapped with a 10-space indent
+        // injected mid-command — unpasteable, which is the one thing the
+        // #1569 rule exists to prevent. The prose now only explains the
+        // CHOICE between them; the commands themselves are copyable lines.
+        suggest: vec![
+            "darkmux mission status --json   # inspect the phase details first".to_string(),
+            format!(
+                "darkmux mission abort {id}   # …then this, to tear the stalled mission down",
+                id = m.id
+            ),
+            format!(
+                "darkmux mission finalize {id}   # …or this instead, if the work is actually done",
+                id = m.id
+            ),
+        ],
     })
 }
 
@@ -132,32 +144,91 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 fn unreachable_phase_drifts(m: &Mission, phases: &[&Phase]) -> Vec<Drift> {
     let phase_by_id: BTreeMap<&str, &&Phase> = phases.iter().map(|p| (p.id.as_str(), p)).collect();
 
-    let mut out = Vec::new();
+    let mut blocked: Vec<&str> = Vec::new();
+    // Non-terminal phases that are NOT blocked — the ones a whole-mission
+    // abort would destroy that the per-phase teardown would spare. Whether
+    // any exist decides whether the bare-abort caveat below is a real warning
+    // or noise (see its comment).
+    let mut salvageable = 0usize;
     let mut dead_ancestor = false;
     for phase_id in &m.phase_ids {
         let Some(phase) = phase_by_id.get(phase_id.as_str()) else { continue };
+        let live = matches!(phase.status, PhaseStatus::Planned | PhaseStatus::Running);
         if dead_ancestor && phase.status == PhaseStatus::Planned {
-            out.push(Drift {
-                kind: "unreachable-phase",
-                detail: format!(
-                    "phase '{}' can never run — an earlier phase in this mission was abandoned",
-                    phase.id
-                ),
-                suggest: vec![format!(
-                    "darkmux mission abort {mid} --phase {pid}   # abandon just this \
-                     permanently-blocked phase (a bare `mission abort {mid}` would abandon \
-                     every healthy phase too); the mission closes on its own once that \
-                     leaves every phase terminal",
-                    mid = m.id,
-                    pid = phase.id
-                )],
-            });
+            blocked.push(phase.id.as_str());
+        } else if live {
+            salvageable += 1;
         }
         if phase.status == PhaseStatus::Abandoned {
             dead_ancestor = true;
         }
     }
-    out
+    if blocked.is_empty() {
+        return Vec::new();
+    }
+
+    // (#1582) ONE drift for the whole situation, not one per blocked phase.
+    // Every sibling shared the same abandoned ancestor and so emitted the
+    // same four lines of rationale verbatim — on a real board that was ~8 of
+    // 21 default lines saying nothing new. The rationale is the same fact
+    // whether one phase or five are blocked, so it is stated once in
+    // `detail`; the per-phase specifics ride the `suggest` list, where each
+    // command already gets its own line and the never-wrapped verbatim
+    // treatment.
+    //
+    // This deliberately narrows `--json`'s drift array from N entries to 1
+    // for this kind. That is the more accurate model — it is one problem
+    // with N instances, not N problems — and the per-phase detail is not
+    // lost: it is in `detail` and in one `suggest` entry per phase. Nothing
+    // counts drift ENTRIES (the attention rollup counts missions carrying
+    // any drift), so no consumer's arithmetic changes.
+    let names = blocked.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ");
+    let subject = if blocked.len() == 1 {
+        format!("phase {names} can never run")
+    } else {
+        format!("{n} phases can never run ({names})", n = blocked.len())
+    };
+    // (#1463 CONSIDER 5, re-scoped by #1582) This line distinguishes two
+    // commands rather than forbidding one. `stale-active` can fire on the
+    // SAME mission and offer `mission abort <id>` as a copyable command, so
+    // phrasing this as a prohibition made the board warn against a command it
+    // was simultaneously recommending. They are not in conflict — they answer
+    // different questions ("give up on this mission" vs "unblock it") — and
+    // saying so is what makes both readable together.
+    //
+    // It stays prose, and the whole-mission abort never becomes a copyable
+    // `→` line HERE: this drift's own recommendation is the per-phase
+    // teardown, and offering both as commands would just restate the
+    // ambiguity it exists to resolve.
+    //
+    // With nothing salvageable the distinction is vacuous — the two commands
+    // would destroy exactly the same work — so the line is dropped entirely
+    // rather than printed as a difference that makes no difference.
+    let caveat = if salvageable > 0 {
+        format!(
+            ". A bare `darkmux mission abort {mid}` ends the WHOLE mission, including \
+             {salvageable} phase(s) that can still run — scope it per-phase instead if you \
+             intend to keep this mission going",
+            mid = m.id
+        )
+    } else {
+        String::new()
+    };
+    let detail = format!(
+        "{subject} — an earlier phase in this mission was abandoned{caveat}. The mission closes \
+         on its own once every phase is terminal"
+    );
+
+    // No per-command rationale: `detail` just said what these are for, and
+    // repeating "abandon just this blocked phase" once per sibling would
+    // reintroduce the duplication this drift was collapsed to remove — the
+    // same defect one level down.
+    let suggest: Vec<String> = blocked
+        .iter()
+        .map(|pid| format!("darkmux mission abort {mid} --phase {pid}", mid = m.id))
+        .collect();
+
+    vec![Drift { kind: "unreachable-phase", detail, suggest }]
 }
 
 /// Entry from main.rs's dispatch. `--json` emits a structured board for the
@@ -218,11 +289,14 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
     // renderer — including the empty-board hint — wraps to the same width.
     let width = style::terminal_width();
     if views.is_empty() {
-        for line in
-            wrap_indented("no missions — propose one with `darkmux mission propose`", 2, width)
-        {
+        // (#1582) The prose wraps; the command does not. Same rule the drift
+        // suggestions follow, for the same reason — this is the one command a
+        // brand-new operator will copy, and it is the worst possible one to
+        // break across a line with an indent injected into the middle.
+        for line in wrap_indented("no missions yet — propose one with:", 2, width) {
             println!("{}", style::dim(&line));
         }
+        println!("  {} darkmux mission propose", style::dim("→"));
         return Ok(0);
     }
 
@@ -1039,6 +1113,37 @@ mod tests {
         assert!(d[0].detail.contains("15 day"));
     }
 
+    /// (#1582) Every command the operator might actually RUN is its own
+    /// suggestion, because only the pre-`#` segment of a suggestion is
+    /// protected from wrapping. A command left inside rationale prose gets
+    /// word-wrapped with the rationale's indent injected mid-command and
+    /// will not survive a copy-paste — the exact failure the #1569
+    /// verbatim-command rule exists to prevent.
+    #[test]
+    fn stale_active_actionable_commands_are_each_their_own_suggestion() {
+        let mut m = mission("m1", MissionStatus::Active);
+        m.started_ts = Some(0);
+        let d = detect_drift(&m, &[], 15 * 86_400, 14);
+        let stale = d.iter().find(|dr| dr.kind == "stale-active").expect("stale-active drift");
+
+        for want in ["darkmux mission abort m1", "darkmux mission finalize m1"] {
+            let is_own_command = stale
+                .suggest
+                .iter()
+                .any(|s| split_suggestion(s).0 == want);
+            assert!(is_own_command, "`{want}` must be a suggestion's own verbatim command, not prose");
+        }
+
+        // …and no suggestion's RATIONALE smuggles a runnable command back in.
+        for s in &stale.suggest {
+            let note = split_suggestion(s).1;
+            assert!(
+                !note.contains("darkmux mission abort") && !note.contains("darkmux mission finalize"),
+                "rationale must not embed a runnable command (it would wrap): {note}"
+            );
+        }
+    }
+
     #[test]
     fn active_mission_within_staleness_threshold_is_clean() {
         let mut m = mission("m1", MissionStatus::Active);
@@ -1089,6 +1194,74 @@ mod tests {
         assert!(d.iter().any(|dr| dr.kind == "unreachable-phase"
             && dr.detail.contains("blocked")
             && dr.suggest.iter().any(|c| c.contains("mission abort m1 --phase blocked"))));
+    }
+
+    /// (#1582) Siblings blocked by the SAME abandoned ancestor are one
+    /// problem with N instances, not N problems. Each used to emit the same
+    /// four lines of rationale verbatim — on a real board that was roughly 8
+    /// of 21 default lines saying nothing new, the #1569 "a default answers a
+    /// question" failure one level down.
+    #[test]
+    fn siblings_blocked_by_one_dead_ancestor_state_the_rationale_once() {
+        let mut dead = phase("dead", "m1", PhaseStatus::Abandoned);
+        dead.abandoned_ts = Some(1);
+        let a = phase("blocked-a", "m1", PhaseStatus::Planned);
+        let b = phase("blocked-b", "m1", PhaseStatus::Planned);
+        let mut m = mission("m1", MissionStatus::Active);
+        m.phase_ids = ["dead", "blocked-a", "blocked-b"].map(String::from).to_vec();
+
+        let d = detect_drift(&m, &[&dead, &a, &b], 0, 14);
+        let un: Vec<_> = d.iter().filter(|dr| dr.kind == "unreachable-phase").collect();
+        assert_eq!(un.len(), 1, "two blocked siblings must not repeat the rationale twice");
+
+        // The rationale is stated once and names every blocked phase…
+        assert!(un[0].detail.contains("blocked-a") && un[0].detail.contains("blocked-b"));
+        // …while the per-phase specifics stay one copyable command each.
+        let cmds: Vec<&str> = un[0].suggest.iter().map(|s| split_suggestion(s).0).collect();
+        assert!(cmds.contains(&"darkmux mission abort m1 --phase blocked-a"));
+        assert!(cmds.contains(&"darkmux mission abort m1 --phase blocked-b"));
+
+        // With nothing salvageable, the bare-abort caveat is noise — and
+        // worse than noise, because `stale-active` fires on this same
+        // mission and offers `mission abort m1` as a copyable command. The
+        // board must not warn against a command it is also recommending.
+        assert!(
+            !un[0].detail.contains("ends the WHOLE mission"),
+            "no salvageable phase -> the whole-vs-per-phase distinction is vacuous and must be \
+             dropped, not printed as a difference that makes no difference: {}",
+            un[0].detail
+        );
+        assert!(
+            !cmds.contains(&"darkmux mission abort m1"),
+            "the bare abort is never offered by THIS drift, salvageable or not"
+        );
+    }
+
+    /// (#1463 CONSIDER 5, re-scoped by #1582) The counter-example only earns
+    /// its line when a whole-mission abort would actually destroy something
+    /// the per-phase teardown spares.
+    #[test]
+    fn bare_abort_caveat_appears_only_when_a_phase_would_be_lost() {
+        // `healthy` sits BEFORE the abandoned phase, so it is still runnable
+        // — real collateral for a bare abort.
+        let healthy = phase("healthy", "m1", PhaseStatus::Planned);
+        let mut dead = phase("dead", "m1", PhaseStatus::Abandoned);
+        dead.abandoned_ts = Some(1);
+        let blocked = phase("blocked", "m1", PhaseStatus::Planned);
+        let mut m = mission("m1", MissionStatus::Active);
+        m.phase_ids = ["healthy", "dead", "blocked"].map(String::from).to_vec();
+
+        let d = detect_drift(&m, &[&healthy, &dead, &blocked], 0, 14);
+        let un = d.iter().find(|dr| dr.kind == "unreachable-phase").expect("unreachable drift");
+        assert!(un.detail.contains("ends the WHOLE mission"), "caveat missing: {}", un.detail);
+        assert!(
+            un.detail.contains("1 phase(s) that can still run"),
+            "caveat must count the collateral: {}",
+            un.detail
+        );
+        // Still prose, never a copyable command.
+        let cmds: Vec<&str> = un.suggest.iter().map(|s| split_suggestion(s).0).collect();
+        assert!(!cmds.contains(&"darkmux mission abort m1"));
     }
 
     #[test]
@@ -1192,9 +1365,25 @@ mod tests {
             "sovereignty-verbs also sits after abandoned file-match — must flag too under \
              strict linearity: {d:?}"
         );
-        // Exactly these three — no accidental extra/missing drift on this
-        // mission's real shape.
-        assert_eq!(d.len(), 3, "unexpected drift set: {d:?}");
+        // (#1582) Exactly TWO now, not three: both blocked phases share one
+        // abandoned ancestor, so they are one drift with two instances
+        // rather than two drifts repeating the same rationale verbatim.
+        // Both phase names are still asserted individually above, so the
+        // collapse cannot silently drop one.
+        assert_eq!(d.len(), 2, "unexpected drift set: {d:?}");
+
+        // (#1582) This real shape is also the case that earns the bare-abort
+        // caveat: `runtime-capture` is Planned and sits BEFORE the abandoned
+        // `file-match`, so it is still runnable and a whole-mission abort
+        // would genuinely destroy it. On a mission with nothing salvageable
+        // the caveat is suppressed — see
+        // `siblings_blocked_by_one_dead_ancestor_state_the_rationale_once`.
+        let un = d.iter().find(|dr| dr.kind == "unreachable-phase").unwrap();
+        assert!(
+            un.detail.contains("1 phase(s) that can still run"),
+            "runtime-capture is salvageable here — the caveat must fire and count it: {}",
+            un.detail
+        );
     }
 
     #[test]
