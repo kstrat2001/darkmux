@@ -149,6 +149,15 @@ fn unreachable_phase_drifts(m: &Mission, phases: &[&Phase]) -> Vec<Drift> {
     // abort would destroy that the per-phase teardown would spare. Whether
     // any exist decides whether the bare-abort caveat below is a real warning
     // or noise (see its comment).
+    //
+    // A RUNNING phase positioned after the abandoned ancestor counts as
+    // salvageable, which is deliberate and NOT an oversight of the linearity
+    // rule: strict linearity (#1341) is this detector's heuristic, not a
+    // lifecycle invariant — `lifecycle::phase_start` has no ancestor gate, so
+    // a Running phase there is genuinely live work, and `mission abort` is
+    // exactly what would reconcile it to Abandoned. It is real collateral, so
+    // the caveat must count it. (Only PLANNED phases after the dead ancestor
+    // are treated as blocked, which is what keeps the two sets disjoint.)
     let mut salvageable = 0usize;
     let mut dead_ancestor = false;
     for phase_id in &m.phase_ids {
@@ -207,9 +216,10 @@ fn unreachable_phase_drifts(m: &Mission, phases: &[&Phase]) -> Vec<Drift> {
     let caveat = if salvageable > 0 {
         format!(
             ". A bare `darkmux mission abort {mid}` ends the WHOLE mission, including \
-             {salvageable} phase(s) that can still run — scope it per-phase instead if you \
+             {salvageable} {phase} that can still run — scope it per-phase instead if you \
              intend to keep this mission going",
-            mid = m.id
+            mid = m.id,
+            phase = if salvageable == 1 { "phase" } else { "phases" }
         )
     } else {
         String::new()
@@ -1255,13 +1265,47 @@ mod tests {
         let un = d.iter().find(|dr| dr.kind == "unreachable-phase").expect("unreachable drift");
         assert!(un.detail.contains("ends the WHOLE mission"), "caveat missing: {}", un.detail);
         assert!(
-            un.detail.contains("1 phase(s) that can still run"),
-            "caveat must count the collateral: {}",
+            un.detail.contains("1 phase that can still run"),
+            "caveat must count the collateral, and pluralize it: {}",
             un.detail
         );
         // Still prose, never a copyable command.
         let cmds: Vec<&str> = un.suggest.iter().map(|s| split_suggestion(s).0).collect();
         assert!(!cmds.contains(&"darkmux mission abort m1"));
+    }
+
+    /// (#1582 gate) A RUNNING phase sitting AFTER the abandoned ancestor is
+    /// salvageable, and that is a deliberate decision rather than an
+    /// oversight of the strict-linearity rule — so it is pinned here against
+    /// a future refactor "fixing" it.
+    ///
+    /// Strict linearity (#1341) is THIS DETECTOR's heuristic, not a lifecycle
+    /// invariant: `lifecycle::phase_start` has no ancestor gate, so a Running
+    /// phase after a dead predecessor is genuinely live work — and
+    /// `mission abort` is precisely what reconciles it to Abandoned. It is
+    /// real collateral, so the caveat must count it. Only PLANNED phases
+    /// after the dead ancestor are treated as blocked, which keeps the
+    /// blocked and salvageable sets disjoint.
+    #[test]
+    fn a_running_phase_after_the_dead_ancestor_counts_as_collateral() {
+        let mut dead = phase("dead", "m1", PhaseStatus::Abandoned);
+        dead.abandoned_ts = Some(1);
+        let running = phase("in-flight", "m1", PhaseStatus::Running);
+        let blocked = phase("blocked", "m1", PhaseStatus::Planned);
+        let mut m = mission("m1", MissionStatus::Active);
+        m.phase_ids = ["dead", "in-flight", "blocked"].map(String::from).to_vec();
+
+        let d = detect_drift(&m, &[&dead, &running, &blocked], 0, 14);
+        let un = d.iter().find(|dr| dr.kind == "unreachable-phase").expect("unreachable drift");
+        assert!(
+            un.detail.contains("1 phase that can still run"),
+            "the Running phase is live work a bare abort would destroy: {}",
+            un.detail
+        );
+        // …and it is NOT reported as blocked: only Planned phases are.
+        assert!(!un.detail.contains("in-flight"), "a Running phase is not blocked: {}", un.detail);
+        let cmds: Vec<&str> = un.suggest.iter().map(|s| split_suggestion(s).0).collect();
+        assert_eq!(cmds, vec!["darkmux mission abort m1 --phase blocked"]);
     }
 
     #[test]
@@ -1380,7 +1424,7 @@ mod tests {
         // `siblings_blocked_by_one_dead_ancestor_state_the_rationale_once`.
         let un = d.iter().find(|dr| dr.kind == "unreachable-phase").unwrap();
         assert!(
-            un.detail.contains("1 phase(s) that can still run"),
+            un.detail.contains("1 phase that can still run"),
             "runtime-capture is salvageable here — the caveat must fire and count it: {}",
             un.detail
         );
