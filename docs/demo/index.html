@@ -165,6 +165,10 @@
      want a look (error red, running amber). */
   .labbadge.complete{color:var(--muted)}
   .labbadge.error{color:var(--bad);border-color:var(--bad)}
+  /* Amber, but deliberately NOT the pulsing `.live` treatment — see
+     runStatusBadge: `running` here means "no terminal artifact", which is not
+     the same claim as "running right now". */
+  .labbadge.running{color:var(--amber);border-color:var(--amber-dim)}
   .labbadge.planned,.labbadge.abandoned{color:var(--muted)}
   .rununtracked{font:600 10px/1 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.04em}
   .runmore{font:12px 'JetBrains Mono',monospace;color:var(--muted);margin-top:10px;cursor:pointer;text-align:center;padding:8px;border:1px dashed var(--line);border-radius:6px}
@@ -3593,6 +3597,14 @@ async function boot(){
 // log / detail pane / scrub bar while this lens is active).
 let LAB_CONFIGURED = null; // null = not yet fetched
 let LAB_RUNS = [];
+// (#1584/#1585) Where `/lab/runs` actually scanned, and whether that path
+// exists. This — not `configured` — is the live signal: since #1585 gave
+// `lab_dir` a config tier and a default, `configured` is true on every real
+// daemon, so the old "restart with --lab-dir" guidance names a cause that can
+// no longer occur. "Zero lab runs" now means either the dir is missing or it
+// holds nothing recognizable, and only the resolved path can tell those apart.
+let LAB_DIR = null;
+let LAB_DIR_EXISTS = null;
 // (#1584) The consolidated `/runs` list + the kind-filter vocabulary. "all"
 // is a filter VALUE, not a separate mode, so every chip goes through one code
 // path; the other three are exactly `RunKind`'s serde spelling (lowercase),
@@ -3620,8 +3632,10 @@ async function loadLabRuns(){
     const res = await fetch(src, {headers:{accept:"application/json"}});
     const body = res.ok ? await res.json() : {configured:false, runs:[]};
     LAB_CONFIGURED = body.configured !== false;
+    LAB_DIR = body.dir || null;
+    LAB_DIR_EXISTS = typeof body.exists==="boolean" ? body.exists : null;
     LAB_RUNS = Array.isArray(body.runs) ? body.runs : [];
-  }catch(_){ LAB_CONFIGURED=false; LAB_RUNS=[]; }
+  }catch(_){ LAB_CONFIGURED=false; LAB_DIR=null; LAB_DIR_EXISTS=null; LAB_RUNS=[]; }
 }
 async function loadLabRunDetail(dir){
   try{
@@ -3699,7 +3713,16 @@ window.drillLabRun=async(dir)=>{
   // with a notice, never a stuck "loading…" pane with a poll loop hammering
   // the same failing request.
   if(!LAB_DETAIL){
-    LAB_NOTICE="couldn't open run \""+dir+"\" — it may have been removed, or the link is stale. Showing the run list.";
+    // (#1584) With NO DAEMON behind the page there is nothing to serve
+    // `/lab/run/detail`, so this isn't a stale link — it's a capability the
+    // static build doesn't have, and "it may have been removed" reads as a
+    // bug on the public demo. Same honesty `renderMissionStatic` already
+    // applies to the mission graph in a daemon-less context, and it keys off
+    // the SAME predicate: playback alone is not the test, because
+    // `/play/<date>` is daemon-served playback where detail resolves fine.
+    LAB_NOTICE = !missionGraphReachable()
+      ? "run detail needs a running daemon — this static build lists runs without their per-run pipeline and event feed."
+      : "couldn't open run \""+dir+"\" — it may have been removed, or the link is stale. Showing the run list.";
     state.level="runs"; state.labRunDir=null;
     render();
     await Promise.all([loadRuns(), loadLabRuns()]);
@@ -3914,15 +3937,34 @@ function renderRunsBar(){
   // the previous run over the same corpus — meaningless for a mission or a
   // dispatch, so the toggle only exists under the lab filter.
   const series = state.runsKind==="lab"
-    ? `<span class="runchip${state.runsSeries?" on":""}" data-act="runsseries" tabindex="0" role="button">${state.runsSeries?"◧ series":"◧ series"}</span>`
+    ? `<span class="runchip${state.runsSeries?" on":""}" data-act="runsseries" tabindex="0" role="button">◧ series</span>`
     : "";
   return `<div class="runsbar">${chips}${series}</div>`;
+}
+// (#1584) Why the lab slice is empty, when it is — and ONLY then, so a
+// healthy board never carries an explanation of a problem it doesn't have.
+// "Zero lab runs" has two causes the operator can act on differently, and
+// only the daemon's resolved path distinguishes them, so the path is the
+// message. Deliberately NOT the pre-#1585 "restart with --lab-dir" text:
+// `lab_dir` has a config tier and a default now, so that cause can no longer
+// occur and naming it would send the operator after a setting that is
+// already set.
+function labSourceNotice(){
+  if(state.runsKind!=="lab" || LAB_CONFIGURED===null) return "";
+  if(RUNS.some(r=>r.kind==="lab")) return "";
+  if(LAB_CONFIGURED===false){
+    return `<div class="labnotice">this daemon has no lab-run source wired — <code>darkmux doctor</code> shows the resolved <code>dirs.lab</code> and where it came from.</div>`;
+  }
+  const where = LAB_DIR ? ` (<code>${esc(LAB_DIR)}</code>)` : "";
+  return LAB_DIR_EXISTS===false
+    ? `<div class="labnotice">the configured lab dir does not exist yet${where} — it appears with the first run.</div>`
+    : `<div class="labnotice">no lab runs found under the configured lab dir${where}.</div>`;
 }
 function renderLabRunsList(){
   $("logscope").textContent="runs";
   // (#1247 deep-link) The one-shot fallback notice (a stale `run=` deep
   // link) renders atop whichever list state applies below.
-  const notice = LAB_NOTICE ? `<div class="labnotice">${esc(LAB_NOTICE)}</div>` : "";
+  const notice = (LAB_NOTICE ? `<div class="labnotice">${esc(LAB_NOTICE)}</div>` : "") + labSourceNotice();
   if(RUNS_LOADED===null){
     $("stage").innerHTML = `<div class="stagehdr">runs</div>${notice}<div class="none">loading…</div>`;
     return;

@@ -240,10 +240,131 @@ test('deep link with an unresolvable run falls back to the run list with a notic
 
   await page.goto('/index-lab.html#lens=runs&run=no-such-run');
   await expect(page.locator('#lens-runs')).toHaveClass(/\bon\b/);
-  // Falls back to the run LIST with the one-shot notice — never a stuck
-  // "loading…" pane polling a failing request forever.
-  await expect(page.locator('.labnotice')).toContainText('no-such-run');
+  // Falls back to the run LIST — never a stuck "loading…" pane polling a
+  // failing request forever. That is the load-bearing behavior and it holds
+  // in every context.
   await expect(page.locator('.labrunrow')).toHaveCount(6);
+  // (#1584) This harness is a STATIC build with no daemon behind it, so the
+  // honest reason is the missing capability, not a stale link. The
+  // "may have been removed" wording is the WITH-daemon branch and is
+  // unreachable here by construction — the predicate is
+  // `missionGraphReachable()`, deliberately the same one the mission graph
+  // uses, because `/play/<date>` is daemon-served playback where run detail
+  // resolves fine and must keep the stale-link explanation.
+  await expect(page.locator('.labnotice')).toContainText('needs a running daemon');
+  await expect(page.locator('.labnotice')).not.toContainText('may have been removed');
+
+  expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+});
+
+// (#1584) Structural XSS tripwire for the runs lens. `viewer-xss.spec.js`
+// injects hostile *flow records*; `/runs` is a separate wire shape reaching a
+// separate render path (renderRunRow / runSubtitle / runStatusBadge), so it
+// needs its own hostile-payload walk or the escaping is only ever verified by
+// hand. Every attacker-controlled string field carries one of the three
+// payload shapes that spec uses: an HTML-injection, a JS-string breakout, and
+// a double-quoted-attribute breakout.
+const XSS_HTML = '<img src=x onerror=window.__xss=1>';
+const XSS_ATTR = '" onmouseover=window.__xss=1 x="';
+const XSS_JS = "'); window.__xss=1;//";
+
+const HOSTILE_RUNS = {
+  generated_at_ms: 1893456600000,
+  runs: [
+    {
+      id: XSS_HTML, kind: 'lab', status: 'running',
+      machine: XSS_ATTR, role: XSS_JS, updated_ts: 1893456500, tracked: true,
+    },
+    {
+      id: XSS_ATTR, kind: 'mission', status: 'complete',
+      machine: XSS_HTML, model: XSS_HTML, route: XSS_ATTR,
+      completed_ts: 1893456000, updated_ts: 1893456000, tracked: true,
+    },
+    {
+      // Untracked -> the non-clickable branch, which assembles attributes
+      // differently and so must be walked separately.
+      id: XSS_JS, kind: 'dispatch', status: 'error',
+      machine: XSS_HTML, role: XSS_ATTR, model: XSS_JS,
+      updated_ts: 1893450000, tracked: false,
+    },
+  ],
+};
+
+async function assertRunsInert(page, where) {
+  const fired = await page.evaluate(() => window.__xss);
+  expect(fired, `XSS canary fired at: ${where}`).toBeUndefined();
+  const injected = await page.evaluate(
+    () => document.querySelectorAll('img[src="x"], img[onerror], [onmouseover]').length
+  );
+  expect(injected, `injected element rendered at: ${where}`).toBe(0);
+}
+
+test('runs lens renders attacker-controlled /runs rows inertly', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', (e) => pageErrors.push(String(e)));
+  await page.route('**/runs-fixture.json', (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify(HOSTILE_RUNS) })
+  );
+
+  await page.goto('/index-lab.html#lens=runs');
+  await page.waitForSelector('.labrunrow');
+  await expect(page.locator('.labrunrow')).toHaveCount(3);
+  await assertRunsInert(page, 'runs list (all kinds)');
+
+  // Two distinct machines in the payload, so the machine column renders —
+  // otherwise the hostile `machine` field would never reach the DOM at all
+  // and this walk would pass vacuously.
+  await expect(page.locator('.labrunmeta').first()).toBeVisible();
+
+  // Each kind filter re-renders the same rows through the same path; the
+  // per-kind walk catches an escape that only one branch misses.
+  for (const kind of ['lab', 'mission', 'dispatch']) {
+    await page.click(`.runchip[data-arg="${kind}"]`);
+    await page.waitForTimeout(100);
+    await assertRunsInert(page, `runs list (kind=${kind})`);
+  }
+
+  // The hostile id also rides the hash on a drill, and the chip counts + the
+  // header re-render on the way back.
+  await page.click('.runchip[data-arg="all"]');
+  await assertRunsInert(page, 'runs list (back to all)');
+
+  expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+});
+
+test('an empty lab slice explains WHERE it scanned, and only when empty', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', (e) => pageErrors.push(String(e)));
+
+  // (#1584/#1585) Deliberately NOT the pre-#1585 "restart with --lab-dir"
+  // guidance: `lab_dir` has a config tier and a default now, so `configured:
+  // false` can no longer occur on a real daemon and naming it would send the
+  // operator after a setting that is already set. The actionable distinction
+  // is whether the resolved dir EXISTS, which only the daemon can report.
+  await page.route('**/runs-fixture.json', (r) =>
+    r.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ runs: [
+        { id: 'm1', kind: 'mission', status: 'complete', updated_ts: 1893456000, tracked: true },
+      ] }),
+    })
+  );
+  await page.route('**/lab-runs-fixture.json', (r) =>
+    r.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ configured: true, dir: '/tmp/nope/runs', exists: false, runs: [] }),
+    })
+  );
+
+  await page.goto('/index-lab.html#lens=runs');
+  // A healthy board never carries an explanation of a problem it doesn't
+  // have — the notice is scoped to the lab filter, and to it being empty.
+  await expect(page.locator('.labnotice')).toHaveCount(0);
+
+  await page.click('.runchip[data-arg="lab"]');
+  await expect(page.locator('.labrunrow')).toHaveCount(0);
+  await expect(page.locator('.labnotice')).toContainText('does not exist yet');
+  await expect(page.locator('.labnotice')).toContainText('/tmp/nope/runs');
 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });

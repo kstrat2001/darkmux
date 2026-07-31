@@ -402,8 +402,13 @@ fn mission_to_run(
         started_ts,
         completed_ts,
         // (#1584) Completion is the truest "last active" for a finished
-        // mission; a still-running one has only its start.
-        updated_ts: completed_ts.or(started_ts),
+        // mission; a still-running one has only its start; a PLANNED mission
+        // has never dispatched at all, and falls back to when it was minted
+        // — without which it would carry no time and sort below runs that
+        // died months ago, which is the exact failure this field exists to
+        // prevent. `created_ts` is non-optional on `Mission`, so this arm
+        // makes the field's "always populated" contract total for this path.
+        updated_ts: completed_ts.or(started_ts).or(Some(mission.created_ts)),
         tracked: true,
     }
 }
