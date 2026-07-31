@@ -464,9 +464,12 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
                 }
                 // (#1583) Every confirmed finding gets a prose bullet for the
                 // fallback body, anchored or not — an unpostable inline
-                // comment must still reach the author.
-                confirmed_all
-                    .push(confirmed_general_bullet(path, record, verified, &j.flag.also_flagged));
+                // comment must still reach the author. Rendered once and
+                // shared with the general list below, which needs the
+                // identical string for the unanchored case.
+                let bullet =
+                    confirmed_general_bullet(path, record, verified, &j.flag.also_flagged);
+                confirmed_all.push(bullet.clone());
                 match resolve_anchor(Some(path), j.flag.anchor.as_deref(), &index) {
                     Some(line) => inline.push(json!({
                         "path": norm_path(path),
@@ -474,8 +477,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
                         "side": "RIGHT",
                         "body": confirmed_comment_body(record, verified, &j.flag.also_flagged),
                     })),
-                    None => confirmed_general
-                        .push(confirmed_general_bullet(path, record, verified, &j.flag.also_flagged)),
+                    None => confirmed_general.push(bullet),
                 }
             }
             Tier::NeedsCheck => {

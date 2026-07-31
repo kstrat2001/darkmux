@@ -257,9 +257,20 @@ jobs:
               # the inline anchors point at lines that no longer exist —
               # skip straight to the summary rather than spending a
               # guaranteed-422 API call to learn that.
-              HEAD_NOW=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+              # `|| HEAD_NOW=""` is load-bearing: under `set -e` a failing
+              # command substitution in an assignment kills the STEP, which
+              # would make one transient 502 on this extra call discard a
+              # review that is already rendered and valid on disk — exactly
+              # the failure class this branch exists to remove, reintroduced
+              # by the guard against it.
+              HEAD_NOW=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha) || HEAD_NOW=""
               POSTED=""
-              if [ "$HEAD_NOW" != "$HEAD_SHA" ]; then
+              # An UNKNOWN head is not a moved head. When the probe fails we
+              # attempt the inline post anyway — the 422 path below already
+              # covers a genuinely-moved branch, whereas treating unknown as
+              # moved would skip a post that would have succeeded and print a
+              # note claiming a SHA transition that was never observed.
+              if [ -n "$HEAD_NOW" ] && [ "$HEAD_NOW" != "$HEAD_SHA" ]; then
                 echo "::warning::branch moved during the review ($HEAD_SHA -> $HEAD_NOW) — posting the summary, inline anchors would not resolve"
                 REASON="the branch moved while the review was running (\`${HEAD_SHA:0:7}\` → \`${HEAD_NOW:0:7}\`), so the findings could not be anchored to diff lines"
               elif gh api "repos/$REPO/pulls/$PR/reviews" --input "$RUNNER_TEMP/qa/review.json" \
@@ -268,7 +279,10 @@ jobs:
               else
                 echo "::warning::inline review rejected — falling back to a summary comment"
                 sed -n '1,20p' "$RUNNER_TEMP/qa/post.err" || true
-                REASON="GitHub rejected the inline comments (\`$(tr -d '\n' < "$RUNNER_TEMP/qa/post.err" | cut -c1-200)\`)"
+                # Backticks are stripped along with newlines: gh's own 422 text
+                # contains them ("thread `line` must be part of the diff"), and
+                # nesting them inside a code span breaks the rendered note.
+                REASON="GitHub rejected the inline comments (\`$(tr -d '\n`' < "$RUNNER_TEMP/qa/post.err" | cut -c1-200)\`)"
               fi
 
               # The findings are the product. Losing them to a posting error
