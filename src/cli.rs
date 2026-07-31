@@ -335,15 +335,28 @@ pub(crate) enum RoleCmd {
 pub(crate) enum MissionCmd {
     /// Global mission-control read (#829): the whole board — every mission
     /// grouped by status with phase progress, the inconsistencies that need
-    /// attention (a Finalized mission with a non-terminal phase; an open mission
-    /// whose phases are all done), and copy-pasteable reconcile commands.
+    /// attention (an open mission whose phases are all done; a stalled Active
+    /// mission; a phase blocked forever by an abandoned one), and
+    /// copy-pasteable reconcile commands.
     /// READ-ONLY — surfaces and suggests, never mutates. The CLI twin of the
     /// viewer's missions lens; run it as session-start housekeeping.
     Status {
         /// Emit the board as structured JSON (for the frontier orchestrator
-        /// or CI/cron) instead of the human-readable view.
+        /// or CI/cron) instead of the human-readable view. Never paginated —
+        /// a machine reader gets the whole board.
         #[arg(long)]
         json: bool,
+        /// Max missions shown PER SECTION (0 = no cap), applied uniformly to
+        /// every section. Omit it for the tuned defaults: 10 for ACTIVE and
+        /// PAUSED, 3 for FINALIZED (closed work is recent-history context, not
+        /// the question the board answers). Each section always reports its
+        /// true total, and drifted missions are ordered first so a cap hides
+        /// only rows needing no attention.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Show every mission in every section, ignoring `--limit`.
+        #[arg(long)]
+        all: bool,
     },
     /// Debrief a mission (#1000) — the post-mission review ceremony's raw
     /// material in one place: the loop pathologies darkmux's detectors flagged

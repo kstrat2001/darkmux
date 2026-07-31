@@ -41,6 +41,64 @@ pub fn set_colorize_override(val: Option<bool>) {
     }, Ordering::SeqCst);
 }
 
+/// Usable terminal width in columns, or `None` when stdout isn't a terminal.
+///
+/// `None` is meaningful, not a failure: when output is piped or redirected
+/// there is no width to adapt to, and a renderer should emit its stable full
+/// form. That keeps `darkmux ... | grep` byte-predictable regardless of the
+/// window the operator happened to run it in — a narrow terminal must never
+/// silently truncate what a script reads.
+///
+/// Resolution order: `COLUMNS` → the TTY check → `ioctl(TIOCGWINSZ)` → `None`.
+///
+/// `COLUMNS` is consulted BEFORE the TTY check, and deliberately: a caller who
+/// exports it has stated a width on purpose, and honoring that even when output
+/// is piped is what makes the adaptive rendering observable and scriptable
+/// (`COLUMNS=80 darkmux mission status | cat` renders as an 80-column terminal
+/// would). Its mere absence says nothing either way, since most shells keep it
+/// as a shell variable and never export it — which is why it can't be the only
+/// source, and why `ioctl` is still what answers for a real terminal.
+///
+/// That env tier doubles as the testing/override seam, which is why there is no
+/// separate `set_width_override` global: renderers here take the width as a
+/// parameter, so they are already testable at any width without process state.
+#[must_use]
+pub fn terminal_width() -> Option<usize> {
+    if let Some(c) = std::env::var("COLUMNS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|c| *c > 0) {
+        return Some(c);
+    }
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    terminal_width_ioctl()
+}
+
+/// `TIOCGWINSZ` query, gated to unix to match this crate's convention for
+/// platform calls (`flock` in `lib.rs`, `libc::kill` in `residency_lease.rs`).
+/// A non-unix build resolves width from `COLUMNS` alone and otherwise reports
+/// `None`, which every caller already handles as "don't adapt".
+#[cfg(unix)]
+fn terminal_width_ioctl() -> Option<usize> {
+    // SAFETY: `winsize` is four `u16`s — plain POD, for which an all-zero bit
+    // pattern is a valid value. We pass a pointer to a live local and read the
+    // struct only when `ioctl` reports success.
+    let cols = unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+            ws.ws_col as usize
+        } else {
+            0
+        }
+    };
+    // A successful ioctl can still report 0 (e.g. a pty with no size set).
+    (cols > 0).then_some(cols)
+}
+
+#[cfg(not(unix))]
+fn terminal_width_ioctl() -> Option<usize> {
+    None
+}
+
 /// Wrap `s` in green ANSI escape (success indicator).
 #[must_use]
 pub fn success(s: &str) -> String { colorize("32", s) }
