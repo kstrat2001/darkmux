@@ -27,6 +27,7 @@ OUT="$ROOT/docs/demo/index.html"
 <meta name="darkmux-flow-src" content="./demo-flow.jsonl">
 <meta name="darkmux-missions-src" content="./demo-missions.json">
 <meta name="darkmux-phases-src" content="./demo-phases.json">
+<meta name="darkmux-runs-src" content="./demo-runs.json">
 EOF
   sed '1,/<head>/d' "$SRC"
 } > "$OUT"

@@ -53,21 +53,26 @@ const PORT = 47823;
     fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'lifecycle-flow.jsonl'), 'utf8')
   );
 
-  // (#1247 Part 3) Lab observer lens smoke harness: the static XSS harness
-  // above has no daemon behind it, so `/lab/runs` would 404 — this variant
-  // injects `darkmux-lab-runs-src` (the same static-fixture-override pattern
-  // `darkmux-missions-src`/`darkmux-phases-src` already use) pointing at a
-  // committed fixture, so `viewer-lab.spec.js` can drive the real lens
-  // end-to-end without a live daemon. Same render path as a real
-  // `/lab/runs` response; no viewer fork.
+  // (#1584, was #1247 Part 3) Runs lens smoke harness: the static XSS harness
+  // above has no daemon behind it, so `/runs` and `/lab/runs` would 404 —
+  // this variant injects BOTH source overrides (the same static-fixture
+  // pattern `darkmux-missions-src`/`darkmux-phases-src` already use) pointing
+  // at committed fixtures, so `viewer-lab.spec.js` can drive the real lens
+  // end-to-end without a live daemon. The lens reads both: `/runs` for the
+  // flat kind-tagged list, `/lab/runs` for the lab-only series view. Same
+  // render path as real responses; no viewer fork.
   const lab = viewer.replace(
     '<head>',
-    '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-flow-src" content="./xss-flow.jsonl">\n<meta name="darkmux-lab-runs-src" content="./lab-runs-fixture.json">'
+    '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-flow-src" content="./xss-flow.jsonl">\n<meta name="darkmux-lab-runs-src" content="./lab-runs-fixture.json">\n<meta name="darkmux-runs-src" content="./runs-fixture.json">'
   );
   fs.writeFileSync(path.join(SERVED, 'index-lab.html'), lab);
   fs.writeFileSync(
     path.join(SERVED, 'lab-runs-fixture.json'),
     fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'lab-runs-fixture.json'), 'utf8')
+  );
+  fs.writeFileSync(
+    path.join(SERVED, 'runs-fixture.json'),
+    fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'runs-fixture.json'), 'utf8')
   );
 
   // (#1471) Mission-graph harness. The mission-graph lens is a SEPARATE asset

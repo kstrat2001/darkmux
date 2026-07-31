@@ -138,6 +138,22 @@ pub(crate) struct Run {
     pub(crate) started_ts: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) completed_ts: Option<u64>,
+    /// (#1584) **When this run was last active** — the one field the runs
+    /// lens can always order by, across all three sources.
+    ///
+    /// `started_ts`/`completed_ts` are deliberately absent whenever the
+    /// source doesn't genuinely know them, which was honest while nothing
+    /// sorted on them — but a run with NEITHER is unorderable, and that is
+    /// not a rare corner: an unfinished lab run has no start timestamp
+    /// (`LabRunSummary` records none) and no completion timestamp (it never
+    /// reached `scores.json`), so on a real machine dozens of rows carry no
+    /// time at all. This field is populated for every source with the best
+    /// activity signal each one actually has — newest-artifact mtime for a
+    /// lab run, completion-else-start for a mission/dispatch/ghost — so
+    /// "newest first" is a total order rather than one with a large
+    /// arbitrarily-ordered tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) updated_ts: Option<u64>,
     /// `false` = a flow-only ghost with no durable record backing it (see
     /// the module doc's "untracked" synthesis). `true` for every mission
     /// and lab run — both have a durable artifact on disk.
@@ -385,6 +401,9 @@ fn mission_to_run(
         model,
         started_ts,
         completed_ts,
+        // (#1584) Completion is the truest "last active" for a finished
+        // mission; a still-running one has only its start.
+        updated_ts: completed_ts.or(started_ts),
         tracked: true,
     }
 }
@@ -476,6 +495,11 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>) -> Run {
         } else {
             None
         },
+        // (#1584) `mtime_ms` is the newest-artifact time, which is exactly
+        // "last active" — and it's the ONLY time an unfinished lab run has.
+        // Using it as `completed_ts` for such a run would claim a completion
+        // that never happened; as `updated_ts` it's simply true.
+        updated_ts: Some(summary.mtime_ms / 1000),
         tracked: true,
     }
 }
@@ -728,6 +752,12 @@ fn ghost_runs(
             model: agg.model.clone(),
             started_ts: agg.start_ts.as_deref().and_then(parse_flow_ts),
             completed_ts: agg.terminal_ts.as_deref().and_then(parse_flow_ts),
+            // (#1584) Same completion-else-start rule as a tracked mission.
+            updated_ts: agg
+                .terminal_ts
+                .as_deref()
+                .and_then(parse_flow_ts)
+                .or_else(|| agg.start_ts.as_deref().and_then(parse_flow_ts)),
             tracked: false,
         });
     }
@@ -1280,6 +1310,33 @@ mod tests {
         assert!(run.tracked);
         assert_eq!(run.completed_ts, Some(1_700_000_000));
         assert_eq!(run.machine.as_deref(), Some("studio"));
+    }
+
+    /// (#1584) The case the `updated_ts` field exists for. An UNFINISHED lab
+    /// run has no start timestamp (`LabRunSummary` records none) and no
+    /// completion timestamp (it never reached `scores.json`) — so before this
+    /// field it carried NO time at all and was unorderable by any consumer.
+    /// On a real machine that is not a corner case: dozens of run dirs are
+    /// killed mid-flight and stay in exactly this shape forever.
+    ///
+    /// `updated_ts` must be populated for BOTH states, and `completed_ts`
+    /// must stay absent while unfinished — claiming a completion that never
+    /// happened would be a worse lie than having no ordering.
+    #[test]
+    fn lab_summary_to_run_always_carries_an_activity_ts() {
+        let unfinished = lab_summary_to_run(&minimal_lab_summary("live/wip", false, false), None);
+        assert_eq!(unfinished.status, RunStatus::Running);
+        assert_eq!(unfinished.started_ts, None);
+        assert_eq!(unfinished.completed_ts, None, "an unfinished run never completed");
+        assert_eq!(
+            unfinished.updated_ts,
+            Some(1_700_000_000),
+            "an unfinished lab run must still be orderable by its newest-artifact time"
+        );
+
+        let finished = lab_summary_to_run(&minimal_lab_summary("live/done", true, false), None);
+        assert_eq!(finished.updated_ts, Some(1_700_000_000));
+        assert_eq!(finished.completed_ts, Some(1_700_000_000));
     }
 
     // ── flow session index + route (#1518 start-OR-complete) ────────────

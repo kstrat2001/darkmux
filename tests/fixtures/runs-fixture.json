@@ -1,0 +1,65 @@
+{
+  "generated_at_ms": 1893456600000,
+  "runs": [
+    {
+      "id": "demo-live/gate",
+      "kind": "lab",
+      "status": "running",
+      "machine": "demo-machine",
+      "updated_ts": 1893456500,
+      "tracked": true
+    },
+    {
+      "id": "demo-case/run2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "demo-machine",
+      "completed_ts": 1893456000,
+      "updated_ts": 1893456000,
+      "tracked": true
+    },
+    {
+      "id": "demo-case/run1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "demo-machine",
+      "completed_ts": 1893452400,
+      "updated_ts": 1893452400,
+      "tracked": true
+    },
+    {
+      "id": "demo-mission",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "demo-machine",
+      "role": "coder",
+      "model": "darkmux:demo-coder-model",
+      "started_ts": 1893448000,
+      "completed_ts": 1893451000,
+      "updated_ts": 1893451000,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-demo-reviewer-1",
+      "kind": "dispatch",
+      "status": "error",
+      "machine": "demo-machine",
+      "role": "code-reviewer",
+      "model": "darkmux:demo-reviewer-model",
+      "started_ts": 1893440000,
+      "completed_ts": 1893440600,
+      "updated_ts": 1893440600,
+      "tracked": true
+    },
+    {
+      "id": "ghost-session-abc",
+      "kind": "dispatch",
+      "status": "running",
+      "machine": "demo-machine",
+      "role": "analyst",
+      "started_ts": 1893430000,
+      "updated_ts": 1893430000,
+      "tracked": false
+    }
+  ]
+}
