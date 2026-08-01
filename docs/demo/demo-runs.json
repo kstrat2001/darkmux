@@ -1,0 +1,74 @@
+{
+  "generated_at_ms": 1779497600000,
+  "runs": [
+    {
+      "id": "demo",
+      "kind": "mission",
+      "status": "running",
+      "machine": "studio",
+      "role": "coder",
+      "model": "darkmux:qwen3.6-35b-a3b",
+      "started_ts": 1779497400,
+      "updated_ts": 1779497560,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1779497000",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "studio",
+      "role": "judge",
+      "model": "darkmux:gpt-oss-120b",
+      "completed_ts": 1779497000,
+      "updated_ts": 1779497000,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-pr-reviewer-1779496200",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "studio",
+      "role": "pr-reviewer",
+      "model": "darkmux:qwen3.6-35b-a3b",
+      "started_ts": 1779495900,
+      "completed_ts": 1779496200,
+      "updated_ts": 1779496200,
+      "tracked": true
+    },
+    {
+      "id": "demo-shipped",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "studio",
+      "role": "coder",
+      "model": "darkmux:qwen3.6-35b-a3b",
+      "started_ts": 1779410000,
+      "completed_ts": 1779495000,
+      "updated_ts": 1779495000,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1779494100",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "studio",
+      "role": "judge",
+      "model": "darkmux:gpt-oss-120b",
+      "completed_ts": 1779494100,
+      "updated_ts": 1779494100,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-analyst-1779492000",
+      "kind": "dispatch",
+      "status": "error",
+      "machine": "mini-1",
+      "role": "analyst",
+      "model": "darkmux:qwen3-4b-instruct-2507",
+      "started_ts": 1779491700,
+      "completed_ts": 1779492000,
+      "updated_ts": 1779492000,
+      "tracked": true
+    }
+  ]
+}

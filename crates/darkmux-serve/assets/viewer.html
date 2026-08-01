@@ -110,11 +110,11 @@
      fleet/missions lenses' flow-record chrome. MOBILE-FIRST throughout: every
      rule below is single-column / stacking by default (flex-wrap, no fixed
      widths beyond small badges); the `.wrap` reflow to full-width `.stage`
-     happens via `.lab-mode` below, and `@media(max-width:768px)` only adds
+     happens via `.runs-mode` below, and `@media(max-width:768px)` only adds
      touch-target sizing on top, matching the rest of this file's convention. */
-  body.lab-mode .log,body.lab-mode .split,body.lab-mode .scrub{display:none}
-  body.lab-mode .wrap{display:block;height:auto}
-  body.lab-mode .stage{padding:16px 16px 32px}
+  body.runs-mode .log,body.runs-mode .split,body.runs-mode .scrub{display:none}
+  body.runs-mode .wrap{display:block;height:auto}
+  body.runs-mode .stage{padding:16px 16px 32px}
   .lablist{display:flex;flex-direction:column;gap:14px;margin-top:10px}
   .labnotice{font:12px/1.5 'JetBrains Mono',monospace;color:var(--warn);border:1px solid var(--warn);border-radius:6px;padding:9px 12px;margin-top:10px;overflow-wrap:anywhere}
   .labtaskcard{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
@@ -123,6 +123,10 @@
   .labrunrow{display:flex;flex-direction:column;gap:4px;padding:10px 11px;border:1px solid var(--line);border-radius:6px;background:var(--bg2);cursor:pointer;margin-bottom:6px}
   .labrunrow:last-child{margin-bottom:0}
   .labrunrow:hover{border-color:var(--amber-dim)}
+  /* (#1584) An untracked ghost has no durable record to open — no pointer, no
+     hover affordance, so the row never promises a drill-down it can't do. */
+  .labrunrow.flat{cursor:default}
+  .labrunrow.flat:hover{border-color:var(--line)}
   .labrunrow:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
   .labrunmain{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
   .labruncrew{font:600 12px 'JetBrains Mono',monospace;color:var(--text)}
@@ -136,6 +140,33 @@
   .labbadge{display:inline-block;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:3px;border:1px solid var(--line);flex:0 0 auto}
   .labbadge.finished{color:var(--good);border-color:var(--good)}
   .labbadge.live{color:var(--amber);border-color:var(--amber);animation:lpulse 1.6s ease-in-out infinite}
+  /* (#1584) The runs lens — one flat, kind-tagged list over /runs. Reuses the
+     .labrun* row styles above (they were never lab-specific); adds only the
+     kind filter chips, the kind tag, and the status colors the three sources
+     share. */
+  .runsbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:10px 0 4px}
+  .runchip{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.04em;padding:6px 10px;border-radius:14px;border:1px solid var(--line);background:var(--bg2);color:var(--muted);cursor:pointer}
+  .runchip:hover{border-color:var(--amber-dim);color:var(--text)}
+  .runchip:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+  .runchip.on{border-color:var(--amber);color:var(--amber);background:var(--panel)}
+  .runchipn{opacity:.7;font-weight:400}
+  .runkind{display:inline-block;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted);flex:0 0 auto}
+  .runkind.mission{color:var(--amber);border-color:var(--amber-dim)}
+  .runkind.dispatch{color:var(--text)}
+  .runkind.lab{color:var(--good);border-color:var(--good)}
+  /* Status colors earn attention rather than spend it: `complete` is the
+     normal case and stays quiet, so the eye lands on the runs that actually
+     want a look (error red, running amber). */
+  .labbadge.complete{color:var(--muted)}
+  .labbadge.error{color:var(--bad);border-color:var(--bad)}
+  /* Amber, but deliberately NOT the pulsing `.live` treatment — see
+     runStatusBadge: `running` here means "no terminal artifact", which is not
+     the same claim as "running right now". */
+  .labbadge.running{color:var(--amber);border-color:var(--amber-dim)}
+  .labbadge.planned,.labbadge.abandoned{color:var(--muted)}
+  .rununtracked{font:600 10px/1 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.04em}
+  .runmore{font:12px 'JetBrains Mono',monospace;color:var(--muted);margin-top:10px;cursor:pointer;text-align:center;padding:8px;border:1px dashed var(--line);border-radius:6px}
+  .runmore:hover{color:var(--amber);border-color:var(--amber-dim)}
   /* Pipeline strip — a VERTICAL stage list always (not just on mobile): a
      stacked list reads cleanly at any width and keeps this lens's CSS
      surface small; see the PR notes for the deliberate no-horizontal-strip
@@ -174,15 +205,15 @@
   body.machine-mode .log,body.machine-mode .split,body.machine-mode .scrub{display:none}
   body.machine-mode .wrap{display:block;height:auto}
   body.machine-mode .stage{padding:16px 16px 32px}
-  /* (UI nit, 2026-07-13) `.wrap{height:auto}` above lets machine/lab-mode
+  /* (UI nit, 2026-07-13) `.wrap{height:auto}` above lets machine/runs-mode
      content grow past the viewport; without an overflow escape on the
      document itself, `html,body{overflow:hidden;height:100vh}` (the
      desktop split-pane default) just silently clips anything past the
      fold — e.g. the "warnings" card at the bottom of a long machine-memory
      read. Scoped to these two modes only; the flow/mission views keep the
      desktop-locked layout `.stage{overflow:auto}` already handles. */
-  body.machine-mode,body.lab-mode{overflow:auto;height:auto;min-height:100vh}
-  html:has(body.machine-mode),html:has(body.lab-mode){overflow:auto;height:auto;min-height:100vh}
+  body.machine-mode,body.runs-mode{overflow:auto;height:auto;min-height:100vh}
+  html:has(body.machine-mode),html:has(body.runs-mode){overflow:auto;height:auto;min-height:100vh}
   /* Was a hardcoded 760px even though the log panel is hidden in this mode
      (full width available) — widened so wide/ultrawide monitors don't
      waste most of the screen on a single narrow column of cards. */
@@ -701,7 +732,7 @@
 </div>
 <div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
-  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a><a class="lens" id="lens-lab" data-act="lab">lab</a><a class="lens" id="lens-machine" data-act="machine">machine</a></span>
+  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a><a class="lens" id="lens-runs" data-act="runs">runs</a><a class="lens" id="lens-machine" data-act="machine">machine</a></span>
   <span class="crumb" id="crumb"></span>
   <span class="meta" id="meta"></span>
 </div>
@@ -938,7 +969,18 @@ recompute();
 // (#691) Default cap on the recent-runs list (newest-first); show-all toggle
 // via state.recentAll. Keeps a busy machine's panel from scrolling unbounded.
 const RECENT_CAP=20;
+// (#1584) The runs lens's default window — a bounded recent slice with the
+// TRUE total always shown beside it (the #1569 rule: a default answers a
+// question, it does not enumerate the store). Expandable via state.runsAll.
+const RUNS_CAP=25;
 let state={level:"fleet",machine:null,session:null,missionId:null,labRunDir:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,activityWindowMin:1440,
+  // (#1584) Runs-lens view state. `runsKind` is a FILTER over one flat list
+  // ("all" | "mission" | "dispatch" | "lab"), never a navigation axis — the
+  // whole point of the lens is that "what ran recently?" doesn't require
+  // knowing which subsystem recorded it. `runsSeries` is the lab-only
+  // series/knob-diff grouping, opt-in and only reachable under the lab
+  // filter (see renderRuns).
+  runsKind:"all", runsAll:false, runsSeries:false,
   // (#1508) Navigational INTENT for the unified machine page's local-vs-
   // remote health-region gate — true only via goMachine() (the nav tab /
   // `#lens=machine` deep-link, which always means "my own page" even before
@@ -2277,40 +2319,43 @@ function renderCrumb(){
   // with nothing running, primaryMission() is null and the crumb drops the
   // mission link (no stale "◆ m6"). Playback: primaryMission()=missions[0].
   // (#827) Light the active lens. The missions lens covers the index + a
-  // mission detail; the lab lens (#1247 Part 3) covers the run list + a run
-  // detail; everything else is the fleet lens.
+  // mission detail; the runs lens (#1584, was the lab lens in #1247 Part 3)
+  // covers the consolidated run list + a lab run's detail; everything else is
+  // the fleet lens.
   // (#1403) The missions lens is the index; on daemon-served pages the mission
   // detail is the graph page (a separate document). The in-viewer `mission`
   // level survives only as the daemon-less static summary (renderMissionStatic).
   const inMissions = state.level==="missions"||state.level==="mission";
-  const inLab = state.level==="lab"||state.level==="lab-run";
+  // (#1584) `lab-run` is the lab-specific DRILL-DOWN, kept exactly as it was —
+  // it just hangs off the runs lens now instead of a top-level lab tab.
+  const inRuns = state.level==="runs"||state.level==="lab-run";
   // (#1508) The unified machine page — live probes (kernel counters + lms
   // metadata via /machine/resources) for the health region plus a plain runs
   // list, a third source class distinct from run artifacts (lab) and flow
   // records (fleet/missions). Absorbed the retired `machinemem` level.
   const inMachine = state.level==="machine";
-  const lf=$("lens-fleet"), lm=$("lens-missions"), ll=$("lens-lab"), lmm=$("lens-machine");
-  if(lf)lf.className="lens"+((inMissions||inLab||inMachine)?"":" on");
+  const lf=$("lens-fleet"), lm=$("lens-missions"), ll=$("lens-runs"), lmm=$("lens-machine");
+  if(lf)lf.className="lens"+((inMissions||inRuns||inMachine)?"":" on");
   if(lm)lm.className="lens"+(inMissions?" on":"");
-  if(ll)ll.className="lens"+(inLab?" on":"");
+  if(ll)ll.className="lens"+(inRuns?" on":"");
   if(lmm)lmm.className="lens"+(inMachine?" on":"");
-  // (#1247 Part 3) The lab lens is a SEPARATE machine-local room, not a rung
+  // (#1247 Part 3) The runs lens is a SEPARATE machine-local room, not a rung
   // of the fleet drill ladder ("two doors, one viewer, distinct questions" —
   // operator direction) — it has no time-scrubbing story, so the flow-record
   // chrome (event log, detail pane, playback scrub bar) is irrelevant and
-  // hidden via this class (see the `.lab-mode` CSS block).
-  document.body.classList.toggle("lab-mode", inLab);
+  // hidden via this class (see the `.runs-mode` CSS block).
+  document.body.classList.toggle("runs-mode", inRuns);
   // (#1508) Same reflow for the unified machine page — its own class, same rules.
   document.body.classList.toggle("machine-mode", inMachine);
   // (#1247 deep-link) Every navigation path lands here, so this is the ONE
-  // place the address bar is kept in sync with the lab/machine view.
-  syncLabHash(inLab, inMachine);
+  // place the address bar is kept in sync with the runs/machine view.
+  syncLabHash(inRuns, inMachine);
   if(inMachine){
     $("crumb").innerHTML=`<a data-act="fleet">fleet</a><span class="sep">›</span>${state.machine!=null?escN(state.machine):"this machine"}`;
     return;
   }
-  if(inLab){
-    let lc=`<a data-act="lab">lab</a>`;
+  if(inRuns){
+    let lc=`<a data-act="runs">runs</a>`;
     if(state.level==="lab-run") lc+=`<span class="sep">›</span>${esc(state.labRunDir||"—")}`;
     $("crumb").innerHTML=lc; return;
   }
@@ -2343,9 +2388,9 @@ function render(){
   // it has no time axis, no filters, no event-log pane, so it skips every
   // flow-scoped call below (renderDetail/renderLog/renderMeta/syncTransport)
   // that assumes `DATA`/`state.t`/the scrub window. renderCrumb() still runs
-  // first (it lights the lens tab + sets the `.lab-mode` body class the CSS
+  // first (it lights the lens tab + sets the `.runs-mode` body class the CSS
   // keys off).
-  if(state.level==="lab"||state.level==="lab-run"){
+  if(state.level==="runs"||state.level==="lab-run"){
     renderCrumb();
     renderLab();
     return;
@@ -2680,8 +2725,12 @@ const ACTIONS={
   golive:()=>{ location.href="/"; },
   gomission:id=>goMissionGraph(id),
   gosession:id=>{ location.href="/?session="+encodeURIComponent(id); },
-  // (#1247 Part 3) The lab observer lens.
-  lab:()=>goLab(),
+  // (#1584) The consolidated runs lens (absorbed #1247 Part 3's lab lens).
+  // `labrun` stays the lab-specific drill-down, now reached from a Lab row.
+  runs:()=>goRuns(),
+  runskind:a=>setRunsKind(a),
+  runsmore:()=>{state.runsAll=true;render();},
+  runsseries:()=>{state.runsSeries=!state.runsSeries;render();},
   labrun:a=>drillLabRun(a),
   // (#1387) Copy the worktree path from the what-changed summary.
   copywt:a=>copyWtPath(a),
@@ -2924,13 +2973,22 @@ function catalogQuery(){
 // as boot-only input: syncLabHash below does not preserve it once the
 // operator navigates lenses (the playback route carries its date in the
 // /play/<date> PATH, not the hash, so nothing durable is lost).
+// (#1584) `lens=runs` is the current spelling; `lens=lab` is kept as a live
+// alias so every bookmark and phone shortcut minted while the lab tab existed
+// still resolves — it lands in the runs lens PRE-FILTERED to Lab, which is
+// the same set of runs the old tab showed. `kind=` carries the filter so a
+// filtered view is itself bookmarkable.
 function labQuery(){
   const p=new URLSearchParams(location.search);
   const h=new URLSearchParams((location.hash||"").replace(/^#/,""));
   const lens=(p.get("lens")||h.get("lens")||"").trim();
-  if(lens!=="lab")return null;
+  if(lens!=="runs"&&lens!=="lab")return null;
   const run=p.has("run")?p.get("run"):(h.has("run")?h.get("run"):null);
-  return {run: run==null?null:run.trim()};
+  const rawKind=((p.get("kind")||h.get("kind")||"").trim()||(lens==="lab"?"lab":"all")).toLowerCase();
+  return {
+    run: run==null?null:run.trim(),
+    kind: RUNS_KINDS.includes(rawKind)?rawKind:"all",
+  };
 }
 // (#1247 deep-link) Reflect the current lab-lens state into location.hash so
 // the view in front of the operator is always copyable from the address bar
@@ -2957,8 +3015,8 @@ function syncLabHash(inLab, inMachine){
     // render after boot).
     if(!raw||isBareDate)return;
     const p=new URLSearchParams(raw);
-    if(!p.has("lens")&&!p.has("run"))return;
-    p.delete("lens");p.delete("run");
+    if(!p.has("lens")&&!p.has("run")&&!p.has("kind"))return;
+    p.delete("lens");p.delete("run");p.delete("kind");
     const next=p.toString();
     history.replaceState(null,"",next?("#"+next):location.pathname+location.search);
     return;
@@ -2967,7 +3025,13 @@ function syncLabHash(inLab, inMachine){
   if(inMachine){
     p.set("lens","machine");p.delete("run");
   }else{
-    p.set("lens","lab");
+    // (#1584) Always writes the CURRENT spelling — an operator who arrived on
+    // a legacy `lens=lab` link has their address bar upgraded to
+    // `lens=runs&kind=lab` (the same view, addressably named), so what they
+    // re-copy is the current form.
+    p.set("lens","runs");
+    if(state.runsKind&&state.runsKind!=="all")p.set("kind",state.runsKind);
+    else p.delete("kind");
     if(state.level==="lab-run"&&state.labRunDir!=null)p.set("run",state.labRunDir);
     else p.delete("run");
   }
@@ -3501,7 +3565,10 @@ async function boot(){
   // empty string addresses a run matched at the lab-dir root) drills into
   // that run's detail; an unresolvable run falls back to the run list with a
   // notice inside drillLabRun.
-  if(lq){ if(lq.run!=null) drillLabRun(lq.run); else goLab(); }
+  // (#1584) The boot filter is applied BEFORE either entry point so a legacy
+  // `#lens=lab` link lands pre-filtered to Lab, and a `kind=` link lands on
+  // exactly the slice it names.
+  if(lq){ state.runsKind=lq.kind||"all"; if(lq.run!=null) drillLabRun(lq.run); else goRuns(); }
   // (#1508 deep-link) Boot straight into the unified machine page (local).
   else if(mq){ goMachine(); }
 }
@@ -3520,10 +3587,25 @@ async function boot(){
 // State lives in its own globals (LAB_*) rather than DATA/RAW — the lab
 // lens has no time axis to scrub and no flow-record filters, so it doesn't
 // share the fleet/missions lenses' render machinery (see `render()`'s
-// early-return above and the `.lab-mode` CSS block that hides the event
+// early-return above and the `.runs-mode` CSS block that hides the event
 // log / detail pane / scrub bar while this lens is active).
 let LAB_CONFIGURED = null; // null = not yet fetched
 let LAB_RUNS = [];
+// (#1584/#1585) Where `/lab/runs` actually scanned, and whether that path
+// exists. This — not `configured` — is the live signal: since #1585 gave
+// `lab_dir` a config tier and a default, `configured` is true on every real
+// daemon, so the old "restart with --lab-dir" guidance names a cause that can
+// no longer occur. "Zero lab runs" now means either the dir is missing or it
+// holds nothing recognizable, and only the resolved path can tell those apart.
+let LAB_DIR = null;
+let LAB_DIR_EXISTS = null;
+// (#1584) The consolidated `/runs` list + the kind-filter vocabulary. "all"
+// is a filter VALUE, not a separate mode, so every chip goes through one code
+// path; the other three are exactly `RunKind`'s serde spelling (lowercase),
+// so a chip value is comparable to `run.kind` with no mapping table.
+let RUNS_LOADED = null; // null = not yet fetched
+let RUNS = [];
+const RUNS_KINDS = ["all","mission","dispatch","lab"];
 let LAB_DETAIL = null; // {dir, funnels, scores} for the open run
 let LAB_EVENTS = []; // accumulated funnel-events.jsonl records for the open run
 let LAB_EVENTS_OFFSET = 0;
@@ -3544,8 +3626,10 @@ async function loadLabRuns(){
     const res = await fetch(src, {headers:{accept:"application/json"}});
     const body = res.ok ? await res.json() : {configured:false, runs:[]};
     LAB_CONFIGURED = body.configured !== false;
+    LAB_DIR = body.dir || null;
+    LAB_DIR_EXISTS = typeof body.exists==="boolean" ? body.exists : null;
     LAB_RUNS = Array.isArray(body.runs) ? body.runs : [];
-  }catch(_){ LAB_CONFIGURED=false; LAB_RUNS=[]; }
+  }catch(_){ LAB_CONFIGURED=false; LAB_DIR=null; LAB_DIR_EXISTS=null; LAB_RUNS=[]; }
 }
 async function loadLabRunDetail(dir){
   try{
@@ -3579,11 +3663,37 @@ async function pollLabEvents(dir){
   }
   setTimeout(()=>pollLabEvents(dir), gotLines ? LAB_POLL_BACKFILL_MS : LAB_POLL_STEADY_MS);
 }
-window.goLab=async()=>{
-  state.level="lab"; state.labRunDir=null; LAB_NOTICE=null;
+// (#1584) The runs lens's own fetch. `/runs` is the read-side union over all
+// three sources (missions/dispatches, lab runs, flow-only ghosts) — see
+// `crates/darkmux-serve/src/runs.rs`. The lab list is fetched ALONGSIDE it,
+// not instead of it: `/runs` carries the flat normalized row every kind
+// shares, while `/lab/runs` carries the lab-only extras (the staffing
+// snapshot the series/knob-diff view compares, and the bundle/flag counts).
+// Both are cheap reads of the same on-disk artifacts.
+async function loadRuns(){
+  const src = injectedMeta("darkmux-runs-src") || "/runs";
+  try{
+    const res = await fetch(src, {headers:{accept:"application/json"}});
+    const body = res.ok ? await res.json() : {runs:[]};
+    RUNS = Array.isArray(body.runs) ? body.runs : [];
+    RUNS_LOADED = true;
+  }catch(_){ RUNS=[]; RUNS_LOADED=true; }
+}
+window.goRuns=async()=>{
+  state.level="runs"; state.labRunDir=null; LAB_NOTICE=null; state.runsAll=false;
   render(); // paint "loading…" immediately
-  await loadLabRuns();
-  if(state.level==="lab") render();
+  await Promise.all([loadRuns(), loadLabRuns()]);
+  if(state.level==="runs") render();
+};
+// (#1584) Switching the kind filter never renavigates — it re-filters the one
+// already-loaded list, and resets the bounded window so the operator lands on
+// the newest slice of the kind they just picked rather than deep in an
+// expanded list from the previous one.
+window.setRunsKind=k=>{
+  state.runsKind = RUNS_KINDS.includes(k) ? k : "all";
+  state.runsAll=false;
+  if(state.runsKind!=="lab") state.runsSeries=false;
+  render();
 };
 window.drillLabRun=async(dir)=>{
   state.level="lab-run"; state.labRunDir=dir; LAB_NOTICE=null;
@@ -3597,11 +3707,20 @@ window.drillLabRun=async(dir)=>{
   // with a notice, never a stuck "loading…" pane with a poll loop hammering
   // the same failing request.
   if(!LAB_DETAIL){
-    LAB_NOTICE="couldn't open run \""+dir+"\" — it may have been removed, or the link is stale. Showing the run list.";
-    state.level="lab"; state.labRunDir=null;
+    // (#1584) With NO DAEMON behind the page there is nothing to serve
+    // `/lab/run/detail`, so this isn't a stale link — it's a capability the
+    // static build doesn't have, and "it may have been removed" reads as a
+    // bug on the public demo. Same honesty `renderMissionStatic` already
+    // applies to the mission graph in a daemon-less context, and it keys off
+    // the SAME predicate: playback alone is not the test, because
+    // `/play/<date>` is daemon-served playback where detail resolves fine.
+    LAB_NOTICE = !missionGraphReachable()
+      ? "run detail needs a running daemon — this static build lists runs without their per-run pipeline and event feed."
+      : "couldn't open run \""+dir+"\" — it may have been removed, or the link is stale. Showing the run list.";
+    state.level="runs"; state.labRunDir=null;
     render();
-    await loadLabRuns();
-    if(state.level==="lab") render();
+    await Promise.all([loadRuns(), loadLabRuns()]);
+    if(state.level==="runs") render();
     return;
   }
   render();
@@ -3721,26 +3840,158 @@ function renderLabTaskCard(group){
     ${rows}
   </div>`;
 }
+// ── the runs lens: one flat, kind-tagged list (#1584) ───────────────────
+//
+// Replaces the per-source `lab` tab. `/runs` already consolidated every run
+// source into one normalized view-model (#1508); this is the navigation
+// catching up to it — the operator asks "what ran recently?" without first
+// having to know which subsystem happened to record it.
+
+// Ordering: STRICTLY newest-activity-first, with no hoisting of `running`
+// rows. Hoisting was the obvious reading of "active first", and it is wrong
+// against real data: a lab run dir that was killed before writing
+// `scores.json` stays `running` forever, and this machine has dozens of them
+// — hoisting would bury today's work under a wall of long-dead runs. A
+// genuinely live run has the newest activity timestamp and reaches the top on
+// its own, so time alone gives the intended result without the viewer having
+// to invent a staleness threshold (whether a stale-`running` run should be
+// reclassified is a policy call that belongs to the operator, not here).
+function runActivity(r){ return r.updated_ts || r.completed_ts || r.started_ts || 0; }
+function runsFiltered(){
+  const k=state.runsKind;
+  const rows=(k==="all") ? RUNS.slice() : RUNS.filter(r=>r.kind===k);
+  rows.sort((a,b)=>runActivity(b)-runActivity(a));
+  return rows;
+}
+// Relative-to-NOW is only meaningful in live mode. In playback (a recorded
+// day, or darkmux.com/demo's committed dataset) the whole page is a past
+// window, so "N ago" measures the age of the RECORDING rather than of the
+// work — it reads as staleness and grows without bound as the fixture ages.
+// There, the absolute timestamp is the honest rendering.
+const runsIsPlayback=()=>document.body.classList.contains("daemon-mode-play");
+function runsAgo(r){
+  const ts=runActivity(r);
+  if(!ts) return "";
+  if(runsIsPlayback()) return new Date(ts*1000).toISOString().replace("T"," ").slice(0,16);
+  const secs=Math.max(0, Math.floor(Date.now()/1000)-ts);
+  if(secs<60) return secs+"s ago";
+  if(secs<3600) return Math.floor(secs/60)+"m ago";
+  if(secs<86400) return Math.floor(secs/3600)+"h ago";
+  return Math.floor(secs/86400)+"d ago";
+}
+// Deliberately NOT the pulsing "● live" badge the lab list used. `running`
+// from `/runs` means "no terminal artifact was written", which is not the
+// same claim as "running right now": a lab run killed before it wrote
+// `scores.json` stays `running` forever, and dozens on this machine are days
+// old. Animating those asserts a liveness they don't have. The relative time
+// beside the badge carries that distinction honestly — "running · 12s ago"
+// reads live and "running · 1d ago" reads abandoned — with no invented
+// staleness threshold in the viewer.
+function runStatusBadge(r){
+  const s=String(r.status||"");
+  return `<span class="labbadge ${esc(s)}">${esc(s)}</span>`;
+}
+// The one-line "what was this" summary. Deliberately thin: the row answers
+// what/when/how-it-ended, and anything richer lives behind the drill-down.
+function runSubtitle(r, showMachine){
+  const bits=[];
+  if(r.role) bits.push(esc(r.role));
+  if(r.model) bits.push(esc(shortModel(r.model)));
+  if(r.route) bits.push("via "+esc(r.route));
+  // A single-machine daemon repeats its own name on every row, which is a
+  // constant, not information. It earns its place only once the fleet
+  // actually has more than one machine in the list.
+  if(showMachine && r.machine) bits.push(esc(r.machine));
+  return bits.join(" · ");
+}
+function runsMultiMachine(){
+  return new Set(RUNS.map(r=>r.machine).filter(Boolean)).size>1;
+}
+function renderRunRow(r, showMachine){
+  // Lab rows drill into the lab-specific run detail (unchanged, #1247);
+  // mission/dispatch rows open that run's graph page. An UNTRACKED ghost has
+  // no durable record behind it, so there is nothing to open — it renders as
+  // a plain non-interactive row rather than a link to a 404.
+  const act = r.kind==="lab" ? `data-act="labrun" data-arg="${esc(r.id)}"`
+            : (r.tracked ? `data-act="gomission" data-arg="${esc(r.id)}"` : "");
+  const attrs = act ? `${act} tabindex="0" role="button"` : "";
+  const ago=runsAgo(r);
+  return `<div class="labrunrow${act?"":" flat"}" ${attrs}>
+    <div class="labrunmain">${runStatusBadge(r)}<span class="runkind ${esc(r.kind)}">${esc(r.kind)}</span><span class="labruncrew">${esc(r.id)}</span>${ago?`<span class="labrundir">${esc(ago)}</span>`:""}${r.tracked?"":`<span class="rununtracked">untracked</span>`}</div>
+    ${runSubtitle(r,showMachine)?`<div class="labrunmeta dim">${runSubtitle(r,showMachine)}</div>`:""}
+  </div>`;
+}
+function renderRunsBar(){
+  const counts={all:RUNS.length};
+  RUNS_KINDS.slice(1).forEach(k=>{counts[k]=RUNS.filter(r=>r.kind===k).length;});
+  const chips=RUNS_KINDS.map(k=>
+    `<span class="runchip${state.runsKind===k?" on":""}" data-act="runskind" data-arg="${k}" tabindex="0" role="button">${k}<span class="runchipn"> ${counts[k]}</span></span>`
+  ).join("");
+  // The series view compares a lab run's recorded staffing snapshot against
+  // the previous run over the same corpus — meaningless for a mission or a
+  // dispatch, so the toggle only exists under the lab filter.
+  const series = state.runsKind==="lab"
+    ? `<span class="runchip${state.runsSeries?" on":""}" data-act="runsseries" tabindex="0" role="button">◧ series</span>`
+    : "";
+  return `<div class="runsbar">${chips}${series}</div>`;
+}
+// (#1584) Why the lab slice is empty, when it is — and ONLY then, so a
+// healthy board never carries an explanation of a problem it doesn't have.
+// "Zero lab runs" has two causes the operator can act on differently, and
+// only the daemon's resolved path distinguishes them, so the path is the
+// message. Deliberately NOT the pre-#1585 "restart with --lab-dir" text:
+// `lab_dir` has a config tier and a default now, so that cause can no longer
+// occur and naming it would send the operator after a setting that is
+// already set.
+function labSourceNotice(){
+  if(state.runsKind!=="lab" || LAB_CONFIGURED===null) return "";
+  if(RUNS.some(r=>r.kind==="lab")) return "";
+  if(LAB_CONFIGURED===false){
+    return `<div class="labnotice">this daemon has no lab-run source wired — <code>darkmux doctor</code> shows the resolved <code>dirs.lab</code> and where it came from.</div>`;
+  }
+  const where = LAB_DIR ? ` (<code>${esc(LAB_DIR)}</code>)` : "";
+  return LAB_DIR_EXISTS===false
+    ? `<div class="labnotice">the configured lab dir does not exist yet${where} — it appears with the first run.</div>`
+    : `<div class="labnotice">no lab runs found under the configured lab dir${where}.</div>`;
+}
 function renderLabRunsList(){
-  $("logscope").textContent="lab";
+  $("logscope").textContent="runs";
   // (#1247 deep-link) The one-shot fallback notice (a stale `run=` deep
   // link) renders atop whichever list state applies below.
-  const notice = LAB_NOTICE ? `<div class="labnotice">${esc(LAB_NOTICE)}</div>` : "";
-  if(LAB_CONFIGURED===null){
-    $("stage").innerHTML = `<div class="stagehdr">lab observer</div>${notice}<div class="none">loading…</div>`;
+  const notice = (LAB_NOTICE ? `<div class="labnotice">${esc(LAB_NOTICE)}</div>` : "") + labSourceNotice();
+  if(RUNS_LOADED===null){
+    $("stage").innerHTML = `<div class="stagehdr">runs</div>${notice}<div class="none">loading…</div>`;
     return;
   }
-  if(LAB_CONFIGURED===false){
-    $("stage").innerHTML = `<div class="stagehdr">lab observer</div>${notice}
-      <div class="none">not configured — restart <code>darkmux serve</code> with <code>--lab-dir &lt;path&gt;</code> (or set <code>DARKMUX_LAB_DIR</code>) to scan this machine's lab run history. Machine-local by design — never a remote path.</div>`;
+  // The lab-only series/knob-diff view, kept exactly as it was — it is the
+  // single-variable-change discipline made visible, and nothing in the flat
+  // list replaces it. Opt-in, and only under the lab filter.
+  if(state.runsKind==="lab" && state.runsSeries){
+    const groups = groupLabRunsByTask(LAB_RUNS);
+    const body = groups.length
+      ? groups.map(renderLabTaskCard).join("")
+      : `<div class="none">no lab runs with a recorded corpus yet — run <code>darkmux lab eval --funnel …</code> to produce one.</div>`;
+    $("stage").innerHTML = `<div class="stagehdr">runs · lab series · ${LAB_RUNS.length} run${LAB_RUNS.length===1?"":"s"} · ${groups.length} task${groups.length===1?"":"s"}</div>
+      ${renderRunsBar()}${notice}<div class="lablist">${body}</div>`;
     return;
   }
-  const groups = groupLabRunsByTask(LAB_RUNS);
-  const body = groups.length
-    ? groups.map(renderLabTaskCard).join("")
-    : `<div class="none">no lab runs found under the configured lab dir yet — run <code>darkmux lab eval --funnel …</code> to produce one.</div>`;
-  $("stage").innerHTML = `<div class="stagehdr">lab observer · ${LAB_RUNS.length} run${LAB_RUNS.length===1?"":"s"} · ${groups.length} task${groups.length===1?"":"s"}</div>${notice}
-    <div class="lablist">${body}</div>`;
+  const rows=runsFiltered();
+  // The bounded window with the TRUE total beside it (#1569): the default
+  // answers "what ran recently", and the full store is one click away.
+  const shown = state.runsAll ? rows : rows.slice(0, RUNS_CAP);
+  const more = rows.length-shown.length;
+  const showMachine = runsMultiMachine();
+  const body = shown.length
+    ? shown.map(r=>renderRunRow(r,showMachine)).join("") + (more>0
+        ? `<div class="runmore" data-act="runsmore" tabindex="0" role="button">show all ${rows.length} — ${more} more</div>`
+        : "")
+    : `<div class="none">no ${state.runsKind==="all"?"":esc(state.runsKind)+" "}runs recorded yet.</div>`;
+  const scope = state.runsKind==="all" ? "" : ` · ${esc(state.runsKind)}`;
+  const count = state.runsAll || more<=0
+    ? `${rows.length} run${rows.length===1?"":"s"}`
+    : `newest ${shown.length} of ${rows.length}`;
+  $("stage").innerHTML = `<div class="stagehdr">runs${scope} · ${count}</div>
+    ${renderRunsBar()}${notice}<div class="lablist">${body}</div>`;
 }
 
 // ── run detail: pipeline strip + live/playback event feed ──────────────
@@ -3845,7 +4096,7 @@ function renderLabRun(){
   const dir = state.labRunDir;
   $("logscope").textContent="lab run";
   if(!LAB_DETAIL){
-    $("stage").innerHTML = `<div class="stagehdr"><a data-act="lab">‹ lab</a> · ${esc(dir)}</div><div class="none">loading…</div>`;
+    $("stage").innerHTML = `<div class="stagehdr"><a data-act="runs">‹ runs</a> · ${esc(dir)}</div><div class="none">loading…</div>`;
     return;
   }
   const env = (LAB_DETAIL.funnels && LAB_DETAIL.funnels[0]) || null;
@@ -3855,7 +4106,7 @@ function renderLabRun(){
   // its completed envelope or scores artifact is present.
   const finished = !!env || (scores!=null);
   $("stage").innerHTML = `
-    <div class="stagehdr"><a data-act="lab">‹ lab</a> · ${esc(dir)} ${finished?labBadge({finished:true}):labBadge({finished:false})}</div>
+    <div class="stagehdr"><a data-act="runs">‹ runs</a> · ${esc(dir)} ${finished?labBadge({finished:true}):labBadge({finished:false})}</div>
     <div class="labpipe">${renderLabPipeline(pipe, env)}</div>
     <div class="labcli"><span class="labclilbl">try it yourself</span><code>${esc(labCliHint(env, scores))}</code></div>
     <div class="labfeedwrap">
