@@ -1725,6 +1725,45 @@ fn tailnet_viewer_url(port: u16) -> Option<String> {
     parse_tailnet_viewer_url(&String::from_utf8_lossy(&out.stdout), port)
 }
 
+/// (#1569 packet A) The base URL that linkified ids in CLI output should
+/// point at, and the ONE place that decision lives — `doctor` and
+/// `mission status` disagreeing about where the viewer is would be a
+/// twin-drift of exactly the kind the CLI-panel work exists to make
+/// impossible.
+///
+/// **Routes on whether the wrong-machine ambiguity exists, not on a
+/// preference between two URLs** (operator call, #1569):
+///
+/// - `standalone` → **loopback**. There is no second daemon a link could open
+///   by mistake, so loopback carries no ambiguity — and a fresh install that
+///   never set up tailscale must still get working links. The docs are the
+///   setup acceptance test; a clean brew-only machine following the guide
+///   cannot be handed a URL it can't resolve.
+/// - `hub` / `peer` → **tailnet when available**, loopback otherwise. Here a
+///   second daemon exists, so a `127.0.0.1` link clicked from an SSH session
+///   opens the WRONG machine's daemon and shows plausible-looking data for
+///   the wrong box. That failure is silent; an unreachable tailnet URL is
+///   loud. Prefer the loud one.
+///
+/// `fleet.mode` is the right input because it is operator-DECLARED, never
+/// detected (#933) — this reads a stated intent rather than sniffing the
+/// environment.
+///
+/// Resolving the tailnet URL spawns `tailscale serve status --json`, so it is
+/// gated on `colorize_enabled()`: piped, redirected, and `--json` output emit
+/// no links at all, and therefore pay no subprocess. A standalone machine
+/// never spawns it regardless.
+pub fn viewer_link_base(port: u16) -> String {
+    let loopback = format!("http://127.0.0.1:{port}/");
+    if !darkmux_types::style::colorize_enabled() {
+        return loopback;
+    }
+    match darkmux_types::config_access::fleet_mode() {
+        darkmux_types::config::FleetMode::Standalone => loopback,
+        _ => tailnet_viewer_url(port).unwrap_or(loopback),
+    }
+}
+
 fn check_daemon_reachable() -> Check {
     // Check if the darkmux daemon is reachable at 127.0.0.1:8765/health.
     // Pass when reachable, Warn otherwise (daemon being off doesn't break

@@ -47,6 +47,30 @@ fn is_terminal(s: PhaseStatus) -> bool {
     matches!(s, PhaseStatus::Complete | PhaseStatus::Abandoned)
 }
 
+/// (#1569 packet A) The daemon URL a mission id links to.
+///
+/// The id IS percent-encoded, and that is not defensive theater: mission ids
+/// are not guaranteed path-safe. `pr-review` ids embed a full TMPDIR path
+/// today (#1563), so an unencoded id would emit a URL with extra path
+/// segments that resolves to the wrong route — or to nothing.
+///
+/// Encoding is inline rather than a new dependency, per this repo's
+/// small-dep convention: the rule needed here is one line of RFC 3986
+/// unreserved-set logic, not a crate.
+fn mission_url(base: &str, id: &str) -> String {
+    let encoded: String = id
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    // `base` always carries its trailing slash (see `viewer_link_base`).
+    format!("{base}mission/{encoded}/graph")
+}
+
 /// Pure drift detection for one mission given its phases. `now` and
 /// `stale_days` are passed in (rather than read internally) so the function
 /// stays IO-free and unit-testable with fixed timestamps — see the module
@@ -298,6 +322,12 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
     // Resolved once, above the early return, so every prose line in this
     // renderer — including the empty-board hint — wraps to the same width.
     let width = style::terminal_width();
+    // (#1569 packet A) Resolved ONCE per board, not per row: on a hub/peer
+    // this may spawn `tailscale serve status --json`, and doing that 82 times
+    // for an 82-mission board would be absurd. Returns loopback without
+    // spawning anything when output isn't a TTY (no links are emitted then)
+    // or when the machine declares itself standalone.
+    let link_base = darkmux_doctor::viewer_link_base(8765);
     if views.is_empty() {
         // (#1582) The prose wraps; the command does not. Same rule the drift
         // suggestions follow, for the same reason — this is the one command a
@@ -347,20 +377,30 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
             let prog = format!("{}/{}", v.complete, v.total);
             let bar = progress_bar(v.complete, v.total);
             let id = ellipsize(&v.m.id, layout.id_width);
+            // (#1569 packet A) Pad BEFORE linking, and by the VISIBLE width:
+            // `{:<width$}` counts the OSC 8 escape bytes, so formatting a
+            // linkified id would silently destroy the column alignment the
+            // whole layout planner exists to maintain. The link wraps only
+            // the id text; the padding stays outside it, so the clickable
+            // target is the id rather than a run of trailing whitespace.
+            let id_cell = format!(
+                "{}{}",
+                style::link(&mission_url(&link_base, &v.m.id), &id),
+                " ".repeat(layout.id_width.saturating_sub(id.chars().count()))
+            );
             if layout.show_mix {
                 println!(
-                    "  ◆ {:<width$}  {:>5}  {}  {}",
-                    id,
+                    "  ◆ {}  {:>5}  {}  {}",
+                    id_cell,
                     prog,
                     bar,
                     style::dim(&phase_mix(v)),
-                    width = layout.id_width
                 );
             } else {
                 // Narrow terminal: the mix is dropped rather than the id or the
                 // progress, because it is the one column whose information the
                 // other two already carry.
-                println!("  ◆ {:<width$}  {:>5}  {}", id, prog, bar, width = layout.id_width);
+                println!("  ◆ {}  {:>5}  {}", id_cell, prog, bar);
             }
             for d in &v.drifts {
                 // The ⚠ marks the warning, not each of its lines — continuation
@@ -1028,6 +1068,122 @@ mod tests {
         let m = mission("m-0123456789-0123456789", MissionStatus::Active);
         let l = plan_layout([view(&m, 1, 0)].iter(), Some(10));
         assert_eq!(l.id_width, MIN_ID_COLS);
+    }
+
+    /// (#1569 packet A) Mission ids are NOT guaranteed path-safe — `pr-review`
+    /// ids embed a full TMPDIR path (#1563) — so an unencoded id would emit a
+    /// URL with extra path segments pointing at the wrong route, or none.
+    #[test]
+    fn mission_url_percent_encodes_ids_that_are_not_path_safe() {
+        let base = "http://127.0.0.1:8765/";
+        assert_eq!(mission_url(base, "doom-loop-m4"), "http://127.0.0.1:8765/mission/doom-loop-m4/graph");
+        // The #1563 shape: a slash would otherwise open a new path segment.
+        assert_eq!(
+            mission_url(base, "review-/tmp/x"),
+            "http://127.0.0.1:8765/mission/review-%2Ftmp%2Fx/graph"
+        );
+        // `?`/`#` would truncate the path into a query/fragment.
+        assert_eq!(
+            mission_url(base, "a?b#c"),
+            "http://127.0.0.1:8765/mission/a%3Fb%23c/graph"
+        );
+        // RFC 3986 unreserved characters survive unescaped.
+        assert_eq!(
+            mission_url(base, "a-b_c.d~e"),
+            "http://127.0.0.1:8765/mission/a-b_c.d~e/graph"
+        );
+    }
+
+    /// (#1569 packet A) The id column must stay aligned once ids carry OSC 8
+    /// escapes. `{:<width$}` counts the escape BYTES, so formatting a
+    /// linkified id directly would silently destroy every column to its
+    /// right — the failure the layout planner exists to prevent, reintroduced
+    /// by the feature. Padding is therefore computed from the VISIBLE text.
+    // Mutates the process-global colorize override — see the note on
+    // `style::set_colorize_override`. Without this a concurrent test flips it
+    // mid-assertion and `link()` returns plain text (the #1544 class, and I
+    // reproduced it writing these).
+    #[test]
+    #[serial_test::serial]
+    fn linkified_id_cell_pads_by_visible_width_not_byte_length() {
+        style::set_colorize_override(Some(true));
+        let id = ellipsize("m1", 12);
+        let cell = format!(
+            "{}{}",
+            style::link(&mission_url("http://127.0.0.1:8765/", "m1"), &id),
+            " ".repeat(12usize.saturating_sub(id.chars().count()))
+        );
+        style::set_colorize_override(None);
+
+        // The cell carries the escape…
+        assert!(cell.contains("\x1b]8;;"), "{cell:?}");
+        // …and exactly the padding the plain form would have had.
+        let visible: String = strip_ansi(&cell);
+        assert_eq!(visible, format!("{:<12}", "m1"), "visible width must match the plain cell");
+    }
+
+    /// (#1569 packet A) A narrow terminal elides the id for DISPLAY, but the
+    /// link must still target the FULL id — otherwise every row on a narrow
+    /// terminal links to a mission that doesn't exist, and the failure is a
+    /// 404 the operator would reasonably blame on the daemon rather than on
+    /// the renderer. The display text and the URL come from different values
+    /// on purpose; this pins that they stay different.
+    // Mutates the process-global colorize override — see the note on
+    // `style::set_colorize_override`. Without this a concurrent test flips it
+    // mid-assertion and `link()` returns plain text (the #1544 class, and I
+    // reproduced it writing these).
+    #[test]
+    #[serial_test::serial]
+    fn a_narrowed_id_still_links_to_the_full_mission() {
+        style::set_colorize_override(Some(true));
+        let full = "dispatch-code-reviewer-1785570518-17301-0";
+        let shown = ellipsize(full, 18);
+        assert_ne!(shown, full, "precondition: this width must actually elide");
+        assert!(shown.contains('…'), "{shown}");
+
+        let cell = style::link(&mission_url("http://127.0.0.1:8765/", full), &shown);
+        style::set_colorize_override(None);
+
+        // The visible text is the elided form…
+        assert!(strip_ansi(&cell).contains('…'), "{cell:?}");
+        // …while the target carries the whole id, unelided.
+        assert!(cell.contains(&format!("mission/{full}/graph")), "{cell:?}");
+        assert!(!cell.contains(&format!("mission/{shown}/graph")), "elided id must never be the target: {cell:?}");
+    }
+
+    /// Minimal ANSI/OSC stripper for the alignment assertion above — enough
+    /// for the two sequences this renderer emits (SGR and OSC 8), not a
+    /// general terminal parser.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                // OSC: consume through ST (ESC \).
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // CSI: consume through the final byte (@..~).
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     #[test]
