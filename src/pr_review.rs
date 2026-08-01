@@ -17,6 +17,19 @@
 //! degenerate envelope) — the workflow posts the comment AND marks its check
 //! failed/neutral, never green.
 //!
+//! **`comment` in `review` mode is the FALLBACK, not the default action**
+//! (#1583). `mode` alone decides what to post; in `review` mode the workflow
+//! posts `review` and only reaches for `comment` if GitHub rejects it. That
+//! rejection is routine, not exotic: a review takes tens of minutes, and a
+//! branch that moves under it invalidates the inline anchors (`422
+//! Unprocessable Entity — Line could not be resolved`). Before #1583 that
+//! 422 killed the posting step under `set -e` and the ENTIRE review was
+//! discarded — a run with eight confirmed findings, one of them a real
+//! inverted-comparator bug, left no trace on the PR. A summary-only post is
+//! a DEGRADED SUCCESS: the findings reach the author, and the note in the
+//! body says anchoring was unavailable so it can't be misread as a thin
+//! review.
+//!
 //! Consumers: `darkmux mission launch review` (`src/mission_launch_review.rs`)
 //! drives the `darkmux_lab::lab::review::{build_review_graph, run_review_graph,
 //! run_judge_only}` machinery and calls back into
@@ -420,6 +433,15 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
     let index = new_side_index(diff);
     let mut inline: Vec<Value> = Vec::new();
     let mut confirmed_general: Vec<String> = Vec::new();
+    // (#1583) EVERY confirmed finding as a prose bullet — the anchored ones
+    // too, which `confirmed_general` deliberately excludes. This is the
+    // summary-only FALLBACK body: when GitHub rejects the inline anchors
+    // (a 422, typically because the branch moved during a review that takes
+    // tens of minutes), the workflow posts this instead of discarding the
+    // run. Built here rather than in the workflow YAML because rendering is
+    // the binary's job and versioned with the role schema (#1060) — the YAML
+    // stays a thin poster.
+    let mut confirmed_all: Vec<String> = Vec::new();
     let mut needs_check_lines: Vec<String> = Vec::new();
     // (#1521-adjacent UX) Whether any confirmed finding in this run lacks a
     // `verified` adjudication — drives the ONE header-level [`CONFIRMED_MARKER`]
@@ -440,6 +462,14 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
                 if verified.is_none() {
                     any_unverified = true;
                 }
+                // (#1583) Every confirmed finding gets a prose bullet for the
+                // fallback body, anchored or not — an unpostable inline
+                // comment must still reach the author. Rendered once and
+                // shared with the general list below, which needs the
+                // identical string for the unanchored case.
+                let bullet =
+                    confirmed_general_bullet(path, record, verified, &j.flag.also_flagged);
+                confirmed_all.push(bullet.clone());
                 match resolve_anchor(Some(path), j.flag.anchor.as_deref(), &index) {
                     Some(line) => inline.push(json!({
                         "path": norm_path(path),
@@ -447,8 +477,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
                         "side": "RIGHT",
                         "body": confirmed_comment_body(record, verified, &j.flag.also_flagged),
                     })),
-                    None => confirmed_general
-                        .push(confirmed_general_bullet(path, record, verified, &j.flag.also_flagged)),
+                    None => confirmed_general.push(bullet),
                 }
             }
             Tier::NeedsCheck => {
@@ -527,12 +556,44 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
         body.push("**Confirmed findings not anchored to a diff line:**".to_string());
         body.extend(confirmed_general);
     }
+    // (#1583) Cloned because the fallback body below renders the same
+    // section — the two bodies are alternatives, never both posted.
+    let needs_check_section_fallback = needs_check_section.clone();
     if needs_check_count > 0 {
         body.push(String::new());
         body.push("**Worth a double check** (not merge-blocking):".to_string());
         body.extend(needs_check_section);
     }
     body.extend(run_warnings_block(env));
+
+    // (#1583) The summary-only fallback body, assembled from the same parts
+    // but with EVERY confirmed finding as a prose bullet carrying its own
+    // `path` — because in this rendering there are no inline comments to
+    // carry the location. Posted by the workflow only when the formal review
+    // is rejected; a successful review never shows it.
+    //
+    // It says plainly that anchoring was unavailable, so a summary-only
+    // review can't be mistaken for a thin one — the same "never read as
+    // something it isn't" contract `mode: degraded` carries (#1113).
+    let mut fallback = vec!["### 🤖 PR review".to_string(), String::new()];
+    fallback.push(format!("**Verdict: flag** · {confirmed_total} confirmed"));
+    fallback.push(
+        "_Inline anchoring was unavailable for this run, so every finding is listed below with \
+         its file. This is the full review, not a partial one._"
+            .to_string(),
+    );
+    if any_unverified {
+        fallback.push(format!("_{CONFIRMED_MARKER}_"));
+    }
+    fallback.push(String::new());
+    fallback.push("**Confirmed findings:**".to_string());
+    fallback.extend(confirmed_all);
+    if needs_check_count > 0 {
+        fallback.push(String::new());
+        fallback.push("**Worth a double check** (not merge-blocking):".to_string());
+        fallback.extend(needs_check_section_fallback);
+    }
+    fallback.extend(run_warnings_block(env));
 
     // (#1302) Confirmed findings default to a NON-blocking `COMMENT`-event
     // formal review: it keeps the formal-review structure and the inline
@@ -557,7 +618,10 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
             "body": format!("{}{}", body.join("\n"), review_footer(env, attribution)),
             "comments": inline,
         })),
-        comment: None,
+        // (#1583) Present in `review` mode too, as the FALLBACK — not an
+        // instruction to post it. `mode` still decides the default action;
+        // this is only reached when posting the formal review fails.
+        comment: Some(format!("{}{}", fallback.join("\n"), review_footer(env, attribution))),
     }
 }
 
@@ -1017,6 +1081,71 @@ mod tests {
             top_body.contains(CONFIRMED_MARKER),
             "the run has one unverified confirm, so the header marker fires once: {top_body}"
         );
+    }
+
+    /// (#1583) A `review`-mode render also carries a summary-only FALLBACK
+    /// body, so a rejected inline post degrades instead of discarding the
+    /// run. The failure this pins: a real review with eight confirmed
+    /// findings — one of them a genuine inverted-comparator bug — left NO
+    /// trace on the PR because a 422 on the anchors killed the posting step.
+    ///
+    /// The load-bearing property is that the fallback carries findings the
+    /// review body does NOT: an anchored finding lives only in
+    /// `review.comments`, so a fallback built from `review.body` alone would
+    /// silently drop exactly the findings that anchored successfully.
+    #[test]
+    fn synthesize_review_mode_also_renders_a_summary_only_fallback() {
+        let anchored = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "shadows the config default",
+            "the clamp is bypassed",
+        );
+        // Deliberately unresolvable, so this one lands in the general body.
+        let unanchored = confirmed_flag(
+            "other@src/x.ts",
+            Some("no-such-line-anywhere"),
+            "second finding note",
+            "second finding evidence",
+        );
+        let env = healthy_envelope(vec![anchored, unanchored]);
+        let r = synthesize_review(&env, DIFF, None);
+        assert_eq!(r.mode, "review", "the fallback never changes the default action");
+
+        let review = r.review.as_ref().unwrap();
+        assert_eq!(review["comments"].as_array().unwrap().len(), 1, "one finding anchored");
+
+        let fallback = r.comment.as_deref().expect("review mode must render a fallback body");
+        // BOTH findings, including the one that only existed as an inline
+        // comment — the whole point.
+        assert!(
+            fallback.contains("shadows the config default"),
+            "the ANCHORED finding must survive into the fallback: {fallback}"
+        );
+        assert!(
+            fallback.contains("second finding note"),
+            "the unanchored finding must too: {fallback}"
+        );
+        // The anchored finding's location has to come along, since there is
+        // no inline comment to carry it in this rendering.
+        assert!(fallback.contains("src/x.ts"), "findings must name their file: {fallback}");
+        // Says plainly it is summary-only, so it can't be misread as thin.
+        assert!(
+            fallback.contains("Inline anchoring was unavailable"),
+            "a summary-only review must say so: {fallback}"
+        );
+        assert!(fallback.contains("2 confirmed"), "the count must be honest: {fallback}");
+    }
+
+    /// (#1583) A `comment`-mode render is unaffected — it had a `comment`
+    /// body before and still does, and gains no `review` payload.
+    #[test]
+    fn comment_mode_is_unchanged_by_the_fallback_work() {
+        let env = healthy_envelope(vec![]);
+        let r = synthesize_review(&env, DIFF, None);
+        assert_eq!(r.mode, "comment", "zero confirms is still a plain comment");
+        assert!(r.review.is_none());
+        assert!(r.comment.is_some());
     }
 
     /// (#1302) Opt-in blocking: `request_changes: true` on the crew (carried
