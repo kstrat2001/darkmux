@@ -49,10 +49,24 @@ fn is_terminal(s: PhaseStatus) -> bool {
 
 /// (#1569 packet A) The daemon URL a mission id links to.
 ///
-/// The id IS percent-encoded, and that is not defensive theater: mission ids
-/// are not guaranteed path-safe. `pr-review` ids embed a full TMPDIR path
-/// today (#1563), so an unencoded id would emit a URL with extra path
-/// segments that resolves to the wrong route — or to nothing.
+/// The id IS percent-encoded: mission ids are not guaranteed path-safe, and
+/// an unencoded one would emit extra path segments that resolve to the wrong
+/// route or to nothing.
+///
+/// **What encoding does and does not buy** (#1593 gate — the first version of
+/// this comment implied more): it makes the URL *well-formed*, not
+/// *resolvable*. The daemon's `mission_graph_json_handler` gates on
+/// `is_valid_catalog_id` (`[A-Za-z0-9-_.:]`, ≤128 chars) AFTER decoding, so an
+/// id containing `/`, `@`, `?`, `#`, non-ASCII, or over 128 chars produces a
+/// correct-looking link to a guaranteed 400. Encoding is still right — a
+/// well-formed link that 400s beats a malformed one that hits an unrelated
+/// route — but it is not a fix for out-of-charset ids.
+///
+/// Every real id on disk today is slugified and passes. The live constraint
+/// is for #1563: whatever charset that fix mints for pr-review ids must stay
+/// inside `is_valid_catalog_id`, or these links go dead for exactly the ids it
+/// introduces. `:` is in the allowed set and round-trips correctly; `/` and
+/// `@` are not.
 ///
 /// Encoding is inline rather than a new dependency, per this repo's
 /// small-dep convention: the rule needed here is one line of RFC 3986

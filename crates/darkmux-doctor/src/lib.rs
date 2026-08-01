@@ -1715,21 +1715,81 @@ fn parse_tailnet_viewer_url(json: &str, port: u16) -> Option<String> {
 /// absent, not serving, or a non-zero/garbage response) — a missing tailnet URL
 /// is never an error, just an absent line in the doctor message.
 fn tailnet_viewer_url(port: u16) -> Option<String> {
-    let out = std::process::Command::new("tailscale")
+    tailnet_viewer_url_bounded(port, TAILNET_PROBE_TIMEOUT)
+}
+
+/// (#1569 packet A gate) How long the `tailscale` probe may take before it is
+/// killed and treated as absent. Short by design: this runs on a path an
+/// operator is WAITING on, and the fallback (loopback) is always correct —
+/// there is nothing to gain by waiting longer for a nicer URL.
+const TAILNET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Bounded `tailscale serve status --json`, killed at `timeout`.
+///
+/// **The deadline is the point.** `.output()` waits forever, and the
+/// `tailscale` CLI blocks on the local API socket — a wedged `tailscaled`
+/// (sleep/wake, mid-upgrade) hangs it indefinitely. That was tolerable while
+/// only `doctor` called this: doctor is a diagnostics verb an operator runs
+/// deliberately. `mission status` is the every-session housekeeping read, so
+/// #1569 packet A put this on a hot path and made the hang reachable — the
+/// same wedged-external-dependency class #1570/#1573 just removed for Redis,
+/// and which `check_daemon_reachable_impl` below already guards against with
+/// explicit socket timeouts.
+///
+/// Poll-and-kill rather than a watchdog thread: `try_wait` keeps ownership of
+/// the child so the kill is guaranteed on every exit path, and the cost is a
+/// few 25ms sleeps in the rare slow case.
+fn tailnet_viewer_url_bounded(port: u16, timeout: std::time::Duration) -> Option<String> {
+    let mut child = std::process::Command::new("tailscale")
         .args(["serve", "status", "--json"])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
-        return None;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            // Still running — give up at the deadline and reap, so a wedged
+            // tailscaled leaves no orphan behind us.
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
+
+    let out = child.wait_with_output().ok()?;
     parse_tailnet_viewer_url(&String::from_utf8_lossy(&out.stdout), port)
 }
 
-/// (#1569 packet A) The base URL that linkified ids in CLI output should
-/// point at, and the ONE place that decision lives — `doctor` and
-/// `mission status` disagreeing about where the viewer is would be a
-/// twin-drift of exactly the kind the CLI-panel work exists to make
-/// impossible.
+/// (#1569 packet A) The base URL that linkified CLI output points at — the
+/// one place THAT choice lives, so every command emitting a link picks the
+/// same target.
+///
+/// **Scope, stated precisely because the first draft of this comment
+/// overclaimed** (#1593 gate): this is the single source for *links*, not for
+/// every URL darkmux prints. `check_daemon_reachable_impl` below deliberately
+/// formats its own line and is the known second formatter — and it is not a
+/// twin, because it answers a different question. Doctor takes an INVENTORY
+/// ("here is the viewer, and here is the phone URL, both labeled"); this makes
+/// a PICK ("the one URL a click should go to"). A standalone machine with
+/// `tailscale serve` running will therefore see doctor advertise a phone URL
+/// while `mission status` links loopback — correct in both cases, and not a
+/// divergence to reconcile.
 ///
 /// **Routes on whether the wrong-machine ambiguity exists, not on a
 /// preference between two URLs** (operator call, #1569):
@@ -3620,6 +3680,94 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── (#1569 packet A) viewer_link_base routing ─────────────────────────
+    //
+    // The routing IS the feature — this function exists to make one choice —
+    // so both non-spawning branches are pinned. The tailnet branch spawns a
+    // real subprocess and stays untested here; its parser has its own tests
+    // against a captured fixture, and its DEADLINE is the part that matters,
+    // covered separately below.
+    //
+    // `#[serial]`: mutates the process-global colorize override and env.
+
+    #[test]
+    #[serial_test::serial]
+    fn viewer_link_base_returns_loopback_without_a_tty() {
+        // No TTY -> no links are emitted at all, so there is nothing to
+        // resolve and (critically) no `tailscale` subprocess to spawn. This
+        // is what keeps `| grep` and `--json` free of both escapes and cost.
+        let prev = std::env::var("DARKMUX_FLEET_MODE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_MODE", "hub") };
+        darkmux_types::style::set_colorize_override(Some(false));
+
+        assert_eq!(viewer_link_base(8765), "http://127.0.0.1:8765/");
+
+        darkmux_types::style::set_colorize_override(None);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_MODE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_MODE"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn viewer_link_base_standalone_is_loopback_even_at_a_tty() {
+        // The operator-agreed rule (#1569): a single-machine install has no
+        // second daemon a link could open by mistake, so loopback carries no
+        // ambiguity — and a fresh install that never set up tailscale must
+        // still get working links. Also proves the standalone path never
+        // spawns `tailscale`, since a machine without it installed must not
+        // pay for a failed spawn on every board render.
+        let prev = std::env::var("DARKMUX_FLEET_MODE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_MODE", "standalone") };
+        darkmux_types::style::set_colorize_override(Some(true));
+
+        assert_eq!(viewer_link_base(8765), "http://127.0.0.1:8765/");
+        assert_eq!(viewer_link_base(9999), "http://127.0.0.1:9999/", "port is honored");
+
+        darkmux_types::style::set_colorize_override(None);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_MODE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_MODE"),
+            }
+        }
+    }
+
+    /// (#1593 gate, MUST FIX) The probe must not outlive its deadline. A
+    /// wedged `tailscaled` used to hang `mission status` forever — the same
+    /// unbounded-external-dependency class #1570/#1573 removed for Redis.
+    /// `sleep 30` stands in for the wedge; the call must return promptly and
+    /// degrade to `None` rather than wait.
+    #[test]
+    fn tailnet_probe_is_bounded_and_degrades_to_none() {
+        // Shadow `tailscale` with a script that never answers.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("tailscale");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", format!("{}:{prev_path}", dir.path().display())) };
+
+        let started = std::time::Instant::now();
+        let got = tailnet_viewer_url_bounded(8765, std::time::Duration::from_millis(300));
+        let elapsed = started.elapsed();
+
+        unsafe { std::env::set_var("PATH", prev_path) };
+
+        assert!(got.is_none(), "a wedged probe resolves to no tailnet URL, never a hang");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "probe must be bounded; took {elapsed:?}"
+        );
+    }
 
     // ─── (#1461) staleness: daemon / binary-vs-source / runtime image ───────
     //
