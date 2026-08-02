@@ -3235,7 +3235,22 @@ fn redis_tail_lines(
     // with operator-visible log. (#294)
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(SSE_MPSC_CAPACITY);
 
-    tokio::spawn(async move {
+    tokio::spawn(redis_tail_task(tx, url, stream_name, date_filter));
+
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+/// The spawned producer half of [`redis_tail_lines`] — named (rather than an
+/// inline `async move` block) so tests can spawn it directly and OBSERVE ITS
+/// EXIT: the #1596 leak was precisely this task failing to terminate, which
+/// an inline block gives a test no handle to assert on.
+pub(crate) async fn redis_tail_task(
+    tx: tokio::sync::mpsc::Sender<String>,
+    url: String,
+    stream_name: String,
+    date_filter: String,
+) {
+    {
         // Eager: resolve the watermark NOW, before the consumer can
         // race with us.
         let url_for_resolve = url.clone();
@@ -3283,6 +3298,20 @@ fn redis_tail_lines(
         let mut dropped_records: u64 = 0;
 
         loop {
+            // Consumer-disconnect check that does NOT require producing.
+            // `SendOutcome::Closed` — the only other exit for a dropped
+            // receiver — is observable solely inside `for r in records`, so
+            // on a QUIET stream (or one whose records all filter to a
+            // different date) a closed tab was never detected: the task
+            // looped `XREAD BLOCK 500` forever, opening a fresh Redis
+            // connection every ~500ms for the daemon's lifetime, one zombie
+            // per ordinary open-then-close of the dashboard. Same class as
+            // the #293 permanent-failure leak this loop already guards —
+            // that fix covered the error path and left the empty-success
+            // path with no exit.
+            if tx.is_closed() {
+                return;
+            }
             let url_call = url.clone();
             let stream_call = stream_name.clone();
             let last_id_call = last_id.clone();
@@ -3395,9 +3424,7 @@ fn redis_tail_lines(
                 }
             }
         }
-    });
-
-    tokio_stream::wrappers::ReceiverStream::new(rx)
+    }
 }
 
 /// Max consecutive `XREAD` failures before `redis_tail_lines` emits
