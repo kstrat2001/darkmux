@@ -140,6 +140,60 @@
   .labbadge{display:inline-block;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:3px;border:1px solid var(--line);flex:0 0 auto}
   .labbadge.finished{color:var(--good);border-color:var(--good)}
   .labbadge.live{color:var(--amber);border-color:var(--amber);animation:lpulse 1.6s ease-in-out infinite}
+  /* (#1569 packet B2) CLI panels. The terminal's own output, so the type is
+     monospace and the palette maps ANSI's 16 colors onto the viewer's own
+     variables — a panel must look like it belongs to this page, not like a
+     pasted screenshot. `white-space: pre` + horizontal scroll INSIDE the
+     panel: the CLI already width-adapted (packet A made `mission status`
+     honor COLUMNS), so re-wrapping here would fight it and break the
+     column alignment that adaptation exists to protect. */
+  .panelwrap{border:1px solid var(--line);border-radius:8px;background:var(--bg2);margin-top:10px;overflow:hidden}
+  .panelchrome{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:8px 12px;
+    border-bottom:1px solid var(--line);background:var(--panel);
+    font:11px 'JetBrains Mono',monospace;color:var(--muted)}
+  .panelchrome .pc-cmd{color:var(--text);font-weight:600}
+  .panelchrome .pc-spacer{flex:1 1 auto}
+  .panelchrome .pc-stale{color:var(--warn)}
+  .panelchrome .pc-manual{color:var(--amber-dim)}
+  .pcbtn{font:600 11px 'JetBrains Mono',monospace;color:var(--muted);background:var(--bg2);
+    border:1px solid var(--line);border-radius:4px;padding:4px 9px;cursor:pointer}
+  .pcbtn:hover{color:var(--amber);border-color:var(--amber-dim)}
+  .pcbtn:disabled{opacity:.45;cursor:default}
+  .pcbtn:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+  /* Font stack order is load-bearing. 'Apple Color Emoji' must come AFTER
+     the monospace fallbacks, never before: it carries DIGIT glyphs (for
+     keycap sequences), so listing it early hands every number to a
+     proportional font — which broke the column grid and left the
+     box-drawing progress bars (▓░) as empty boxes. Emoji last means it is
+     reached only for codepoints no monospace font covers. */
+  .panelout{margin:0;padding:12px;overflow-x:auto;white-space:pre;
+    font:12px/1.5 'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace,'Apple Color Emoji';
+    color:var(--text)}
+  .panelerr{padding:12px;font:12px/1.5 'JetBrains Mono',monospace;color:var(--bad);white-space:pre-wrap}
+  /* ANSI SGR -> palette. Only what darkmux's own output emits is mapped
+     with intent; the rest fall back to sane terminal-ish values. */
+  .panelout .a-bold{font-weight:700}
+  .panelout .a-dim{opacity:.62}
+  .panelout .a-ital{font-style:italic}
+  .panelout .a-underline{text-decoration:underline}
+  .panelout .a-fg1,.panelout .a-fg9{color:var(--bad)}      /* red    */
+  .panelout .a-fg2,.panelout .a-fg10{color:var(--good)}    /* green  */
+  .panelout .a-fg3,.panelout .a-fg11{color:var(--run)}     /* yellow */
+  .panelout .a-fg4,.panelout .a-fg12{color:#7aa2f7}        /* blue   */
+  .panelout .a-fg5,.panelout .a-fg13{color:#c39cf7}        /* magenta*/
+  .panelout .a-fg6,.panelout .a-fg14{color:var(--amber)}   /* cyan   */
+  .panelout .a-fg0,.panelout .a-fg8{color:var(--muted)}    /* black  */
+  .panelout .a-fg7,.panelout .a-fg15{color:var(--text)}    /* white  */
+  .panelout .a-link{color:inherit;text-decoration:underline;text-underline-offset:2px;
+    text-decoration-color:var(--amber-dim)}
+  /* A tap target that survives a phone: the CLI's own ids are short, so
+     pad the hit box without disturbing the monospace grid (#1569's
+     "styling is legal; parsing prose is not"). */
+  .panelout .a-link{padding:2px 0}
+  @media (max-width:700px){
+    .panelout{font-size:11px;padding:10px}
+    .panelchrome{font-size:10px;padding:7px 10px}
+  }
   /* (#1584) The runs lens — one flat, kind-tagged list over /runs. Reuses the
      .labrun* row styles above (they were never lab-specific); adds only the
      kind filter chips, the kind tag, and the status colors the three sources
@@ -732,7 +786,7 @@
 </div>
 <div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
-  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a><a class="lens" id="lens-runs" data-act="runs">runs</a><a class="lens" id="lens-machine" data-act="machine">machine</a></span>
+  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-console" data-act="console">console</a><a class="lens" id="lens-runs" data-act="runs">runs</a><a class="lens" id="lens-machine" data-act="machine">machine</a></span>
   <span class="crumb" id="crumb"></span>
   <span class="meta" id="meta"></span>
 </div>
@@ -981,6 +1035,8 @@ let state={level:"fleet",machine:null,session:null,missionId:null,labRunDir:null
   // series/knob-diff grouping, opt-in and only reachable under the lab
   // filter (see renderRuns).
   runsKind:"all", runsAll:false, runsSeries:false,
+  // (#1569 B2) Which CLI panel the console tab is showing.
+  panelId:"mission-status",
   // (#1508) Navigational INTENT for the unified machine page's local-vs-
   // remote health-region gate — true only via goMachine() (the nav tab /
   // `#lens=machine` deep-link, which always means "my own page" even before
@@ -2326,6 +2382,9 @@ function renderCrumb(){
   // detail is the graph page (a separate document). The in-viewer `mission`
   // level survives only as the daemon-less static summary (renderMissionStatic).
   const inMissions = state.level==="missions"||state.level==="mission";
+  // (#1569 B2) The console tab. `missions`/`mission` levels survive for the
+  // daemon-less static summary a mission click falls back to.
+  const inConsole = state.level==="console";
   // (#1584) `lab-run` is the lab-specific DRILL-DOWN, kept exactly as it was —
   // it just hangs off the runs lens now instead of a top-level lab tab.
   const inRuns = state.level==="runs"||state.level==="lab-run";
@@ -2334,9 +2393,9 @@ function renderCrumb(){
   // list, a third source class distinct from run artifacts (lab) and flow
   // records (fleet/missions). Absorbed the retired `machinemem` level.
   const inMachine = state.level==="machine";
-  const lf=$("lens-fleet"), lm=$("lens-missions"), ll=$("lens-runs"), lmm=$("lens-machine");
-  if(lf)lf.className="lens"+((inMissions||inRuns||inMachine)?"":" on");
-  if(lm)lm.className="lens"+(inMissions?" on":"");
+  const lf=$("lens-fleet"), lm=$("lens-console"), ll=$("lens-runs"), lmm=$("lens-machine");
+  if(lf)lf.className="lens"+((inMissions||inRuns||inMachine||inConsole)?"":" on");
+  if(lm)lm.className="lens"+((inConsole||inMissions)?" on":"");
   if(ll)ll.className="lens"+(inRuns?" on":"");
   if(lmm)lmm.className="lens"+(inMachine?" on":"");
   // (#1247 Part 3) The runs lens is a SEPARATE machine-local room, not a rung
@@ -2344,7 +2403,7 @@ function renderCrumb(){
   // operator direction) — it has no time-scrubbing story, so the flow-record
   // chrome (event log, detail pane, playback scrub bar) is irrelevant and
   // hidden via this class (see the `.runs-mode` CSS block).
-  document.body.classList.toggle("runs-mode", inRuns);
+  document.body.classList.toggle("runs-mode", inRuns||inConsole);
   // (#1508) Same reflow for the unified machine page — its own class, same rules.
   document.body.classList.toggle("machine-mode", inMachine);
   // (#1247 deep-link) Every navigation path lands here, so this is the ONE
@@ -2361,8 +2420,15 @@ function renderCrumb(){
   }
   // Missions-lens crumb: the index, plus the static mission summary's id when
   // a daemon-less context is showing one (#1403 gate remediation).
+  if(inConsole){
+    $("crumb").innerHTML=`<a data-act="console">console</a><span class="sep">›</span>${esc((state.panelId||"mission-status").replace(/-/g," "))}`;
+    return;
+  }
   if(inMissions){
-    let mc=`<a data-act="missions">missions</a>`;
+    // (#1569 B2) The daemon-less static mission summary — a mission click
+    // in a context with no graph page to open. Its up-nav points at the
+    // console now, since that is where the mission board lives.
+    let mc=`<a data-act="console">console</a>`;
     if(state.level==="mission") mc+=`<span class="sep">›</span>◆ ${esc(state.missionId||primaryMission()||"—")}`;
     $("crumb").innerHTML=mc; return;
   }
@@ -2390,6 +2456,14 @@ function render(){
   // that assumes `DATA`/`state.t`/the scrub window. renderCrumb() still runs
   // first (it lights the lens tab + sets the `.runs-mode` body class the CSS
   // keys off).
+  // (#1569 B2) The console tab renders a CLI panel — text, not flow
+  // records: no time axis, no filters, no event log, same early-return
+  // shape the runs/machine lenses use.
+  if(state.level==="console"){
+    renderCrumb();
+    renderConsole();
+    return;
+  }
   if(state.level==="runs"||state.level==="lab-run"){
     renderCrumb();
     renderLab();
@@ -2488,7 +2562,7 @@ window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;st
 // already flowSrc-shielded; this gates the click paths the same way.
 const missionGraphReachable=()=>!!injectedMeta("darkmux-mode")&&!injectedMeta("darkmux-flow-src");
 window.goMissionGraph=id=>{
-  if(!id)return goMissions();
+  if(!id)return goConsole();
   if(missionGraphReachable()){ location.href="/mission/"+encodeURIComponent(id)+"/graph"; return; }
   state.level="mission";state.machine=null;state.session=null;state.missionId=id;state.follow=true;render();
 };
@@ -2496,7 +2570,12 @@ window.goMission=()=>{ const id=primaryMission(); if(!id)return goFleet(); goMis
 // (#827 Slice A) The missions lens: the index of all missions. Clicking a row
 // leaves for that mission's graph page (#1403), or renders the static summary
 // below in daemon-less contexts.
-window.goMissions=()=>{ state.level="missions";state.machine=null;state.session=null;state.missionId=null;state.follow=true;render();};
+// (#1569 B2) `missions` now RESOLVES to the console tab: the mission board
+// is the `mission status` panel, so an old deep link, an old crumb, or the
+// mission-graph page's back-nav all land somewhere real instead of a lens
+// that no longer exists. The `mission` level (the daemon-less static
+// summary) is untouched — it is a different surface with a different job.
+window.goMissions=()=>{ state.panelId="mission-status"; goConsole(); };
 // (#1403 gate remediation) Static-context mission summary — the daemon-less
 // fallback for a mission click: mission id + status badge + the phase list
 // from the static missions/phases JSON (the demo injects demo-missions.json /
@@ -2706,7 +2785,7 @@ const ACTIONS={
   query:a=>setQuery(a||""),
   rec:a=>selectRec(Number(a)),
   fleet:()=>goFleet(),
-  missions:()=>goMissions(),
+  missions:()=>goMissions(),   // legacy id -> console (#1569 B2)
   missiondrill:a=>goMissionGraph(a),
   mission:()=>goMission(),
   recentall:()=>toggleRecentAll(),
@@ -2725,6 +2804,10 @@ const ACTIONS={
   golive:()=>{ location.href="/"; },
   gomission:id=>goMissionGraph(id),
   gosession:id=>{ location.href="/?session="+encodeURIComponent(id); },
+  // (#1569 B2) The console tab — allowlisted CLI panels.
+  console:()=>goConsole(),
+  setpanel:a=>setPanel(a),
+  refreshpanel:()=>refreshPanel(),
   // (#1584) The consolidated runs lens (absorbed #1247 Part 3's lab lens).
   // `labrun` stays the lab-specific drill-down, now reached from a Lab row.
   runs:()=>goRuns(),
@@ -3840,6 +3923,283 @@ function renderLabTaskCard(group){
     ${rows}
   </div>`;
 }
+// ── CLI panels: ANSI/OSC 8 renderer (#1569 packet B2) ──────────────────
+//
+// Renders an allowlisted command's OWN terminal output, so the panel cannot
+// drift from the CLI the way a JS re-implementation does (#1561 is exactly
+// that drift). This parser is deliberately NARROW: SGR (colors/bold/dim) and
+// OSC 8 (hyperlinks) — the only two escape families darkmux's own output
+// emits. Anything else is DROPPED, never guessed at.
+//
+// SECURITY POSTURE. This turns server-provided bytes into DOM, so:
+//   * every text run goes through `esc()` before insertion — the parser
+//     never hands raw input to innerHTML;
+//   * link hrefs are validated against an http/https allowlist, so a
+//     `javascript:` URI smuggled into an OSC 8 target renders as inert text
+//     rather than becoming a clickable script;
+//   * unknown escapes are consumed and discarded rather than emitted, so a
+//     hostile sequence cannot survive as markup.
+// The e2e XSS gate walks hostile fixtures through this path (viewer-panel).
+
+const ANSI_SGR_CLASS = {
+  1: "a-bold", 2: "a-dim", 3: "a-ital", 4: "a-underline",
+  30: "a-fg0", 31: "a-fg1", 32: "a-fg2", 33: "a-fg3",
+  34: "a-fg4", 35: "a-fg5", 36: "a-fg6", 37: "a-fg7",
+  90: "a-fg8", 91: "a-fg9", 92: "a-fg10", 93: "a-fg11",
+  94: "a-fg12", 95: "a-fg13", 96: "a-fg14", 97: "a-fg15",
+};
+
+// (#1569 B2) An OSC 8 target is safe to linkify only when it is http(s).
+// `mission status` bakes ABSOLUTE daemon URLs (packet A's rule picks
+// loopback on a standalone machine) — and a loopback href tapped from the
+// phone would open the PHONE's localhost, not this daemon. So a URL whose
+// origin is a daemon origin is rewritten RELATIVE: the link then rides
+// whatever origin the page itself was loaded from (tailnet on the phone,
+// loopback at the desk). Foreign origins are left absolute and intact.
+function panelHref(raw){
+  var u;
+  try { u = new URL(raw, window.location.href); } catch(_e){ return null; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  // Same origin as the page: pure relative, no ambiguity.
+  if (u.origin === window.location.origin) return u.pathname + u.search + u.hash;
+  // A DIFFERENT origin that is nonetheless "this daemon by another name" —
+  // the packet-A link scheme's loopback form, seen from a tailnet client.
+  // Rewriting to relative is what makes one baked link work from both.
+  if (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1") {
+    return u.pathname + u.search + u.hash;
+  }
+  return u.href;
+}
+
+// Parse `text` into HTML. Returns a string built exclusively from escaped
+// segments and a fixed tag vocabulary (`span`/`a`).
+function renderAnsi(text){
+  var out = [];
+  var classes = [];        // active SGR classes
+  var link = null;         // active OSC 8 href, already validated
+  var i = 0;
+  var buf = "";
+
+  function flush(){
+    if (!buf) return;
+    var html = esc(buf);
+    if (classes.length) html = '<span class="' + classes.join(" ") + '">' + html + "</span>";
+    if (link) html = '<a href="' + esc(link) + '" class="a-link">' + html + "</a>";
+    out.push(html);
+    buf = "";
+  }
+
+  while (i < text.length) {
+    var ch = text[i];
+    if (ch !== "\x1b") { buf += ch; i++; continue; }
+
+    // CSI ... final-byte  (only `m` — SGR — is honored)
+    if (text[i + 1] === "[") {
+      var j = i + 2;
+      while (j < text.length && !(text[j] >= "@" && text[j] <= "~")) j++;
+      if (j >= text.length) { i = text.length; break; }   // truncated: drop
+      var final = text[j];
+      var params = text.slice(i + 2, j);
+      if (final === "m") {
+        flush();
+        var codes = params.split(";").filter(function(x){ return x !== ""; });
+        if (!codes.length) codes = ["0"];                 // bare ESC[m == reset
+        codes.forEach(function(c){
+          var n = parseInt(c, 10);
+          if (n === 0) { classes = []; return; }
+          var cls = ANSI_SGR_CLASS[n];
+          if (cls && classes.indexOf(cls) === -1) classes.push(cls);
+        });
+      }
+      i = j + 1;
+      continue;
+    }
+
+    // OSC 8 — `ESC ] 8 ; params ; URL ST` opens, empty URL closes.
+    if (text[i + 1] === "]") {
+      var end = text.indexOf("\x1b\\", i);               // ST
+      var bel = text.indexOf("\x07", i);
+      if (bel !== -1 && (end === -1 || bel < end)) end = bel;
+      if (end === -1) { i = text.length; break; }        // truncated: drop
+      var body = text.slice(i + 2, end);
+      var stLen = text[end] === "\x07" ? 1 : 2;
+      if (body.slice(0, 2) === "8;") {
+        var semi = body.indexOf(";", 2);
+        var url = semi === -1 ? "" : body.slice(semi + 1);
+        flush();
+        link = url ? panelHref(url) : null;
+      }
+      i = end + stLen;
+      continue;
+    }
+
+    // Any other escape: consume the introducer and move on.
+    i += 2;
+  }
+  flush();
+  return out.join("");
+}
+
+// ── CLI panel: fetch + chrome (#1569 packet B2) ────────────────────────
+//
+// The daemon now ENFORCES what this client used to be trusted for (#1602
+// gate): `X-Darkmux-Panel` is required (it forces a CORS preflight a foreign
+// page cannot pass), and manual-only panels are rate-floored server-side.
+// So this layer honors a contract rather than a convention — and when it
+// gets a 429 it reports the daemon's own reason instead of retrying.
+
+const PANEL_STATE = {};   // id -> {body, error, loading, fetchedAt}
+
+// (#1569 B2) The panel picker's vocabulary. Mirrors the daemon's allowlist;
+// a stale entry simply 404s and shows the daemon's own message, so drift is
+// self-announcing rather than silent.
+// Panels the daemon marks `auto_refresh: false` — they PROBE the machine,
+// so nothing but an explicit operator action may run them (#1286). The
+// server enforces a rate floor independently; this is the client honoring
+// the same contract rather than relying on being asked nicely.
+const MANUAL_PANELS = new Set(["doctor"]);
+
+const PANELS = [
+  {id:"mission-status",   label:"mission status"},
+  {id:"machine-status",   label:"machine"},
+  {id:"flow-status",      label:"flow"},
+  {id:"role-list",        label:"roles"},
+  {id:"config-list",      label:"config"},
+  {id:"lab-fixture-list", label:"fixtures"},
+  {id:"doctor",           label:"doctor"},
+];
+
+function panelCols(){
+  // The CLI adapts to COLUMNS (packet A). Ask for a width that matches the
+  // space the panel actually has, so `mission status` drops its mix column
+  // on a phone instead of overflowing. Character width at 12px JetBrains
+  // Mono is ~7.2px; the daemon clamps whatever we send to 60..=200.
+  const el = document.querySelector(".panelout") || document.getElementById("stage");
+  const px = el ? el.clientWidth : window.innerWidth;
+  return Math.max(60, Math.min(200, Math.floor((px - 24) / 7.2)));
+}
+
+async function loadPanel(id){
+  const st = (PANEL_STATE[id] = PANEL_STATE[id] || {});
+  st.loading = true; st.error = null;
+  renderConsole();
+  try{
+    const res = await fetch("/panel/" + encodeURIComponent(id) + "?cols=" + panelCols(), {
+      headers: {accept: "application/json", "X-Darkmux-Panel": "1"},
+    });
+    if(!res.ok){
+      // The daemon's own text is the message — a 429 explains the manual
+      // floor, a 404 names the allowlist. Inventing our own wording here
+      // would be the twin-drift this whole packet exists to kill.
+      st.error = (await res.text()).trim() || ("panel request failed: HTTP " + res.status);
+      st.body = null;
+    } else {
+      st.body = await res.json();
+      st.error = null;
+      st.fetchedAt = Date.now();
+    }
+  }catch(e){
+    st.error = "could not reach the daemon: " + e;
+    st.body = null;
+  }
+  st.loading = false;
+  if(state.level === "console") renderConsole();
+}
+
+window.goConsole = async () => {
+  state.level = "console";
+  render();
+  const id = state.panelId || "mission-status";
+  if(!PANEL_STATE[id] || (!PANEL_STATE[id].body && !PANEL_STATE[id].loading)) await loadPanel(id);
+};
+window.setPanel = (id) => {
+  if(!PANELS.some(p => p.id === id)) return;
+  state.panelId = id;
+  render();
+  // A manual-only panel is NEVER auto-fetched — that is the whole point of
+  // `auto_refresh: false`. Selecting `doctor` shows its run button; the
+  // operator decides when it probes the machine.
+  //
+  // This guard returns EARLY on purpose. Folding `!manual` into the
+  // condition below reads correct and is not: `!st ||` short-circuits, so
+  // the very first selection (when there is no state yet) fetched anyway —
+  // the guard worked only on repeat visits, which is exactly backwards.
+  if(MANUAL_PANELS.has(id)) return;
+  const st = PANEL_STATE[id];
+  if(!st || (!st.body && !st.loading)) loadPanel(id);
+};
+window.refreshPanel = () => loadPanel(state.panelId || "mission-status");
+
+// Refresh-on-EVIDENCE, never on a timer: a panel is a snapshot, and a
+// snapshot that silently re-runs commands on the measured host is the
+// observer joining the observed (#1286). A phone waking from sleep is the
+// one moment its snapshot is reliably stale, so that is when we re-check —
+// and only for auto-refreshable panels.
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState !== "visible" || state.level !== "console") return;
+  const id = state.panelId || "mission-status";
+  const st = PANEL_STATE[id];
+  if(!st || !st.body || st.body.auto_refresh === false) return;
+  if(Date.now() - (st.fetchedAt || 0) > (st.body.cache_ttl_ms || 3000)) loadPanel(id);
+});
+
+function panelAgeLabel(body, fetchedAt){
+  const age = Date.now() - (fetchedAt || Date.now());
+  const ttl = body.cache_ttl_ms || 0;
+  const captured = new Date(body.captured_ts_ms || Date.now());
+  const hhmmss = captured.toTimeString().slice(0,8);
+  // The daemon reports whether IT served us a cached body (`age_ms`); we
+  // add how long ago WE fetched. Both are stated rather than implied —
+  // #1286's "cadence is a recorded knob, never adaptive-silent".
+  const served = body.age_ms ? " · daemon cache " + Math.round(body.age_ms/1000) + "s" : "";
+  const stale = ttl && age > ttl * 3;
+  return {hhmmss, served, stale, ageSec: Math.round(age/1000)};
+}
+
+function renderConsole(){
+  $("logscope").textContent = "console";
+  const id = state.panelId || "mission-status";
+  const st = PANEL_STATE[id] || {};
+  const tabs = PANELS.map(p =>
+    `<span class="runchip${p.id===id?" on":""}" data-act="setpanel" data-arg="${esc(p.id)}" tabindex="0" role="button">${esc(p.label)}</span>`
+  ).join("");
+
+  let body;
+  if(st.loading){
+    body = `<div class="panelout">${esc("running…")}</div>`;
+  } else if(st.error){
+    body = `<div class="panelerr">${esc(st.error)}</div>`;
+  } else if(st.body){
+    body = `<pre class="panelout">${renderAnsi(st.body.ansi_text || "")}</pre>`;
+  } else {
+    // Manual panel, never run this session.
+    body = `<div class="panelout">${esc("not run yet — this panel probes the machine, so it runs only when you ask.")}</div>`;
+  }
+
+  let chrome = "";
+  if(st.body){
+    const a = panelAgeLabel(st.body, st.fetchedAt);
+    chrome =
+      `<span class="pc-cmd">$ darkmux ${esc((st.body.argv||[]).join(" "))}</span>` +
+      `<span>captured ${esc(a.hhmmss)}${esc(a.served)}</span>` +
+      (a.stale ? `<span class="pc-stale">· stale (${a.ageSec}s)</span>` : "") +
+      (st.body.auto_refresh === false ? `<span class="pc-manual">· manual-run only</span>` : "") +
+      `<span>· ${st.body.gather_ms}ms</span>` +
+      `<span class="pc-spacer"></span>` +
+      `<button class="pcbtn" data-act="refreshpanel">re-run</button>`;
+  } else {
+    chrome =
+      `<span class="pc-cmd">$ darkmux ${esc(id.replace(/-/g," "))}</span>` +
+      `<span class="pc-spacer"></span>` +
+      `<button class="pcbtn" data-act="refreshpanel"${st.loading?" disabled":""}>run</button>`;
+  }
+
+  $("stage").innerHTML =
+    `<div class="stagehdr">console</div>` +
+    `<div class="runsbar">${tabs}</div>` +
+    `<div class="panelwrap"><div class="panelchrome">${chrome}</div>${body}</div>`;
+}
+
 // ── the runs lens: one flat, kind-tagged list (#1584) ───────────────────
 //
 // Replaces the per-source `lab` tab. `/runs` already consolidated every run
