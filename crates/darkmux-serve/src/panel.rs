@@ -100,10 +100,14 @@ struct CacheEntry {
 /// Panel state carried on [`AppState`]: the TTL cache plus the per-panel
 /// single-flight locks. Both keyed by the panel id (a `&'static str` from
 /// the allowlist, so no unbounded key growth).
+/// One panel's single-flight lock — concurrent cache misses for the same
+/// panel queue on this instead of each spawning a child.
+type FlightLock = Arc<tokio::sync::Mutex<()>>;
+
 #[derive(Clone, Default)]
 pub(crate) struct PanelState {
     cache: Arc<tokio::sync::Mutex<HashMap<&'static str, CacheEntry>>>,
-    flights: Arc<tokio::sync::Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>>,
+    flights: Arc<tokio::sync::Mutex<HashMap<&'static str, FlightLock>>>,
 }
 
 #[derive(Deserialize)]
