@@ -100,9 +100,6 @@
   .mirow{display:flex;align-items:center;gap:14px;padding:11px 12px;border:1px solid var(--line);border-radius:7px;margin-bottom:8px;cursor:pointer;background:var(--panel)}
   .mirow:hover{border-color:var(--amber-dim)}
   .mistatus{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted);flex:0 0 auto}
-  .mistatus.active{color:var(--good);border-color:var(--good)}
-  .mistatus.finalized{color:var(--muted)}
-  .mistatus.paused{color:var(--warn);border-color:var(--warn)}
   .miname{font:600 13px 'JetBrains Mono',monospace;color:var(--amber);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .mitag{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;padding:3px 7px;border-radius:3px;color:var(--muted);background:var(--bg2);border:1px dashed var(--line);flex:0 0 auto}
 
@@ -303,7 +300,7 @@
   .memwarn{font:11px/1.5 'JetBrains Mono',monospace;color:var(--warn);overflow-wrap:anywhere}
   @media(max-width:768px){.membar{height:34px}}
 
-  /* (#827) fleet | missions lens toggle — two co-equal views of the fleet */
+  /* (#827, #1569 B3) fleet | console lens toggle */
   .lenstabs{display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden}
   .lens{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:5px 11px;cursor:pointer;text-decoration:none;background:none}
   .lens+.lens{border-left:1px solid var(--line)}
@@ -2373,7 +2370,8 @@ function renderCrumb(){
   // (#691) Gate on the live-SCOPED mission, not the global count — in live mode
   // with nothing running, primaryMission() is null and the crumb drops the
   // mission link (no stale "◆ m6"). Playback: primaryMission()=missions[0].
-  // (#827) Light the active lens. The missions lens covers the index + a
+  // (#827, #1569 B3) Light the active lens. The console lens covers the CLI
+  // panels + the daemon-less static
   // mission detail; the runs lens (#1584, was the lab lens in #1247 Part 3)
   // covers the consolidated run list + a lab run's detail; everything else is
   // the fleet lens.
@@ -2587,7 +2585,8 @@ window.goMissionGraph=id=>{
   state.level="mission";state.machine=null;state.session=null;state.missionId=id;state.follow=true;render();
 };
 window.goMission=()=>{ const id=primaryMission(); if(!id)return goFleet(); goMissionGraph(id); };
-// (#827 Slice A) The missions lens: the index of all missions. Clicking a row
+// (#827 Slice A, #1569 B2) Was the missions index; now a legacy alias onto the
+// console. Clicking a row
 // leaves for that mission's graph page (#1403), or renders the static summary
 // below in daemon-less contexts.
 // (#1569 B2) `missions` now RESOLVES to the console tab: the mission board
@@ -2670,7 +2669,7 @@ const missionBadge=ms=>ms?`<span class="mstat ${clsSafe(ms)}">${esc(ms)}</span>`
 // (#1403) renderMission + renderMissionFromFlow (the flat in-viewer mission
 // drill-down) retired here, along with their private helpers (cycleStage,
 // runSid) and CSS family — the mission view is the graph page now
-// (/mission/<id>/graph), reached in one hop from the missions index. The
+// (/mission/<id>/graph), reached from the console panel's linkified ids. The
 // graph page carries the header/status/meters and degrades to phases-only for
 // pre-registry missions; daemon-less static builds keep the minimal
 // renderMissionStatic summary above instead.
@@ -2762,7 +2761,6 @@ const ACTIONS={
   rec:a=>selectRec(Number(a)),
   fleet:()=>goFleet(),
   missions:()=>goMissions(),   // legacy id -> console (#1569 B2)
-  missiondrill:a=>goMissionGraph(a),
   mission:()=>goMission(),
   recentall:()=>toggleRecentAll(),
   actwin:a=>setActivityWindow(Number(a)),
@@ -3630,7 +3628,7 @@ async function boot(){
   // (#827 Slice A/C) Pull the durable mission/phase plan. Live: the daemon's
   // /missions + /phases endpoints. Static demo: the committed fixture files
   // injected as metas (no daemon). Best-effort either way — absent → the
-  // missions lens derives rows from mission_ids in the flow instead.
+  // the console's `mission status` panel reads them from the CLI instead.
   const missionsSrc=injectedMeta("darkmux-missions-src");
   const phasesSrc=injectedMeta("darkmux-phases-src");
   if(!flowSrc && mode!=="no-daemon"){ await loadMissionsPhases(); }
