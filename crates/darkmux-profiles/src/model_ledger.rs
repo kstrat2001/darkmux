@@ -91,14 +91,29 @@ const LMS_PROBE_BOUND: Duration = Duration::from_secs(5);
 /// return in milliseconds when healthy.
 const SYS_PROBE_BOUND: Duration = Duration::from_secs(3);
 
-/// Swap-in-use red threshold (#1286 pressure signal). Set ABOVE incidental
-/// residue: macOS retains swap long after the pressure that created it
-/// (live-observed while building this: 1.7 GB used at 94% memorystatus
-/// free on a healthy 128 GB box), so a small used-swap figure is stale
-/// evidence, not an active signal — the crisp "pressure NOW" tell is
-/// [`MEMORY_FREE_PERCENT_RED`]. Multiple gigabytes of swap on an AI
-/// workstation is past the residue band.
-pub const SWAP_USED_RED_BYTES: u64 = 4 << 30; // 4 GiB
+// A swap-in-use RED THRESHOLD used to live here (4 GiB). It was wrong, and
+// the doc comment that justified it contained its own refutation: "macOS
+// retains swap long after the pressure that created it (live-observed: 1.7 GB
+// used at 94% memorystatus free on a healthy 128 GB box), so a small used-swap
+// figure is stale evidence, not an active signal — the crisp 'pressure NOW'
+// tell is MEMORY_FREE_PERCENT_RED." All true. The error was concluding that
+// residue is BOUNDED, so a bigger number must mean something. It is not
+// bounded: swap-in-use is a monotonic high-water mark that macOS never
+// reclaims, so it grows with UPTIME, not with distress.
+//
+// Observed 2026-08-02 on the dev laptop: 6.96 GB swap in use at 94%
+// memorystatus free, 15 GB genuinely free, 45 days of uptime. Every card in
+// the lens rendered RED — machine total (18% committed against its limit) and
+// every model row — because `pressure.red` is the FIRST match arm in the
+// machine-state decision and short-circuits the limit comparison entirely. A
+// lens that cries wolf is worse than a lens with no color, because after the
+// first false alarm the operator stops reading the color at all.
+//
+// Swap-in-use is now a ROW, not a trigger — the same call already made for
+// the compressor row, for the same reason: turning a LEVEL into a pressure
+// signal needs a RATE, and a rate needs history a single snapshot does not
+// have. If swap ever becomes a trigger again it has to be a delta between
+// samples, not a number compared to a constant.
 
 /// `kern.memorystatus_level` red threshold (#1286 pressure signal) — the
 /// kernel counter behind `memory_pressure`'s "system-wide memory free
@@ -375,7 +390,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         swap_used_bytes,
         compressor_bytes,
         memory_free_percent,
-        red: pressure_red(swap_used_bytes, memory_free_percent),
+        red: pressure_red(memory_free_percent),
     };
 
     // Machine-total color per the #1286 semantics.
@@ -444,11 +459,12 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     }
 }
 
-/// Red-zone pressure detection (#1286): unified memory fails silent; used
-/// swap and a low `memory_pressure` free% are the only tells.
-fn pressure_red(swap_used_bytes: Option<u64>, memory_free_percent: Option<u64>) -> bool {
-    swap_used_bytes.is_some_and(|s| s > SWAP_USED_RED_BYTES)
-        || memory_free_percent.is_some_and(|p| p < MEMORY_FREE_PERCENT_RED)
+/// Red-zone pressure detection (#1286): unified memory fails silent, and the
+/// kernel's own memorystatus level is the one tell that describes NOW. Swap
+/// and compressor are reported as rows — see the note where the swap
+/// threshold used to be for why neither is a trigger.
+fn pressure_red(memory_free_percent: Option<u64>) -> bool {
+    memory_free_percent.is_some_and(|p| p < MEMORY_FREE_PERCENT_RED)
 }
 
 /// Attribute worker footprints to model rows, filling `current_bytes`.
@@ -1197,12 +1213,18 @@ mod tests {
     }
 
     #[test]
-    fn red_on_swap_pressure_signal() {
+    fn swap_alone_is_a_row_not_a_red_trigger() {
+        // Swap-in-use is a monotonic high-water mark macOS never reclaims, so
+        // it tracks UPTIME rather than distress: 6.96 GB observed at 94%
+        // memorystatus free on a healthy box with 45 days up. It reports; it
+        // does not alarm. Same call as `compressor_alone_is_a_row_...`.
         let mut inputs = base_inputs();
-        inputs.swap_used_bytes = Some(SWAP_USED_RED_BYTES + 1);
+        inputs.swap_used_bytes = Some(64 << 30); // 64 GiB — absurd, still not a trigger
         let ledger = compute_ledger(inputs, 1);
-        assert!(ledger.pressure.red);
-        assert_eq!(ledger.machine.state, LedgerState::Red);
+        assert!(!ledger.pressure.red);
+        assert_eq!(ledger.machine.state, LedgerState::Green);
+        // Still REPORTED — demoting the trigger must not drop the row.
+        assert_eq!(ledger.pressure.swap_used_bytes, Some(64 << 30));
     }
 
     #[test]
@@ -1309,7 +1331,7 @@ mod tests {
     fn pressure_red_wins_even_without_a_limit() {
         let mut inputs = base_inputs();
         inputs.pool = None;
-        inputs.swap_used_bytes = Some(SWAP_USED_RED_BYTES * 2);
+        inputs.memory_free_percent = Some(MEMORY_FREE_PERCENT_RED - 1);
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.state, LedgerState::Red);
     }
@@ -1500,17 +1522,6 @@ mod tests {
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.state, LedgerState::Green);
         assert!(ledger.machine.shrink_hint.is_none());
-    }
-
-    #[test]
-    fn swap_used_exactly_at_threshold_is_not_red() {
-        // swap_used == SWAP_USED_RED_BYTES: the test is strict `>`, so equality
-        // is NOT red.
-        let mut inputs = base_inputs();
-        inputs.swap_used_bytes = Some(SWAP_USED_RED_BYTES);
-        let ledger = compute_ledger(inputs, 1);
-        assert!(!ledger.pressure.red);
-        assert_eq!(ledger.machine.state, LedgerState::Green);
     }
 
     #[test]
