@@ -3398,6 +3398,43 @@ mod tests {
         assert_eq!(redact_url_creds("garbage"), "garbage");
     }
 
+    /// A raw (unencoded) `@` inside the password. Unreachable from the
+    /// Tier-2 assembled path (`assemble_redis_url` percent-encodes), but the
+    /// Tier-1 `DARKMUX_REDIS_URL` path is documented VERBATIM — byte-for-byte
+    /// unchanged — and cloud Redis providers generate `@`-bearing passwords.
+    /// The redis crate parses the LAST `@` as the userinfo/host boundary and
+    /// connects fine; the old first-`@` redaction disagreed with that parse
+    /// and echoed everything after the password's first `@` in clear:
+    /// `redis://:***@secretpw@real.host:6379/0`. A redactor that disagrees
+    /// with the connection parser leaks exactly the disagreement.
+    #[test]
+    fn redact_url_creds_masks_a_password_containing_at() {
+        assert_eq!(
+            redact_url_creds("redis://:my@secretpw@real.host:6379/0"),
+            "redis://:***@real.host:6379/0",
+            "everything left of the LAST authority `@` is password"
+        );
+        assert_eq!(
+            redact_url_creds("redis://user:p@ss@w@rd@h:6379"),
+            "redis://user:***@h:6379",
+            "multiple `@`s — only the final one is the boundary"
+        );
+        // An `@` in the PATH is data, not a boundary — the authority is
+        // bounded at the first `/` so redaction neither mis-splits on it
+        // nor swallows the path.
+        assert_eq!(
+            redact_url_creds("redis://user:pw@h:6379/queue@2"),
+            "redis://user:***@h:6379/queue@2"
+        );
+        // No `@` in the authority but one in the path: no userinfo exists,
+        // and the path `@` must not conjure one (the old code split on it
+        // and mangled the URL).
+        assert_eq!(
+            redact_url_creds("redis://h:6379/queue@2"),
+            "redis://h:6379/queue@2"
+        );
+    }
+
     #[test]
     fn sink_init_banner_format_redacts_password() {
         // Regression for #213: the Redis sink-init banner used to print
