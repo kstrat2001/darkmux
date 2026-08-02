@@ -1388,7 +1388,17 @@ function App(){
   // a failed fetch never breaks the live panel or graph. Single-day scope
   // matches the SSE tail (`todayUtc()`), same as the original inline backfill.
   var backfillEvents = React.useCallback(function(){
-    fetch("/flow/" + todayUtc(), {headers:{accept:"application/json"}})
+    // (#1569 sweep) The mission-SCOPED endpoint, not today's day file. The
+    // backfill exists so a page opened after the fact isn't blank — but
+    // `/flow/<today>` can only ever contain records written TODAY, while a
+    // mission's records live on the day(s) it RAN. So every mission older
+    // than the current UTC day showed "no events" permanently despite having
+    // records, which is precisely the failure this backfill was added to
+    // prevent. `/flow-mission/:id` stitches a mission across every day it
+    // touched — the same endpoint the viewer's own catalog replay path uses.
+    // It is also strictly less data over the wire: the day file was fetched
+    // whole and then filtered down client-side.
+    fetch("/flow-mission/" + encodeURIComponent(missionId), {headers:{accept:"application/json"}})
       .then(function(r){ return r.ok ? r.json() : []; })
       .then(function(body){
         var recs = Array.isArray(body) ? body : (body && (body.records || body.flow)) || [];
@@ -1731,9 +1741,24 @@ function App(){
       h("div", {className:"brand"}, h("a", {href:"/"}, h("b", null, "darkmux"), h("span", {className:"sub"}, " · mission"))),
       h("span", {className:"midname", title: g.mission_id}, g.mission_id),
       h("span", {className:"mstatus " + normalizeMissionStatus(g.mission_status)}, normalizeMissionStatus(g.mission_status)),
-      // (#1480) Connection state — "● live" (calm amber) vs a LOUD warn
-      // "○ reconnecting" so stale-but-looks-live never happens silently.
-      h("span", {className:"livepill" + (live ? " on" : " off")}, live ? "● live" : "○ reconnecting"),
+      // (#1480) Connection state — "● live" vs a LOUD warn "○ reconnecting"
+      // so stale-but-looks-live never happens silently.
+      //
+      // (#1569 sweep) `live` is the SSE CONNECTION, not the mission. On a
+      // terminal mission it therefore rendered "● live" immediately beside a
+      // "FINALIZED" badge — two labels in the same header appearing to
+      // contradict each other, when in fact one is about the mission and the
+      // other about the socket. The affirmation is dropped once the mission
+      // has ended, because there is nothing left for it to truthfully claim.
+      //
+      // The WARNING is deliberately kept in both cases: a terminal mission
+      // still backfills its events over the network, so a dead daemon means
+      // the operator may be looking at an incomplete history and has to be
+      // told. Silence on a terminal+connected page; a loud pill whenever
+      // something is actually wrong.
+      (live && statusRank(normalizeMissionStatus(g.mission_status)) >= 2)
+        ? null
+        : h("span", {className:"livepill" + (live ? " on" : " off")}, live ? "● live" : "○ reconnecting"),
       meterEl,
       procEl,
       // (#1480) Manual refresh — the first-class control the activity-window
