@@ -131,6 +131,7 @@ pub(crate) struct PanelSpec {
 #[cfg(test)]
 pub(crate) const PANEL_IDS: &[&str] = &[
     "mission-status",
+    "mission-status-all",
     "role-list",
     "machine-status",
     "config-list",
@@ -145,6 +146,14 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
     let (id, argv, auto_refresh, ttl): (&'static str, &'static [&'static str], bool, Duration) =
         match id {
             "mission-status" => ("mission-status", &["mission", "status"], true, PANEL_CACHE_TTL),
+            // The unlimited variant. A section limit is right for a glance and
+            // wrong for a hunt, and the CLI already says so ("`--all` for every
+            // mission") — in a terminal that hint is actionable, in a panel it
+            // was a dead end. It is a SEPARATE allowlist entry, never a `--all`
+            // query parameter: the client picks an id, the argv lives here.
+            "mission-status-all" => {
+                ("mission-status-all", &["mission", "status", "--all"], true, PANEL_CACHE_TTL)
+            }
             "role-list" => ("role-list", &["role", "list"], true, PANEL_CACHE_TTL),
             "machine-status" => ("machine-status", &["machine", "status"], true, PANEL_CACHE_TTL),
             "config-list" => ("config-list", &["config", "list"], true, PANEL_CACHE_TTL),
@@ -279,6 +288,12 @@ pub(crate) async fn panel_handler(
         .env("CLICOLOR_FORCE", "1")
         .env_remove("NO_COLOR")
         .env("COLUMNS", cols.to_string())
+        // The child is told WHICH panel it is rendering into, so a verb can
+        // make its own hints actionable here without the viewer having to
+        // pattern-match its output (that matching IS the twin drift this
+        // endpoint exists to kill). Opt-in by construction: a verb that
+        // ignores this env var behaves exactly as it does in a terminal.
+        .env("DARKMUX_PANEL", spec.id)
         // A child must never inherit the daemon's own serve lifecycle env in
         // a way that could confuse it; everything else (DARKMUX_HOME, dirs)
         // is deliberately inherited — the panel must see the same state the
@@ -383,7 +398,13 @@ mod tests {
             assert_eq!(spec.id, *id, "a spec must report the id it was looked up by");
             assert!(!spec.argv.is_empty(), "{id} has empty argv");
         }
-        assert_eq!(PANEL_IDS.len(), 7, "allowlist growth is a doctrine decision, not a drive-by");
+        // 8 as of `mission-status-all`. Bumping this number is the doctrine
+        // decision: an entry is legal only if it neither dispatches a model
+        // (#1286) nor mutates, so the worst case of a bug here stays a wrong
+        // READING. If growth ever comes from wanting operator-supplied VALUES
+        // (`--machine <id>`, `--since <when>`), stop — an open value space is
+        // not an allowlist, and that surface is a lens, not a panel.
+        assert_eq!(PANEL_IDS.len(), 8, "allowlist growth is a doctrine decision, not a drive-by");
     }
 
     #[test]

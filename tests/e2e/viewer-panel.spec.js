@@ -166,3 +166,39 @@ test('the console renders attacker-controlled panel bytes inertly', async ({ pag
 
   expect(pageErrors, `uncaught: ${pageErrors.join(' | ')}`).toEqual([]);
 });
+
+test('a panel deep link switches in page instead of navigating', async ({ page }) => {
+  // The verb emits this when it knows it is rendering into a panel (see
+  // `panel_deep_link`): "`--all` for every mission" is actionable advice in a
+  // terminal and a dead end here, so the flag names itself as a link instead.
+  const WITH_LINK =
+    '\x1b[2m  … 81 more (3 of 84 shown)\x1b[0m\n' +
+    '  \x1b]8;;http://127.0.0.1:8765/#lens=console&panel=mission-status-all\x1b\\' +
+    '→ show every mission\x1b]8;;\x1b\\\n';
+  const asked = [];
+  await routePanels(page, (route) => {
+    const id = new URL(route.request().url()).pathname.split('/').pop();
+    asked.push(id);
+    route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(
+        id === 'mission-status-all'
+          ? panelBody('\x1b[2m  the whole board\x1b[0m\n', { panel: id, argv: ['mission', 'status', '--all'] })
+          : panelBody(WITH_LINK)
+      ),
+    });
+  });
+
+  await page.goto('/index-lab.html');
+  await page.click('[data-act="console"]');
+  await expect(page.locator('.panelout')).toContainText('81 more');
+
+  const before = page.url();
+  await page.click('.panelout a:has-text("show every mission")');
+  await expect(page.locator('.panelout')).toContainText('the whole board');
+
+  // Switched IN PAGE: the target panel was fetched, and following the href
+  // would have reloaded the viewer to land one tab from where it already was.
+  expect(asked).toContain('mission-status-all');
+  expect(page.url().split('#')[0]).toBe(before.split('#')[0]);
+});
