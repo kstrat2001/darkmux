@@ -1,6 +1,31 @@
-use darkmux_types::LoadedModel;
+use crate::gestalt_host::lms_host::{run_bounded, StdoutMode, DEFAULT_LIST_BOUND};
+use crate::gestalt_host::resolved_load_deadline;
 use anyhow::{Context, Result, bail};
+use darkmux_gestalt::Deadline;
+use darkmux_types::LoadedModel;
 use std::process::Command;
+
+// ─── bounded by construction (#1595) ────────────────────────────────────
+//
+// Every call in this file spawns the external `lms` CLI, and every call
+// sits on a path an operator is actively WAITING on — the dispatch
+// preflight (`ensure_model_loaded_at_ctx` calls `list_loaded` + `unload`
+// before every local dispatch), the telemetry sampler, the swap paths. The
+// `lms` CLI blocks on LMStudio's local API socket, so a wedged backend
+// used to hang these calls — and with them the whole dispatch — forever,
+// with no error and no diagnostic.
+//
+// That is the third instance of the unbounded-external-call class this
+// project has paid for (#1570/#1573 removed it for Redis reads/writes,
+// #1276 for the gestalt host port; the #1593 gate caught a fourth being
+// born in `mission status`'s tailscale probe). The fix is the same shape
+// every time, so these calls now route through the SAME bounded runner
+// the gestalt adapter uses (`run_bounded`: spawn + poll + kill-at-deadline)
+// instead of growing a bespoke fourth timeout:
+//
+//   - read-only lists  → `DEFAULT_LIST_BOUND` (30s, shared with `LmsHost`)
+//   - unload / load    → `resolved_load_deadline()` — the operator-tunable
+//                        `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` (#1276)
 
 // pub(crate): the gestalt host adapter (`gestalt_host::LmsHost`, #1274
 // packet 2b) resolves its binary through the same single precedence home.
@@ -10,24 +35,24 @@ pub(crate) fn lms_bin() -> String {
 }
 
 pub fn list_loaded() -> Result<Vec<LoadedModel>> {
-    let out = Command::new(lms_bin())
-        .args(["ps", "--json"])
-        .output()
-        .with_context(|| "running `lms ps --json`")?;
+    let mut cmd = Command::new(lms_bin());
+    cmd.args(["ps", "--json"]);
+    let out = run_bounded(cmd, "ps", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Capture)
+        .map_err(|e| anyhow::anyhow!("running `lms ps --json`: {e}"))?;
     if out.status.success() {
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&out.stdout) {
             if let Some(arr) = parsed.as_array() {
                 return Ok(arr.iter().map(model_from_json).collect());
             }
         }
     }
-    // fallback to text parsing
-    let text_out = Command::new(lms_bin())
-        .args(["ps"])
-        .output()
-        .with_context(|| "running `lms ps`")?;
-    let text = String::from_utf8_lossy(&text_out.stdout);
-    Ok(parse_text_ps(&text))
+    // fallback to text parsing — bounded the same way (a wedged `lms`
+    // would hang the fallback just as readily as the primary).
+    let mut cmd = Command::new(lms_bin());
+    cmd.args(["ps"]);
+    let text_out = run_bounded(cmd, "ps", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Capture)
+        .map_err(|e| anyhow::anyhow!("running `lms ps`: {e}"))?;
+    Ok(parse_text_ps(&text_out.stdout))
 }
 
 fn model_from_json(v: &serde_json::Value) -> LoadedModel {
@@ -134,14 +159,14 @@ pub struct ModelMeta {
 /// Returns an empty vec on failure rather than erroring — the caller likely
 /// wants to render "(no models found)" rather than crash.
 pub fn list_available() -> Result<Vec<ModelMeta>> {
-    let out = Command::new(lms_bin())
-        .args(["ls", "--json"])
-        .output()
-        .with_context(|| "running `lms ls --json`")?;
+    let mut cmd = Command::new(lms_bin());
+    cmd.args(["ls", "--json"]);
+    let out = run_bounded(cmd, "ls", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Capture)
+        .map_err(|e| anyhow::anyhow!("running `lms ls --json`: {e}"))?;
     if !out.status.success() {
         return Ok(Vec::new());
     }
-    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&out.stdout) else {
         return Ok(Vec::new());
     };
     let Some(arr) = parsed.as_array() else {
@@ -190,15 +215,12 @@ fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
 }
 
 pub fn unload(identifier: &str) -> Result<()> {
-    let out = Command::new(lms_bin())
-        .args(["unload", identifier])
-        .output()
-        .with_context(|| format!("running `lms unload {identifier}`"))?;
+    let mut cmd = Command::new(lms_bin());
+    cmd.args(["unload", identifier]);
+    let out = run_bounded(cmd, "unload", resolved_load_deadline(), StdoutMode::Null)
+        .map_err(|e| anyhow::anyhow!("running `lms unload {identifier}`: {e}"))?;
     if !out.status.success() {
-        bail!(
-            "lms unload {identifier} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        bail!("lms unload {identifier} failed: {}", out.stderr.trim());
     }
     Ok(())
 }
@@ -235,9 +257,35 @@ pub fn load_with_identifier(
         cmd.stdout(std::process::Stdio::inherit());
         cmd.stderr(std::process::Stdio::inherit());
     }
-    let status = cmd
-        .status()
+    // Bounded like everything else in this file, but NOT via `run_bounded`:
+    // that runner pipes/nulls stdio, and this call deliberately inherits it
+    // (the operator watches the load spinner; #1135 nulls stdout in quiet
+    // mode to protect `--json` envelopes). Same spawn + poll + kill shape,
+    // stdio left exactly as configured above.
+    let deadline = resolved_load_deadline();
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("running `lms load {model_id}`"))?;
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() >= deadline.0 => {
+                let _ = child.kill();
+                let _ = child.wait(); // reap — the kill must not leave a zombie
+                bail!(
+                    "lms load {model_id} timed out after {}s                      (DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS to tune)",
+                    deadline.0.as_secs()
+                );
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("waiting on `lms load {model_id}`: {e}");
+            }
+        }
+    };
     if !status.success() {
         bail!("lms load {model_id} failed: exit {}", status.code().unwrap_or(-1));
     }

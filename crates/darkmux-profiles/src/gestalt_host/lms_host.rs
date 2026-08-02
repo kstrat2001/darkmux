@@ -38,7 +38,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// adapter supplies a generous bound of its own: a wedged `lms ps` must not
 /// hang plan assembly any more than a wedged `lms load` may hang execution
 /// (#1276).
-const DEFAULT_LIST_BOUND: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_LIST_BOUND: Duration = Duration::from_secs(30);
 
 /// The `lms`-CLI implementation of the gestalt [`ModelHost`] port.
 ///
