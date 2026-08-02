@@ -1780,9 +1780,22 @@ function renderMachine(){
       ? models.map(mm=>renderMachineMemModel(mm, perScale, null)).join("")
       : `<div class="none">no models loaded.</div>`;
     const freePct=pressure.memory_free_percent!=null?`${Number(pressure.memory_free_percent)}%`:"—";
+    // Each row is colored by ITS OWN condition, never by the card's. Both the
+    // swap and memory-free rows used to key on `pressure.red`, so whichever
+    // signal tripped painted the OTHER row red too — that is how a healthy
+    // "memory free 94%" rendered as an alarm. A value that passed its own
+    // check must never be drawn as the thing that failed.
+    //
+    // swap + compressor REPORT, they never alarm: both are monotonic
+    // high-water marks that track uptime rather than distress (see the note in
+    // darkmux-profiles/src/model_ledger.rs where the swap threshold used to
+    // live). memory-free is the sole trigger, which is why it alone may key on
+    // `pressure.red` — `pressure_red()` takes exactly one argument now, so the
+    // coupling is visible at the signature. Add a second trigger and this row
+    // needs its own flag from the server rather than the card's.
     const pressureCard=`<div class="memcard${pressure.red?" red":""}">
       <div class="memhdr"><span class="memname">pressure</span>${pressure.red?`<span class="memstate red">red</span>`:""}</div>
-      <div class="memrow"><span class="k">swap used</span><span class="v${pressure.red?" bad":""}">${memBytes(pressure.swap_used_bytes)}</span></div>
+      <div class="memrow"><span class="k">swap used</span><span class="v">${memBytes(pressure.swap_used_bytes)}</span></div>
       <div class="memrow"><span class="k">compressor</span><span class="v">${memBytes(pressure.compressor_bytes)}</span></div>
       <div class="memrow"><span class="k">memory free</span><span class="v${pressure.red?" bad":""}">${esc(freePct)}</span></div>
     </div>`;
