@@ -259,15 +259,28 @@ pub(crate) fn find_redis_cfg(info: &SinkInfo) -> Option<RedisCfg> {
 /// daemon's permissive-CORS endpoint and shown in the browser modal).
 /// (#170 QA Q7)
 ///
-/// Conservative: anything between the scheme and the host that contains
-/// `@` is treated as `<userinfo>@`; the password portion (after the first
-/// `:` in userinfo) is replaced with `***`. URLs without an `@` are
+/// The userinfo/host boundary is the **last** `@` in the authority (RFC
+/// 3986), which is also how the `redis`/`url` crates parse the URL they
+/// connect with. This function used to split on the *first* `@` — so a
+/// password itself containing `@` (a real shape: cloud Redis providers
+/// generate them, and the Tier-1 `DARKMUX_REDIS_URL` path is documented
+/// verbatim-no-validation) had everything after its first `@` treated as
+/// "host" and echoed in clear:
+///
+/// `redis://:my@secretpw@real.host:6379/0` → `redis://:***@secretpw@real.host:6379/0`
+///
+/// A redactor that disagrees with the connection parser about where the
+/// password ends leaks exactly the disagreement. The authority is bounded
+/// at the first `/`, `?`, or `#` first, so an `@` in the path/query is
+/// data, never a boundary. URLs without an `@` in the authority are
 /// returned unchanged.
 pub fn redact_url_creds(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
-    let Some((userinfo, host)) = rest.split_once('@') else {
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(auth_end);
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
         return url.to_string();
     };
     let masked_userinfo = if let Some((user, _pass)) = userinfo.split_once(':') {
@@ -276,7 +289,7 @@ pub fn redact_url_creds(url: &str) -> String {
         // username only, no password — still keep the username visible.
         userinfo.to_string()
     };
-    format!("{scheme}://{masked_userinfo}@{host}")
+    format!("{scheme}://{masked_userinfo}@{host}{tail}")
 }
 
 /// Probe Redis: open a connection, run XLEN + XREVRANGE for oldest/newest,
