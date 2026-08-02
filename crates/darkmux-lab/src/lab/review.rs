@@ -819,6 +819,37 @@ impl RemoteBucket {
         self.calls += calls;
     }
 
+    fn remaining(&self) -> u64 {
+        self.budget.saturating_sub(self.used)
+    }
+
+    /// (#swarm-6) Admit AND reserve in one operation — the concurrent-caller
+    /// twin of [`Self::admit`], mirroring `MapRemoteBucket::admit_reserve`
+    /// (the probe stage's shared-bucket discipline, #1442). Grants the
+    /// clamped completion cap and reserves it immediately, so concurrent
+    /// judges sharing this bucket under a briefly-held lock cannot all admit
+    /// against the same untouched balance. `admit`/`spend` stay for the
+    /// verify stage's sequential unshared loop, where the pair is already
+    /// race-free by construction.
+    fn admit_reserve(&mut self, requested: u32) -> Option<u32> {
+        if self.exhausted() {
+            self.skipped += 1;
+            return None;
+        }
+        let granted = u32::try_from(self.remaining()).unwrap_or(u32::MAX).min(requested);
+        self.used = self.used.saturating_add(u64::from(granted));
+        Some(granted)
+    }
+
+    /// Settle a reserved call against its ACTUAL spend. An endpoint that
+    /// reports under the granted cap releases the difference back to its
+    /// siblings; one that reports above pushes the bucket over — the same
+    /// documented soft-ceiling overshoot reading as the map path.
+    fn settle(&mut self, granted: u32, actual_tokens: u64, calls: u32) {
+        self.used = self.used.saturating_sub(u64::from(granted)).saturating_add(actual_tokens);
+        self.calls += calls;
+    }
+
     fn record(&self) -> Option<RemoteBudgetRecord> {
         if self.calls == 0 && self.skipped == 0 {
             return None;
@@ -2320,7 +2351,7 @@ fn budget_exhausted_outcome(pass: u8) -> PassOutcome {
 #[allow(clippy::too_many_arguments)]
 fn run_budgeted_pass(
     pass: u8,
-    bucket: Option<&mut RemoteBucket>,
+    budgets: Option<&std::sync::Mutex<JudgeBudgets>>,
     model: &str,
     system: &str,
     prompt: &str,
@@ -2328,13 +2359,32 @@ fn run_budgeted_pass(
     endpoint: Option<&ModelEndpoint>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
 ) -> PassOutcome {
-    match bucket {
-        Some(b) => {
-            if !b.admit() {
+    // (#swarm-6) The bucket mutex is held for the ADMIT and the SETTLE only
+    // — never across the network dispatch. The previous shape locked at the
+    // judge spawn site and held the guard through `judge_one_flag_with_passes`
+    // entirely, which serialized every concurrent judge on remote runs: the
+    // `review.judge_concurrency` knob spun up N threads that then queued on
+    // one mutex, silently degrading to sequential. Reservation is what makes
+    // the narrow lock safe: the granted cap is debited at admission, so
+    // siblings can't collectively overshoot the #1260 ceiling by admitting
+    // against an untouched balance (the same discipline the probe stage's
+    // `MapRemoteBucket` uses, #1442).
+    match budgets {
+        Some(m) => {
+            let granted = {
+                let mut b = m.lock().expect("judge budgets mutex poisoned");
+                let bucket = if pass == 1 { &mut b.pass1 } else { &mut b.pass2 };
+                bucket.admit_reserve(max_tokens)
+            };
+            let Some(clamped) = granted else {
                 return budget_exhausted_outcome(pass);
+            };
+            let o = judge_pass_with_retry(pass, model, system, prompt, clamped, endpoint, chat);
+            {
+                let mut b = m.lock().expect("judge budgets mutex poisoned");
+                let bucket = if pass == 1 { &mut b.pass1 } else { &mut b.pass2 };
+                bucket.settle(clamped, o.tokens, o.calls);
             }
-            let o = judge_pass_with_retry(pass, model, system, prompt, max_tokens, endpoint, chat);
-            b.spend(o.tokens, o.calls);
             o
         }
         None => judge_pass_with_retry(pass, model, system, prompt, max_tokens, endpoint, chat),
@@ -2398,16 +2448,16 @@ fn judge_one_flag_with_passes(
     system: &str,
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
-    mut budgets: Option<&mut JudgeBudgets>,
+    budgets: Option<&std::sync::Mutex<JudgeBudgets>>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
 ) -> JudgeOutcome {
     let result = multi_pass_confirm(
         passes,
         |pass_no| {
-            let bucket = budgets
-                .as_deref_mut()
-                .map(|b| if pass_no == 1 { &mut b.pass1 } else { &mut b.pass2 });
-            run_budgeted_pass(pass_no as u8, bucket, model, system, prompt, max_tokens, endpoint, chat)
+            // Pass selection moved INTO run_budgeted_pass, under its brief
+            // lock — the closure no longer needs `&mut` access to the
+            // budgets at all (#swarm-6).
+            run_budgeted_pass(pass_no as u8, budgets, model, system, prompt, max_tokens, endpoint, chat)
         },
         |p: &PassOutcome| match p.record.ruling {
             JudgeRuling::Confirmed => PassClass::Confirm,
@@ -2475,7 +2525,7 @@ fn judge_one_flag(
     system: &str,
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
-    budgets: Option<&mut JudgeBudgets>,
+    budgets: Option<&std::sync::Mutex<JudgeBudgets>>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
 ) -> JudgeOutcome {
     judge_one_flag_with_passes(2, prompt, model, system, max_tokens, endpoint, budgets, chat)
@@ -2915,9 +2965,14 @@ fn finish_review(
     // (#1260) A remote judge draws from its own per-pass token buckets
     // (pass-1 and pass-2 are separate executions — operator decision) and
     // skips the cycler entirely (nothing to load off-box).
-    let mut judge_budgets = judge_endpoint.map(|_| JudgeBudgets {
-        pass1: RemoteBucket::new("judge-pass1", inputs.remote_max_tokens_per_execution),
-        pass2: RemoteBucket::new("judge-pass2", inputs.remote_max_tokens_per_execution),
+    // Wrapped in a Mutex purely for signature unity with the parallel
+    // mission path (#swarm-6): this loop is sequential, the lock is
+    // uncontended, and `into_inner` below reads the final state without one.
+    let judge_budgets = judge_endpoint.map(|_| {
+        std::sync::Mutex::new(JudgeBudgets {
+            pass1: RemoteBucket::new("judge-pass1", inputs.remote_max_tokens_per_execution),
+            pass2: RemoteBucket::new("judge-pass2", inputs.remote_max_tokens_per_execution),
+        })
     });
 
     if !judge.pm.is_remote() {
@@ -2948,7 +3003,7 @@ fn finish_review(
             inputs.judge_system,
             judge_max_tokens,
             judge_endpoint,
-            judge_budgets.as_mut(),
+            judge_budgets.as_ref(),
             chat,
         );
         judge_tokens += outcome.tokens;
@@ -3059,6 +3114,10 @@ fn finish_review(
             )
         })
         .count();
+    // Judging is complete — take the budgets back out of the mutex for the
+    // read-only gate report (mirrors the parallel path's `into_inner`).
+    let judge_budgets = judge_budgets
+        .map(|m| m.into_inner().expect("judge budgets mutex poisoned"));
     let gate = judge_gate_outcome(
         judge.pm.is_remote(),
         judged.len(),
@@ -4778,7 +4837,15 @@ impl StepKind for ReviewJudgeStepKind {
                     let results = &results;
                     scope.spawn(move || {
                         let mut chat = |call: &ChatCall| dispatch_chat(ctx, call);
-                        let mut guard = judge_budgets.map(|b| b.lock().expect("judge budgets mutex poisoned"));
+                        // (#swarm-6) No guard held here anymore: the old
+                        // shape locked the budgets mutex ACROSS the whole
+                        // judge dispatch, so the N threads this scope spawns
+                        // (`review.judge_concurrency`) queued on one mutex
+                        // and silently ran sequentially on every remote
+                        // run. `run_budgeted_pass` now locks only around
+                        // admit_reserve and settle — the reservation is
+                        // what keeps the #1260 ceiling intact with the lock
+                        // narrowed (see its doc).
                         let outcome = judge_one_flag_with_passes(
                             judge_passes,
                             &prompt,
@@ -4786,7 +4853,7 @@ impl StepKind for ReviewJudgeStepKind {
                             judge_system,
                             judge_max_tokens,
                             judge_endpoint,
-                            guard.as_deref_mut(),
+                            judge_budgets,
                             &mut chat,
                         );
                         emit_review_step_result(

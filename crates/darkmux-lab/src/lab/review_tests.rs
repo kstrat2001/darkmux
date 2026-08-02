@@ -2432,6 +2432,38 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(over.exhausted(), "over budget: 101 >= 100");
     }
 
+    /// (#swarm-6) `admit_reserve` debits the granted cap AT ADMISSION, so
+    /// concurrent judges sharing the bucket under a briefly-held lock can't
+    /// all admit against the same untouched balance. Under the old
+    /// `admit()`/`spend()` pair with the lock narrowed, two callers near the
+    /// limit would BOTH admit unclamped and overshoot the #1260 ceiling by
+    /// a full call each — which is exactly why the old code held the mutex
+    /// across the whole dispatch (correct, but it serialized the
+    /// `judge_concurrency` knob into a no-op). Reservation is what makes
+    /// the narrow lock safe; this pins it.
+    #[test]
+    fn remote_bucket_admit_reserve_prevents_concurrent_overshoot() {
+        let mut b = RemoteBucket::new("s", 100);
+        // First caller wants 80 — granted in full, and RESERVED.
+        assert_eq!(b.admit_reserve(80), Some(80));
+        // Second caller wants 80 — the reservation is already debited, so
+        // the grant clamps to what genuinely remains, never a fresh 80.
+        assert_eq!(b.admit_reserve(80), Some(20));
+        // Third caller: exhausted, refused, counted as skipped.
+        assert_eq!(b.admit_reserve(10), None);
+
+        // Settle releases the unspent part of a reservation back.
+        let mut c = RemoteBucket::new("s", 100);
+        let granted = c.admit_reserve(80).unwrap();
+        c.settle(granted, 30, 1);
+        assert_eq!(c.remaining(), 70, "unspent reservation returns to the pool");
+        // …and an endpoint reporting ABOVE its cap pushes the bucket over —
+        // the documented soft-ceiling overshoot, same reading as the map path.
+        let granted2 = c.admit_reserve(80).unwrap();
+        c.settle(granted2, 90, 1);
+        assert!(c.exhausted(), "over-report lands as real spend: 30+90 >= 100");
+    }
+
     // ─── (#1230/#1341 DRY pass) Task/Step graph orchestration ───────────
 
     /// (#1530) `bundles` no longer lands on `ReviewStepContext` directly
