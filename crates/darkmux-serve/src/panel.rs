@@ -42,6 +42,18 @@
 //! spawn per [`PANEL_CACHE_TTL`] per panel, and a per-panel single-flight
 //! lock collapses concurrent misses into one spawn. Cache entries are
 //! whole-response; `age_ms` reports how stale a served entry is.
+//!
+//! **`cols` is deliberately NOT part of the cache key.** Two clients at
+//! different widths share one entry for up to the TTL, so the second sees
+//! the first's width — self-describing (the body carries the `cols` it was
+//! rendered at) and bounded at 3s. Keying on width would multiply spawns
+//! for a difference nobody notices in a 3-second window.
+//!
+//! **The spawn timeout kills the CHILD, not its descendants.** `kill_on_drop`
+//! SIGKILLs the direct child; a grandchild it left running (doctor's `curl`,
+//! `machine status`'s `lms`) survives until its own bound fires. Every verb
+//! on today's allowlist bounds its own subprocesses, so this is latent — but
+//! any addition to [`panel_spec`] must re-check that it still holds.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -65,30 +77,84 @@ pub(crate) const PANEL_CACHE_TTL: Duration = Duration::from_millis(3_000);
 /// instances of unbounded external calls; this one is born bounded).
 const PANEL_SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Required on every `/panel/*` request. Its ONLY job is to be a
+/// non-simple header, which forces the browser to send a CORS **preflight**
+/// — and `local_only_cors()` allows no custom request headers, so a foreign
+/// origin's preflight fails and the real request is never sent (#1602 gate).
+///
+/// Without it, `/panel/:id` is a "simple request": any page open in the
+/// operator's browser could `fetch("http://127.0.0.1:8765/panel/doctor")` on
+/// a loop from a background tab. CORS would stop it READING the response but
+/// not SENDING it, and the daemon would faithfully run doctor — spawning
+/// probes, shelling to `curl` against the GitHub API, touching the Keychain
+/// — over and over on the measured host. That is precisely the #1286
+/// "observer joins the observed" failure, driven by a page the operator
+/// never opened on purpose.
+///
+/// Bearer auth does not cover this: loopback is exempt by design, and under
+/// the documented `tailscale serve` phone-dashboard pattern every tailnet
+/// peer arrives as loopback too.
+pub(crate) const PANEL_HEADER: &str = "x-darkmux-panel";
+
+/// Server-enforced floor between runs of a MANUAL-ONLY panel (TTL 0).
+///
+/// `auto_refresh: false` is advice to the viewer, and the module doc used to
+/// admit as much — "the viewer must honor it". A buggy viewer build, a stuck
+/// tab, or any non-browser client defeats advice. This floor is the
+/// enforcement: doctor costs ~2.2s of probing per run, so an unbounded
+/// caller could pin the measured host indefinitely. A human clicking
+/// "re-run" does not notice 30s; a loop is bounded to twice a minute and
+/// told so with `Retry-After`.
+const MANUAL_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
 /// One allowlist entry: the argv after the binary, whether the viewer may
 /// auto-refresh it, and the cache TTL applied.
 pub(crate) struct PanelSpec {
+    /// The canonical id — carried HERE rather than derived by a second
+    /// lookup. An earlier draft had `panel_spec()` plus a `panel_spec_key()`
+    /// twin plus a hardcoded list in the tests: three copies of one table,
+    /// where adding an 8th panel and forgetting the twin panicked the
+    /// handler on first request and no test could catch the drift. One
+    /// match, one table (#1602 gate).
+    pub(crate) id: &'static str,
     pub(crate) argv: &'static [&'static str],
     pub(crate) auto_refresh: bool,
     pub(crate) cache_ttl: Duration,
 }
 
+/// Every allowlisted panel id — the ONE list. `panel_spec` must answer for
+/// each of these, which [`every_listed_id_has_a_spec`] enforces.
+pub(crate) const PANEL_IDS: &[&str] = &[
+    "mission-status",
+    "role-list",
+    "machine-status",
+    "config-list",
+    "flow-status",
+    "lab-fixture-list",
+    "doctor",
+];
+
 /// The allowlist. Deliberately short — see the module doc. Ids are kebab-case
 /// and OPAQUE to the client; the mapping to argv lives here and only here.
 pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
-    let (argv, auto_refresh, ttl): (&'static [&'static str], bool, Duration) = match id {
-        "mission-status" => (&["mission", "status"], true, PANEL_CACHE_TTL),
-        "role-list" => (&["role", "list"], true, PANEL_CACHE_TTL),
-        "machine-status" => (&["machine", "status"], true, PANEL_CACHE_TTL),
-        "config-list" => (&["config", "list"], true, PANEL_CACHE_TTL),
-        "flow-status" => (&["flow", "status"], true, PANEL_CACHE_TTL),
-        "lab-fixture-list" => (&["lab", "fixture", "list"], true, PANEL_CACHE_TTL),
-        // Manual-run only (#1286): never auto-refreshed by the viewer, and
-        // TTL 0 so an explicit re-run is always a real run.
-        "doctor" => (&["doctor"], false, Duration::ZERO),
-        _ => return None,
-    };
-    Some(PanelSpec { argv, auto_refresh, cache_ttl: ttl })
+    let (id, argv, auto_refresh, ttl): (&'static str, &'static [&'static str], bool, Duration) =
+        match id {
+            "mission-status" => ("mission-status", &["mission", "status"], true, PANEL_CACHE_TTL),
+            "role-list" => ("role-list", &["role", "list"], true, PANEL_CACHE_TTL),
+            "machine-status" => ("machine-status", &["machine", "status"], true, PANEL_CACHE_TTL),
+            "config-list" => ("config-list", &["config", "list"], true, PANEL_CACHE_TTL),
+            "flow-status" => ("flow-status", &["flow", "status"], true, PANEL_CACHE_TTL),
+            "lab-fixture-list" => {
+                ("lab-fixture-list", &["lab", "fixture", "list"], true, PANEL_CACHE_TTL)
+            }
+            // Manual-run only (#1286): never auto-refreshed by the viewer,
+            // TTL 0 so an explicit re-run is always a real run, and rate-
+            // floored server-side (see MANUAL_MIN_INTERVAL) because
+            // "the viewer must honor it" is not enforcement.
+            "doctor" => ("doctor", &["doctor"], false, Duration::ZERO),
+            _ => return None,
+        };
+    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl })
 }
 
 /// Whole-response cache entry.
@@ -108,6 +174,10 @@ type FlightLock = Arc<tokio::sync::Mutex<()>>;
 pub(crate) struct PanelState {
     cache: Arc<tokio::sync::Mutex<HashMap<&'static str, CacheEntry>>>,
     flights: Arc<tokio::sync::Mutex<HashMap<&'static str, FlightLock>>>,
+    /// Last completed run of each MANUAL-ONLY panel — the floor's clock.
+    /// Manual panels are uncached by design, so this is the only record
+    /// that one ran at all.
+    last_manual: Arc<tokio::sync::Mutex<HashMap<&'static str, Instant>>>,
 }
 
 #[derive(Deserialize)]
@@ -124,20 +194,52 @@ fn clamp_cols(cols: Option<u16>) -> u16 {
 pub(crate) async fn panel_handler(
     Path(id): Path<String>,
     Query(params): Query<PanelParams>,
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    // The preflight forcer — see PANEL_HEADER. Checked BEFORE the allowlist
+    // lookup so a drive-by never even learns which ids exist.
+    if !headers.contains_key(PANEL_HEADER) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "panel requests require the `{PANEL_HEADER}` header — it forces a CORS \
+                 preflight so a foreign page cannot drive this endpoint from the \
+                 operator's browser\n"
+            ),
+        ));
+    }
     let Some(spec) = panel_spec(&id) else {
         return Err((
             StatusCode::NOT_FOUND,
             format!("unknown panel \"{id}\" — panels are a fixed allowlist, not arbitrary commands\n"),
         ));
     };
-    // Canonical id from the table (a &'static str for the cache keys).
-    let id: &'static str = match panel_spec_key(&id) {
-        Some(k) => k,
-        None => unreachable!("panel_spec above already matched"),
-    };
+    // Canonical &'static id straight off the spec — one table, no second
+    // lookup that could drift out from under it.
+    let id = spec.id;
     let cols = clamp_cols(params.cols);
+
+    // Manual-only panels (TTL 0) are floored server-side: `auto_refresh:
+    // false` is advice to a client the server does not control.
+    if !spec.auto_refresh {
+        let last = state.panels.last_manual.lock().await;
+        if let Some(prev) = last.get(id) {
+            let since = prev.elapsed();
+            if since < MANUAL_MIN_INTERVAL {
+                let wait = (MANUAL_MIN_INTERVAL - since).as_secs() + 1;
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "panel \"{id}\" is manual-run only and ran {}s ago — it probes the \
+                         machine, so it is floored at {}s between runs. Retry-After: {wait}\n",
+                        since.as_secs(),
+                        MANUAL_MIN_INTERVAL.as_secs()
+                    ),
+                ));
+            }
+        }
+    }
 
     // Serve fresh-enough cache without spawning.
     if let Some(body) = cached_if_fresh(&state.panels, id, spec.cache_ttl).await {
@@ -220,25 +322,15 @@ pub(crate) async fn panel_handler(
         "auto_refresh": spec.auto_refresh,
     });
 
-    if !spec.cache_ttl.is_zero() {
+    if spec.cache_ttl.is_zero() {
+        // Manual panel: nothing cached (an explicit run is a real run), but
+        // the floor's clock advances so the next caller is bounded.
+        state.panels.last_manual.lock().await.insert(id, Instant::now());
+    } else {
         let mut cache = state.panels.cache.lock().await;
         cache.insert(id, CacheEntry { body: body.clone(), captured: Instant::now() });
     }
     Ok(axum::Json(body))
-}
-
-/// The canonical `&'static str` key for a matched id.
-fn panel_spec_key(id: &str) -> Option<&'static str> {
-    match id {
-        "mission-status" => Some("mission-status"),
-        "role-list" => Some("role-list"),
-        "machine-status" => Some("machine-status"),
-        "config-list" => Some("config-list"),
-        "flow-status" => Some("flow-status"),
-        "lab-fixture-list" => Some("lab-fixture-list"),
-        "doctor" => Some("doctor"),
-        _ => None,
-    }
 }
 
 /// Serve the cached body if it is within `ttl`, with `age_ms` restamped so
@@ -275,11 +367,18 @@ mod tests {
         assert!(panel_spec("rm -rf /").is_none());
         assert!(panel_spec("mission status").is_none(), "argv-looking ids are not ids");
         assert!(panel_spec("").is_none());
-        // Every spec'd id has a canonical key and vice versa.
-        for id in ["mission-status", "role-list", "machine-status", "config-list", "flow-status", "lab-fixture-list", "doctor"] {
-            assert!(panel_spec(id).is_some(), "{id}");
-            assert_eq!(panel_spec_key(id), Some(id));
+    }
+
+    /// The drift guard the three-parallel-tables shape could not have: the
+    /// ONE list and the ONE match must agree, in both directions.
+    #[test]
+    fn every_listed_id_has_a_spec_and_reports_itself() {
+        for id in PANEL_IDS {
+            let spec = panel_spec(id).unwrap_or_else(|| panic!("PANEL_IDS lists {id} with no spec"));
+            assert_eq!(spec.id, *id, "a spec must report the id it was looked up by");
+            assert!(!spec.argv.is_empty(), "{id} has empty argv");
         }
+        assert_eq!(PANEL_IDS.len(), 7, "allowlist growth is a doctrine decision, not a drive-by");
     }
 
     #[test]
