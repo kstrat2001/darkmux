@@ -202,7 +202,18 @@
   /* Status colors earn attention rather than spend it: `complete` is the
      normal case and stays quiet, so the eye lands on the runs that actually
      want a look (error red, running amber). */
-  .labbadge.complete{color:var(--muted)}
+  /* (#1569) Complete is an ACHIEVEMENT, and it reads as one. It used to be
+     muted, grouped with .planned/.abandoned below — but those are non-events
+     and this is a run that finished its work. Two tells that it was an
+     accident rather than a choice: the run DETAIL page still badges the very
+     same run green via labBadge()'s "finished", so one run had two colors
+     depending on where you looked at it (#1584's unification renamed the
+     status and dropped the color with it); and unlike .error/.running this
+     set no border-color, leaving it doubly grey.
+     Green does not become wallpaper here — the live split is complete 116 /
+     running 41 / error 13, so amber and red stay visible at rates that keep
+     the color informative rather than decorative. */
+  .labbadge.complete{color:var(--good);border-color:var(--good)}
   .labbadge.error{color:var(--bad);border-color:var(--bad)}
   /* Amber, but deliberately NOT the pulsing `.live` treatment — see
      runStatusBadge: `running` here means "no terminal artifact", which is not
