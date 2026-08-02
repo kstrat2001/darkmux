@@ -45,39 +45,39 @@
 <style>
   :root{
     --bg:#0a0a0b; --bg2:#131316; --panel:#1c1c22; --line:#1f1f24;
-    --text:#e8e6e3; --muted:#8a8a92; --amber:#6df1ff; --amber-dim:#2a8a96;
+    --text:#e8e6e3; --muted:#8a8a92; --accent:#6df1ff; --accent-dim:#2a8a96;
     --good:#5af0a3; --warn:#ffb86b; --bad:#ff6b85; --run:#ffd166;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 'Inter',-apple-system,system-ui,sans-serif;overflow:hidden}
   .top{height:46px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--bg2)}
-  .brand{font-weight:700;letter-spacing:.04em}.brand b{color:var(--amber)}.brand a{color:inherit;text-decoration:none}.brand a:hover b{text-decoration:underline}
+  .brand{font-weight:700;letter-spacing:.04em}.brand b{color:var(--accent)}.brand a{color:inherit;text-decoration:none}.brand a:hover b{text-decoration:underline}
   /* (#1129) Build identifier — version (+ git SHA) and flow-schema the daemon injects; empty on the static demo. */
   /* (#1132) When populated (daemon-served) it's the trigger for the about modal. */
   .ver{font:11px/1 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.02em}
   .ver[data-act]{cursor:pointer}.ver[data-act]:hover{color:var(--text)}
   .topnav{margin-left:auto;display:flex;gap:18px;align-items:center}
   .topnav a{color:var(--muted);text-decoration:none;font:600 12px 'JetBrains Mono',monospace;letter-spacing:.04em}
-  .topnav a:hover{color:var(--amber)}
-  .badge{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:#0a0a0b;background:var(--amber);padding:5px 9px;border-radius:3px}
+  .topnav a:hover{color:var(--accent)}
+  .badge{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--bg);background:var(--accent);padding:5px 9px;border-radius:3px}
   /* (#1098) the source/date badge ("today") doubles as the history trigger when
      a daemon is behind it — looks like a button, opens the catalog (the old ▤
      button read as a "stop" glyph). */
   .badge.srcbtn{cursor:pointer}
-  .badge.srcbtn:hover{box-shadow:0 0 0 2px var(--amber-dim)}
-  .pb{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border:1px solid var(--amber-dim);padding:4px 9px;border-radius:3px}
+  .badge.srcbtn:hover{box-shadow:0 0 0 2px var(--accent-dim)}
+  .pb{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent-dim);padding:4px 9px;border-radius:3px}
   .catpanel{position:absolute;top:48px;left:16px;z-index:60;background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:5px;min-width:300px;max-width:min(420px,92vw);max-height:60vh;overflow:auto;box-shadow:0 10px 30px rgba(0,0,0,.55)}
   .catpanel .cathdr{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:7px 8px 4px}
   .catrow{display:block;width:100%;text-align:left;background:none;border:0;color:var(--text);padding:7px 9px;border-radius:4px;cursor:pointer}
-  .catrow:hover{background:var(--amber-dim)}
+  .catrow:hover{background:var(--accent-dim)}
   .catrow .cd{font:600 13px/1.2 Inter,sans-serif}
   .catrow .cs{color:var(--muted);font:11px/1.3 Inter,sans-serif;margin-top:2px}
-  .catrow.live .cd{color:var(--amber)}
+  .catrow.live .cd{color:var(--accent)}
   .catempty{color:var(--muted);font:12px/1.4 Inter,sans-serif;padding:8px 9px}
   @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.5}}
   /* (#1071) live-MODE badge is cyan, not green — green now means a SUCCESSFUL
      run (status convention). The badge is a viewing-mode cue, not a verdict. */
-  .pb.live{color:var(--amber);border-color:var(--amber);animation:lpulse 1.6s ease-in-out infinite}
+  .pb.live{color:var(--accent);border-color:var(--accent);animation:lpulse 1.6s ease-in-out infinite}
   /* (#238) Respect prefers-reduced-motion: drop the infinite live-badge pulse
      (and shorten transitions) for vestibular accessibility. Live state stays
      distinguishable WITHOUT motion — the badge keeps its cyan color, the "●"
@@ -92,15 +92,15 @@
   @media (prefers-reduced-motion: reduce){
     *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
   }
-  .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:#131316}
+  .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--bg2)}
   .crumb{font:600 13px 'JetBrains Mono',monospace;color:var(--muted)}
-  .crumb a{color:var(--amber);cursor:pointer;text-decoration:none}.crumb a:hover{text-decoration:underline}
+  .crumb a{color:var(--accent);cursor:pointer;text-decoration:none}.crumb a:hover{text-decoration:underline}
   /* (#827) missions index rows */
   .milist{margin-top:6px}
   .mirow{display:flex;align-items:center;gap:14px;padding:11px 12px;border:1px solid var(--line);border-radius:7px;margin-bottom:8px;cursor:pointer;background:var(--panel)}
-  .mirow:hover{border-color:var(--amber-dim)}
+  .mirow:hover{border-color:var(--accent-dim)}
   .mistatus{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted);flex:0 0 auto}
-  .miname{font:600 13px 'JetBrains Mono',monospace;color:var(--amber);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .miname{font:600 13px 'JetBrains Mono',monospace;color:var(--accent);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .mitag{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;padding:3px 7px;border-radius:3px;color:var(--muted);background:var(--bg2);border:1px dashed var(--line);flex:0 0 auto}
 
   /* (#1247 Part 3) Lab observer lens — machine-local room, distinct from the
@@ -115,16 +115,16 @@
   .lablist{display:flex;flex-direction:column;gap:14px;margin-top:10px}
   .labnotice{font:12px/1.5 'JetBrains Mono',monospace;color:var(--warn);border:1px solid var(--warn);border-radius:6px;padding:9px 12px;margin-top:10px;overflow-wrap:anywhere}
   .labtaskcard{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
-  .labtaskhdr{font:600 13px 'JetBrains Mono',monospace;color:var(--amber);display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-bottom:8px}
+  .labtaskhdr{font:600 13px 'JetBrains Mono',monospace;color:var(--accent);display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-bottom:8px}
   .labtaskcount{font:600 10px 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
   .labrunrow{display:flex;flex-direction:column;gap:4px;padding:10px 11px;border:1px solid var(--line);border-radius:6px;background:var(--bg2);cursor:pointer;margin-bottom:6px}
   .labrunrow:last-child{margin-bottom:0}
-  .labrunrow:hover{border-color:var(--amber-dim)}
+  .labrunrow:hover{border-color:var(--accent-dim)}
   /* (#1584) An untracked ghost has no durable record to open — no pointer, no
      hover affordance, so the row never promises a drill-down it can't do. */
   .labrunrow.flat{cursor:default}
   .labrunrow.flat:hover{border-color:var(--line)}
-  .labrunrow:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+  .labrunrow:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
   .labrunmain{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
   .labruncrew{font:600 12px 'JetBrains Mono',monospace;color:var(--text)}
   .labrundir{font:11px 'JetBrains Mono',monospace;color:var(--muted);overflow-wrap:anywhere}
@@ -136,7 +136,7 @@
   .labdiffline.dim{color:var(--muted);border-left-color:var(--line)}
   .labbadge{display:inline-block;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:3px;border:1px solid var(--line);flex:0 0 auto}
   .labbadge.finished{color:var(--good);border-color:var(--good)}
-  .labbadge.live{color:var(--amber);border-color:var(--amber);animation:lpulse 1.6s ease-in-out infinite}
+  .labbadge.live{color:var(--accent);border-color:var(--accent);animation:lpulse 1.6s ease-in-out infinite}
   /* (#1569 packet B2) CLI panels. The terminal's own output, so the type is
      monospace and the palette maps ANSI's 16 colors onto the viewer's own
      variables — a panel must look like it belongs to this page, not like a
@@ -151,12 +151,12 @@
   .panelchrome .pc-cmd{color:var(--text);font-weight:600}
   .panelchrome .pc-spacer{flex:1 1 auto}
   .panelchrome .pc-stale{color:var(--warn)}
-  .panelchrome .pc-manual{color:var(--amber-dim)}
+  .panelchrome .pc-manual{color:var(--accent-dim)}
   .pcbtn{font:600 11px 'JetBrains Mono',monospace;color:var(--muted);background:var(--bg2);
     border:1px solid var(--line);border-radius:4px;padding:4px 9px;cursor:pointer}
-  .pcbtn:hover{color:var(--amber);border-color:var(--amber-dim)}
+  .pcbtn:hover{color:var(--accent);border-color:var(--accent-dim)}
   .pcbtn:disabled{opacity:.45;cursor:default}
-  .pcbtn:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+  .pcbtn:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
   /* Font stack order is load-bearing. 'Apple Color Emoji' must come AFTER
      the monospace fallbacks, never before: it carries DIGIT glyphs (for
      keycap sequences), so listing it early hands every number to a
@@ -178,11 +178,11 @@
   .panelout .a-fg3,.panelout .a-fg11{color:var(--run)}     /* yellow */
   .panelout .a-fg4,.panelout .a-fg12{color:#7aa2f7}        /* blue   */
   .panelout .a-fg5,.panelout .a-fg13{color:#c39cf7}        /* magenta*/
-  .panelout .a-fg6,.panelout .a-fg14{color:var(--amber)}   /* cyan   */
+  .panelout .a-fg6,.panelout .a-fg14{color:var(--accent)}   /* cyan   */
   .panelout .a-fg0,.panelout .a-fg8{color:var(--muted)}    /* black  */
   .panelout .a-fg7,.panelout .a-fg15{color:var(--text)}    /* white  */
   .panelout .a-link{color:inherit;text-decoration:underline;text-underline-offset:2px;
-    text-decoration-color:var(--amber-dim)}
+    text-decoration-color:var(--accent-dim)}
   /* A tap target that survives a phone: the CLI's own ids are short, so
      pad the hit box without disturbing the monospace grid (#1569's
      "styling is legal; parsing prose is not"). */
@@ -197,17 +197,14 @@
      share. */
   .runsbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:10px 0 4px}
   .runchip{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.04em;padding:6px 10px;border-radius:14px;border:1px solid var(--line);background:var(--bg2);color:var(--muted);cursor:pointer}
-  .runchip:hover{border-color:var(--amber-dim);color:var(--text)}
-  .runchip:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
-  .runchip.on{border-color:var(--amber);color:var(--amber);background:var(--panel)}
+  .runchip:hover{border-color:var(--accent-dim);color:var(--text)}
+  .runchip:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .runchip.on{border-color:var(--accent);color:var(--accent);background:var(--panel)}
   .runchipn{opacity:.7;font-weight:400}
   .runkind{display:inline-block;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted);flex:0 0 auto}
-  .runkind.mission{color:var(--amber);border-color:var(--amber-dim)}
+  .runkind.mission{color:var(--accent);border-color:var(--accent-dim)}
   .runkind.dispatch{color:var(--text)}
   .runkind.lab{color:var(--good);border-color:var(--good)}
-  /* Status colors earn attention rather than spend it: `complete` is the
-     normal case and stays quiet, so the eye lands on the runs that actually
-     want a look (error red, running amber). */
   /* (#1569) Complete is an ACHIEVEMENT, and it reads as one. It used to be
      muted, grouped with .planned/.abandoned below — but those are non-events
      and this is a run that finished its work. Two tells that it was an
@@ -224,11 +221,11 @@
   /* Amber, but deliberately NOT the pulsing `.live` treatment — see
      runStatusBadge: `running` here means "no terminal artifact", which is not
      the same claim as "running right now". */
-  .labbadge.running{color:var(--amber);border-color:var(--amber-dim)}
+  .labbadge.running{color:var(--accent);border-color:var(--accent-dim)}
   .labbadge.planned,.labbadge.abandoned{color:var(--muted)}
   .rununtracked{font:600 10px/1 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.04em}
   .runmore{font:12px 'JetBrains Mono',monospace;color:var(--muted);margin-top:10px;cursor:pointer;text-align:center;padding:8px;border:1px dashed var(--line);border-radius:6px}
-  .runmore:hover{color:var(--amber);border-color:var(--amber-dim)}
+  .runmore:hover{color:var(--accent);border-color:var(--accent-dim)}
   /* Pipeline strip — a VERTICAL stage list always (not just on mobile): a
      stacked list reads cleanly at any width and keeps this lens's CSS
      surface small; see the PR notes for the deliberate no-horizontal-strip
@@ -240,7 +237,7 @@
   .labstage.finished{border-color:var(--good)}
   .labstage.error{border-color:var(--bad)}
   .labstage.synth{border-style:dashed}
-  .labstagename{font:600 11px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;color:var(--amber);min-width:90px}
+  .labstagename{font:600 11px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);min-width:90px}
   .labstagemeta{font:11px 'JetBrains Mono',monospace;color:var(--muted);overflow-wrap:anywhere}
   .labcli{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border:1px dashed var(--line);border-radius:6px;background:var(--bg2);margin-bottom:14px}
   .labclilbl{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
@@ -250,7 +247,7 @@
   .labfeedrow{display:flex;flex-wrap:wrap;gap:8px;padding:5px 8px;border-radius:4px;font:11px/1.4 'JetBrains Mono',monospace}
   .labfeedrow:nth-child(odd){background:var(--panel)}
   .labfeedts{color:var(--muted);flex:0 0 auto}
-  .labfeedtag{color:var(--amber-dim);flex:0 0 auto;text-transform:uppercase;font-weight:600}
+  .labfeedtag{color:var(--accent-dim);flex:0 0 auto;text-transform:uppercase;font-weight:600}
   .labfeedtext{color:var(--text);overflow-wrap:anywhere}
   .labfeedrow.host{color:var(--muted)}
   .labfeedrow.host .labfeedtext{color:var(--muted)}
@@ -299,7 +296,7 @@
   .membar .cur.amber{background:var(--warn)}
   .membar .cur.red{background:var(--bad);opacity:.65}
   .membar .cur.unknown{background:var(--muted);opacity:.3}
-  .membar .lim{position:absolute;top:0;bottom:0;width:2px;background:var(--amber)}
+  .membar .lim{position:absolute;top:0;bottom:0;width:2px;background:var(--accent)}
   .membar .poolline{position:absolute;top:0;bottom:0;width:2px;background:var(--muted);opacity:.7}
   .memmeta{font:11px/1.5 'JetBrains Mono',monospace;color:var(--muted);overflow-wrap:anywhere}
   .memhint{font:11px/1.4 'JetBrains Mono',monospace;color:var(--warn);border-left:2px solid var(--warn);padding:2px 0 2px 8px;margin-top:6px;overflow-wrap:anywhere}
@@ -316,25 +313,25 @@
   .lens{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:5px 11px;cursor:pointer;text-decoration:none;background:none}
   .lens+.lens{border-left:1px solid var(--line)}
   .lens:hover{color:var(--text)}
-  .lens.on{background:var(--amber-dim);color:#0a0f17}
-  .crumb .sep{color:var(--amber-dim);margin:0 6px}
+  .lens.on{background:var(--accent-dim);color:#0a0f17}
+  .crumb .sep{color:var(--accent-dim);margin:0 6px}
   .meta{margin-left:auto;font:11px/1.4 'JetBrains Mono',monospace;color:var(--muted);text-align:right}.meta b{color:var(--text)}
   .wrap{display:flex;height:calc(100vh - 46px - 40px - 64px)}
   .stage{flex:1;position:relative;overflow:auto;padding:24px}
   .log{width:380px;border-left:1px solid var(--line);background:var(--bg2);display:flex;flex-direction:column}
-  .detail{display:flex;flex-direction:column;padding:12px 14px 0;background:#131316}
+  .detail{display:flex;flex-direction:column;padding:12px 14px 0;background:var(--bg2)}
   #detailbody{flex:1;overflow:auto;min-height:0;padding-bottom:12px}
   .split{height:7px;flex:none;background:var(--line);cursor:row-resize}
-  .split:hover{background:var(--amber-dim)}
+  .split:hover{background:var(--accent-dim)}
   .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
   .dt{font:600 11px 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
   /* (#1098) filter (funnel) + follow (clock) are grouped icon buttons in the log header */
   .logbtns{display:inline-flex;align-items:center;gap:6px;flex:none}
   .follow{display:inline-flex;align-items:center;justify-content:center;padding:5px;border-radius:6px;cursor:pointer;border:1px solid var(--line);color:var(--muted);background:none}
-  .follow:hover{border-color:var(--amber-dim);color:var(--amber)}
-  .follow.on{color:var(--amber);border-color:var(--amber-dim)}
+  .follow:hover{border-color:var(--accent-dim);color:var(--accent)}
+  .follow.on{color:var(--accent);border-color:var(--accent-dim)}
   .fbtn svg,.follow svg{width:16px;height:16px;display:block}
-  .fdot{color:var(--amber);font-size:11px;line-height:1;margin-left:1px}
+  .fdot{color:var(--accent);font-size:11px;line-height:1;margin-left:1px}
   .detail pre{margin:0;padding:10px 12px;background:var(--bg);border:1px solid var(--line);border-radius:5px;color:var(--text);white-space:pre-wrap;font:11px/1.55 'JetBrains Mono',monospace}
   .detail pre .k{color:var(--muted)}
   .detail .none{color:var(--muted);font:11px 'JetBrains Mono',monospace;padding:10px 0}
@@ -346,34 +343,34 @@
   .searchbox .sicon{position:absolute;left:9px;font-size:14px;line-height:1;color:var(--muted);pointer-events:none;transition:color .15s}
   .searchbox input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:7px 28px;font:12px 'JetBrains Mono',monospace;transition:border-color .15s,box-shadow .15s}
   .searchbox input::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none}
-  .searchbox input:focus{outline:none;border-color:var(--amber);box-shadow:0 0 0 3px rgba(109,241,255,.12)}
+  .searchbox input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(109,241,255,.12)}
   .searchbox input:focus-visible{outline:none}
-  .searchbox.has-q .sicon{color:var(--amber-dim)}
-  .searchbox:focus-within .sicon{color:var(--amber)}
+  .searchbox.has-q .sicon{color:var(--accent-dim)}
+  .searchbox:focus-within .sicon{color:var(--accent)}
   .searchbox input::placeholder{color:var(--muted);font-style:italic}
   .sclear{position:absolute;right:5px;display:flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;border:none;border-radius:50%;background:none;color:var(--muted);font-size:11px;line-height:1;cursor:pointer;transition:color .12s,background .12s}
   .sclear:hover{color:var(--text);background:var(--panel)}
-  .sclear:focus-visible{outline:none;color:var(--amber);box-shadow:0 0 0 2px var(--amber-dim)}
+  .sclear:focus-visible{outline:none;color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
   .sclear[hidden]{display:none}
   /* (#1090) visible keyboard-focus ring for the delegated drill-nav cards
      (role=button + tabindex added at runtime). :focus-visible = keyboard only,
      so mouse clicks don't draw a ring. */
-  [data-act]:focus-visible{outline:2px solid var(--amber);outline-offset:2px;border-radius:4px}
-  .qcount{flex:none;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.04em;color:var(--amber-dim);white-space:nowrap;padding:3px 7px;border:1px solid var(--line);border-radius:10px;opacity:0;transition:opacity .15s}
+  [data-act]:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+  .qcount{flex:none;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.04em;color:var(--accent-dim);white-space:nowrap;padding:3px 7px;border:1px solid var(--line);border-radius:10px;opacity:0;transition:opacity .15s}
   .qcount.show{opacity:1}
   .qcount.zero{color:var(--bad);border-color:rgba(255,107,133,.35)}
   #logbody{flex:1;overflow:auto;padding:8px 14px 10px}
   .fbtn{display:inline-flex;align-items:center;justify-content:center;gap:1px;background:none;border:1px solid var(--line);color:var(--muted);padding:5px;border-radius:6px;cursor:pointer}
-  .fbtn:hover{border-color:var(--amber-dim);color:var(--amber)}
-  .fbtn.on{border-color:var(--amber);color:var(--amber)}
+  .fbtn:hover{border-color:var(--accent-dim);color:var(--accent)}
+  .fbtn.on{border-color:var(--accent);color:var(--accent)}
   .rec{font:11px/1.5 'JetBrains Mono',monospace;color:var(--muted);padding:5px 6px;border-bottom:1px solid var(--line);cursor:pointer;border-left:2px solid transparent}
-  .rec:hover{background:#1c1c22}
-  .rec.sel{background:#23232b;border-left:2px solid var(--amber);color:var(--text)}
-  .rec .t{color:var(--amber)}.rec .tag{color:var(--text)}.rec.telemetry .tag{color:var(--warn)}
+  .rec:hover{background:var(--panel)}
+  .rec.sel{background:#23232b;border-left:2px solid var(--accent);color:var(--text)}
+  .rec .t{color:var(--accent)}.rec .tag{color:var(--text)}.rec.telemetry .tag{color:var(--warn)}
   .empty{color:var(--muted);font:11px 'JetBrains Mono',monospace;padding:10px 2px}
   .scrub{height:64px;border-top:1px solid var(--line);background:var(--bg2);display:flex;align-items:center;gap:14px;padding:0 18px}
-  .scrub button{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);padding:7px 14px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
-  .scrub button.primary{background:var(--amber);color:#0a0a0b;border-color:var(--amber)}
+  .scrub button{background:var(--bg);border:1px solid var(--accent-dim);color:var(--text);padding:7px 14px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
+  .scrub button.primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}
   /* Live mode follows the tail — historical replay lives at /play/<date>. Hide
      the playback transport and reclaim its reserved 64px back into .wrap. */
   body.live-mode .scrub{display:none}
@@ -402,7 +399,7 @@
   body.booting .scrub{display:none}
   body.booting .wrap{height:calc(100vh - 46px - 40px)}
   body.booting #modebadge{visibility:hidden}
-  input[type=range]{flex:1;accent-color:var(--amber)}
+  input[type=range]{flex:1;accent-color:var(--accent)}
   .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
   .fleet{display:flex;gap:16px;flex-wrap:wrap;align-items:stretch}
   .fleettl{margin-top:30px;border-top:1px solid var(--line);padding-top:18px}
@@ -413,7 +410,7 @@
   .twinb{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;color:var(--muted);padding:4px 8px;cursor:pointer;background:none;border:0;text-transform:uppercase}
   .twinb+.twinb{border-left:1px solid var(--line)}
   .twinb:hover{color:var(--text)}
-  .twinb.on{background:var(--amber-dim);color:#0a0f17}
+  .twinb.on{background:var(--accent-dim);color:#0a0f17}
   .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
   .lname{width:var(--lname-w,150px);flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .tltrack{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
@@ -432,39 +429,39 @@
   .tlaxis{margin-left:calc(var(--lname-w,150px) + 12px);display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
   .tlempty{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .mach{width:248px;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;cursor:pointer;transition:border-color .15s}
-  .mach:hover{border-color:var(--amber-dim)}.mach.active{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber-dim)}
+  .mach:hover{border-color:var(--accent-dim)}.mach.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-dim)}
   .mach .name{font:600 15px 'JetBrains Mono',monospace;color:var(--text);display:flex;align-items:center;gap:8px}
-  .mico{display:inline-flex;color:var(--amber-dim)}.mico svg{width:19px;height:19px;display:block}
-  .mach.active .mico{color:var(--amber)}
+  .mico{display:inline-flex;color:var(--accent-dim)}.mico svg{width:19px;height:19px;display:block}
+  .mach.active .mico{color:var(--accent)}
   .mach .spec{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:3px}
   .mach .specdim{opacity:.5;font-style:italic}
   .mach .stat{margin-top:12px;font:12px 'JetBrains Mono',monospace}
   .mach .runs{margin-top:5px;font:12px 'JetBrains Mono',monospace;color:var(--text)}
-  .mach .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--amber-dim);margin-right:7px;vertical-align:middle}
-  .mach.active .dot{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+  .mach .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent-dim);margin-right:7px;vertical-align:middle}
+  .mach.active .dot{background:var(--accent);box-shadow:0 0 8px var(--accent)}
   .mach.absent{opacity:.45}.mach.absent .dot{background:var(--muted);box-shadow:none}
   .hint{display:block;color:var(--muted);font:11px 'JetBrains Mono',monospace;margin-top:10px}
   .stagehdr{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:14px}
-  .stagehdr a{color:var(--amber);cursor:pointer;text-decoration:none}.stagehdr a:hover{text-decoration:underline}
+  .stagehdr a{color:var(--accent);cursor:pointer;text-decoration:none}.stagehdr a:hover{text-decoration:underline}
   .node{display:inline-block;width:260px;vertical-align:top;margin:0 24px 24px 0;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;cursor:pointer}
-  .node:hover{border-color:var(--amber-dim)}.node .h{font:600 13px 'JetBrains Mono',monospace;display:flex;align-items:center;gap:8px}
-  .nico{display:inline-flex;color:var(--amber-dim);flex:none}.nico svg{width:17px;height:17px;display:block}
+  .node:hover{border-color:var(--accent-dim)}.node .h{font:600 13px 'JetBrains Mono',monospace;display:flex;align-items:center;gap:8px}
+  .nico{display:inline-flex;color:var(--accent-dim);flex:none}.nico svg{width:17px;height:17px;display:block}
   .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px;overflow-wrap:anywhere}
-  .node .s.tsline{color:var(--amber-dim);margin-top:6px}
+  .node .s.tsline{color:var(--accent-dim);margin-top:6px}
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
   /* (#1071) status convention — running=yellow(pulse), complete=green,
      canceled=orange, failed=red, anomaly=cyan. */
-  .pill.run{background:#2a2410;color:var(--run);animation:lpulse 1.6s ease-in-out infinite}.pill.done{background:#16261d;color:var(--good)}.pill.util{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
+  .pill.run{background:#2a2410;color:var(--run);animation:lpulse 1.6s ease-in-out infinite}.pill.done{background:#16261d;color:var(--good)}.pill.util{background:var(--bg2);color:var(--accent-dim);border:1px solid var(--line)}
   .pill.canceled{background:#241a12;color:var(--warn)}
-  .pill.muted{background:#1c1c22;color:var(--muted)} /* neutral (e.g. utility-model residency states), not a dispatch verdict */
-  .pill.warn{background:var(--bg2);color:var(--amber);border:1px solid var(--amber)}
+  .pill.muted{background:var(--panel);color:var(--muted)} /* neutral (e.g. utility-model residency states), not a dispatch verdict */
+  .pill.warn{background:#241a12;color:var(--warn)}
   .pill.err{background:#2a1416;color:var(--bad)}
   .wallerr{color:var(--bad);font-weight:600}
-  .node.util{cursor:default;border-left:3px solid var(--amber-dim)}.node.util:hover{border-color:var(--line)}
+  .node.util{cursor:default;border-left:3px solid var(--accent-dim)}.node.util:hover{border-color:var(--line)}
   .rglbl{font:11px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
   /* (#691 Slice 2) "recent runs" — completed dispatches in live mode, dimmed so
      they read as history one click away, not current crew. */
-  .rglbl.rgdim{margin-top:8px;color:var(--amber-dim)}
+  .rglbl.rgdim{margin-top:8px;color:var(--accent-dim)}
   .recentruns{opacity:.55}.recentruns:hover{opacity:1}
   /* (#691) recent runs as an expandable list — richer + scannable vs cards */
   .rrlist{border-top:1px solid var(--line);margin-top:2px;max-width:920px}
@@ -474,8 +471,8 @@
   .rr>summary:hover,.rr[open]>summary{background:var(--bg2)}
   .rr .rrmain{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
   .rr .rrmeta{flex-shrink:0;color:var(--muted)}
-  .rr .rrtime{flex-shrink:0;color:var(--amber-dim)}
-  .rrmore{max-width:920px;text-align:center;padding:8px;cursor:pointer;font:11px 'JetBrains Mono',monospace;color:var(--amber);border-bottom:1px solid var(--line)}
+  .rr .rrtime{flex-shrink:0;color:var(--accent-dim)}
+  .rrmore{max-width:920px;text-align:center;padding:8px;cursor:pointer;font:11px 'JetBrains Mono',monospace;color:var(--accent);border-bottom:1px solid var(--line)}
   .rrmore:hover{background:var(--bg2)}
   /* New-run affordances: a row's first render slides in with a settle flash
      (one tick only — the live stage rebuilds ~1/sec, so the class is applied
@@ -486,8 +483,12 @@
      scannable identity — newest = highest, numbers don't shift as new runs
      prepend. */
   .rr .rrord{flex-shrink:0;color:var(--muted);min-width:38px;text-align:right}
-  .rr.rrfresh>summary{box-shadow:inset 3px 0 0 var(--green,#4ade80)}
-  .rr.rrfresh .rrord{color:var(--green,#4ade80)}
+  /* `var(--green, …)` here fell through to a hardcoded off-palette green:
+     --green has never been defined, so the fallback was the ONLY value and
+     the fresh-run marker sat at #4ade80 while every other green was
+     var(--good) #5af0a3. The palette name is --good. */
+  .rr.rrfresh>summary{box-shadow:inset 3px 0 0 var(--good)}
+  .rr.rrfresh .rrord{color:var(--good)}
   @keyframes rrslide{from{opacity:0;transform:translateY(-7px)}to{opacity:1;transform:none}}
   @keyframes rrflash{from{background:rgba(74,222,128,.16)}to{background:transparent}}
   .rr.rrnew{animation:rrslide .45s ease-out}
@@ -500,34 +501,34 @@
   .rrdetail .kv span{min-width:0;word-break:break-all}
   /* (#1127) Collapsed prompt block in the run brief. */
   .rrdetail .promptdet{border-bottom:none;margin-top:6px}
-  .rrdetail .promptdet>summary{list-style:none;cursor:pointer;color:var(--amber)}
+  .rrdetail .promptdet>summary{list-style:none;cursor:pointer;color:var(--accent)}
   .rrdetail .promptdet>summary::-webkit-details-marker{display:none}
   .promptbody{margin:6px 0 2px;padding:8px;background:var(--bg);border:1px solid var(--line);border-radius:4px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:11px/1.45 'JetBrains Mono',monospace;color:var(--text)}
-  .rrdetail a{color:var(--amber);cursor:pointer}.rrdetail a:hover{text-decoration:underline}
+  .rrdetail a{color:var(--accent);cursor:pointer}.rrdetail a:hover{text-decoration:underline}
   /* (#691) unscoped-records composition breakdown */
   .lbreakdown{max-width:560px;margin-top:2px}
   .lrow{display:flex;align-items:center;gap:12px;padding:6px 8px;border-radius:6px;font:11px 'JetBrains Mono',monospace}
   .lrow[onclick]{cursor:pointer}.lrow[onclick]:hover{background:var(--bg2)}
-  .lrow.sel{background:var(--bg2);outline:1px solid var(--amber-dim)}
+  .lrow.sel{background:var(--bg2);outline:1px solid var(--accent-dim)}
   .lrlbl{flex:0 0 220px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .lrbar{flex:1;height:10px;background:var(--bg2);border-radius:5px;overflow:hidden}
-  .lrbar>span{display:block;height:100%;background:var(--amber-dim)}
+  .lrbar>span{display:block;height:100%;background:var(--accent-dim)}
   .lrcnt{flex:0 0 auto;color:var(--muted);min-width:34px;text-align:right}
   .rghint{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:14px}
-  .rghint a{color:var(--amber);cursor:pointer}.rghint a:hover{text-decoration:underline}
-  .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:0 0 4px}
-  .sub h2 a{color:var(--amber);text-decoration:underline;cursor:pointer}
+  .rghint a{color:var(--accent);cursor:pointer}.rghint a:hover{text-decoration:underline}
+  .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin:0 0 4px}
+  .sub h2 a{color:var(--accent);text-decoration:underline;cursor:pointer}
   .track{margin:18px 0}.track .lbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:6px}
-  .seg{display:inline-flex;align-items:center;height:30px;padding:0 12px;margin-right:2px;font:11px 'JetBrains Mono',monospace;border-radius:3px;color:#0a0a0b;background:var(--amber)}
+  .seg{display:inline-flex;align-items:center;height:30px;padding:0 12px;margin-right:2px;font:11px 'JetBrains Mono',monospace;border-radius:3px;color:var(--bg);background:var(--accent)}
   .seg.b{background:var(--warn)}
   .metrics{display:flex;gap:12px;margin:14px 0 4px;flex-wrap:wrap}
   .met{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:9px 14px;min-width:118px}
   .met .mv{font:600 17px 'JetBrains Mono',monospace;color:var(--text)}
   .met .ml{font:10px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-top:3px}
-  .tokbar{height:4px;background:var(--line);border-radius:2px;margin-top:7px;overflow:hidden}.tokbar span{display:block;height:100%;background:var(--amber)}
+  .tokbar{height:4px;background:var(--line);border-radius:2px;margin-top:7px;overflow:hidden}.tokbar span{display:block;height:100%;background:var(--accent)}
   .cpuchart{display:flex;gap:8px;align-items:flex-end;overflow-x:auto}
   .yax{display:flex;flex-direction:column;justify-content:space-between;height:80px;font:9px 'JetBrains Mono',monospace;color:var(--muted);text-align:right}
-  .bars{display:flex;align-items:flex-end;gap:6px;height:80px;border-bottom:1px solid var(--line)}.bar{width:24px;background:var(--amber-dim);border-radius:2px 2px 0 0}
+  .bars{display:flex;align-items:flex-end;gap:6px;height:80px;border-bottom:1px solid var(--line)}.bar{width:24px;background:var(--accent-dim);border-radius:2px 2px 0 0}
   .xvals{display:flex;gap:6px;margin-top:4px}.xvals span{width:24px;text-align:center;font:9px 'JetBrains Mono',monospace;color:var(--muted)}
   .ctxchart{width:100%;height:74px;display:block;border-bottom:1px solid var(--line)}
   .loadsvg{width:100%;height:40px;display:block;border-bottom:1px solid var(--line)}
@@ -539,7 +540,7 @@
   .finding .fk{display:block;font:600 12px 'JetBrains Mono',monospace;color:var(--warn)}.finding.ok .fk{color:var(--good)}
   .finding .fm{display:block;font-size:12px;color:var(--text);margin-top:3px}
   .finding .ff{display:block;font-size:11px;color:var(--muted);margin-top:5px}
-  .misslink{cursor:pointer;color:var(--amber);text-decoration:none}.misslink:hover{text-decoration:underline}
+  .misslink{cursor:pointer;color:var(--accent);text-decoration:none}.misslink:hover{text-decoration:underline}
   /* (#789) activity-driven headline: running = live-green subject; idle = muted status (not a link) */
   #meta .run{color:var(--run)}
   #meta .idle{color:var(--muted);cursor:default}
@@ -548,28 +549,28 @@
   #meta .idle .rdot{font-weight:700}
   #meta .idle .rdot.ok{color:var(--good)}
   /* (#1105) machine-count chip in the headline — the count stays in the muted
-     headline color; the chip glyph is tinted like the machine cards (--amber-dim) */
+     headline color; the chip glyph is tinted like the machine cards (--accent-dim) */
   #meta .idle .mco{white-space:nowrap}
-  #meta .idle .mco svg{width:13px;height:13px;vertical-align:-2px;margin-left:2px;color:var(--amber-dim)}
+  #meta .idle .mco svg{width:13px;height:13px;vertical-align:-2px;margin-left:2px;color:var(--accent-dim)}
   #meta .metahint{color:var(--muted);font:11px 'JetBrains Mono',monospace}
   /* (#803) hybrid note — the encouraging line inside the savings card */
   .hybnote{margin-top:9px;padding-top:8px;border-top:1px solid var(--line);font:12px 'JetBrains Mono',monospace;color:var(--good)}
   /* (#807) real orchestrator notes: timestamp + history link on the note line,
      and the notes-history modal (wider than filters; notes are prose). */
   .hybts{color:var(--muted);font-size:10px}
-  .hyblink{color:var(--amber);cursor:pointer;font-size:11px;margin-left:4px}.hyblink:hover{text-decoration:underline}
+  .hyblink{color:var(--accent);cursor:pointer;font-size:11px;margin-left:4px}.hyblink:hover{text-decoration:underline}
   .nmodal{width:540px;max-width:92vw;max-height:72vh;overflow:auto}
   .nrow{border-bottom:1px solid var(--line);padding:9px 0}.nrow:last-child{border-bottom:none}
-  .nts{font:10px 'JetBrains Mono',monospace;color:var(--amber-dim)}
+  .nts{font:10px 'JetBrains Mono',monospace;color:var(--accent-dim)}
   .ntext{font:12px/1.5 'JetBrains Mono',monospace;color:var(--text);margin-top:3px;white-space:pre-wrap}
   /* (#1387) what-changed summary + worktree handoff — replaces the retired
      live-diff panel (#756). The daemon never ships diff content over HTTP
      any more; this renders totals + a copy/zed handoff to the worktree path. */
   .wtpath{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}
   .wtpath code{font:11px/1.5 'JetBrains Mono',ui-monospace,monospace;color:var(--text);background:#0a0f17;border:1px solid var(--line);border-radius:6px;padding:6px 10px;overflow-wrap:anywhere}
-  .wtcopy{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);border-radius:4px;padding:4px 10px;cursor:pointer;font:600 11px 'JetBrains Mono',monospace}
-  .wtcopy:hover{border-color:var(--amber)}
-  .wtzed{color:var(--amber);font:11px 'JetBrains Mono',monospace;text-decoration:none}
+  .wtcopy{background:var(--bg);border:1px solid var(--accent-dim);color:var(--text);border-radius:4px;padding:4px 10px;cursor:pointer;font:600 11px 'JetBrains Mono',monospace}
+  .wtcopy:hover{border-color:var(--accent)}
+  .wtzed{color:var(--accent);font:11px 'JetBrains Mono',monospace;text-decoration:none}
   .wtzed:hover{text-decoration:underline}
   /* (#783) savings hero — tokens kept off the meter. The "bang-up" on the fleet view. */
   /* (#803 layout) Horizontal hero: the big number leads on the left, the
@@ -587,7 +588,7 @@
   .savrow{display:flex;align-items:center;gap:14px 40px;flex-wrap:wrap}
   .savlead{flex:0 0 auto}
   .savnum{font:700 48px/1 'JetBrains Mono',monospace;color:var(--good);letter-spacing:.01em}
-  .savlead.cloud .savnum{color:var(--amber)}
+  .savlead.cloud .savnum{color:var(--accent)}
   .savlbl{font:600 12px/1 'JetBrains Mono',monospace;color:var(--text);margin-top:7px;text-transform:uppercase;letter-spacing:.12em}
   .savclasses{display:flex;gap:10px 30px;flex-wrap:wrap;align-items:center;justify-content:flex-end;flex:1 1 auto}
   .savc .scv{font:600 23px/1.1 'JetBrains Mono',monospace;color:var(--text)}
@@ -606,19 +607,19 @@
   /* Per-activity glyph on each log line — scannable "what's the model doing". */
   .aico{display:inline-flex;vertical-align:-2px;width:13px;height:13px;margin-right:2px;color:var(--muted)}
   .aico svg{width:13px;height:13px}
-  .aico.act-tool-call{color:var(--amber)}
+  .aico.act-tool-call{color:var(--accent)}
   .aico.act-reasoning{color:#8ab4f8}
   .aico.act-dispatch-start{color:#4ade80}
   .aico.act-dispatch-end{color:#4ade80}
   .aico.act-compaction{color:#c084fc}
   .aico.act-routing{color:#8ab4f8}
-  .aico.act-note{color:var(--amber)}
-  .aico.act-dispatch-error{color:var(--warn,#f87171)}
+  .aico.act-note{color:var(--accent)}
+  .aico.act-dispatch-error{color:var(--bad)}
   .aico.act-feedback{color:#8ab4f8}
   .aico.act-machine-online,.aico.act-machine-offline{color:var(--muted)}
   .detail-card{padding:14px;background:var(--bg);border:1px solid var(--line);border-radius:6px;margin-bottom:12px;font:12px/1.55 'JetBrains Mono',monospace}
-  .detail-card h3{margin:0 0 10px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--amber)}
-  .detail-card.reasoning{border-left:3px solid var(--amber)}
+  .detail-card h3{margin:0 0 10px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+  .detail-card.reasoning{border-left:3px solid var(--accent)}
   .detail-card.tool{border-left:3px solid var(--good)}
   .detail-card.tool.fail{border-left:3px solid var(--bad)}
   .detail-card .content{white-space:pre-wrap;color:var(--text);font-size:11px}
@@ -631,16 +632,16 @@
 
   /* filter modal */
   .modalbg{position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:100;display:none;align-items:center;justify-content:center}
-  .modal{width:380px;max-width:92vw;background:var(--bg2);border:1px solid var(--amber-dim);border-radius:8px;padding:18px 20px}
-  .mhd{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;font:600 13px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--amber)}
+  .modal{width:380px;max-width:92vw;background:var(--bg2);border:1px solid var(--accent-dim);border-radius:8px;padding:18px 20px}
+  .mhd{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;font:600 13px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
   .mx{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer}
   .fgroup{margin-bottom:14px}
   .fgroup h4{margin:0 0 8px;font:600 10px 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
   .fgroup label{display:inline-flex;align-items:center;gap:6px;margin:0 14px 7px 0;font:12px 'JetBrains Mono',monospace;color:var(--text);cursor:pointer}
-  .fgroup input{accent-color:var(--amber);cursor:pointer}
+  .fgroup input{accent-color:var(--accent);cursor:pointer}
   .mft{display:flex;gap:10px;margin-top:8px}
   .mft input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:4px;padding:8px 10px;font:12px 'JetBrains Mono',monospace}
-  .clr{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);border-radius:4px;padding:8px 12px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
+  .clr{background:var(--bg);border:1px solid var(--accent-dim);color:var(--text);border-radius:4px;padding:8px 12px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
 
   /* ---- Mobile phase 1 — survival #634 -------------------------------
      Desktop locks viewport to 100vh + overflow:hidden + horizontal flex
@@ -2135,7 +2136,7 @@ function runRegions(){
     // whose context delta is too small to render as a visible step (a ~200-token
     // turn is ~0.15px on a 100K window). Makes turns countable + time-locatable,
     // and lines up with the CPU bars + compaction marks on the shared time axis.
-    const dots=xy.map((p,i)=>`<circle cx="${p[0].toFixed(0)}" cy="${p[1].toFixed(1)}" r="2.4" fill="var(--bg)" stroke="var(--amber)" stroke-width="1.4" vector-effect="non-scaling-stroke"><title>turn ${i+1} · ${(cx[i].fields.used/1000).toFixed(1)}k ctx</title></circle>`).join("");
+    const dots=xy.map((p,i)=>`<circle cx="${p[0].toFixed(0)}" cy="${p[1].toFixed(1)}" r="2.4" fill="var(--bg)" stroke="var(--accent)" stroke-width="1.4" vector-effect="non-scaling-stroke"><title>turn ${i+1} · ${(cx[i].fields.used/1000).toFixed(1)}k ctx</title></circle>`).join("");
     const area="M0,"+H+" L"+step.map(p=>p[0].toFixed(0)+","+p[1].toFixed(0)).join(" L")+" L"+AX_W+","+H+" Z";
     const marks=comps.map(r=>{const x=tx(r.ts).toFixed(0);return `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="2 3"/><text x="${x}" y="9" fill="var(--warn)" font-size="9" text-anchor="middle">⚡</text>`;}).join("");
     // (#711) Native hover tooltip on the chart — now / peak / window at a glance.
@@ -2149,7 +2150,7 @@ function runRegions(){
     // approaches the window ceiling (y=0 = nctx). The top-left label names that
     // ceiling so "how full toward the max" reads at a glance (the operator asked
     // to see the max + a danger cue without an exact threshold line).
-    ctxChart=`<div class="track"><div class="lbl">context window — ${(nctx/1000)}K · ⚡ = compaction (${comps.length})</div><svg class="ctxchart" viewBox="0 0 ${AX_W} ${H+2}" preserveAspectRatio="none"><title>${esc(tip)}</title><defs><linearGradient id="ctxgrad" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${H}"><stop offset="0" stop-color="#ff6b6b"/><stop offset="0.5" stop-color="var(--warn)"/><stop offset="1" stop-color="var(--good)"/></linearGradient></defs><path d="${area}" fill="url(#ctxgrad)" opacity="0.28"/><polyline points="${linePts}" fill="none" stroke="var(--amber)" stroke-width="1.5"/>${thrLine}<text x="2" y="9" fill="var(--muted)" font-size="8" opacity="0.5">${(nctx/1000)}K</text>${marks}${dots}</svg></div>`;
+    ctxChart=`<div class="track"><div class="lbl">context window — ${(nctx/1000)}K · ⚡ = compaction (${comps.length})</div><svg class="ctxchart" viewBox="0 0 ${AX_W} ${H+2}" preserveAspectRatio="none"><title>${esc(tip)}</title><defs><linearGradient id="ctxgrad" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${H}"><stop offset="0" stop-color="#ff6b6b"/><stop offset="0.5" stop-color="var(--warn)"/><stop offset="1" stop-color="var(--good)"/></linearGradient></defs><path d="${area}" fill="url(#ctxgrad)" opacity="0.28"/><polyline points="${linePts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/>${thrLine}<text x="2" y="9" fill="var(--muted)" font-size="8" opacity="0.5">${(nctx/1000)}K</text>${marks}${dots}</svg></div>`;
   }
   const finds=[];
   if(distinct.length>1)finds.push({s:"warn",k:"jit-model-swap",d:`${distinct.length} models loaded in one run (${distinct.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`,f:"pin one model for the run, or pre-warm the swap target."});
