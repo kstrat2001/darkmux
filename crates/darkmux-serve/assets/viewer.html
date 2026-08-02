@@ -93,17 +93,11 @@
   .milist{margin-top:6px}
   .mirow{display:flex;align-items:center;gap:14px;padding:11px 12px;border:1px solid var(--line);border-radius:7px;margin-bottom:8px;cursor:pointer;background:var(--panel)}
   .mirow:hover{border-color:var(--amber-dim)}
-  .midimrow{opacity:.55}
   .mistatus{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted);flex:0 0 auto}
   .mistatus.active{color:var(--good);border-color:var(--good)}
   .mistatus.finalized{color:var(--muted)}
   .mistatus.paused{color:var(--warn);border-color:var(--warn)}
   .miname{font:600 13px 'JetBrains Mono',monospace;color:var(--amber);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .miprog{display:inline-flex;align-items:center;gap:7px;font:11px 'JetBrains Mono',monospace;color:var(--muted);flex:0 0 auto}
-  .mibar{display:inline-block;width:60px;height:6px;background:var(--line);border-radius:3px;overflow:hidden}
-  .mibar span{display:block;height:100%;background:var(--good)}
-  .mimeta{font:11px 'JetBrains Mono',monospace;color:var(--muted);flex:0 0 auto}
-  .midim{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .mitag{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;padding:3px 7px;border-radius:3px;color:var(--muted);background:var(--bg2);border:1px dashed var(--line);flex:0 0 auto}
 
   /* (#1247 Part 3) Lab observer lens — machine-local room, distinct from the
@@ -754,7 +748,6 @@
     .detail { height: auto !important; max-height: 24vh; }
     /* mission index rows: reflow, meta drops to its own line */
     .mirow { flex-wrap: wrap; }
-    .mimeta { flex: 1 1 100%; }
     /* (#1247 Part 3) Lab lens on phones: touch-size the run rows (already
        stacking by default — see the base rules above), and drop the fixed
        stage-name column so a long stage/status line wraps under it instead
@@ -2378,12 +2371,13 @@ function renderCrumb(){
   // mission detail; the runs lens (#1584, was the lab lens in #1247 Part 3)
   // covers the consolidated run list + a lab run's detail; everything else is
   // the fleet lens.
-  // (#1403) The missions lens is the index; on daemon-served pages the mission
-  // detail is the graph page (a separate document). The in-viewer `mission`
-  // level survives only as the daemon-less static summary (renderMissionStatic).
-  const inMissions = state.level==="missions"||state.level==="mission";
-  // (#1569 B2) The console tab. `missions`/`mission` levels survive for the
-  // daemon-less static summary a mission click falls back to.
+  // (#1403) On daemon-served pages a mission's detail is the graph page, a
+  // separate document. The in-viewer `mission` level survives ONLY as the
+  // daemon-less static summary (renderMissionStatic); the `missions` INDEX
+  // level it used to sit beside went with the board (#1561).
+  const inMission = state.level==="mission";
+  // (#1569 B2) The console tab. A static mission summary reads as living under
+  // it — that is where the mission board is now.
   const inConsole = state.level==="console";
   // (#1584) `lab-run` is the lab-specific DRILL-DOWN, kept exactly as it was —
   // it just hangs off the runs lens now instead of a top-level lab tab.
@@ -2394,8 +2388,8 @@ function renderCrumb(){
   // records (fleet/missions). Absorbed the retired `machinemem` level.
   const inMachine = state.level==="machine";
   const lf=$("lens-fleet"), lm=$("lens-console"), ll=$("lens-runs"), lmm=$("lens-machine");
-  if(lf)lf.className="lens"+((inMissions||inRuns||inMachine||inConsole)?"":" on");
-  if(lm)lm.className="lens"+((inConsole||inMissions)?" on":"");
+  if(lf)lf.className="lens"+((inMission||inRuns||inMachine||inConsole)?"":" on");
+  if(lm)lm.className="lens"+((inConsole||inMission)?" on":"");
   if(ll)ll.className="lens"+(inRuns?" on":"");
   if(lmm)lmm.className="lens"+(inMachine?" on":"");
   // (#1247 Part 3) The runs lens is a SEPARATE machine-local room, not a rung
@@ -2443,12 +2437,10 @@ function renderCrumb(){
     $("crumb").innerHTML = "";
     return;
   }
-  if(inMissions){
+  if(inMission){
     // The daemon-less static mission summary (#1403) — a mission click with
     // no graph page to open. Only the mission id is below the tab.
-    $("crumb").innerHTML = state.level==="mission"
-      ? `◆ ${esc(state.missionId||primaryMission()||"—")}`
-      : "";
+    $("crumb").innerHTML = `◆ ${esc(state.missionId||primaryMission()||"—")}`;
     return;
   }
   // Fleet lens. `◆ <mission>` stays: it is a shortcut to the running
@@ -2499,7 +2491,7 @@ function render(){
     renderMachine();
     return;
   }
-  if(state.level==="missions")renderMissionsIndex(); else if(state.level==="mission")renderMissionStatic(); else if(state.level==="fleet")renderFleet(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
+  if(state.level==="mission")renderMissionStatic(); else if(state.level==="fleet")renderFleet(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
   syncTransport();
@@ -2643,59 +2635,15 @@ async function loadMissionsPhases(mUrl, pUrl){
 // the flow (so it works under the demo without a /missions endpoint). Each row:
 // status, phase progress (from the durable plan), machines touched + token
 // rollup (from the flow), last activity. Click → that mission's detail.
-function renderMissionsIndex(){
-  $("logscope").textContent="missions"; state.stageScope=()=>true;
-  const ids=new Set();
-  MISSIONS.forEach(m=>{ if(m&&m.id)ids.add(m.id); });
-  visible().forEach(r=>{ if(r.mission_id)ids.add(r.mission_id); });
-  const byId={}; MISSIONS.forEach(m=>{ if(m&&m.id)byId[m.id]=m; });
-  // (#827 QA) One pass to bucket records by mission_id — avoids re-filtering
-  // the whole visible window per row (O(n×m) → O(n+m)) on every live render.
-  const recsBy={}, phBy={};
-  visible().forEach(r=>{ if(r.mission_id){(recsBy[r.mission_id]||(recsBy[r.mission_id]=[])).push(r);} });
-  PHASES.forEach(s=>{ if(s&&s.mission_id){(phBy[s.mission_id]||(phBy[s.mission_id]=[])).push(s);} });
-  const rows=[...ids].map(id=>{
-    const m=byId[id]||null;
-    // (#827 Slice B) status is the durable MISSION status; a mission with no
-    // /missions struct (flow-only) has no status — it's "untracked", shown as
-    // a separate provenance tag, NOT jammed into the status slot.
-    const status=m?normalizeMissionStatus(m.status||"active"):"untracked";
-    const known=!!m;
-    // Phase progress from the durable plan when present.
-    const sids=(m&&Array.isArray(m.phase_ids))?m.phase_ids:[];
-    const phaseObjs=phBy[id]||[];
-    const total=sids.length||phaseObjs.length;
-    const done=phaseObjs.filter(s=>s.status==="complete").length;
-    const pct=total?Math.round(done/total*100):0;
-    // Cross-machine + token rollup from the flow.
-    const recs=recsBy[id]||[];
-    const machs=[...new Set(recs.map(r=>nameOf(uidOf(r))).filter(Boolean))];
-    const toks=recs.filter(r=>r.category==="telemetry"&&r.source==="tokens")
-                   .reduce((a,r)=>a+((r.payload&&r.payload.total_tokens)||0),0);
-    const last=recs.length?Math.max(...recs.map(r=>T(r.ts))):0;
-    return {id,status,total,done,pct,machs,toks,last,known};
-  }).sort((a,b)=> (a.status==="finalized")-(b.status==="finalized") || b.last-a.last );
-  const body=rows.length?rows.map(r=>{
-    const prog=r.total?`<span class="miprog"><span class="mibar"><span style="width:${r.pct}%"></span></span> ${r.done}/${r.total}</span>`
-                      :`<span class="midim">no phases yet</span>`;
-    const tok=r.toks?` · ${fmtC(r.toks)} tok`:'';
-    const mach=r.machs.length?` · ${esc(r.machs.length===1?r.machs[0]:r.machs.length+' machines')}`:'';
-    // finalized → done check; untracked (flow-only) → a quiet provenance tag,
-    // not a status chip; otherwise the real mission status. `r.status` is
-    // already normalized (Closed→Finalized rename, #1463 lineage) — see
-    // `normalizeMissionStatus`.
-    const chip=r.known
-      ? `<span class="mistatus ${esc(r.status)}">${r.status==="finalized"?"✓ ":""}${esc(r.status)}</span>`
-      : `<span class="mitag">untracked</span>`;
-    return `<div class="mirow ${r.status==="finalized"?'midimrow':''}" data-act="missiondrill" data-arg="${esc(r.id)}">
-      ${chip}
-      <span class="miname">◆ ${esc(r.id)}</span>
-      ${prog}
-      <span class="mimeta">${mach}${tok}</span></div>`;
-  }).join(""):`<div class="none">no missions yet — propose one with <code>darkmux mission propose</code></div>`;
-  $("stage").innerHTML=savingsHero()+`<div><div class="stagehdr">missions · ${rows.length} total</div>
-    <div class="milist">${body}</div></div>`;
-}
+// (#1561, #1569 B3) The missions INDEX used to live here — a JavaScript
+// re-implementation of `darkmux mission status` that had DIVERGED from it:
+// the one mission needing attention rendered as the one row with no signal.
+// It is deleted, not fixed. The console tab renders the CLI's own output, so
+// the second implementation cannot drift from the first by not existing.
+//
+// `renderMissionStatic` (above) is NOT that board: it is the single-mission
+// summary a mission click falls back to when there is no daemon to serve the
+// graph page (#1403), and it has no CLI twin to disagree with.
 // (#827 Slice B QA) Sanitize a record-derived value used as a CSS class token.
 // esc() makes it HTML-safe but a status with a space/dot would still split or
 // invalidate the class; strip to alpha (enum values are alpha today — this is
