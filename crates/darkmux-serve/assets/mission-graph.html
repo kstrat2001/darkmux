@@ -47,7 +47,7 @@
 <style>
   :root{
     --bg:#0a0a0b; --bg2:#131316; --panel:#1c1c22; --line:#1f1f24;
-    --text:#e8e6e3; --muted:#8a8a92; --amber:#6df1ff; --amber-dim:#2a8a96;
+    --text:#e8e6e3; --muted:#8a8a92; --accent:#6df1ff; --accent-dim:#2a8a96;
     --good:#5af0a3; --warn:#ffb86b; --bad:#ff6b85; --run:#ffd166;
   }
   *{box-sizing:border-box}
@@ -83,7 +83,7 @@
   .top{position:sticky;top:0;z-index:50;min-height:46px;flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:env(safe-area-inset-top,0px) calc(16px + env(safe-area-inset-right,0px)) 0 calc(16px + env(safe-area-inset-left,0px));border-bottom:1px solid var(--line);background:var(--bg2)}
   .brand{font-weight:700;letter-spacing:.04em}
   .brand a{color:inherit;text-decoration:none}
-  .brand b{color:var(--amber)}
+  .brand b{color:var(--accent)}
   .brand a:hover b{text-decoration:underline}
   .midname{font:600 13px 'JetBrains Mono',monospace;color:var(--text)}
   .mstatus{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted)}
@@ -92,7 +92,7 @@
   .mstatus.paused{color:var(--warn);border-color:var(--warn)}
   .livepill{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);padding:3px 8px;border-radius:3px}
   @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.5}}
-  .livepill.on{color:var(--amber);border-color:var(--amber);animation:lpulse 1.6s ease-in-out infinite}
+  .livepill.on{color:var(--accent);border-color:var(--accent);animation:lpulse 1.6s ease-in-out infinite}
   /* (#1480) Disconnected/reconnecting is a LOUD state, not a calm one — a
      stale page that still "looks live" is the failure this guards. The warn
      hue + a faster pulse read unmistakably as "not live right now" so the
@@ -116,7 +116,7 @@
   .mnode{border-radius:7px;border:1px solid var(--line);background:var(--panel);padding:8px 10px;min-width:170px;max-width:260px;font-family:'Inter',sans-serif}
   .mnode .mn-label{font:600 12px/1.3 'JetBrains Mono',monospace;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .mnode .mn-kind{font:10px/1 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:3px}
-  .mnode.k-phase{background:var(--bg2);border-color:var(--amber-dim);min-width:200px}
+  .mnode.k-phase{background:var(--bg2);border-color:var(--accent-dim);min-width:200px}
   .mnode.k-phase .mn-label{font-size:13px}
   .mnode.k-task{border-style:solid}
   .mnode.s-planned{border-color:var(--line)}
@@ -137,7 +137,7 @@
      lead column via the `.mnode` override in the shared block. */
   .mnode .mn-steps{margin-top:6px;padding-top:6px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:2px}
   .react-flow__edge-path{stroke:var(--muted)}
-  .react-flow__edge.edge-depends_on .react-flow__edge-path{stroke:var(--amber-dim);stroke-width:1.6}
+  .react-flow__edge.edge-depends_on .react-flow__edge-path{stroke:var(--accent-dim);stroke-width:1.6}
   .react-flow__edge.edge-contains .react-flow__edge-path{stroke:var(--line);stroke-dasharray:3 3}
   /* (#1594) Phase-as-container. Reads as GROUND, never as a card: no shadow,
      hairline border, fill barely off the canvas. Status tints the border only
@@ -180,18 +180,18 @@
      never be assumed; these are the ONLY way out of the page. */
   .nav{display:inline-flex;align-items:center;gap:8px}
   .nav a{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);text-decoration:none;border:1px solid var(--line);border-radius:5px;padding:5px 9px;background:none}
-  .nav a:hover{color:var(--text);border-color:var(--amber-dim)}
+  .nav a:hover{color:var(--text);border-color:var(--accent-dim)}
 
   /* (#1403) Header live token/turn readout — mission-scoped, local vs cloud
      honesty split, same convention as the main viewer's savings hero. */
   .mmeter{display:inline-flex;align-items:baseline;gap:6px;font:11px/1 'JetBrains Mono',monospace;color:var(--muted);white-space:nowrap}
-  .mmeter b{color:var(--amber);font-weight:700}
+  .mmeter b{color:var(--accent);font-weight:700}
   .mmeter .split{color:var(--muted)}
   .mmeter .cloud{color:var(--warn)}
 
   /* (#1403) Per-step token/turn meter on an AI-dispatching step row. */
   .mn-step-meter{margin-left:auto;flex:0 0 auto;display:inline-flex;gap:6px;font:10px/1 'JetBrains Mono',monospace;color:var(--muted);white-space:nowrap}
-  .mn-step-meter .tok{color:var(--amber)}
+  .mn-step-meter .tok{color:var(--accent)}
   .mn-step-meter .tok.cloud{color:var(--warn)}
   .mn-step-meter .idle{opacity:.45}
   /* (#1483) Live "generating" affordance on a running dispatch — an elapsed
@@ -209,7 +209,7 @@
      reads it without re-navigating to the run view. Omitted entirely for a
      step with no resolved model (procedural / Tier 3). The namespace prefix
      is stripped for the label; the full id is one hover away (title). */
-  .steprow .smodel{flex:0 1 auto;min-width:0;font:9px/1 'JetBrains Mono',monospace;color:var(--amber-dim);
+  .steprow .smodel{flex:0 1 auto;min-width:0;font:9px/1 'JetBrains Mono',monospace;color:var(--accent-dim);
     border:1px solid var(--line);border-radius:3px;padding:2px 5px;overflow:hidden;
     text-overflow:ellipsis;white-space:nowrap;max-width:140px}
   .mnode .steprow .smodel{max-width:86px}
@@ -234,10 +234,10 @@
      `::after` rail rules leaves a valid downgrade on the same markup. */
   .steprow{position:relative;display:flex;align-items:center;gap:8px;padding:5px 0 5px 32px;
     font:11px/1.3 'JetBrains Mono',monospace;color:var(--muted)}
-  .steprow::before{content:"";position:absolute;left:9px;top:0;bottom:0;width:1px;background:var(--amber-dim);opacity:.5}
+  .steprow::before{content:"";position:absolute;left:9px;top:0;bottom:0;width:1px;background:var(--accent-dim);opacity:.5}
   .steprow:first-child::before{top:50%}
   .steprow:last-child::before{bottom:50%}
-  .steprow::after{content:"";position:absolute;left:9px;top:50%;width:8px;height:1px;background:var(--amber-dim);opacity:.5}
+  .steprow::after{content:"";position:absolute;left:9px;top:50%;width:8px;height:1px;background:var(--accent-dim);opacity:.5}
   .steprow .sring{position:absolute;left:17px;top:50%;transform:translateY(-50%);width:9px;height:9px;
     border-radius:50%;border:1.5px solid var(--muted);background:var(--bg2);box-sizing:border-box}
   .steprow.s-running .sring{border-color:var(--run);animation:lpulse 1.1s ease-in-out infinite}
@@ -264,8 +264,8 @@
      breakpoint, where it stands in for the inline .legend dots) — without this
      it fell back to a raw white default-button on phones. */
   .evbtn,.legbtn{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:5px 9px;background:none;cursor:pointer}
-  .evbtn:hover{color:var(--text);border-color:var(--amber-dim)}
-  .evbtn.on{color:var(--amber);border-color:var(--amber)}
+  .evbtn:hover{color:var(--text);border-color:var(--accent-dim)}
+  .evbtn.on{color:var(--accent);border-color:var(--accent)}
   .body{flex:1 1 auto;display:flex;min-height:0;position:relative}
   .body .canvas{flex:1 1 auto}
   .evpanel{flex:0 0 340px;border-left:1px solid var(--line);background:var(--bg2);display:flex;flex-direction:column;min-height:0}
@@ -277,7 +277,7 @@
   .evrow .evt{flex:0 0 auto;color:var(--muted);font-size:10px}
   .evrow .eva{flex:0 0 auto;color:var(--text)}
   .evrow .evh{flex:1 1 auto;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .evrow.telemetry .eva{color:var(--amber-dim)}
+  .evrow.telemetry .eva{color:var(--accent-dim)}
   .evrow.review .eva,.evrow.work .eva{color:var(--text)}
   .evrow.err .eva{color:var(--bad)}
   .evempty{padding:20px 12px;color:var(--muted);font:12px 'Inter',sans-serif}
@@ -289,7 +289,7 @@
      phase, tap a card to expand step detail. Consumes the SAME merged graph
      state as the canvas — one data source, two renderers. */
   .timeline{flex:1 1 auto;overflow-y:auto;padding:12px 12px 40px;display:flex;flex-direction:column;gap:16px}
-  .tlphase{border:1px solid var(--amber-dim);border-radius:8px;background:var(--bg2);overflow:hidden}
+  .tlphase{border:1px solid var(--accent-dim);border-radius:8px;background:var(--bg2);overflow:hidden}
   .tlphase .tlph-hd{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line)}
   .tlphase .tlph-hd .tlph-dot{flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:var(--line)}
   .tlphase.s-running .tlph-dot{background:var(--run);animation:lpulse 1.1s ease-in-out infinite}
