@@ -830,14 +830,14 @@
 </div>
 <div class="modalbg" id="modalbg">
   <div class="modal">
-    <div class="mhd"><span>filter events</span><button class="mx" data-act="closefilters">✕</button></div>
+    <div class="mhd"><span>filter events</span><button class="mx" data-act="closefilters" aria-label="close">✕</button></div>
     <div id="filterbody"></div>
     <div class="mft"><input id="fsearch" placeholder="search text…"><button class="clr" data-act="onlymodel" title="show only reasoning, tool calls, and turns">model only</button><button class="clr" data-act="clearfilters">clear all</button></div>
   </div>
 </div>
 <div class="modalbg" id="nmodalbg">
   <div class="modal nmodal">
-    <div class="mhd"><span>orchestrator notes</span><button class="mx" data-act="closenotes">✕</button></div>
+    <div class="mhd"><span>orchestrator notes</span><button class="mx" data-act="closenotes" aria-label="close">✕</button></div>
     <div id="notesbody"></div>
   </div>
 </div>
@@ -1498,9 +1498,9 @@ function openNotes(){
   const rows=orchNotes().slice().reverse().map(n=>
     `<div class="nrow"><div class="nts">${clk(T(n.ts))} · ${relAgo(T(n.ts))}</div><div class="ntext">${esc(n.handle)}</div></div>`
   ).join("")||'<div class="none">no orchestrator notes in this window</div>';
-  $("notesbody").innerHTML=rows;$("nmodalbg").style.display="flex";
+  $("notesbody").innerHTML=rows;openModalEl("nmodalbg");
 }
-function closeNotes(){$("nmodalbg").style.display="none";}
+function closeNotes(){$("nmodalbg").style.display="none";restoreModalFocus();}
 // (#1132) About modal — build + status snapshot. Rendered once on open (a
 // point-in-time snapshot, like the notes/filter modals); it lives at body
 // level so the ~1/sec live rebuild can't reset it. Values are darkmux-owned
@@ -2746,8 +2746,8 @@ window.onlyModelActivity=()=>{
   renderFilters();render();
 };
 window.toggleFilter=(k,v)=>{const s=state.filters[k];s.has(v)?s.delete(v):s.add(v);render();};
-window.openFilters=()=>{renderFilters();$("fsearch").value=state.filters.q;$("modalbg").style.display="flex";};
-window.closeFilters=()=>{$("modalbg").style.display="none";};
+window.openFilters=()=>{renderFilters();$("fsearch").value=state.filters.q;openModalEl("modalbg");};
+window.closeFilters=()=>{$("modalbg").style.display="none";restoreModalFocus();};
 window.clearFilters=()=>{state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),act:new Set(FACTS),q:""};setQuery("");renderFilters();};
 // One query, two inputs: the first-class pane search (#logq) and the modal
 // search (#fsearch) stay in sync through setQuery so either entry point filters
@@ -2766,6 +2766,37 @@ $("logq").oninput=e=>setQuery(e.target.value);
 // Clear affordance in the pane search — wipes the shared query and re-focuses
 // the input so the operator can keep typing a fresh filter.
 $("sclear").onclick=()=>{setQuery("");const lq=$("logq");if(lq)lq.focus();};
+// (#1569 sweep) Every `.modalbg` dialog now dismisses the same three ways:
+// the ✕, a backdrop click, and Escape — and every one returns focus to
+// whatever opened it. Before this, all three shared the class and the ✕ and
+// the backdrop handler, but only the about modal (#1132) answered Escape or
+// managed focus, so a keyboard user's Escape silently did nothing on two of
+// the three. `closeInfo` keeps its own explicit restore-to-verbadge; the
+// generic path is a no-op when it has nothing remembered.
+const MODAL_IDS=["modalbg","nmodalbg","imodalbg"];
+let MODAL_RETURN_FOCUS=null;
+function openModalEl(id){
+  MODAL_RETURN_FOCUS=(document.activeElement&&document.activeElement!==document.body)?document.activeElement:null;
+  const m=$(id); if(!m)return;
+  m.style.display="flex";
+  const x=m.querySelector(".mx"); if(x)x.focus();
+}
+function restoreModalFocus(){
+  const el=MODAL_RETURN_FOCUS; MODAL_RETURN_FOCUS=null;
+  if(el&&el.isConnected&&typeof el.focus==="function")el.focus();
+}
+// Closes the one open dialog, whichever it is. Returns true if it closed
+// something, so Escape can fall through to the catalog panel otherwise.
+function closeOpenModal(){
+  for(const id of MODAL_IDS){
+    const m=$(id);
+    if(m&&m.style.display!=="none"&&m.style.display!==""){
+      if(id==="modalbg")closeFilters(); else if(id==="nmodalbg")closeNotes(); else closeInfo();
+      return true;
+    }
+  }
+  return false;
+}
 $("modalbg").onclick=e=>{if(e.target===$("modalbg"))closeFilters();};
 $("nmodalbg").onclick=e=>{if(e.target===$("nmodalbg"))closeNotes();};
 $("imodalbg").onclick=e=>{if(e.target===$("imodalbg"))closeInfo();}; // (#1132) click-outside
@@ -2802,7 +2833,6 @@ const ACTIONS={
   goday:d=>{ location.href="/play/"+encodeURIComponent(d); },
   golive:()=>{ location.href="/"; },
   gomission:id=>goMissionGraph(id),
-  gosession:id=>{ location.href="/?session="+encodeURIComponent(id); },
   // (#1569 B2) The console tab — allowlisted CLI panels.
   console:()=>goConsole(),
   setpanel:a=>setPanel(a),
@@ -2844,7 +2874,9 @@ document.addEventListener("click",e=>{
 // keep their own key handling, so no double-dispatch. Space is prevent-defaulted
 // only when it lands on a card (else the page would scroll), never elsewhere.
 document.addEventListener("keydown",e=>{
-  if(e.key==="Escape"){closeInfo(); const p=$("catpanel"); if(p) p.hidden=true; return;} // (#1132) Escape closes the about modal (no-op if hidden)
+  // (#1132, generalized #1569) Escape closes whichever dialog is open — not
+  // just the about modal — then the catalog panel. No-op when nothing is open.
+  if(e.key==="Escape"){closeOpenModal(); const p=$("catpanel"); if(p) p.hidden=true; return;}
   if(e.key!=="Enter"&&e.key!==" "&&e.key!=="Spacebar")return;
   const el=e.target.closest("[data-act]");
   if(!el||el.matches("button,a[href],input,textarea,select"))return;
