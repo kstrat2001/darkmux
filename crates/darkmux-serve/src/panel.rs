@@ -122,8 +122,13 @@ pub(crate) struct PanelSpec {
     pub(crate) cache_ttl: Duration,
 }
 
-/// Every allowlisted panel id — the ONE list. `panel_spec` must answer for
-/// each of these, which [`every_listed_id_has_a_spec`] enforces.
+/// Every allowlisted panel id. Test-only by design: the production source
+/// of truth is `panel_spec`'s single match (that is the whole point of
+/// collapsing the old three-table shape), and this exists so the drift guard
+/// can assert against an INDEPENDENT list rather than deriving its
+/// expectations from the thing under test. Promote it to a real constant
+/// when a consumer needs it — B3's panel picker likely will.
+#[cfg(test)]
 pub(crate) const PANEL_IDS: &[&str] = &[
     "mission-status",
     "role-list",
