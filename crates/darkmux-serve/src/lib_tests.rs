@@ -2455,6 +2455,41 @@
             );
         }
 
+        /// (#1596) A consumer that disconnects during a QUIET period must
+        /// still terminate the producer task. `SendOutcome::Closed` — the
+        /// only other disconnect exit — is observable solely while
+        /// producing, so before the `tx.is_closed()` guard a closed tab on
+        /// an idle stream left the task looping `XREAD BLOCK 500` and
+        /// opening a fresh Redis connection every ~500ms for the daemon's
+        /// lifetime: one zombie per ordinary open-then-close of the
+        /// dashboard. The task is spawned HERE (not via `redis_tail_lines`)
+        /// exactly so its exit is assertable — the production wrapper
+        /// discards the JoinHandle.
+        #[tokio::test]
+        #[serial]
+        async fn redis_tail_task_exits_when_consumer_drops_while_quiet() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+            let task = tokio::spawn(redis_tail_task(
+                tx,
+                redis.url.clone(),
+                "darkmux:flow".to_string(),
+                today_utc_date(),
+            ));
+            // Let it reach the XREAD loop, then disconnect with NOTHING
+            // having been produced — the quiet-stream shape.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(rx);
+            tokio::time::timeout(Duration::from_millis(3000), task)
+                .await
+                .expect("producer task must exit after the consumer drops — not loop forever")
+                .expect("task must not panic");
+        }
+
         /// Records for OTHER dates are filtered out by the tail.
         #[tokio::test]
         #[serial]
