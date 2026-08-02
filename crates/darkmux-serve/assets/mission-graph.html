@@ -139,6 +139,23 @@
   .react-flow__edge-path{stroke:var(--muted)}
   .react-flow__edge.edge-depends_on .react-flow__edge-path{stroke:var(--amber-dim);stroke-width:1.6}
   .react-flow__edge.edge-contains .react-flow__edge-path{stroke:var(--line);stroke-dasharray:3 3}
+  /* (#1594) Phase-as-container. Reads as GROUND, never as a card: no shadow,
+     hairline border, fill barely off the canvas. Status tints the border only
+     — a running phase must stay legible without shouting over its own tasks.
+     `pointer-events:none` on the body so the container never steals a click
+     from a task inside it; the handles are absolutely positioned by React
+     Flow and unaffected. */
+  .phasegroup{width:100%;height:100%;box-sizing:border-box;border:1px solid var(--line);
+    border-radius:14px;background:rgba(255,255,255,.018);pointer-events:none;position:relative}
+  .phasegroup .pg-label{position:absolute;top:10px;left:14px;display:flex;flex-direction:column;gap:2px;line-height:1.1}
+  .phasegroup .pg-kind{font:600 9px 'JetBrains Mono',monospace;letter-spacing:.14em;color:var(--muted);opacity:.8}
+  .phasegroup .pg-name{font:600 13px 'JetBrains Mono',monospace;color:var(--text);opacity:.85}
+  .phasegroup.s-running{border-color:var(--run)}
+  .phasegroup.s-running .pg-name{color:var(--run)}
+  .phasegroup.s-complete{border-color:rgba(126,231,135,.45)}
+  .phasegroup.s-error{border-color:var(--bad)}
+  .phasegroup.s-error .pg-name{color:var(--bad)}
+  .phasegroup.s-abandoned{border-style:dashed;opacity:.6}
   /* (#1230 graph-lens lineage) Phase-order edges — a client-synthesized
      phase[i]->phase[i+1] arrow (see `phaseOrderEdges`) showing the mission's
      phase sequence. Heavier, solid, `--good` green so it reads as the
@@ -463,6 +480,7 @@ function computeLayout(nodes){
   });
 
   var positions = {};
+  var boxes = {};
   var bandTop = 0;
   var phaseList = phases.length ? phases : [{id:"__none__", depth:0}];
   phaseList.forEach(function(phase){
@@ -495,9 +513,16 @@ function computeLayout(nodes){
       positions[phase.id] = {x: 0, y: bandTop + BAND_PAD};
     }
     var bandHeight = Math.max(160, maxColumnHeight + BAND_PAD * 2);
+    // (#1594) The phase's CONTAINER box. No new geometry: the band is how
+    // tasks were already being laid out — one horizontal band per phase —
+    // this just stops discarding the rectangle that was implicitly there.
+    if (phase.id !== "__none__") {
+      var lastX = PHASE_LABEL_W + COL_W + maxDepth * (COL_W + COL_GAP);
+      boxes[phase.id] = { x: 0, y: bandTop, w: lastX + COL_W + BAND_PAD, h: bandHeight };
+    }
     bandTop += bandHeight + BAND_GAP;
   });
-  return positions;
+  return {positions: positions, boxes: boxes};
 }
 
 // ─── node component ─────────────────────────────────────────────────────
@@ -627,10 +652,30 @@ function MissionNode(props){
     h(V.Handle, {type:"source", id:"lr-out", position: V.Position.Right, style:{opacity:0}})
   );
 }
-var nodeTypes = { missionNode: MissionNode };
+// (#1594) The phase container. Deliberately quiet: hairline border, a fill
+// barely off the canvas, label in the top-left gutter. It must read as GROUND
+// the tasks sit on — the old phase node was the same size and weight as a
+// task, which is much of why it looked like a sibling rather than a parent.
+//
+// It carries the SAME `phase-in`/`phase-out` handle pair `MissionNode` gives a
+// phase, because `phaseOrderEdges` still draws phase[i] -> phase[i+1] and
+// those edges bind to those handle ids. Dropping them (as the first prototype
+// did) silently deleted every ordering arrow on a multi-phase mission —
+// stacked containers imply sequence, but "imply" is not "state", and a
+// mission whose phases run in a definite order should say so.
+function PhaseGroup(props){
+  var d = props.data || {};
+  return h("div", {className: "phasegroup s-" + (d.status || "planned"), title: d.description || ""},
+    h(V.Handle, {key:"pin", type:"target", id:"phase-in", position: V.Position.Top, style:{opacity:0}}),
+    h(V.Handle, {key:"pout", type:"source", id:"phase-out", position: V.Position.Bottom, style:{opacity:0}}),
+    h("div", {className: "pg-label"},
+      h("span", {className: "pg-kind"}, "PHASE"),
+      h("span", {className: "pg-name"}, d.label || "")));
+}
+var nodeTypes = { missionNode: MissionNode, phaseGroup: PhaseGroup };
 
 // ─── graph.json -> React Flow shape ─────────────────────────────────────
-function toRfNodes(graphNodes, positions, metrics, now){
+function toRfNodes(graphNodes, positions, metrics, now, boxes){
   metrics = metrics || {};
   return graphNodes.map(function(n){
     var pos = positions[n.id] || {x:0, y:0};
@@ -641,10 +686,30 @@ function toRfNodes(graphNodes, positions, metrics, now){
     var steps = (n.steps || []).map(function(s){
       return Object.assign({}, s, { _meter: stepMeterFor(s, metrics, now) });
     });
+    // (#1594) A phase is a CONTAINER, not a sibling card. Rendering
+    // containment as an EDGE was the defect: a `contains` relationship drawn
+    // as a horizontal line between two equal-weight boxes reads as flow, and
+    // it scaled badly — on the review pipeline it was 11 faint dashed lines
+    // radiating across the whole canvas to convey one fact that enclosure
+    // conveys for free. `zIndex: 0` keeps it behind its own tasks.
+    if (n.kind === "phase") {
+      var box = (boxes || {})[n.id] || {x: pos.x, y: pos.y, w: 320, h: 160};
+      return {
+        id: n.id,
+        type: "phaseGroup",
+        position: {x: box.x, y: box.y},
+        style: {width: box.w, height: box.h},
+        data: { label: n.label, kind: n.kind, status: n.status, description: n.description },
+        draggable: false,
+        selectable: false,
+        zIndex: 0,
+      };
+    }
     return {
       id: n.id,
       type: "missionNode",
       position: pos,
+      zIndex: 1,
       // (#1398) `description` carries the FULL phase/task description text
       // (never the short `label`) into the node's `title` attribute — a
       // hover tooltip, so the long text (which for coder-phase doubles as
@@ -680,7 +745,11 @@ function phaseOrderEdges(nodes){
 }
 
 function toRfEdges(graphEdges, graphNodes){
-  var all = graphEdges.concat(phaseOrderEdges(graphNodes));
+  // (#1594) `contains` is drawn by ENCLOSURE now, so its edges are dropped
+  // here rather than at the server: the wire contract is unchanged, and a
+  // peer on an older/newer darkmux still renders correctly either way.
+  var all = graphEdges.filter(function(e){ return e.kind !== "contains"; })
+    .concat(phaseOrderEdges(graphNodes));
   return all.map(function(e){
     var isPhaseOrder = e.kind === "phase_order";
     return {
@@ -1080,7 +1149,22 @@ function initMinimap(){
     if (v === "1") return true;
     if (v === "0") return false;
   } catch(_e) {}
-  return !isNarrowViewport();
+  // (#1594) Default OFF at EVERY width, not just narrow ones (operator call).
+  // Two reasons, and the second is the load-bearing one:
+  //
+  // 1. It is an overview of a thing you have not looked at yet. On first
+  //    open it costs attention and repays none — the operator came to see
+  //    the graph, not a thumbnail of it. Tapping to reveal makes it
+  //    user-initiated instead of imposed.
+  // 2. It is BROKEN between 701px and ~1000px. `isNarrowViewport()` is
+  //    `<= 700`, matching the CSS breakpoint that caps the widget at
+  //    104x78 — but above that line the widget takes its ~940px intrinsic
+  //    width and overflows a tablet viewport, landing top-left over the
+  //    canvas instead of bottom-right. So the old default showed it exactly
+  //    where it renders worst. (Pre-existing; verified identical on `main`.
+  //    Defaulting off stops shipping the broken state to every tablet
+  //    visitor, but it is a mitigation — the width bug is filed separately.)
+  return false;
 }
 // (#1404/#1432) THE renderer decision, in one place: the timeline renders
 // when manually selected, or in "auto" below the breakpoint. Both the
@@ -1248,10 +1332,11 @@ function App(){
   // is our own clock so "recent?" never depends on host/client clock skew.
   var _proc = React.useState(null);
   var proc = _proc[0], setProc = _proc[1];
-  // (#1482) Minimap visibility — persisted; default HIDDEN on a narrow
-  // viewport where the canvas real estate is scarce, shown on desktop.
+  // (#1482/#1594) Minimap visibility — persisted; default HIDDEN at every
+  // width (see `initMinimap`).
   var _mm = React.useState(initMinimap());
   var minimapOn = _mm[0], setMinimapOn = _mm[1];
+
   // (#1401/#1403) One index ref carrying every lookup the SSE handler needs:
   // node ids (a record whose `handle` names a phase/task node), step->task
   // mapping (a step-lifecycle record's `handle` is a STEP id, rendered as a
@@ -1599,8 +1684,8 @@ function App(){
   if (useTimeline) {
     body = h("div", {className:"timeline"}, renderMissionTimeline(g, metrics, expanded, toggleTask, now));
   } else {
-    var positions = computeLayout(g.nodes);
-    var rfNodes = toRfNodes(g.nodes, positions, metrics, now);
+    var layout = computeLayout(g.nodes);
+    var rfNodes = toRfNodes(g.nodes, layout.positions, metrics, now, layout.boxes);
     var rfEdges = toRfEdges(g.edges, g.nodes);
     body = h("div", {className:"canvas"},
       g.note ? h("div", {className:"note"}, g.note) : null,
