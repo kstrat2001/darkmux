@@ -1489,6 +1489,53 @@ fn coder_phase_gate_outcome(
         return Ok(2);
     }
 
+    // An UNREADABLE review is not a clean review. `parse_signoff` yields
+    // `indeterminate` when the dispatch text carried NO recognizable
+    // severity markers AND no explicit clean marker — an empty/truncated
+    // local-model response, or a marker style the parser doesn't know. That
+    // outcome has been observed in production once already (#66's dogfood,
+    // documented at its parse site), and before this arm it fell straight
+    // through to the same "✓ ready for sign-off" + exit 0 as a genuinely
+    // clean review, because the gate checked only `block > 0`. A broken QA
+    // response must never read as a green check (#1113's contract, applied
+    // to the coder gate) — so it takes the SAME exit-3 posture as a failed
+    // QA dispatch: gate holds, manual review required.
+    if review.verdict == "indeterminate" {
+        println!(
+            "\n{}",
+            style::warn(
+                "⚠ QA response was unreadable — no severity markers and no clean marker. \
+                 The review may not have engaged with the format (empty/truncated reply, \
+                 or an unrecognized marker style). This is NOT a pass."
+            )
+        );
+        println!("  {}", style::dim("inspect the review output above, then either:"));
+        println!(
+            "  {} darkmux mission launch review --param worktree={} --param diff_file=<diff>",
+            style::dim("→ re-run QA: "),
+            handles.workdir.display()
+        );
+        println!(
+            "  {} darkmux mission finalize {mission_id}",
+            style::dim("→ or adjudicate manually and finalize: ")
+        );
+        coder_phase::emit_step_result(
+            flow::Level::Warn,
+            "mission.verify",
+            &verify_step_id,
+            mission_id,
+            phase_id,
+            session_id,
+            serde_json::json!({
+                "verdict": review.verdict,
+                "blockers": 0,
+                "flags": review.by_severity.flag,
+                "total_tokens": tokens_total,
+            }),
+        );
+        return Ok(3);
+    }
+
     println!(
         "\n{}",
         style::success(&format!(
@@ -2367,6 +2414,41 @@ mod tests {
         let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps, &registry).unwrap();
         assert_eq!(exit, 3, "QA-unavailable must exit 3, mirroring `mission run`"); // drift-guard:allow mission run — test names the retired verb whose exit code this preserves (#1469)
         assert_eq!(phase_status_on_disk("gate-test-mission", phase_id), PhaseStatus::Running);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gate_outcome_indeterminate_verdict_exit_3_never_reads_as_a_pass() {
+        // (#swarm-4) An UNREADABLE review — `parse_signoff` yields
+        // `indeterminate` when the dispatch text carried no severity
+        // markers and no clean marker (empty/truncated reply, or a marker
+        // style the parser doesn't know; observed in production during
+        // #66's dogfood). Before this arm the gate checked only
+        // `block > 0`, so this fell through to the SAME "✓ ready for
+        // sign-off" + exit 0 as a genuinely clean review — the operator
+        // shipped code that was never actually reviewed. It must take the
+        // exit-3 "manual review required" posture, with the phase left
+        // Running so the operator's next move (re-run QA or adjudicate)
+        // stays open.
+        let _guard = LaunchTestGuard::new();
+        let phase_id = "gate-test-mission-build";
+        seed_running_instance("gate-test-mission", phase_id);
+        let (handles, steps) =
+            scripted_gate_fixture(phase_id, NodeStatus::Complete, NodeStatus::Complete, NodeStatus::Complete);
+        *handles.verify_slot.lock().unwrap() = Some(Ok(review_output(0, 0, "indeterminate")));
+
+        let registry = crew::step_kinds::StepKindRegistry::new();
+        let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps, &registry).unwrap();
+        assert_eq!(exit, 3, "an unreadable QA response must exit 3 (manual review), never 0");
+        assert!(
+            !gate_outcome_reached_no_gate(&Ok(3)),
+            "the gate HOLDS on indeterminate — same posture as QA-unavailable"
+        );
+        assert_eq!(
+            phase_status_on_disk("gate-test-mission", phase_id),
+            PhaseStatus::Running,
+            "phase stays Running — the operator re-runs QA or adjudicates manually"
+        );
     }
 
     #[test]
