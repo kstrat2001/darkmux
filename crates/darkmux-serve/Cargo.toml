@@ -23,7 +23,7 @@ darkmux-doctor = { path = "../darkmux-doctor" }
 darkmux-lab = { path = "../darkmux-lab" }
 anyhow = "1.0"
 axum = "0.7"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util", "process", "time"] }
 tokio-stream = "0.1"
 futures = "0.3"
 tower-http = { version = "0.5", features = ["cors", "timeout"] }

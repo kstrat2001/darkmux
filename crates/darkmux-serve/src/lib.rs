@@ -41,6 +41,7 @@ pub mod mission_graph;
 /// its own unit-test surface; see the module's own doc for the full
 /// design. Private (unlike `mission_graph`, which the binary crate also
 /// pins against) — `runs_handler` below is this module's only caller.
+mod panel;
 mod runs;
 
 /// (#925) Per-route request timeout for the NON-streaming routes. Bounds a
@@ -66,6 +67,8 @@ pub(crate) struct AppState {
     /// gates new streams on `MAX_CONCURRENT_SSE` and an `SseSlot` guard
     /// decrements this on disconnect.
     sse_open: Arc<AtomicUsize>,
+    /// (#1569 packet B) Panel cache + single-flight locks — see `panel.rs`.
+    panels: panel::PanelState,
     /// (#1585, was #1247 Part 3) The lab-run scan root — `--lab-dir` >
     /// `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/runs`.
     ///
@@ -340,6 +343,7 @@ pub(crate) fn build_router_full(
         worktrees_base,
         sse_open: Arc::new(AtomicUsize::new(0)),
         lab_dir,
+        panels: panel::PanelState::default(),
     };
     let auth_on = darkmux_flow::serve_token_present();
 
@@ -364,6 +368,7 @@ pub(crate) fn build_router_full(
         .route("/machine/resources", get(machine_resources_handler))
         .route("/missions", get(missions_handler))
         .route("/runs", get(runs_handler))
+        .route("/panel/:id", get(panel::panel_handler))
         .route("/phases", get(phases_handler))
         .route("/mission/:id/graph", get(mission_graph_html))
         .route("/mission/:id/graph.json", get(mission_graph_json_handler))
