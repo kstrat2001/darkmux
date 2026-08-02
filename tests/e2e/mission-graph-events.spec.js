@@ -4,13 +4,23 @@
 // `onMessage` handler, which tails the flow stream from NOW — so a page refresh
 // showed "no events for this mission yet" until a new record streamed, even for
 // a mission with a rich history. The fix adds a one-shot backfill on load that
-// fetches the day's records from `/flow/<date>`, filters them through the SAME
+// fetches the mission's records, filters them through the SAME
 // `recordInMission` predicate the live path uses, and seeds the panel — deduped
 // against any live rows that arrived in the race window.
 //
+// (#1569 sweep) That backfill originally fetched `/flow/<today>`, which fixed
+// the refresh case and left a bigger one: a day file can only ever hold records
+// written THAT DAY, while a mission's records live on the day(s) it RAN. So
+// every mission older than the current UTC day still showed "no events" — the
+// exact symptom this backfill exists to prevent, for most missions. It now
+// fetches `/flow-mission/<id>`, which stitches a mission across every day it
+// touched (the same endpoint the viewer's catalog replay path uses). These
+// tests mock THAT endpoint; changing them back to a date-scoped URL IS the
+// regression.
+//
 // The mission-graph lens is a SEPARATE asset from viewer.html (its own vendored
 // React Flow bundle), so this spec route-mocks the page's three same-origin data
-// sources (graph.json snapshot, /flow/<date> backfill, the SSE stream) and
+// sources (graph.json snapshot, /flow-mission/<id> backfill, the SSE stream) and
 // fulfills the `/mission/<id>/graph` route with the served HTML shell so
 // `missionIdFromPath()` sees the real path. The /vendor/* bundle falls through
 // to the static server (see playwright.config.js's mission-graph harness).
@@ -22,8 +32,9 @@ const MISSION_ID = 'test-mission';
 const GRAPH_PATH = `**/mission/${MISSION_ID}/graph`;
 // The date the page fetches — todayUtc() === new Date().toISOString().slice(0,10).
 const TODAY = new Date().toISOString().slice(0, 10);
-// Match `/flow/<date>` (backfill) but NOT `/flow/<date>/stream` (live SSE).
-const BACKFILL_RE = /\/flow\/\d{4}-\d{2}-\d{2}(\?.*)?$/;
+// The MISSION-scoped backfill (#1569 sweep), not a day file. A distinct URL
+// space from the stream below, so no negative lookahead is needed.
+const BACKFILL_RE = /\/flow-mission\/[^/?]+(\?.*)?$/;
 const STREAM_RE = /\/flow\/\d{4}-\d{2}-\d{2}\/stream(\?.*)?$/;
 
 const MISSION_GRAPH_HTML = fs.readFileSync(
@@ -96,6 +107,41 @@ test('EVENTS panel backfills existing mission records on load (not live-stream-o
   // The unrelated record was filtered out by `recordInMission`.
   await expect(page.locator('.evpanel .evrow .evh', { hasText: 'not-in-this-mission' })).toHaveCount(0);
 
+  expect(pageErrors).toEqual([]);
+});
+
+test('records from a PRIOR day still backfill — the cross-day case (#1569 sweep)', async ({ page }) => {
+  // The property the day-scoped backfill could not have: a mission that ran
+  // BEFORE today. `/flow/<today>` can only ever contain records written today,
+  // so every finished mission showed "no events" — which is most of them, and
+  // exactly the symptom the backfill was added to prevent. The records here are
+  // deliberately dated days back; if they render, the fetch was mission-scoped.
+  const pageErrors = [];
+  page.on('pageerror', (e) => pageErrors.push(String(e)));
+  await routeShellAndGraph(page);
+
+  const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+  await page.route(BACKFILL_RE, (r) =>
+    r.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        records: [
+          { ts: `${daysAgo(3)}T10:00:00Z`, action: 'step start', handle: 'step-1', category: 'work', level: 'info' },
+          { ts: `${daysAgo(2)}T11:30:00Z`, action: 'mission start', handle: 'm', mission_id: MISSION_ID, category: 'work', level: 'info' },
+        ],
+      }),
+    })
+  );
+  await page.route(STREAM_RE, (r) => r.fulfill({ contentType: 'text/event-stream', body: '' }));
+
+  await page.goto(`/mission/${MISSION_ID}/graph`);
+
+  // Both old records render, and the empty-state message is gone.
+  await expect(page.locator('.evpanel .evrow')).toHaveCount(2);
+  await expect(page.locator('.evpanel')).not.toContainText('no events');
+  // Also proves the `{records: [...]}` envelope is unwrapped — /flow-mission
+  // returns an object, while the day file returned a bare array.
+  await expect(page.locator('.evpanel .evrow .evh', { hasText: /^step-1$/ })).toHaveCount(1);
   expect(pageErrors).toEqual([]);
 });
 
