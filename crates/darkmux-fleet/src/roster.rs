@@ -364,11 +364,28 @@ pub(crate) fn parse_address(address: &str) -> Result<std::net::SocketAddr> {
     if trimmed.is_empty() {
         return Err(anyhow!("empty address"));
     }
-    // First try as-is (covers `host:port` and `ip:port`).
+    // (#swarm-7) A bare IP literal — v4 OR v6 — gets the default port
+    // directly, before any DNS machinery. This is what fixes bare
+    // compressed IPv6: `fd7a::1234` CONTAINS `:`, so the no-colon
+    // append-default-port fallback below never fired for it, and the as-is
+    // resolution can't read it as `host:port` — every tailnet/loopback
+    // peer registered by its bare v6 address was permanently "unreachable"
+    // in `machine list`. (Bonus: bare v4 now skips the DNS-resolver thread
+    // it never needed.) A bracketed literal without a port (`[fd7a::1234]`)
+    // is normalized the same way — brackets are v6's port-delimiter
+    // syntax, meaningless without one.
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, DEFAULT_DAEMON_PORT));
+    }
+    // Try as-is (covers `host:port`, `ip:port`, and `[v6]:port`).
     if let Some(a) = resolve_with_timeout(trimmed)? {
         return Ok(a);
     }
-    // Fall back to default port if no `:` in the string.
+    // Fall back to default port if no `:` in the string (DNS names).
     if !trimmed.contains(':') {
         let with_port = format!("{trimmed}:{DEFAULT_DAEMON_PORT}");
         if let Some(a) = resolve_with_timeout(&with_port)? {
@@ -456,4 +473,55 @@ pub struct ReachabilityResult {
     pub resolved_address: String,
     pub elapsed_ms: u64,
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod parse_address_tests {
+    use super::*;
+
+    /// (#swarm-7) Bare compressed IPv6 — the case that never resolved. It
+    /// CONTAINS `:`, so the append-default-port fallback was skipped, and
+    /// the as-is resolution can't read it as `host:port`: every peer
+    /// registered by its bare v6 tailnet/loopback address showed as
+    /// permanently unreachable in `machine list`. All IP-literal forms are
+    /// pure (the bare-IP branch returns before any DNS), so these tests
+    /// touch no resolver.
+    #[test]
+    fn bare_ipv6_gets_the_default_port() {
+        let a = parse_address("fd7a:115c:a1e0::1234").unwrap();
+        assert_eq!(a.ip().to_string(), "fd7a:115c:a1e0::1234");
+        assert_eq!(a.port(), DEFAULT_DAEMON_PORT);
+        // Loopback shorthand — the most compressed form of all.
+        let l = parse_address("::1").unwrap();
+        assert_eq!(l.port(), DEFAULT_DAEMON_PORT);
+    }
+
+    #[test]
+    fn bracketed_ipv6_without_port_is_normalized() {
+        // Brackets are v6's port-delimiter syntax; without a port they are
+        // noise, not an error.
+        let a = parse_address("[fd7a:115c:a1e0::1234]").unwrap();
+        assert_eq!(a.port(), DEFAULT_DAEMON_PORT);
+    }
+
+    #[test]
+    fn bracketed_ipv6_with_port_keeps_its_port() {
+        let a = parse_address("[fd7a:115c:a1e0::1234]:9999").unwrap();
+        assert_eq!(a.port(), 9999);
+    }
+
+    #[test]
+    fn bare_ipv4_and_ipv4_with_port_still_work() {
+        // Bare v4 previously resolved through the DNS thread; the bare-IP
+        // branch answers it directly now. Same result, no resolver.
+        let a = parse_address("100.74.208.36").unwrap();
+        assert_eq!(a.port(), DEFAULT_DAEMON_PORT);
+        let b = parse_address("100.74.208.36:8765").unwrap();
+        assert_eq!(b.port(), 8765);
+    }
+
+    #[test]
+    fn empty_address_errors() {
+        assert!(parse_address("  ").is_err());
+    }
 }
