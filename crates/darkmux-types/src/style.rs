@@ -127,6 +127,37 @@ pub fn header(s: &str) -> String { colorize("1;36", s) }
 #[must_use]
 pub fn bold(s: &str) -> String { colorize("1", s) }
 
+/// Render `text` as an OSC 8 terminal hyperlink to `url` (#1569 packet A).
+///
+/// Gated on the same [`colorize_enabled`] check the color helpers use, for
+/// the same reason: when output is piped, redirected, or headed for `--json`,
+/// it must stay byte-clean. A terminal that doesn't understand OSC 8 ignores
+/// the escape and shows `text` — but a `grep` or a JSON parser does NOT, so
+/// "harmless to terminals" is not the same as "safe to always emit".
+///
+/// **`url` is not escaped or validated here.** OSC 8 terminates its URL on
+/// `ST` (`ESC \`) or `BEL`, so a control character in `url` would break out
+/// of the escape and corrupt the line. Every caller today builds its URL from
+/// a resolved daemon base plus a percent-encoded id, never from raw operator
+/// text; a future caller taking arbitrary input must encode before calling.
+/// Control bytes are stripped defensively below rather than trusted, because
+/// the failure is silent line corruption rather than a visible error.
+///
+/// Terminal support: iTerm2, WezTerm, Kitty, VS Code's terminal, GNOME
+/// Terminal. Terminal.app has none and degrades to plain `text`.
+#[must_use]
+pub fn link(url: &str, text: &str) -> String {
+    if !colorize_enabled() {
+        return text.to_string();
+    }
+    // Strip C0 controls + DEL. `ESC` and `BEL` would terminate the escape
+    // early; the rest can't appear in a valid URL and have no business in
+    // one. Cheap, and it makes the corruption unreachable rather than
+    // merely unlikely.
+    let safe: String = url.chars().filter(|c| !c.is_control()).collect();
+    format!("\x1b]8;;{safe}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
 /// Internal helper: wrap `s` in the given ANSI code when coloring is enabled.
 fn colorize(code: &str, s: &str) -> String {
     if colorize_enabled() {
@@ -159,7 +190,56 @@ mod tests {
         assert_eq!(success("ok"), "ok");
         assert_eq!(warn("ok"), "ok");
 
+        // (#1569 packet A) A hyperlink is styling, not content — piped or
+        // redirected output must stay byte-clean. "Terminals that don't
+        // understand OSC 8 ignore it" is NOT sufficient: `grep`, `jq`, and a
+        // golden-file diff all see the bytes.
+        assert_eq!(link("http://127.0.0.1:8765/", "m1"), "m1");
+        assert!(!link("http://x/", "m1").contains('\x1b'));
+
         set_colorize_override(None); // restore
+    }
+
+    /// (#1569 packet A) The exact OSC 8 byte sequence, frozen. Contract-6
+    /// shape: "frozen means one hash, not one intention" — a renderer whose
+    /// output a viewer will parse cannot drift silently.
+    ///
+    /// `ESC ] 8 ; ; <url> ESC \  <text>  ESC ] 8 ; ; ESC \`
+    /// The empty `;;` is the (unused) params slot; `ESC \` is ST.
+    #[serial_test::serial]
+    #[test]
+    fn link_emits_the_exact_osc8_sequence() {
+        set_colorize_override(Some(true));
+
+        assert_eq!(
+            link("http://127.0.0.1:8765/mission/m1/graph", "◆ m1"),
+            "\x1b]8;;http://127.0.0.1:8765/mission/m1/graph\x1b\\◆ m1\x1b]8;;\x1b\\"
+        );
+
+        set_colorize_override(None);
+    }
+
+    /// A control byte in the URL would terminate the escape early and corrupt
+    /// the rest of the line — silently, since the terminal would render the
+    /// tail as text. Stripped rather than trusted: callers build URLs from a
+    /// resolved base today, but "no caller does that yet" is not a guarantee.
+    #[serial_test::serial]
+    #[test]
+    fn link_strips_control_bytes_that_would_break_out_of_the_escape() {
+        set_colorize_override(Some(true));
+
+        let out = link("http://x/\x1b\\evil\x07more\n", "t");
+        // Exactly two STs: the URL terminator and the closing sequence. An
+        // injected ESC/BEL would add more and split the escape.
+        assert_eq!(out.matches("\x1b\\").count(), 2, "{out:?}");
+        assert!(!out.contains('\x07'), "BEL also terminates OSC 8: {out:?}");
+        assert!(!out.contains('\n'), "{out:?}");
+        // The literal `\` survives, and should: it is not a control byte and
+        // cannot terminate the escape on its own. This helper prevents escape
+        // BREAKOUT; it does not validate URLs — see its doc comment.
+        assert!(out.contains("http://x/\\evilmore"), "{out:?}");
+
+        set_colorize_override(None);
     }
 
     /// When override is ON, helpers DO wrap with the expected ANSI codes.
