@@ -460,6 +460,32 @@ impl MissionConfig {
                     }
                 }
 
+                // (#swarm-5) A NON-expanding task with zero steps is a
+                // graph the scheduler can never finish: a task's status
+                // derives from its steps, so with none it can never reach
+                // Complete — it wedges Planned forever, every downstream
+                // `depends_on` never unblocks, and the mission sits
+                // permanently stuck with nothing erroring. That is a
+                // composition mistake, and this is exactly the load-time/
+                // doctor surface composition mistakes are supposed to fail
+                // loudly at (contract 7: lenient on READ, loud at
+                // validate) — not a runtime hang the operator diagnoses
+                // from a frozen graph lens. An EXPANDING task is exempt:
+                // its steps materialize per-item at interpret time, and its
+                // own arm below enforces exactly-one template step.
+                if task.expand.is_none() && task.steps.is_empty() {
+                    findings.push(ValidationFinding {
+                        severity: FindingSeverity::Error,
+                        path: format!("{task_path}.steps"),
+                        message: format!(
+                            "task \"{}\" has no steps and no `expand` — the scheduler can \
+                             never complete it, so it would wedge the mission graph forever \
+                             (every task derives completion from its steps)",
+                            task.id
+                        ),
+                    });
+                }
+
                 // (#1284 review round 2, consider 5) `expand` template
                 // integrity — these mirror `interpret`'s own loud-error
                 // guards so the problems surface at doctor/validate time,
@@ -803,6 +829,46 @@ mod tests {
             message: "test message".to_string(),
         };
         assert_eq!(f.to_string(), "[warning] phases[0].id: test message");
+    }
+
+    /// (#swarm-5) A non-expanding task with zero steps can never reach
+    /// Complete (a task derives completion from its steps), so it wedges
+    /// the mission graph forever with nothing erroring. That is a
+    /// composition mistake and must fail HERE — at validate/doctor time —
+    /// not surface as a frozen graph lens mid-run.
+    #[test]
+    fn zero_step_non_expanding_task_is_an_error() {
+        let cfg = doc(vec![phase("p1", vec![task("hollow", &[], vec![])])]);
+        let findings = cfg.validate(&[]);
+        assert!(
+            findings.iter().any(|f| f.severity == FindingSeverity::Error
+                && f.path.ends_with(".steps")
+                && f.message.contains("hollow")),
+            "expected a zero-steps error, got {findings:?}"
+        );
+
+        // The same shape WITH a step stays clean — the error is about
+        // emptiness, not about this task's other properties.
+        let ok = doc(vec![phase("p1", vec![task("solid", &[], vec![step("s1", "dispatch.internal")])])]);
+        assert!(
+            !ok.validate(&[]).iter().any(|f| f.severity == FindingSeverity::Error),
+            "a one-step task must not trip the zero-step error"
+        );
+
+        // An EXPANDING task is exempt: its steps materialize per-item at
+        // interpret time (and its own arm enforces exactly-one template
+        // step) — the zero-step rule must not fire on it.
+        let expanding = doc(vec![phase(
+            "p1",
+            vec![expanding_task_with("bundles", "t-{index}", "s-{index}", vec![step("s1", "dispatch.map")])],
+        )]);
+        assert!(
+            !expanding
+                .validate(&[])
+                .iter()
+                .any(|f| f.severity == FindingSeverity::Error && f.message.contains("no steps")),
+            "an expanding task must never trip the zero-step error"
+        );
     }
 
     // ── (#1284 review round 2, consider 5) ExpansionSpec validation ────
