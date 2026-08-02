@@ -357,11 +357,19 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
     let width = style::terminal_width();
     // (#1569 packet A) Resolved ONCE per board, not per row: on a hub/peer
     // this may spawn `tailscale serve status --json`, and doing that 82 times
-    // for an 82-mission board would be absurd. Returns loopback without
-    // spawning anything when output isn't a TTY (no links are emitted then)
-    // or when the machine declares itself standalone.
+    // for an 82-mission board would be absurd. It short-circuits to loopback
+    // without spawning when the machine declares itself standalone, or when
+    // no links will be emitted at all.
+    //
+    // NB the old "isn't a TTY" spelling of that second case stopped being
+    // true in B1: a panel spawn is a pipe but sets CLICOLOR_FORCE, so it DOES
+    // resolve — bounded by the daemon's own panel cache.
     let link_base = darkmux_doctor::viewer_link_base(8765);
     let all_link = panel_deep_link(&link_base, "mission-status-all");
+    // The link is one affordance for the whole board, not one per section:
+    // it goes to the same place from every group, and Active + Paused +
+    // Finalized all overflowing would otherwise stack three identical rows.
+    let mut all_link_shown = false;
     if views.is_empty() {
         // (#1582) The prose wraps; the command does not. Same rule the drift
         // suggestions follow, for the same reason — this is the one command a
@@ -490,7 +498,10 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
                 }
             }
             if let Some(url) = &all_link {
-                println!("  {}", style::link(url, "→ show every mission"));
+                if !all_link_shown {
+                    all_link_shown = true;
+                    println!("  {}", style::link(url, "→ show every mission"));
+                }
             }
         }
     }
