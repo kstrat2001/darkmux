@@ -2440,7 +2440,12 @@ function renderCrumb(){
     return;
   }
   if(inConsole){
-    $("crumb").innerHTML = esc((state.panelId||"mission-status").replace(/-/g," "));
+    // The picker's own label, not the id with its dashes rubbed out: those
+    // agree for `mission-status` and diverge the moment an id carries a flag
+    // ("mission status all" vs "all missions"). One name per panel.
+    var pid = state.panelId || "mission-status";
+    var pmeta = PANELS.find(function(p){ return p.id === pid; });
+    $("crumb").innerHTML = esc(pmeta ? pmeta.label : pid.replace(/-/g," "));
     return;
   }
   if(inMissions){
@@ -3993,6 +3998,25 @@ function panelHref(raw){
   return u.href;
 }
 
+// An OSC 8 target that means "switch to another panel" rather than "leave
+// this page": a same-origin `#lens=console&panel=<id>` whose id is one this
+// build actually has. Returns the id, or null for every other link.
+//
+// The verb emits these (see `panel_deep_link` in src/mission_status.rs) so a
+// hint like "`--all` for every mission" stays actionable in a surface with no
+// prompt to type it at. Routing on the URL's OWN parameters is the reason
+// this is not twin drift: the viewer never reads the hint's prose, and an id
+// this build does not have simply falls through to a plain link.
+function panelSwitchId(href){
+  var u;
+  try { u = new URL(href, window.location.href); } catch(_e){ return null; }
+  if (u.origin !== window.location.origin) return null;
+  var h = new URLSearchParams((u.hash || "").replace(/^#/, ""));
+  if (h.get("lens") !== "console") return null;
+  var id = h.get("panel");
+  return (id && PANELS.some(function(p){ return p.id === id; })) ? id : null;
+}
+
 // Parse `text` into HTML. Returns a string built exclusively from escaped
 // segments and a fixed tag vocabulary (`span`/`a`).
 function renderAnsi(text){
@@ -4006,7 +4030,16 @@ function renderAnsi(text){
     if (!buf) return;
     var html = esc(buf);
     if (classes.length) html = '<span class="' + classes.join(" ") + '">' + html + "</span>";
-    if (link) html = '<a href="' + esc(link) + '" class="a-link">' + html + "</a>";
+    if (link) {
+      // A panel deep link switches IN PAGE — following it would reload the
+      // viewer to land one tab away from where it already is. The href is
+      // kept real so copy-link and middle-click still behave.
+      var sw = panelSwitchId(link);
+      var attrs = sw
+        ? ' class="a-link" onclick="setPanel(\'' + esc(sw) + '\');return false"'
+        : ' class="a-link"';
+      html = '<a href="' + esc(link) + '"' + attrs + ">" + html + "</a>";
+    }
     out.push(html);
     buf = "";
   }
@@ -4083,6 +4116,7 @@ const MANUAL_PANELS = new Set(["doctor"]);
 
 const PANELS = [
   {id:"mission-status",   label:"mission status"},
+  {id:"mission-status-all", label:"all missions"},
   {id:"machine-status",   label:"machine"},
   {id:"flow-status",      label:"flow"},
   {id:"role-list",        label:"roles"},
