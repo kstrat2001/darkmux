@@ -2409,39 +2409,55 @@ function renderCrumb(){
   // (#1247 deep-link) Every navigation path lands here, so this is the ONE
   // place the address bar is kept in sync with the runs/machine view.
   syncLabHash(inRuns, inMachine);
+  // (#1569 B2, operator nit) ONE crumb rule: show only what is BELOW the
+  // current tab, never the tab's own name. The tab is already named and
+  // highlighted a few pixels above — repeating it as a bright link is noise
+  // that also reads as navigation to somewhere you already are.
+  //
+  // It used to be four branches with three conventions: `machine` led with
+  // `fleet ›` (a DIFFERENT tab's name), `console` and `runs` each led with
+  // their own, and the fleet lens led with `◆ mission › fleet`. Hence the
+  // "only some tabs show it" inconsistency — there was no rule to be
+  // inconsistent with.
+  //
+  // Up-navigation is unaffected: the lens tabs themselves are the up-nav,
+  // and every within-lens hop (machine, mission) is still a link here.
+  const crumb = (parts) =>
+    parts.filter(Boolean).join(`<span class="sep">›</span>`);
+
   if(inMachine){
-    $("crumb").innerHTML=`<a data-act="fleet">fleet</a><span class="sep">›</span>${state.machine!=null?escN(state.machine):"this machine"}`;
+    $("crumb").innerHTML = state.machine!=null ? escN(state.machine) : "this machine";
     return;
   }
   if(inRuns){
-    let lc=`<a data-act="runs">runs</a>`;
-    if(state.level==="lab-run") lc+=`<span class="sep">›</span>${esc(state.labRunDir||"—")}`;
-    $("crumb").innerHTML=lc; return;
+    $("crumb").innerHTML = state.level==="lab-run" ? esc(state.labRunDir||"—") : "";
+    return;
   }
-  // Missions-lens crumb: the index, plus the static mission summary's id when
-  // a daemon-less context is showing one (#1403 gate remediation).
   if(inConsole){
-    $("crumb").innerHTML=`<a data-act="console">console</a><span class="sep">›</span>${esc((state.panelId||"mission-status").replace(/-/g," "))}`;
+    $("crumb").innerHTML = esc((state.panelId||"mission-status").replace(/-/g," "));
     return;
   }
   if(inMissions){
-    // (#1569 B2) The daemon-less static mission summary — a mission click
-    // in a context with no graph page to open. Its up-nav points at the
-    // console now, since that is where the mission board lives.
-    let mc=`<a data-act="console">console</a>`;
-    if(state.level==="mission") mc+=`<span class="sep">›</span>◆ ${esc(state.missionId||primaryMission()||"—")}`;
-    $("crumb").innerHTML=mc; return;
+    // The daemon-less static mission summary (#1403) — a mission click with
+    // no graph page to open. Only the mission id is below the tab.
+    $("crumb").innerHTML = state.level==="mission"
+      ? `◆ ${esc(state.missionId||primaryMission()||"—")}`
+      : "";
+    return;
   }
+  // Fleet lens. `◆ <mission>` stays: it is a shortcut to the running
+  // mission, not the name of the tab you are on.
   const pm=primaryMission();
-  const hasMission=pm!=null;
-  let c=hasMission?`<a class="misslink" data-act="mission">◆ ${esc(pm)}</a>`:``;
-  c+=(hasMission?`<span class="sep">›</span>`:``)+`<a data-act="fleet">fleet</a>`;
-  // (#1094) loose included so the crumb carries the machine link there too —
-  // it's the up-nav now that the back button is gone (loose drills from a
-  // machine). `machine` itself is handled in the early-return above.
-  if(state.level==="subsystem"||state.level==="loose") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`;
-  if(state.level==="subsystem") c+=`<span class="sep">›</span>${esc(state.session)}`;
-  $("crumb").innerHTML=c;
+  // (#1094) loose carries the machine link too — it is the up-nav within
+  // this lens now that the back button is gone.
+  const machineLink = (state.level==="subsystem"||state.level==="loose")
+    ? `<a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`
+    : "";
+  $("crumb").innerHTML = crumb([
+    pm!=null ? `<a class="misslink" data-act="mission">◆ ${esc(pm)}</a>` : "",
+    machineLink,
+    state.level==="subsystem" ? esc(state.session) : "",
+  ]);
 }
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||state.filters.act.size<FACTS.length||!!state.filters.q;}
 function updateFbtn(){const a=filtersActive();const b=$("fbtn");b.className="fbtn"+(a?" on":"");b.innerHTML=ICON.filter+(a?'<span class="fdot">•</span>':'');b.title=a?"filters (active)":"filters";b.setAttribute("aria-label",b.title);}
@@ -4194,8 +4210,13 @@ function renderConsole(){
       `<button class="pcbtn" data-act="refreshpanel"${st.loading?" disabled":""}>run</button>`;
   }
 
+  // No `stagehdr` here, deliberately (operator nit, same family as the
+  // crumb one): the tab is already named and highlighted, and the panel's
+  // own chrome line states exactly which command produced what you are
+  // looking at (`$ darkmux mission status · captured … · 12ms`). A header
+  // reading "console" between those two would be the third place the same
+  // word appears in one screen.
   $("stage").innerHTML =
-    `<div class="stagehdr">console</div>` +
     `<div class="runsbar">${tabs}</div>` +
     `<div class="panelwrap"><div class="panelchrome">${chrome}</div>${body}</div>`;
 }
