@@ -202,3 +202,70 @@ test('a panel deep link switches in page instead of navigating', async ({ page }
   expect(asked).toContain('mission-status-all');
   expect(page.url().split('#')[0]).toBe(before.split('#')[0]);
 });
+
+test('a manual panel stays unrun across leaving and re-entering the tab', async ({ page }) => {
+  // The guard on `setPanel` alone was not enough: selecting `doctor` returns
+  // BEFORE creating any state entry, so `goConsole`'s "no state yet -> load"
+  // re-entry path probed the machine unasked. The server's rate floor bounds
+  // a loop; it never stopped the first run. Doctor spawns lms + a GitHub API
+  // call + a Keychain read on the measured host, so an unasked run is the
+  // #1286 failure, not a performance nit.
+  const asked = [];
+  await routePanels(page, (route) => {
+    const id = new URL(route.request().url()).pathname.split('/').pop();
+    asked.push(id);
+    route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(panelBody(REAL_ANSI, { panel: id, auto_refresh: id !== 'doctor' })),
+    });
+  });
+
+  await page.goto('/index-lab.html');
+  await page.click('[data-act="console"]');
+  await expect(page.locator('.panelout')).toBeVisible();
+  await page.click('[data-act="setpanel"][data-arg="doctor"]');
+  await page.waitForTimeout(300);
+  expect(asked).not.toContain('doctor');
+
+  // Leave and come back — `doctor` is still the selected panel.
+  await page.click('[data-act="fleet"]');
+  await page.waitForTimeout(200);
+  await page.click('[data-act="console"]');
+  await page.waitForTimeout(600);
+  expect(asked).not.toContain('doctor');
+});
+
+test('a console deep link boots straight into that panel and stays addressable', async ({ page }) => {
+  // The CLI emits `#lens=console&panel=<id>` links, so they have to survive
+  // being treated as URLs — middle-click, copy-link, a phone long-press
+  // "open in new tab". Without a parser they worked on click and died
+  // everywhere else, which is the same dead end in a second modality.
+  await routePanels(page, (route) => {
+    const id = new URL(route.request().url()).pathname.split('/').pop();
+    route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(
+        panelBody('\x1b[2m  the whole board\x1b[0m\n', { panel: id, argv: ['mission', 'status', '--all'] })
+      ),
+    });
+  });
+
+  await page.goto('/index-lab.html#lens=console&panel=mission-status-all');
+  await expect(page.locator('.panelout')).toContainText('the whole board');
+  await expect(page.locator('[data-act="setpanel"][data-arg="mission-status-all"]')).toHaveClass(/\bon\b/);
+
+  // And the address bar still describes what is on screen, so what the
+  // operator copies out of it comes back to the same place.
+  expect(page.url()).toContain('lens=console');
+  expect(page.url()).toContain('panel=mission-status-all');
+});
+
+test('the console shows no crumb — the picker and the chrome line already say which panel', async ({ page }) => {
+  await routePanels(page, (route) =>
+    route.fulfill({ contentType: 'application/json', body: JSON.stringify(panelBody(REAL_ANSI)) })
+  );
+  await page.goto('/index-lab.html');
+  await page.click('[data-act="console"]');
+  await expect(page.locator('.panelout')).toBeVisible();
+  expect((await page.locator('#crumb').innerText()).trim()).toBe('');
+});

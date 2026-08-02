@@ -2414,7 +2414,7 @@ function renderCrumb(){
   document.body.classList.toggle("machine-mode", inMachine);
   // (#1247 deep-link) Every navigation path lands here, so this is the ONE
   // place the address bar is kept in sync with the runs/machine view.
-  syncLabHash(inRuns, inMachine);
+  syncLabHash(inRuns, inMachine, inConsole);
   // (#1569 B2, operator nit) ONE crumb rule: show only what is BELOW the
   // current tab, never the tab's own name. The tab is already named and
   // highlighted a few pixels above — repeating it as a bright link is noise
@@ -2440,12 +2440,13 @@ function renderCrumb(){
     return;
   }
   if(inConsole){
-    // The picker's own label, not the id with its dashes rubbed out: those
-    // agree for `mission-status` and diverge the moment an id carries a flag
-    // ("mission status all" vs "all missions"). One name per panel.
-    var pid = state.panelId || "mission-status";
-    var pmeta = PANELS.find(function(p){ return p.id === pid; });
-    $("crumb").innerHTML = esc(pmeta ? pmeta.label : pid.replace(/-/g," "));
+    // Nothing. The picker chip for the selected panel is highlighted a few
+    // pixels below, and the panel's own chrome line names the exact command
+    // ("$ darkmux mission status --all") — a crumb here is the third copy of
+    // one fact. Same operator rule that removed the tab-name crumb and the
+    // stage header: a label earns its pixels by saying something the
+    // surrounding context does not.
+    $("crumb").innerHTML = "";
     return;
   }
   if(inMissions){
@@ -2861,6 +2862,10 @@ document.addEventListener("click",e=>{
     if(panel && !panel.hidden && !e.target.closest("#catpanel")) panel.hidden=true;
   }
   if(!el)return;
+  // An anchor carrying [data-act] is an IN-PAGE action wearing a real href
+  // (kept real so copy-link and middle-click still work). Following it would
+  // reload the viewer to land where the action already put us.
+  if(el.matches("a[href]"))e.preventDefault();
   dispatchAct(el);
 });
 // (#1090) Keyboard activation. Enter or Space on a focused non-native [data-act]
@@ -3114,10 +3119,10 @@ function labQuery(){
 // (#1508) `inMachine` rides the same chokepoint: the unified machine page
 // writes `lens=machine` (no `run` param) so the phone view is bookmarkable
 // too — for both the local nav-tab visit and a remote fleet-card drill.
-function syncLabHash(inLab, inMachine){
+function syncLabHash(inLab, inMachine, inConsole){
   const raw=(location.hash||"").replace(/^#/,"");
   const isBareDate=/^\d{4}-\d{2}-\d{2}$/.test(raw);
-  if(!inLab&&!inMachine){
+  if(!inLab&&!inMachine&&!inConsole){
     // Outside the lab/machine lenses, only touch the hash when it carries
     // lens params to REMOVE — a bare-date or #mission=/#session= hash the
     // operator arrived with stays put (renderCrumb repaints every view; an
@@ -3132,7 +3137,14 @@ function syncLabHash(inLab, inMachine){
     return;
   }
   const p=isBareDate?new URLSearchParams():new URLSearchParams(raw);
-  if(inMachine){
+  if(inConsole){
+    // Addressable like every other lens: what the operator is looking at is
+    // what they copy out of the address bar. The phone dashboard is a
+    // first-class consumer of that (a bookmarked panel is the whole point).
+    p.set("lens","console");p.delete("run");p.delete("kind");
+    const pid=state.panelId||"mission-status";
+    if(pid==="mission-status")p.delete("panel"); else p.set("panel",pid);
+  }else if(inMachine){
     p.set("lens","machine");p.delete("run");
   }else{
     // (#1584) Always writes the CURRENT spelling — an operator who arrived on
@@ -3154,6 +3166,21 @@ function syncLabHash(inLab, inMachine){
 // as labQuery. `lens` is a single value, so lab/machine can't conflict; a
 // `#mission=`/`#session=` replay query alongside is contradictory and the
 // lens half is honored (same precedence rule as the lab lens).
+// (#1569 B2) `#lens=console&panel=<id>` — the console's deep link, parsed the
+// same way as the lab and machine lenses. This exists because the CLI EMITS
+// such links (see `panel_deep_link`): without a parser they worked on click
+// and died on middle-click, copy-link, or a phone long-press "open in new
+// tab" — recreating in a second modality the dead end this packet set out to
+// fix. Returns the panel id (validated against this build's PANELS) or "" for
+// the default; null when this is not a console link at all.
+function consoleQuery(){
+  const p=new URLSearchParams(location.search);
+  const h=new URLSearchParams((location.hash||"").replace(/^#/,""));
+  if((p.get("lens")||h.get("lens")||"").trim()!=="console") return null;
+  const id=(p.get("panel")||h.get("panel")||"").trim();
+  return PANELS.some(x=>x.id===id) ? id : "";
+}
+
 function machineQuery(){
   const p=new URLSearchParams(location.search);
   const h=new URLSearchParams((location.hash||"").replace(/^#/,""));
@@ -3585,9 +3612,12 @@ async function boot(){
   // (#1286 deep-link) `#lens=machine` — same separate-room precedence as the
   // lab lens (`lens` is single-valued, so lab and machine can't both match).
   const mq = machineQuery();
+  // (#1569 B2 deep-link) `#lens=console&panel=<id>` — same single-valued
+  // `lens` precedence as the lab/machine lenses, so these can never conflict.
+  const nq = consoleQuery();
   // (#691) Replay-by-query applies only against a daemon (the static demo has no
   // catalog endpoints). A mission/session query forces playback of that thing.
-  const cq = (flowSrc||lq||mq) ? null : catalogQuery();
+  const cq = (flowSrc||lq||mq||nq!=null) ? null : catalogQuery();
   let date=injectedDate||targetDate();
   // Playback mode is daemon-controlled (or static-flow-src driven): it forces
   // "play" regardless of whether the date happens to be today, and SSE is
@@ -3681,6 +3711,7 @@ async function boot(){
   if(lq){ state.runsKind=lq.kind||"all"; if(lq.run!=null) drillLabRun(lq.run); else goRuns(); }
   // (#1508 deep-link) Boot straight into the unified machine page (local).
   else if(mq){ goMachine(); }
+  else if(nq!=null){ if(nq) state.panelId=nq; goConsole(); }
 }
 // ── Lab observer lens (#1247 Part 3) ────────────────────────────────────
 //
@@ -3992,7 +4023,11 @@ function panelHref(raw){
   // A DIFFERENT origin that is nonetheless "this daemon by another name" —
   // the packet-A link scheme's loopback form, seen from a tailnet client.
   // Rewriting to relative is what makes one baked link work from both.
-  if (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1") {
+  // `hostname` brackets IPv6 (`[::1]`, per WHATWG) — matching the bare form
+  // was dead code, so an IPv6 daemon link stayed absolute and opened the
+  // PHONE's own loopback.
+  if (u.hostname === "127.0.0.1" || u.hostname === "localhost"
+      || u.hostname === "[::1]" || u.hostname === "::1") {
     return u.pathname + u.search + u.hash;
   }
   return u.href;
@@ -4035,10 +4070,16 @@ function renderAnsi(text){
       // viewer to land one tab away from where it already is. The href is
       // kept real so copy-link and middle-click still behave.
       var sw = panelSwitchId(link);
-      var attrs = sw
-        ? ' class="a-link" onclick="setPanel(\'' + esc(sw) + '\');return false"'
-        : ' class="a-link"';
-      html = '<a href="' + esc(link) + '"' + attrs + ">" + html + "</a>";
+      // Routed through the SAME delegated [data-act] path the picker chips
+      // use, rather than an inline onclick. The interpolation was safe — `sw`
+      // can only be one of the compile-time PANELS ids — but safe by an
+      // allowlist three functions away, and `esc()` is an HTML-entity
+      // escaper, which is the wrong tool for a JS string inside an attribute
+      // (the browser decodes entities before the JS lexer ever runs). This
+      // way the question does not arise, and the file keeps zero inline
+      // handlers.
+      var attrs = sw ? ' data-act="setpanel" data-arg="' + esc(sw) + '"' : '';
+      html = '<a href="' + esc(link) + '" class="a-link"' + attrs + ">" + html + "</a>";
     }
     out.push(html);
     buf = "";
@@ -4166,6 +4207,13 @@ window.goConsole = async () => {
   state.level = "console";
   render();
   const id = state.panelId || "mission-status";
+  // The manual-only guard has to live on EVERY path that can start a panel,
+  // not just the one that selects it. `setPanel("doctor")` returns before
+  // creating any PANEL_STATE entry — so leaving the tab and coming back hit
+  // `!PANEL_STATE[id]` and probed the machine unasked, which is the exact
+  // #1286 failure the guard exists to prevent. The server's rate floor bounds
+  // a LOOP; it does not stop the first unasked run.
+  if(MANUAL_PANELS.has(id)) return;
   if(!PANEL_STATE[id] || (!PANEL_STATE[id].body && !PANEL_STATE[id].loading)) await loadPanel(id);
 };
 window.setPanel = (id) => {
