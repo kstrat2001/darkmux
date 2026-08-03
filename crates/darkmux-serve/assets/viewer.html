@@ -2352,8 +2352,14 @@ function renderLog(){
   const qc=$("qcount");
   if(qc){
     const q=!!state.filters.q;
-    qc.textContent=q?(all.length?`${all.length} match${all.length===1?'':'es'}${all.length>50?' · newest 50':''}`:"no match"):"";
-    qc.classList.toggle("show",q);
+    // The "newest 50" note used to ride along with the match count, so it only
+    // appeared while FILTERING — the unfiltered log, which is the normal case,
+    // silently dropped everything past the newest 50.
+    const capped=all.length>50;
+    qc.textContent = q
+      ? (all.length?`${all.length} match${all.length===1?'':'es'}${capped?' · newest 50':''}`:"no match")
+      : (capped?`newest 50 of ${all.length}`:"");
+    qc.classList.toggle("show", q||capped);
     qc.classList.toggle("zero",q&&all.length===0);
   }
   $("logbody").innerHTML=recs.length?recs.map(r=>{
@@ -2916,6 +2922,9 @@ document.addEventListener("toggle",e=>{
 // summary. Selecting a day navigates to /play/<date>; "live" goes to /. Only
 // daemon-backed views get the button (the static demo has no /flow-days), so
 // this is gated in boot().
+// (#1569 sweep) Catalog mission cap — declared, and DISCLOSED in the header
+// below rather than silently truncating a browse list.
+const CATALOG_MISSION_CAP=50;
 async function toggleCatalog(){
   const panel=$("catpanel");
   if(!panel) return;
@@ -2944,7 +2953,8 @@ async function toggleCatalog(){
   }).join("");
   // (#691) Missions section — the cross-day catalog. Selecting a mission replays
   // it by query (?mission=), stitching its records across every day it ran.
-  const missRows=missions.slice(0,50).map(m=>{
+  // The list is capped; the header below discloses it (#1569 sweep).
+  const missRows=missions.slice(0,CATALOG_MISSION_CAP).map(m=>{
     const id=esc(m.mission_id||"");
     const disp=Number(m.dispatches)||0, recs=Number(m.records)||0;
     const span=(m.first_date&&m.first_date!==m.last_date)
@@ -2953,7 +2963,13 @@ async function toggleCatalog(){
     const summary=`${disp} dispatch${disp===1?'':'es'} · ${recs} record${recs===1?'':'s'}${span?` · ${span}`:''}`;
     return `<button class="catrow" data-act="gomission" data-arg="${id}"><div class="cd">▣ ${id}</div><div class="cs">${summary}</div></button>`;
   }).join("");
-  const missSection=missions.length?`<div class="cathdr">missions</div>${missRows}`:"";
+  // A cap that says nothing reads as "this is all of them". The header names
+  // the truncation the way the rest of the product does ("N of M"), so a
+  // mission that isn't listed is visibly absent rather than silently missing.
+  const missHdr=missions.length>CATALOG_MISSION_CAP
+    ? `missions · newest ${CATALOG_MISSION_CAP} of ${missions.length}`
+    : "missions";
+  const missSection=missions.length?`<div class="cathdr">${missHdr}</div>${missRows}`:"";
   const daysSection=days.length
     ? `<div class="cathdr">days</div>${dayRows}`
     : `<div class="catempty">no recorded days yet — dispatches you run will appear here.</div>`;
