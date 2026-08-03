@@ -53,6 +53,23 @@ const PORT = 47823;
     fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'lifecycle-flow.jsonl'), 'utf8')
   );
 
+  // (#1607) Savings-hero attribution harness. Three sessions, one per tier:
+  // a positively-LOCAL one (bookends, no endpoint), a CLOUD one whose
+  // completion names an endpoint and reports spend only as `remote_tokens`
+  // (the review path's actual shape), and an UNKNOWN one — a `task:` seat
+  // session with tokens and no bookend of its own. viewer-savings.spec.js
+  // asserts the three-way split, and specifically that unknown is NOT
+  // credited to local.
+  const savings = viewer.replace(
+    '<head>',
+    '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-flow-src" content="./savings-flow.jsonl">'
+  );
+  fs.writeFileSync(path.join(SERVED, 'index-savings.html'), savings);
+  fs.writeFileSync(
+    path.join(SERVED, 'savings-flow.jsonl'),
+    fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'savings-flow.jsonl'), 'utf8')
+  );
+
   // (#1584, was #1247 Part 3) Runs lens smoke harness: the static XSS harness
   // above has no daemon behind it, so `/runs` and `/lab/runs` would 404 —
   // this variant injects BOTH source overrides (the same static-fixture

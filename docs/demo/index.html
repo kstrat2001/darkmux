@@ -580,6 +580,7 @@
      content width to align with the recent-activity timeline below it (no
      width cap), and the stat blocks justify right so the breakdown fills the
      space rather than leaving a black gutter (#1095). */
+  .savlead.unknown .savnum{color:var(--muted)}
   .savings{margin:0 0 18px;padding:16px 22px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(74,222,128,.06),rgba(74,222,128,.01))}
   /* (#1186) "by your fleet" eyebrow frames the local + cloud numbers as one
      hybrid workforce; the cloud lead takes the brand accent (legitimate tier,
@@ -1395,21 +1396,66 @@ function tokensOffMeter(){
   // carries endpoint). Collect those completes so tool-less remote dispatches
   // still show in "via cloud" (fallback below); endpoint-bearing records are
   // intrinsically remote, so this map never captures local work.
+  // NB the dotted spelling is correct here and needs no leniency:
+  // `flowToRenderModel` normalizes the wire's "dispatch start"/"dispatch
+  // complete" (space) into the dotted form before anything reaches DATA. I
+  // added a both-spellings helper here on the theory that production emitted
+  // the space form and this never matched — then red-proving showed reverting
+  // it changed nothing, because the mismatch I "found" was between the raw
+  // flow file and this function, with the normalizer in between. Comparing a
+  // producer to a consumer without reading the layer between them invents
+  // bugs.
   const epBySid=new Map(),dcTok=new Map();
   for(const r of DATA){
     if(T(r.ts)>state.t||!r.session_id||!r.payload||!r.payload.endpoint)continue;
-    if(r.action==="dispatch.start")epBySid.set(r.session_id,String(r.payload.endpoint));
-    if(r.action==="dispatch.complete"&&(r.payload.total_tokens||r.payload.prompt_tokens||r.payload.completion_tokens)){
-      dcTok.set(r.session_id,r.payload);
+    // (#1607) An endpoint on ANY dispatch bookend is the tier evidence, on
+    // its own. This used to register the session only from inside the
+    // token-bearing branch, so a `dispatch complete` that named its endpoint
+    // but carried no `total_tokens` never marked its session as cloud — and
+    // the review path is exactly that record: it reports spend as
+    // `remote_tokens` and leaves the other three null. Evidence of WHERE and
+    // evidence of HOW MUCH are separate facts; conflating them meant one
+    // missing field silently reclassified a whole session as local.
+    if(r.action==="dispatch.start"||r.action==="dispatch.complete"){
       epBySid.set(r.session_id,String(r.payload.endpoint));
     }
+    if(r.action==="dispatch.complete"&&(r.payload.total_tokens||r.payload.prompt_tokens||r.payload.completion_tokens||r.payload.remote_tokens)){
+      dcTok.set(r.session_id,r.payload);
+    }
   }
-  let total=0,prompt=0,completion=0,cloud=0;const sess=new Map();
+  // Sessions POSITIVELY known local — and the bar is a SUCCESSFUL TERMINAL
+  // with no endpoint, not any bookend at all.
+  //
+  // A `dispatch.start` proves nothing: the review path stamps its remote
+  // classification only when it CLOSES cleanly, so its start record carries no
+  // endpoint no matter how the run is staffed. Accepting starts meant a hosted
+  // review that panicked or errored mid-run had its per-call token records —
+  // already emitted, already spent — read as local, which is the exact
+  // flattering direction this whole change exists to remove, surviving on the
+  // error path. `dispatch.error` is excluded for the same reason: a run that
+  // died before classifying itself has not told us where it ran.
+  //
+  // So the only positive evidence is a clean completion that named no
+  // endpoint. Everything else is unknown, which is the honest answer.
+  const localSids=new Set();
+  for(const r of DATA){
+    if(T(r.ts)>state.t||!r.session_id||!r.payload)continue;
+    if(r.action==="dispatch.complete"&&!r.payload.endpoint)localSids.add(r.session_id);
+  }
+  let total=0,prompt=0,completion=0,cloud=0,unknown=0;const sess=new Map();
   for(const r of DATA){
     if(r.category==="telemetry"&&r.source==="tokens"&&T(r.ts)<=state.t){
       const p=r.payload||{};
       total+=p.total_tokens||0; prompt+=p.prompt_tokens||0; completion+=p.completion_tokens||0;
+      // (#1607) THREE states, not two. The old split was `endpoint present →
+      // cloud`, `absent → local`, and that default was the defect: "could not
+      // determine" was reported as "off the meter", the one direction this
+      // number must never err in. A session with no endpoint-bearing bookend
+      // is now UNKNOWN and is excluded from the savings claim rather than
+      // credited to it. Unknown shrinking toward zero is the visible signal
+      // that the remaining producers have started emitting their bookends.
       if(r.session_id&&epBySid.has(r.session_id))cloud+=p.total_tokens||0;
+      else if(!r.session_id||!localSids.has(r.session_id))unknown+=p.total_tokens||0;
       // Composite fallback key: two sessionless records sharing a ts must
       // not merge into one pseudo-session (it would corrupt the turn_seq
       // decomposition below). session_id is the norm; this is defensive.
@@ -1440,12 +1486,23 @@ function tokensOffMeter(){
   let directRuns=0;
   for(const [sid,p] of dcTok){
     if(sess.has(sid))continue;
-    const tt=p.total_tokens||((p.prompt_tokens||0)+(p.completion_tokens||0));
+    // `remote_tokens` is the review path's spelling for its own spend; the
+    // other three are null there. Last in the chain so it never overrides a
+    // record that reported the standard fields.
+    const tt=p.total_tokens||((p.prompt_tokens||0)+(p.completion_tokens||0))||p.remote_tokens||0;
     total+=tt; cloud+=tt; prompt+=p.prompt_tokens||0; completion+=p.completion_tokens||0;
     fresh+=p.prompt_tokens||0;
+    // A `remote_tokens`-only payload has no prompt/completion split to
+    // decompose, so without this its spend joined `total` while appearing in
+    // NO class chip — the headline would quietly exceed the row beneath it.
+    // `unclassified` is exactly the bucket for "counted, cannot be broken
+    // down", and it already renders only when non-zero.
+    if(!p.total_tokens&&!p.prompt_tokens&&!p.completion_tokens&&p.remote_tokens)uncls+=tt;
     directRuns++; cloudRuns++;
   }
-  return {total,local:total-cloud,cloud,prompt,completion,fresh,reread,uncls,runs:sess.size+directRuns,cloudRuns};
+  // `local` is now what is LEFT after both the cloud and the unknown are
+  // removed — never a residual that absorbs everything unproven.
+  return {total,local:total-cloud-unknown,cloud,unknown,prompt,completion,fresh,reread,uncls,runs:sess.size+directRuns,cloudRuns};
 }
 // Thousands-separated integer (locale-free, deterministic for tests).
 const fmtN=n=>Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g,',');
@@ -1567,6 +1624,10 @@ function savingsHero(){
         <div class="savnum">${fmtN(t.cloud)}</div>
         <div class="savlbl">cloud tokens</div>
       </div>
+      ${t.unknown?`<div class="savlead unknown" title="No dispatch record for these sessions named an endpoint, so darkmux cannot say whether the model ran locally or on a hosted endpoint. They are excluded from the local figure rather than assumed to be free.">
+        <div class="savnum">${fmtN(t.unknown)}</div>
+        <div class="savlbl">unattributed</div>
+      </div>`:""}
       <div class="savclasses">
         ${sc(fmtC(t.completion),'generated','gen')}
         ${sc(fmtC(t.fresh),'fresh input','')}
