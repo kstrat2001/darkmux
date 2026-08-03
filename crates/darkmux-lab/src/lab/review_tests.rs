@@ -2441,27 +2441,66 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// across the whole dispatch (correct, but it serialized the
     /// `judge_concurrency` knob into a no-op). Reservation is what makes
     /// the narrow lock safe; this pins it.
+    /// (#1610) A grant too small to buy a parseable ruling is a DENIAL.
+    ///
+    /// The bug: `admit_reserve` clamped without a floor, so a judge call
+    /// requesting 20,000 tokens against 60 remaining was dispatched with
+    /// `max_tokens: 60`. The reply truncates → parses as `Unparsed` →
+    /// classifies as `Reject` → `multi_pass_confirm` archives the flag on
+    /// pass 1 with an empty note and no confirmation pass. A real finding,
+    /// deleted.
+    ///
+    /// And silently: `Some(60)` meant `skipped` never incremented, so no
+    /// degraded gate fired and the envelope reported healthy. A flag that
+    /// could not be judged must read as UNJUDGED, never as rejected.
+    #[test]
+    fn a_grant_too_small_to_buy_a_ruling_is_denied_and_counted_as_skipped() {
+        let mut b = RemoteBucket::new("s", 100_000);
+        // Spend down to a sliver.
+        let g = b.admit_reserve(99_900).unwrap();
+        b.settle(g, 99_900, 1);
+        assert_eq!(b.remaining(), 100, "a sliver remains — not exhausted");
+        assert!(!b.exhausted(), "the old code reached the clamp precisely here");
+
+        // The old behavior was `Some(100)` — a cap that cannot close a JSON
+        // ruling. It is now refused, and the refusal is REPORTED.
+        let before = b.skipped;
+        assert_eq!(
+            b.admit_reserve(20_000),
+            None,
+            "a 100-token cap on a 20k ruling request must not be dispatched"
+        );
+        assert_eq!(b.skipped, before + 1, "the denial is visible to the degraded gates");
+        // Denying must not consume the sliver — a later, smaller-appetite
+        // caller is still entitled to it.
+        assert_eq!(b.remaining(), 100, "a denied request reserves nothing");
+    }
+
     #[test]
     fn remote_bucket_admit_reserve_prevents_concurrent_overshoot() {
-        let mut b = RemoteBucket::new("s", 100);
-        // First caller wants 80 — granted in full, and RESERVED.
-        assert_eq!(b.admit_reserve(80), Some(80));
-        // Second caller wants 80 — the reservation is already debited, so
-        // the grant clamps to what genuinely remains, never a fresh 80.
-        assert_eq!(b.admit_reserve(80), Some(20));
+        // (#1610) Realistic units. The reservation property this pins is
+        // scale-free, but `admit_reserve` now denies a grant too small to buy
+        // a parseable ruling — so a fixture in tens of tokens would trip that
+        // floor and test the wrong thing. Same arithmetic, real magnitudes.
+        let mut b = RemoteBucket::new("s", 100_000);
+        // First caller wants 80k — granted in full, and RESERVED.
+        assert_eq!(b.admit_reserve(80_000), Some(80_000));
+        // Second caller wants 80k — the reservation is already debited, so
+        // the grant clamps to what genuinely remains, never a fresh 80k.
+        assert_eq!(b.admit_reserve(80_000), Some(20_000));
         // Third caller: exhausted, refused, counted as skipped.
-        assert_eq!(b.admit_reserve(10), None);
+        assert_eq!(b.admit_reserve(10_000), None);
 
         // Settle releases the unspent part of a reservation back.
-        let mut c = RemoteBucket::new("s", 100);
-        let granted = c.admit_reserve(80).unwrap();
-        c.settle(granted, 30, 1);
-        assert_eq!(c.remaining(), 70, "unspent reservation returns to the pool");
+        let mut c = RemoteBucket::new("s", 100_000);
+        let granted = c.admit_reserve(80_000).unwrap();
+        c.settle(granted, 30_000, 1);
+        assert_eq!(c.remaining(), 70_000, "unspent reservation returns to the pool");
         // …and an endpoint reporting ABOVE its cap pushes the bucket over —
         // the documented soft-ceiling overshoot, same reading as the map path.
-        let granted2 = c.admit_reserve(80).unwrap();
-        c.settle(granted2, 90, 1);
-        assert!(c.exhausted(), "over-report lands as real spend: 30+90 >= 100");
+        let granted2 = c.admit_reserve(80_000).unwrap();
+        c.settle(granted2, 90_000, 1);
+        assert!(c.exhausted(), "over-report lands as real spend: 30k+90k >= 100k");
     }
 
     // ─── (#1230/#1341 DRY pass) Task/Step graph orchestration ───────────
