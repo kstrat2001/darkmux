@@ -732,7 +732,18 @@
        shoved off-screen. */
     .crumbbar { height: auto; flex-wrap: wrap; padding: 8px 12px; gap: 6px 8px; }
     .crumb { flex: 1 1 auto; min-width: 0; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
-    .meta { flex: 1 1 100%; margin-left: 0; text-align: left; font-size: 10px; }
+    /* (#1614) ORDER, not just wrapping. The bar is one row on desktop with
+       .meta pushed right, which reads unmistakably as chrome. On a phone it
+       wraps — and landed BELOW the tab selector, one line above the panel, so
+       a global status line ("coder on MacBook-Pro") read as content belonging
+       to whichever tab was selected.
+       Chrome now reads broadest-scope-first: global status, then the selector,
+       then the crumb — which is per-tab context and therefore belongs nearest
+       the content it describes. The tab strip ends up directly above the panel
+       it selects, which is the association a tab bar is supposed to carry. */
+    .meta { order: -1; flex: 1 1 100%; margin-left: 0; text-align: left; font-size: 10px; }
+    .lenstabs { order: 0; }
+    .crumb { order: 1; }
 
     /* (#1087) Touch-size the icon-only chrome buttons on phones. #1067 stripped
        the text labels that gave .fbtn/.follow their height,
@@ -4257,7 +4268,11 @@ function panelCols(){
   // Mono is ~7.2px; the daemon clamps whatever we send to 60..=200.
   const el = document.querySelector(".panelout") || document.getElementById("stage");
   const px = el ? el.clientWidth : window.innerWidth;
-  return Math.max(60, Math.min(200, Math.floor((px - 24) / 7.2)));
+  // (#1613) Floor matches the daemon's own clamp (36). The measured advance
+  // width at 12px JetBrains Mono is ~6.82px, so 7.2 is deliberately
+  // conservative — it asks for FEWER columns than fit, which is the safe
+  // direction. The 24 is the panel's horizontal padding.
+  return Math.max(36, Math.min(200, Math.floor((px - 24) / 7.2)));
 }
 
 async function loadPanel(id){

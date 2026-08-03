@@ -202,7 +202,14 @@ pub(crate) struct PanelParams {
 }
 
 fn clamp_cols(cols: Option<u16>) -> u16 {
-    cols.unwrap_or(100).clamp(60, 200)
+    // (#1613) Floor is 36, not 60. A 390px phone fits ~52 columns at the
+    // panel's font; the old 60 floor meant the viewer ASKED for 60, the CLI
+    // faithfully rendered 60, and eight columns hung off the right edge — so
+    // the operator scrolled sideways to see a mission's progress. The CLI
+    // adapts correctly all the way down (measured: exact fits at 40, 44 and
+    // 50), so the floor was defending against nothing and costing the
+    // narrowest, most-used surface.
+    cols.unwrap_or(100).clamp(36, 200)
 }
 
 pub(crate) async fn panel_handler(
@@ -423,8 +430,13 @@ mod tests {
     #[test]
     fn cols_clamped_hard() {
         assert_eq!(clamp_cols(None), 100);
-        assert_eq!(clamp_cols(Some(10)), 60);
+        assert_eq!(clamp_cols(Some(10)), 36);
         assert_eq!(clamp_cols(Some(5000)), 200);
         assert_eq!(clamp_cols(Some(120)), 120);
+        // (#1613) A phone's real ask must survive the clamp unchanged. 390px
+        // fits ~52 columns; the old floor of 60 rounded it UP, which is how a
+        // narrow screen ended up rendering wider than itself.
+        assert_eq!(clamp_cols(Some(52)), 52, "a phone's width is not a floor violation");
+        assert_eq!(clamp_cols(Some(46)), 46);
     }
 }
