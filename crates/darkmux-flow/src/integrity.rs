@@ -179,6 +179,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
             path: path.display().to_string(),
             records_checked: 0,
             chain_valid: true,
+            unverifiable_newer: 0,
             break_at_line: None,
             break_reason: None,
         });
@@ -189,6 +190,9 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
     let header_line = lines[0];
     let mut expected_prev = audit_seed_hash(header_line);
     let mut records_checked = 0u64;
+    // (#1611) Records this binary can LINK but not content-verify — see the
+    // `has_unknown_enum` branch below.
+    let mut unverifiable_newer = 0u64;
 
     for (idx, line) in lines.iter().enumerate().skip(1) {
         records_checked += 1;
@@ -199,6 +203,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
                     path: path.display().to_string(),
                     records_checked,
                     chain_valid: false,
+                    unverifiable_newer,
                     break_at_line: Some((idx + 1) as u64), // 1-indexed
                     break_reason: Some(format!("unparseable JSON: {e}")),
                 });
@@ -211,6 +216,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
                 path: path.display().to_string(),
                 records_checked,
                 chain_valid: false,
+                    unverifiable_newer,
                 break_at_line: Some((idx + 1) as u64),
                 break_reason: Some(format!(
                     "prev_hash mismatch: stored `{stored_prev}` != expected `{expected_prev}` (audit log has been edited or a write was interleaved)"
@@ -225,6 +231,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
                     path: path.display().to_string(),
                     records_checked,
                     chain_valid: false,
+                    unverifiable_newer,
                     break_at_line: Some((idx + 1) as u64),
                     break_reason: Some(
                         "record lacks `hash` field — not produced by AuditFileSink, or chain is corrupted".to_string(),
@@ -233,12 +240,37 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
             }
         };
 
+        // (#1611 / #1617 review) A record written by a NEWER binary — one
+        // carrying an enum spelling this one does not know — is readable but
+        // not byte-reproducible: the catch-all parses `"catastrophe"` to
+        // `Unknown`, and `audit_hash_of` re-serializes that as `"unknown"`.
+        // The hash would therefore differ for a record nobody touched.
+        //
+        // Reporting that as "record content has been edited" is the exact
+        // false tamper alert the catch-alls were added to prevent, and simply
+        // making the record parseable did NOT prevent it — it only changed the
+        // wording from "unparseable JSON" to "hash mismatch", which reads MORE
+        // like tampering, not less.
+        //
+        // So: say what is true. The content hash is UNVERIFIABLE here, not
+        // wrong. The chain LINKAGE is still checked (the `prev_hash` comparison
+        // above already ran, and the stored hash below still binds the next
+        // record), so reordering, deletion and insertion are all still caught —
+        // only this one record's content is beyond this binary's ability to
+        // confirm, and upgrading resolves it.
+        if rec.has_unknown_enum() {
+            unverifiable_newer += 1;
+            expected_prev = stored_hash;
+            continue;
+        }
+
         let recomputed = audit_hash_of(&rec).context("recomputing audit hash")?;
         if recomputed != stored_hash {
             return Ok(IntegrityReport {
                 path: path.display().to_string(),
                 records_checked,
                 chain_valid: false,
+                    unverifiable_newer,
                 break_at_line: Some((idx + 1) as u64),
                 break_reason: Some(format!(
                     "hash mismatch: stored `{stored_hash}` != recomputed `{recomputed}` (record content has been edited)"
@@ -253,6 +285,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
         path: path.display().to_string(),
         records_checked,
         chain_valid: true,
+        unverifiable_newer,
         break_at_line: None,
         break_reason: None,
     })
@@ -300,4 +333,25 @@ pub struct IntegrityReport {
     pub break_at_line: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub break_reason: Option<String>,
+    /// (#1611) Records whose chain LINKAGE was verified but whose CONTENT hash
+    /// this binary cannot reproduce, because they carry an enum spelling it
+    /// does not know (see `FlowRecord::has_unknown_enum`). Written by a newer
+    /// darkmux; upgrading resolves them.
+    ///
+    /// These are NOT chain breaks and must never be reported as tampering —
+    /// that is the whole point of counting them separately. `chain_valid` stays
+    /// `true` and the exit status stays 0, because a version skew is not a
+    /// compliance event. It IS surfaced loudly, because "verified" and "could
+    /// not verify" are different claims and an audit substrate may not blur
+    /// them.
+    ///
+    /// Reordering, deletion and insertion are still caught across these
+    /// records: `prev_hash` is compared before this branch, and the stored hash
+    /// still binds the next record.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unverifiable_newer: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }

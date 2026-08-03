@@ -1028,7 +1028,7 @@ pub(crate) fn remote_chat_url(ep: &darkmux_types::ModelEndpoint) -> String {
 /// string formatting delegates to `darkmux_flow::remote_route_label`
 /// (#1230 Packet 0) so this shape has one source of truth shared with the
 /// review→dispatch bookend bridge in `src/pr_review.rs`.
-fn remote_endpoint_label(ep: &darkmux_types::ModelEndpoint, model_id: &str) -> String {
+pub(crate) fn remote_endpoint_label(ep: &darkmux_types::ModelEndpoint, model_id: &str) -> String {
     let url = ep.base_url();
     let host = url
         .split("://")
@@ -4083,36 +4083,146 @@ fn strict_selection_enabled() -> bool {
 /// A load failure (insufficient RAM / LMStudio load timeout) returns a clear,
 /// operator-actionable error rather than degrading silently to the default —
 /// the early-detection half of #1139 (the fallback/eviction half is #1139/#1140).
+/// (#1609) Is this resident a legitimate unload/reload target for `want`?
+///
+/// BOTH conditions, and the second is the one that was missing: the resident
+/// must serve the model we want AND be one darkmux owns. `lms ps` reports a
+/// darkmux load as `identifier=darkmux:foo, modelKey=foo` and a hand-loaded
+/// one as `identifier=foo, modelKey=foo`, so a model-key-only match selects
+/// the operator's copy just as readily as ours — and the caller unloads what
+/// it selects.
+///
+/// Extracted as a free function so the namespace guarantee is TESTABLE without
+/// a live `lms`. The contract it enforces (#1274) is absolute, and an absolute
+/// contract defended only by a line of prose inside a match arm is how this
+/// broke in the first place.
+/// (#1617 review) Ownership is "the identifier THIS PROFILE declares", not
+/// "starts with `darkmux:`". The namespace is the DEFAULT spelling of that
+/// declaration, not the whole of it: `ProfileModel.identifier` is a documented
+/// opt-out (see `darkmux_gestalt::namespaced_identifier`, and the namespace
+/// convention's "Pass-through explicit overrides" rule), and a profile using it
+/// loads under a bare name that `is_darkmux_owned` rejects.
+///
+/// The first shape of this guard tested the prefix alone, which quietly broke
+/// that opt-out: a profile declaring `identifier: "myid"` loaded once as
+/// `myid`, then FAILED its own ownership check on every later dispatch —
+/// darkmux printed the "which darkmux does not own and will not unload" notice
+/// about its own load and re-loaded under a name already taken.
+///
+/// Comparing against the minted identifier recognizes both forms and still
+/// excludes a hand-loaded bare copy, because a resident darkmux did not load
+/// cannot carry the identifier this profile would have minted.
+pub(crate) fn is_reloadable_target(
+    resident_model: &str,
+    resident_identifier: &str,
+    want: &str,
+    want_identifier: Option<&str>,
+) -> bool {
+    resident_model == want
+        && resident_identifier == darkmux_gestalt::namespaced_identifier(want, want_identifier)
+}
+
+/// (#1615) The LOADABLE model key for a value that may carry the darkmux
+/// namespace. A bare key passes through untouched; `darkmux:foo` becomes `foo`.
+///
+/// The namespace is a LOAD-TIME DECORATION, never part of the key: `lms ps`
+/// reports a darkmux load as `identifier=darkmux:foo, modelKey=foo`, so
+/// LMStudio has no key carrying the prefix and every comparison-or-load
+/// against a prefixed string is guaranteed to miss.
+///
+/// Pure and borrowing, so the strip is unit-testable without a live `lms` and
+/// costs no allocation on the hot path.
+pub(crate) fn bare_model_key(value: &str) -> &str {
+    value
+        .strip_prefix(darkmux_gestalt::DARKMUX_NAMESPACE)
+        .unwrap_or(value)
+}
+
 fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
-    use darkmux_profiles::{lms, swap};
+    use darkmux_profiles::lms;
     // (#1282) This is a LOCAL load path (remote-brained dispatches skip it) —
     // a model without a declared `n_ctx` is a resolution error here, with the
     // uniform require_n_ctx message, never a parse-stage failure.
     let n_ctx = pm.require_n_ctx()?;
+    // (#1615) Normalize ONCE, at the point the key is first derived from the
+    // profile, so the residency check, the operator-facing messages and the
+    // load all speak the same vocabulary. A config that names its utility
+    // model as `darkmux:qwen3-4b-instruct-2507` (a namespaced IDENTIFIER where
+    // a KEY belongs — `internal.utility` accepts both spellings) otherwise
+    // failed in two places at once: the load could never resolve, AND
+    // `is_reloadable_target` compared the prefixed string against `lms ps`'s
+    // bare `modelKey`, so the model read as absent even when it was resident.
+    // The compactor was therefore unloadable, and every dispatch that compacted
+    // fell through to LMStudio's JIT-load at the model default with truncated
+    // summaries — silently, behind one warning line.
+    //
+    // Stripping is safe in both directions: a bare key is unchanged, and a
+    // namespaced string could never have been a valid key. `namespaced_
+    // identifier` below is idempotent over the prefix, so the identifier
+    // darkmux mints is byte-identical either way.
+    let model_key = bare_model_key(&pm.id);
     let loaded = lms::list_loaded().unwrap_or_default();
-    match loaded.iter().find(|m| m.model == pm.id) {
+    // (#1609) Consider ONLY darkmux-owned residents. This used to match on the
+    // bare model key alone — and `lms ps` reports a darkmux load as
+    // `identifier=darkmux:foo, modelKey=foo` and a hand-loaded one as
+    // `identifier=foo, modelKey=foo`, so BOTH matched. The unload below then
+    // took whichever came first, which on the sanctioned ForeignDuplicate path
+    // is the operator's own copy: darkmux deleted user state mid-dispatch,
+    // with a stderr line that read like a routine reload.
+    //
+    // The namespace convention exists precisely so this is impossible by
+    // construction (#1274, ABSOLUTE for model lifecycle): darkmux loads,
+    // unloads and reconciles only what IT loaded. `darkmux-gestalt` enforces
+    // that structurally through `OwnedTarget`; this legacy path reached past it
+    // to the raw `lms::unload`, so the guarantee has to be restated here until
+    // the raw call is retired in favor of the `ModelHost` seam.
+    //
+    // (#1617 review) "What it loaded" is the identifier this profile DECLARES,
+    // which is the `darkmux:` form by default and the operator's own string
+    // when they take the documented `identifier` opt-out — see
+    // `is_reloadable_target`.
+    let want_identifier = pm.identifier.as_deref();
+    match loaded
+        .iter()
+        .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
+    {
         Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
         Some(m) => {
             eprintln!(
                 "darkmux dispatch: `{}` is resident at context {} but the profile \
                  declares n_ctx={}; reloading at {} so the dispatch gets the declared \
                  context. (#1135)",
-                pm.id, m.context, n_ctx, n_ctx
+                model_key, m.context, n_ctx, n_ctx
             );
             lms::unload(&m.identifier).with_context(|| {
                 format!("unloading `{}` to reload at n_ctx={}", m.identifier, n_ctx)
             })?;
         }
         None => {
-            eprintln!(
-                "darkmux dispatch: loading `{}` at n_ctx={} (the profile's declared \
-                 context) before dispatch. (#1135)",
-                pm.id, n_ctx
-            );
+            // (#1609) A foreign resident of the same model is NOT an error and
+            // NOT ours to remove — the contract is "surface a reason naming the
+            // blocking instance and suggest; never touch". darkmux loads its
+            // own namespaced copy alongside it, exactly as the gestalt planner
+            // already decides for a ForeignDuplicate.
+            if let Some(foreign) = loaded.iter().find(|m| m.model == model_key) {
+                eprintln!(
+                    "darkmux dispatch: `{}` is already resident as `{}`, which darkmux \
+                     does not own and will not unload; loading darkmux's own copy at \
+                     n_ctx={} alongside it. Free the RAM yourself with `lms unload {}` \
+                     if that is not what you want. (#1609)",
+                    model_key, foreign.identifier, n_ctx, foreign.identifier
+                );
+            } else {
+                eprintln!(
+                    "darkmux dispatch: loading `{}` at n_ctx={} (the profile's declared \
+                     context) before dispatch. (#1135)",
+                    model_key, n_ctx
+                );
+            }
         }
     }
-    let identifier = swap::namespaced_identifier(pm);
-    load_at_ctx_bounded(&pm.id, &identifier, n_ctx)
+    let identifier = darkmux_gestalt::namespaced_identifier(model_key, want_identifier);
+    load_at_ctx_bounded(model_key, &identifier, n_ctx)
 }
 
 /// (#1139) Load `model_key` under `identifier` at `n_ctx` through the bounded
@@ -4122,6 +4232,9 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
 /// enforces the resolved model-load deadline and classifies the failure into a
 /// TYPED error, so a RAM-exhausted load becomes a clear, operator-actionable
 /// message — never a hang or a silent degrade.
+///
+/// `model_key` must already be BARE (`ensure_model_loaded_at_ctx` normalizes it
+/// via [`bare_model_key`], #1615) — the namespace belongs only in `identifier`.
 fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32) -> Result<()> {
     use darkmux_gestalt::{Deadline, ModelHost};
     let mut host = darkmux_profiles::gestalt_host::LmsHost::new();

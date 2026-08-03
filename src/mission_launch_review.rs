@@ -1138,6 +1138,15 @@ fn run_dispatch(
         let report_phase_id_for_closure = report_phase_id.clone();
         let report_phase_id_for_persist = report_phase_id.clone();
         let mut started_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // (#1620) Phase order, for closing the bands an advance has moved past.
+        // `derive_phase_ids` is keyed by config id, so the order comes from the
+        // config's own declaration rather than from map iteration.
+        let phase_order_for_persist: Vec<String> = vec![
+            investigate_phase_id.clone(),
+            adjudicate_phase_id.clone(),
+            report_phase_id.clone(),
+        ];
+        let mut closed_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let result = with_dispatch_bookends(
             &mut emitter,
@@ -1174,12 +1183,28 @@ fn run_dispatch(
                             .get(&step.id)
                             .map(String::as_str)
                             .unwrap_or(&report_phase_id_for_persist);
-                        mission_launch::lazy_start_phase_for_step(
+                        let was_new = mission_launch::lazy_start_phase_for_step(
                             &mission_id_for_persist,
                             phase_id,
                             step.status,
                             &mut started_phases,
                         );
+                        // (#1620) A phase becoming live is the signal that the
+                        // bands before it are over — phases are strictly
+                        // sequential (#1341), so reaching this one means the
+                        // earlier ones' work is done. Close them at their EARNED
+                        // outcome now, instead of leaving every touched phase
+                        // `Running` until the whole mission finalizes and
+                        // reconciles them in bulk (which made the board read
+                        // `0/3` for the entire run, then jump to `3/3`).
+                        if was_new {
+                            mission_launch::lazy_close_prior_phases(
+                                &mission_id_for_persist,
+                                &phase_order_for_persist,
+                                phase_id,
+                                &mut closed_phases,
+                            );
+                        }
                         // (F2, gate remediation) Warn, never silently
                         // swallow — same dim-warning parity as
                         // `mission_launch.rs`/`coder_phase.rs`'s persist
@@ -1807,6 +1832,92 @@ mod tests {
             &mut started,
         );
         assert_eq!(phase_status(&mission_id, &real_phase_ids["report"]), "running");
+    }
+
+    /// (#1620) Starting a phase CLOSES the ones before it, at their earned
+    /// outcome — the counterpart the lazy-start path never had.
+    ///
+    /// Without it, every touched phase sat `Running` until the whole mission
+    /// finalized and reconciled them in bulk, so the board read `0/3` for the
+    /// entire run and then jumped to `3/3`. On the live board a review whose
+    /// judge was working showed `0/3` with investigate AND adjudicate both
+    /// `Running` — two phases live at once, contradicting the strictly-linear
+    /// model (#1341), and a progress column that could not distinguish
+    /// two-thirds-done from never-started.
+    ///
+    /// Every existing test asserted the FINALIZED state (all phases complete),
+    /// which is why a whole run's worth of missing intermediate state passed
+    /// 2684 green tests. This one asserts the middle.
+    #[test]
+    #[serial_test::serial]
+    fn advancing_a_phase_closes_the_ones_before_it() {
+        let _guard = CrewDirGuard::new();
+        let config = crew::mission_config::load("review").expect("review is embedded").config;
+        let mission_id = mission_launch::mint_run_id("review").unwrap();
+        let real_phase_ids = mission_launch::ensure_mission_and_phases_with_provenance(
+            &mission_id,
+            &config,
+            Some("PR review test — advance closes prior"),
+            None,
+        )
+        .unwrap();
+        let order: Vec<String> = ["investigate", "adjudicate", "report"]
+            .iter()
+            .map(|k| real_phase_ids[*k].clone())
+            .collect();
+        let mut started = std::collections::HashSet::new();
+        let mut closed = std::collections::HashSet::new();
+
+        // Investigate goes live. Nothing precedes it, so nothing closes.
+        assert!(mission_launch::lazy_start_phase_for_step(
+            &mission_id,
+            &order[0],
+            crew::types::NodeStatus::Running,
+            &mut started,
+        ));
+        mission_launch::lazy_close_prior_phases(&mission_id, &order, &order[0], &mut closed);
+        assert_eq!(phase_status(&mission_id, &order[0]), "running");
+
+        // Adjudicate goes live. Investigate has no persisted steps here, so the
+        // conservative branch leaves it alone rather than inventing a verdict —
+        // an early WRONG terminal is worse than a late correct one.
+        assert!(mission_launch::lazy_start_phase_for_step(
+            &mission_id,
+            &order[1],
+            crew::types::NodeStatus::Running,
+            &mut started,
+        ));
+        mission_launch::lazy_close_prior_phases(&mission_id, &order, &order[1], &mut closed);
+
+        // Now give investigate a genuinely finished step and advance again.
+        // (Re-running the close is the real-world shape: the persist closure
+        // fires per step, so the same advance is re-evaluated.)
+        let step = crew::types::Step {
+            id: format!("{}-s1", order[0]),
+            task_id: format!("{}-t1", order[0]),
+            kind: "procedural.noop".to_string(),
+            status: crew::types::NodeStatus::Complete,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        crew::lifecycle::save_step(&mission_id, &order[0], &step).unwrap();
+        closed.remove(&order[0]);
+        mission_launch::lazy_close_prior_phases(&mission_id, &order, &order[1], &mut closed);
+
+        assert_eq!(
+            phase_status(&mission_id, &order[0]),
+            "complete",
+            "investigate must close when adjudicate is live — phases are strictly linear (#1341), \
+             so reaching one means the earlier ones are over"
+        );
+        assert_eq!(
+            phase_status(&mission_id, &order[1]),
+            "running",
+            "and exactly ONE phase is live at a time"
+        );
+        assert_eq!(phase_status(&mission_id, &order[2]), "planned");
     }
 
     /// (#1432 item 2) The review launcher's mint path threads each phase's

@@ -1618,18 +1618,22 @@ pub(crate) fn load_phase_for_brief(mission_id: &str, phase_id: &str) -> Result<P
 /// loud dim warning, never a hard error — the same "continue, the whole-mission
 /// terminal (`mission finalize` / `mission abort`) reconciles phase state"
 /// posture the pre-#1400 eager loop used (#1463).
+/// Returns `true` when this call is the one that brought `phase_id` live —
+/// the caller's cue that the bands BEFORE it are over (#1620, see
+/// [`lazy_close_prior_phases`]). `false` on every later step of an
+/// already-started phase, so the advance fires exactly once per band.
 pub(crate) fn lazy_start_phase_for_step(
     mission_id: &str,
     phase_id: &str,
     step_status: crew::types::NodeStatus,
     started: &mut std::collections::HashSet<String>,
-) {
+) -> bool {
     use crew::types::NodeStatus;
     if step_status != NodeStatus::Running {
-        return;
+        return false;
     }
     if phase_id.is_empty() || !started.insert(phase_id.to_string()) {
-        return;
+        return false;
     }
     let status = load_phase_for_brief(mission_id, phase_id)
         .map(|p| p.status)
@@ -1642,6 +1646,86 @@ pub(crate) fn lazy_start_phase_for_step(
                     "mission launch: phase_start({phase_id}) failed: {e:#} — continuing; the \
                      whole-mission terminal (`mission finalize` / `mission abort`) reconciles \
                      phase state."
+                ))
+            );
+        }
+    }
+    true
+}
+
+/// (#1620) The counterpart to [`lazy_start_phase_for_step`]: close the phases
+/// a newly-started one has moved past.
+///
+/// Without this, a launcher that starts phases lazily never CLOSES them, so
+/// every phase it touched sat `Running` until the whole mission finalized and
+/// reconciled them in bulk. The board counts `Complete` phases, so a review
+/// read `0/3` for its entire run and then jumped to `3/3` — no intermediate
+/// state at all, on the one column an operator consults to see how far along a
+/// run is. `0/3` on a mission whose judge is working is not stale, it is
+/// indistinguishable from a mission that never started. Two phases also read
+/// `Running` at once, contradicting the strictly-linear phase model (#1341).
+///
+/// The advance itself is the evidence: phases are strictly sequential, so
+/// reaching phase N means N-1's work is over. What that phase EARNED is not
+/// assumed — it is derived from its own steps by the same
+/// [`phase_finalization`] rules `finalize` would apply later, so closing early
+/// yields the identical verdict, just sooner.
+///
+/// Deliberately conservative in one place: a prior phase with any step still
+/// non-terminal is LEFT ALONE rather than abandoned. Concurrency could in
+/// principle overlap bands, and an early wrong `Abandoned` is far worse than a
+/// late-but-correct one — finalize still reconciles whatever this skips.
+pub(crate) fn lazy_close_prior_phases(
+    mission_id: &str,
+    phase_order: &[String],
+    newly_started: &str,
+    closed: &mut std::collections::HashSet<String>,
+) {
+    use crew::types::NodeStatus;
+    let Some(at) = phase_order.iter().position(|p| p == newly_started) else {
+        return;
+    };
+    for prior in &phase_order[..at] {
+        if !closed.insert(prior.clone()) {
+            continue;
+        }
+        let status = load_phase_for_brief(mission_id, prior).map(|p| p.status);
+        if !matches!(status, Ok(PhaseStatus::Running)) {
+            continue;
+        }
+        let Ok(steps) = crew::lifecycle::load_steps_for_phase(mission_id, prior) else {
+            closed.remove(prior);
+            continue;
+        };
+        // (#1620) NO steps on disk is absence of evidence, not evidence of
+        // failure — and `phase_finalization` reads an empty slice as "the
+        // scheduler never reached this phase", i.e. Abandoned. Deriving a
+        // verdict from nothing is the same defect as rendering an unknown run
+        // as `running` (#1621); it just fails in the pessimistic direction.
+        // Caught by `advancing_a_phase_closes_the_ones_before_it`, which
+        // abandoned a healthy phase on the first advance.
+        //
+        // Likewise a phase with any step still live is not ours to close.
+        // Both cases defer to finalize, which reconciles with full information.
+        if steps.is_empty()
+            || steps.iter().any(|s| matches!(s.status, NodeStatus::Planned | NodeStatus::Running))
+        {
+            closed.remove(prior);
+            continue;
+        }
+        let refs: Vec<&crew::types::Step> = steps.iter().collect();
+        let (outcome, _reason) = phase_finalization(&refs);
+        let result = match outcome {
+            crew::envelope::PhaseOutcomeKind::Complete => crew::lifecycle::phase_complete(prior),
+            _ => crew::lifecycle::phase_abandon(prior),
+        };
+        if let Err(e) = result {
+            closed.remove(prior);
+            eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "mission launch: closing phase `{prior}` on advance failed: {e:#} — \
+                     continuing; the whole-mission terminal reconciles phase state."
                 ))
             );
         }

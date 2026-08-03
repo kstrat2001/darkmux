@@ -732,7 +732,18 @@
        shoved off-screen. */
     .crumbbar { height: auto; flex-wrap: wrap; padding: 8px 12px; gap: 6px 8px; }
     .crumb { flex: 1 1 auto; min-width: 0; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
-    .meta { flex: 1 1 100%; margin-left: 0; text-align: left; font-size: 10px; }
+    /* (#1614) ORDER, not just wrapping. The bar is one row on desktop with
+       .meta pushed right, which reads unmistakably as chrome. On a phone it
+       wraps — and landed BELOW the tab selector, one line above the panel, so
+       a global status line ("coder on MacBook-Pro") read as content belonging
+       to whichever tab was selected.
+       Chrome now reads broadest-scope-first: global status, then the selector,
+       then the crumb — which is per-tab context and therefore belongs nearest
+       the content it describes. The tab strip ends up directly above the panel
+       it selects, which is the association a tab bar is supposed to carry. */
+    .meta { order: -1; flex: 1 1 100%; margin-left: 0; text-align: left; font-size: 10px; }
+    .lenstabs { order: 0; }
+    .crumb { order: 1; }
 
     /* (#1087) Touch-size the icon-only chrome buttons on phones. #1067 stripped
        the text labels that gave .fbtn/.follow their height,
@@ -4252,12 +4263,22 @@ const PANELS = [
 
 function panelCols(){
   // The CLI adapts to COLUMNS (packet A). Ask for a width that matches the
-  // space the panel actually has, so `mission status` drops its mix column
-  // on a phone instead of overflowing. Character width at 12px JetBrains
-  // Mono is ~7.2px; the daemon clamps whatever we send to 60..=200.
+  // space the panel actually has, so `mission status` sheds its optional
+  // columns on a phone instead of overflowing.
+  //
+  // (#1613) The clamp is 36..=200 at BOTH ends — this floor and the daemon's
+  // `clamp_cols` must agree, or the negotiation lies: the viewer would ask for
+  // a width it cannot show, the CLI would faithfully render it, and the
+  // remainder would hang off the right edge. That is precisely what a stale
+  // 60 here did on a 390px phone.
+  //
+  // The measured advance width at 12px JetBrains Mono is ~6.82px, so the 7.2
+  // divisor is deliberately conservative — it asks for FEWER columns than fit,
+  // which is the safe direction to be wrong in. The 24 is the panel's
+  // horizontal padding.
   const el = document.querySelector(".panelout") || document.getElementById("stage");
   const px = el ? el.clientWidth : window.innerWidth;
-  return Math.max(60, Math.min(200, Math.floor((px - 24) / 7.2)));
+  return Math.max(36, Math.min(200, Math.floor((px - 24) / 7.2)));
 }
 
 async function loadPanel(id){

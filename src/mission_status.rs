@@ -104,6 +104,91 @@ fn panel_deep_link(link_base: &str, target: &str) -> Option<String> {
     Some(format!("{link_base}#lens=console&panel={target}"))
 }
 
+/// (#1612) What the row CALLS a mission.
+///
+/// The id is a mint artifact — `dispatch-code-reviewer-1785589698-5d6a-0` —
+/// and on a phone it ate two thirds of the width for the least informative
+/// thing on the line, pushing progress off the edge. Meanwhile every mission
+/// already carries a `description` (92/92 populated on this board) and it was
+/// going unshown.
+///
+/// The descriptions come in two measured shapes, which is what makes this a
+/// lookup rather than a truncation (92 real missions: 59 / 33):
+///   - operator-named missions carry prose — "PR review — kstrat2001/darkmux@…";
+///   - auto-minted ones carry "dispatch: code-reviewer", i.e. the role.
+///
+/// Both beat the id, and the `dispatch: ` prefix is noise once the row's own
+/// glyph already distinguishes a single-role dispatch from a graph, so it is
+/// stripped. The id is not lost: the row is an OSC 8 link, so it is one click
+/// away, and any row that needs an id typed carries it verbatim in the drift
+/// suggestion printed directly beneath it.
+///
+/// Falls back to the id when a description is genuinely absent — an id is a
+/// poor label but never a wrong one.
+fn display_label(m: &Mission) -> &str {
+    let d = m.description.trim();
+    if d.is_empty() {
+        return &m.id;
+    }
+    d.strip_prefix("dispatch: ").unwrap_or(d)
+}
+
+/// (#1612) Single-role dispatch vs multi-phase graph, in one column-safe glyph.
+///
+/// The operator asked whether a row could say "graph" versus "role" and floated
+/// an emoji. Emoji are DOUBLE-WIDTH, and every column budget in this module is
+/// exact arithmetic over `chars().count()` — one emoji would silently overflow
+/// every row it appeared on. These two are single-width, so the distinction is
+/// free: it costs no column at all, replacing a marker that was already there.
+fn kind_glyph(total_phases: usize) -> &'static str {
+    if total_phases > 1 {
+        "◆"
+    } else {
+        "•"
+    }
+}
+
+/// (#1612) A stable short handle for a mission, or `None` when the id has no
+/// discriminating token.
+///
+/// The operator's ask was "a number" — something short that tells two otherwise
+/// identical rows apart. Both minting paths already end in one: `mint_run_id`
+/// emits `<config>-<secs>-<hex6>` (`review-1785400940-136e76`), and the older
+/// dispatch path emits `dispatch-<role>-<secs>-<hex>-<n>`.
+///
+/// So: scan segments right-to-left for the first all-hex run of at least
+/// `MIN_HANDLE_HEX` chars. A HEURISTIC, deliberately — the two formats are not
+/// one, and hand-authored ids (`doom-loop-m4`, `104-daemon-observability`) match
+/// nothing and correctly yield `None`. It is display-only and drops to nothing
+/// on no match, so a wrong guess costs a column, never correctness.
+fn short_handle(id: &str) -> Option<&str> {
+    id.rsplit('-').find(|seg| {
+        seg.len() >= MIN_HANDLE_HEX && seg.chars().all(|c| c.is_ascii_hexdigit())
+    })
+}
+
+/// Shortest run of hex that reads as a deliberate discriminator rather than an
+/// accident. Below 4, ordinary id fragments (`-0`, `-5`, a version `-2`) start
+/// matching and the column fills with noise.
+const MIN_HANDLE_HEX: usize = 4;
+
+/// (#1612) Compact "how long ago", in at most `AGE_COLS` columns.
+///
+/// One unit, never two — `3d` not `3d 4h`. The board answers "what needs me
+/// now"; the difference between 3d and 3d4h has never changed that answer, and
+/// the second unit costs the columns the name needs. Rounds DOWN, so a row
+/// never claims to be older than it is.
+fn relative_age(now: u64, then: u64) -> String {
+    let secs = now.saturating_sub(then);
+    match secs {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m", secs / 60),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        86_400..=2_591_999 => format!("{}d", secs / 86_400),
+        _ => format!("{}w", secs / 604_800),
+    }
+}
+
 /// Pure drift detection for one mission given its phases. `now` and
 /// `stale_days` are passed in (rather than read internally) so the function
 /// stays IO-free and unit-testable with fixed timestamps — see the module
@@ -418,31 +503,55 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
         for v in g.iter().take(shown) {
             let prog = format!("{}/{}", v.complete, v.total);
             let bar = progress_bar(v.complete, v.total);
-            let id = ellipsize(&v.m.id, layout.id_width);
+            let name = ellipsize(display_label(v.m), layout.name_width);
             // (#1569 packet A) Pad BEFORE linking, and by the VISIBLE width:
             // `{:<width$}` counts the OSC 8 escape bytes, so formatting a
-            // linkified id would silently destroy the column alignment the
+            // linkified name would silently destroy the column alignment the
             // whole layout planner exists to maintain. The link wraps only
-            // the id text; the padding stays outside it, so the clickable
-            // target is the id rather than a run of trailing whitespace.
-            let id_cell = format!(
+            // the name text; the padding stays outside it, so the clickable
+            // target is the name rather than a run of trailing whitespace.
+            let name_cell = format!(
                 "{}{}",
-                style::link(&mission_url(&link_base, &v.m.id), &id),
-                " ".repeat(layout.id_width.saturating_sub(id.chars().count()))
+                style::link(&mission_url(&link_base, &v.m.id), &name),
+                " ".repeat(layout.name_width.saturating_sub(name.chars().count()))
+            );
+            // (#1612) Dim, and blank-padded rather than omitted, so a board
+            // where only some ids carry a handle keeps one straight column.
+            let handle_cell = if layout.show_handle {
+                let h = short_handle(&v.m.id).unwrap_or("");
+                format!(
+                    "  {}{}",
+                    style::dim(h),
+                    " ".repeat(layout.handle_width.saturating_sub(h.chars().count()))
+                )
+            } else {
+                String::new()
+            };
+            // Right-aligned by hand for the same reason the name is padded by
+            // hand: `{:>width$}` would count `style::dim`'s escape bytes and
+            // silently eat the alignment.
+            let age = relative_age(now, last_activity(v.m));
+            let age_cell = format!(
+                "{}{}",
+                " ".repeat(AGE_COLS.saturating_sub(age.chars().count())),
+                style::dim(&age)
+            );
+            let row = format!(
+                "  {} {}{}  {}  {:>5}  {}",
+                kind_glyph(v.total),
+                name_cell,
+                handle_cell,
+                age_cell,
+                prog,
+                bar,
             );
             if layout.show_mix {
-                println!(
-                    "  ◆ {}  {:>5}  {}  {}",
-                    id_cell,
-                    prog,
-                    bar,
-                    style::dim(&phase_mix(v)),
-                );
+                println!("{row}  {}", style::dim(&phase_mix(v)));
             } else {
-                // Narrow terminal: the mix is dropped rather than the id or the
-                // progress, because it is the one column whose information the
-                // other two already carry.
-                println!("  ◆ {}  {:>5}  {}", id_cell, prog, bar);
+                // Narrow terminal: the mix is dropped rather than the name, the
+                // age or the progress, because it is the one column whose
+                // information the others already carry.
+                println!("{row}");
             }
             for d in &v.drifts {
                 // The ⚠ marks the warning, not each of its lines — continuation
@@ -621,29 +730,42 @@ fn default_limit(group: MissionStatus) -> usize {
     }
 }
 
-/// Fixed per-row cost of a row WITHOUT the mix column: `"  ◆ "` (4) + the two
-/// 2-space gaps + the 5-wide progress field + the 4-wide bar = 17.
+/// Fixed per-row cost of a row with NEITHER optional column: `"  ◆ "` (4) +
+/// the age gap (2) + the age field (3) + a gap (2) + the 5-wide progress field
+/// + a gap (2) + the 4-wide bar = 22.
 ///
-/// Exactly this and no more: a row that also shows the mix pays one ADDITIONAL
-/// gap, which is `MIX_GAP_COLS`. Conflating the two let `plan_layout` judge a
-/// with-mix row 2 columns narrower than it renders, so at `COLUMNS=51` an
-/// id(12) + mix(22) row measured 51 and printed 53 — hard-wrapping on exactly
-/// the terminal width the adaptation exists to respect.
-const ROW_FIXED_COLS: usize = 17;
+/// Exactly this and no more: a row that also shows the mix or the handle pays
+/// one ADDITIONAL gap each (`MIX_GAP_COLS` / `HANDLE_GAP_COLS`). Conflating the
+/// gap into the base let `plan_layout` judge a with-mix row 2 columns narrower
+/// than it renders, so at `COLUMNS=51` an id(12) + mix(22) row measured 51 and
+/// printed 53 — hard-wrapping on exactly the terminal width the adaptation
+/// exists to respect. The same trap now exists twice; the arithmetic is pinned
+/// by `plan_layout_row_fits_every_width_it_can_honor`, which measures the
+/// RENDERED string rather than recomputing this budget. It earned its keep
+/// immediately: the first draft of this constant said 23.
+const ROW_FIXED_COLS: usize = 22;
+
+/// Width of the age field. `now`/`59m`/`23h`/`29d`/`99w` — three columns covers
+/// every value `relative_age` can emit below a hundred weeks.
+const AGE_COLS: usize = 3;
 
 /// The extra 2-space gap between the bar and the mix column, paid only when the
 /// mix is shown. See `ROW_FIXED_COLS`.
 const MIX_GAP_COLS: usize = 2;
 
-/// Never shrink the id column below this — a mission id truncated to a few
+/// The extra 2-space gap between the name and the handle column, paid only when
+/// the handle is shown. See `ROW_FIXED_COLS`.
+const HANDLE_GAP_COLS: usize = 2;
+
+/// Never shrink the name column below this — a name truncated to a few
 /// characters identifies nothing, which defeats the point of keeping it.
-const MIN_ID_COLS: usize = 12;
+const MIN_NAME_COLS: usize = 12;
 
 /// Below this much room for text, `wrap_indented` stops wrapping and emits one
 /// overlong line instead. Wrapping prose into a 3-column gutter produces
 /// something less readable than an overflowing line, not more.
 ///
-/// Deliberately its OWN constant rather than reusing `MIN_ID_COLS`: the two
+/// Deliberately its OWN constant rather than reusing `MIN_NAME_COLS`: the two
 /// happen to share a value but answer unrelated questions (how short an id may
 /// be truncated vs. how narrow a paragraph is worth wrapping), so tying them
 /// together would make one silently move when the other is tuned.
@@ -652,32 +774,61 @@ const MIN_WRAP_ROOM: usize = 12;
 /// How one board row is laid out at the current terminal width.
 #[derive(Debug, PartialEq)]
 struct Layout {
-    id_width: usize,
+    name_width: usize,
+    handle_width: usize,
+    show_handle: bool,
     show_mix: bool,
 }
 
 /// Plan the row layout from the rows that will actually be printed.
 ///
-/// Degradation order is deliberate: the phase mix goes first (the progress
-/// fraction and bar already carry its information), and only then does the id
-/// get truncated. `width == None` means output isn't a terminal, so nothing is
-/// adapted and nothing is dropped — piped output stays complete.
+/// Degradation order is deliberate, widest-terminal first:
+///   1. the phase mix goes — the progress fraction and bar already carry it;
+///   2. then the handle — the age already tells two same-named rows apart, and
+///      the full id is a click away on the row's own link;
+///   3. only then does the name get truncated.
+///
+/// The age is never dropped. It is 3 columns, it is the one field that answers
+/// "is this still relevant", and it is what makes step 2 survivable.
+///
+/// `width == None` means output isn't a terminal, so nothing is adapted and
+/// nothing is dropped — piped output stays complete.
 fn plan_layout<'a>(
     rows: impl Iterator<Item = &'a MissionView<'a>>,
     width: Option<usize>,
 ) -> Layout {
-    let (max_id, max_mix) = rows.fold((0, 0), |(i, x), v| {
-        (i.max(v.m.id.chars().count()), x.max(phase_mix(v).chars().count()))
+    let (max_name, max_handle, max_mix) = rows.fold((0, 0, 0), |(n, h, x), v| {
+        (
+            n.max(display_label(v.m).chars().count()),
+            h.max(short_handle(&v.m.id).map_or(0, |s| s.chars().count())),
+            x.max(phase_mix(v).chars().count()),
+        )
     });
-    let Some(w) = width else {
-        return Layout { id_width: max_id, show_mix: true };
+    // A handle column is only ever planned if some row actually has one —
+    // otherwise every row would pay two gap columns for a run of blanks.
+    let handle_cost = if max_handle == 0 { 0 } else { HANDLE_GAP_COLS + max_handle };
+    let with_handle = |name_width: usize, show_mix: bool| Layout {
+        name_width,
+        handle_width: max_handle,
+        show_handle: max_handle > 0,
+        show_mix,
     };
-    if max_id + ROW_FIXED_COLS + MIX_GAP_COLS + max_mix <= w {
-        Layout { id_width: max_id, show_mix: true }
-    } else if max_id + ROW_FIXED_COLS <= w {
-        Layout { id_width: max_id, show_mix: false }
+    let Some(w) = width else {
+        return with_handle(max_name, true);
+    };
+    if max_name + ROW_FIXED_COLS + handle_cost + MIX_GAP_COLS + max_mix <= w {
+        with_handle(max_name, true)
+    } else if max_name + ROW_FIXED_COLS + handle_cost <= w {
+        with_handle(max_name, false)
+    } else if max_name + ROW_FIXED_COLS <= w {
+        Layout { name_width: max_name, handle_width: 0, show_handle: false, show_mix: false }
     } else {
-        Layout { id_width: w.saturating_sub(ROW_FIXED_COLS).max(MIN_ID_COLS), show_mix: false }
+        Layout {
+            name_width: w.saturating_sub(ROW_FIXED_COLS).max(MIN_NAME_COLS),
+            handle_width: 0,
+            show_handle: false,
+            show_mix: false,
+        }
     }
 }
 
@@ -818,7 +969,10 @@ mod tests {
     fn mission(id: &str, status: MissionStatus) -> Mission {
         Mission {
             id: id.into(),
-            description: "d".into(),
+            // (#1612) Mirror the id: the row labels from `description` now, so
+            // a fixed "d" would make every width test measure a 1-column name
+            // and silently stop exercising the arithmetic it exists to pin.
+            description: id.into(),
             status,
             phase_ids: vec![],
             created_ts: 0,
@@ -1018,7 +1172,7 @@ mod tests {
         let m = mission("a-very-long-machine-minted-mission-id-0001", MissionStatus::Active);
         let v = view(&m, 3, 1);
         let l = plan_layout([v].iter(), None);
-        assert_eq!(l.id_width, 42);
+        assert_eq!(l.name_width, 42);
         assert!(l.show_mix);
     }
 
@@ -1029,7 +1183,7 @@ mod tests {
         let rows = [view(&short, 1, 0), view(&long, 1, 0)];
         let l = plan_layout(rows.iter(), Some(200));
         // Natural width, not the old hardcoded 30 — narrow boards stay narrow.
-        assert_eq!(l.id_width, "m-longer-id".len());
+        assert_eq!(l.name_width, "m-longer-id".len());
         assert!(l.show_mix);
     }
 
@@ -1042,24 +1196,36 @@ mod tests {
     fn render_row(v: &MissionView, layout: &Layout) -> String {
         let prog = format!("{}/{}", v.complete, v.total);
         let bar = progress_bar(v.complete, v.total);
-        let id = ellipsize(&v.m.id, layout.id_width);
-        if layout.show_mix {
-            format!(
-                "  ◆ {:<width$}  {:>5}  {}  {}",
-                id,
-                prog,
-                bar,
-                phase_mix(v),
-                width = layout.id_width
-            )
+        let name = ellipsize(display_label(v.m), layout.name_width);
+        let handle = if layout.show_handle {
+            let h = short_handle(&v.m.id).unwrap_or("");
+            format!("  {:<width$}", h, width = layout.handle_width)
         } else {
-            format!("  ◆ {:<width$}  {:>5}  {}", id, prog, bar, width = layout.id_width)
+            String::new()
+        };
+        // Any age of the right WIDTH exercises the same budget — the row's
+        // column cost is `AGE_COLS`, never the particular value.
+        let age = format!("{:>width$}", "9d", width = AGE_COLS);
+        let row = format!(
+            "  {} {:<width$}{}  {}  {:>5}  {}",
+            kind_glyph(v.total),
+            name,
+            handle,
+            age,
+            prog,
+            bar,
+            width = layout.name_width
+        );
+        if layout.show_mix {
+            format!("{row}  {}", phase_mix(v))
+        } else {
+            row
         }
     }
 
     /// The narrowest terminal a row can honor: the fixed columns plus the id
-    /// floor. Below this the row overflows BY DESIGN (see `MIN_ID_COLS`).
-    const NARROWEST_HONORABLE: usize = ROW_FIXED_COLS + MIN_ID_COLS;
+    /// floor. Below this the row overflows BY DESIGN (see `MIN_NAME_COLS`).
+    const NARROWEST_HONORABLE: usize = ROW_FIXED_COLS + MIN_NAME_COLS;
 
     #[test]
     fn plan_layout_row_fits_every_width_it_can_honor() {
@@ -1089,7 +1255,7 @@ mod tests {
         let m = mission("m-0123456789-0123456789", MissionStatus::Active);
         for w in 1..NARROWEST_HONORABLE {
             let layout = plan_layout([view(&m, 2, 1)].iter(), Some(w));
-            assert_eq!(layout.id_width, MIN_ID_COLS, "at COLUMNS={w}");
+            assert_eq!(layout.name_width, MIN_NAME_COLS, "at COLUMNS={w}");
             assert!(!layout.show_mix, "at COLUMNS={w} the mix must be gone before this point");
             let cols = render_row(&view(&m, 2, 1), &layout).chars().count();
             assert_eq!(cols, NARROWEST_HONORABLE, "at COLUMNS={w} overflow must stay bounded");
@@ -1101,25 +1267,32 @@ mod tests {
         let m = mission("m-0123456789", MissionStatus::Active);
         let v = view(&m, 2, 1); // mix = "2 complete · 1 running"
         let mix_cols = phase_mix(&v).chars().count();
-        let id_cols = m.id.chars().count();
+        let name_cols = display_label(&m).chars().count();
+        // (#1612) This id's trailing `0123456789` is all hex, so the row also
+        // carries a handle — and the mix is only droppable AFTER the widest
+        // row it must sit beside is accounted for. Omitting this term is what
+        // made this test fail when the handle column landed.
+        let handle_cols =
+            HANDLE_GAP_COLS + short_handle(&m.id).map_or(0, |h| h.chars().count());
+        let base = name_cols + ROW_FIXED_COLS + handle_cols;
 
-        // One column short of fitting the mix: the mix goes, the id survives
-        // intact — the fraction and bar already carry the mix's information.
-        let tight = id_cols + ROW_FIXED_COLS + MIX_GAP_COLS + mix_cols - 1;
-        let l = plan_layout([view(&m, 2, 1)].iter(), Some(tight));
-        assert_eq!(l.id_width, id_cols, "id must not shrink while a mix column is still droppable");
+        // One column short of fitting the mix: the mix goes, the name AND the
+        // handle survive intact — the fraction and bar already carry the mix's
+        // information, so it is the first thing worth losing.
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(base + MIX_GAP_COLS + mix_cols - 1));
+        assert_eq!(l.name_width, name_cols, "the name must not shrink while the mix is droppable");
+        assert!(l.show_handle, "the handle must not go before the mix");
         assert!(!l.show_mix);
 
         // And one column MORE than the widest with-mix row does fit it.
-        let exact = id_cols + ROW_FIXED_COLS + MIX_GAP_COLS + mix_cols;
-        assert!(plan_layout([view(&m, 2, 1)].iter(), Some(exact)).show_mix);
+        assert!(plan_layout([view(&m, 2, 1)].iter(), Some(base + MIX_GAP_COLS + mix_cols)).show_mix);
     }
 
     #[test]
     fn plan_layout_truncates_the_id_only_when_even_that_cannot_fit() {
         let m = mission("m-0123456789-0123456789", MissionStatus::Active);
         let l = plan_layout([view(&m, 1, 0)].iter(), Some(ROW_FIXED_COLS + 15));
-        assert_eq!(l.id_width, 15);
+        assert_eq!(l.name_width, 15);
         assert!(!l.show_mix);
     }
 
@@ -1129,7 +1302,114 @@ mod tests {
         // an id too short to identify anything.
         let m = mission("m-0123456789-0123456789", MissionStatus::Active);
         let l = plan_layout([view(&m, 1, 0)].iter(), Some(10));
-        assert_eq!(l.id_width, MIN_ID_COLS);
+        assert_eq!(l.name_width, MIN_NAME_COLS);
+    }
+
+    // ── (#1612) What a row actually calls a mission ─────────────────────────
+
+    /// The two description shapes measured on a real 92-mission board, and the
+    /// fallback. The `dispatch: ` prefix goes because `kind_glyph` already
+    /// carries "this is one role, not a graph".
+    #[test]
+    fn display_label_prefers_the_description_and_drops_the_dispatch_prefix() {
+        let mut m = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Finalized);
+        m.description = "dispatch: code-reviewer".into();
+        assert_eq!(display_label(&m), "code-reviewer");
+
+        m.description = "PR review — kstrat2001/darkmux@38031a5".into();
+        assert_eq!(display_label(&m), "PR review — kstrat2001/darkmux@38031a5");
+
+        // No description at all: an id is a poor label, never a wrong one.
+        m.description = "   ".into();
+        assert_eq!(display_label(&m), "dispatch-code-reviewer-1785589698-5d6a-0");
+    }
+
+    /// Both minting formats seen in the wild yield a handle; hand-authored ids
+    /// correctly yield none rather than a meaningless word fragment.
+    #[test]
+    fn short_handle_finds_the_mint_discriminator_or_nothing() {
+        // `mint_run_id`: <config>-<secs>-<hex6>
+        assert_eq!(short_handle("review-1785400940-136e76"), Some("136e76"));
+        // the older dispatch path: <config>-<role>-<secs>-<hex>-<n>
+        assert_eq!(short_handle("dispatch-code-reviewer-1785589698-5d6a-0"), Some("5d6a"));
+        // Hand-authored ids have no discriminator — a column of word fragments
+        // would be worse than an empty column.
+        assert_eq!(short_handle("doom-loop-m4"), None);
+        assert_eq!(short_handle("104-daemon-observability"), None);
+        // The `-0` counter is below the hex floor, so it can never be picked as
+        // the handle in preference to the real one.
+        assert!(short_handle("dispatch-x-1785589698-5d6a-0") != Some("0"));
+    }
+
+    /// Rounds DOWN and emits exactly one unit, so the column is `AGE_COLS` wide
+    /// for every value it can produce short of a hundred weeks.
+    #[test]
+    fn relative_age_is_one_unit_and_fits_its_column() {
+        assert_eq!(relative_age(30, 0), "now");
+        assert_eq!(relative_age(59, 0), "now");
+        assert_eq!(relative_age(60, 0), "1m");
+        assert_eq!(relative_age(3_599, 0), "59m");
+        assert_eq!(relative_age(3_600, 0), "1h");
+        assert_eq!(relative_age(86_399, 0), "23h");
+        assert_eq!(relative_age(86_400, 0), "1d");
+        assert_eq!(relative_age(2_591_999, 0), "29d");
+        assert_eq!(relative_age(2_592_000, 0), "4w");
+        // A clock that went backwards must not underflow into a huge age.
+        assert_eq!(relative_age(0, 5_000), "now");
+        for secs in [0u64, 61, 4_000, 90_000, 3_000_000, 60_000_000] {
+            assert!(
+                relative_age(secs, 0).chars().count() <= AGE_COLS,
+                "{secs}s rendered wider than AGE_COLS"
+            );
+        }
+    }
+
+    /// Single-width, both of them — an emoji here would overflow every row it
+    /// appeared on, because every budget in this module is exact `chars()` math.
+    #[test]
+    fn kind_glyph_separates_graphs_from_single_role_dispatches() {
+        assert_eq!(kind_glyph(3), "◆");
+        assert_eq!(kind_glyph(1), "•");
+        assert_eq!(kind_glyph(0), "•");
+        for total in [0, 1, 2, 9] {
+            assert_eq!(kind_glyph(total).chars().count(), 1);
+        }
+    }
+
+    /// The new rung in the ladder. Between "everything fits" and "truncate the
+    /// name" the handle goes — the age still tells two same-named rows apart,
+    /// and the full id is on the row's own link.
+    #[test]
+    fn plan_layout_drops_the_handle_before_truncating_the_name() {
+        let m = mission("review-1785400940-136e76", MissionStatus::Active);
+        let name_cols = display_label(&m).chars().count();
+        let handle_cols = short_handle(&m.id).unwrap().chars().count();
+
+        // Exactly wide enough for the handle but not the mix: handle stays.
+        let with_handle = name_cols + ROW_FIXED_COLS + HANDLE_GAP_COLS + handle_cols;
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(with_handle));
+        assert!(l.show_handle && !l.show_mix);
+        assert_eq!(l.name_width, name_cols);
+
+        // One column short: the handle goes, the name survives INTACT.
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(with_handle - 1));
+        assert!(!l.show_handle);
+        assert_eq!(l.name_width, name_cols, "the name must not shrink while the handle is droppable");
+
+        // Only below the no-handle row does the name finally truncate.
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(name_cols + ROW_FIXED_COLS - 1));
+        assert!(!l.show_handle);
+        assert!(l.name_width < name_cols);
+    }
+
+    /// A board whose ids carry no discriminator must not pay two gap columns
+    /// for a column of blanks.
+    #[test]
+    fn plan_layout_plans_no_handle_column_when_no_row_has_one() {
+        let m = mission("doom-loop-m4", MissionStatus::Active);
+        let l = plan_layout([view(&m, 2, 1)].iter(), Some(200));
+        assert!(!l.show_handle);
+        assert_eq!(l.handle_width, 0);
     }
 
     /// (#1569 packet A) Mission ids are NOT guaranteed path-safe — `pr-review`

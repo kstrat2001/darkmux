@@ -4115,3 +4115,153 @@
         assert!(err.contains("ghost"), "{err}");
         assert!(err.contains("lms ls"), "{err}");
     }
+
+// ── (#1609) Namespace contract: darkmux never unloads user state ────────────
+
+/// The regression itself. A hand-loaded resident serves the same model key as
+/// the profile wants, but darkmux does not own it — selecting it as a reload
+/// target is what let a dispatch unload the operator's own model mid-run.
+#[test]
+fn a_foreign_resident_is_never_a_reload_target() {
+    assert!(
+        !super::is_reloadable_target("qwen3-4b", "qwen3-4b", "qwen3-4b", None),
+        "a bare identifier is USER state — matching the model key must not make it ours"
+    );
+}
+
+/// The other half: the guard must not break the case it exists to serve.
+#[test]
+fn a_darkmux_owned_resident_of_the_same_model_is_a_reload_target() {
+    assert!(super::is_reloadable_target(
+        "qwen3-4b",
+        "darkmux:qwen3-4b",
+        "qwen3-4b",
+        None
+    ));
+}
+
+/// Ownership alone is not enough — a darkmux resident of a DIFFERENT model is
+/// still not a target, or a reload would evict an unrelated seat.
+#[test]
+fn a_darkmux_owned_resident_of_another_model_is_not_a_reload_target() {
+    assert!(!super::is_reloadable_target(
+        "llama-3-8b",
+        "darkmux:llama-3-8b",
+        "qwen3-4b",
+        None
+    ));
+}
+
+/// The ForeignDuplicate shape end to end: both copies resident, only ours
+/// selectable. This is the exact list `lms ps` returns when an operator has
+/// hand-loaded a model darkmux also uses.
+#[test]
+fn with_both_copies_resident_only_the_darkmux_one_is_selected() {
+    let residents = [
+        ("qwen3-4b", "qwen3-4b"),           // the operator's, loaded first
+        ("qwen3-4b", "darkmux:qwen3-4b"),   // darkmux's own
+    ];
+    let picked: Vec<&str> = residents
+        .iter()
+        .filter(|(m, id)| super::is_reloadable_target(m, id, "qwen3-4b", None))
+        .map(|(_, id)| *id)
+        .collect();
+    assert_eq!(
+        picked,
+        vec!["darkmux:qwen3-4b"],
+        "exactly one target, and never the operator's — insertion order must not decide this"
+    );
+}
+
+// ── (#1615) The namespace is a decoration on the identifier, never the key ───
+
+/// The strip itself, both directions. A bare key must survive untouched — the
+/// overwhelmingly common spelling — and a namespaced one must reduce to the key
+/// LMStudio actually publishes.
+#[test]
+fn bare_model_key_strips_only_the_namespace() {
+    assert_eq!(super::bare_model_key("qwen3-4b-instruct-2507"), "qwen3-4b-instruct-2507");
+    assert_eq!(
+        super::bare_model_key("darkmux:qwen3-4b-instruct-2507"),
+        "qwen3-4b-instruct-2507"
+    );
+    // Not a prefix match on anything shorter or adjacent — those are real keys.
+    assert_eq!(super::bare_model_key("dark:foo"), "dark:foo");
+    assert_eq!(super::bare_model_key("predarkmux:foo"), "predarkmux:foo");
+    // Idempotent: stripping an already-bare key is a no-op, so normalizing
+    // twice on a path that gains a second call site can never over-strip.
+    let once = super::bare_model_key("darkmux:foo");
+    assert_eq!(super::bare_model_key(once), once);
+}
+
+/// The regression. `internal.utility` accepts a namespaced IDENTIFIER
+/// (`darkmux:qwen3-4b-instruct-2507`) where a model KEY belongs, and `lms ps`
+/// reports the resident as `modelKey=qwen3-4b-instruct-2507`. Comparing the
+/// prefixed string against that key can never match, so darkmux's OWN compactor
+/// read as absent on every dispatch — it reloaded each time, and when the load
+/// itself was handed the same prefixed string it could not resolve at all.
+#[test]
+fn a_namespaced_utility_binding_still_finds_darkmuxs_own_resident() {
+    let want = super::bare_model_key("darkmux:qwen3-4b-instruct-2507");
+    assert!(
+        super::is_reloadable_target(
+            "qwen3-4b-instruct-2507",
+            "darkmux:qwen3-4b-instruct-2507",
+            want,
+            None
+        ),
+        "darkmux's own resident must be recognized however the operator spelled the binding"
+    );
+    // And the #1609 guarantee is undamaged by the normalization: a foreign
+    // copy of the same model is still never a target.
+    assert!(!super::is_reloadable_target(
+        "qwen3-4b-instruct-2507",
+        "qwen3-4b-instruct-2507",
+        want,
+        None
+    ));
+}
+
+// ── (#1617 review) The documented `identifier` opt-out is still darkmux's ───
+
+/// The regression the first shape of the #1609 guard introduced.
+///
+/// `ProfileModel.identifier` is a documented namespace opt-out: darkmux loads
+/// under the operator's literal string, which does NOT start with `darkmux:`.
+/// A prefix-only ownership test therefore rejected darkmux's OWN load — so
+/// every dispatch after the first re-announced "loading…", printed the "darkmux
+/// does not own and will not unload" notice about its own instance, and loaded
+/// again under a name already taken.
+#[test]
+fn a_profiles_explicit_identifier_is_still_darkmuxs_own_load() {
+    assert!(
+        super::is_reloadable_target("qwen3-4b", "myid", "qwen3-4b", Some("myid")),
+        "a load made under the profile's declared identifier must be recognized as ours"
+    );
+    // ...and the #1609 guarantee survives it: a hand-loaded BARE copy still
+    // cannot be selected, because it cannot carry the declared identifier.
+    assert!(
+        !super::is_reloadable_target("qwen3-4b", "qwen3-4b", "qwen3-4b", Some("myid")),
+        "the operator's own bare copy is never a target, opt-out or not"
+    );
+    // Nor can some other profile's opt-out name be mistaken for this one's.
+    assert!(!super::is_reloadable_target("qwen3-4b", "otherid", "qwen3-4b", Some("myid")));
+    // And with no opt-out declared, the namespaced form is what counts —
+    // a bare-named resident is user state even though the KEY matches.
+    assert!(super::is_reloadable_target("qwen3-4b", "darkmux:qwen3-4b", "qwen3-4b", None));
+    assert!(!super::is_reloadable_target("qwen3-4b", "myid", "qwen3-4b", None));
+}
+
+/// The identifier darkmux mints must be byte-identical whichever spelling the
+/// operator used — otherwise normalizing the key would fork ownership, and
+/// `machine eject` would stop recognizing loads made under the other spelling.
+#[test]
+fn normalizing_the_key_does_not_change_the_minted_identifier() {
+    let from_bare =
+        darkmux_gestalt::namespaced_identifier(super::bare_model_key("qwen3-4b"), None);
+    let from_namespaced =
+        darkmux_gestalt::namespaced_identifier(super::bare_model_key("darkmux:qwen3-4b"), None);
+    assert_eq!(from_bare, "darkmux:qwen3-4b");
+    assert_eq!(from_bare, from_namespaced);
+    assert!(darkmux_profiles::swap::is_darkmux_owned(&from_namespaced));
+}

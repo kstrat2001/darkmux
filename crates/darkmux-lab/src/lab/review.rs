@@ -837,6 +837,39 @@ impl RemoteBucket {
             return None;
         }
         let granted = u32::try_from(self.remaining()).unwrap_or(u32::MAX).min(requested);
+        // (#1610) A grant too small to buy a parseable ruling is a DENIAL, not
+        // a grant. Clamping without a floor dispatched judge calls with caps
+        // like 60 tokens against a JSON-ruling prompt: the reply truncates,
+        // parses as `Unparsed`, classifies as `Reject`, and
+        // `multi_pass_confirm` archives the flag on pass 1 with an empty note
+        // and no confirmation pass — a real finding deleted.
+        //
+        // And silently: because this returned `Some`, `skipped` never
+        // incremented, so none of the degraded gates fired. The run reported
+        // healthy. A flag that could not be judged must read as UNJUDGED, never
+        // as rejected — the whole point of the skip counter is that a review
+        // says when it did less than it claims.
+        //
+        // The floor is deliberately generous relative to a ruling's real cost;
+        // erring toward "deny and report" is correct here, because a denial is
+        // visible and a starved grant is not.
+        // The floor is capped by the CONFIGURED budget, because the operator's
+        // budget is the authority on what "enough" means. If they configured
+        // 100 tokens total, a 100-token grant is not starvation — it is their
+        // policy, and denying it would silently turn every budget under the
+        // floor into a hard opt-out, redefining a documented config knob
+        // (`remote.max_tokens_per_execution`, whose only documented refusal
+        // value is 0). Starvation is the OTHER shape: a large budget whose
+        // remainder has dwindled to a sliver.
+        //
+        // `MapRemoteBucket::admit_reserve` carries the identical floor for the
+        // identical reason (#1617 review) — the two buckets meter different
+        // stages but share this failure mode.
+        let floor = MIN_VIABLE_JUDGE_GRANT.min(u32::try_from(self.budget).unwrap_or(u32::MAX));
+        if granted < floor {
+            self.skipped += 1;
+            return None;
+        }
         self.used = self.used.saturating_add(u64::from(granted));
         Some(granted)
     }
@@ -1175,6 +1208,18 @@ impl ModelCycler for LmsCycler {
 const PROBE_TEMPERATURE: f32 = 0.2;
 const JUDGE_TEMPERATURE: f32 = 0.2;
 const DEFAULT_PROBE_MAX_TOKENS: u32 = 4_000;
+/// (#1610) The smallest completion cap that can still buy a parseable judge
+/// ruling. Below this, `admit_reserve` denies (a visible skip) rather than
+/// granting a cap that can only produce a truncated, unparseable reply — which
+/// the pipeline would otherwise read as the model rejecting the flag.
+///
+/// Sized well under a normal ruling and well over a truncation: a ruling is a
+/// small JSON object, and anything under a few hundred tokens cannot close it.
+///
+/// Capped at the configured budget where that is smaller — see `admit_reserve`.
+/// A deliberately tiny budget is an operator policy, not a starved grant.
+const MIN_VIABLE_JUDGE_GRANT: u32 = 512;
+
 const DEFAULT_JUDGE_MAX_TOKENS: u32 = 20_000;
 /// (#1260) Reasoning-aware completion FLOOR for REMOTE seats. Local-tuned
 /// defaults (probe's 4000 especially) are the reasoning-guillotine class on

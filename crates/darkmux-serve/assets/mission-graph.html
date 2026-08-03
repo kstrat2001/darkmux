@@ -145,8 +145,18 @@
      `pointer-events:none` on the body so the container never steals a click
      from a task inside it; the handles are absolutely positioned by React
      Flow and unaffected. */
-  .phasegroup{width:100%;height:100%;box-sizing:border-box;border:1px solid var(--line);
-    border-radius:14px;background:rgba(255,255,255,.018);pointer-events:none;position:relative}
+  /* (#1618) The BASE border is what a `planned` phase gets — there is no
+     `.s-planned` rule, so every not-yet-started phase falls through to here.
+     It used to be `var(--line)` (#1f1f24) on `var(--bg)` (#0a0a0b): about
+     1.2:1, which is not a faint container, it is an invisible one. The last
+     phase of a running mission is ALWAYS planned, so the mission's own
+     destination was the least visible thing on the canvas — the operator read
+     the phase-order arrow as pointing into nothing.
+     A container must read as a container before it reads as a status. This is
+     still quiet — well below the amber/green a running or complete phase
+     earns — but it is unambiguously THERE. */
+  .phasegroup{width:100%;height:100%;box-sizing:border-box;border:1px solid rgba(138,138,146,.34);
+    border-radius:14px;background:rgba(255,255,255,.028);pointer-events:none;position:relative}
   .phasegroup .pg-label{position:absolute;top:10px;left:14px;display:flex;flex-direction:column;gap:2px;line-height:1.1}
   .phasegroup .pg-kind{font:600 9px 'JetBrains Mono',monospace;letter-spacing:.14em;color:var(--muted);opacity:.8}
   .phasegroup .pg-name{font:600 13px 'JetBrains Mono',monospace;color:var(--text);opacity:.85}
@@ -172,7 +182,16 @@
      makes it read as one opaque overlay parked in its corner, on top of the
      canvas rather than tangled into it. Corner-anchored (bottom-right) is the
      React Flow default; we only firm up the stacking + chrome here. */
-  .react-flow__minimap{background:var(--bg2)!important;border:1px solid var(--line);border-radius:6px;z-index:6}
+  /* (#1618) And it must never overflow its own viewport. React Flow sizes the
+     widget from the FLOW's extent, not the screen's, so a wide graph produced
+     a ~940px minimap that ran off the right edge — the operator's report was
+     "off the screen", on a phone, where the 104px cap below was supposed to
+     have handled it. It did not, because that cap lives behind a <=700px media
+     query and this page renders its canvas at a logical width above it.
+     A viewport-relative cap needs no breakpoint to be right: whatever React
+     Flow asks for, it cannot exceed a third of the screen. */
+  .react-flow__minimap{background:var(--bg2)!important;border:1px solid var(--line);border-radius:6px;z-index:6;
+    max-width:min(33vw,240px)!important;max-height:min(28vh,180px)!important}
   .react-flow__attribution{display:none}
 
   /* (#1403) In-site navigation — explicit, not the wordmark. The operator
@@ -487,8 +506,30 @@ function computeLayout(nodes){
     var tasks = tasksByPhase[phase.id] || [];
     var byDepth = {};
     var maxDepth = 0;
+    // (#1618) `depth` is the task's depth in the WHOLE mission DAG, but the
+    // column here is a position within ONE phase band. Using the global number
+    // directly indented every phase by however many columns preceded it: in
+    // the review graph, Investigate held depths 0-2, so Adjudicate's lone
+    // Judge task landed in column 3 and Report's Verify in column 4 — each
+    // lane empty from its own left edge out to there, the last one clipped off
+    // the right of the viewport entirely.
+    //
+    // Worse than ugly, it made the phase-transition arrows LIE: the
+    // `phase_order` edge runs band-to-band down the left, so it pointed into
+    // an empty lane while that lane's only task sat far off to the right.
+    // The operator read it as a broken arrow, which is exactly what it looked
+    // like.
+    //
+    // Re-base each band to its own first column. Intra-phase dependency order
+    // still reads left-to-right (the RELATIVE depths are untouched); only the
+    // per-band offset is dropped. `maxDepth` becomes band-local too, so the
+    // container box below stops stretching to accommodate columns that were
+    // never in this phase.
+    var minDepth = Infinity;
+    tasks.forEach(function(t){ minDepth = Math.min(minDepth, t.depth || 0); });
+    if (!isFinite(minDepth)) minDepth = 0;
     tasks.forEach(function(t){
-      var d = t.depth || 0;
+      var d = Math.max(0, (t.depth || 0) - minDepth);
       maxDepth = Math.max(maxDepth, d);
       (byDepth[d] = byDepth[d] || []).push(t);
     });

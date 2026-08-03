@@ -3144,6 +3144,133 @@ mod tests {
         }
     }
 
+    /// (#1611 / #1617 review) A record written by a NEWER darkmux must not read
+    /// as tampering.
+    ///
+    /// This is the differential the frontier review built to disprove #1611's
+    /// original claim, kept as a permanent regression test. The catch-all enum
+    /// variants make such a record PARSE — but `audit_hash_of` recomputes the
+    /// BLAKE3 from the re-serialized struct, and an unknown `"catastrophe"`
+    /// re-serializes as `"unknown"`. So leniency alone converted the failure
+    /// from `unparseable JSON` into `hash mismatch — record content has been
+    /// edited`, which reads MORE like tampering, on the one substrate where a
+    /// false alarm is most expensive.
+    ///
+    /// The simulation is faithful rather than convenient: the record is given
+    /// the hash the NEWER writer would have stored — computed over ITS spelling
+    /// — because a test that stored this binary's hash would be testing
+    /// tampering, not skew.
+    #[serial_test::serial]
+    #[test]
+    fn a_newer_peers_record_reads_as_unverifiable_not_as_tampering() {
+        let tmp = TempDir::new().unwrap();
+        let prev_audit = env::var("DARKMUX_AUDIT_DIR").ok();
+        unsafe { env::set_var("DARKMUX_AUDIT_DIR", tmp.path()); }
+
+        let sink = AuditFileSink::new();
+        for i in 0..3u32 {
+            let rec = FlowRecord {
+                ts: format!("2026-08-03T00:00:0{i}Z"),
+                level: Level::Info,
+                category: Category::Work,
+                tier: Tier::Operator,
+                stage: Stage::Scope,
+                action: format!("audit-{i}"),
+                handle: format!("rec-{i}"),
+                phase_id: None,
+                session_id: None,
+                source: None,
+                model: None,
+                reasoning: None,
+                mission_id: None,
+                machine_id: None,
+                machine_uid: None,
+                orchestrator: None,
+                prev_hash: None,
+                hash: None,
+                payload: None,
+                work_id: None,
+                attempt: None,
+            };
+            sink.write(&rec).unwrap();
+        }
+
+        let day = day_utc_now();
+        let path = tmp.path().join(format!("{day}.jsonl"));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = contents.lines().map(String::from).collect();
+
+        // Rewrite the middle record the way a newer binary would have written
+        // it: an enum spelling this binary does not know, hashed over THAT
+        // spelling. Line 0 is the schema header, so record 1 is at index 2.
+        let target = lines[2].clone();
+        let old_hash = {
+            let v: serde_json::Value = serde_json::from_str(&target).unwrap();
+            v["hash"].as_str().unwrap().to_string()
+        };
+        // `audit_hash_of` serializes the struct with `hash: None`, and
+        // `skip_serializing_if` omits it entirely — so the canonical bytes are
+        // this line with that one member removed. Reconstructing through a
+        // `serde_json::Value` would NOT work: `Map` is a BTreeMap, so key order
+        // would diverge from the struct's declaration order.
+        let newer = target
+            .replace(&format!(",\"hash\":\"{old_hash}\""), "")
+            .replace("\"level\":\"info\"", "\"level\":\"catastrophe\"");
+        let newer_hash = blake3::hash(newer.as_bytes()).to_hex().to_string();
+        lines[2] = newer.replace(
+            "\"prev_hash\":",
+            &format!("\"hash\":\"{newer_hash}\",\"prev_hash\":"),
+        );
+        // Guard the simulation itself: if the splice didn't land, the test
+        // would "pass" while proving nothing.
+        assert!(lines[2].contains("catastrophe"), "the newer spelling must be in the line");
+        assert!(lines[2].contains(&newer_hash), "the newer writer's hash must be stored");
+
+        // Re-link the tail, because the newer writer would have. Rewriting one
+        // record in place leaves the NEXT record's `prev_hash` pointing at a
+        // hash that no longer exists — which is a genuine chain break, and
+        // would have made this test assert the wrong thing. The records after
+        // the skewed one use only known variants, so they re-hash normally.
+        let mut prev = newer_hash.clone();
+        for line in lines.iter_mut().skip(3) {
+            let mut rec: FlowRecord = serde_json::from_str(line).unwrap();
+            rec.prev_hash = Some(prev.clone());
+            rec.hash = None;
+            let h = crate::integrity::audit_hash_of(&rec).unwrap();
+            rec.hash = Some(h.clone());
+            *line = serde_json::to_string(&rec).unwrap();
+            prev = h;
+        }
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let report = integrity_check_file(&path).unwrap();
+
+        assert!(
+            report.chain_valid,
+            "a newer peer's record is a VERSION SKEW, never a compliance event; got {report:?}"
+        );
+        assert!(
+            report.break_reason.is_none(),
+            "nothing was tampered with — reporting a reason at all trains the operator to \
+             dismiss the real thing; got {:?}",
+            report.break_reason
+        );
+        assert_eq!(
+            report.unverifiable_newer, 1,
+            "...but it must be COUNTED — 'verified' and 'could not verify' are different claims"
+        );
+        // The records this binary CAN verify were still verified, and the chain
+        // still links across the skewed one.
+        assert_eq!(report.records_checked, 3);
+
+        unsafe {
+            match prev_audit {
+                Some(v) => env::set_var("DARKMUX_AUDIT_DIR", v),
+                None => env::remove_var("DARKMUX_AUDIT_DIR"),
+            }
+        }
+    }
+
     #[serial_test::serial]
     #[test]
     fn audit_file_sink_recovers_from_header_only_file() {
