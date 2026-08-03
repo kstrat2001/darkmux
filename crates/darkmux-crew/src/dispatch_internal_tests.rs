@@ -4115,3 +4115,58 @@
         assert!(err.contains("ghost"), "{err}");
         assert!(err.contains("lms ls"), "{err}");
     }
+
+// ── (#1609) Namespace contract: darkmux never unloads user state ────────────
+
+/// The regression itself. A hand-loaded resident serves the same model key as
+/// the profile wants, but darkmux does not own it — selecting it as a reload
+/// target is what let a dispatch unload the operator's own model mid-run.
+#[test]
+fn a_foreign_resident_is_never_a_reload_target() {
+    assert!(
+        !super::is_reloadable_target("qwen3-4b", "qwen3-4b", "qwen3-4b"),
+        "a bare identifier is USER state — matching the model key must not make it ours"
+    );
+}
+
+/// The other half: the guard must not break the case it exists to serve.
+#[test]
+fn a_darkmux_owned_resident_of_the_same_model_is_a_reload_target() {
+    assert!(super::is_reloadable_target(
+        "qwen3-4b",
+        "darkmux:qwen3-4b",
+        "qwen3-4b"
+    ));
+}
+
+/// Ownership alone is not enough — a darkmux resident of a DIFFERENT model is
+/// still not a target, or a reload would evict an unrelated seat.
+#[test]
+fn a_darkmux_owned_resident_of_another_model_is_not_a_reload_target() {
+    assert!(!super::is_reloadable_target(
+        "llama-3-8b",
+        "darkmux:llama-3-8b",
+        "qwen3-4b"
+    ));
+}
+
+/// The ForeignDuplicate shape end to end: both copies resident, only ours
+/// selectable. This is the exact list `lms ps` returns when an operator has
+/// hand-loaded a model darkmux also uses.
+#[test]
+fn with_both_copies_resident_only_the_darkmux_one_is_selected() {
+    let residents = [
+        ("qwen3-4b", "qwen3-4b"),           // the operator's, loaded first
+        ("qwen3-4b", "darkmux:qwen3-4b"),   // darkmux's own
+    ];
+    let picked: Vec<&str> = residents
+        .iter()
+        .filter(|(m, id)| super::is_reloadable_target(m, id, "qwen3-4b"))
+        .map(|(_, id)| *id)
+        .collect();
+    assert_eq!(
+        picked,
+        vec!["darkmux:qwen3-4b"],
+        "exactly one target, and never the operator's — insertion order must not decide this"
+    );
+}

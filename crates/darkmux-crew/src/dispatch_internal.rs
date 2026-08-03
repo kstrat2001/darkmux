@@ -1028,7 +1028,7 @@ pub(crate) fn remote_chat_url(ep: &darkmux_types::ModelEndpoint) -> String {
 /// string formatting delegates to `darkmux_flow::remote_route_label`
 /// (#1230 Packet 0) so this shape has one source of truth shared with the
 /// review→dispatch bookend bridge in `src/pr_review.rs`.
-fn remote_endpoint_label(ep: &darkmux_types::ModelEndpoint, model_id: &str) -> String {
+pub(crate) fn remote_endpoint_label(ep: &darkmux_types::ModelEndpoint, model_id: &str) -> String {
     let url = ep.base_url();
     let host = url
         .split("://")
@@ -4083,6 +4083,23 @@ fn strict_selection_enabled() -> bool {
 /// A load failure (insufficient RAM / LMStudio load timeout) returns a clear,
 /// operator-actionable error rather than degrading silently to the default —
 /// the early-detection half of #1139 (the fallback/eviction half is #1139/#1140).
+/// (#1609) Is this resident a legitimate unload/reload target for `want`?
+///
+/// BOTH conditions, and the second is the one that was missing: the resident
+/// must serve the model we want AND be one darkmux owns. `lms ps` reports a
+/// darkmux load as `identifier=darkmux:foo, modelKey=foo` and a hand-loaded
+/// one as `identifier=foo, modelKey=foo`, so a model-key-only match selects
+/// the operator's copy just as readily as ours — and the caller unloads what
+/// it selects.
+///
+/// Extracted as a free function so the namespace guarantee is TESTABLE without
+/// a live `lms`. The contract it enforces (#1274) is absolute, and an absolute
+/// contract defended only by a line of prose inside a match arm is how this
+/// broke in the first place.
+pub(crate) fn is_reloadable_target(resident_model: &str, resident_identifier: &str, want: &str) -> bool {
+    resident_model == want && darkmux_profiles::swap::is_darkmux_owned(resident_identifier)
+}
+
 fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
     use darkmux_profiles::{lms, swap};
     // (#1282) This is a LOCAL load path (remote-brained dispatches skip it) —
@@ -4090,7 +4107,21 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
     // uniform require_n_ctx message, never a parse-stage failure.
     let n_ctx = pm.require_n_ctx()?;
     let loaded = lms::list_loaded().unwrap_or_default();
-    match loaded.iter().find(|m| m.model == pm.id) {
+    // (#1609) Consider ONLY darkmux-owned residents. This used to match on the
+    // bare model key alone — and `lms ps` reports a darkmux load as
+    // `identifier=darkmux:foo, modelKey=foo` and a hand-loaded one as
+    // `identifier=foo, modelKey=foo`, so BOTH matched. The unload below then
+    // took whichever came first, which on the sanctioned ForeignDuplicate path
+    // is the operator's own copy: darkmux deleted user state mid-dispatch,
+    // with a stderr line that read like a routine reload.
+    //
+    // The namespace convention exists precisely so this is impossible by
+    // construction (#1274, ABSOLUTE for model lifecycle): darkmux loads,
+    // unloads and reconciles only `darkmux:*`. `darkmux-gestalt` enforces that
+    // structurally through `OwnedTarget`; this legacy path reached past it to
+    // the raw `lms::unload`, so the guarantee has to be restated here until
+    // the raw call is retired in favor of the `ModelHost` seam.
+    match loaded.iter().find(|m| is_reloadable_target(&m.model, &m.identifier, &pm.id)) {
         Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
         Some(m) => {
             eprintln!(
@@ -4104,11 +4135,26 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
             })?;
         }
         None => {
-            eprintln!(
-                "darkmux dispatch: loading `{}` at n_ctx={} (the profile's declared \
-                 context) before dispatch. (#1135)",
-                pm.id, n_ctx
-            );
+            // (#1609) A foreign resident of the same model is NOT an error and
+            // NOT ours to remove — the contract is "surface a reason naming the
+            // blocking instance and suggest; never touch". darkmux loads its
+            // own namespaced copy alongside it, exactly as the gestalt planner
+            // already decides for a ForeignDuplicate.
+            if let Some(foreign) = loaded.iter().find(|m| m.model == pm.id) {
+                eprintln!(
+                    "darkmux dispatch: `{}` is already resident as `{}`, which darkmux \
+                     does not own and will not unload; loading darkmux's own copy at \
+                     n_ctx={} alongside it. Free the RAM yourself with `lms unload {}` \
+                     if that is not what you want. (#1609)",
+                    pm.id, foreign.identifier, n_ctx, foreign.identifier
+                );
+            } else {
+                eprintln!(
+                    "darkmux dispatch: loading `{}` at n_ctx={} (the profile's declared \
+                     context) before dispatch. (#1135)",
+                    pm.id, n_ctx
+                );
+            }
         }
     }
     let identifier = swap::namespaced_identifier(pm);
