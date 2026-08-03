@@ -1417,15 +1417,24 @@ function tokensOffMeter(){
       dcTok.set(r.session_id,r.payload);
     }
   }
-  // Sessions POSITIVELY known local: a dispatch bookend that resolved with no
-  // endpoint. Anything else is unknown — absence of evidence is not evidence
-  // of local.
+  // Sessions POSITIVELY known local — and the bar is a SUCCESSFUL TERMINAL
+  // with no endpoint, not any bookend at all.
+  //
+  // A `dispatch.start` proves nothing: the review path stamps its remote
+  // classification only when it CLOSES cleanly, so its start record carries no
+  // endpoint no matter how the run is staffed. Accepting starts meant a hosted
+  // review that panicked or errored mid-run had its per-call token records —
+  // already emitted, already spent — read as local, which is the exact
+  // flattering direction this whole change exists to remove, surviving on the
+  // error path. `dispatch.error` is excluded for the same reason: a run that
+  // died before classifying itself has not told us where it ran.
+  //
+  // So the only positive evidence is a clean completion that named no
+  // endpoint. Everything else is unknown, which is the honest answer.
   const localSids=new Set();
   for(const r of DATA){
     if(T(r.ts)>state.t||!r.session_id||!r.payload)continue;
-    if((r.action==="dispatch.start"||r.action==="dispatch.complete")&&!r.payload.endpoint){
-      localSids.add(r.session_id);
-    }
+    if(r.action==="dispatch.complete"&&!r.payload.endpoint)localSids.add(r.session_id);
   }
   let total=0,prompt=0,completion=0,cloud=0,unknown=0;const sess=new Map();
   for(const r of DATA){
@@ -1477,6 +1486,12 @@ function tokensOffMeter(){
     const tt=p.total_tokens||((p.prompt_tokens||0)+(p.completion_tokens||0))||p.remote_tokens||0;
     total+=tt; cloud+=tt; prompt+=p.prompt_tokens||0; completion+=p.completion_tokens||0;
     fresh+=p.prompt_tokens||0;
+    // A `remote_tokens`-only payload has no prompt/completion split to
+    // decompose, so without this its spend joined `total` while appearing in
+    // NO class chip — the headline would quietly exceed the row beneath it.
+    // `unclassified` is exactly the bucket for "counted, cannot be broken
+    // down", and it already renders only when non-zero.
+    if(!p.total_tokens&&!p.prompt_tokens&&!p.completion_tokens&&p.remote_tokens)uncls+=tt;
     directRuns++; cloudRuns++;
   }
   // `local` is now what is LEFT after both the cloud and the unknown are
