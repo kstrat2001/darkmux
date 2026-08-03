@@ -1280,9 +1280,18 @@ function renderMissionTimeline(g, metrics, expanded, toggleTask, now){
   return out;
 }
 // (#1403) The mission-scoped events panel body (header + newest-first list).
-function eventsPanelEls(events, closePanel){
+function eventsPanelEls(events, total, closePanel){
+  // `events` is capped at EVENTS_CAP; `total` is how many were actually
+  // available before the slice. Printing only `events.length` turned a
+  // truncation into a total — a mission with 1361 records read "events · 250",
+  // which is the cap, and nothing on screen said so. The CLI's own board
+  // solved this years ago ("… 81 more (3 of 84 shown)"); the viewer should not
+  // be the surface that hides it.
+  var capped = total > events.length;
   return [
-    h("div", {key:"hd", className:"evhd"}, "events · " + events.length,
+    h("div", {key:"hd", className:"evhd"},
+      capped ? ("events · " + events.length + " of " + total)
+             : ("events · " + events.length),
       h("button", {className:"evx", title:"close", onClick: function(){ closePanel(); }}, "✕")),
     h("div", {key:"list", className:"evlist"}, events.length
       ? events.map(function(e){
@@ -1313,6 +1322,11 @@ function App(){
   var metrics = _m[0], setMetrics = _m[1];
   var _e = React.useState([]);
   var events = _e[0], setEvents = _e[1];
+  // Pre-cap count, for honest "N of M" in the panel header. A ref rather than
+  // state because it is derived from the very update that sets `events` — the
+  // write is idempotent, so StrictMode's double-invoke is harmless, and the
+  // setEvents that follows is what schedules the render that reads it.
+  var evTotalRef = React.useRef(0);
   var _mob = React.useState(isNarrowViewport());
   var isMobile = _mob[0], setIsMobile = _mob[1];
   var _vm = React.useState("auto");            // "auto" | "canvas" | "timeline"
@@ -1427,6 +1441,7 @@ function App(){
             merged.push(rows[k]);
           }
           merged.sort(function(a, b){ return (b.ts < a.ts) ? -1 : (b.ts > a.ts) ? 1 : 0; });
+          evTotalRef.current = merged.length;
           return merged.length > EVENTS_CAP ? merged.slice(0, EVENTS_CAP) : merged;
         });
       })
@@ -1520,6 +1535,9 @@ function App(){
                       handle: rec.handle || "", category: rec.category || "",
                       level: rec.level || "" };
           var next = [row].concat(prev);
+          // A live row grows the true total even once the visible list is
+          // pinned at the cap, so the "of M" keeps counting up.
+          evTotalRef.current = Math.max(evTotalRef.current, 0) + 1;
           return next.length > EVENTS_CAP ? next.slice(0, EVENTS_CAP) : next;
         });
       }
@@ -1781,7 +1799,7 @@ function App(){
     ),
     h("div", {className:"body"},
       body,
-      evOpen ? h("div", {className:"evpanel"}, eventsPanelEls(events, function(){ setEvOpen(false); })) : null
+      evOpen ? h("div", {className:"evpanel"}, eventsPanelEls(events, evTotalRef.current, function(){ setEvOpen(false); })) : null
     )
   );
 }

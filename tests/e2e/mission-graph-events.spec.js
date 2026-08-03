@@ -145,6 +145,34 @@ test('records from a PRIOR day still backfill — the cross-day case (#1569 swee
   expect(pageErrors).toEqual([]);
 });
 
+test('the EVENTS header discloses the cap instead of printing it as a total (#1569 sweep)', async ({ page }) => {
+  // The panel caps at EVENTS_CAP (250) and the header printed `events.length`,
+  // so a mission with 1361 records on disk read "events · 250" — the cap
+  // presented as the count, with nothing on screen admitting the truncation.
+  // The CLI's own board has always disclosed this ("… 81 more (3 of 84
+  // shown)"); the viewer should not be the surface that hides it.
+  const pageErrors = [];
+  page.on('pageerror', (e) => pageErrors.push(String(e)));
+  await routeShellAndGraph(page);
+
+  const N = 400; // > EVENTS_CAP
+  const records = Array.from({ length: N }, (_, i) => ({
+    ts: `${TODAY}T10:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z`,
+    action: 'step start', handle: 'step-1', category: 'work', level: 'info',
+  }));
+  await page.route(BACKFILL_RE, (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ records }) })
+  );
+  await page.route(STREAM_RE, (r) => r.fulfill({ contentType: 'text/event-stream', body: '' }));
+
+  await page.goto(`/mission/${MISSION_ID}/graph`);
+
+  // Capped: the header names both numbers, and the list really is at the cap.
+  await expect(page.locator('.evpanel .evhd')).toContainText(`250 of ${N}`);
+  await expect(page.locator('.evpanel .evrow')).toHaveCount(250);
+  expect(pageErrors).toEqual([]);
+});
+
 test('a live-streamed record appends without duplicating a backfilled one', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
