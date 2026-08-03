@@ -861,6 +861,10 @@ impl RemoteBucket {
         // (`remote.max_tokens_per_execution`, whose only documented refusal
         // value is 0). Starvation is the OTHER shape: a large budget whose
         // remainder has dwindled to a sliver.
+        //
+        // `MapRemoteBucket::admit_reserve` carries the identical floor for the
+        // identical reason (#1617 review) — the two buckets meter different
+        // stages but share this failure mode.
         let floor = MIN_VIABLE_JUDGE_GRANT.min(u32::try_from(self.budget).unwrap_or(u32::MAX));
         if granted < floor {
             self.skipped += 1;

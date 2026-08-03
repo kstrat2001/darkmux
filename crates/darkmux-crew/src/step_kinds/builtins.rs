@@ -2357,12 +2357,17 @@ mod tests {
 
     #[test]
     fn map_remote_bucket_admits_until_exhausted_then_skips() {
-        let mut b = MapRemoteBucket::new(100);
-        let g1 = b.admit_reserve(60).expect("fresh bucket admits");
-        b.settle(g1, 60);
-        let g2 = b.admit_reserve(60).expect("still under budget");
-        b.settle(g2, 60); // now 120 >= 100 (the endpoint reported above its grant)
-        assert!(b.admit_reserve(60).is_none(), "over budget -> skip");
+        // (#1617 review) Magnitudes scaled x1000 from the original 100/60.
+        // Those were arbitrary small numbers chosen to exercise the ARITHMETIC,
+        // but they sit below `MIN_VIABLE_MAP_GRANT` — so once the starvation
+        // floor landed, this test was measuring the floor instead of the
+        // accounting it exists to pin. Same shape, realistic token counts.
+        let mut b = MapRemoteBucket::new(100_000);
+        let g1 = b.admit_reserve(60_000).expect("fresh bucket admits");
+        b.settle(g1, 60_000);
+        let g2 = b.admit_reserve(60_000).expect("still under budget");
+        b.settle(g2, 60_000); // now 120k >= 100k (the endpoint reported above its grant)
+        assert!(b.admit_reserve(60_000).is_none(), "over budget -> skip");
         assert_eq!(b.skipped(), 1);
     }
 
@@ -2389,6 +2394,46 @@ mod tests {
         assert_eq!(b2.remaining(), 100, "an errored call spends nothing");
     }
 
+    /// (#1610 / #1617 review) The same starvation class the judge bucket was
+    /// floored against, which this bucket carried unfloored.
+    ///
+    /// A grant too small to hold a reply "succeeds", the endpoint truncates
+    /// mid-JSON, and the caller reads the debris as a result. On this bucket —
+    /// the `dispatch.map` fan-out, i.e. the probe stage — that is reduced
+    /// COVERAGE reported as a clean run. A low-flag review must mean "few
+    /// flags", never "we stopped looking and said nothing".
+    #[test]
+    fn map_remote_bucket_denies_a_starved_grant_instead_of_truncating() {
+        // A budget that was never small, spent down to a sliver: a probe asks
+        // for a usable cap and would be handed 40 tokens. That is the failure.
+        let mut b = MapRemoteBucket::new(100_000);
+        let g = b.admit_reserve(99_960).expect("the first draw admits");
+        b.settle(g, 99_960);
+        assert_eq!(b.remaining(), 40);
+        assert!(
+            b.admit_reserve(4096).is_none(),
+            "a 40-token grant cannot hold a reply — deny it rather than truncate"
+        );
+        assert_eq!(b.skipped(), 1, "and COUNT it, or the run reports coverage it never had");
+
+        // Not starvation: the operator configured a tiny BUDGET. That is
+        // policy — the only documented refusal value for the knob is 0, so a
+        // floor that swallowed small budgets would invent a second one.
+        let mut tiny = MapRemoteBucket::new(100);
+        assert_eq!(
+            tiny.admit_reserve(4096),
+            Some(100),
+            "a deliberately small budget is operator policy, not a starved grant"
+        );
+        assert_eq!(tiny.skipped(), 0);
+
+        // A healthy bucket grants the full ask untouched — the floor must be
+        // invisible on the path that matters most.
+        let mut healthy = MapRemoteBucket::new(100_000);
+        assert_eq!(healthy.admit_reserve(4096), Some(4096));
+        assert_eq!(healthy.skipped(), 0);
+    }
+
     #[test]
     fn map_remote_bucket_zero_budget_is_exhausted_from_the_first_item() {
         // The hard opt-out: a 0 allowance refuses every hosted call, the same
@@ -2402,17 +2447,21 @@ mod tests {
     fn map_remote_bucket_remaining_shrinks_with_spend_and_never_underflows() {
         // (#1442 gate C6) The per-item clamp target: what is LEFT, not the
         // full budget — a late item must not be granted more than remains.
-        let mut b = MapRemoteBucket::new(100);
-        assert_eq!(b.remaining(), 100);
-        let g = b.admit_reserve(70).expect("admits");
-        b.settle(g, 70);
-        assert_eq!(b.remaining(), 30, "a later item's grant clamps to 30, not 100");
+        // (#1617 review) Scaled x1000 from 100/70/30 for the same reason as
+        // `..._admits_until_exhausted_then_skips` above: the original numbers
+        // are below the starvation floor, so they would exercise it rather
+        // than the clamp arithmetic this test is about.
+        let mut b = MapRemoteBucket::new(100_000);
+        assert_eq!(b.remaining(), 100_000);
+        let g = b.admit_reserve(70_000).expect("admits");
+        b.settle(g, 70_000);
+        assert_eq!(b.remaining(), 30_000, "a later item's grant clamps to 30k, not 100k");
         assert_eq!(
-            b.admit_reserve(4096).expect("still admits"),
-            30,
+            b.admit_reserve(40_960).expect("still admits"),
+            30_000,
             "the grant reads the remaining allowance"
         );
-        b.settle(30, 60); // overshoot: the endpoint reported above its grant
+        b.settle(30_000, 60_000); // overshoot: the endpoint reported above its grant
         assert_eq!(b.remaining(), 0, "saturating, never an underflow wrap");
     }
 

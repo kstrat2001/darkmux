@@ -4096,8 +4096,30 @@ fn strict_selection_enabled() -> bool {
 /// a live `lms`. The contract it enforces (#1274) is absolute, and an absolute
 /// contract defended only by a line of prose inside a match arm is how this
 /// broke in the first place.
-pub(crate) fn is_reloadable_target(resident_model: &str, resident_identifier: &str, want: &str) -> bool {
-    resident_model == want && darkmux_profiles::swap::is_darkmux_owned(resident_identifier)
+/// (#1617 review) Ownership is "the identifier THIS PROFILE declares", not
+/// "starts with `darkmux:`". The namespace is the DEFAULT spelling of that
+/// declaration, not the whole of it: `ProfileModel.identifier` is a documented
+/// opt-out (see `darkmux_gestalt::namespaced_identifier`, and the namespace
+/// convention's "Pass-through explicit overrides" rule), and a profile using it
+/// loads under a bare name that `is_darkmux_owned` rejects.
+///
+/// The first shape of this guard tested the prefix alone, which quietly broke
+/// that opt-out: a profile declaring `identifier: "myid"` loaded once as
+/// `myid`, then FAILED its own ownership check on every later dispatch —
+/// darkmux printed the "which darkmux does not own and will not unload" notice
+/// about its own load and re-loaded under a name already taken.
+///
+/// Comparing against the minted identifier recognizes both forms and still
+/// excludes a hand-loaded bare copy, because a resident darkmux did not load
+/// cannot carry the identifier this profile would have minted.
+pub(crate) fn is_reloadable_target(
+    resident_model: &str,
+    resident_identifier: &str,
+    want: &str,
+    want_identifier: Option<&str>,
+) -> bool {
+    resident_model == want
+        && resident_identifier == darkmux_gestalt::namespaced_identifier(want, want_identifier)
 }
 
 /// (#1615) The LOADABLE model key for a value that may carry the darkmux
@@ -4150,11 +4172,20 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
     //
     // The namespace convention exists precisely so this is impossible by
     // construction (#1274, ABSOLUTE for model lifecycle): darkmux loads,
-    // unloads and reconciles only `darkmux:*`. `darkmux-gestalt` enforces that
-    // structurally through `OwnedTarget`; this legacy path reached past it to
-    // the raw `lms::unload`, so the guarantee has to be restated here until
+    // unloads and reconciles only what IT loaded. `darkmux-gestalt` enforces
+    // that structurally through `OwnedTarget`; this legacy path reached past it
+    // to the raw `lms::unload`, so the guarantee has to be restated here until
     // the raw call is retired in favor of the `ModelHost` seam.
-    match loaded.iter().find(|m| is_reloadable_target(&m.model, &m.identifier, model_key)) {
+    //
+    // (#1617 review) "What it loaded" is the identifier this profile DECLARES,
+    // which is the `darkmux:` form by default and the operator's own string
+    // when they take the documented `identifier` opt-out — see
+    // `is_reloadable_target`.
+    let want_identifier = pm.identifier.as_deref();
+    match loaded
+        .iter()
+        .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
+    {
         Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
         Some(m) => {
             eprintln!(
@@ -4190,7 +4221,7 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
             }
         }
     }
-    let identifier = darkmux_gestalt::namespaced_identifier(model_key, pm.identifier.as_deref());
+    let identifier = darkmux_gestalt::namespaced_identifier(model_key, want_identifier);
     load_at_ctx_bounded(model_key, &identifier, n_ctx)
 }
 

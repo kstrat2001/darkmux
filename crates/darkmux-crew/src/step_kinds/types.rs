@@ -7,6 +7,17 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+/// (#1610 / #1617 review) Smallest grant that can hold a usable reply.
+///
+/// Deliberately its own constant rather than a reference to the review
+/// pipeline's `MIN_VIABLE_JUDGE_GRANT`: they happen to share a value but answer
+/// different questions (how small a JUDGE ruling can be vs how small any
+/// `dispatch.map` item's reply can be), and `darkmux-crew` must not depend on
+/// `darkmux-lab` to know its own floor. Same reasoning as `MIN_WRAP_ROOM` vs
+/// `MIN_NAME_COLS` in the mission board — tying two numbers together because
+/// they match today makes one move silently when the other is tuned.
+const MIN_VIABLE_MAP_GRANT: u32 = 512;
+
 /// (#1442) One remote-token bucket metering the per-EXECUTION remote
 /// allowance (`DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`, where one
 /// execution = one pipeline stage). Local dispatches never touch it. A
@@ -79,6 +90,30 @@ impl MapRemoteBucket {
             return None;
         }
         let granted = u32::try_from(self.remaining()).unwrap_or(u32::MAX).min(requested);
+        // (#1610 / #1617 review) A grant too small to hold a reply is worse
+        // than no grant. The call "succeeds", the endpoint truncates mid-JSON,
+        // and the caller reads the debris as a result — silently. That is the
+        // exact failure #1610 fixed for the judge bucket, and this bucket (the
+        // `dispatch.map` fan-out — the probe stage, and the graph verify path)
+        // carried the identical mechanism with no floor at all.
+        //
+        // Milder consequences here than for the judge, which is why it was not
+        // release-blocking: a starved probe draw is reduced COVERAGE rather
+        // than a deleted finding. But "reduced coverage, unreported" is exactly
+        // the silence this floor exists to break — a low-flag review has to
+        // mean "few flags", never "we stopped looking and said nothing".
+        //
+        // Capped by the CONFIGURED budget, exactly as the judge bucket's floor
+        // is: an operator who sets a deliberately tiny allowance is stating
+        // policy, not being starved, and denying it would turn every small
+        // budget into an undocumented hard opt-out of a knob whose only
+        // documented refusal value is 0. Starvation is the other shape — a
+        // budget that was never small, spent down to a sliver.
+        let floor = MIN_VIABLE_MAP_GRANT.min(u32::try_from(self.budget).unwrap_or(u32::MAX));
+        if granted < floor {
+            self.skipped += 1;
+            return None;
+        }
         self.used = self.used.saturating_add(u64::from(granted));
         Some(granted)
     }

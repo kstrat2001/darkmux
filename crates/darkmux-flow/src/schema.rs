@@ -201,21 +201,29 @@ pub enum Level {
     /// non-`Option` field, so one unrecognized string makes the entire
     /// `FlowRecord` unparseable rather than partially readable.
     ///
-    /// That matters most where it is least acceptable: `integrity_check_file`
-    /// reports an unparseable line as `chain_valid: false — unparseable JSON`,
-    /// so a newer peer's perfectly legitimate record reads as **chain corruption**
-    /// on an older reader. A false tamper alert on the compliance substrate is
-    /// worse than a missing one, because it trains an operator to dismiss the
-    /// real thing.
-    ///
     /// The schema's own version history promised this already ("older readers
     /// ignore the unknown category", FLOW_SCHEMA 1.10.0) — true for the additive
     /// `Option` fields and the free-form `action` string, and never true for
     /// these enums until now. Contract 5: consumers are lenient-on-read, loud in
-    /// doctor.
+    /// doctor. The typed production readers this makes whole are
+    /// `integrity_check_file` and `darkmux-crew`'s role index.
     ///
-    /// Serialization is unaffected: nothing constructs `Unknown`, so no record is
-    /// ever WRITTEN with it. It exists purely so a reader can carry on.
+    /// Nothing ever WRITES `Unknown` — no code constructs it — so no record is
+    /// emitted carrying one. But reading is lossy where writing is not: a record
+    /// parsed to `Unknown` **re-serializes as `"unknown"`**, not as whatever the
+    /// writer wrote.
+    ///
+    /// That loss is why leniency ALONE does not make the audit chain honest, and
+    /// the first version of this change wrongly claimed it did.
+    /// `audit_hash_of` recomputes the BLAKE3 from the PARSED struct, so a
+    /// newer peer's record hashes differently and the checker called it
+    /// `hash mismatch — record content has been edited`. That is a false tamper
+    /// alert on the compliance substrate, and a worse-reading one than the
+    /// `unparseable JSON` it replaced. The real fix lives in
+    /// `integrity_check_file`, which now asks `has_unknown_enum` first and
+    /// reports such a record as unverifiable-pending-upgrade rather than
+    /// corrupt. Any FUTURE consumer that round-trips a record owes the same
+    /// question.
     #[serde(other)]
     #[value(skip)]
     Unknown,
@@ -275,6 +283,45 @@ pub enum Stage {
     #[serde(other)]
     #[value(skip)]
     Unknown,
+}
+
+/// (#1611) Did this record carry an enum spelling THIS binary does not know?
+///
+/// The catch-all variants make such a record READABLE, which is contract 5 and
+/// the whole point. What they cannot do is make it re-serializable to its
+/// original bytes: an unknown `"catastrophe"` reads as `Unknown` and writes
+/// back as `"unknown"`. Any consumer that round-trips a record — most
+/// consequentially `integrity_check_file`, which recomputes the audit hash from
+/// the PARSED struct — must therefore be able to ask whether the value it holds
+/// is lossy, or it will report its own lossy re-serialization as evidence the
+/// record was edited.
+///
+/// A predicate rather than a stored flag so it cannot go stale, and so nothing
+/// has to be added to the wire format to support it.
+pub trait MaybeUnknown {
+    /// `true` when this value came from a spelling this binary does not know.
+    fn is_unknown(&self) -> bool;
+}
+
+impl MaybeUnknown for Level {
+    fn is_unknown(&self) -> bool {
+        matches!(self, Level::Unknown)
+    }
+}
+impl MaybeUnknown for Category {
+    fn is_unknown(&self) -> bool {
+        matches!(self, Category::Unknown)
+    }
+}
+impl MaybeUnknown for Tier {
+    fn is_unknown(&self) -> bool {
+        matches!(self, Tier::Unknown)
+    }
+}
+impl MaybeUnknown for Stage {
+    fn is_unknown(&self) -> bool {
+        matches!(self, Stage::Unknown)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -396,6 +443,25 @@ pub struct FlowRecord {
     pub attempt: Option<u32>,
 }
 
+impl FlowRecord {
+    /// (#1611) `true` when any of this record's enum fields fell back to its
+    /// catch-all — i.e. the record was written by a binary that knows a
+    /// spelling this one does not.
+    ///
+    /// Such a record is fully READABLE (that is the point of the catch-alls)
+    /// but NOT byte-reproducible: re-serializing it emits `"unknown"` in place
+    /// of whatever the writer wrote. Consumers that compare a re-serialization
+    /// against something the writer produced — the audit chain's content hash
+    /// is the one that matters — must consult this first, or they will report
+    /// their own lossy round-trip as evidence of tampering.
+    pub fn has_unknown_enum(&self) -> bool {
+        self.level.is_unknown()
+            || self.category.is_unknown()
+            || self.tier.is_unknown()
+            || self.stage.is_unknown()
+    }
+}
+
 /// Resolve the flows directory. Precedence (#661 Slice 3):
 /// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > ~/.darkmux/flows`, with a
 /// `/tmp/darkmux/flows` HOME-less (CI / sandbox) fallback. Delegates to the
@@ -512,9 +578,12 @@ mod forward_compat_tests {
 
     /// (#1611) A record from a NEWER peer must still parse. Before the
     /// `#[serde(other)]` catch-alls, one unrecognized enum string failed the
-    /// whole `FlowRecord` — and `integrity_check_file` reports an unparseable
-    /// line as a CHAIN BREAK, so a legitimate record from an upgraded fleet
-    /// member read as tamper evidence on an older reader.
+    /// whole `FlowRecord`.
+    ///
+    /// Parsing is the FLOOR, not the fix. The same record still does not
+    /// re-serialize to its original bytes — see `unknown_variants_are_lossy_on_
+    /// write_which_is_why_the_checker_asks` below, and the integrity checker's
+    /// `has_unknown_enum` branch that consumes this.
     #[test]
     fn a_record_from_a_newer_peer_parses_instead_of_failing_the_whole_record() {
         let wire = r#"{
@@ -560,10 +629,55 @@ mod forward_compat_tests {
         assert!(matches!(rec.category, Category::Telemetry));
         assert!(matches!(rec.tier, Tier::Local));
         assert!(matches!(rec.stage, Stage::Dispatch));
-        // And a re-serialize keeps the wire spelling, so a record read and
-        // re-written by a middle-version peer is unchanged.
+        // And a re-serialize keeps the wire spelling — true for variants this
+        // binary KNOWS. It is emphatically not true for unknown ones; that
+        // asymmetry is the subject of the next test.
         let out = serde_json::to_value(&rec).unwrap();
         assert_eq!(out["category"], "telemetry");
         assert_eq!(out["stage"], "dispatch");
+    }
+
+    /// The correction. Leniency makes a newer record READABLE; it does not make
+    /// it REPRODUCIBLE — and the audit chain hashes a re-serialization, so the
+    /// difference is the difference between "verified" and "tampered".
+    ///
+    /// This is the test that would have caught the original overclaim: the
+    /// first version of #1611 asserted the catch-alls fixed the false tamper
+    /// alert, and they did not. They changed its wording from `unparseable
+    /// JSON` to `hash mismatch — record content has been edited`, which reads
+    /// MORE like tampering.
+    #[test]
+    fn unknown_variants_are_lossy_on_write_which_is_why_the_checker_asks() {
+        let wire = r#"{
+            "ts": "2026-08-03T12:00:00Z",
+            "level": "catastrophe",
+            "category": "audit",
+            "tier": "local",
+            "stage": "dispatch",
+            "action": "dispatch start",
+            "handle": "seat-1"
+        }"#;
+        let rec: FlowRecord = serde_json::from_str(wire).unwrap();
+        let out = serde_json::to_value(&rec).unwrap();
+
+        assert_eq!(
+            out["level"], "unknown",
+            "the writer's spelling is GONE on re-serialize — this is the lossiness \
+             that makes a recomputed content hash differ for an untouched record"
+        );
+        assert_ne!(out["level"], "catastrophe");
+
+        // ...which is exactly the question any round-tripping consumer must
+        // ask, and the integrity checker now does.
+        assert!(rec.has_unknown_enum());
+
+        // A record this binary fully understands is NOT flagged, so the
+        // checker keeps verifying everything it legitimately can.
+        let known: FlowRecord = serde_json::from_str(
+            r#"{"ts":"2026-08-03T12:00:00Z","level":"info","category":"audit",
+                "tier":"local","stage":"dispatch","action":"a","handle":"h"}"#,
+        )
+        .unwrap();
+        assert!(!known.has_unknown_enum());
     }
 }

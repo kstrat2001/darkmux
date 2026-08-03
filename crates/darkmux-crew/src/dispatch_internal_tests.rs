@@ -4124,7 +4124,7 @@
 #[test]
 fn a_foreign_resident_is_never_a_reload_target() {
     assert!(
-        !super::is_reloadable_target("qwen3-4b", "qwen3-4b", "qwen3-4b"),
+        !super::is_reloadable_target("qwen3-4b", "qwen3-4b", "qwen3-4b", None),
         "a bare identifier is USER state — matching the model key must not make it ours"
     );
 }
@@ -4135,7 +4135,8 @@ fn a_darkmux_owned_resident_of_the_same_model_is_a_reload_target() {
     assert!(super::is_reloadable_target(
         "qwen3-4b",
         "darkmux:qwen3-4b",
-        "qwen3-4b"
+        "qwen3-4b",
+        None
     ));
 }
 
@@ -4146,7 +4147,8 @@ fn a_darkmux_owned_resident_of_another_model_is_not_a_reload_target() {
     assert!(!super::is_reloadable_target(
         "llama-3-8b",
         "darkmux:llama-3-8b",
-        "qwen3-4b"
+        "qwen3-4b",
+        None
     ));
 }
 
@@ -4161,7 +4163,7 @@ fn with_both_copies_resident_only_the_darkmux_one_is_selected() {
     ];
     let picked: Vec<&str> = residents
         .iter()
-        .filter(|(m, id)| super::is_reloadable_target(m, id, "qwen3-4b"))
+        .filter(|(m, id)| super::is_reloadable_target(m, id, "qwen3-4b", None))
         .map(|(_, id)| *id)
         .collect();
     assert_eq!(
@@ -4205,7 +4207,8 @@ fn a_namespaced_utility_binding_still_finds_darkmuxs_own_resident() {
         super::is_reloadable_target(
             "qwen3-4b-instruct-2507",
             "darkmux:qwen3-4b-instruct-2507",
-            want
+            want,
+            None
         ),
         "darkmux's own resident must be recognized however the operator spelled the binding"
     );
@@ -4214,8 +4217,39 @@ fn a_namespaced_utility_binding_still_finds_darkmuxs_own_resident() {
     assert!(!super::is_reloadable_target(
         "qwen3-4b-instruct-2507",
         "qwen3-4b-instruct-2507",
-        want
+        want,
+        None
     ));
+}
+
+// ── (#1617 review) The documented `identifier` opt-out is still darkmux's ───
+
+/// The regression the first shape of the #1609 guard introduced.
+///
+/// `ProfileModel.identifier` is a documented namespace opt-out: darkmux loads
+/// under the operator's literal string, which does NOT start with `darkmux:`.
+/// A prefix-only ownership test therefore rejected darkmux's OWN load — so
+/// every dispatch after the first re-announced "loading…", printed the "darkmux
+/// does not own and will not unload" notice about its own instance, and loaded
+/// again under a name already taken.
+#[test]
+fn a_profiles_explicit_identifier_is_still_darkmuxs_own_load() {
+    assert!(
+        super::is_reloadable_target("qwen3-4b", "myid", "qwen3-4b", Some("myid")),
+        "a load made under the profile's declared identifier must be recognized as ours"
+    );
+    // ...and the #1609 guarantee survives it: a hand-loaded BARE copy still
+    // cannot be selected, because it cannot carry the declared identifier.
+    assert!(
+        !super::is_reloadable_target("qwen3-4b", "qwen3-4b", "qwen3-4b", Some("myid")),
+        "the operator's own bare copy is never a target, opt-out or not"
+    );
+    // Nor can some other profile's opt-out name be mistaken for this one's.
+    assert!(!super::is_reloadable_target("qwen3-4b", "otherid", "qwen3-4b", Some("myid")));
+    // And with no opt-out declared, the namespaced form is what counts —
+    // a bare-named resident is user state even though the KEY matches.
+    assert!(super::is_reloadable_target("qwen3-4b", "darkmux:qwen3-4b", "qwen3-4b", None));
+    assert!(!super::is_reloadable_target("qwen3-4b", "myid", "qwen3-4b", None));
 }
 
 /// The identifier darkmux mints must be byte-identical whichever spelling the

@@ -4257,15 +4257,21 @@ const PANELS = [
 
 function panelCols(){
   // The CLI adapts to COLUMNS (packet A). Ask for a width that matches the
-  // space the panel actually has, so `mission status` drops its mix column
-  // on a phone instead of overflowing. Character width at 12px JetBrains
-  // Mono is ~7.2px; the daemon clamps whatever we send to 60..=200.
+  // space the panel actually has, so `mission status` sheds its optional
+  // columns on a phone instead of overflowing.
+  //
+  // (#1613) The clamp is 36..=200 at BOTH ends — this floor and the daemon's
+  // `clamp_cols` must agree, or the negotiation lies: the viewer would ask for
+  // a width it cannot show, the CLI would faithfully render it, and the
+  // remainder would hang off the right edge. That is precisely what a stale
+  // 60 here did on a 390px phone.
+  //
+  // The measured advance width at 12px JetBrains Mono is ~6.82px, so the 7.2
+  // divisor is deliberately conservative — it asks for FEWER columns than fit,
+  // which is the safe direction to be wrong in. The 24 is the panel's
+  // horizontal padding.
   const el = document.querySelector(".panelout") || document.getElementById("stage");
   const px = el ? el.clientWidth : window.innerWidth;
-  // (#1613) Floor matches the daemon's own clamp (36). The measured advance
-  // width at 12px JetBrains Mono is ~6.82px, so 7.2 is deliberately
-  // conservative — it asks for FEWER columns than fit, which is the safe
-  // direction. The 24 is the panel's horizontal padding.
   return Math.max(36, Math.min(200, Math.floor((px - 24) / 7.2)));
 }
 
