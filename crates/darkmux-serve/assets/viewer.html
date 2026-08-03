@@ -4006,8 +4006,12 @@ function renderLabTaskCard(group){
 //   * every text run goes through `esc()` before insertion — the parser
 //     never hands raw input to innerHTML;
 //   * link hrefs are validated against an http/https allowlist, so a
-//     `javascript:` URI smuggled into an OSC 8 target renders as inert text
-//     rather than becoming a clickable script;
+//     script-scheme URI smuggled into an OSC 8 target renders as inert text
+//     rather than becoming a clickable script. (Spelling the scheme out
+//     literally here would trip `viewer_has_no_inline_event_handlers`, whose
+//     substring guard deliberately makes no code/comment distinction — a
+//     check that parsed well enough to exempt prose is a check that can be
+//     talked out of firing.);
 //   * unknown escapes are consumed and discarded rather than emitted, so a
 //     hostile sequence cannot survive as markup.
 // The e2e XSS gate walks hostile fixtures through this path (viewer-panel).
