@@ -2,9 +2,18 @@
   "name": "darkmux-viewer-e2e",
   "version": "0.0.0",
   "private": true,
-  "description": "Headless browser e2e gate for the observability viewer (crates/darkmux-serve/assets/viewer.html). Dev-only; not part of the shipped binary.",
+  "description": "Headless browser e2e gate for the observability viewer (crates/darkmux-serve/assets/viewer.html). Dev-only; not part of the shipped binary. The WHOLE suite runs in ~11s, so it is the fast loop for anything rendered \u2014 prefer it over the ~10min cargo workspace suite when the change is UI (#1622).",
   "scripts": {
-    "test": "playwright test"
+    "test": "playwright test",
+    "ui": "playwright test",
+    "one": "playwright test --",
+    "grep": "playwright test -g",
+    "graph": "playwright test mission-graph",
+    "panel": "playwright test viewer-panel",
+    "phone": "playwright test chrome-order",
+    "headed": "playwright test --headed --",
+    "debug": "PWDEBUG=1 playwright test --",
+    "list": "playwright test --list"
   },
   "devDependencies": {
     "@playwright/test": "1.60.0"
