@@ -85,6 +85,25 @@ fn mission_url(base: &str, id: &str) -> String {
     format!("{base}mission/{encoded}/graph")
 }
 
+/// A deep link to another panel, but ONLY when this process is rendering
+/// into the console (`DARKMUX_PANEL`, set by the serve daemon's panel
+/// spawner) and is not already the target.
+///
+/// The point is that the ADVICE has to match the surface. "`--all` for every
+/// mission" is actionable in a terminal and a dead end in a panel, where
+/// there is no prompt to type it at — the operator hit exactly that. The verb
+/// fixes it here rather than the viewer pattern-matching this text, because
+/// that matching is the twin drift `/panel/:id` exists to kill: the flag and
+/// its link are one edit, in one file.
+fn panel_deep_link(link_base: &str, target: &str) -> Option<String> {
+    let current = std::env::var("DARKMUX_PANEL").ok()?;
+    if current == target {
+        return None;
+    }
+    // `link_base` always carries its trailing slash (see `viewer_link_base`).
+    Some(format!("{link_base}#lens=console&panel={target}"))
+}
+
 /// Pure drift detection for one mission given its phases. `now` and
 /// `stale_days` are passed in (rather than read internally) so the function
 /// stays IO-free and unit-testable with fixed timestamps — see the module
@@ -338,10 +357,19 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
     let width = style::terminal_width();
     // (#1569 packet A) Resolved ONCE per board, not per row: on a hub/peer
     // this may spawn `tailscale serve status --json`, and doing that 82 times
-    // for an 82-mission board would be absurd. Returns loopback without
-    // spawning anything when output isn't a TTY (no links are emitted then)
-    // or when the machine declares itself standalone.
+    // for an 82-mission board would be absurd. It short-circuits to loopback
+    // without spawning when the machine declares itself standalone, or when
+    // no links will be emitted at all.
+    //
+    // NB the old "isn't a TTY" spelling of that second case stopped being
+    // true in B1: a panel spawn is a pipe but sets CLICOLOR_FORCE, so it DOES
+    // resolve — bounded by the daemon's own panel cache.
     let link_base = darkmux_doctor::viewer_link_base(8765);
+    let all_link = panel_deep_link(&link_base, "mission-status-all");
+    // The link is one affordance for the whole board, not one per section:
+    // it goes to the same place from every group, and Active + Paused +
+    // Finalized all overflowing would otherwise stack three identical rows.
+    let mut all_link_shown = false;
     if views.is_empty() {
         // (#1582) The prose wraps; the command does not. Same rule the drift
         // suggestions follow, for the same reason — this is the one command a
@@ -439,12 +467,19 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
         }
         if shown < g.len() {
             let hidden_drift = g.iter().skip(shown).filter(|v| !v.drifts.is_empty()).count();
-            let more = format!(
-                "… {} more ({} of {} shown) — `--all` for every mission",
-                g.len() - shown,
-                shown,
-                g.len()
-            );
+            // In a panel the flag names itself once, as a link, at the end of
+            // the block — so the two overflow lines don't each repeat advice
+            // the operator cannot take.
+            let more = if all_link.is_some() {
+                format!("… {} more ({} of {} shown)", g.len() - shown, shown, g.len())
+            } else {
+                format!(
+                    "… {} more ({} of {} shown) — `--all` for every mission",
+                    g.len() - shown,
+                    shown,
+                    g.len()
+                )
+            };
             for line in wrap_indented(&more, 2, width) {
                 println!("{}", style::dim(&line));
             }
@@ -452,13 +487,20 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
                 any_drift_hidden = true;
                 // Never let a limit silently swallow an attention item.
                 let warn = format!(
-                    "⚠ {} hidden mission{} need{} attention — run with `--all`",
+                    "⚠ {} hidden mission{} need{} attention{}",
                     hidden_drift,
                     if hidden_drift == 1 { "" } else { "s" },
-                    if hidden_drift == 1 { "s" } else { "" }
+                    if hidden_drift == 1 { "s" } else { "" },
+                    if all_link.is_some() { "" } else { " — run with `--all`" }
                 );
                 for line in wrap_indented(&warn, 2, width) {
                     println!("{}", style::warn(&line));
+                }
+            }
+            if let Some(url) = &all_link {
+                if !all_link_shown {
+                    all_link_shown = true;
+                    println!("  {}", style::link(url, "→ show every mission"));
                 }
             }
         }
@@ -478,7 +520,13 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
             attention,
             if attention == 1 { "" } else { "s" },
             if attention == 1 { "needs" } else { "need" },
-            if any_drift_hidden { " (some are hidden — `--all` to see them)" } else { "" }
+            if !any_drift_hidden {
+                ""
+            } else if all_link.is_some() {
+                " (some are hidden — open the full board above)"
+            } else {
+                " (some are hidden — `--all` to see them)"
+            }
         );
         for line in wrap_indented(&summary, 0, width) {
             println!("{}", style::warn(&line));
@@ -1087,6 +1135,30 @@ mod tests {
     /// (#1569 packet A) Mission ids are NOT guaranteed path-safe — `pr-review`
     /// ids embed a full TMPDIR path (#1563) — so an unencoded id would emit a
     /// URL with extra path segments pointing at the wrong route, or none.
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_PANEL, a process-global
+    fn panel_deep_link_only_fires_inside_a_panel_and_never_at_itself() {
+        let base = "http://127.0.0.1:8765/";
+        // A terminal has a prompt to type `--all` at, so the hint stays a
+        // hint and no link is emitted.
+        std::env::remove_var("DARKMUX_PANEL");
+        assert_eq!(panel_deep_link(base, "mission-status-all"), None);
+
+        // Rendering into the base panel: the flag becomes reachable.
+        std::env::set_var("DARKMUX_PANEL", "mission-status");
+        assert_eq!(
+            panel_deep_link(base, "mission-status-all").as_deref(),
+            Some("http://127.0.0.1:8765/#lens=console&panel=mission-status-all")
+        );
+
+        // Already the unlimited panel — a link to where you are is noise, and
+        // it is the one case the caller's `shown < len` guard would not catch
+        // if the section limit ever applied under `--all`.
+        std::env::set_var("DARKMUX_PANEL", "mission-status-all");
+        assert_eq!(panel_deep_link(base, "mission-status-all"), None);
+        std::env::remove_var("DARKMUX_PANEL");
+    }
+
     #[test]
     fn mission_url_percent_encodes_ids_that_are_not_path_safe() {
         let base = "http://127.0.0.1:8765/";

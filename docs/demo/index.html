@@ -45,39 +45,39 @@
 <style>
   :root{
     --bg:#0a0a0b; --bg2:#131316; --panel:#1c1c22; --line:#1f1f24;
-    --text:#e8e6e3; --muted:#8a8a92; --amber:#6df1ff; --amber-dim:#2a8a96;
+    --text:#e8e6e3; --muted:#8a8a92; --accent:#6df1ff; --accent-dim:#2a8a96;
     --good:#5af0a3; --warn:#ffb86b; --bad:#ff6b85; --run:#ffd166;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 'Inter',-apple-system,system-ui,sans-serif;overflow:hidden}
   .top{height:46px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--bg2)}
-  .brand{font-weight:700;letter-spacing:.04em}.brand b{color:var(--amber)}.brand a{color:inherit;text-decoration:none}.brand a:hover b{text-decoration:underline}
+  .brand{font-weight:700;letter-spacing:.04em}.brand b{color:var(--accent)}.brand a{color:inherit;text-decoration:none}.brand a:hover b{text-decoration:underline}
   /* (#1129) Build identifier — version (+ git SHA) and flow-schema the daemon injects; empty on the static demo. */
   /* (#1132) When populated (daemon-served) it's the trigger for the about modal. */
   .ver{font:11px/1 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.02em}
   .ver[data-act]{cursor:pointer}.ver[data-act]:hover{color:var(--text)}
   .topnav{margin-left:auto;display:flex;gap:18px;align-items:center}
   .topnav a{color:var(--muted);text-decoration:none;font:600 12px 'JetBrains Mono',monospace;letter-spacing:.04em}
-  .topnav a:hover{color:var(--amber)}
-  .badge{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:#0a0a0b;background:var(--amber);padding:5px 9px;border-radius:3px}
+  .topnav a:hover{color:var(--accent)}
+  .badge{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--bg);background:var(--accent);padding:5px 9px;border-radius:3px}
   /* (#1098) the source/date badge ("today") doubles as the history trigger when
      a daemon is behind it — looks like a button, opens the catalog (the old ▤
      button read as a "stop" glyph). */
   .badge.srcbtn{cursor:pointer}
-  .badge.srcbtn:hover{box-shadow:0 0 0 2px var(--amber-dim)}
-  .pb{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border:1px solid var(--amber-dim);padding:4px 9px;border-radius:3px}
+  .badge.srcbtn:hover{box-shadow:0 0 0 2px var(--accent-dim)}
+  .pb{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent-dim);padding:4px 9px;border-radius:3px}
   .catpanel{position:absolute;top:48px;left:16px;z-index:60;background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:5px;min-width:300px;max-width:min(420px,92vw);max-height:60vh;overflow:auto;box-shadow:0 10px 30px rgba(0,0,0,.55)}
   .catpanel .cathdr{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:7px 8px 4px}
   .catrow{display:block;width:100%;text-align:left;background:none;border:0;color:var(--text);padding:7px 9px;border-radius:4px;cursor:pointer}
-  .catrow:hover{background:var(--amber-dim)}
+  .catrow:hover{background:var(--accent-dim)}
   .catrow .cd{font:600 13px/1.2 Inter,sans-serif}
   .catrow .cs{color:var(--muted);font:11px/1.3 Inter,sans-serif;margin-top:2px}
-  .catrow.live .cd{color:var(--amber)}
+  .catrow.live .cd{color:var(--accent)}
   .catempty{color:var(--muted);font:12px/1.4 Inter,sans-serif;padding:8px 9px}
   @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.5}}
   /* (#1071) live-MODE badge is cyan, not green — green now means a SUCCESSFUL
      run (status convention). The badge is a viewing-mode cue, not a verdict. */
-  .pb.live{color:var(--amber);border-color:var(--amber);animation:lpulse 1.6s ease-in-out infinite}
+  .pb.live{color:var(--accent);border-color:var(--accent);animation:lpulse 1.6s ease-in-out infinite}
   /* (#238) Respect prefers-reduced-motion: drop the infinite live-badge pulse
      (and shorten transitions) for vestibular accessibility. Live state stays
      distinguishable WITHOUT motion — the badge keeps its cyan color, the "●"
@@ -92,24 +92,15 @@
   @media (prefers-reduced-motion: reduce){
     *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
   }
-  .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:#131316}
+  .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--bg2)}
   .crumb{font:600 13px 'JetBrains Mono',monospace;color:var(--muted)}
-  .crumb a{color:var(--amber);cursor:pointer;text-decoration:none}.crumb a:hover{text-decoration:underline}
+  .crumb a{color:var(--accent);cursor:pointer;text-decoration:none}.crumb a:hover{text-decoration:underline}
   /* (#827) missions index rows */
   .milist{margin-top:6px}
   .mirow{display:flex;align-items:center;gap:14px;padding:11px 12px;border:1px solid var(--line);border-radius:7px;margin-bottom:8px;cursor:pointer;background:var(--panel)}
-  .mirow:hover{border-color:var(--amber-dim)}
-  .midimrow{opacity:.55}
+  .mirow:hover{border-color:var(--accent-dim)}
   .mistatus{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted);flex:0 0 auto}
-  .mistatus.active{color:var(--good);border-color:var(--good)}
-  .mistatus.finalized{color:var(--muted)}
-  .mistatus.paused{color:var(--warn);border-color:var(--warn)}
-  .miname{font:600 13px 'JetBrains Mono',monospace;color:var(--amber);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .miprog{display:inline-flex;align-items:center;gap:7px;font:11px 'JetBrains Mono',monospace;color:var(--muted);flex:0 0 auto}
-  .mibar{display:inline-block;width:60px;height:6px;background:var(--line);border-radius:3px;overflow:hidden}
-  .mibar span{display:block;height:100%;background:var(--good)}
-  .mimeta{font:11px 'JetBrains Mono',monospace;color:var(--muted);flex:0 0 auto}
-  .midim{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
+  .miname{font:600 13px 'JetBrains Mono',monospace;color:var(--accent);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .mitag{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;padding:3px 7px;border-radius:3px;color:var(--muted);background:var(--bg2);border:1px dashed var(--line);flex:0 0 auto}
 
   /* (#1247 Part 3) Lab observer lens — machine-local room, distinct from the
@@ -124,16 +115,16 @@
   .lablist{display:flex;flex-direction:column;gap:14px;margin-top:10px}
   .labnotice{font:12px/1.5 'JetBrains Mono',monospace;color:var(--warn);border:1px solid var(--warn);border-radius:6px;padding:9px 12px;margin-top:10px;overflow-wrap:anywhere}
   .labtaskcard{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
-  .labtaskhdr{font:600 13px 'JetBrains Mono',monospace;color:var(--amber);display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-bottom:8px}
+  .labtaskhdr{font:600 13px 'JetBrains Mono',monospace;color:var(--accent);display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-bottom:8px}
   .labtaskcount{font:600 10px 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
   .labrunrow{display:flex;flex-direction:column;gap:4px;padding:10px 11px;border:1px solid var(--line);border-radius:6px;background:var(--bg2);cursor:pointer;margin-bottom:6px}
   .labrunrow:last-child{margin-bottom:0}
-  .labrunrow:hover{border-color:var(--amber-dim)}
+  .labrunrow:hover{border-color:var(--accent-dim)}
   /* (#1584) An untracked ghost has no durable record to open — no pointer, no
      hover affordance, so the row never promises a drill-down it can't do. */
   .labrunrow.flat{cursor:default}
   .labrunrow.flat:hover{border-color:var(--line)}
-  .labrunrow:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+  .labrunrow:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
   .labrunmain{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
   .labruncrew{font:600 12px 'JetBrains Mono',monospace;color:var(--text)}
   .labrundir{font:11px 'JetBrains Mono',monospace;color:var(--muted);overflow-wrap:anywhere}
@@ -145,34 +136,96 @@
   .labdiffline.dim{color:var(--muted);border-left-color:var(--line)}
   .labbadge{display:inline-block;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:3px;border:1px solid var(--line);flex:0 0 auto}
   .labbadge.finished{color:var(--good);border-color:var(--good)}
-  .labbadge.live{color:var(--amber);border-color:var(--amber);animation:lpulse 1.6s ease-in-out infinite}
+  .labbadge.live{color:var(--accent);border-color:var(--accent);animation:lpulse 1.6s ease-in-out infinite}
+  /* (#1569 packet B2) CLI panels. The terminal's own output, so the type is
+     monospace and the palette maps ANSI's 16 colors onto the viewer's own
+     variables — a panel must look like it belongs to this page, not like a
+     pasted screenshot. `white-space: pre` + horizontal scroll INSIDE the
+     panel: the CLI already width-adapted (packet A made `mission status`
+     honor COLUMNS), so re-wrapping here would fight it and break the
+     column alignment that adaptation exists to protect. */
+  .panelwrap{border:1px solid var(--line);border-radius:8px;background:var(--bg2);margin-top:10px;overflow:hidden}
+  .panelchrome{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:8px 12px;
+    border-bottom:1px solid var(--line);background:var(--panel);
+    font:11px 'JetBrains Mono',monospace;color:var(--muted)}
+  .panelchrome .pc-cmd{color:var(--text);font-weight:600}
+  .panelchrome .pc-spacer{flex:1 1 auto}
+  .panelchrome .pc-stale{color:var(--warn)}
+  .panelchrome .pc-manual{color:var(--accent-dim)}
+  .pcbtn{font:600 11px 'JetBrains Mono',monospace;color:var(--muted);background:var(--bg2);
+    border:1px solid var(--line);border-radius:4px;padding:4px 9px;cursor:pointer}
+  .pcbtn:hover{color:var(--accent);border-color:var(--accent-dim)}
+  .pcbtn:disabled{opacity:.45;cursor:default}
+  .pcbtn:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  /* Font stack order is load-bearing. 'Apple Color Emoji' must come AFTER
+     the monospace fallbacks, never before: it carries DIGIT glyphs (for
+     keycap sequences), so listing it early hands every number to a
+     proportional font — which broke the column grid and left the
+     box-drawing progress bars (▓░) as empty boxes. Emoji last means it is
+     reached only for codepoints no monospace font covers. */
+  .panelout{margin:0;padding:12px;overflow-x:auto;white-space:pre;
+    font:12px/1.5 'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace,'Apple Color Emoji';
+    color:var(--text)}
+  .panelerr{padding:12px;font:12px/1.5 'JetBrains Mono',monospace;color:var(--bad);white-space:pre-wrap}
+  /* ANSI SGR -> palette. Only what darkmux's own output emits is mapped
+     with intent; the rest fall back to sane terminal-ish values. */
+  .panelout .a-bold{font-weight:700}
+  .panelout .a-dim{opacity:.62}
+  .panelout .a-ital{font-style:italic}
+  .panelout .a-underline{text-decoration:underline}
+  .panelout .a-fg1,.panelout .a-fg9{color:var(--bad)}      /* red    */
+  .panelout .a-fg2,.panelout .a-fg10{color:var(--good)}    /* green  */
+  .panelout .a-fg3,.panelout .a-fg11{color:var(--run)}     /* yellow */
+  .panelout .a-fg4,.panelout .a-fg12{color:#7aa2f7}        /* blue   */
+  .panelout .a-fg5,.panelout .a-fg13{color:#c39cf7}        /* magenta*/
+  .panelout .a-fg6,.panelout .a-fg14{color:var(--accent)}   /* cyan   */
+  .panelout .a-fg0,.panelout .a-fg8{color:var(--muted)}    /* black  */
+  .panelout .a-fg7,.panelout .a-fg15{color:var(--text)}    /* white  */
+  .panelout .a-link{color:inherit;text-decoration:underline;text-underline-offset:2px;
+    text-decoration-color:var(--accent-dim)}
+  /* A tap target that survives a phone: the CLI's own ids are short, so
+     pad the hit box without disturbing the monospace grid (#1569's
+     "styling is legal; parsing prose is not"). */
+  .panelout .a-link{padding:2px 0}
+  @media (max-width:700px){
+    .panelout{font-size:11px;padding:10px}
+    .panelchrome{font-size:10px;padding:7px 10px}
+  }
   /* (#1584) The runs lens — one flat, kind-tagged list over /runs. Reuses the
      .labrun* row styles above (they were never lab-specific); adds only the
      kind filter chips, the kind tag, and the status colors the three sources
      share. */
   .runsbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:10px 0 4px}
   .runchip{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.04em;padding:6px 10px;border-radius:14px;border:1px solid var(--line);background:var(--bg2);color:var(--muted);cursor:pointer}
-  .runchip:hover{border-color:var(--amber-dim);color:var(--text)}
-  .runchip:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
-  .runchip.on{border-color:var(--amber);color:var(--amber);background:var(--panel)}
+  .runchip:hover{border-color:var(--accent-dim);color:var(--text)}
+  .runchip:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .runchip.on{border-color:var(--accent);color:var(--accent);background:var(--panel)}
   .runchipn{opacity:.7;font-weight:400}
   .runkind{display:inline-block;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted);flex:0 0 auto}
-  .runkind.mission{color:var(--amber);border-color:var(--amber-dim)}
+  .runkind.mission{color:var(--accent);border-color:var(--accent-dim)}
   .runkind.dispatch{color:var(--text)}
   .runkind.lab{color:var(--good);border-color:var(--good)}
-  /* Status colors earn attention rather than spend it: `complete` is the
-     normal case and stays quiet, so the eye lands on the runs that actually
-     want a look (error red, running amber). */
-  .labbadge.complete{color:var(--muted)}
+  /* (#1569) Complete is an ACHIEVEMENT, and it reads as one. It used to be
+     muted, grouped with .planned/.abandoned below — but those are non-events
+     and this is a run that finished its work. Two tells that it was an
+     accident rather than a choice: the run DETAIL page still badges the very
+     same run green via labBadge()'s "finished", so one run had two colors
+     depending on where you looked at it (#1584's unification renamed the
+     status and dropped the color with it); and unlike .error/.running this
+     set no border-color, leaving it doubly grey.
+     Green does not become wallpaper here — the live split is complete 116 /
+     running 41 / error 13, so amber and red stay visible at rates that keep
+     the color informative rather than decorative. */
+  .labbadge.complete{color:var(--good);border-color:var(--good)}
   .labbadge.error{color:var(--bad);border-color:var(--bad)}
   /* Amber, but deliberately NOT the pulsing `.live` treatment — see
      runStatusBadge: `running` here means "no terminal artifact", which is not
      the same claim as "running right now". */
-  .labbadge.running{color:var(--amber);border-color:var(--amber-dim)}
+  .labbadge.running{color:var(--accent);border-color:var(--accent-dim)}
   .labbadge.planned,.labbadge.abandoned{color:var(--muted)}
   .rununtracked{font:600 10px/1 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.04em}
   .runmore{font:12px 'JetBrains Mono',monospace;color:var(--muted);margin-top:10px;cursor:pointer;text-align:center;padding:8px;border:1px dashed var(--line);border-radius:6px}
-  .runmore:hover{color:var(--amber);border-color:var(--amber-dim)}
+  .runmore:hover{color:var(--accent);border-color:var(--accent-dim)}
   /* Pipeline strip — a VERTICAL stage list always (not just on mobile): a
      stacked list reads cleanly at any width and keeps this lens's CSS
      surface small; see the PR notes for the deliberate no-horizontal-strip
@@ -184,7 +237,7 @@
   .labstage.finished{border-color:var(--good)}
   .labstage.error{border-color:var(--bad)}
   .labstage.synth{border-style:dashed}
-  .labstagename{font:600 11px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;color:var(--amber);min-width:90px}
+  .labstagename{font:600 11px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);min-width:90px}
   .labstagemeta{font:11px 'JetBrains Mono',monospace;color:var(--muted);overflow-wrap:anywhere}
   .labcli{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border:1px dashed var(--line);border-radius:6px;background:var(--bg2);margin-bottom:14px}
   .labclilbl{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
@@ -194,7 +247,7 @@
   .labfeedrow{display:flex;flex-wrap:wrap;gap:8px;padding:5px 8px;border-radius:4px;font:11px/1.4 'JetBrains Mono',monospace}
   .labfeedrow:nth-child(odd){background:var(--panel)}
   .labfeedts{color:var(--muted);flex:0 0 auto}
-  .labfeedtag{color:var(--amber-dim);flex:0 0 auto;text-transform:uppercase;font-weight:600}
+  .labfeedtag{color:var(--accent-dim);flex:0 0 auto;text-transform:uppercase;font-weight:600}
   .labfeedtext{color:var(--text);overflow-wrap:anywhere}
   .labfeedrow.host{color:var(--muted)}
   .labfeedrow.host .labfeedtext{color:var(--muted)}
@@ -243,7 +296,7 @@
   .membar .cur.amber{background:var(--warn)}
   .membar .cur.red{background:var(--bad);opacity:.65}
   .membar .cur.unknown{background:var(--muted);opacity:.3}
-  .membar .lim{position:absolute;top:0;bottom:0;width:2px;background:var(--amber)}
+  .membar .lim{position:absolute;top:0;bottom:0;width:2px;background:var(--accent)}
   .membar .poolline{position:absolute;top:0;bottom:0;width:2px;background:var(--muted);opacity:.7}
   .memmeta{font:11px/1.5 'JetBrains Mono',monospace;color:var(--muted);overflow-wrap:anywhere}
   .memhint{font:11px/1.4 'JetBrains Mono',monospace;color:var(--warn);border-left:2px solid var(--warn);padding:2px 0 2px 8px;margin-top:6px;overflow-wrap:anywhere}
@@ -255,30 +308,30 @@
   .memwarn{font:11px/1.5 'JetBrains Mono',monospace;color:var(--warn);overflow-wrap:anywhere}
   @media(max-width:768px){.membar{height:34px}}
 
-  /* (#827) fleet | missions lens toggle — two co-equal views of the fleet */
+  /* (#827, #1569 B3) fleet | console lens toggle */
   .lenstabs{display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden}
   .lens{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:5px 11px;cursor:pointer;text-decoration:none;background:none}
   .lens+.lens{border-left:1px solid var(--line)}
   .lens:hover{color:var(--text)}
-  .lens.on{background:var(--amber-dim);color:#0a0f17}
-  .crumb .sep{color:var(--amber-dim);margin:0 6px}
+  .lens.on{background:var(--accent-dim);color:#0a0f17}
+  .crumb .sep{color:var(--accent-dim);margin:0 6px}
   .meta{margin-left:auto;font:11px/1.4 'JetBrains Mono',monospace;color:var(--muted);text-align:right}.meta b{color:var(--text)}
   .wrap{display:flex;height:calc(100vh - 46px - 40px - 64px)}
   .stage{flex:1;position:relative;overflow:auto;padding:24px}
   .log{width:380px;border-left:1px solid var(--line);background:var(--bg2);display:flex;flex-direction:column}
-  .detail{display:flex;flex-direction:column;padding:12px 14px 0;background:#131316}
+  .detail{display:flex;flex-direction:column;padding:12px 14px 0;background:var(--bg2)}
   #detailbody{flex:1;overflow:auto;min-height:0;padding-bottom:12px}
   .split{height:7px;flex:none;background:var(--line);cursor:row-resize}
-  .split:hover{background:var(--amber-dim)}
+  .split:hover{background:var(--accent-dim)}
   .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
   .dt{font:600 11px 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
   /* (#1098) filter (funnel) + follow (clock) are grouped icon buttons in the log header */
   .logbtns{display:inline-flex;align-items:center;gap:6px;flex:none}
   .follow{display:inline-flex;align-items:center;justify-content:center;padding:5px;border-radius:6px;cursor:pointer;border:1px solid var(--line);color:var(--muted);background:none}
-  .follow:hover{border-color:var(--amber-dim);color:var(--amber)}
-  .follow.on{color:var(--amber);border-color:var(--amber-dim)}
+  .follow:hover{border-color:var(--accent-dim);color:var(--accent)}
+  .follow.on{color:var(--accent);border-color:var(--accent-dim)}
   .fbtn svg,.follow svg{width:16px;height:16px;display:block}
-  .fdot{color:var(--amber);font-size:11px;line-height:1;margin-left:1px}
+  .fdot{color:var(--accent);font-size:11px;line-height:1;margin-left:1px}
   .detail pre{margin:0;padding:10px 12px;background:var(--bg);border:1px solid var(--line);border-radius:5px;color:var(--text);white-space:pre-wrap;font:11px/1.55 'JetBrains Mono',monospace}
   .detail pre .k{color:var(--muted)}
   .detail .none{color:var(--muted);font:11px 'JetBrains Mono',monospace;padding:10px 0}
@@ -290,34 +343,34 @@
   .searchbox .sicon{position:absolute;left:9px;font-size:14px;line-height:1;color:var(--muted);pointer-events:none;transition:color .15s}
   .searchbox input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:7px 28px;font:12px 'JetBrains Mono',monospace;transition:border-color .15s,box-shadow .15s}
   .searchbox input::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none}
-  .searchbox input:focus{outline:none;border-color:var(--amber);box-shadow:0 0 0 3px rgba(109,241,255,.12)}
+  .searchbox input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(109,241,255,.12)}
   .searchbox input:focus-visible{outline:none}
-  .searchbox.has-q .sicon{color:var(--amber-dim)}
-  .searchbox:focus-within .sicon{color:var(--amber)}
+  .searchbox.has-q .sicon{color:var(--accent-dim)}
+  .searchbox:focus-within .sicon{color:var(--accent)}
   .searchbox input::placeholder{color:var(--muted);font-style:italic}
   .sclear{position:absolute;right:5px;display:flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;border:none;border-radius:50%;background:none;color:var(--muted);font-size:11px;line-height:1;cursor:pointer;transition:color .12s,background .12s}
   .sclear:hover{color:var(--text);background:var(--panel)}
-  .sclear:focus-visible{outline:none;color:var(--amber);box-shadow:0 0 0 2px var(--amber-dim)}
+  .sclear:focus-visible{outline:none;color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
   .sclear[hidden]{display:none}
   /* (#1090) visible keyboard-focus ring for the delegated drill-nav cards
      (role=button + tabindex added at runtime). :focus-visible = keyboard only,
      so mouse clicks don't draw a ring. */
-  [data-act]:focus-visible{outline:2px solid var(--amber);outline-offset:2px;border-radius:4px}
-  .qcount{flex:none;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.04em;color:var(--amber-dim);white-space:nowrap;padding:3px 7px;border:1px solid var(--line);border-radius:10px;opacity:0;transition:opacity .15s}
+  [data-act]:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+  .qcount{flex:none;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.04em;color:var(--accent-dim);white-space:nowrap;padding:3px 7px;border:1px solid var(--line);border-radius:10px;opacity:0;transition:opacity .15s}
   .qcount.show{opacity:1}
   .qcount.zero{color:var(--bad);border-color:rgba(255,107,133,.35)}
   #logbody{flex:1;overflow:auto;padding:8px 14px 10px}
   .fbtn{display:inline-flex;align-items:center;justify-content:center;gap:1px;background:none;border:1px solid var(--line);color:var(--muted);padding:5px;border-radius:6px;cursor:pointer}
-  .fbtn:hover{border-color:var(--amber-dim);color:var(--amber)}
-  .fbtn.on{border-color:var(--amber);color:var(--amber)}
+  .fbtn:hover{border-color:var(--accent-dim);color:var(--accent)}
+  .fbtn.on{border-color:var(--accent);color:var(--accent)}
   .rec{font:11px/1.5 'JetBrains Mono',monospace;color:var(--muted);padding:5px 6px;border-bottom:1px solid var(--line);cursor:pointer;border-left:2px solid transparent}
-  .rec:hover{background:#1c1c22}
-  .rec.sel{background:#23232b;border-left:2px solid var(--amber);color:var(--text)}
-  .rec .t{color:var(--amber)}.rec .tag{color:var(--text)}.rec.telemetry .tag{color:var(--warn)}
+  .rec:hover{background:var(--panel)}
+  .rec.sel{background:#23232b;border-left:2px solid var(--accent);color:var(--text)}
+  .rec .t{color:var(--accent)}.rec .tag{color:var(--text)}.rec.telemetry .tag{color:var(--warn)}
   .empty{color:var(--muted);font:11px 'JetBrains Mono',monospace;padding:10px 2px}
   .scrub{height:64px;border-top:1px solid var(--line);background:var(--bg2);display:flex;align-items:center;gap:14px;padding:0 18px}
-  .scrub button{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);padding:7px 14px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
-  .scrub button.primary{background:var(--amber);color:#0a0a0b;border-color:var(--amber)}
+  .scrub button{background:var(--bg);border:1px solid var(--accent-dim);color:var(--text);padding:7px 14px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
+  .scrub button.primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}
   /* Live mode follows the tail — historical replay lives at /play/<date>. Hide
      the playback transport and reclaim its reserved 64px back into .wrap. */
   body.live-mode .scrub{display:none}
@@ -346,7 +399,7 @@
   body.booting .scrub{display:none}
   body.booting .wrap{height:calc(100vh - 46px - 40px)}
   body.booting #modebadge{visibility:hidden}
-  input[type=range]{flex:1;accent-color:var(--amber)}
+  input[type=range]{flex:1;accent-color:var(--accent)}
   .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
   .fleet{display:flex;gap:16px;flex-wrap:wrap;align-items:stretch}
   .fleettl{margin-top:30px;border-top:1px solid var(--line);padding-top:18px}
@@ -357,7 +410,7 @@
   .twinb{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;color:var(--muted);padding:4px 8px;cursor:pointer;background:none;border:0;text-transform:uppercase}
   .twinb+.twinb{border-left:1px solid var(--line)}
   .twinb:hover{color:var(--text)}
-  .twinb.on{background:var(--amber-dim);color:#0a0f17}
+  .twinb.on{background:var(--accent-dim);color:#0a0f17}
   .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
   .lname{width:var(--lname-w,150px);flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .tltrack{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
@@ -376,39 +429,39 @@
   .tlaxis{margin-left:calc(var(--lname-w,150px) + 12px);display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
   .tlempty{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .mach{width:248px;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;cursor:pointer;transition:border-color .15s}
-  .mach:hover{border-color:var(--amber-dim)}.mach.active{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber-dim)}
+  .mach:hover{border-color:var(--accent-dim)}.mach.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-dim)}
   .mach .name{font:600 15px 'JetBrains Mono',monospace;color:var(--text);display:flex;align-items:center;gap:8px}
-  .mico{display:inline-flex;color:var(--amber-dim)}.mico svg{width:19px;height:19px;display:block}
-  .mach.active .mico{color:var(--amber)}
+  .mico{display:inline-flex;color:var(--accent-dim)}.mico svg{width:19px;height:19px;display:block}
+  .mach.active .mico{color:var(--accent)}
   .mach .spec{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:3px}
   .mach .specdim{opacity:.5;font-style:italic}
   .mach .stat{margin-top:12px;font:12px 'JetBrains Mono',monospace}
   .mach .runs{margin-top:5px;font:12px 'JetBrains Mono',monospace;color:var(--text)}
-  .mach .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--amber-dim);margin-right:7px;vertical-align:middle}
-  .mach.active .dot{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+  .mach .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent-dim);margin-right:7px;vertical-align:middle}
+  .mach.active .dot{background:var(--accent);box-shadow:0 0 8px var(--accent)}
   .mach.absent{opacity:.45}.mach.absent .dot{background:var(--muted);box-shadow:none}
   .hint{display:block;color:var(--muted);font:11px 'JetBrains Mono',monospace;margin-top:10px}
   .stagehdr{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:14px}
-  .stagehdr a{color:var(--amber);cursor:pointer;text-decoration:none}.stagehdr a:hover{text-decoration:underline}
+  .stagehdr a{color:var(--accent);cursor:pointer;text-decoration:none}.stagehdr a:hover{text-decoration:underline}
   .node{display:inline-block;width:260px;vertical-align:top;margin:0 24px 24px 0;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;cursor:pointer}
-  .node:hover{border-color:var(--amber-dim)}.node .h{font:600 13px 'JetBrains Mono',monospace;display:flex;align-items:center;gap:8px}
-  .nico{display:inline-flex;color:var(--amber-dim);flex:none}.nico svg{width:17px;height:17px;display:block}
+  .node:hover{border-color:var(--accent-dim)}.node .h{font:600 13px 'JetBrains Mono',monospace;display:flex;align-items:center;gap:8px}
+  .nico{display:inline-flex;color:var(--accent-dim);flex:none}.nico svg{width:17px;height:17px;display:block}
   .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px;overflow-wrap:anywhere}
-  .node .s.tsline{color:var(--amber-dim);margin-top:6px}
+  .node .s.tsline{color:var(--accent-dim);margin-top:6px}
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
   /* (#1071) status convention — running=yellow(pulse), complete=green,
      canceled=orange, failed=red, anomaly=cyan. */
-  .pill.run{background:#2a2410;color:var(--run);animation:lpulse 1.6s ease-in-out infinite}.pill.done{background:#16261d;color:var(--good)}.pill.util{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
+  .pill.run{background:#2a2410;color:var(--run);animation:lpulse 1.6s ease-in-out infinite}.pill.done{background:#16261d;color:var(--good)}.pill.util{background:var(--bg2);color:var(--accent-dim);border:1px solid var(--line)}
   .pill.canceled{background:#241a12;color:var(--warn)}
-  .pill.muted{background:#1c1c22;color:var(--muted)} /* neutral (e.g. utility-model residency states), not a dispatch verdict */
-  .pill.warn{background:var(--bg2);color:var(--amber);border:1px solid var(--amber)}
+  .pill.muted{background:var(--panel);color:var(--muted)} /* neutral (e.g. utility-model residency states), not a dispatch verdict */
+  .pill.warn{background:#241a12;color:var(--warn)}
   .pill.err{background:#2a1416;color:var(--bad)}
   .wallerr{color:var(--bad);font-weight:600}
-  .node.util{cursor:default;border-left:3px solid var(--amber-dim)}.node.util:hover{border-color:var(--line)}
+  .node.util{cursor:default;border-left:3px solid var(--accent-dim)}.node.util:hover{border-color:var(--line)}
   .rglbl{font:11px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
   /* (#691 Slice 2) "recent runs" — completed dispatches in live mode, dimmed so
      they read as history one click away, not current crew. */
-  .rglbl.rgdim{margin-top:8px;color:var(--amber-dim)}
+  .rglbl.rgdim{margin-top:8px;color:var(--accent-dim)}
   .recentruns{opacity:.55}.recentruns:hover{opacity:1}
   /* (#691) recent runs as an expandable list — richer + scannable vs cards */
   .rrlist{border-top:1px solid var(--line);margin-top:2px;max-width:920px}
@@ -418,8 +471,8 @@
   .rr>summary:hover,.rr[open]>summary{background:var(--bg2)}
   .rr .rrmain{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
   .rr .rrmeta{flex-shrink:0;color:var(--muted)}
-  .rr .rrtime{flex-shrink:0;color:var(--amber-dim)}
-  .rrmore{max-width:920px;text-align:center;padding:8px;cursor:pointer;font:11px 'JetBrains Mono',monospace;color:var(--amber);border-bottom:1px solid var(--line)}
+  .rr .rrtime{flex-shrink:0;color:var(--accent-dim)}
+  .rrmore{max-width:920px;text-align:center;padding:8px;cursor:pointer;font:11px 'JetBrains Mono',monospace;color:var(--accent);border-bottom:1px solid var(--line)}
   .rrmore:hover{background:var(--bg2)}
   /* New-run affordances: a row's first render slides in with a settle flash
      (one tick only — the live stage rebuilds ~1/sec, so the class is applied
@@ -430,8 +483,12 @@
      scannable identity — newest = highest, numbers don't shift as new runs
      prepend. */
   .rr .rrord{flex-shrink:0;color:var(--muted);min-width:38px;text-align:right}
-  .rr.rrfresh>summary{box-shadow:inset 3px 0 0 var(--green,#4ade80)}
-  .rr.rrfresh .rrord{color:var(--green,#4ade80)}
+  /* `var(--green, …)` here fell through to a hardcoded off-palette green:
+     --green has never been defined, so the fallback was the ONLY value and
+     the fresh-run marker sat at #4ade80 while every other green was
+     var(--good) #5af0a3. The palette name is --good. */
+  .rr.rrfresh>summary{box-shadow:inset 3px 0 0 var(--good)}
+  .rr.rrfresh .rrord{color:var(--good)}
   @keyframes rrslide{from{opacity:0;transform:translateY(-7px)}to{opacity:1;transform:none}}
   @keyframes rrflash{from{background:rgba(74,222,128,.16)}to{background:transparent}}
   .rr.rrnew{animation:rrslide .45s ease-out}
@@ -444,34 +501,34 @@
   .rrdetail .kv span{min-width:0;word-break:break-all}
   /* (#1127) Collapsed prompt block in the run brief. */
   .rrdetail .promptdet{border-bottom:none;margin-top:6px}
-  .rrdetail .promptdet>summary{list-style:none;cursor:pointer;color:var(--amber)}
+  .rrdetail .promptdet>summary{list-style:none;cursor:pointer;color:var(--accent)}
   .rrdetail .promptdet>summary::-webkit-details-marker{display:none}
   .promptbody{margin:6px 0 2px;padding:8px;background:var(--bg);border:1px solid var(--line);border-radius:4px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:11px/1.45 'JetBrains Mono',monospace;color:var(--text)}
-  .rrdetail a{color:var(--amber);cursor:pointer}.rrdetail a:hover{text-decoration:underline}
+  .rrdetail a{color:var(--accent);cursor:pointer}.rrdetail a:hover{text-decoration:underline}
   /* (#691) unscoped-records composition breakdown */
   .lbreakdown{max-width:560px;margin-top:2px}
   .lrow{display:flex;align-items:center;gap:12px;padding:6px 8px;border-radius:6px;font:11px 'JetBrains Mono',monospace}
   .lrow[onclick]{cursor:pointer}.lrow[onclick]:hover{background:var(--bg2)}
-  .lrow.sel{background:var(--bg2);outline:1px solid var(--amber-dim)}
+  .lrow.sel{background:var(--bg2);outline:1px solid var(--accent-dim)}
   .lrlbl{flex:0 0 220px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .lrbar{flex:1;height:10px;background:var(--bg2);border-radius:5px;overflow:hidden}
-  .lrbar>span{display:block;height:100%;background:var(--amber-dim)}
+  .lrbar>span{display:block;height:100%;background:var(--accent-dim)}
   .lrcnt{flex:0 0 auto;color:var(--muted);min-width:34px;text-align:right}
   .rghint{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:14px}
-  .rghint a{color:var(--amber);cursor:pointer}.rghint a:hover{text-decoration:underline}
-  .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:0 0 4px}
-  .sub h2 a{color:var(--amber);text-decoration:underline;cursor:pointer}
+  .rghint a{color:var(--accent);cursor:pointer}.rghint a:hover{text-decoration:underline}
+  .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin:0 0 4px}
+  .sub h2 a{color:var(--accent);text-decoration:underline;cursor:pointer}
   .track{margin:18px 0}.track .lbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:6px}
-  .seg{display:inline-flex;align-items:center;height:30px;padding:0 12px;margin-right:2px;font:11px 'JetBrains Mono',monospace;border-radius:3px;color:#0a0a0b;background:var(--amber)}
+  .seg{display:inline-flex;align-items:center;height:30px;padding:0 12px;margin-right:2px;font:11px 'JetBrains Mono',monospace;border-radius:3px;color:var(--bg);background:var(--accent)}
   .seg.b{background:var(--warn)}
   .metrics{display:flex;gap:12px;margin:14px 0 4px;flex-wrap:wrap}
   .met{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:9px 14px;min-width:118px}
   .met .mv{font:600 17px 'JetBrains Mono',monospace;color:var(--text)}
   .met .ml{font:10px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-top:3px}
-  .tokbar{height:4px;background:var(--line);border-radius:2px;margin-top:7px;overflow:hidden}.tokbar span{display:block;height:100%;background:var(--amber)}
+  .tokbar{height:4px;background:var(--line);border-radius:2px;margin-top:7px;overflow:hidden}.tokbar span{display:block;height:100%;background:var(--accent)}
   .cpuchart{display:flex;gap:8px;align-items:flex-end;overflow-x:auto}
   .yax{display:flex;flex-direction:column;justify-content:space-between;height:80px;font:9px 'JetBrains Mono',monospace;color:var(--muted);text-align:right}
-  .bars{display:flex;align-items:flex-end;gap:6px;height:80px;border-bottom:1px solid var(--line)}.bar{width:24px;background:var(--amber-dim);border-radius:2px 2px 0 0}
+  .bars{display:flex;align-items:flex-end;gap:6px;height:80px;border-bottom:1px solid var(--line)}.bar{width:24px;background:var(--accent-dim);border-radius:2px 2px 0 0}
   .xvals{display:flex;gap:6px;margin-top:4px}.xvals span{width:24px;text-align:center;font:9px 'JetBrains Mono',monospace;color:var(--muted)}
   .ctxchart{width:100%;height:74px;display:block;border-bottom:1px solid var(--line)}
   .loadsvg{width:100%;height:40px;display:block;border-bottom:1px solid var(--line)}
@@ -483,7 +540,7 @@
   .finding .fk{display:block;font:600 12px 'JetBrains Mono',monospace;color:var(--warn)}.finding.ok .fk{color:var(--good)}
   .finding .fm{display:block;font-size:12px;color:var(--text);margin-top:3px}
   .finding .ff{display:block;font-size:11px;color:var(--muted);margin-top:5px}
-  .misslink{cursor:pointer;color:var(--amber);text-decoration:none}.misslink:hover{text-decoration:underline}
+  .misslink{cursor:pointer;color:var(--accent);text-decoration:none}.misslink:hover{text-decoration:underline}
   /* (#789) activity-driven headline: running = live-green subject; idle = muted status (not a link) */
   #meta .run{color:var(--run)}
   #meta .idle{color:var(--muted);cursor:default}
@@ -492,28 +549,28 @@
   #meta .idle .rdot{font-weight:700}
   #meta .idle .rdot.ok{color:var(--good)}
   /* (#1105) machine-count chip in the headline — the count stays in the muted
-     headline color; the chip glyph is tinted like the machine cards (--amber-dim) */
+     headline color; the chip glyph is tinted like the machine cards (--accent-dim) */
   #meta .idle .mco{white-space:nowrap}
-  #meta .idle .mco svg{width:13px;height:13px;vertical-align:-2px;margin-left:2px;color:var(--amber-dim)}
+  #meta .idle .mco svg{width:13px;height:13px;vertical-align:-2px;margin-left:2px;color:var(--accent-dim)}
   #meta .metahint{color:var(--muted);font:11px 'JetBrains Mono',monospace}
   /* (#803) hybrid note — the encouraging line inside the savings card */
   .hybnote{margin-top:9px;padding-top:8px;border-top:1px solid var(--line);font:12px 'JetBrains Mono',monospace;color:var(--good)}
   /* (#807) real orchestrator notes: timestamp + history link on the note line,
      and the notes-history modal (wider than filters; notes are prose). */
   .hybts{color:var(--muted);font-size:10px}
-  .hyblink{color:var(--amber);cursor:pointer;font-size:11px;margin-left:4px}.hyblink:hover{text-decoration:underline}
+  .hyblink{color:var(--accent);cursor:pointer;font-size:11px;margin-left:4px}.hyblink:hover{text-decoration:underline}
   .nmodal{width:540px;max-width:92vw;max-height:72vh;overflow:auto}
   .nrow{border-bottom:1px solid var(--line);padding:9px 0}.nrow:last-child{border-bottom:none}
-  .nts{font:10px 'JetBrains Mono',monospace;color:var(--amber-dim)}
+  .nts{font:10px 'JetBrains Mono',monospace;color:var(--accent-dim)}
   .ntext{font:12px/1.5 'JetBrains Mono',monospace;color:var(--text);margin-top:3px;white-space:pre-wrap}
   /* (#1387) what-changed summary + worktree handoff — replaces the retired
      live-diff panel (#756). The daemon never ships diff content over HTTP
      any more; this renders totals + a copy/zed handoff to the worktree path. */
   .wtpath{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}
   .wtpath code{font:11px/1.5 'JetBrains Mono',ui-monospace,monospace;color:var(--text);background:#0a0f17;border:1px solid var(--line);border-radius:6px;padding:6px 10px;overflow-wrap:anywhere}
-  .wtcopy{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);border-radius:4px;padding:4px 10px;cursor:pointer;font:600 11px 'JetBrains Mono',monospace}
-  .wtcopy:hover{border-color:var(--amber)}
-  .wtzed{color:var(--amber);font:11px 'JetBrains Mono',monospace;text-decoration:none}
+  .wtcopy{background:var(--bg);border:1px solid var(--accent-dim);color:var(--text);border-radius:4px;padding:4px 10px;cursor:pointer;font:600 11px 'JetBrains Mono',monospace}
+  .wtcopy:hover{border-color:var(--accent)}
+  .wtzed{color:var(--accent);font:11px 'JetBrains Mono',monospace;text-decoration:none}
   .wtzed:hover{text-decoration:underline}
   /* (#783) savings hero — tokens kept off the meter. The "bang-up" on the fleet view. */
   /* (#803 layout) Horizontal hero: the big number leads on the left, the
@@ -531,7 +588,7 @@
   .savrow{display:flex;align-items:center;gap:14px 40px;flex-wrap:wrap}
   .savlead{flex:0 0 auto}
   .savnum{font:700 48px/1 'JetBrains Mono',monospace;color:var(--good);letter-spacing:.01em}
-  .savlead.cloud .savnum{color:var(--amber)}
+  .savlead.cloud .savnum{color:var(--accent)}
   .savlbl{font:600 12px/1 'JetBrains Mono',monospace;color:var(--text);margin-top:7px;text-transform:uppercase;letter-spacing:.12em}
   .savclasses{display:flex;gap:10px 30px;flex-wrap:wrap;align-items:center;justify-content:flex-end;flex:1 1 auto}
   .savc .scv{font:600 23px/1.1 'JetBrains Mono',monospace;color:var(--text)}
@@ -550,19 +607,19 @@
   /* Per-activity glyph on each log line — scannable "what's the model doing". */
   .aico{display:inline-flex;vertical-align:-2px;width:13px;height:13px;margin-right:2px;color:var(--muted)}
   .aico svg{width:13px;height:13px}
-  .aico.act-tool-call{color:var(--amber)}
+  .aico.act-tool-call{color:var(--accent)}
   .aico.act-reasoning{color:#8ab4f8}
   .aico.act-dispatch-start{color:#4ade80}
   .aico.act-dispatch-end{color:#4ade80}
   .aico.act-compaction{color:#c084fc}
   .aico.act-routing{color:#8ab4f8}
-  .aico.act-note{color:var(--amber)}
-  .aico.act-dispatch-error{color:var(--warn,#f87171)}
+  .aico.act-note{color:var(--accent)}
+  .aico.act-dispatch-error{color:var(--bad)}
   .aico.act-feedback{color:#8ab4f8}
   .aico.act-machine-online,.aico.act-machine-offline{color:var(--muted)}
   .detail-card{padding:14px;background:var(--bg);border:1px solid var(--line);border-radius:6px;margin-bottom:12px;font:12px/1.55 'JetBrains Mono',monospace}
-  .detail-card h3{margin:0 0 10px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--amber)}
-  .detail-card.reasoning{border-left:3px solid var(--amber)}
+  .detail-card h3{margin:0 0 10px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+  .detail-card.reasoning{border-left:3px solid var(--accent)}
   .detail-card.tool{border-left:3px solid var(--good)}
   .detail-card.tool.fail{border-left:3px solid var(--bad)}
   .detail-card .content{white-space:pre-wrap;color:var(--text);font-size:11px}
@@ -575,16 +632,16 @@
 
   /* filter modal */
   .modalbg{position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:100;display:none;align-items:center;justify-content:center}
-  .modal{width:380px;max-width:92vw;background:var(--bg2);border:1px solid var(--amber-dim);border-radius:8px;padding:18px 20px}
-  .mhd{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;font:600 13px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--amber)}
+  .modal{width:380px;max-width:92vw;background:var(--bg2);border:1px solid var(--accent-dim);border-radius:8px;padding:18px 20px}
+  .mhd{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;font:600 13px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
   .mx{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer}
   .fgroup{margin-bottom:14px}
   .fgroup h4{margin:0 0 8px;font:600 10px 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
   .fgroup label{display:inline-flex;align-items:center;gap:6px;margin:0 14px 7px 0;font:12px 'JetBrains Mono',monospace;color:var(--text);cursor:pointer}
-  .fgroup input{accent-color:var(--amber);cursor:pointer}
+  .fgroup input{accent-color:var(--accent);cursor:pointer}
   .mft{display:flex;gap:10px;margin-top:8px}
   .mft input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:4px;padding:8px 10px;font:12px 'JetBrains Mono',monospace}
-  .clr{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);border-radius:4px;padding:8px 12px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
+  .clr{background:var(--bg);border:1px solid var(--accent-dim);color:var(--text);border-radius:4px;padding:8px 12px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
 
   /* ---- Mobile phase 1 — survival #634 -------------------------------
      Desktop locks viewport to 100vh + overflow:hidden + horizontal flex
@@ -706,7 +763,6 @@
     .detail { height: auto !important; max-height: 24vh; }
     /* mission index rows: reflow, meta drops to its own line */
     .mirow { flex-wrap: wrap; }
-    .mimeta { flex: 1 1 100%; }
     /* (#1247 Part 3) Lab lens on phones: touch-size the run rows (already
        stacking by default — see the base rules above), and drop the fixed
        stage-name column so a long stage/status line wraps under it instead
@@ -738,7 +794,7 @@
 </div>
 <div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
-  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a><a class="lens" id="lens-runs" data-act="runs">runs</a><a class="lens" id="lens-machine" data-act="machine">machine</a></span>
+  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-console" data-act="console">console</a><a class="lens" id="lens-runs" data-act="runs">runs</a><a class="lens" id="lens-machine" data-act="machine">machine</a></span>
   <span class="crumb" id="crumb"></span>
   <span class="meta" id="meta"></span>
 </div>
@@ -774,14 +830,14 @@
 </div>
 <div class="modalbg" id="modalbg">
   <div class="modal">
-    <div class="mhd"><span>filter events</span><button class="mx" data-act="closefilters">✕</button></div>
+    <div class="mhd"><span>filter events</span><button class="mx" data-act="closefilters" aria-label="close">✕</button></div>
     <div id="filterbody"></div>
     <div class="mft"><input id="fsearch" placeholder="search text…"><button class="clr" data-act="onlymodel" title="show only reasoning, tool calls, and turns">model only</button><button class="clr" data-act="clearfilters">clear all</button></div>
   </div>
 </div>
 <div class="modalbg" id="nmodalbg">
   <div class="modal nmodal">
-    <div class="mhd"><span>orchestrator notes</span><button class="mx" data-act="closenotes">✕</button></div>
+    <div class="mhd"><span>orchestrator notes</span><button class="mx" data-act="closenotes" aria-label="close">✕</button></div>
     <div id="notesbody"></div>
   </div>
 </div>
@@ -987,6 +1043,8 @@ let state={level:"fleet",machine:null,session:null,missionId:null,labRunDir:null
   // series/knob-diff grouping, opt-in and only reachable under the lab
   // filter (see renderRuns).
   runsKind:"all", runsAll:false, runsSeries:false,
+  // (#1569 B2) Which CLI panel the console tab is showing.
+  panelId:"mission-status",
   // (#1508) Navigational INTENT for the unified machine page's local-vs-
   // remote health-region gate — true only via goMachine() (the nav tab /
   // `#lens=machine` deep-link, which always means "my own page" even before
@@ -1440,9 +1498,9 @@ function openNotes(){
   const rows=orchNotes().slice().reverse().map(n=>
     `<div class="nrow"><div class="nts">${clk(T(n.ts))} · ${relAgo(T(n.ts))}</div><div class="ntext">${esc(n.handle)}</div></div>`
   ).join("")||'<div class="none">no orchestrator notes in this window</div>';
-  $("notesbody").innerHTML=rows;$("nmodalbg").style.display="flex";
+  $("notesbody").innerHTML=rows;openModalEl("nmodalbg");
 }
-function closeNotes(){$("nmodalbg").style.display="none";}
+function closeNotes(){$("nmodalbg").style.display="none";restoreModalFocus();}
 // (#1132) About modal — build + status snapshot. Rendered once on open (a
 // point-in-time snapshot, like the notes/filter modals); it lives at body
 // level so the ~1/sec live rebuild can't reset it. Values are darkmux-owned
@@ -1734,9 +1792,22 @@ function renderMachine(){
       ? models.map(mm=>renderMachineMemModel(mm, perScale, null)).join("")
       : `<div class="none">no models loaded.</div>`;
     const freePct=pressure.memory_free_percent!=null?`${Number(pressure.memory_free_percent)}%`:"—";
+    // Each row is colored by ITS OWN condition, never by the card's. Both the
+    // swap and memory-free rows used to key on `pressure.red`, so whichever
+    // signal tripped painted the OTHER row red too — that is how a healthy
+    // "memory free 94%" rendered as an alarm. A value that passed its own
+    // check must never be drawn as the thing that failed.
+    //
+    // swap + compressor REPORT, they never alarm: both are monotonic
+    // high-water marks that track uptime rather than distress (see the note in
+    // darkmux-profiles/src/model_ledger.rs where the swap threshold used to
+    // live). memory-free is the sole trigger, which is why it alone may key on
+    // `pressure.red` — `pressure_red()` takes exactly one argument now, so the
+    // coupling is visible at the signature. Add a second trigger and this row
+    // needs its own flag from the server rather than the card's.
     const pressureCard=`<div class="memcard${pressure.red?" red":""}">
       <div class="memhdr"><span class="memname">pressure</span>${pressure.red?`<span class="memstate red">red</span>`:""}</div>
-      <div class="memrow"><span class="k">swap used</span><span class="v${pressure.red?" bad":""}">${memBytes(pressure.swap_used_bytes)}</span></div>
+      <div class="memrow"><span class="k">swap used</span><span class="v">${memBytes(pressure.swap_used_bytes)}</span></div>
       <div class="memrow"><span class="k">compressor</span><span class="v">${memBytes(pressure.compressor_bytes)}</span></div>
       <div class="memrow"><span class="k">memory free</span><span class="v${pressure.red?" bad":""}">${esc(freePct)}</span></div>
     </div>`;
@@ -2065,7 +2136,7 @@ function runRegions(){
     // whose context delta is too small to render as a visible step (a ~200-token
     // turn is ~0.15px on a 100K window). Makes turns countable + time-locatable,
     // and lines up with the CPU bars + compaction marks on the shared time axis.
-    const dots=xy.map((p,i)=>`<circle cx="${p[0].toFixed(0)}" cy="${p[1].toFixed(1)}" r="2.4" fill="var(--bg)" stroke="var(--amber)" stroke-width="1.4" vector-effect="non-scaling-stroke"><title>turn ${i+1} · ${(cx[i].fields.used/1000).toFixed(1)}k ctx</title></circle>`).join("");
+    const dots=xy.map((p,i)=>`<circle cx="${p[0].toFixed(0)}" cy="${p[1].toFixed(1)}" r="2.4" fill="var(--bg)" stroke="var(--accent)" stroke-width="1.4" vector-effect="non-scaling-stroke"><title>turn ${i+1} · ${(cx[i].fields.used/1000).toFixed(1)}k ctx</title></circle>`).join("");
     const area="M0,"+H+" L"+step.map(p=>p[0].toFixed(0)+","+p[1].toFixed(0)).join(" L")+" L"+AX_W+","+H+" Z";
     const marks=comps.map(r=>{const x=tx(r.ts).toFixed(0);return `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="2 3"/><text x="${x}" y="9" fill="var(--warn)" font-size="9" text-anchor="middle">⚡</text>`;}).join("");
     // (#711) Native hover tooltip on the chart — now / peak / window at a glance.
@@ -2079,7 +2150,7 @@ function runRegions(){
     // approaches the window ceiling (y=0 = nctx). The top-left label names that
     // ceiling so "how full toward the max" reads at a glance (the operator asked
     // to see the max + a danger cue without an exact threshold line).
-    ctxChart=`<div class="track"><div class="lbl">context window — ${(nctx/1000)}K · ⚡ = compaction (${comps.length})</div><svg class="ctxchart" viewBox="0 0 ${AX_W} ${H+2}" preserveAspectRatio="none"><title>${esc(tip)}</title><defs><linearGradient id="ctxgrad" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${H}"><stop offset="0" stop-color="#ff6b6b"/><stop offset="0.5" stop-color="var(--warn)"/><stop offset="1" stop-color="var(--good)"/></linearGradient></defs><path d="${area}" fill="url(#ctxgrad)" opacity="0.28"/><polyline points="${linePts}" fill="none" stroke="var(--amber)" stroke-width="1.5"/>${thrLine}<text x="2" y="9" fill="var(--muted)" font-size="8" opacity="0.5">${(nctx/1000)}K</text>${marks}${dots}</svg></div>`;
+    ctxChart=`<div class="track"><div class="lbl">context window — ${(nctx/1000)}K · ⚡ = compaction (${comps.length})</div><svg class="ctxchart" viewBox="0 0 ${AX_W} ${H+2}" preserveAspectRatio="none"><title>${esc(tip)}</title><defs><linearGradient id="ctxgrad" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${H}"><stop offset="0" stop-color="#ff6b6b"/><stop offset="0.5" stop-color="var(--warn)"/><stop offset="1" stop-color="var(--good)"/></linearGradient></defs><path d="${area}" fill="url(#ctxgrad)" opacity="0.28"/><polyline points="${linePts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/>${thrLine}<text x="2" y="9" fill="var(--muted)" font-size="8" opacity="0.5">${(nctx/1000)}K</text>${marks}${dots}</svg></div>`;
   }
   const finds=[];
   if(distinct.length>1)finds.push({s:"warn",k:"jit-model-swap",d:`${distinct.length} models loaded in one run (${distinct.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`,f:"pin one model for the run, or pre-warm the swap target."});
@@ -2287,8 +2358,14 @@ function renderLog(){
   const qc=$("qcount");
   if(qc){
     const q=!!state.filters.q;
-    qc.textContent=q?(all.length?`${all.length} match${all.length===1?'':'es'}${all.length>50?' · newest 50':''}`:"no match"):"";
-    qc.classList.toggle("show",q);
+    // The "newest 50" note used to ride along with the match count, so it only
+    // appeared while FILTERING — the unfiltered log, which is the normal case,
+    // silently dropped everything past the newest 50.
+    const capped=all.length>50;
+    qc.textContent = q
+      ? (all.length?`${all.length} match${all.length===1?'':'es'}${capped?' · newest 50':''}`:"no match")
+      : (capped?`newest 50 of ${all.length}`:"");
+    qc.classList.toggle("show", q||capped);
     qc.classList.toggle("zero",q&&all.length===0);
   }
   $("logbody").innerHTML=recs.length?recs.map(r=>{
@@ -2324,14 +2401,19 @@ function renderCrumb(){
   // (#691) Gate on the live-SCOPED mission, not the global count — in live mode
   // with nothing running, primaryMission() is null and the crumb drops the
   // mission link (no stale "◆ m6"). Playback: primaryMission()=missions[0].
-  // (#827) Light the active lens. The missions lens covers the index + a
+  // (#827, #1569 B3) Light the active lens. The console lens covers the CLI
+  // panels + the daemon-less static
   // mission detail; the runs lens (#1584, was the lab lens in #1247 Part 3)
   // covers the consolidated run list + a lab run's detail; everything else is
   // the fleet lens.
-  // (#1403) The missions lens is the index; on daemon-served pages the mission
-  // detail is the graph page (a separate document). The in-viewer `mission`
-  // level survives only as the daemon-less static summary (renderMissionStatic).
-  const inMissions = state.level==="missions"||state.level==="mission";
+  // (#1403) On daemon-served pages a mission's detail is the graph page, a
+  // separate document. The in-viewer `mission` level survives ONLY as the
+  // daemon-less static summary (renderMissionStatic); the `missions` INDEX
+  // level it used to sit beside went with the board (#1561).
+  const inMission = state.level==="mission";
+  // (#1569 B2) The console tab. A static mission summary reads as living under
+  // it — that is where the mission board is now.
+  const inConsole = state.level==="console";
   // (#1584) `lab-run` is the lab-specific DRILL-DOWN, kept exactly as it was —
   // it just hangs off the runs lens now instead of a top-level lab tab.
   const inRuns = state.level==="runs"||state.level==="lab-run";
@@ -2340,9 +2422,9 @@ function renderCrumb(){
   // list, a third source class distinct from run artifacts (lab) and flow
   // records (fleet/missions). Absorbed the retired `machinemem` level.
   const inMachine = state.level==="machine";
-  const lf=$("lens-fleet"), lm=$("lens-missions"), ll=$("lens-runs"), lmm=$("lens-machine");
-  if(lf)lf.className="lens"+((inMissions||inRuns||inMachine)?"":" on");
-  if(lm)lm.className="lens"+(inMissions?" on":"");
+  const lf=$("lens-fleet"), lm=$("lens-console"), ll=$("lens-runs"), lmm=$("lens-machine");
+  if(lf)lf.className="lens"+((inMission||inRuns||inMachine||inConsole)?"":" on");
+  if(lm)lm.className="lens"+((inConsole||inMission)?" on":"");
   if(ll)ll.className="lens"+(inRuns?" on":"");
   if(lmm)lmm.className="lens"+(inMachine?" on":"");
   // (#1247 Part 3) The runs lens is a SEPARATE machine-local room, not a rung
@@ -2350,38 +2432,65 @@ function renderCrumb(){
   // operator direction) — it has no time-scrubbing story, so the flow-record
   // chrome (event log, detail pane, playback scrub bar) is irrelevant and
   // hidden via this class (see the `.runs-mode` CSS block).
-  document.body.classList.toggle("runs-mode", inRuns);
+  document.body.classList.toggle("runs-mode", inRuns||inConsole);
   // (#1508) Same reflow for the unified machine page — its own class, same rules.
   document.body.classList.toggle("machine-mode", inMachine);
   // (#1247 deep-link) Every navigation path lands here, so this is the ONE
   // place the address bar is kept in sync with the runs/machine view.
-  syncLabHash(inRuns, inMachine);
+  syncLabHash(inRuns, inMachine, inConsole);
+  // (#1569 B2, operator nit) ONE crumb rule: show only what is BELOW the
+  // current tab, never the tab's own name. The tab is already named and
+  // highlighted a few pixels above — repeating it as a bright link is noise
+  // that also reads as navigation to somewhere you already are.
+  //
+  // It used to be four branches with three conventions: `machine` led with
+  // `fleet ›` (a DIFFERENT tab's name), `console` and `runs` each led with
+  // their own, and the fleet lens led with `◆ mission › fleet`. Hence the
+  // "only some tabs show it" inconsistency — there was no rule to be
+  // inconsistent with.
+  //
+  // Up-navigation is unaffected: the lens tabs themselves are the up-nav,
+  // and every within-lens hop (machine, mission) is still a link here.
+  const crumb = (parts) =>
+    parts.filter(Boolean).join(`<span class="sep">›</span>`);
+
   if(inMachine){
-    $("crumb").innerHTML=`<a data-act="fleet">fleet</a><span class="sep">›</span>${state.machine!=null?escN(state.machine):"this machine"}`;
+    $("crumb").innerHTML = state.machine!=null ? escN(state.machine) : "this machine";
     return;
   }
   if(inRuns){
-    let lc=`<a data-act="runs">runs</a>`;
-    if(state.level==="lab-run") lc+=`<span class="sep">›</span>${esc(state.labRunDir||"—")}`;
-    $("crumb").innerHTML=lc; return;
+    $("crumb").innerHTML = state.level==="lab-run" ? esc(state.labRunDir||"—") : "";
+    return;
   }
-  // Missions-lens crumb: the index, plus the static mission summary's id when
-  // a daemon-less context is showing one (#1403 gate remediation).
-  if(inMissions){
-    let mc=`<a data-act="missions">missions</a>`;
-    if(state.level==="mission") mc+=`<span class="sep">›</span>◆ ${esc(state.missionId||primaryMission()||"—")}`;
-    $("crumb").innerHTML=mc; return;
+  if(inConsole){
+    // Nothing. The picker chip for the selected panel is highlighted a few
+    // pixels below, and the panel's own chrome line names the exact command
+    // ("$ darkmux mission status --all") — a crumb here is the third copy of
+    // one fact. Same operator rule that removed the tab-name crumb and the
+    // stage header: a label earns its pixels by saying something the
+    // surrounding context does not.
+    $("crumb").innerHTML = "";
+    return;
   }
+  if(inMission){
+    // The daemon-less static mission summary (#1403) — a mission click with
+    // no graph page to open. Only the mission id is below the tab.
+    $("crumb").innerHTML = `◆ ${esc(state.missionId||primaryMission()||"—")}`;
+    return;
+  }
+  // Fleet lens. `◆ <mission>` stays: it is a shortcut to the running
+  // mission, not the name of the tab you are on.
   const pm=primaryMission();
-  const hasMission=pm!=null;
-  let c=hasMission?`<a class="misslink" data-act="mission">◆ ${esc(pm)}</a>`:``;
-  c+=(hasMission?`<span class="sep">›</span>`:``)+`<a data-act="fleet">fleet</a>`;
-  // (#1094) loose included so the crumb carries the machine link there too —
-  // it's the up-nav now that the back button is gone (loose drills from a
-  // machine). `machine` itself is handled in the early-return above.
-  if(state.level==="subsystem"||state.level==="loose") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`;
-  if(state.level==="subsystem") c+=`<span class="sep">›</span>${esc(state.session)}`;
-  $("crumb").innerHTML=c;
+  // (#1094) loose carries the machine link too — it is the up-nav within
+  // this lens now that the back button is gone.
+  const machineLink = (state.level==="subsystem"||state.level==="loose")
+    ? `<a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`
+    : "";
+  $("crumb").innerHTML = crumb([
+    pm!=null ? `<a class="misslink" data-act="mission">◆ ${esc(pm)}</a>` : "",
+    machineLink,
+    state.level==="subsystem" ? esc(state.session) : "",
+  ]);
 }
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||state.filters.act.size<FACTS.length||!!state.filters.q;}
 function updateFbtn(){const a=filtersActive();const b=$("fbtn");b.className="fbtn"+(a?" on":"");b.innerHTML=ICON.filter+(a?'<span class="fdot">•</span>':'');b.title=a?"filters (active)":"filters";b.setAttribute("aria-label",b.title);}
@@ -2396,6 +2505,14 @@ function render(){
   // that assumes `DATA`/`state.t`/the scrub window. renderCrumb() still runs
   // first (it lights the lens tab + sets the `.runs-mode` body class the CSS
   // keys off).
+  // (#1569 B2) The console tab renders a CLI panel — text, not flow
+  // records: no time axis, no filters, no event log, same early-return
+  // shape the runs/machine lenses use.
+  if(state.level==="console"){
+    renderCrumb();
+    renderConsole();
+    return;
+  }
   if(state.level==="runs"||state.level==="lab-run"){
     renderCrumb();
     renderLab();
@@ -2409,7 +2526,7 @@ function render(){
     renderMachine();
     return;
   }
-  if(state.level==="missions")renderMissionsIndex(); else if(state.level==="mission")renderMissionStatic(); else if(state.level==="fleet")renderFleet(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
+  if(state.level==="mission")renderMissionStatic(); else if(state.level==="fleet")renderFleet(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
   syncTransport();
@@ -2494,15 +2611,21 @@ window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;st
 // already flowSrc-shielded; this gates the click paths the same way.
 const missionGraphReachable=()=>!!injectedMeta("darkmux-mode")&&!injectedMeta("darkmux-flow-src");
 window.goMissionGraph=id=>{
-  if(!id)return goMissions();
+  if(!id)return goConsole();
   if(missionGraphReachable()){ location.href="/mission/"+encodeURIComponent(id)+"/graph"; return; }
   state.level="mission";state.machine=null;state.session=null;state.missionId=id;state.follow=true;render();
 };
 window.goMission=()=>{ const id=primaryMission(); if(!id)return goFleet(); goMissionGraph(id); };
-// (#827 Slice A) The missions lens: the index of all missions. Clicking a row
+// (#827 Slice A, #1569 B2) Was the missions index; now a legacy alias onto the
+// console. Clicking a row
 // leaves for that mission's graph page (#1403), or renders the static summary
 // below in daemon-less contexts.
-window.goMissions=()=>{ state.level="missions";state.machine=null;state.session=null;state.missionId=null;state.follow=true;render();};
+// (#1569 B2) `missions` now RESOLVES to the console tab: the mission board
+// is the `mission status` panel, so an old deep link, an old crumb, or the
+// mission-graph page's back-nav all land somewhere real instead of a lens
+// that no longer exists. The `mission` level (the daemon-less static
+// summary) is untouched — it is a different surface with a different job.
+window.goMissions=()=>{ state.panelId="mission-status"; goConsole(); };
 // (#1403 gate remediation) Static-context mission summary — the daemon-less
 // fallback for a mission click: mission id + status badge + the phase list
 // from the static missions/phases JSON (the demo injects demo-missions.json /
@@ -2548,59 +2671,15 @@ async function loadMissionsPhases(mUrl, pUrl){
 // the flow (so it works under the demo without a /missions endpoint). Each row:
 // status, phase progress (from the durable plan), machines touched + token
 // rollup (from the flow), last activity. Click → that mission's detail.
-function renderMissionsIndex(){
-  $("logscope").textContent="missions"; state.stageScope=()=>true;
-  const ids=new Set();
-  MISSIONS.forEach(m=>{ if(m&&m.id)ids.add(m.id); });
-  visible().forEach(r=>{ if(r.mission_id)ids.add(r.mission_id); });
-  const byId={}; MISSIONS.forEach(m=>{ if(m&&m.id)byId[m.id]=m; });
-  // (#827 QA) One pass to bucket records by mission_id — avoids re-filtering
-  // the whole visible window per row (O(n×m) → O(n+m)) on every live render.
-  const recsBy={}, phBy={};
-  visible().forEach(r=>{ if(r.mission_id){(recsBy[r.mission_id]||(recsBy[r.mission_id]=[])).push(r);} });
-  PHASES.forEach(s=>{ if(s&&s.mission_id){(phBy[s.mission_id]||(phBy[s.mission_id]=[])).push(s);} });
-  const rows=[...ids].map(id=>{
-    const m=byId[id]||null;
-    // (#827 Slice B) status is the durable MISSION status; a mission with no
-    // /missions struct (flow-only) has no status — it's "untracked", shown as
-    // a separate provenance tag, NOT jammed into the status slot.
-    const status=m?normalizeMissionStatus(m.status||"active"):"untracked";
-    const known=!!m;
-    // Phase progress from the durable plan when present.
-    const sids=(m&&Array.isArray(m.phase_ids))?m.phase_ids:[];
-    const phaseObjs=phBy[id]||[];
-    const total=sids.length||phaseObjs.length;
-    const done=phaseObjs.filter(s=>s.status==="complete").length;
-    const pct=total?Math.round(done/total*100):0;
-    // Cross-machine + token rollup from the flow.
-    const recs=recsBy[id]||[];
-    const machs=[...new Set(recs.map(r=>nameOf(uidOf(r))).filter(Boolean))];
-    const toks=recs.filter(r=>r.category==="telemetry"&&r.source==="tokens")
-                   .reduce((a,r)=>a+((r.payload&&r.payload.total_tokens)||0),0);
-    const last=recs.length?Math.max(...recs.map(r=>T(r.ts))):0;
-    return {id,status,total,done,pct,machs,toks,last,known};
-  }).sort((a,b)=> (a.status==="finalized")-(b.status==="finalized") || b.last-a.last );
-  const body=rows.length?rows.map(r=>{
-    const prog=r.total?`<span class="miprog"><span class="mibar"><span style="width:${r.pct}%"></span></span> ${r.done}/${r.total}</span>`
-                      :`<span class="midim">no phases yet</span>`;
-    const tok=r.toks?` · ${fmtC(r.toks)} tok`:'';
-    const mach=r.machs.length?` · ${esc(r.machs.length===1?r.machs[0]:r.machs.length+' machines')}`:'';
-    // finalized → done check; untracked (flow-only) → a quiet provenance tag,
-    // not a status chip; otherwise the real mission status. `r.status` is
-    // already normalized (Closed→Finalized rename, #1463 lineage) — see
-    // `normalizeMissionStatus`.
-    const chip=r.known
-      ? `<span class="mistatus ${esc(r.status)}">${r.status==="finalized"?"✓ ":""}${esc(r.status)}</span>`
-      : `<span class="mitag">untracked</span>`;
-    return `<div class="mirow ${r.status==="finalized"?'midimrow':''}" data-act="missiondrill" data-arg="${esc(r.id)}">
-      ${chip}
-      <span class="miname">◆ ${esc(r.id)}</span>
-      ${prog}
-      <span class="mimeta">${mach}${tok}</span></div>`;
-  }).join(""):`<div class="none">no missions yet — propose one with <code>darkmux mission propose</code></div>`;
-  $("stage").innerHTML=savingsHero()+`<div><div class="stagehdr">missions · ${rows.length} total</div>
-    <div class="milist">${body}</div></div>`;
-}
+// (#1561, #1569 B3) The missions INDEX used to live here — a JavaScript
+// re-implementation of `darkmux mission status` that had DIVERGED from it:
+// the one mission needing attention rendered as the one row with no signal.
+// It is deleted, not fixed. The console tab renders the CLI's own output, so
+// the second implementation cannot drift from the first by not existing.
+//
+// `renderMissionStatic` (above) is NOT that board: it is the single-mission
+// summary a mission click falls back to when there is no daemon to serve the
+// graph page (#1403), and it has no CLI twin to disagree with.
 // (#827 Slice B QA) Sanitize a record-derived value used as a CSS class token.
 // esc() makes it HTML-safe but a status with a space/dot would still split or
 // invalidate the class; strip to alpha (enum values are alpha today — this is
@@ -2621,7 +2700,7 @@ const missionBadge=ms=>ms?`<span class="mstat ${clsSafe(ms)}">${esc(ms)}</span>`
 // (#1403) renderMission + renderMissionFromFlow (the flat in-viewer mission
 // drill-down) retired here, along with their private helpers (cycleStage,
 // runSid) and CSS family — the mission view is the graph page now
-// (/mission/<id>/graph), reached in one hop from the missions index. The
+// (/mission/<id>/graph), reached from the console panel's linkified ids. The
 // graph page carries the header/status/meters and degrades to phases-only for
 // pre-registry missions; daemon-less static builds keep the minimal
 // renderMissionStatic summary above instead.
@@ -2673,8 +2752,8 @@ window.onlyModelActivity=()=>{
   renderFilters();render();
 };
 window.toggleFilter=(k,v)=>{const s=state.filters[k];s.has(v)?s.delete(v):s.add(v);render();};
-window.openFilters=()=>{renderFilters();$("fsearch").value=state.filters.q;$("modalbg").style.display="flex";};
-window.closeFilters=()=>{$("modalbg").style.display="none";};
+window.openFilters=()=>{renderFilters();$("fsearch").value=state.filters.q;openModalEl("modalbg");};
+window.closeFilters=()=>{$("modalbg").style.display="none";restoreModalFocus();};
 window.clearFilters=()=>{state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),act:new Set(FACTS),q:""};setQuery("");renderFilters();};
 // One query, two inputs: the first-class pane search (#logq) and the modal
 // search (#fsearch) stay in sync through setQuery so either entry point filters
@@ -2693,6 +2772,37 @@ $("logq").oninput=e=>setQuery(e.target.value);
 // Clear affordance in the pane search — wipes the shared query and re-focuses
 // the input so the operator can keep typing a fresh filter.
 $("sclear").onclick=()=>{setQuery("");const lq=$("logq");if(lq)lq.focus();};
+// (#1569 sweep) Every `.modalbg` dialog now dismisses the same three ways:
+// the ✕, a backdrop click, and Escape — and every one returns focus to
+// whatever opened it. Before this, all three shared the class and the ✕ and
+// the backdrop handler, but only the about modal (#1132) answered Escape or
+// managed focus, so a keyboard user's Escape silently did nothing on two of
+// the three. `closeInfo` keeps its own explicit restore-to-verbadge; the
+// generic path is a no-op when it has nothing remembered.
+const MODAL_IDS=["modalbg","nmodalbg","imodalbg"];
+let MODAL_RETURN_FOCUS=null;
+function openModalEl(id){
+  MODAL_RETURN_FOCUS=(document.activeElement&&document.activeElement!==document.body)?document.activeElement:null;
+  const m=$(id); if(!m)return;
+  m.style.display="flex";
+  const x=m.querySelector(".mx"); if(x)x.focus();
+}
+function restoreModalFocus(){
+  const el=MODAL_RETURN_FOCUS; MODAL_RETURN_FOCUS=null;
+  if(el&&el.isConnected&&typeof el.focus==="function")el.focus();
+}
+// Closes the one open dialog, whichever it is. Returns true if it closed
+// something, so Escape can fall through to the catalog panel otherwise.
+function closeOpenModal(){
+  for(const id of MODAL_IDS){
+    const m=$(id);
+    if(m&&m.style.display!=="none"&&m.style.display!==""){
+      if(id==="modalbg")closeFilters(); else if(id==="nmodalbg")closeNotes(); else closeInfo();
+      return true;
+    }
+  }
+  return false;
+}
 $("modalbg").onclick=e=>{if(e.target===$("modalbg"))closeFilters();};
 $("nmodalbg").onclick=e=>{if(e.target===$("nmodalbg"))closeNotes();};
 $("imodalbg").onclick=e=>{if(e.target===$("imodalbg"))closeInfo();}; // (#1132) click-outside
@@ -2712,8 +2822,7 @@ const ACTIONS={
   query:a=>setQuery(a||""),
   rec:a=>selectRec(Number(a)),
   fleet:()=>goFleet(),
-  missions:()=>goMissions(),
-  missiondrill:a=>goMissionGraph(a),
+  missions:()=>goMissions(),   // legacy id -> console (#1569 B2)
   mission:()=>goMission(),
   recentall:()=>toggleRecentAll(),
   actwin:a=>setActivityWindow(Number(a)),
@@ -2730,7 +2839,10 @@ const ACTIONS={
   goday:d=>{ location.href="/play/"+encodeURIComponent(d); },
   golive:()=>{ location.href="/"; },
   gomission:id=>goMissionGraph(id),
-  gosession:id=>{ location.href="/?session="+encodeURIComponent(id); },
+  // (#1569 B2) The console tab — allowlisted CLI panels.
+  console:()=>goConsole(),
+  setpanel:a=>setPanel(a),
+  refreshpanel:()=>refreshPanel(),
   // (#1584) The consolidated runs lens (absorbed #1247 Part 3's lab lens).
   // `labrun` stays the lab-specific drill-down, now reached from a Lab row.
   runs:()=>goRuns(),
@@ -2757,6 +2869,10 @@ document.addEventListener("click",e=>{
     if(panel && !panel.hidden && !e.target.closest("#catpanel")) panel.hidden=true;
   }
   if(!el)return;
+  // An anchor carrying [data-act] is an IN-PAGE action wearing a real href
+  // (kept real so copy-link and middle-click still work). Following it would
+  // reload the viewer to land where the action already put us.
+  if(el.matches("a[href]"))e.preventDefault();
   dispatchAct(el);
 });
 // (#1090) Keyboard activation. Enter or Space on a focused non-native [data-act]
@@ -2764,7 +2880,9 @@ document.addEventListener("click",e=>{
 // keep their own key handling, so no double-dispatch. Space is prevent-defaulted
 // only when it lands on a card (else the page would scroll), never elsewhere.
 document.addEventListener("keydown",e=>{
-  if(e.key==="Escape"){closeInfo(); const p=$("catpanel"); if(p) p.hidden=true; return;} // (#1132) Escape closes the about modal (no-op if hidden)
+  // (#1132, generalized #1569) Escape closes whichever dialog is open — not
+  // just the about modal — then the catalog panel. No-op when nothing is open.
+  if(e.key==="Escape"){closeOpenModal(); const p=$("catpanel"); if(p) p.hidden=true; return;}
   if(e.key!=="Enter"&&e.key!==" "&&e.key!=="Spacebar")return;
   const el=e.target.closest("[data-act]");
   if(!el||el.matches("button,a[href],input,textarea,select"))return;
@@ -2810,6 +2928,9 @@ document.addEventListener("toggle",e=>{
 // summary. Selecting a day navigates to /play/<date>; "live" goes to /. Only
 // daemon-backed views get the button (the static demo has no /flow-days), so
 // this is gated in boot().
+// (#1569 sweep) Catalog mission cap — declared, and DISCLOSED in the header
+// below rather than silently truncating a browse list.
+const CATALOG_MISSION_CAP=50;
 async function toggleCatalog(){
   const panel=$("catpanel");
   if(!panel) return;
@@ -2838,7 +2959,8 @@ async function toggleCatalog(){
   }).join("");
   // (#691) Missions section — the cross-day catalog. Selecting a mission replays
   // it by query (?mission=), stitching its records across every day it ran.
-  const missRows=missions.slice(0,50).map(m=>{
+  // The list is capped; the header below discloses it (#1569 sweep).
+  const missRows=missions.slice(0,CATALOG_MISSION_CAP).map(m=>{
     const id=esc(m.mission_id||"");
     const disp=Number(m.dispatches)||0, recs=Number(m.records)||0;
     const span=(m.first_date&&m.first_date!==m.last_date)
@@ -2847,7 +2969,13 @@ async function toggleCatalog(){
     const summary=`${disp} dispatch${disp===1?'':'es'} · ${recs} record${recs===1?'':'s'}${span?` · ${span}`:''}`;
     return `<button class="catrow" data-act="gomission" data-arg="${id}"><div class="cd">▣ ${id}</div><div class="cs">${summary}</div></button>`;
   }).join("");
-  const missSection=missions.length?`<div class="cathdr">missions</div>${missRows}`:"";
+  // A cap that says nothing reads as "this is all of them". The header names
+  // the truncation the way the rest of the product does ("N of M"), so a
+  // mission that isn't listed is visibly absent rather than silently missing.
+  const missHdr=missions.length>CATALOG_MISSION_CAP
+    ? `missions · newest ${CATALOG_MISSION_CAP} of ${missions.length}`
+    : "missions";
+  const missSection=missions.length?`<div class="cathdr">${missHdr}</div>${missRows}`:"";
   const daysSection=days.length
     ? `<div class="cathdr">days</div>${dayRows}`
     : `<div class="catempty">no recorded days yet — dispatches you run will appear here.</div>`;
@@ -3010,10 +3138,10 @@ function labQuery(){
 // (#1508) `inMachine` rides the same chokepoint: the unified machine page
 // writes `lens=machine` (no `run` param) so the phone view is bookmarkable
 // too — for both the local nav-tab visit and a remote fleet-card drill.
-function syncLabHash(inLab, inMachine){
+function syncLabHash(inLab, inMachine, inConsole){
   const raw=(location.hash||"").replace(/^#/,"");
   const isBareDate=/^\d{4}-\d{2}-\d{2}$/.test(raw);
-  if(!inLab&&!inMachine){
+  if(!inLab&&!inMachine&&!inConsole){
     // Outside the lab/machine lenses, only touch the hash when it carries
     // lens params to REMOVE — a bare-date or #mission=/#session= hash the
     // operator arrived with stays put (renderCrumb repaints every view; an
@@ -3028,7 +3156,14 @@ function syncLabHash(inLab, inMachine){
     return;
   }
   const p=isBareDate?new URLSearchParams():new URLSearchParams(raw);
-  if(inMachine){
+  if(inConsole){
+    // Addressable like every other lens: what the operator is looking at is
+    // what they copy out of the address bar. The phone dashboard is a
+    // first-class consumer of that (a bookmarked panel is the whole point).
+    p.set("lens","console");p.delete("run");p.delete("kind");
+    const pid=state.panelId||"mission-status";
+    if(pid==="mission-status")p.delete("panel"); else p.set("panel",pid);
+  }else if(inMachine){
     p.set("lens","machine");p.delete("run");
   }else{
     // (#1584) Always writes the CURRENT spelling — an operator who arrived on
@@ -3050,6 +3185,21 @@ function syncLabHash(inLab, inMachine){
 // as labQuery. `lens` is a single value, so lab/machine can't conflict; a
 // `#mission=`/`#session=` replay query alongside is contradictory and the
 // lens half is honored (same precedence rule as the lab lens).
+// (#1569 B2) `#lens=console&panel=<id>` — the console's deep link, parsed the
+// same way as the lab and machine lenses. This exists because the CLI EMITS
+// such links (see `panel_deep_link`): without a parser they worked on click
+// and died on middle-click, copy-link, or a phone long-press "open in new
+// tab" — recreating in a second modality the dead end this packet set out to
+// fix. Returns the panel id (validated against this build's PANELS) or "" for
+// the default; null when this is not a console link at all.
+function consoleQuery(){
+  const p=new URLSearchParams(location.search);
+  const h=new URLSearchParams((location.hash||"").replace(/^#/,""));
+  if((p.get("lens")||h.get("lens")||"").trim()!=="console") return null;
+  const id=(p.get("panel")||h.get("panel")||"").trim();
+  return PANELS.some(x=>x.id===id) ? id : "";
+}
+
 function machineQuery(){
   const p=new URLSearchParams(location.search);
   const h=new URLSearchParams((location.hash||"").replace(/^#/,""));
@@ -3481,9 +3631,12 @@ async function boot(){
   // (#1286 deep-link) `#lens=machine` — same separate-room precedence as the
   // lab lens (`lens` is single-valued, so lab and machine can't both match).
   const mq = machineQuery();
+  // (#1569 B2 deep-link) `#lens=console&panel=<id>` — same single-valued
+  // `lens` precedence as the lab/machine lenses, so these can never conflict.
+  const nq = consoleQuery();
   // (#691) Replay-by-query applies only against a daemon (the static demo has no
   // catalog endpoints). A mission/session query forces playback of that thing.
-  const cq = (flowSrc||lq||mq) ? null : catalogQuery();
+  const cq = (flowSrc||lq||mq||nq!=null) ? null : catalogQuery();
   let date=injectedDate||targetDate();
   // Playback mode is daemon-controlled (or static-flow-src driven): it forces
   // "play" regardless of whether the date happens to be today, and SSE is
@@ -3548,7 +3701,7 @@ async function boot(){
   // (#827 Slice A/C) Pull the durable mission/phase plan. Live: the daemon's
   // /missions + /phases endpoints. Static demo: the committed fixture files
   // injected as metas (no daemon). Best-effort either way — absent → the
-  // missions lens derives rows from mission_ids in the flow instead.
+  // the console's `mission status` panel reads them from the CLI instead.
   const missionsSrc=injectedMeta("darkmux-missions-src");
   const phasesSrc=injectedMeta("darkmux-phases-src");
   if(!flowSrc && mode!=="no-daemon"){ await loadMissionsPhases(); }
@@ -3577,6 +3730,7 @@ async function boot(){
   if(lq){ state.runsKind=lq.kind||"all"; if(lq.run!=null) drillLabRun(lq.run); else goRuns(); }
   // (#1508 deep-link) Boot straight into the unified machine page (local).
   else if(mq){ goMachine(); }
+  else if(nq!=null){ if(nq) state.panelId=nq; goConsole(); }
 }
 // ── Lab observer lens (#1247 Part 3) ────────────────────────────────────
 //
@@ -3846,6 +4000,338 @@ function renderLabTaskCard(group){
     ${rows}
   </div>`;
 }
+// ── CLI panels: ANSI/OSC 8 renderer (#1569 packet B2) ──────────────────
+//
+// Renders an allowlisted command's OWN terminal output, so the panel cannot
+// drift from the CLI the way a JS re-implementation does (#1561 is exactly
+// that drift). This parser is deliberately NARROW: SGR (colors/bold/dim) and
+// OSC 8 (hyperlinks) — the only two escape families darkmux's own output
+// emits. Anything else is DROPPED, never guessed at.
+//
+// SECURITY POSTURE. This turns server-provided bytes into DOM, so:
+//   * every text run goes through `esc()` before insertion — the parser
+//     never hands raw input to innerHTML;
+//   * link hrefs are validated against an http/https allowlist, so a
+//     script-scheme URI smuggled into an OSC 8 target renders as inert text
+//     rather than becoming a clickable script. (Spelling the scheme out
+//     literally here would trip `viewer_has_no_inline_event_handlers`, whose
+//     substring guard deliberately makes no code/comment distinction — a
+//     check that parsed well enough to exempt prose is a check that can be
+//     talked out of firing.);
+//   * unknown escapes are consumed and discarded rather than emitted, so a
+//     hostile sequence cannot survive as markup.
+// The e2e XSS gate walks hostile fixtures through this path (viewer-panel).
+
+const ANSI_SGR_CLASS = {
+  1: "a-bold", 2: "a-dim", 3: "a-ital", 4: "a-underline",
+  30: "a-fg0", 31: "a-fg1", 32: "a-fg2", 33: "a-fg3",
+  34: "a-fg4", 35: "a-fg5", 36: "a-fg6", 37: "a-fg7",
+  90: "a-fg8", 91: "a-fg9", 92: "a-fg10", 93: "a-fg11",
+  94: "a-fg12", 95: "a-fg13", 96: "a-fg14", 97: "a-fg15",
+};
+
+// (#1569 B2) An OSC 8 target is safe to linkify only when it is http(s).
+// `mission status` bakes ABSOLUTE daemon URLs (packet A's rule picks
+// loopback on a standalone machine) — and a loopback href tapped from the
+// phone would open the PHONE's localhost, not this daemon. So a URL whose
+// origin is a daemon origin is rewritten RELATIVE: the link then rides
+// whatever origin the page itself was loaded from (tailnet on the phone,
+// loopback at the desk). Foreign origins are left absolute and intact.
+function panelHref(raw){
+  var u;
+  try { u = new URL(raw, window.location.href); } catch(_e){ return null; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  // Same origin as the page: pure relative, no ambiguity.
+  if (u.origin === window.location.origin) return u.pathname + u.search + u.hash;
+  // A DIFFERENT origin that is nonetheless "this daemon by another name" —
+  // the packet-A link scheme's loopback form, seen from a tailnet client.
+  // Rewriting to relative is what makes one baked link work from both.
+  // `hostname` brackets IPv6 (`[::1]`, per WHATWG) — matching the bare form
+  // was dead code, so an IPv6 daemon link stayed absolute and opened the
+  // PHONE's own loopback.
+  if (u.hostname === "127.0.0.1" || u.hostname === "localhost"
+      || u.hostname === "[::1]" || u.hostname === "::1") {
+    return u.pathname + u.search + u.hash;
+  }
+  return u.href;
+}
+
+// An OSC 8 target that means "switch to another panel" rather than "leave
+// this page": a same-origin `#lens=console&panel=<id>` whose id is one this
+// build actually has. Returns the id, or null for every other link.
+//
+// The verb emits these (see `panel_deep_link` in src/mission_status.rs) so a
+// hint like "`--all` for every mission" stays actionable in a surface with no
+// prompt to type it at. Routing on the URL's OWN parameters is the reason
+// this is not twin drift: the viewer never reads the hint's prose, and an id
+// this build does not have simply falls through to a plain link.
+function panelSwitchId(href){
+  var u;
+  try { u = new URL(href, window.location.href); } catch(_e){ return null; }
+  if (u.origin !== window.location.origin) return null;
+  var h = new URLSearchParams((u.hash || "").replace(/^#/, ""));
+  if (h.get("lens") !== "console") return null;
+  var id = h.get("panel");
+  return (id && PANELS.some(function(p){ return p.id === id; })) ? id : null;
+}
+
+// Parse `text` into HTML. Returns a string built exclusively from escaped
+// segments and a fixed tag vocabulary (`span`/`a`).
+function renderAnsi(text){
+  var out = [];
+  var classes = [];        // active SGR classes
+  var link = null;         // active OSC 8 href, already validated
+  var i = 0;
+  var buf = "";
+
+  function flush(){
+    if (!buf) return;
+    var html = esc(buf);
+    if (classes.length) html = '<span class="' + classes.join(" ") + '">' + html + "</span>";
+    if (link) {
+      // A panel deep link switches IN PAGE — following it would reload the
+      // viewer to land one tab away from where it already is. The href is
+      // kept real so copy-link and middle-click still behave.
+      var sw = panelSwitchId(link);
+      // Routed through the SAME delegated [data-act] path the picker chips
+      // use, rather than an inline onclick. The interpolation was safe — `sw`
+      // can only be one of the compile-time PANELS ids — but safe by an
+      // allowlist three functions away, and `esc()` is an HTML-entity
+      // escaper, which is the wrong tool for a JS string inside an attribute
+      // (the browser decodes entities before the JS lexer ever runs). This
+      // way the question does not arise, and the file keeps zero inline
+      // handlers.
+      var attrs = sw ? ' data-act="setpanel" data-arg="' + esc(sw) + '"' : '';
+      html = '<a href="' + esc(link) + '" class="a-link"' + attrs + ">" + html + "</a>";
+    }
+    out.push(html);
+    buf = "";
+  }
+
+  while (i < text.length) {
+    var ch = text[i];
+    if (ch !== "\x1b") { buf += ch; i++; continue; }
+
+    // CSI ... final-byte  (only `m` — SGR — is honored)
+    if (text[i + 1] === "[") {
+      var j = i + 2;
+      while (j < text.length && !(text[j] >= "@" && text[j] <= "~")) j++;
+      if (j >= text.length) { i = text.length; break; }   // truncated: drop
+      var final = text[j];
+      var params = text.slice(i + 2, j);
+      if (final === "m") {
+        flush();
+        var codes = params.split(";").filter(function(x){ return x !== ""; });
+        if (!codes.length) codes = ["0"];                 // bare ESC[m == reset
+        codes.forEach(function(c){
+          var n = parseInt(c, 10);
+          if (n === 0) { classes = []; return; }
+          var cls = ANSI_SGR_CLASS[n];
+          if (cls && classes.indexOf(cls) === -1) classes.push(cls);
+        });
+      }
+      i = j + 1;
+      continue;
+    }
+
+    // OSC 8 — `ESC ] 8 ; params ; URL ST` opens, empty URL closes.
+    if (text[i + 1] === "]") {
+      var end = text.indexOf("\x1b\\", i);               // ST
+      var bel = text.indexOf("\x07", i);
+      if (bel !== -1 && (end === -1 || bel < end)) end = bel;
+      if (end === -1) { i = text.length; break; }        // truncated: drop
+      var body = text.slice(i + 2, end);
+      var stLen = text[end] === "\x07" ? 1 : 2;
+      if (body.slice(0, 2) === "8;") {
+        var semi = body.indexOf(";", 2);
+        var url = semi === -1 ? "" : body.slice(semi + 1);
+        flush();
+        link = url ? panelHref(url) : null;
+      }
+      i = end + stLen;
+      continue;
+    }
+
+    // Any other escape: consume the introducer and move on.
+    i += 2;
+  }
+  flush();
+  return out.join("");
+}
+
+// ── CLI panel: fetch + chrome (#1569 packet B2) ────────────────────────
+//
+// The daemon now ENFORCES what this client used to be trusted for (#1602
+// gate): `X-Darkmux-Panel` is required (it forces a CORS preflight a foreign
+// page cannot pass), and manual-only panels are rate-floored server-side.
+// So this layer honors a contract rather than a convention — and when it
+// gets a 429 it reports the daemon's own reason instead of retrying.
+
+const PANEL_STATE = {};   // id -> {body, error, loading, fetchedAt}
+
+// (#1569 B2) The panel picker's vocabulary. Mirrors the daemon's allowlist;
+// a stale entry simply 404s and shows the daemon's own message, so drift is
+// self-announcing rather than silent.
+// Panels the daemon marks `auto_refresh: false` — they PROBE the machine,
+// so nothing but an explicit operator action may run them (#1286). The
+// server enforces a rate floor independently; this is the client honoring
+// the same contract rather than relying on being asked nicely.
+const MANUAL_PANELS = new Set(["doctor"]);
+
+const PANELS = [
+  {id:"mission-status",   label:"mission status"},
+  {id:"mission-status-all", label:"all missions"},
+  {id:"machine-status",   label:"machine"},
+  {id:"flow-status",      label:"flow"},
+  {id:"role-list",        label:"roles"},
+  {id:"config-list",      label:"config"},
+  {id:"lab-fixture-list", label:"fixtures"},
+  {id:"doctor",           label:"doctor"},
+];
+
+function panelCols(){
+  // The CLI adapts to COLUMNS (packet A). Ask for a width that matches the
+  // space the panel actually has, so `mission status` drops its mix column
+  // on a phone instead of overflowing. Character width at 12px JetBrains
+  // Mono is ~7.2px; the daemon clamps whatever we send to 60..=200.
+  const el = document.querySelector(".panelout") || document.getElementById("stage");
+  const px = el ? el.clientWidth : window.innerWidth;
+  return Math.max(60, Math.min(200, Math.floor((px - 24) / 7.2)));
+}
+
+async function loadPanel(id){
+  const st = (PANEL_STATE[id] = PANEL_STATE[id] || {});
+  st.loading = true; st.error = null;
+  renderConsole();
+  try{
+    const res = await fetch("/panel/" + encodeURIComponent(id) + "?cols=" + panelCols(), {
+      headers: {accept: "application/json", "X-Darkmux-Panel": "1"},
+    });
+    if(!res.ok){
+      // The daemon's own text is the message — a 429 explains the manual
+      // floor, a 404 names the allowlist. Inventing our own wording here
+      // would be the twin-drift this whole packet exists to kill.
+      st.error = (await res.text()).trim() || ("panel request failed: HTTP " + res.status);
+      st.body = null;
+    } else {
+      st.body = await res.json();
+      st.error = null;
+      st.fetchedAt = Date.now();
+    }
+  }catch(e){
+    st.error = "could not reach the daemon: " + e;
+    st.body = null;
+  }
+  st.loading = false;
+  if(state.level === "console") renderConsole();
+}
+
+window.goConsole = async () => {
+  state.level = "console";
+  render();
+  const id = state.panelId || "mission-status";
+  // The manual-only guard has to live on EVERY path that can start a panel,
+  // not just the one that selects it. `setPanel("doctor")` returns before
+  // creating any PANEL_STATE entry — so leaving the tab and coming back hit
+  // `!PANEL_STATE[id]` and probed the machine unasked, which is the exact
+  // #1286 failure the guard exists to prevent. The server's rate floor bounds
+  // a LOOP; it does not stop the first unasked run.
+  if(MANUAL_PANELS.has(id)) return;
+  if(!PANEL_STATE[id] || (!PANEL_STATE[id].body && !PANEL_STATE[id].loading)) await loadPanel(id);
+};
+window.setPanel = (id) => {
+  if(!PANELS.some(p => p.id === id)) return;
+  state.panelId = id;
+  render();
+  // A manual-only panel is NEVER auto-fetched — that is the whole point of
+  // `auto_refresh: false`. Selecting `doctor` shows its run button; the
+  // operator decides when it probes the machine.
+  //
+  // This guard returns EARLY on purpose. Folding `!manual` into the
+  // condition below reads correct and is not: `!st ||` short-circuits, so
+  // the very first selection (when there is no state yet) fetched anyway —
+  // the guard worked only on repeat visits, which is exactly backwards.
+  if(MANUAL_PANELS.has(id)) return;
+  const st = PANEL_STATE[id];
+  if(!st || (!st.body && !st.loading)) loadPanel(id);
+};
+window.refreshPanel = () => loadPanel(state.panelId || "mission-status");
+
+// Refresh-on-EVIDENCE, never on a timer: a panel is a snapshot, and a
+// snapshot that silently re-runs commands on the measured host is the
+// observer joining the observed (#1286). A phone waking from sleep is the
+// one moment its snapshot is reliably stale, so that is when we re-check —
+// and only for auto-refreshable panels.
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState !== "visible" || state.level !== "console") return;
+  const id = state.panelId || "mission-status";
+  const st = PANEL_STATE[id];
+  if(!st || !st.body || st.body.auto_refresh === false) return;
+  if(Date.now() - (st.fetchedAt || 0) > (st.body.cache_ttl_ms || 3000)) loadPanel(id);
+});
+
+function panelAgeLabel(body, fetchedAt){
+  const age = Date.now() - (fetchedAt || Date.now());
+  const ttl = body.cache_ttl_ms || 0;
+  const captured = new Date(body.captured_ts_ms || Date.now());
+  const hhmmss = captured.toTimeString().slice(0,8);
+  // The daemon reports whether IT served us a cached body (`age_ms`); we
+  // add how long ago WE fetched. Both are stated rather than implied —
+  // #1286's "cadence is a recorded knob, never adaptive-silent".
+  const served = body.age_ms ? " · daemon cache " + Math.round(body.age_ms/1000) + "s" : "";
+  const stale = ttl && age > ttl * 3;
+  return {hhmmss, served, stale, ageSec: Math.round(age/1000)};
+}
+
+function renderConsole(){
+  $("logscope").textContent = "console";
+  const id = state.panelId || "mission-status";
+  const st = PANEL_STATE[id] || {};
+  const tabs = PANELS.map(p =>
+    `<span class="runchip${p.id===id?" on":""}" data-act="setpanel" data-arg="${esc(p.id)}" tabindex="0" role="button">${esc(p.label)}</span>`
+  ).join("");
+
+  let body;
+  if(st.loading){
+    body = `<div class="panelout">${esc("running…")}</div>`;
+  } else if(st.error){
+    body = `<div class="panelerr">${esc(st.error)}</div>`;
+  } else if(st.body){
+    body = `<pre class="panelout">${renderAnsi(st.body.ansi_text || "")}</pre>`;
+  } else {
+    // Manual panel, never run this session.
+    body = `<div class="panelout">${esc("not run yet — this panel probes the machine, so it runs only when you ask.")}</div>`;
+  }
+
+  let chrome = "";
+  if(st.body){
+    const a = panelAgeLabel(st.body, st.fetchedAt);
+    chrome =
+      `<span class="pc-cmd">$ darkmux ${esc((st.body.argv||[]).join(" "))}</span>` +
+      `<span>captured ${esc(a.hhmmss)}${esc(a.served)}</span>` +
+      (a.stale ? `<span class="pc-stale">· stale (${a.ageSec}s)</span>` : "") +
+      (st.body.auto_refresh === false ? `<span class="pc-manual">· manual-run only</span>` : "") +
+      `<span>· ${st.body.gather_ms}ms</span>` +
+      `<span class="pc-spacer"></span>` +
+      `<button class="pcbtn" data-act="refreshpanel">re-run</button>`;
+  } else {
+    chrome =
+      `<span class="pc-cmd">$ darkmux ${esc(id.replace(/-/g," "))}</span>` +
+      `<span class="pc-spacer"></span>` +
+      `<button class="pcbtn" data-act="refreshpanel"${st.loading?" disabled":""}>run</button>`;
+  }
+
+  // No `stagehdr` here, deliberately (operator nit, same family as the
+  // crumb one): the tab is already named and highlighted, and the panel's
+  // own chrome line states exactly which command produced what you are
+  // looking at (`$ darkmux mission status · captured … · 12ms`). A header
+  // reading "console" between those two would be the third place the same
+  // word appears in one screen.
+  $("stage").innerHTML =
+    `<div class="runsbar">${tabs}</div>` +
+    `<div class="panelwrap"><div class="panelchrome">${chrome}</div>${body}</div>`;
+}
+
 // ── the runs lens: one flat, kind-tagged list (#1584) ───────────────────
 //
 // Replaces the per-source `lab` tab. `/runs` already consolidated every run
