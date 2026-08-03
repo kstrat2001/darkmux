@@ -34,8 +34,25 @@ const GRAPH_PATH = `**/mission/${MISSION_ID}/graph`;
 const TODAY = new Date().toISOString().slice(0, 10);
 // The MISSION-scoped backfill (#1569 sweep), not a day file. A distinct URL
 // space from the stream below, so no negative lookahead is needed.
-const BACKFILL_RE = /\/flow-mission\/[^/?]+(\?.*)?$/;
+// TWO backfill sources, mocked separately because the real server treats them
+// differently and a mock that ignores that difference is how the first version
+// of this change shipped a regression (see the header note).
+//
+// MISSION_RE — `/flow-mission/<id>`: cross-day, but the server matches on the
+// TOP-LEVEL `mission_id` field only (`collect_records_by_field`), so it returns
+// the stamped subset. The scheduler does not stamp step lifecycle records, so
+// these mocks must NOT put unstamped records here — the real endpoint could
+// never return them.
+// DAY_RE — `/flow/<date>`: today only, but EVERY record regardless of stamping,
+// which is where step rows come from. Negative lookahead so it does not swallow
+// the SSE stream below.
+const MISSION_RE = /\/flow-mission\/[^/?]+(\?.*)?$/;
+const DAY_RE = /\/flow\/\d{4}-\d{2}-\d{2}(?!\/stream)(\?.*)?$/;
 const STREAM_RE = /\/flow\/\d{4}-\d{2}-\d{2}\/stream(\?.*)?$/;
+// Most tests care about one source; silence the other so an unmocked request
+// never reaches the harness server.
+const mockEmpty = (page, re) => page.route(re, (r) =>
+  r.fulfill({ contentType: 'application/json', body: JSON.stringify([]) }));
 
 const MISSION_GRAPH_HTML = fs.readFileSync(
   path.join(__dirname, '.served', 'mission-graph.html'),
@@ -76,10 +93,13 @@ test('EVENTS panel backfills existing mission records on load (not live-stream-o
 
   await routeShellAndGraph(page);
 
-  // The day's records: three that belong to THIS mission (by step id, phase id,
-  // and mission_id respectively) + one unrelated record that must be filtered
-  // out by `recordInMission` (proving backfill uses the same filter as live).
-  await page.route(BACKFILL_RE, (r) =>
+  // The DAY file's records: three that belong to THIS mission (by step id,
+  // phase id, and mission_id respectively) + one unrelated record that must be
+  // filtered out by `recordInMission` (proving backfill uses the same filter as
+  // live). Two of the three carry NO `mission_id`, which is exactly why the day
+  // file cannot be dropped: `/flow-mission` would never return them.
+  await mockEmpty(page, MISSION_RE);
+  await page.route(DAY_RE, (r) =>
     r.fulfill({
       contentType: 'application/json',
       body: JSON.stringify([
@@ -121,17 +141,25 @@ test('records from a PRIOR day still backfill — the cross-day case (#1569 swee
   await routeShellAndGraph(page);
 
   const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
-  await page.route(BACKFILL_RE, (r) =>
+  // Only `/flow-mission` reaches prior days, and the server matches the
+  // top-level `mission_id` field — so every fixture here is STAMPED. Putting an
+  // unstamped record in this mock would be testing a response the real server
+  // cannot produce, which is how the first version of this change hid a
+  // regression behind a green suite.
+  await page.route(MISSION_RE, (r) =>
     r.fulfill({
       contentType: 'application/json',
       body: JSON.stringify({
         records: [
-          { ts: `${daysAgo(3)}T10:00:00Z`, action: 'step start', handle: 'step-1', category: 'work', level: 'info' },
+          { ts: `${daysAgo(3)}T10:00:00Z`, action: 'phase start', handle: 'phase-a', mission_id: MISSION_ID, category: 'work', level: 'info' },
           { ts: `${daysAgo(2)}T11:30:00Z`, action: 'mission start', handle: 'm', mission_id: MISSION_ID, category: 'work', level: 'info' },
         ],
       }),
     })
   );
+  // The day file holds nothing for a mission that ran days ago — which is the
+  // precise condition that used to leave this panel empty.
+  await mockEmpty(page, DAY_RE);
   await page.route(STREAM_RE, (r) => r.fulfill({ contentType: 'text/event-stream', body: '' }));
 
   await page.goto(`/mission/${MISSION_ID}/graph`);
@@ -140,8 +168,9 @@ test('records from a PRIOR day still backfill — the cross-day case (#1569 swee
   await expect(page.locator('.evpanel .evrow')).toHaveCount(2);
   await expect(page.locator('.evpanel')).not.toContainText('no events');
   // Also proves the `{records: [...]}` envelope is unwrapped — /flow-mission
-  // returns an object, while the day file returned a bare array.
-  await expect(page.locator('.evpanel .evrow .evh', { hasText: /^step-1$/ })).toHaveCount(1);
+  // returns an object, while the day file returns a bare array, and the
+  // backfill now consumes BOTH shapes in one pass.
+  await expect(page.locator('.evpanel .evrow .evh', { hasText: /^phase-a$/ })).toHaveCount(1);
   expect(pageErrors).toEqual([]);
 });
 
@@ -160,8 +189,9 @@ test('the EVENTS header discloses the cap instead of printing it as a total (#15
     ts: `${TODAY}T10:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z`,
     action: 'step start', handle: 'step-1', category: 'work', level: 'info',
   }));
-  await page.route(BACKFILL_RE, (r) =>
-    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ records }) })
+  await mockEmpty(page, MISSION_RE);
+  await page.route(DAY_RE, (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify(records) })
   );
   await page.route(STREAM_RE, (r) => r.fulfill({ contentType: 'text/event-stream', body: '' }));
 
@@ -193,7 +223,8 @@ test('a live-streamed record appends without duplicating a backfilled one', asyn
   // against them. A straight replace or a naive concat would double X.
   let releaseBackfill;
   const backfillGate = new Promise((res) => { releaseBackfill = res; });
-  await page.route(BACKFILL_RE, async (r) => {
+  await mockEmpty(page, MISSION_RE);
+  await page.route(DAY_RE, async (r) => {
     await backfillGate;
     r.fulfill({ contentType: 'application/json', body: JSON.stringify([recX, recZ]) });
   });

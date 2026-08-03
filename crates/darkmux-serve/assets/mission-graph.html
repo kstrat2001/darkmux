@@ -1280,18 +1280,21 @@ function renderMissionTimeline(g, metrics, expanded, toggleTask, now){
   return out;
 }
 // (#1403) The mission-scoped events panel body (header + newest-first list).
-function eventsPanelEls(events, total, closePanel){
+function eventsPanelEls(events, total, srvTruncated, closePanel){
   // `events` is capped at EVENTS_CAP; `total` is how many were actually
   // available before the slice. Printing only `events.length` turned a
   // truncation into a total — a mission with 1361 records read "events · 250",
   // which is the cap, and nothing on screen said so. The CLI's own board
   // solved this years ago ("… 81 more (3 of 84 shown)"); the viewer should not
   // be the surface that hides it.
+  // Two independent truncations, and the header has to be honest about both:
+  // the CLIENT cap (EVENTS_CAP) and the SERVER's own response cap. "250 of
+  // 10000" would restate the second as a total.
   var capped = total > events.length;
   return [
     h("div", {key:"hd", className:"evhd"},
-      capped ? ("events · " + events.length + " of " + total)
-             : ("events · " + events.length),
+      capped ? ("events · " + events.length + " of " + total + (srvTruncated ? "+" : ""))
+             : ("events · " + events.length + (srvTruncated ? "+" : "")),
       h("button", {className:"evx", title:"close", onClick: function(){ closePanel(); }}, "✕")),
     h("div", {key:"list", className:"evlist"}, events.length
       ? events.map(function(e){
@@ -1323,10 +1326,18 @@ function App(){
   var _e = React.useState([]);
   var events = _e[0], setEvents = _e[1];
   // Pre-cap count, for honest "N of M" in the panel header. A ref rather than
-  // state because it is derived from the very update that sets `events` — the
-  // write is idempotent, so StrictMode's double-invoke is harmless, and the
-  // setEvents that follows is what schedules the render that reads it.
+  // state because it is derived from the very update that sets `events`, and
+  // the setEvents that follows is what schedules the render that reads it.
+  //
+  // NB the two write sites differ: the backfill ASSIGNS (idempotent), the live
+  // path INCREMENTS (not). That is safe only because this page mounts with a
+  // bare `createRoot` and no StrictMode, so updaters run exactly once. Anyone
+  // enabling StrictMode must move the increment out of the updater first.
   var evTotalRef = React.useRef(0);
+  // Whether the SERVER capped its own response (MAX_CATALOG_RECORDS). Without
+  // this, a mission past the server cap would render "N of 10000" — the same
+  // truncation-as-total this sweep exists to remove, one layer up.
+  var srvTruncRef = React.useRef(false);
   var _mob = React.useState(isNarrowViewport());
   var isMobile = _mob[0], setIsMobile = _mob[1];
   var _vm = React.useState("auto");            // "auto" | "canvas" | "timeline"
@@ -1402,20 +1413,48 @@ function App(){
   // a failed fetch never breaks the live panel or graph. Single-day scope
   // matches the SSE tail (`todayUtc()`), same as the original inline backfill.
   var backfillEvents = React.useCallback(function(){
-    // (#1569 sweep) The mission-SCOPED endpoint, not today's day file. The
-    // backfill exists so a page opened after the fact isn't blank — but
-    // `/flow/<today>` can only ever contain records written TODAY, while a
-    // mission's records live on the day(s) it RAN. So every mission older
-    // than the current UTC day showed "no events" permanently despite having
-    // records, which is precisely the failure this backfill was added to
-    // prevent. `/flow-mission/:id` stitches a mission across every day it
-    // touched — the same endpoint the viewer's own catalog replay path uses.
-    // It is also strictly less data over the wire: the day file was fetched
-    // whole and then filtered down client-side.
-    fetch("/flow-mission/" + encodeURIComponent(missionId), {headers:{accept:"application/json"}})
-      .then(function(r){ return r.ok ? r.json() : []; })
-      .then(function(body){
-        var recs = Array.isArray(body) ? body : (body && (body.records || body.flow)) || [];
+    // (#1569 sweep, gate-corrected) TWO sources, merged — because neither one
+    // alone is complete, and picking either is a bug:
+    //
+    //   `/flow/<today>` holds every record written today REGARDLESS of whether
+    //   it carries a top-level `mission_id`, which matters because the
+    //   scheduler does NOT stamp one on step lifecycle records
+    //   (`crates/darkmux-crew/src/scheduler.rs` — `mission_id: None`). Those
+    //   are the most numerous records a mission produces and the ones the
+    //   graph animates on. But a day file can only ever contain records
+    //   written TODAY, so every mission older than the current UTC day
+    //   backfilled to nothing.
+    //
+    //   `/flow-mission/<id>` stitches across every day a mission touched, but
+    //   the server matches on the top-level `mission_id` field only
+    //   (`collect_records_by_field`), so it returns the stamped subset —
+    //   bookends. Measured on a real review mission: 10 records, versus the
+    //   full step-by-step narrative the day file yields.
+    //
+    // Fetching only the mission-scoped one traded the prior-day bug for a
+    // same-day one: reload a running review and every step row vanished. Both
+    // responses go through the SAME `recordInMission` predicate and the SAME
+    // dedup below, so overlap is free and the union is what the panel wants.
+    // The real fix is upstream — stamp `mission_id` on scheduler records so
+    // one endpoint suffices — tracked separately; this keeps the page honest
+    // until then.
+    Promise.all([
+      fetch("/flow-mission/" + encodeURIComponent(missionId), {headers:{accept:"application/json"}})
+        .then(function(r){ return r.ok ? r.json() : []; }).catch(function(){ return []; }),
+      fetch("/flow/" + todayUtc(), {headers:{accept:"application/json"}})
+        .then(function(r){ return r.ok ? r.json() : []; }).catch(function(){ return []; }),
+    ])
+      .then(function(bodies){
+        var unwrap = function(body){
+          return Array.isArray(body) ? body : (body && (body.records || body.flow)) || [];
+        };
+        // The mission-scoped body carries a server-side `truncated` flag; a
+        // huge mission is capped there too, and a cap nobody mentions is the
+        // very thing this sweep set out to stop.
+        srvTruncRef.current = !!(bodies[0] && bodies[0].truncated);
+        return unwrap(bodies[0]).concat(unwrap(bodies[1]));
+      })
+      .then(function(recs){
         var idx = idxRef.current;
         var rows = [];
         for (var i = 0; i < recs.length; i++) {
@@ -1799,7 +1838,7 @@ function App(){
     ),
     h("div", {className:"body"},
       body,
-      evOpen ? h("div", {className:"evpanel"}, eventsPanelEls(events, evTotalRef.current, function(){ setEvOpen(false); })) : null
+      evOpen ? h("div", {className:"evpanel"}, eventsPanelEls(events, evTotalRef.current, srvTruncRef.current, function(){ setEvOpen(false); })) : null
     )
   );
 }
