@@ -196,6 +196,29 @@ pub enum Level {
     Info,
     Debug,
     Trace,
+    /// (#1611) Lenient-on-read catch-all. Without it, a variant this binary does
+    /// not know fails serde for the WHOLE record — `category` is a required,
+    /// non-`Option` field, so one unrecognized string makes the entire
+    /// `FlowRecord` unparseable rather than partially readable.
+    ///
+    /// That matters most where it is least acceptable: `integrity_check_file`
+    /// reports an unparseable line as `chain_valid: false — unparseable JSON`,
+    /// so a newer peer's perfectly legitimate record reads as **chain corruption**
+    /// on an older reader. A false tamper alert on the compliance substrate is
+    /// worse than a missing one, because it trains an operator to dismiss the
+    /// real thing.
+    ///
+    /// The schema's own version history promised this already ("older readers
+    /// ignore the unknown category", FLOW_SCHEMA 1.10.0) — true for the additive
+    /// `Option` fields and the free-form `action` string, and never true for
+    /// these enums until now. Contract 5: consumers are lenient-on-read, loud in
+    /// doctor.
+    ///
+    /// Serialization is unaffected: nothing constructs `Unknown`, so no record is
+    /// ever WRITTEN with it. It exists purely so a reader can carry on.
+    #[serde(other)]
+    #[value(skip)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
@@ -210,6 +233,10 @@ pub enum Category {
     /// load/unload, container CPU — emitted into the one stream, always-on.
     /// Replaces the retired instruments.jsonl sidecar.
     Telemetry,
+    /// See [`Level::Unknown`] — same lenient-on-read contract.
+    #[serde(other)]
+    #[value(skip)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
@@ -218,6 +245,10 @@ pub enum Tier {
     Operator,
     Frontier,
     Local,
+    /// See [`Level::Unknown`] — same lenient-on-read contract.
+    #[serde(other)]
+    #[value(skip)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
@@ -240,6 +271,10 @@ pub enum Stage {
     /// `audit`; the `reasoning` field carries the operator-visible
     /// rationale. Serialized as `"tier-decision"`.
     TierDecision,
+    /// See [`Level::Unknown`] — same lenient-on-read contract.
+    #[serde(other)]
+    #[value(skip)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -468,4 +503,67 @@ pub fn resolve_machine_id() -> Option<String> {
 pub fn resolve_orchestrator() -> Option<String> {
     // env(DARKMUX_ORCHESTRATOR) > config.orchestrator (#661 Slice 4), read live.
     darkmux_types::config_access::orchestrator()
+}
+
+
+#[cfg(test)]
+mod forward_compat_tests {
+    use super::*;
+
+    /// (#1611) A record from a NEWER peer must still parse. Before the
+    /// `#[serde(other)]` catch-alls, one unrecognized enum string failed the
+    /// whole `FlowRecord` — and `integrity_check_file` reports an unparseable
+    /// line as a CHAIN BREAK, so a legitimate record from an upgraded fleet
+    /// member read as tamper evidence on an older reader.
+    #[test]
+    fn a_record_from_a_newer_peer_parses_instead_of_failing_the_whole_record() {
+        let wire = r#"{
+            "ts": "2026-08-03T12:00:00Z",
+            "level": "catastrophe",
+            "category": "quantum",
+            "tier": "orbital",
+            "stage": "teleport",
+            "action": "dispatch start",
+            "handle": "seat-1",
+            "session_id": "task-t1",
+            "model": "gpt-4o"
+        }"#;
+        let rec: FlowRecord =
+            serde_json::from_str(wire).expect("an unknown enum variant must not fail the record");
+
+        // The unknown values degrade to Unknown; everything else survives, which
+        // is the whole point — a reader keeps the fields it understands.
+        assert!(matches!(rec.level, Level::Unknown));
+        assert!(matches!(rec.category, Category::Unknown));
+        assert!(matches!(rec.tier, Tier::Unknown));
+        assert!(matches!(rec.stage, Stage::Unknown));
+        assert_eq!(rec.action, "dispatch start");
+        assert_eq!(rec.session_id.as_deref(), Some("task-t1"));
+        assert_eq!(rec.model.as_deref(), Some("gpt-4o"));
+    }
+
+    /// Known variants are untouched — the catch-all must not swallow a
+    /// variant this binary DOES understand.
+    #[test]
+    fn known_variants_still_round_trip_exactly() {
+        let wire = r#"{
+            "ts": "2026-08-03T12:00:00Z",
+            "level": "info",
+            "category": "telemetry",
+            "tier": "local",
+            "stage": "dispatch",
+            "action": "telemetry.tokens",
+            "handle": "seat-1"
+        }"#;
+        let rec: FlowRecord = serde_json::from_str(wire).unwrap();
+        assert!(matches!(rec.level, Level::Info));
+        assert!(matches!(rec.category, Category::Telemetry));
+        assert!(matches!(rec.tier, Tier::Local));
+        assert!(matches!(rec.stage, Stage::Dispatch));
+        // And a re-serialize keeps the wire spelling, so a record read and
+        // re-written by a middle-version peer is unchanged.
+        let out = serde_json::to_value(&rec).unwrap();
+        assert_eq!(out["category"], "telemetry");
+        assert_eq!(out["stage"], "dispatch");
+    }
 }
