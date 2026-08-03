@@ -11,6 +11,97 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-08-03
+
+The observability release: CLI panels in the browser, a mission board that says
+what a mission IS, and a batch of producer-side defects that made the data
+underneath all of it quietly wrong.
+
+### Added
+
+- **CLI panels in the viewer** — a `console` lens rendering real `darkmux`
+  command output as styled DOM, served from an allowlisted `GET /panel/:id`
+  (#1569 packets B1-B3). The CLI is the single source of truth; the viewer
+  renders it rather than reimplementing it, which is the twin-drift that
+  #1561 already was.
+- **OSC 8 terminal hyperlinks** — mission ids in `mission status` are
+  clickable through to the viewer (#1569 packet A).
+- **One runs lens** — the nav catches up to `/runs`, four tabs collapse to
+  three (#1584).
+- **Phases render as containers** in the mission graph rather than sibling
+  cards (#1594).
+
+### Changed
+
+- **The mission board row says what a mission IS** (#1612). It led with the
+  mint id (`dispatch-code-reviewer-1785589698-5d6a-0`), which on a phone ate
+  two thirds of the width for the least informative thing on the line. Rows
+  now carry a name (from the description, populated on every real mission and
+  previously unshown), a graph-vs-single-role glyph, the id's own short
+  discriminator, and an age. The id stays one click away on the row's link,
+  and any row needing an id typed still prints it verbatim beneath.
+- `mission status` defaults answer a question instead of enumerating the
+  store (#1569), and drift suggestions survive a paste (#1582).
+
+### Fixed
+
+- **A dispatch could unload a model the OPERATOR owned** (#1609). The preflight
+  matched residents on the bare model key, and `lms ps` reports darkmux's copy
+  and a hand-loaded copy with the same key — so on the sanctioned duplicate
+  path it took whichever came first, which is yours. Ownership now means "the
+  identifier this profile declares", which also honors the documented
+  `identifier` opt-out.
+- **A namespaced `internal.utility` binding made the compactor unloadable**
+  (#1615). The namespace is a load-time decoration, so a prefixed string can
+  never resolve as a model key — the load failed AND the residency check never
+  matched its own resident. Compaction fell through to a JIT-load at the model
+  default with truncated summaries, on the path that exists to save long
+  dispatches. Verified live: the compactor now loads namespaced.
+- **A starved judge grant deleted a real finding, silently** (#1610). A grant
+  too small to hold a ruling produced a truncated response that read as "no
+  finding" — and because the call "succeeded", no degraded gate fired. Now
+  denied and counted. The same floor was missing from the `dispatch.map`
+  bucket the probe stage rides.
+- **A newer peer's flow record read as chain corruption** (#1611). An unknown
+  enum value failed the whole record, and the audit checker reported that as a
+  broken chain — a false tamper alert on the compliance substrate. Records are
+  now lenient on read, and a record this binary cannot content-verify is
+  reported as unverifiable-pending-upgrade rather than as evidence of
+  tampering. Chain linkage is still enforced across it.
+- **`dispatch.map` emitted no liveness bookends** (#1607), so a production
+  path doing model work was invisible while it ran. Now RAII-guarded, terminal
+  on every exit path. The savings hero also counted hosted tokens as "off the
+  meter"; cloud, local and unknown are now distinguished honestly.
+- **A review read `0/N` for its entire run** (#1620). Phases started lazily and
+  never closed, so every touched phase sat Running until the mission finalized
+  and reconciled them in bulk — `0/3` on a mission whose judge was working,
+  indistinguishable from one that never started. Phases now close at their
+  earned outcome as the run advances.
+- **The phone asked for more columns than it had** (#1613, #1614). A 390px
+  screen fits ~52 columns; both ends of the negotiation floored at 60, so nine
+  columns hung off the right edge. Machine-scope status also wrapped below the
+  tab strip, where a global line read as the selected tab's content.
+- **The mission graph's last phase read as an empty lane** (#1618) — an
+  invisible container border (1.2:1 against the background), task columns
+  indented by global rather than per-phase depth so later phases ran
+  off-screen, and a minimap that overflowed its viewport.
+- 247 lab runs were invisible because `lab_dir` had no config tier (#1585);
+  the review summary fallback that never fired (#1583); `dispatch.map` session
+  ids (#1524); plus seven audit fixes from a crate-by-crate sweep (#1595-#1601).
+
+### Notes
+
+- `FLOW_SCHEMA` stays 1.18.0. The `#[serde(other)]` catch-alls are additive
+  and no record is ever written carrying one, so existing audit chains survive
+  without rotation.
+- The release dogfood ran a real long-agentic coder dispatch to convergence
+  (`wall=798s, verify=pass`) and confirmed #1615's compactor load live.
+  Compaction itself did not trigger in that run (0 compactions in 47 turns —
+  the `deep` profile's threshold is 131k tokens and per-turn context stayed
+  well under it), so the path downstream of the load is unexercised by this
+  release's dogfood.
+
+
 ## [2.3.1] - 2026-07-29
 
 **A degraded Redis can no longer take the dashboard down with it**, plus three
@@ -41,6 +132,7 @@ schema changes (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`).
   "ready" with no time reference at all, indistinguishable from a fleet that
   had never dispatched.
 
+[2.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.4.0
 [2.3.1]: https://github.com/kstrat2001/darkmux/releases/tag/v2.3.1
 
 ## [2.3.0] - 2026-07-28
