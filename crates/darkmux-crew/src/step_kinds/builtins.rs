@@ -964,6 +964,67 @@ impl DispatchMapStepKind {
     /// total_tokens across every item. See the emission site in `run` for
     /// why the sum (not the per-item values) is what the mission graph's
     /// max-fold token meter must see.
+    /// (#1607) The dispatch-liveness bookends this kind owes contract #2:
+    /// "any production code path that performs model work emits
+    /// `dispatch.start` and a terminal `dispatch.complete`/`dispatch.error`
+    /// ... new vocabularies supplement, never replace."
+    ///
+    /// `dispatch.map` emitted only its own `step result` vocabulary, so the
+    /// per-seat sessions it mints (`task-<id>` — the review's probe and verify
+    /// seats) had token records but nothing anywhere naming WHERE they ran.
+    /// The savings hero reads `payload.endpoint` off these bookends and off
+    /// nothing else, so hosted seat spend was unattributable: 229,034 tokens
+    /// on one machine in one day.
+    ///
+    /// `endpoint_label` is `None` for a local seat, which leaves the payload
+    /// byte-identical to a purely-local dispatch's — the same no-op-when-None
+    /// discipline `stamp_remote_classification` keeps.
+    fn bookend_record(
+        step: &Step,
+        model: &str,
+        action: &str,
+        level: darkmux_flow::Level,
+        endpoint_label: Option<&str>,
+        extra: serde_json::Value,
+    ) -> darkmux_flow::FlowRecord {
+        let mut payload = serde_json::json!({
+            "step_id": step.id,
+            "kind": "dispatch.map",
+            "runtime": "scheduler",
+        });
+        if let (Some(obj), Some(ex)) = (payload.as_object_mut(), extra.as_object()) {
+            for (k, v) in ex {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        darkmux_flow::stamp_remote_classification(&mut payload, endpoint_label, None);
+        darkmux_flow::FlowRecord {
+            ts: darkmux_flow::ts_utc_now(),
+            level,
+            category: darkmux_flow::Category::Work,
+            tier: darkmux_flow::Tier::Local,
+            stage: darkmux_flow::Stage::Dispatch,
+            action: action.to_string(),
+            handle: step.id.clone(),
+            phase_id: None,
+            // The SAME session id the item/aggregate records use — that is
+            // what lets a consumer join a seat's tokens to its endpoint.
+            session_id: Some(darkmux_types::session_id::task(&step.task_id)),
+            source: Some("scheduler".to_string()),
+            model: Some(model.to_string()),
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            machine_uid: None,
+            orchestrator: None,
+            prev_hash: None,
+            hash: None,
+            payload: Some(payload),
+            work_id: None,
+            attempt: None,
+        }
+    }
+
     fn aggregate_record(
         step: &Step,
         model: &str,
@@ -1123,6 +1184,38 @@ impl DispatchMapStepKind {
             None => None,
         };
 
+        // (#1607) Contract #2's liveness bookends. Opened BEFORE any model
+        // work and closed on every exit path, including the ones a `?` takes:
+        // `MapBookend`'s Drop emits `dispatch error` unless `close` already
+        // consumed the terminal. This is what gives a per-seat `task-<id>`
+        // session an endpoint to be attributed by — without it the seat's
+        // token records name a model and a cost but never a place.
+        let endpoint_label: Option<String> = endpoint
+            .as_ref()
+            .map(|ep| crate::dispatch_internal::remote_endpoint_label(ep, model));
+        let mut bookend = MapBookend::new(
+            ctx,
+            Self::bookend_record(
+                step,
+                model,
+                "dispatch start",
+                darkmux_flow::Level::Info,
+                endpoint_label.as_deref(),
+                serde_json::json!({ "items_in": items.len() }),
+            ),
+            Self::bookend_record(
+                step,
+                model,
+                "dispatch error",
+                darkmux_flow::Level::Error,
+                endpoint_label.as_deref(),
+                serde_json::json!({
+                    "result_class": "error",
+                    "error": "dispatch.map terminated before completion (early return or panic)",
+                }),
+            ),
+        );
+
         // Per-EXECUTION remote allowance. When the step named a
         // `bucket_group`, the SCHEDULER already resolved the group's SHARED
         // bucket and handed it in through `ctx.remote_bucket()` — every
@@ -1213,8 +1306,97 @@ impl DispatchMapStepKind {
         // existing max-fold reads the true spend with zero viewer changes.
         push(Self::aggregate_record(step, model, endpoint.is_some(), &results), &mut batched);
 
+        // (#1607) The clean terminal. `remote_tokens` is stamped only for a
+        // hosted seat, and only the SUM the seat actually spent — the same
+        // figure the aggregate reports, so the two never disagree.
+        let ok_count = results.iter().filter(|r| r.ok).count();
+        let spent: u64 = results.iter().filter_map(|r| r.total_tokens).sum();
+        let mut done = Self::bookend_record(
+            step,
+            model,
+            "dispatch complete",
+            if ok_count == results.len() { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
+            endpoint_label.as_deref(),
+            serde_json::json!({
+                "result_class": if ok_count == results.len() { "ok" } else { "partial" },
+                "items_in": results.len(),
+                "ok_count": ok_count,
+                "failed_count": results.len() - ok_count,
+            }),
+        );
+        if endpoint_label.is_some() {
+            if let Some(payload) = done.payload.as_mut() {
+                darkmux_flow::stamp_remote_classification(payload, None, Some(spent));
+            }
+        }
+        bookend.close(done);
+
         let output = serde_json::to_string(&results).context("serializing dispatch.map results")?;
         Ok(StepOutcome { output, flow_records: batched })
+    }
+}
+
+/// (#1607) RAII half of `dispatch.map`'s liveness bookends.
+///
+/// Contract #2 requires a terminal on ALL exit paths, and `run_map` has many:
+/// a `?` on collection resolution, on the budget admit gate, on serialization,
+/// plus a panic in the loop. A hand-written "emit the terminal before each
+/// return" would be correct exactly until the next `?` is added — which is how
+/// #1272 happened the first time. The Drop impl makes forgetting impossible.
+///
+/// `close` consumes the pre-built error terminal and emits the caller's real
+/// one instead, so exactly ONE terminal is emitted per open — never two.
+///
+/// Streaming vs batched: with a `ctx` the records go out live, so a terminal
+/// emitted from Drop during unwinding still reaches the sink. WITHOUT a ctx
+/// (the `run()` path, tests) records are returned in `StepOutcome` and are
+/// already lost on `Err`, so Drop has nowhere useful to put one — it no-ops
+/// rather than pretending. Production always has a ctx (`run_streaming`).
+struct MapBookend<'a> {
+    ctx: Option<&'a StepRunCtx>,
+    /// The terminal to emit if dropped without `close` — taken by `close`.
+    on_abort: Option<darkmux_flow::FlowRecord>,
+}
+
+impl<'a> MapBookend<'a> {
+    fn new(
+        ctx: Option<&'a StepRunCtx>,
+        start: darkmux_flow::FlowRecord,
+        on_abort: darkmux_flow::FlowRecord,
+    ) -> Self {
+        if let Some(c) = ctx {
+            c.emit(start);
+        }
+        Self { ctx, on_abort: Some(on_abort) }
+    }
+
+    /// Emit the real terminal and disarm.
+    ///
+    /// Without a ctx this emits NOTHING — deliberately. `new` can only emit
+    /// the START through a ctx, so pushing a terminal into the batched vec
+    /// here would produce an ORPHAN: a `dispatch complete` with no matching
+    /// `dispatch start`. Liveness surfaces key on the PAIR (#857), so half a
+    /// pair is worse than neither — it reads as a dispatch that ended without
+    /// ever beginning. The guard is therefore entirely inert without a
+    /// streaming sink, and the batched `flow_records` shape is unchanged from
+    /// before this bookend existed.
+    ///
+    /// (Found by the workspace suite: pushing here appended a record that
+    /// shifted `flow_records.last()` off the aggregate and broke two existing
+    /// tests. They were right and the push was wrong.)
+    fn close(&mut self, finished: darkmux_flow::FlowRecord) {
+        self.on_abort = None;
+        if let Some(c) = self.ctx {
+            c.emit(finished);
+        }
+    }
+}
+
+impl Drop for MapBookend<'_> {
+    fn drop(&mut self) {
+        if let (Some(rec), Some(c)) = (self.on_abort.take(), self.ctx) {
+            c.emit(rec);
+        }
     }
 }
 
@@ -2824,6 +3006,131 @@ mod tests {
                 model: served.map(str::to_string),
             })
         });
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates the remote-budget env var
+    fn dispatch_map_hosted_emits_liveness_bookends_carrying_the_endpoint() {
+        // (#1607) THE conformance test for contract #2: "any production code
+        // path that performs model work emits `dispatch.start` and a terminal
+        // ... new vocabularies supplement, never replace."
+        //
+        // `dispatch.map` emitted only its own `step result` vocabulary, so the
+        // per-seat `task-<id>` sessions it mints — the review's probe and
+        // verify seats — carried token records with no record anywhere naming
+        // WHERE they ran. `payload.endpoint` on these bookends is the ONLY
+        // thing the savings hero reads to call a session cloud; without them
+        // hosted spend is unattributable (229,034 tokens on one machine in one
+        // day, reported as local until the consumer learned to say "unknown").
+        //
+        // Contract violations recur — this is the second (#1272 was the
+        // first) — so this asserts the SHAPE, not one field.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        install_hosted_delayed(1, None, Some(42));
+        let s = map_step(json!({
+            "model": "gpt-4o",
+            "user_template": "check {item}",
+            "collection": ["a", "b"],
+            "endpoint": { "url": "https://example.cognitiveservices.azure.com" },
+        }));
+        // The bookends ride the STREAMING seam, so drive `run_streaming` with a
+        // live emitter — the same shape the scheduler supplies in production.
+        // The batched `run()` path deliberately emits none (see MapBookend).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(
+            Some(tx),
+            None,
+            None,
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+        DispatchMapStepKind
+            .run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx)
+            .unwrap();
+        drop(ctx);
+        clear_hosted_override();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        let emitted: Vec<darkmux_flow::FlowRecord> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let actions: Vec<&str> = emitted.iter().map(|r| r.action.as_str()).collect();
+        assert!(
+            actions.contains(&"dispatch start"),
+            "a hosted map must OPEN its liveness edge; got {actions:?}"
+        );
+        assert!(
+            actions.contains(&"dispatch complete"),
+            "...and close it; got {actions:?}"
+        );
+        // Exactly one of each — the drop guard must not double-emit alongside
+        // the clean close.
+        assert_eq!(
+            actions.iter().filter(|a| **a == "dispatch start").count(),
+            1,
+            "one start per run; got {actions:?}"
+        );
+        assert_eq!(
+            actions.iter().filter(|a| a.starts_with("dispatch ") && **a != "dispatch start").count(),
+            1,
+            "exactly one terminal per open; got {actions:?}"
+        );
+
+        let terminal = emitted
+            .iter()
+            .find(|r| r.action == "dispatch complete")
+            .expect("terminal present");
+        let payload = terminal.payload.as_ref().expect("terminal carries a payload");
+        assert_eq!(
+            payload["endpoint"], "azure:example.cognitiveservices.azure.com/gpt-4o",
+            "the terminal names WHERE the seat ran, in the one format the viewer parses"
+        );
+        assert_eq!(
+            payload["remote_tokens"].as_u64(),
+            Some(84),
+            "remote spend is the seat's own sum (2 items x 42), matching the aggregate"
+        );
+        assert_eq!(
+            terminal.session_id.as_deref(),
+            Some(darkmux_types::session_id::task("t1").as_str()),
+            "SAME session as the seat's token records — that join is the whole point"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_local_bookend_carries_no_endpoint() {
+        // The no-op-when-local half: a local seat's terminal must be
+        // byte-identical to one from a build with no endpoint concept at all,
+        // or every local dispatch starts reporting as cloud.
+        clear_hosted_override();
+        let s = map_step(json!({
+            "model": "qwen3.6-35b",
+            "user_template": "check {item}",
+            "collection": [],
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        for r in &out.flow_records {
+            if let Some(p) = r.payload.as_ref() {
+                assert!(
+                    p.get("endpoint").is_none(),
+                    "a local map must never stamp an endpoint: {p}"
+                );
+            }
+        }
     }
 
     #[test]
