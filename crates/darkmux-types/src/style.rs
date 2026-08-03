@@ -17,14 +17,26 @@ static COLORIZE_OVERRIDE: AtomicU8 = AtomicU8::new(OVERRIDE_AUTO);
 
 /// Whether colorize is currently enabled.
 ///
-/// Returns `true` only when stdout is a TTY **and** the `NO_COLOR`
-/// environment variable is unset.  When disabled, styling helpers return
-/// the input string unchanged (no escape codes).
+/// Auto-detect resolves: `NO_COLOR` set → off (it wins — the informal spec
+/// says respect it unconditionally); else `CLICOLOR_FORCE` set non-empty,
+/// non-`"0"` → **on even without a TTY** (#1569 packet B: the daemon's
+/// `/panel/:id` spawns this binary with stdout on a PIPE, and the whole
+/// point is styled output for the viewer's ANSI renderer — the de-facto
+/// CLICOLOR convention exists for exactly this, so no bespoke env var);
+/// else TTY.  When disabled, styling helpers return the input unchanged.
 pub fn colorize_enabled() -> bool {
     match COLORIZE_OVERRIDE.load(Ordering::SeqCst) {
         OVERRIDE_ON => true,   // forced on
         OVERRIDE_OFF => false,  // forced off
-        _ => std::io::stdout().is_terminal() && std::env::var("NO_COLOR").is_err(),
+        _ => {
+            if std::env::var("NO_COLOR").is_ok() {
+                return false;
+            }
+            if std::env::var("CLICOLOR_FORCE").is_ok_and(|v| !v.is_empty() && v != "0") {
+                return true;
+            }
+            std::io::stdout().is_terminal()
+        }
     }
 }
 
@@ -262,6 +274,42 @@ mod tests {
         assert!(error("ok").ends_with("\x1b[0m"));
 
         set_colorize_override(None); // restore
+    }
+
+    /// (#1569 packet B) `CLICOLOR_FORCE` turns color ON without a TTY — the
+    /// daemon's panel endpoint spawns this binary with stdout on a pipe and
+    /// needs styled output. `NO_COLOR` still wins over it (the informal
+    /// spec's rule), and `"0"`/empty don't count as force.
+    #[serial_test::serial]
+    #[test]
+    fn clicolor_force_enables_without_a_tty_but_no_color_wins() {
+        let prev_force = std::env::var("CLICOLOR_FORCE").ok();
+        let prev_no = std::env::var("NO_COLOR").ok();
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+            std::env::set_var("CLICOLOR_FORCE", "1");
+        }
+        assert!(colorize_enabled(), "CLICOLOR_FORCE=1 must force color on a pipe");
+
+        unsafe { std::env::set_var("CLICOLOR_FORCE", "0") };
+        assert!(!colorize_enabled(), "CLICOLOR_FORCE=0 is not a force (test runs piped)");
+
+        unsafe {
+            std::env::set_var("CLICOLOR_FORCE", "1");
+            std::env::set_var("NO_COLOR", "1");
+        }
+        assert!(!colorize_enabled(), "NO_COLOR wins over CLICOLOR_FORCE");
+
+        unsafe {
+            match prev_force {
+                Some(v) => std::env::set_var("CLICOLOR_FORCE", v),
+                None => std::env::remove_var("CLICOLOR_FORCE"),
+            }
+            match prev_no {
+                Some(v) => std::env::set_var("NO_COLOR", v),
+                None => std::env::remove_var("NO_COLOR"),
+            }
+        }
     }
 
     /// NO_COLOR env var disables coloring even when stdout is a TTY.
