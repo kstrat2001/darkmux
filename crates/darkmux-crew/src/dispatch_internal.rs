@@ -4100,12 +4100,45 @@ pub(crate) fn is_reloadable_target(resident_model: &str, resident_identifier: &s
     resident_model == want && darkmux_profiles::swap::is_darkmux_owned(resident_identifier)
 }
 
+/// (#1615) The LOADABLE model key for a value that may carry the darkmux
+/// namespace. A bare key passes through untouched; `darkmux:foo` becomes `foo`.
+///
+/// The namespace is a LOAD-TIME DECORATION, never part of the key: `lms ps`
+/// reports a darkmux load as `identifier=darkmux:foo, modelKey=foo`, so
+/// LMStudio has no key carrying the prefix and every comparison-or-load
+/// against a prefixed string is guaranteed to miss.
+///
+/// Pure and borrowing, so the strip is unit-testable without a live `lms` and
+/// costs no allocation on the hot path.
+pub(crate) fn bare_model_key(value: &str) -> &str {
+    value
+        .strip_prefix(darkmux_gestalt::DARKMUX_NAMESPACE)
+        .unwrap_or(value)
+}
+
 fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
-    use darkmux_profiles::{lms, swap};
+    use darkmux_profiles::lms;
     // (#1282) This is a LOCAL load path (remote-brained dispatches skip it) —
     // a model without a declared `n_ctx` is a resolution error here, with the
     // uniform require_n_ctx message, never a parse-stage failure.
     let n_ctx = pm.require_n_ctx()?;
+    // (#1615) Normalize ONCE, at the point the key is first derived from the
+    // profile, so the residency check, the operator-facing messages and the
+    // load all speak the same vocabulary. A config that names its utility
+    // model as `darkmux:qwen3-4b-instruct-2507` (a namespaced IDENTIFIER where
+    // a KEY belongs — `internal.utility` accepts both spellings) otherwise
+    // failed in two places at once: the load could never resolve, AND
+    // `is_reloadable_target` compared the prefixed string against `lms ps`'s
+    // bare `modelKey`, so the model read as absent even when it was resident.
+    // The compactor was therefore unloadable, and every dispatch that compacted
+    // fell through to LMStudio's JIT-load at the model default with truncated
+    // summaries — silently, behind one warning line.
+    //
+    // Stripping is safe in both directions: a bare key is unchanged, and a
+    // namespaced string could never have been a valid key. `namespaced_
+    // identifier` below is idempotent over the prefix, so the identifier
+    // darkmux mints is byte-identical either way.
+    let model_key = bare_model_key(&pm.id);
     let loaded = lms::list_loaded().unwrap_or_default();
     // (#1609) Consider ONLY darkmux-owned residents. This used to match on the
     // bare model key alone — and `lms ps` reports a darkmux load as
@@ -4121,14 +4154,14 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
     // structurally through `OwnedTarget`; this legacy path reached past it to
     // the raw `lms::unload`, so the guarantee has to be restated here until
     // the raw call is retired in favor of the `ModelHost` seam.
-    match loaded.iter().find(|m| is_reloadable_target(&m.model, &m.identifier, &pm.id)) {
+    match loaded.iter().find(|m| is_reloadable_target(&m.model, &m.identifier, model_key)) {
         Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
         Some(m) => {
             eprintln!(
                 "darkmux dispatch: `{}` is resident at context {} but the profile \
                  declares n_ctx={}; reloading at {} so the dispatch gets the declared \
                  context. (#1135)",
-                pm.id, m.context, n_ctx, n_ctx
+                model_key, m.context, n_ctx, n_ctx
             );
             lms::unload(&m.identifier).with_context(|| {
                 format!("unloading `{}` to reload at n_ctx={}", m.identifier, n_ctx)
@@ -4140,25 +4173,25 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
             // blocking instance and suggest; never touch". darkmux loads its
             // own namespaced copy alongside it, exactly as the gestalt planner
             // already decides for a ForeignDuplicate.
-            if let Some(foreign) = loaded.iter().find(|m| m.model == pm.id) {
+            if let Some(foreign) = loaded.iter().find(|m| m.model == model_key) {
                 eprintln!(
                     "darkmux dispatch: `{}` is already resident as `{}`, which darkmux \
                      does not own and will not unload; loading darkmux's own copy at \
                      n_ctx={} alongside it. Free the RAM yourself with `lms unload {}` \
                      if that is not what you want. (#1609)",
-                    pm.id, foreign.identifier, n_ctx, foreign.identifier
+                    model_key, foreign.identifier, n_ctx, foreign.identifier
                 );
             } else {
                 eprintln!(
                     "darkmux dispatch: loading `{}` at n_ctx={} (the profile's declared \
                      context) before dispatch. (#1135)",
-                    pm.id, n_ctx
+                    model_key, n_ctx
                 );
             }
         }
     }
-    let identifier = swap::namespaced_identifier(pm);
-    load_at_ctx_bounded(&pm.id, &identifier, n_ctx)
+    let identifier = darkmux_gestalt::namespaced_identifier(model_key, pm.identifier.as_deref());
+    load_at_ctx_bounded(model_key, &identifier, n_ctx)
 }
 
 /// (#1139) Load `model_key` under `identifier` at `n_ctx` through the bounded
@@ -4168,6 +4201,9 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
 /// enforces the resolved model-load deadline and classifies the failure into a
 /// TYPED error, so a RAM-exhausted load becomes a clear, operator-actionable
 /// message — never a hang or a silent degrade.
+///
+/// `model_key` must already be BARE (`ensure_model_loaded_at_ctx` normalizes it
+/// via [`bare_model_key`], #1615) — the namespace belongs only in `identifier`.
 fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32) -> Result<()> {
     use darkmux_gestalt::{Deadline, ModelHost};
     let mut host = darkmux_profiles::gestalt_host::LmsHost::new();
