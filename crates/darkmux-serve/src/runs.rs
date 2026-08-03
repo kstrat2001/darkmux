@@ -208,8 +208,15 @@ pub(crate) fn build_runs(flows_dir: &StdPath, lab_dir: Option<&StdPath>) -> Vec<
     // re-read config for each one.
     let lab_machine = darkmux_types::config_access::machine_id();
     if let Some(dir) = lab_dir {
+        // (#1621) Read the clock ONCE for the whole scan, so every row in a
+        // response is judged against the same instant — otherwise two runs with
+        // identical mtimes could straddle the staleness edge within one payload.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         for summary in crate::scan_lab_runs(dir) {
-            runs.push(lab_summary_to_run(&summary, lab_machine.clone()));
+            runs.push(lab_summary_to_run(&summary, lab_machine.clone(), now_ms));
         }
     }
 
@@ -479,12 +486,12 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg]) -> RunStatus 
 /// [`Run`]. `machine` is resolved ONCE by the caller ([`build_runs`]) and
 /// passed in — every lab run shares the same daemon-declared machine
 /// (#1523 gate CONSIDER 7).
-fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>) -> Run {
+fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: u64) -> Run {
     let (role, model, route) = lab_staffing_role_model_route(summary.staffing.as_ref());
     Run {
         id: summary.dir.clone(),
         kind: RunKind::Lab,
-        status: lab_run_status(summary),
+        status: lab_run_status(summary, now_ms),
         machine,
         route,
         role,
@@ -516,14 +523,41 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>) -> Run {
 /// `Error` (there's no separate "degraded" value in this view-model — the
 /// step-4 lens can special-case `degenerate` directly off the richer
 /// `/lab/runs` payload if finer granularity turns out to matter).
-fn lab_run_status(summary: &LabRunSummary) -> RunStatus {
-    if !summary.finished {
-        return RunStatus::Running;
+fn lab_run_status(summary: &LabRunSummary, now_ms: u64) -> RunStatus {
+    if summary.finished {
+        return if summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
     }
-    if summary.degenerate {
-        return RunStatus::Error;
+    // (#1621) Unfinished is NOT the same as running, and treating it as such
+    // is what made the `running` filter useless: 49 of 52 rows it returned
+    // were long-dead bench runs, and the three live ones were lost in them.
+    // "Running" is a claim about the PRESENT and needs positive evidence.
+    //
+    // The threshold is derived, not invented. The runtime's own inactivity
+    // watchdog HARD-KILLS a dispatch that goes `inactivity_timeout_seconds`
+    // without proof-of-work, so a run whose newest artifact predates that
+    // budget cannot have live work under it — there is nothing left running to
+    // have written it. Doubled for headroom, because `mtime_ms` tracks marker
+    // ARTIFACTS rather than every heartbeat, and a live run legitimately goes
+    // quiet between them.
+    //
+    // Measured when this landed: all 49 unfinished lab runs on the operator's
+    // machine were untouched for over an hour, the freshest 2.6h. Not one was
+    // plausibly live.
+    let idle_ms = now_ms.saturating_sub(summary.mtime_ms);
+    if idle_ms > stale_after_ms() {
+        // It left a trail and the trail STOPS — that is evidence of
+        // abandonment, not absence of evidence, so `Abandoned` is honest here
+        // rather than a manufactured verdict.
+        return RunStatus::Abandoned;
     }
-    RunStatus::Complete
+    RunStatus::Running
+}
+
+/// (#1621) How long a lab run's newest artifact may age before the run stops
+/// counting as live. Twice the runtime's inactivity budget — see
+/// [`lab_run_status`] for why that is the right anchor.
+fn stale_after_ms() -> u64 {
+    darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(2_000)
 }
 
 /// Representative role/model/route for a lab run's `/runs` row, off its
@@ -1300,15 +1334,16 @@ mod tests {
 
     #[test]
     fn lab_run_status_maps_finished_and_degenerate() {
-        assert_eq!(lab_run_status(&minimal_lab_summary("d1", false, false)), RunStatus::Running);
-        assert_eq!(lab_run_status(&minimal_lab_summary("d2", true, false)), RunStatus::Complete);
-        assert_eq!(lab_run_status(&minimal_lab_summary("d3", true, true)), RunStatus::Error);
+        let now = FIXTURE_NOW_MS;
+        assert_eq!(lab_run_status(&minimal_lab_summary("d1", false, false), now), RunStatus::Running);
+        assert_eq!(lab_run_status(&minimal_lab_summary("d2", true, false), now), RunStatus::Complete);
+        assert_eq!(lab_run_status(&minimal_lab_summary("d3", true, true), now), RunStatus::Error);
     }
 
     #[test]
     fn lab_summary_to_run_uses_dir_as_id_and_kind_lab() {
         let summary = minimal_lab_summary("live/case-1", true, false);
-        let run = lab_summary_to_run(&summary, Some("studio".to_string()));
+        let run = lab_summary_to_run(&summary, Some("studio".to_string()), FIXTURE_NOW_MS);
         assert_eq!(run.id, "live/case-1");
         assert_eq!(run.kind, RunKind::Lab);
         assert_eq!(run.status, RunStatus::Complete);
@@ -1329,7 +1364,8 @@ mod tests {
     /// happened would be a worse lie than having no ordering.
     #[test]
     fn lab_summary_to_run_always_carries_an_activity_ts() {
-        let unfinished = lab_summary_to_run(&minimal_lab_summary("live/wip", false, false), None);
+        let unfinished =
+            lab_summary_to_run(&minimal_lab_summary("live/wip", false, false), None, FIXTURE_NOW_MS);
         assert_eq!(unfinished.status, RunStatus::Running);
         assert_eq!(unfinished.started_ts, None);
         assert_eq!(unfinished.completed_ts, None, "an unfinished run never completed");
@@ -1339,9 +1375,79 @@ mod tests {
             "an unfinished lab run must still be orderable by its newest-artifact time"
         );
 
-        let finished = lab_summary_to_run(&minimal_lab_summary("live/done", true, false), None);
+        let finished =
+            lab_summary_to_run(&minimal_lab_summary("live/done", true, false), None, FIXTURE_NOW_MS);
         assert_eq!(finished.updated_ts, Some(1_700_000_000));
         assert_eq!(finished.completed_ts, Some(1_700_000_000));
+    }
+
+    /// The fixture's newest-artifact time is 1_700_000_000_000 ms, so "now" for
+    /// a run that is still live is that instant — an idle age of zero.
+    const FIXTURE_NOW_MS: u64 = 1_700_000_000_000;
+
+    /// (#1621) The defect: `!finished` was returned as `Running`, so a lab run
+    /// that died months ago read as live forever. On the operator's machine
+    /// that was 49 of the 52 rows the `running` filter returned — the three
+    /// genuinely-live runs were lost in a pile of corpses, which defeats the
+    /// one question the filter exists to answer.
+    ///
+    /// "Running" is a claim about the PRESENT and needs positive evidence.
+    #[test]
+    fn an_unfinished_lab_run_stops_reading_as_live_once_it_goes_quiet() {
+        let summary = minimal_lab_summary("live/killed", false, false);
+
+        // Just now: still live. The floor must not break a real in-flight run.
+        assert_eq!(
+            lab_run_status(&summary, FIXTURE_NOW_MS),
+            RunStatus::Running,
+            "a run whose artifact was just written IS live"
+        );
+
+        // One second inside the window: still live. A live run legitimately
+        // goes quiet between marker artifacts.
+        let inside = FIXTURE_NOW_MS + stale_after_ms() - 1_000;
+        assert_eq!(lab_run_status(&summary, inside), RunStatus::Running);
+
+        // Past the window: it left a trail and the trail STOPS. The runtime's
+        // inactivity watchdog would have killed anything live by now, so there
+        // is nothing left that could have written it.
+        let outside = FIXTURE_NOW_MS + stale_after_ms() + 1_000;
+        assert_eq!(
+            lab_run_status(&summary, outside),
+            RunStatus::Abandoned,
+            "a run untouched for longer than the watchdog budget cannot be live"
+        );
+
+        // The operator's actual data: the FRESHEST of 49 stuck runs was 2.6h
+        // old. Every one of them must fall out of `running`.
+        let two_point_six_hours = FIXTURE_NOW_MS + (2.6 * 3_600_000.0) as u64;
+        assert_eq!(lab_run_status(&summary, two_point_six_hours), RunStatus::Abandoned);
+    }
+
+    /// Staleness must never override a run's OWN terminal verdict — a finished
+    /// run stays finished however long ago it ran, or every completed run in
+    /// history would decay into `Abandoned`.
+    #[test]
+    fn a_finished_lab_run_keeps_its_verdict_no_matter_how_old() {
+        let ancient = FIXTURE_NOW_MS + 400 * 24 * 3_600_000;
+        assert_eq!(
+            lab_run_status(&minimal_lab_summary("old/done", true, false), ancient),
+            RunStatus::Complete
+        );
+        assert_eq!(
+            lab_run_status(&minimal_lab_summary("old/degen", true, true), ancient),
+            RunStatus::Error
+        );
+    }
+
+    /// The threshold is DERIVED from the runtime's own inactivity budget, not
+    /// invented — so it moves with the operator's config instead of drifting
+    /// away from it.
+    #[test]
+    fn the_staleness_window_tracks_the_runtime_inactivity_budget() {
+        let budget = darkmux_types::config_access::inactivity_timeout_seconds();
+        assert_eq!(stale_after_ms(), budget * 2_000, "twice the watchdog budget, in ms");
+        assert!(stale_after_ms() >= 600 * 2_000, "and never below the shipped default");
     }
 
     // ── flow session index + route (#1518 start-OR-complete) ────────────
