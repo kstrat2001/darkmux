@@ -1,0 +1,8 @@
+src/mission_launch.rs:937:25: delete field image from struct TaskOverride expression in build_launch_params
+src/mission_launch.rs:938:25: delete field description from struct TaskOverride expression in build_launch_params
+src/mission_launch.rs:945:36: delete field workdir from struct TaskOverride expression in build_launch_params
+src/mission_launch.rs:945:62: delete field image from struct TaskOverride expression in build_launch_params
+src/mission_launch.rs:1652:28: replace || with && in lazy_start_phase_for_step
+src/skills.rs:302:9: delete field targets from struct InstallReport expression in install_from_disk
+src/skills.rs:360:9: delete field source from struct InstallReport expression in install_from_embedded
+src/skills.rs:361:9: delete field targets from struct InstallReport expression in install_from_embedded

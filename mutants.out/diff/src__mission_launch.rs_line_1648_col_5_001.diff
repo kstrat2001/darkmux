@@ -1,0 +1,43 @@
+--- src/mission_launch.rs
++++ replace lazy_start_phase_for_step -> bool with true
+@@ -1640,39 +1640,17 @@
+ /// [`lazy_close_prior_phases`]). `false` on every later step of an
+ /// already-started phase, so the advance fires exactly once per band.
+ pub(crate) fn lazy_start_phase_for_step(
+     mission_id: &str,
+     phase_id: &str,
+     step_status: crew::types::NodeStatus,
+     started: &mut std::collections::HashSet<String>,
+ ) -> bool {
+-    use crew::types::NodeStatus;
+-    if step_status != NodeStatus::Running {
+-        return false;
+-    }
+-    if phase_id.is_empty() || !started.insert(phase_id.to_string()) {
+-        return false;
+-    }
+-    let status = load_phase_for_brief(mission_id, phase_id)
+-        .map(|p| p.status)
+-        .unwrap_or(PhaseStatus::Planned);
+-    if matches!(status, PhaseStatus::Planned | PhaseStatus::Abandoned) {
+-        if let Err(e) = crew::lifecycle::phase_start(phase_id) {
+-            eprintln!(
+-                "{}",
+-                style::dim(&format!(
+-                    "mission launch: phase_start({phase_id}) failed: {e:#} — continuing; the \
+-                     whole-mission terminal (`mission finalize` / `mission abort`) reconciles \
+-                     phase state."
+-                ))
+-            );
+-        }
+-    }
+-    true
++    true /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// (#1620) The counterpart to [`lazy_start_phase_for_step`]: close the phases
+ /// a newly-started one has moved past.
+ ///
+ /// Without this, a launcher that starts phases lazily never CLOSES them, so
+ /// every phase it touched sat `Running` until the whole mission finalized and
+ /// reconciled them in bulk. The board counts `Complete` phases, so a review

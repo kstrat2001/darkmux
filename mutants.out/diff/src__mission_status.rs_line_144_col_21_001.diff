@@ -1,0 +1,21 @@
+--- src/mission_status.rs
++++ replace > with < in kind_glyph
+@@ -136,17 +136,17 @@
+ /// (#1612) Single-role dispatch vs multi-phase graph, in one column-safe glyph.
+ ///
+ /// The operator asked whether a row could say "graph" versus "role" and floated
+ /// an emoji. Emoji are DOUBLE-WIDTH, and every column budget in this module is
+ /// exact arithmetic over `chars().count()` — one emoji would silently overflow
+ /// every row it appeared on. These two are single-width, so the distinction is
+ /// free: it costs no column at all, replacing a marker that was already there.
+ fn kind_glyph(total_phases: usize) -> &'static str {
+-    if total_phases > 1 {
++    if total_phases < /* ~ changed by cargo-mutants ~ */ 1 {
+         "◆"
+     } else {
+         "•"
+     }
+ }
+ 
+ /// (#1612) A stable short handle for a mission, or `None` when the id has no
+ /// discriminating token.

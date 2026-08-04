@@ -1,0 +1,21 @@
+--- src/mission_launch.rs
++++ replace == with != in lazy_close_prior_phases
+@@ -1694,17 +1694,17 @@
+ /// late-but-correct one — finalize still reconciles whatever this skips.
+ pub(crate) fn lazy_close_prior_phases(
+     mission_id: &str,
+     phase_order: &[String],
+     newly_started: &str,
+     closed: &mut std::collections::HashSet<String>,
+ ) {
+     use crew::types::NodeStatus;
+-    let Some(at) = phase_order.iter().position(|p| p == newly_started) else {
++    let Some(at) = phase_order.iter().position(|p| p != /* ~ changed by cargo-mutants ~ */ newly_started) else {
+         return;
+     };
+     for prior in &phase_order[..at] {
+         if !closed.insert(prior.clone()) {
+             continue;
+         }
+         let status = load_phase_for_brief(mission_id, prior).map(|p| p.status);
+         if !matches!(status, Ok(PhaseStatus::Running)) {

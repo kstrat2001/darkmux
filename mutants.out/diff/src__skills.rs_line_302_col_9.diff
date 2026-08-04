@@ -1,0 +1,21 @@
+--- src/skills.rs
++++ delete field targets from struct InstallReport expression in install_from_disk
+@@ -294,17 +294,17 @@
+ 
+ fn install_from_disk(
+     source: &Path,
+     target: &Path,
+     opts: &InstallOptions,
+ ) -> Result<InstallReport> {
+     let mut report = InstallReport {
+         source: source.to_path_buf(),
+-        targets: vec![target.to_path_buf()],
++         /* ~ changed by cargo-mutants ~ */
+         ..Default::default()
+     };
+ 
+     for entry in fs::read_dir(source)
+         .with_context(|| format!("reading {}", source.display()))?
+     {
+         let entry = entry?;
+         let path = entry.path();

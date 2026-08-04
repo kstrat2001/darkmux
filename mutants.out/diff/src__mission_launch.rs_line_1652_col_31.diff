@@ -1,0 +1,21 @@
+--- src/mission_launch.rs
++++ delete ! in lazy_start_phase_for_step
+@@ -1644,17 +1644,17 @@
+     phase_id: &str,
+     step_status: crew::types::NodeStatus,
+     started: &mut std::collections::HashSet<String>,
+ ) -> bool {
+     use crew::types::NodeStatus;
+     if step_status != NodeStatus::Running {
+         return false;
+     }
+-    if phase_id.is_empty() || !started.insert(phase_id.to_string()) {
++    if phase_id.is_empty() ||  /* ~ changed by cargo-mutants ~ */started.insert(phase_id.to_string()) {
+         return false;
+     }
+     let status = load_phase_for_brief(mission_id, phase_id)
+         .map(|p| p.status)
+         .unwrap_or(PhaseStatus::Planned);
+     if matches!(status, PhaseStatus::Planned | PhaseStatus::Abandoned) {
+         if let Err(e) = crew::lifecycle::phase_start(phase_id) {
+             eprintln!(
