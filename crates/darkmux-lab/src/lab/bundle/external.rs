@@ -6,7 +6,7 @@
 //! one for a non-TS repo, plugs in here without touching the built-in
 //! path.
 
-use super::{Bundle, BundleSet};
+use super::{Bundle, BundleSet, BundleSkipReport};
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -74,7 +74,10 @@ fn parse_bundle_set(text: &str) -> Result<BundleSet> {
         }
         bundles.push(bundle);
     }
-    Ok(BundleSet { bundles })
+    // (#1605) An external bundler has no notion of this crate's internal
+    // decline bookkeeping — `skip` stays the honest empty default rather
+    // than fabricating file-level accounting the plugin never reported.
+    Ok(BundleSet { bundles, skip: BundleSkipReport::default() })
 }
 
 #[cfg(test)]

@@ -10,12 +10,15 @@
 //! silently degrades when it drifts.
 //!
 //! The output is one JSON object:
-//! `{ "mode": "review"|"comment"|"degraded", "review": <gh-review-payload>|null,
+//! `{ "mode": "review"|"comment"|"degraded"|"noop", "review": <gh-review-payload>|null,
 //!    "comment": <markdown>|null }`. The thin workflow YAML posts it (so the
 //! operator keeps control of the model/profile, trigger, and the `gh` call).
 //! `mode: "degraded"` (#1113) means NO review signal was produced (a
 //! degenerate envelope) — the workflow posts the comment AND marks its check
-//! failed/neutral, never green.
+//! failed/neutral, never green. `mode: "noop"` (#1605) is a DIFFERENT
+//! outcome from `"degraded"`: a genuinely non-code diff (every file the
+//! bundler touched declined for a benign reason) posts a neutral note
+//! naming what the diff contained — not a failure, not a green approval.
 //!
 //! **`comment` in `review` mode is the FALLBACK, not the default action**
 //! (#1583). `mode` alone decides what to post; in `review` mode the workflow
@@ -49,7 +52,7 @@
 //! module to `mission launch review` in #1284 Packet 4b.
 
 use anyhow::{Context, Result};
-use darkmux_lab::lab::review::{JudgeRecord, ReviewEnvelope, Tier, VerifyRecord, VerifyRuling};
+use darkmux_lab::lab::review::{DegenerateKind, JudgeRecord, ReviewEnvelope, Tier, VerifyRecord, VerifyRuling};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -62,7 +65,7 @@ const REVIEW_TAGLINE: &str = "Advisory, not a merge gate.";
 
 /// What the verb emits: the posting mode + the payload for it.
 pub struct Rendered {
-    pub mode: &'static str, // "review" | "comment" | "degraded" (#1113: no review signal)
+    pub mode: &'static str, // "review" | "comment" | "degraded" (#1113: no review signal) | "noop" (#1605: benign-empty, not a failure)
     pub review: Option<Value>,
     pub comment: Option<String>,
 }
@@ -221,6 +224,47 @@ fn degraded_with_footer(note: &str, footer: &str) -> Rendered {
              review. Human review (or a re-run) required.{footer}"
         )),
     }
+}
+
+/// (#1605) The neutral no-op comment for a benign-empty run — every file
+/// the diff touched declined for a reason that means "nothing here to
+/// review" (today: [`darkmux_lab::lab::review::DegenerateKind::BenignEmpty`]
+/// fires only when every skip is non-code content — see
+/// `classify_zero_bundle_degenerate`'s own doc). Names what the diff
+/// actually contained (from `env.bundle_skip`) so the requester sees WHY,
+/// never just a bare "nothing to review" — and this is explicitly NOT a
+/// green approval: the workflow posts it via `mode: "noop"`, distinct from
+/// both `"review"`/`"comment"` (real signal) and `"degraded"` (a genuine
+/// failure).
+fn render_benign_noop_comment(env: &ReviewEnvelope, footer: &str) -> String {
+    let (considered, listing) = match &env.bundle_skip {
+        Some(report) => {
+            let mut paths: Vec<&str> = report.files_skipped.iter().map(|f| f.path.as_str()).collect();
+            paths.sort_unstable();
+            const MAX_NAMED: usize = 8;
+            let listing = if paths.is_empty() {
+                "no files".to_string()
+            } else if paths.len() <= MAX_NAMED {
+                paths.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+            } else {
+                format!(
+                    "{}, and {} more",
+                    paths[..MAX_NAMED].iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", "),
+                    paths.len() - MAX_NAMED
+                )
+            };
+            (report.files_considered, listing)
+        }
+        None => (0, "no files".to_string()),
+    };
+    format!(
+        "### 🤖 PR review — nothing to review\n\n\
+         This diff touched {considered} file(s) — {listing} — and none of them contained code \
+         this reviewer bundles (non-code content such as fixtures, lockfiles, or generated \
+         config). There is nothing here for an automated code review to check. **This is a \
+         neutral note, not an approval** — it reflects what the diff contained, not a judgment \
+         on the change.{footer}"
+    )
 }
 
 /// (#1298) The review's posted footer, with its dispatch-provenance clause
@@ -417,10 +461,27 @@ fn public_safe_note(note: &str) -> String {
 /// - Zero confirmed AND zero needs-check on a healthy (non-degenerate)
 ///   review -> an honest `"comment"` summary naming how much was
 ///   investigated plus which models ran it — never a silent green pass.
-/// - A degenerate envelope (`env.degenerate.is_some()`) -> `"degraded"`,
-///   the same contract [`degraded_fallback`] (#1113) uses elsewhere in
-///   this module — no review signal was produced.
+/// - A degenerate envelope whose `degenerate_kind` is
+///   [`DegenerateKind::BenignEmpty`] (#1605 — every file the diff touched
+///   declined for a benign, "nothing to review" reason) -> `"noop"`: a short,
+///   NEUTRAL comment naming what the diff contained and why there's nothing
+///   to review. Not a green approval, not a red failure — see
+///   [`render_benign_noop_comment`].
+/// - Any OTHER degenerate envelope (`env.degenerate.is_some()`, `degenerate_kind`
+///   absent or [`DegenerateKind::Error`]) -> `"degraded"`, the same contract
+///   [`degraded_fallback`] (#1113) uses elsewhere in this module — no review
+///   signal was produced.
 pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&str>) -> Rendered {
+    if env.degenerate_kind == Some(DegenerateKind::BenignEmpty) {
+        // (#1605) A genuinely non-code diff is an honest outcome, not a
+        // failure — post a neutral note (never a green approval) instead of
+        // the loud "no signal" degraded treatment, and don't fail the run.
+        return Rendered {
+            mode: "noop",
+            review: None,
+            comment: Some(render_benign_noop_comment(env, &review_footer(env, attribution))),
+        };
+    }
     if let Some(note) = &env.degenerate {
         // (#1298) Even a degenerate run posts the envelope-derived footer, so a
         // remote crew that produced no signal never claims "no cloud API".
@@ -757,6 +818,10 @@ mod tests {
     // iteration), so importing them at file scope would warn "unused" on a
     // plain (non-test) `cargo build`.
     use darkmux_lab::lab::review::{JudgeRuling, JudgedFlag, MemberRecord, NeedsCheckCluster, ProbeFlag};
+    // (#1605) Test-only — the no-op-comment tests build a `bundle_skip`
+    // report by hand; production code only ever receives one already
+    // populated by `ReviewBundleStepKind::run_streaming`.
+    use darkmux_lab::lab::bundle::{BundleSkipReport, SkipReason, SkippedFile};
 
     const DIFF: &str = "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,3 +1,4 @@\n const a = 1;\n+const b = 2;\n const c = 3;\n-const d = 4;\n+const d = 5;\n";
 
@@ -1338,6 +1403,53 @@ mod tests {
         let c = r.comment.unwrap();
         assert!(c.contains("no signal"), "{c}");
         assert!(c.contains("zero flags from all probe draws"), "{c}");
+    }
+
+    /// (#1605) A benign-empty run — every file the diff touched declined
+    /// because it was non-code content — posts a NEUTRAL no-op comment
+    /// (`mode: "noop"`), never the loud "degraded"/"no signal" treatment,
+    /// and the comment names what the diff actually contained.
+    #[test]
+    fn synthesize_benign_empty_envelope_is_a_noop_naming_what_the_diff_contained() {
+        let env = ReviewEnvelope {
+            degenerate: Some(
+                "no bundles produced from the diff — 2 file(s) considered, 2 skipped \
+                 (2 non-code extension)"
+                    .to_string(),
+            ),
+            degenerate_kind: Some(DegenerateKind::BenignEmpty),
+            bundle_skip: Some(BundleSkipReport {
+                files_considered: 2,
+                files_skipped: vec![
+                    SkippedFile { path: "package-lock.json".to_string(), reason: SkipReason::NonCodeExtension },
+                    SkippedFile {
+                        path: "fixtures/sample.json".to_string(),
+                        reason: SkipReason::NonCodeExtension,
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let r = synthesize_review(&env, DIFF, None);
+        assert_eq!(r.mode, "noop", "a benign-empty run must post the neutral noop mode, never degraded");
+        assert!(r.review.is_none(), "never a formal review payload for a no-op");
+        let c = r.comment.expect("a noop run still posts a comment");
+        // Names WHAT the diff contained — the actual file paths, not just a
+        // bare "nothing to review" — so the requester sees the diff was
+        // genuinely inspected, not silently dropped.
+        assert!(c.contains("package-lock.json"), "{c}");
+        assert!(c.contains("fixtures/sample.json"), "{c}");
+        assert!(c.contains("2 file(s)"), "the count is named too: {c}");
+        // Explicitly NOT an approval — a neutral note, and never the
+        // "degraded"/"no review signal" red-failure language.
+        assert!(
+            !c.to_lowercase().contains("no signal") && !c.to_lowercase().contains("degraded"),
+            "a benign-empty note must never read like the loud degraded failure comment: {c}"
+        );
+        assert!(
+            c.to_lowercase().contains("neutral") || c.to_lowercase().contains("not an approval"),
+            "must explicitly disclaim this is not an approval: {c}"
+        );
     }
 
     #[test]

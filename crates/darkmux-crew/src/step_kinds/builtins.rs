@@ -748,6 +748,23 @@ pub struct MapItemResult {
     pub served_model: Option<String>,
     #[serde(default)]
     pub wall_ms: u64,
+    /// (#1605) How many `retry_on_error` attempts this item actually
+    /// consumed (0 on a first-attempt success or a non-retried error — the
+    /// default and overwhelmingly common case). Distinct from
+    /// `retry_on_empty`'s bookkeeping (which never surfaces per-item,
+    /// because an all-empty item still ends `ok: true` and its retries are
+    /// invisible-by-design): an ERROR retry is loud on purpose — darkmux#1605
+    /// found that "every probe draw errored" reads identically whether it
+    /// was a clean single failure or a transient blip that self-healed on
+    /// retry, so callers that care (the review probe stage) sum this into
+    /// `ReviewEnvelope::probe_retries` to make a recovered run visibly
+    /// different from one that never needed to retry at all.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub retried: u32,
+}
+
+fn u32_is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// The text a `{item}` placeholder in `dispatch.map`'s `user_template` is
@@ -869,7 +886,8 @@ fn resolve_map_collection(
 /// only), `timeout_seconds` (u32, default 120), `endpoint`
 /// (`darkmux_types::ModelEndpoint` JSON — presence selects the HOSTED
 /// dialect), `n_ctx`/`identifier` (residency hints — see [`Self::residency`]),
-/// `retry_on_empty` (u32, default 0 — see below).
+/// `retry_on_empty` (u32, default 0 — see below), `retry_on_error` (u32,
+/// default 0 — see below).
 ///
 /// **`retry_on_empty` (#1442, the generic port of the probe stage's
 /// retry-on-empty loop).** Default `0` (off) — a call whose trimmed content
@@ -880,11 +898,27 @@ fn resolve_map_collection(
 /// Tokens are accumulated across EVERY attempt (an empty reasoning-model reply
 /// still burns — and is billed — its whole completion budget), and the hosted
 /// arm draws from the remote bucket on each attempt (a retry is another
-/// billable call). A dispatch-level `Err` on any attempt is NOT retried (the
-/// single-shot primitive owns its own transport backoff — a second-guessing
-/// retry here would hide a real infra problem); it isolates as `ok: false`.
-/// The block stays Tier-1-pure and domain-blind: `retry_on_empty` is a plain
-/// config integer, not review-specific knowledge.
+/// billable call). The block stays Tier-1-pure and domain-blind:
+/// `retry_on_empty` is a plain config integer, not review-specific knowledge.
+///
+/// **`retry_on_error` (#1605, darkmux issue #1605 cause 2 — "every probe
+/// draw errored").** Default `0` (off) — a dispatch-level `Err` on any
+/// attempt is NOT retried, matching this block's ORIGINAL policy: the
+/// single-shot primitive already owns its own transport backoff (a bounded
+/// 429/503 ladder), so a second-guessing retry on top would hide a real
+/// infra problem for every caller by default. It isolates as `ok: false`
+/// exactly as before. When a step explicitly opts in with `N > 0`, an
+/// errored attempt is RE-DISPATCHED up to `N` additional times, each
+/// separated by a short fixed backoff
+/// ([`RETRY_ON_ERROR_BACKOFF`]) — for the ONE caller
+/// darkmux#1605 found this genuinely warranted (a batch of probe draws
+/// failing together reads like a transient endpoint-side outage, not a
+/// structural break), never for anything downstream of a successful probe
+/// (judge/verify stay at the default). [`MapItemResult::retried`] records
+/// how many error-retries an item actually consumed, so a recovered item is
+/// visibly distinct from one that never needed to retry. Still Tier-1-pure:
+/// the RETRY POLICY is a plain config integer a caller opts into; nothing
+/// here knows what "probe" or "review" means.
 ///
 /// **Templating boundary (by design, #1442).** `user_template` can reference
 /// ONLY `{item}` — never another dependency's output. A consumer that needs
@@ -1107,6 +1141,31 @@ impl DispatchMapStepKind {
         }
     }
 
+    /// (#1605) Shared parse/validate for a `dispatch.map` retry-budget
+    /// config key (`retry_on_empty`, `retry_on_error`) — both are a
+    /// non-negative integer, default 0/off when absent, and a loud
+    /// step-run-time `Err` (never silent coercion) when present but
+    /// non-integer or out of `u32`'s range. Named after the key it reads so
+    /// the error messages stay specific to whichever knob was misconfigured.
+    fn config_retry_budget(&self, step: &Step, key: &'static str) -> Result<u32> {
+        match step.config.get(key) {
+            None => Ok(0),
+            Some(v) => {
+                let n = v.as_u64().ok_or_else(|| {
+                    anyhow!("step `{}`: `{}` config.{key} must be a non-negative integer", step.id, self.id())
+                })?;
+                u32::try_from(n).map_err(|_| {
+                    anyhow!(
+                        "step `{}`: `{}` config.{key} ({n}) exceeds the maximum of {}",
+                        step.id,
+                        self.id(),
+                        u32::MAX
+                    )
+                })
+            }
+        }
+    }
+
     /// (#1442) The shared map body behind both the ctx-free [`StepKind::run`]
     /// and the streaming [`StepKind::run_streaming`]. `ctx` is `None` for the
     /// unit-test/no-scheduler path (records batch into
@@ -1156,26 +1215,14 @@ impl DispatchMapStepKind {
         // an out-of-u32-range `retry_on_empty` must NOT become ~4 billion
         // re-dispatches (the prior `u32::try_from(...).unwrap_or(u32::MAX)`
         // did exactly that; #1442 gate CONSIDER).
-        let retry_on_empty = match step.config.get("retry_on_empty") {
-            None => 0u32,
-            Some(v) => {
-                let n = v.as_u64().ok_or_else(|| {
-                    anyhow!(
-                        "step `{}`: `{}` config.retry_on_empty must be a non-negative integer",
-                        step.id,
-                        self.id()
-                    )
-                })?;
-                u32::try_from(n).map_err(|_| {
-                    anyhow!(
-                        "step `{}`: `{}` config.retry_on_empty ({n}) exceeds the maximum of {}",
-                        step.id,
-                        self.id(),
-                        u32::MAX
-                    )
-                })?
-            }
-        };
+        let retry_on_empty = self.config_retry_budget(step, "retry_on_empty")?;
+        // (#1605) `retry_on_error` — same shape, same validation, default
+        // 0/off. See [`DispatchMapStepKind`]'s doc for the policy this opts
+        // a step INTO: a dispatch `Err` is retried up to this many times
+        // (short backoff between attempts) instead of isolating immediately.
+        // Off by default for every existing caller; the review pipeline's
+        // probe stage is the first to set it (darkmux#1605 cause 2).
+        let retry_on_error = self.config_retry_budget(step, "retry_on_error")?;
         let endpoint: Option<darkmux_types::ModelEndpoint> = match step.config.get("endpoint") {
             Some(v) => Some(
                 serde_json::from_value(v.clone())
@@ -1252,11 +1299,11 @@ impl DispatchMapStepKind {
             let res = match &endpoint {
                 Some(ep) => map_hosted_item(
                     index, &bucket, ep, model, system, &user, max_tokens, timeout_seconds,
-                    retry_on_empty, ovr,
+                    retry_on_empty, retry_on_error, ovr,
                 ),
                 None => map_local_item(
                     index, model, system, &user, temperature, max_tokens, timeout_seconds,
-                    retry_on_empty, ovr,
+                    retry_on_empty, retry_on_error, ovr,
                 ),
             };
             // (#1442 gate C3) LIVE per-item emission when streaming.
@@ -1519,11 +1566,21 @@ fn accumulate_split(
     *any_split = true;
 }
 
+/// (#1605) The bounded transient-error retry's backoff — short on purpose
+/// (this is a per-item pause inside an already-bounded dispatch, not a
+/// rate-limit ladder; `single_shot_chat`/`single_shot_chat_hosted` already
+/// own a real 429/503 backoff ladder underneath this, per
+/// [`DispatchMapStepKind`]'s `retry_on_error` doc). Only ever slept when
+/// `retry_on_error > 0` AND an attempt actually errored — the overwhelming
+/// majority of items (every default-config caller, and every successful
+/// dispatch) never pay it.
+const RETRY_ON_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// (#1442) One LOCAL map item — dispatch, with the generic `retry_on_empty`
-/// loop (default 0/off). Tokens accumulate across every attempt; the loop
-/// stops early on the first non-empty reply; a dispatch `Err` isolates as
-/// `ok: false` and is never retried. See [`DispatchMapStepKind`]'s doc for the
-/// full `retry_on_empty` semantics.
+/// loop (default 0/off) and the `retry_on_error` loop (#1605, default
+/// 0/off). Tokens accumulate across every attempt; the loop stops early on
+/// the first non-empty reply. See [`DispatchMapStepKind`]'s doc for the
+/// full `retry_on_empty`/`retry_on_error` semantics.
 #[allow(clippy::too_many_arguments)]
 fn map_local_item(
     index: usize,
@@ -1534,6 +1591,7 @@ fn map_local_item(
     max_tokens: u32,
     timeout_seconds: u32,
     retry_on_empty: u32,
+    retry_on_error: u32,
     ovr: Option<&MapDispatchOverride>,
 ) -> MapItemResult {
     use crate::single_shot::{single_shot_chat, SingleShotRequest};
@@ -1547,7 +1605,10 @@ fn map_local_item(
     // doc): the response body's echoed `model` is not ground truth for a local
     // dispatch, so this arm never reads it.
     let mut wall_ms = 0u64;
-    for _ in 0..=retry_on_empty {
+    let mut empty_budget = retry_on_empty;
+    let mut error_budget = retry_on_error;
+    let mut error_retries_used = 0u32;
+    loop {
         let req = SingleShotRequest {
             base_url: None,
             model,
@@ -1598,23 +1659,41 @@ fn map_local_item(
                         completion_tokens: item_split_tokens(any_split, csum),
                         served_model: None,
                         wall_ms,
+                        retried: error_retries_used,
                     };
                 }
                 // Empty content — retry (until the budget is spent).
-            }
-            // Per-item error ISOLATION: capture, continue (never retried).
-            Err(e) => {
-                return MapItemResult {
-                    index,
-                    ok: false,
-                    content: String::new(),
-                    error: Some(format!("{e:#}")),
-                    total_tokens: item_total_tokens(any_usage, sum),
-                    prompt_tokens: item_split_tokens(any_split, psum),
-                    completion_tokens: item_split_tokens(any_split, csum),
-                    served_model: None,
-                    wall_ms,
+                if empty_budget == 0 {
+                    break;
                 }
+                empty_budget -= 1;
+            }
+            // (#1605) A dispatch `Err` retries ONLY when `retry_on_error`
+            // opted in (default 0 — the historical "never retried, a
+            // second-guessing retry here would hide a real infra problem"
+            // behavior stays the default for every caller that doesn't ask
+            // for otherwise). When it does retry, a short backoff separates
+            // the attempts and `error_retries_used` tracks how many fired,
+            // so a recovered item is distinguishable from one that never
+            // needed to retry.
+            Err(e) => {
+                if error_budget == 0 {
+                    return MapItemResult {
+                        index,
+                        ok: false,
+                        content: String::new(),
+                        error: Some(format!("{e:#}")),
+                        total_tokens: item_total_tokens(any_usage, sum),
+                        prompt_tokens: item_split_tokens(any_split, psum),
+                        completion_tokens: item_split_tokens(any_split, csum),
+                        served_model: None,
+                        wall_ms,
+                        retried: error_retries_used,
+                    };
+                }
+                error_budget -= 1;
+                error_retries_used += 1;
+                std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
     }
@@ -1631,16 +1710,18 @@ fn map_local_item(
         completion_tokens: item_split_tokens(any_split, csum),
         served_model: None,
         wall_ms,
+        retried: error_retries_used,
     }
 }
 
 /// (#1442) One HOSTED map item — the remote-bucketed sibling of
-/// [`map_local_item`]. Each attempt (including a `retry_on_empty` retry) draws
-/// from the SHARED per-execution bucket: it admits before the call, clamps
-/// `max_tokens` to what remains (#1442 gate C6), and spends the conservative
-/// cost after. A first-attempt exhaustion is the named skip (`ok: false`); a
-/// LATER-attempt exhaustion stops retrying and keeps the empty-but-dispatched
-/// result already earned (never a spurious skip for an item that did fire).
+/// [`map_local_item`]. Each attempt (including a `retry_on_empty` or
+/// `retry_on_error`, #1605, retry) draws from the SHARED per-execution
+/// bucket: it admits before the call, clamps `max_tokens` to what remains
+/// (#1442 gate C6), and spends the conservative cost after. A first-attempt
+/// exhaustion is the named skip (`ok: false`); a LATER-attempt exhaustion
+/// stops retrying and keeps the empty-but-dispatched result already earned
+/// (never a spurious skip for an item that did fire).
 #[allow(clippy::too_many_arguments)]
 fn map_hosted_item(
     index: usize,
@@ -1652,6 +1733,7 @@ fn map_hosted_item(
     max_tokens: u32,
     timeout_seconds: u32,
     retry_on_empty: u32,
+    retry_on_error: u32,
     ovr: Option<&MapDispatchOverride>,
 ) -> MapItemResult {
     use crate::single_shot::HostedSingleShotRequest;
@@ -1667,7 +1749,11 @@ fn map_hosted_item(
     // their honest zero/`None`.
     let mut wall_ms = 0u64;
     let mut served_model: Option<String> = None;
-    for attempt in 0..=retry_on_empty {
+    let mut empty_budget = retry_on_empty;
+    let mut error_budget = retry_on_error;
+    let mut error_retries_used = 0u32;
+    let mut attempt: u32 = 0;
+    loop {
         // (#1442 fan-out) admit_reserve grants — and RESERVES — the clamped
         // completion cap in one locked operation, so concurrent sibling
         // steps sharing this bucket (`bucket_group`) cannot all admit
@@ -1689,6 +1775,7 @@ fn map_hosted_item(
                     completion_tokens: None,
                     served_model: None,
                     wall_ms,
+                    retried: 0,
                 };
             }
             // A retry the bucket can no longer fund — stop, keep what fired.
@@ -1749,28 +1836,42 @@ fn map_hosted_item(
                         completion_tokens: item_split_tokens(any_split, csum),
                         served_model,
                         wall_ms,
+                        retried: error_retries_used,
                     };
                 }
                 // Empty content — retry (if the bucket funds another attempt).
+                if empty_budget == 0 {
+                    break;
+                }
+                empty_budget -= 1;
             }
-            // Per-item error ISOLATION: capture, continue (never retried).
+            // (#1605) See `map_local_item`'s matching arm — same policy:
+            // retried only when `retry_on_error` opted in, with a short
+            // backoff and `error_retries_used` tracking how many fired.
             Err(e) => {
                 // Release the reservation — a dispatch-level error spent
                 // nothing (the pre-reserve accounting billed 0 here too).
                 bucket.lock().expect("map remote bucket mutex poisoned").settle(clamped, 0);
-                return MapItemResult {
-                    index,
-                    ok: false,
-                    content: String::new(),
-                    error: Some(format!("{e:#}")),
-                    total_tokens: item_total_tokens(any_usage, sum),
-                    prompt_tokens: item_split_tokens(any_split, psum),
-                    completion_tokens: item_split_tokens(any_split, csum),
-                    served_model,
-                    wall_ms,
+                if error_budget == 0 {
+                    return MapItemResult {
+                        index,
+                        ok: false,
+                        content: String::new(),
+                        error: Some(format!("{e:#}")),
+                        total_tokens: item_total_tokens(any_usage, sum),
+                        prompt_tokens: item_split_tokens(any_split, psum),
+                        completion_tokens: item_split_tokens(any_split, csum),
+                        served_model,
+                        wall_ms,
+                        retried: error_retries_used,
+                    };
                 }
+                error_budget -= 1;
+                error_retries_used += 1;
+                std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
+        attempt += 1;
     }
     MapItemResult {
         index,
@@ -1782,6 +1883,7 @@ fn map_hosted_item(
         completion_tokens: item_split_tokens(any_split, csum),
         served_model,
         wall_ms,
+        retried: error_retries_used,
     }
 }
 
@@ -2522,6 +2624,7 @@ mod tests {
             completion_tokens: None,
             served_model: None,
             wall_ms: 0,
+            retried: 0,
         }];
         let rec = DispatchMapStepKind::aggregate_record(&s, "m", false, &results);
         assert_eq!(
@@ -2543,6 +2646,7 @@ mod tests {
             completion_tokens: Some(2057),
             served_model: None,
             wall_ms: 0,
+            retried: 0,
         };
         let payload = map_item_token_payload(&res).expect("a reply with usage emits a record");
         assert_eq!(payload["total_tokens"], 4547);
@@ -2565,6 +2669,7 @@ mod tests {
             completion_tokens: None,
             served_model: None,
             wall_ms: 0,
+            retried: 0,
         };
         let payload = map_item_token_payload(&res).expect("a total alone still emits");
         assert_eq!(payload["total_tokens"], 1521);
@@ -2589,6 +2694,7 @@ mod tests {
             completion_tokens: Some(12),
             served_model: None,
             wall_ms: 0,
+            retried: 0,
         };
         let payload = map_item_token_payload(&res).expect("a split alone still emits");
         assert_eq!(payload["total_tokens"], 42, "arithmetic on reported parts, not fabrication");
@@ -2610,6 +2716,7 @@ mod tests {
             completion_tokens: None,
             served_model: None,
             wall_ms: 0,
+            retried: 0,
         };
         assert!(map_item_token_payload(&res).is_none());
     }
@@ -2642,9 +2749,9 @@ mod tests {
         // mission graph's max-fold token meter reads as the step's true
         // spend (any per-item value is <= the sum).
         let results = vec![
-            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0 },
-            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0 },
-            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0 },
+            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
+            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
+            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
         ];
         let s = map_step(json!({}));
         let rec = DispatchMapStepKind::aggregate_record(&s, "m", true, &results);
@@ -2660,7 +2767,7 @@ mod tests {
             "any failed item raises the level"
         );
 
-        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0 }];
+        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, served_model: None, wall_ms: 0, retried: 0 }];
         let rec = DispatchMapStepKind::aggregate_record(&s, "m", false, &clean);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
         assert_eq!(rec.payload.as_ref().unwrap()["remote"], false);
@@ -3004,6 +3111,178 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    // ── (#1605) dispatch.map retry_on_error ──────────────────────────────
+    //
+    // darkmux issue #1605 cause 2: a probe stage where EVERY draw errored
+    // together read like a transient endpoint outage in the sampled data,
+    // so the review probe stage opts a `dispatch.map` step into a bounded
+    // ONE-retry-with-backoff via this generic (default-off) config knob.
+    // These tests pin the mechanism itself; `review.rs`'s own tests pin
+    // that probe opts in and verify does not.
+
+    /// Script a sequence of hosted call OUTCOMES (`Ok`/`Err`) — walks one
+    /// entry per call, clamping to the last entry once exhausted, and counts
+    /// how many calls actually fired (so a test can assert the retry
+    /// happened exactly the expected number of times, not just that the
+    /// final result looks right).
+    fn install_scripted_hosted_outcomes(
+        script: Vec<Result<(&'static str, Option<u64>)>>,
+    ) -> std::rc::Rc<std::cell::Cell<usize>> {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let calls_inner = calls.clone();
+        let idx = std::cell::Cell::new(0usize);
+        let script = std::rc::Rc::new(script);
+        install_hosted_override(move |_req| {
+            calls_inner.set(calls_inner.get() + 1);
+            let i = idx.get().min(script.len().saturating_sub(1));
+            idx.set(idx.get() + 1);
+            match &script[i] {
+                Ok((content, total)) => Ok(crate::single_shot::SingleShotReply {
+                    content: content.to_string(),
+                    total_tokens: *total,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: Some("hosted".to_string()),
+                }),
+                Err(e) => Err(anyhow!("{e}")),
+            }
+        });
+        calls
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_retry_on_error_retries_then_succeeds() {
+        // First attempt errors (a transient blip); retry_on_error=1 fires
+        // ONE retry, which succeeds. The item ends ok:true and exactly TWO
+        // calls fired — not zero, not more than the bounded budget.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        let calls = install_scripted_hosted_outcomes(vec![
+            Err(anyhow!("transient: connection reset")),
+            Ok(("flag", Some(70))),
+        ]);
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "endpoint": { "url": "https://example.com" },
+            "retry_on_error": 1,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok, "the retry recovered the item");
+        assert_eq!(results[0].content, "flag");
+        assert_eq!(results[0].retried, 1, "exactly one error-retry was consumed");
+        assert_eq!(calls.get(), 2, "exactly two calls fired: the failed attempt + the one retry");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_retry_on_error_bounded_to_one_never_retries_twice() {
+        // Every attempt errors. retry_on_error=1 permits exactly ONE retry —
+        // two calls total, then the item isolates as ok:false carrying the
+        // LAST attempt's error. A THIRD call would mean the bound leaked.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        let calls = install_scripted_hosted_outcomes(vec![
+            Err(anyhow!("first failure")),
+            Err(anyhow!("second failure")),
+            Ok(("would never be reached", Some(999))),
+        ]);
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "endpoint": { "url": "https://example.com" },
+            "retry_on_error": 1,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].ok, "both attempts failed — isolated, never fabricated a success");
+        assert_eq!(results[0].retried, 1, "the one permitted retry was consumed");
+        assert!(
+            results[0].error.as_deref().unwrap().contains("second failure"),
+            "the LAST attempt's error is what's recorded: {:?}",
+            results[0].error
+        );
+        assert_eq!(calls.get(), 2, "bounded to exactly one retry — never a third call");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_retry_on_error_default_off_isolates_immediately() {
+        // With no `retry_on_error` configured (default 0/off — the ORIGINAL
+        // policy, preserved for every caller that doesn't opt in), a single
+        // dispatch error isolates on the FIRST attempt — exactly one call,
+        // matching pre-#1605 behavior byte-for-byte.
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        let calls = install_scripted_hosted_outcomes(vec![
+            Err(anyhow!("boom")),
+            Ok(("would never be reached", Some(999))),
+        ]);
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "endpoint": { "url": "https://example.com" },
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        clear_hosted_override();
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].ok);
+        assert_eq!(results[0].retried, 0, "no retry budget — never retried");
+        assert_eq!(calls.get(), 1, "exactly one call — the historical no-retry-on-error behavior");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_map_retry_on_error_out_of_range_is_a_loud_config_error() {
+        let s = map_step(json!({
+            "model": "gpt-5.1",
+            "user_template": "check {item}",
+            "collection": ["a"],
+            "retry_on_error": u64::from(u32::MAX) + 1,
+        }));
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("retry_on_error"), "{err}");
     }
 
     #[test]

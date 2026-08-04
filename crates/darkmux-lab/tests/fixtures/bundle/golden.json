@@ -280,5 +280,9 @@
       ],
       "truncated": true
     }
-  ]
+  ],
+  "skip": {
+    "files_considered": 1,
+    "files_skipped": []
+  }
 }
