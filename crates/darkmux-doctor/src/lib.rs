@@ -2659,6 +2659,38 @@ fn check_mission_config_registry() -> Check {
                                  built-in or delete it to fall back to the embedded tier"
                             ));
                         }
+                        // (#1648) The MIRROR direction, and the more dangerous
+                        // one. A doc on a NEWER minor parses cleanly here —
+                        // `TaskConfig`'s `#[serde(flatten)] extras` swallows
+                        // every field this binary doesn't know — so an
+                        // additive field silently stops existing. The schema's
+                        // minor-bump rule assumes a consumer "can SAFELY
+                        // IGNORE what it can't yet evaluate", but #1619's
+                        // `reads` breaks that assumption: ignoring it drops
+                        // both the data delivery AND the execution ordering,
+                        // and since the scheduler is not phase-gated, a review
+                        // variant's judge task then has no remaining
+                        // dependency, dispatches at launch against an empty
+                        // docket, and the run completes GREEN WITH ZERO
+                        // FINDINGS. A false-green review is the worst failure
+                        // this project has; better to refuse to guess.
+                        //
+                        // Honest about reach: this only helps binaries that
+                        // HAVE the check, so it cannot retroactively protect
+                        // an already-shipped older binary. It closes the
+                        // window from here forward, which is the only window
+                        // a code change can close.
+                        if doc_major == bin_major && doc_minor > bin_minor {
+                            blocking.push(format!(
+                                "\"{id}\": user-tier copy declares schema {doc_major}.{doc_minor}, \
+                                 NEWER than this binary's {bin_major}.{bin_minor} — it may declare \
+                                 additive fields this binary silently ignores rather than \
+                                 rejects (a `reads` relation, for one, carries both data and \
+                                 ordering: dropping it can let a stage run early against empty \
+                                 input and finish green with no findings). Upgrade darkmux, or \
+                                 re-author this copy against {bin_major}.{bin_minor}"
+                            ));
+                        }
                     }
                 }
                 if !kind_warnings.is_empty() {
@@ -5337,6 +5369,71 @@ mod tests {
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("user-tier copy declares schema 1.0"), "{}", check.message);
         assert!(check.message.contains("zero probe tasks"), "{}", check.message);
+    }
+
+    /// (#1648) The MIRROR direction — a user-tier copy on a NEWER minor than
+    /// the binary. Parses cleanly (the flatten `extras` swallows unknown
+    /// fields), which is exactly the hazard: an additive field silently stops
+    /// existing. For `reads` (#1619) that drops data AND ordering, letting a
+    /// stage run early against empty input and finish GREEN WITH NO FINDINGS.
+    /// A false-green review must never be reachable in silence.
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_warns_when_user_tier_minor_leads_the_binary() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        // Same major, minor AHEAD of whatever this binary ships — derived
+        // from the constant rather than hardcoded, so the test keeps meaning
+        // the same thing after the next minor bump.
+        let (major, minor) =
+            parse_major_minor(darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA).expect("valid constant");
+        let ahead = format!("{major}.{}", minor + 1);
+        std::fs::write(
+            guard.path().join("mission-configs").join("review.json"),
+            format!(
+                r#"{{"id":"review","name":"PR Review (from a newer darkmux)","schema_version":"{ahead}"}}"#
+            ),
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains(&format!("declares schema {ahead}")),
+            "the warning must name the document's own newer version: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("silently ignores"),
+            "the warning must say the fields are IGNORED, not rejected — that is the hazard: {}",
+            check.message
+        );
+    }
+
+    /// (#1648) A copy on the SAME minor as the binary must not trip either
+    /// direction. Without this, a fix for the leading case could trivially
+    /// fire on every well-formed user copy and train the operator to ignore
+    /// doctor.
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_is_quiet_when_user_tier_minor_matches() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("review.json"),
+            format!(
+                r#"{{"id":"review","name":"PR Review (current)","schema_version":"{}"}}"#,
+                darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA
+            ),
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert!(
+            !check.message.contains("declares schema"),
+            "a current-schema user copy must not trip any drift warning: {}",
+            check.message
+        );
     }
 
     #[test]
