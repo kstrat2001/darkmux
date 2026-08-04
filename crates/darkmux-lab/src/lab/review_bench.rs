@@ -1091,6 +1091,10 @@ fn run_funnel_case(
         // (#1530) None — bench bundles through the step, like production.
         // The override survives for HERMETIC UNIT TESTS only.
         bundle_override: None,
+        // (#1641) A bench run is per-run-local (lab/fleet sink boundary) —
+        // no Mission is ever minted for it, so `None` here matches the
+        // `--charges-file` path's own honest `None`.
+        mission_id: None,
     });
 
     let graph = review::build_review_graph(

@@ -719,7 +719,28 @@ pub(crate) struct StepFinals {
 /// `dispatch.internal` step defaults to; (3) `handle == <step id>`. Returns
 /// the id only when it is one of THIS mission's steps (`step_ids`), so a
 /// scan over a shared per-day flow file attributes nothing foreign.
-fn step_for_record<'a>(rec: &serde_json::Value, step_ids: &'a BTreeSet<String>) -> Option<&'a str> {
+///
+/// (#1641) `step_ids` alone cannot make that guarantee: step ids are
+/// CONFIG-scoped, so two missions launched from the same config share every
+/// one of the three keys byte-for-byte, and the backfill window has no upper
+/// bound — a reload of mission A's page would fold mission B's totals into
+/// A's meter forever. Now that the producers stamp `mission_id`, a record
+/// carrying a DIFFERENT mission's id is rejected before any key matching;
+/// an absent `mission_id` (legacy record) still proxy-matches, mirroring the
+/// page-side `stepForRecord` rule exactly. Note the residual leak is
+/// one-directional by design: a legacy UNSTAMPED record can still match into
+/// a new mission's page — acceptable compat, whereas the reverse (stamped
+/// records crossing missions) is the #1641 defect and is what this blocks.
+fn step_for_record<'a>(
+    rec: &serde_json::Value,
+    step_ids: &'a BTreeSet<String>,
+    mission_id: &str,
+) -> Option<&'a str> {
+    if let Some(rec_mid) = rec.get("mission_id").and_then(|m| m.as_str()) {
+        if !rec_mid.is_empty() && rec_mid != mission_id {
+            return None;
+        }
+    }
     if let Some(sid) = rec.get("payload").and_then(|p| p.get("step_id")).and_then(|s| s.as_str()) {
         if let Some(found) = step_ids.get(sid) {
             return Some(found.as_str());
@@ -756,13 +777,17 @@ fn step_for_record<'a>(rec: &serde_json::Value, step_ids: &'a BTreeSet<String>) 
 /// mirroring the JS fold (which flags cloud before its action branches).
 /// Pure + iterator-driven so the correlation/fold logic is unit-testable
 /// without touching the filesystem.
-pub(crate) fn fold_step_finals<I>(records: I, step_ids: &BTreeSet<String>) -> BTreeMap<String, StepFinals>
+pub(crate) fn fold_step_finals<I>(
+    records: I,
+    step_ids: &BTreeSet<String>,
+    mission_id: &str,
+) -> BTreeMap<String, StepFinals>
 where
     I: IntoIterator<Item = serde_json::Value>,
 {
     let mut out: BTreeMap<String, StepFinals> = BTreeMap::new();
     for rec in records {
-        let Some(sid) = step_for_record(&rec, step_ids) else {
+        let Some(sid) = step_for_record(&rec, step_ids, mission_id) else {
             continue;
         };
         let action = rec.get("action").and_then(|a| a.as_str()).unwrap_or("");
@@ -921,15 +946,17 @@ pub(crate) const MAX_BACKFILL_RECORDS: usize = 100_000;
 fn backfill_step_finals(
     flows_dir: &std::path::Path,
     step_ids: &BTreeSet<String>,
+    mission_id: &str,
     mission_created_ts: u64,
 ) -> BTreeMap<String, StepFinals> {
-    backfill_step_finals_bounded(flows_dir, step_ids, mission_created_ts, MAX_BACKFILL_RECORDS)
+    backfill_step_finals_bounded(flows_dir, step_ids, mission_id, mission_created_ts, MAX_BACKFILL_RECORDS)
 }
 
 /// [`backfill_step_finals`] with the record cap injectable for tests.
 fn backfill_step_finals_bounded(
     flows_dir: &std::path::Path,
     step_ids: &BTreeSet<String>,
+    mission_id: &str,
     mission_created_ts: u64,
     max_records: usize,
 ) -> BTreeMap<String, StepFinals> {
@@ -976,7 +1003,7 @@ fn backfill_step_finals_bounded(
             }
         }
     }
-    fold_step_finals(records, step_ids)
+    fold_step_finals(records, step_ids, mission_id)
 }
 
 /// Build the full node-link graph for one mission. `Ok(None)` when no
@@ -1064,7 +1091,7 @@ pub fn build_mission_graph(
     // bounded to the mission's lifetime window (#1445 gate).
     let all_step_ids: BTreeSet<String> =
         all_tasks.iter().flat_map(|t| t.step_ids.iter().cloned()).collect();
-    let step_finals = backfill_step_finals(flows_dir, &all_step_ids, mission.created_ts);
+    let step_finals = backfill_step_finals(flows_dir, &all_step_ids, &mission.id, mission.created_ts);
 
     for (phase_index, phase_id) in mission.phase_ids.iter().enumerate() {
         let Some(phase) = phase_by_id.remove(phase_id) else {
@@ -1320,10 +1347,63 @@ mod tests {
             "action": "step result",
             "payload": { "step_id": "review-judge-step", "total_tokens": 4200 }
         });
-        let out = fold_step_finals(vec![rec], &step_ids);
+        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["review-judge-step"].tokens, Some(4200));
         assert_eq!(out["review-judge-step"].turns, None);
         assert!(!out["review-judge-step"].cloud);
+    }
+
+    #[test]
+    fn fold_finals_rejects_a_record_stamped_with_a_foreign_mission_id() {
+        // (#1641) THE defect, server-side: step ids are config-scoped, so
+        // mission B's records carry the byte-identical step_id/handle/
+        // session_id keys — and the backfill window has no upper bound, so
+        // without the gate a reload of A's page folds B's totals into A's
+        // meter forever. All three correlation keys are exercised because the
+        // gate must fire BEFORE any key matching, not inside one branch.
+        let step_ids = ids(&["review-judge-step"]);
+        let foreign = |extra: serde_json::Value| {
+            let mut rec = serde_json::json!({
+                "action": "step result",
+                "mission_id": "m-other",
+                "payload": { "total_tokens": 4200 }
+            });
+            rec.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            rec
+        };
+        let recs = vec![
+            foreign(serde_json::json!({ "payload": { "step_id": "review-judge-step", "total_tokens": 4200 } })),
+            foreign(serde_json::json!({ "session_id": "step-review-judge-step" })),
+            foreign(serde_json::json!({ "handle": "review-judge-step" })),
+        ];
+        let out = fold_step_finals(recs, &step_ids, "m-this");
+        assert!(
+            out.is_empty(),
+            "a foreign-stamped record matched into this mission's fold: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fold_finals_matching_and_legacy_unstamped_records_still_fold() {
+        // (#1641) The gate's two allow paths, pinned so it can't quietly
+        // become stricter: a record stamped with THIS mission's id folds, and
+        // a legacy record with NO mission_id still proxy-matches (pre-#1641
+        // history must keep rendering).
+        let step_ids = ids(&["s1", "s2"]);
+        let recs = vec![
+            serde_json::json!({
+                "action": "step result",
+                "mission_id": "m-this",
+                "payload": { "step_id": "s1", "total_tokens": 100 }
+            }),
+            serde_json::json!({
+                "action": "step result",
+                "payload": { "step_id": "s2", "total_tokens": 200 }
+            }),
+        ];
+        let out = fold_step_finals(recs, &step_ids, "m-this");
+        assert_eq!(out["s1"].tokens, Some(100), "own-stamped record must fold");
+        assert_eq!(out["s2"].tokens, Some(200), "legacy unstamped record must fold");
     }
 
     #[test]
@@ -1335,7 +1415,7 @@ mod tests {
             "session_id": "step-s1",
             "payload": { "total_tokens": 15200, "total_turns": 9 }
         });
-        let out = fold_step_finals(vec![rec], &step_ids);
+        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(15200));
         assert_eq!(out["s1"].turns, Some(9));
     }
@@ -1350,7 +1430,7 @@ mod tests {
             serde_json::json!({ "action": "dispatch complete", "handle": "s1",
                                 "payload": { "total_tokens": 900, "total_turns": 5 } }),
         ];
-        let out = fold_step_finals(recs, &step_ids);
+        let out = fold_step_finals(recs, &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(900), "later/higher complete wins");
         assert_eq!(out["s1"].turns, Some(5));
     }
@@ -1362,7 +1442,7 @@ mod tests {
             "action": "step result",
             "payload": { "step_id": "s1", "total_tokens": 50, "endpoint": "https://api.example/v1" }
         });
-        let out = fold_step_finals(vec![rec], &step_ids);
+        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert!(out["s1"].cloud);
         assert_eq!(out["s1"].tokens, Some(50));
     }
@@ -1380,7 +1460,7 @@ mod tests {
                                 "payload": { "total_tokens": 7 } }),
             serde_json::json!({ "action": "dispatch.turn", "handle": "mine" }),
         ];
-        let out = fold_step_finals(recs, &step_ids);
+        let out = fold_step_finals(recs, &step_ids, "m-this");
         assert!(!out.contains_key("mine"), "no finalized record -> no entry (honest absent)");
         assert!(!out.contains_key("someone-else"));
     }
@@ -1396,7 +1476,7 @@ mod tests {
             "action": "step result",
             "payload": { "step_id": "review-judge-step", "kind": "review.judge", "tokens": 4200 }
         });
-        let out = fold_step_finals(vec![rec], &step_ids);
+        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["review-judge-step"].tokens, Some(4200), "review `tokens` payload folds");
     }
 
@@ -1409,7 +1489,7 @@ mod tests {
             "action": "step result",
             "payload": { "step_id": "s1", "total_tokens": 900, "tokens": 100 }
         });
-        let out = fold_step_finals(vec![rec], &step_ids);
+        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(900));
     }
 
@@ -1424,7 +1504,7 @@ mod tests {
             "action": "telemetry.tokens", "handle": "s1",
             "payload": { "total_tokens": 7, "endpoint": "https://api.example/v1" }
         });
-        let out = fold_step_finals(vec![rec], &step_ids);
+        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert!(out["s1"].cloud, "non-terminal endpoint record still marks cloud (JS parity)");
         assert_eq!(out["s1"].tokens, None, "running increment still never folds a total");
         assert_eq!(out["s1"].turns, None);
@@ -1441,7 +1521,7 @@ mod tests {
             "session_id": "step:s1",
             "payload": { "total_tokens": 500, "total_turns": 3 }
         });
-        let out = fold_step_finals(vec![rec], &step_ids);
+        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert!(!out.contains_key("s1"), "colon-era session id must not correlate");
     }
 
@@ -1518,7 +1598,7 @@ mod tests {
         write_day_file(tmp.path(), "2026-07-16", &[complete_rec("s1", 100)]);
         // Mission-lifetime day: folds (max wins).
         write_day_file(tmp.path(), "2026-07-18", &[complete_rec("s1", 200)]);
-        let out = backfill_step_finals(tmp.path(), &step_ids, created_ts);
+        let out = backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts);
         assert_eq!(
             out["s1"].tokens,
             Some(200),
@@ -1537,10 +1617,10 @@ mod tests {
             "2026-07-17",
             &[complete_rec("s1", 100), complete_rec("s1", 900), complete_rec("s1", 950)],
         );
-        let out = backfill_step_finals_bounded(tmp.path(), &step_ids, created_ts, 1);
+        let out = backfill_step_finals_bounded(tmp.path(), &step_ids, "m-this", created_ts, 1);
         assert_eq!(out["s1"].tokens, Some(100), "cap stops parsing after the first record");
         // The production cap folds all three.
-        let out_full = backfill_step_finals(tmp.path(), &step_ids, created_ts);
+        let out_full = backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts);
         assert_eq!(out_full["s1"].tokens, Some(950));
     }
 
@@ -1555,7 +1635,7 @@ mod tests {
             format!("this is not json\n{{\"truncated\": \n{good}\n"),
         )
         .unwrap();
-        let out = backfill_step_finals(tmp.path(), &step_ids, created_ts);
+        let out = backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts);
         assert_eq!(out["s1"].tokens, Some(4200), "malformed lines skip; the good record folds");
     }
 

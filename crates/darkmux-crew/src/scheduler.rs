@@ -861,6 +861,22 @@ pub const STEP_LIFECYCLE_ACTIONS: [&str; 3] = ["step start", "step complete", "s
 /// `Tier::Local` since these are scheduler-driven, not operator-explicit
 /// like a Phase transition; `Stage::Dispatch` since a Step is
 /// dispatch-shaped work).
+///
+/// `mission_id: None` here is deliberate, not a gap (#1641): this function
+/// (and every `StepKind`'s own records that reach `run_step_graph`'s
+/// `emit` closure — e.g. `dispatch.map`'s per-item "step result") is
+/// scheduler-generic and structurally has no `Mission` concept of its own
+/// (`darkmux-crew` doesn't own instance minting). The LAUNCHER backfills it
+/// instead: every production caller wraps `emit` so a record with no
+/// `mission_id` gets THIS run's id stamped on before it's written
+/// (`get_or_insert`-style — never overwrites a record that already carries
+/// one) — see `src/mission_launch.rs`'s and `src/mission_launch_review.rs`'s
+/// (`FleetFlowEmitter`) `run_step_graph`/`run_review_graph` call sites.
+/// Without that wrap, `session_id` here is CONFIG-scoped
+/// (`session_id::task` hashes only `step.task_id`, a string straight out of
+/// the mission config, e.g. `task-review-probe-mid-task`) — identical
+/// across every mission launched from the same config, so two concurrent
+/// runs collide in the viewer with no `mission_id` to tell them apart.
 fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
     FlowRecord {
         ts: darkmux_flow::ts_utc_now(),

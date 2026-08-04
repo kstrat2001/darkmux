@@ -675,7 +675,10 @@ impl<'a> ReviewObs<'a> {
     /// a `kind` field), just routed through the injected emitter.
     fn step_result(&mut self, kind: &str, step_id: &str, payload: serde_json::Value) {
         self.drain();
-        self.emitter.emit(review_step_result_record(kind, step_id, &self.case_id, payload));
+        // (#1641) `run_judge_only` (this struct's one caller) mints no
+        // Mission — see `review_step_result_record`'s own doc.
+        self.emitter
+            .emit(review_step_result_record(kind, step_id, &self.case_id, None, payload));
     }
 }
 
@@ -3591,6 +3594,30 @@ pub struct ReviewStepContext {
     /// artifact, not who reads it.
     #[allow(clippy::type_complexity)]
     pub bundle_override: Option<Arc<dyn Fn() -> Result<Vec<BundleInput>> + Send + Sync>>,
+    /// (#1641) The run's own Mission identity, carried as an OPAQUE tag
+    /// string only — this module does not depend on `darkmux_crew::
+    /// lifecycle` and does not resolve/create Mission records (the
+    /// crate-boundary note above this struct's own doc), so this is
+    /// deliberately just a string the CALLER already minted, not a live
+    /// lookup. `Some(&mission_id)` for a real `mission launch review`
+    /// (stamped by `src/mission_launch_review.rs` once `mission_launch::
+    /// mint_run_id` has minted it), `None` for every lab-bench run
+    /// (`review_bench.rs` — per-run-local, no Mission — lab/fleet sink
+    /// boundary) and the `--charges-file` judge-only path (mints no
+    /// Mission at all).
+    ///
+    /// Threaded into this module's OWN directly-emitted records
+    /// ([`emit_review_step_result`], [`emit_review_token_telemetry`],
+    /// [`apply_verify_results`]) — the ones that write straight to the
+    /// global flow sink because they run inside `run_bounded` worker
+    /// threads and can't hold the caller-injected [`ReviewEmitter`] (see
+    /// [`emit_review_step_result`]'s own doc). Records that instead route
+    /// through `run_step_graph`'s `emit` closure (the scheduler's generic
+    /// step-lifecycle bookends, `dispatch.map`'s per-item records) get
+    /// their `mission_id` backfilled at the LAUNCHER level instead
+    /// (`FleetFlowEmitter`, `src/mission_launch_review.rs`) — this field
+    /// covers the other, structurally-separate gap.
+    pub mission_id: Option<String>,
 }
 
 /// The production dispatch primitive every review step kind below calls —
@@ -3610,7 +3637,7 @@ pub struct ReviewStepContext {
 fn dispatch_chat(ctx: &ReviewStepContext, call: &ChatCall) -> Result<SingleShotReply> {
     if let Some(mock) = &ctx.chat_override {
         let reply = mock(call)?;
-        emit_review_token_telemetry(&ctx.case_id, call.model, &reply);
+        emit_review_token_telemetry(&ctx.case_id, ctx.mission_id.as_deref(), call.model, &reply);
         return Ok(reply);
     }
     let reply = match call.endpoint {
@@ -3632,7 +3659,7 @@ fn dispatch_chat(ctx: &ReviewStepContext, call: &ChatCall) -> Result<SingleShotR
             timeout_seconds: ctx.timeout_seconds,
         }),
     }?;
-    emit_review_token_telemetry(&ctx.case_id, call.model, &reply);
+    emit_review_token_telemetry(&ctx.case_id, ctx.mission_id.as_deref(), call.model, &reply);
     Ok(reply)
 }
 
@@ -3649,7 +3676,20 @@ fn dispatch_chat(ctx: &ReviewStepContext, call: &ChatCall) -> Result<SingleShotR
 /// unclassified rather than fabricating a sequential-turn overlap.
 /// Silently skipped when the response carried no `usage.total_tokens` at
 /// all (nothing to report — matches `turn_tokens_payload`'s same skip).
-fn emit_review_token_telemetry(case_id: &str, model: &str, reply: &SingleShotReply) {
+///
+/// `mission_id` (#1641): threaded from [`ReviewStepContext::mission_id`] —
+/// this function writes straight to the global flow sink (it's called from
+/// [`dispatch_chat`], which can run on a `run_bounded` worker thread with no
+/// injected emitter to hold), so it's a producer this run's `mission_id`
+/// would otherwise never reach, unlike records that route through
+/// `run_step_graph`'s `emit` closure (backfilled at the launcher instead —
+/// see [`ReviewStepContext::mission_id`]'s own doc).
+fn emit_review_token_telemetry(
+    case_id: &str,
+    mission_id: Option<&str>,
+    model: &str,
+    reply: &SingleShotReply,
+) {
     let Some(payload) = review_token_telemetry_payload(reply) else {
         return;
     };
@@ -3660,7 +3700,7 @@ fn emit_review_token_telemetry(case_id: &str, model: &str, reply: &SingleShotRep
         "review",
         case_id,
         Some(model),
-        None,
+        mission_id,
         None,
         payload,
     ));
@@ -3701,10 +3741,17 @@ fn review_token_telemetry_payload(reply: &SingleShotReply) -> Option<serde_json:
 /// worker threads with no injected emitter to hold), and the sequential
 /// `run_judge_only` path emits it through its injected [`ReviewEmitter`] via
 /// [`ReviewObs::step_result`] (#1434 — one vocabulary across both paths).
+///
+/// `mission_id` (#1641): `None` on the `run_judge_only` path (mints no
+/// Mission — [`ReviewObs::step_result`]'s caller always passes `None`), and
+/// on the [`ReviewStepContext`] passed in on the graph path, `Some` iff this
+/// run's launcher minted one — see that field's own doc for why it's a
+/// caller-supplied opaque tag rather than a live lookup.
 fn review_step_result_record(
     kind: &str,
     step_id: &str,
     case_id: &str,
+    mission_id: Option<&str>,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
     let mut full = serde_json::json!({ "step_id": step_id, "kind": kind });
@@ -3724,7 +3771,7 @@ fn review_step_result_record(
         source: Some("review".to_string()),
         model: None,
         reasoning: None,
-        mission_id: None,
+        mission_id: mission_id.map(String::from),
         machine_id: None,
         machine_uid: None,
         orchestrator: None,
@@ -3740,8 +3787,15 @@ fn review_step_result_record(
 /// (`darkmux_flow::record`). Used by the graph step kinds, which run inside
 /// the scheduler's `run_bounded` worker threads and so can't hold the
 /// caller-injected emitter (`ReviewObs` covers the sequential path instead).
-fn emit_review_step_result(kind: &str, step_id: &str, case_id: &str, payload: serde_json::Value) {
-    let _ = darkmux_flow::record(review_step_result_record(kind, step_id, case_id, payload));
+fn emit_review_step_result(
+    kind: &str,
+    step_id: &str,
+    case_id: &str,
+    mission_id: Option<&str>,
+    payload: serde_json::Value,
+) {
+    let _ =
+        darkmux_flow::record(review_step_result_record(kind, step_id, case_id, mission_id, payload));
 }
 
 // ─── investigate: bundle ────────────────────────────────────────────────
@@ -4002,6 +4056,7 @@ impl StepKind for ReviewBundleStepKind {
             "review.bundle",
             &step.id,
             &ctx.case_id,
+            ctx.mission_id.as_deref(),
             json!({ "items_out": bundle_inputs.len() }),
         );
         Ok(StepOutcome { output, flow_records: Vec::new() })
@@ -4175,6 +4230,7 @@ impl StepKind for ReviewProbeRenderStepKind {
             "review.probe-render",
             &step.id,
             &ctx.case_id,
+            ctx.mission_id.as_deref(),
             json!({ "items_out": collection.len() }),
         );
 
@@ -4664,6 +4720,7 @@ impl StepKind for ReviewDedupStepKind {
             "review.dedup",
             &step.id,
             &ctx.case_id,
+            ctx.mission_id.as_deref(),
             json!({ "items_in": raw_count, "items_out": deduped.len(), "wall_ms": wall_ms }),
         );
         let output = serde_json::to_string(&deduped).context("serializing deduped flags")?;
@@ -4905,6 +4962,7 @@ impl StepKind for ReviewJudgeStepKind {
                             "review.judge",
                             "review-ruling",
                             &ctx.case_id,
+                            ctx.mission_id.as_deref(),
                             json!({
                                 "bundle_id": flag.bundle_id, "pass": 1,
                                 "ruling": outcome.pass1.ruling, "seconds": outcome.pass1.seconds,
@@ -4915,6 +4973,7 @@ impl StepKind for ReviewJudgeStepKind {
                                 "review.judge",
                                 "review-ruling",
                                 &ctx.case_id,
+                                ctx.mission_id.as_deref(),
                                 json!({
                                     "bundle_id": flag.bundle_id, "pass": p2.pass,
                                     "ruling": p2.ruling, "seconds": p2.seconds,
@@ -5001,6 +5060,7 @@ impl StepKind for ReviewJudgeStepKind {
             "review.judge",
             &step.id,
             &ctx.case_id,
+            ctx.mission_id.as_deref(),
             json!({
                 "items_in": deduped.len(), "items_out": judged.len(), "wall_ms": wall_ms,
                 "pass1_wall_ms": pass1_wall_ms, "pass2_wall_ms": pass2_wall_ms,
@@ -5243,7 +5303,13 @@ impl StepKind for ReviewVerifyRenderStepKind {
         if let Some(reason) = skip_reason {
             payload["short_circuit"] = json!(reason);
         }
-        emit_review_step_result("review.verify-render", &step.id, &ctx.case_id, payload);
+        emit_review_step_result(
+            "review.verify-render",
+            &step.id,
+            &ctx.case_id,
+            ctx.mission_id.as_deref(),
+            payload,
+        );
 
         let output = serde_json::to_string(&prompts).context("serializing verify prompts")?;
         Ok(StepOutcome { output, flow_records: Vec::new() })
@@ -5281,6 +5347,14 @@ pub(crate) struct VerifyApplyOutcome {
 /// step's own config, the same "compute once, stamp, read back" pattern the
 /// judge/verify-render kinds now use — so this function's OWN logic is
 /// unchanged, only what it derives the values FROM moved to its caller.
+///
+/// Argument count exceeds clippy's default threshold (8 vs 7) since #1641's
+/// `mission_id` addition — every parameter is inherent to the call (the
+/// per-item results, the seat's derived identity, the budget, the run's own
+/// case/mission identity for the "step result" records this emits), not
+/// incidental bloat; mirrors the same accepted trade-off `run_step_graph`'s
+/// own `#[allow(clippy::too_many_arguments)]` documents.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_verify_results(
     judged: &mut [JudgedFlag],
     results: &[MapItemResult],
@@ -5289,6 +5363,7 @@ pub(crate) fn apply_verify_results(
     endpoint_host: Option<&str>,
     budget: u64,
     case_id: &str,
+    mission_id: Option<&str>,
 ) -> VerifyApplyOutcome {
     let identifier = identifier.to_string();
     let endpoint_host = endpoint_host.map(String::from);
@@ -5353,6 +5428,7 @@ pub(crate) fn apply_verify_results(
             "review.verify",
             "review-ruling",
             case_id,
+            mission_id,
             json!({ "bundle_id": j.flag.bundle_id, "stage": "verify", "ruling": record.ruling, "seconds": record.seconds }),
         );
         if record.ruling == VerifyRuling::Refuted {
@@ -5580,6 +5656,7 @@ impl StepKind for ReviewSynthesisStepKind {
                     endpoint_host,
                     remote_budget,
                     &ctx.case_id,
+                    ctx.mission_id.as_deref(),
                 );
                 if let Some(member) = outcome.member {
                     members.lock().expect("members mutex poisoned").push(member);
@@ -5667,6 +5744,7 @@ impl StepKind for ReviewSynthesisStepKind {
             "review.synthesis",
             &step.id,
             &ctx.case_id,
+            ctx.mission_id.as_deref(),
             json!({
                 "confirmed": env.confirmed, "needs_check": env.needs_check, "archived": env.archived,
                 "verified": env.verified, "refuted": env.refuted, "wall_ms": wall_ms,
