@@ -504,6 +504,16 @@ pub fn launch(
     // (#1400) Tracks which phases this dispatch has already lazy-started —
     // see `lazy_start_phase_for_step`'s doc.
     let mut started_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // (#1632) The counterpart #1620 gave the review launcher and not this one.
+    // Phase order comes from the CONFIG's own declaration, so it matches the
+    // strictly-linear order (#1341) the close logic depends on — map iteration
+    // would not.
+    let phase_order: Vec<String> = config
+        .phases
+        .iter()
+        .filter_map(|p| real_phase_ids.get(&p.id).cloned())
+        .collect();
+    let mut closed_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
     // (#1530 Packets 2/3b-1) The coder-phase kinds' two structured-result
     // slots, plus the run's identity context, seeded onto the run-scoped
     // `ArtifactBus` via `run_step_graph`'s caller-seed path — `coder_handles`
@@ -549,7 +559,14 @@ pub fn launch(
                 .get(&step.task_id)
                 .map(|t| t.phase_id.as_str())
                 .unwrap_or_default();
-            lazy_start_phase_for_step(&mission_id, phase_id, step.status, &mut started_phases);
+            // (#1632) Without this the GENERIC launcher — every non-review
+            // config, including coder-phase and anything from `mission propose`
+            // — started phases and never closed them, so its board row read
+            // `0/N` for the whole run and then jumped to `N/N`. Exactly the
+            // #1620 defect, fixed there for the review launcher only.
+            if lazy_start_phase_for_step(&mission_id, phase_id, step.status, &mut started_phases) {
+                lazy_close_prior_phases(&mission_id, &phase_order, phase_id, &mut closed_phases);
+            }
             if let Err(e) = crew::lifecycle::save_step(&mission_id, phase_id, step) {
                 eprintln!(
                     "{}",
@@ -3005,6 +3022,76 @@ mod tests {
         // And a config named "review" with no review kinds is NOT forced to
         // the review driver — routing is the graph's shape, never the name.
         assert!(!config_uses_review_kinds(&config_with_kind("review", "dispatch.single_shot")));
+    }
+
+    /// (#1632) The invariant, asserted at the LIFECYCLE level rather than for
+    /// one launcher's phase count.
+    ///
+    /// Phases are strictly linear (#1341), so at most ONE may be Running at any
+    /// instant. #1620 fixed that for the review launcher and left the generic
+    /// one — every non-review config, including coder-phase and anything from
+    /// `mission propose` — starting phases it never closed. The board then read
+    /// `0/N` for the whole run and jumped to `N/N`, indistinguishable from a
+    /// mission that never started.
+    ///
+    /// The old test walked p1 -> Running, p2 -> Running and asserted nothing
+    /// about p1 closing, so it PASSED while demonstrating the defect. This one
+    /// asserts the property that makes the defect impossible, and it holds for
+    /// any launcher that drives phases through these two helpers.
+    #[test]
+    #[serial_test::serial]
+    fn at_most_one_phase_is_running_as_a_generic_mission_advances() {
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        let mission_id = "one-running-test";
+        let real = ensure_mission_and_phases_with_provenance(mission_id, &config, None, None).unwrap();
+        let order: Vec<String> =
+            config.phases.iter().filter_map(|p| real.get(&p.id).cloned()).collect();
+        assert!(order.len() >= 2, "the fixture must have enough phases to advance between");
+
+        let running_count = |ids: &[String]| {
+            ids.iter()
+                .filter(|id| phase_status_on_disk(mission_id, id) == PhaseStatus::Running)
+                .count()
+        };
+
+        let mut started = std::collections::HashSet::new();
+        let mut closed = std::collections::HashSet::new();
+
+        // Phase 1 goes live.
+        assert!(lazy_start_phase_for_step(mission_id, &order[0], NodeStatus::Running, &mut started));
+        lazy_close_prior_phases(mission_id, &order, &order[0], &mut closed);
+        assert_eq!(running_count(&order), 1, "exactly one phase live after the first advance");
+
+        // Give phase 1 a finished step, then advance. Without a terminal step
+        // the close path deliberately leaves it alone (an empty step list is
+        // absence of evidence, not evidence of failure — the bug inside
+        // #1620's own first draft), so this mirrors a real completed band.
+        let step = crew::types::Step {
+            id: format!("{}-s1", order[0]),
+            task_id: format!("{}-t1", order[0]),
+            kind: "procedural.noop".to_string(),
+            status: NodeStatus::Complete,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        crew::lifecycle::save_step(mission_id, &order[0], &step).unwrap();
+
+        assert!(lazy_start_phase_for_step(mission_id, &order[1], NodeStatus::Running, &mut started));
+        lazy_close_prior_phases(mission_id, &order, &order[1], &mut closed);
+
+        assert_eq!(
+            running_count(&order),
+            1,
+            "advancing must CLOSE the band behind it — two Running phases contradicts #1341"
+        );
+        assert_eq!(
+            phase_status_on_disk(mission_id, &order[0]),
+            PhaseStatus::Complete,
+            "and the closed band keeps the outcome it earned"
+        );
     }
 
     // ── #1400: lazy phase start ("phase 2 stays planned until reached") ──
