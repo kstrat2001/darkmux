@@ -917,7 +917,9 @@ pub fn mission_start_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
             bail!("mission `{id}` is already Active and was started at ts={:?}", mission.started_ts)
         }
         MissionStatus::Paused => bail!("mission `{id}` is Paused — use `mission resume` instead"),
-        MissionStatus::Finalized => bail!("mission `{id}` is Finalized (terminal) — create a new mission instead"),
+        MissionStatus::Finalized | MissionStatus::Aborted => {
+            bail!("mission `{id}` is terminal ({:?}) — create a new mission instead", mission.status)
+        }
         MissionStatus::Active => {}
     }
     mission.status = MissionStatus::Active;
@@ -939,16 +941,48 @@ pub(crate) fn mission_close(id: &str) -> Result<Mission> {
 /// a Mission can never persist `Finalized` while a Phase it contains is
 /// still `Planned`/`Running`.
 pub fn mission_close_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
+    mission_terminal_with_reasoning(id, MissionStatus::Finalized, reasoning)
+}
+
+/// (#1626) Drive a mission to a TERMINAL status — `Finalized` for the success
+/// path, `Aborted` for a teardown.
+///
+/// Both were `Finalized` before this, so a review that completed and a review
+/// someone killed were indistinguishable on disk and on the board. Measured
+/// when this landed: 6 of 51 phase-bearing missions read `FINALIZED` with ZERO
+/// phases complete. A status column that cannot tell success from teardown is
+/// not a status column.
+///
+/// Reconciliation is identical for both — whichever terminal it lands on, no
+/// live phase may survive it (#1504).
+pub fn mission_terminal_with_reasoning(
+    id: &str,
+    terminal: MissionStatus,
+    reasoning: Option<&str>,
+) -> Result<Mission> {
+    debug_assert!(
+        matches!(terminal, MissionStatus::Finalized | MissionStatus::Aborted),
+        "only Finalized/Aborted are terminals"
+    );
     let mut mission = load_mission(id)?;
     match mission.status {
         MissionStatus::Active | MissionStatus::Paused => {}
         MissionStatus::Finalized => bail!("mission `{id}` is already Finalized"),
+        MissionStatus::Aborted => bail!("mission `{id}` is already Aborted"),
     }
     reconcile_mission_phases_terminal(id);
-    mission.status = MissionStatus::Finalized;
+    mission.status = terminal;
+    // `finalized_ts` is the one terminal timestamp — the field name predates
+    // the split and stays, because "when did this mission end" is the same
+    // question either way. `status` is what says HOW it ended.
     mission.finalized_ts = Some(now_unix());
     save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record_with_reasoning(id, "mission close", reasoning);
+    let action = if matches!(terminal, MissionStatus::Aborted) {
+        "mission abort"
+    } else {
+        "mission close"
+    };
+    emit_mission_transition_record_with_reasoning(id, action, reasoning);
     Ok(mission)
 }
 
@@ -964,7 +998,9 @@ pub fn mission_pause_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
     match mission.status {
         MissionStatus::Active => {}
         MissionStatus::Paused => bail!("mission `{id}` is already Paused"),
-        MissionStatus::Finalized => bail!("mission `{id}` is Finalized — can't pause a finished mission"),
+        MissionStatus::Finalized | MissionStatus::Aborted => {
+            bail!("mission `{id}` is terminal ({:?}) — can't pause a finished mission", mission.status)
+        }
     }
     mission.status = MissionStatus::Paused;
     mission.paused_ts = Some(now_unix());
@@ -985,7 +1021,9 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
     match mission.status {
         MissionStatus::Paused => {}
         MissionStatus::Active => bail!("mission `{id}` is already Active"),
-        MissionStatus::Finalized => bail!("mission `{id}` is Finalized — can't resume a finished mission"),
+        MissionStatus::Finalized | MissionStatus::Aborted => {
+            bail!("mission `{id}` is terminal ({:?}) — can't resume a finished mission", mission.status)
+        }
     }
     mission.status = MissionStatus::Active;
     save_json(&mission_path(id), &mission)?;
@@ -1542,6 +1580,59 @@ mod tests {
     /// `mission_status.rs`'s drift detector already knows about (#1463's own
     /// finding), now prevented structurally at the source instead of merely
     /// detected after the fact.
+    /// (#1626) A torn-down mission is a DISTINCT terminal from a completed one.
+    ///
+    /// `abort` used to write `Finalized` — the status whose own doc calls it
+    /// the SUCCESS path — so a review that finished and a review someone killed
+    /// were the same value on disk. Measured when this landed: 6 of 51
+    /// phase-bearing missions on the operator's machine read `FINALIZED` with
+    /// ZERO phases complete. Failures wearing the success label, which is the
+    /// one thing a status column must never do.
+    #[serial_test::serial]
+    #[test]
+    fn an_aborted_mission_is_not_a_finalized_one() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Active);
+        seed_phase("still-running", PhaseStatus::Running);
+
+        let m = mission_terminal_with_reasoning(
+            "test-mission",
+            MissionStatus::Aborted,
+            Some("operator tore it down"),
+        )
+        .unwrap();
+        assert_eq!(
+            m.status,
+            MissionStatus::Aborted,
+            "abort must not report the success terminal"
+        );
+        assert_ne!(m.status, MissionStatus::Finalized);
+
+        // The #1504 invariant is terminal-agnostic: no live phase survives
+        // EITHER terminal. An abort that left a Running phase behind would be
+        // the same strand bug, just under a new name.
+        let phase = load_phase("test-mission", "still-running").unwrap();
+        assert_eq!(phase.status, PhaseStatus::Abandoned);
+
+        // And it is genuinely terminal — a second teardown is refused, and the
+        // refusal names what it actually is rather than saying "Finalized".
+        let err = mission_terminal_with_reasoning("test-mission", MissionStatus::Aborted, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already Aborted"), "{err}");
+    }
+
+    /// The success path is unchanged — this is the other half, and without it
+    /// a fix that made everything `Aborted` would pass the test above.
+    #[serial_test::serial]
+    #[test]
+    fn finalize_still_writes_the_success_terminal() {
+        let _g = CrewGuard::new();
+        seed_mission("test-mission", MissionStatus::Active);
+        let m = mission_close_with_reasoning("test-mission", None).unwrap();
+        assert_eq!(m.status, MissionStatus::Finalized);
+    }
+
     #[serial_test::serial]
     #[test]
     fn mission_close_reconciles_a_non_terminal_phase_to_abandoned() {

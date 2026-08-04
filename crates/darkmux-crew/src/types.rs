@@ -259,6 +259,20 @@ pub enum MissionStatus {
     /// touched (same pattern as `phase_ids`'s `sprint_ids` alias above).
     #[serde(alias = "closed")]
     Finalized,
+    /// Terminal (FAILURE path). A mission the operator tore down with
+    /// `mission abort`, or one reconciled after its process died.
+    ///
+    /// (#1626) Before this existed, `abort` wrote `Finalized` — the status
+    /// whose own doc, one line up, calls it the SUCCESS path. So a review that
+    /// completed and a review someone killed were the same value on disk, and
+    /// the board could not tell them apart: 6 of 51 phase-bearing missions on
+    /// the operator's machine read `FINALIZED` with ZERO phases complete.
+    /// Failures wearing the success label, which is the one thing a status
+    /// column must never do.
+    ///
+    /// Deliberately a distinct TERMINAL rather than a flavor of Finalized:
+    /// both end the mission, but only one of them means the work happened.
+    Aborted,
     Paused,
 }
 
