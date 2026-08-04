@@ -2873,25 +2873,77 @@ $("sclear").onclick=()=>{setQuery("");const lq=$("logq");if(lq)lq.focus();};
 // generic path is a no-op when it has nothing remembered.
 const MODAL_IDS=["modalbg","nmodalbg","imodalbg"];
 let MODAL_RETURN_FOCUS=null;
+// (#1642) EXACTLY ONE dialog may be open. Two could be before this: nothing
+// checked, and tabbing out of an open modal (see the focus trap below) reached
+// the version chip and the notes link, either of which opens another.
+//
+// Two open at once broke Escape in a way that reads as the UI ignoring you:
+// `closeOpenModal` walks a FIXED list and closes the first open one, not the
+// visually topmost — so with About over Filters, one Escape closed Filters
+// (invisible, underneath) while About stayed covering the screen. It also lost
+// the return-focus target, because this function overwrote MODAL_RETURN_FOCUS
+// on the second open.
+//
+// Closing any existing one first makes "topmost" and "only" the same thing, so
+// the fixed-list walk becomes correct by construction rather than by ordering
+// luck. The ORIGINAL return target is preserved — focus belongs back where the
+// operator started, not at the control that opened the second dialog.
 function openModalEl(id){
-  MODAL_RETURN_FOCUS=(document.activeElement&&document.activeElement!==document.body)?document.activeElement:null;
+  const already=MODAL_IDS.some(m=>isModalOpen(m));
+  if(already){
+    const keep=MODAL_RETURN_FOCUS;
+    closeOpenModal({restore:false});
+    MODAL_RETURN_FOCUS=keep;
+  }else{
+    MODAL_RETURN_FOCUS=(document.activeElement&&document.activeElement!==document.body)?document.activeElement:null;
+  }
   const m=$(id); if(!m)return;
   m.style.display="flex";
   const x=m.querySelector(".mx"); if(x)x.focus();
 }
+function isModalOpen(id){
+  const m=$(id);
+  return !!(m&&m.style.display!=="none"&&m.style.display!=="");
+}
+// (#1642) Keep Tab inside the open dialog.
+//
+// The overlays are opaque `position:fixed;inset:0`, but nothing stopped Tab
+// walking out of one — 31 presses from an open Filters landed on the page
+// header link, visually buried under the backdrop. A keyboard or switch user
+// is then operating controls they cannot see. This is the population the
+// managed-focus work (#1090) exists for, so the gap mattered most exactly
+// where the feature was aimed.
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Tab")return;
+  const openId=MODAL_IDS.find(isModalOpen);
+  if(!openId)return;
+  const scope=$(openId);
+  const f=[...scope.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]),select,textarea,[tabindex]:not([tabindex="-1"])')]
+    .filter(el=>el.offsetParent!==null||el===document.activeElement);
+  if(!f.length)return;
+  const first=f[0],last=f[f.length-1];
+  // Focus outside the dialog entirely (it escaped earlier, or the page just
+  // loaded) pulls back to the first control rather than letting Tab continue.
+  if(!scope.contains(document.activeElement)){e.preventDefault();first.focus();return;}
+  if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}
+  else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
+},true);
 function restoreModalFocus(){
   const el=MODAL_RETURN_FOCUS; MODAL_RETURN_FOCUS=null;
   if(el&&el.isConnected&&typeof el.focus==="function")el.focus();
 }
 // Closes the one open dialog, whichever it is. Returns true if it closed
 // something, so Escape can fall through to the catalog panel otherwise.
-function closeOpenModal(){
+// (#1642) `opts.restore:false` closes without returning focus — used when
+// swapping one dialog for another, where the original target must survive.
+function closeOpenModal(opts){
+  const restore=!opts||opts.restore!==false;
   for(const id of MODAL_IDS){
-    const m=$(id);
-    if(m&&m.style.display!=="none"&&m.style.display!==""){
-      if(id==="modalbg")closeFilters(); else if(id==="nmodalbg")closeNotes(); else closeInfo();
-      return true;
-    }
+    if(!isModalOpen(id))continue;
+    const keep=MODAL_RETURN_FOCUS;
+    if(id==="modalbg")closeFilters(); else if(id==="nmodalbg")closeNotes(); else closeInfo();
+    if(!restore)MODAL_RETURN_FOCUS=keep;
+    return true;
   }
   return false;
 }
