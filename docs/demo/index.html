@@ -603,6 +603,9 @@
      (the missions index + the static mission summary) still renders it. */
   .mstat{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:2px 8px;border-radius:3px;border:1px solid var(--line);color:var(--muted);vertical-align:middle}
   .mstat.active{color:var(--good);border-color:var(--good)}.mstat.finalized{color:var(--muted)}.mstat.paused{color:var(--warn);border-color:var(--warn)}
+  /* (#1626) See mission-graph.html's .mstatus.aborted — a teardown must not
+     read as a success in the fast colour scan. */
+  .mstat.aborted{color:var(--warn);border-color:var(--warn)}
   .preview-text{color:var(--muted);font-style:italic}
   .rec.sel .preview-text{color:rgba(232,230,227,0.7)}
   /* Per-activity glyph on each log line — scannable "what's the model doing". */
