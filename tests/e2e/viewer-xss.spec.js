@@ -37,7 +37,16 @@ test('viewer renders attacker-controlled flow records inertly across every view'
   await page.waitForSelector('.stagehdr');
   await assertInert(page, 'machine');
 
-  // Expand a recent-run row if the live/playback split surfaced one.
+  // (#1622) Each of these three used to be a bare `if (await X.count())`, so
+  // if the surface stopped rendering AT ALL the block was SKIPPED, not failed
+  // — the walk stayed green while silently covering less than its name claims.
+  // The fixture guarantees each of these exists, so a zero count is a
+  // regression upstream of the XSS check and must be loud.
+  // (#1631) NOT hardened, deliberately, and this is the finding: the XSS
+  // fixture renders ZERO recent-run rows, so this branch has never once
+  // executed. The surface is UNWALKED, not merely conditionally walked.
+  // Left soft rather than failing the security gate on a fixture gap; the
+  // missing coverage is tracked separately.
   const rr = page.locator('details.rr').first();
   if (await rr.count()) {
     await rr.locator('summary').click();
@@ -58,6 +67,20 @@ test('viewer renders attacker-controlled flow records inertly across every view'
     await miss.click();
     await assertInert(page, 'mission');
   }
+
+  // (#1631) Report which drill-downs this walk ACTUALLY entered. The test name
+  // claims "across every view"; these three are conditional, and a surface that
+  // renders nothing is skipped rather than failed. Counted here so the claim is
+  // auditable instead of assumed.
+  const walked = {
+    recentRun: await page.locator('details.rr').count(),
+    session: await page.locator('[data-act="session"]').count(),
+    mission: await page.locator('[data-act="mission"]').count(),
+  };
+  expect(
+    walked.recentRun + walked.session + walked.mission,
+    `the walk entered NO drill-down at all: ${JSON.stringify(walked)}`
+  ).toBeGreaterThan(0);
 
   // Filters modal renders the record-derived category/tier/source values.
   await page.locator('[data-act="filters"]').click();
