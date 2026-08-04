@@ -4,10 +4,12 @@ This file is for any AI agent (Claude Code, Cursor, OpenClaw, etc.) that's helpi
 
 ## What darkmux is
 
-A Rust CLI (v1.x, on the 2.0 track) that is two things for users running local LLMs (LMStudio + Ollama + llama.cpp):
+A Rust CLI (v2.x) that is two things for users running local LLMs:
 
 1. **Mission orchestrator**: config-defined missions launched with `darkmux mission launch <config>` that run as a live task graph. A crew of local-AI roles works the phases through the internal Docker-bounded runtime (any seat can instead be staffed by a hosted cloud endpoint), every dispatch gated on operator sign-off, each run finalizing into a typed envelope. `darkmux dispatch <role> <message>` is the task-grain entry point (one role, one turn). This is the 2.0 headline.
 2. **Lab harness**: `darkmux lab run <workload>` dispatches a workload against the same internal runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
+
+**Backend, stated honestly (#316):** darkmux drives **LMStudio** today, and only LMStudio. The residency arbiter, the `darkmux:` namespace convention, the empirical profile defaults, and every `lms`-shell-out in `darkmux-gestalt` are LMStudio-shaped. An earlier version of this line claimed "LMStudio + Ollama + llama.cpp"; that was aspiration, not capability, and a fresh agent session reading it would confidently propose work against backends that don't exist. A `ModelBackend` abstraction is tracked as #316 and is deliberately NOT being built — revisit when a real second backend has a real user. Until then: don't deepen LMStudio coupling gratuitously in new code, but don't pretend the abstraction is there either.
 
 Managing model residency (the founding *profile multiplexer*: loading the right models at the right context under the RAM budget) is now an internal capability underneath both, not a verb the operator drives. The `swap` verb retired on the 2.0 track (#1426); gestalt loads what each dispatch's staffing declares.
 
