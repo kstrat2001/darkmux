@@ -2530,7 +2530,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             timeout_seconds: 30,
             chat_override: None,
             bundle_override: Some(Arc::new(move || Ok(bundles.clone()))),
-            mission_id: Some("mission-token-test".to_string()),
+            mission_id: None,
         })
     }
 
@@ -6443,7 +6443,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 })
             })),
             bundle_override: None,
-            mission_id: None,
+            mission_id: Some("mission-token-test".to_string()),
         };
         let call = ChatCall {
             model: "test-model",
