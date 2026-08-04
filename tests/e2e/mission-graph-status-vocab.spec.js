@@ -309,3 +309,85 @@ test('a step that just started still reads as live', async ({ page }) => {
 
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
+
+// ── (#1643) The two ways my own #1639/#1628 fixes were wrong ────────────────
+//
+// Found by a frontier audit told to assume my fixes carried the same error rate
+// as my tests. It was right twice.
+
+test('a heartbeat keeps a slow seat alive — the signal that moves no counter', async ({ page }) => {
+  // #1639's first cut stamped arrival time INSIDE the metrics object, which the
+  // no-change guard then discarded: it compares counters and bookends only, so
+  // every record that moves no counter was thrown away without recording that
+  // we heard from the step.
+  //
+  // That is not an edge case. This machine's real flow files hold 35,136
+  // `dispatch.turn.heartbeat` records — the runtime's DESIGNATED proof-of-work
+  // signal — plus 5,909 `dispatch.reasoning` and 4,187 `telemetry.context`.
+  // A live seat mid-turn, heartbeating the whole way, read as stalled. The fix's
+  // own comment called that the worse failure.
+  const old = Math.floor(Date.now() / 1000) - 6 * 3600;
+  const g = graph('active', 'running');
+  g.nodes[1].steps = [
+    { id: 'probe-1', kind: 'dispatch.internal', label: 'probe', status: 'running', startedTs: old },
+  ];
+
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.route(GRAPH_PATH, (r) =>
+    r.fulfill({ contentType: 'text/html; charset=utf-8', body: MISSION_GRAPH_HTML })
+  );
+  await page.route(`**/mission/${MISSION_ID}/graph.json*`, (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify(g) })
+  );
+  await page.route(BACKFILL_RE, (r) => r.fulfill({ contentType: 'application/json', body: '[]' }));
+  // A heartbeat NOW for a step that started six hours ago. It moves no counter.
+  const today = new Date().toISOString().slice(0, 10);
+  const beat = {
+    ts: `${today}T10:00:00Z`, action: 'dispatch.turn.heartbeat', level: 'info',
+    category: 'work', tier: 'local', stage: 'dispatch', handle: 'h',
+    session_id: 'step-probe-1', payload: {},
+  };
+  await page.route(STREAM_RE, (r) =>
+    r.fulfill({ contentType: 'text/event-stream', body: `data: ${JSON.stringify(beat)}\n\n` })
+  );
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(`/mission/${MISSION_ID}/graph`);
+  await expect(page.locator('.mnode').first()).toBeVisible();
+
+  await expect(
+    page.locator('.mnode .gen'),
+    'a heartbeat is proof of work — the seat is live and must still animate'
+  ).toHaveCount(1);
+
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});
+
+test('an unknown status does not become permanent', async ({ page }) => {
+  // #1628's first cut ranked unknown at 99 so it would win on arrival. It did —
+  // and then won FOREVER as the held value, because the ratchet keeps the page's
+  // value when its rank is >=. A real terminal arriving later could never
+  // displace it, across the reconcile poll, a second merge, and manual refresh.
+  // Only a full browser reload cleared it, which a chromeless home-screen page
+  // cannot assume.
+  //
+  // Three snapshots: running -> unknown -> complete. The last must land.
+  await page.clock.install();
+  const { errors } = await open(page, [
+    graph('active', 'running'),
+    graph('active', 'blocked'),
+    graph('active', 'complete'),
+  ]);
+  await expect(page.locator('.mnode.s-running').first()).toBeVisible();
+
+  await page.clock.fastForward(25_000);
+  await expect(page.locator('.mnode.s-running')).toHaveCount(0);
+
+  await page.clock.fastForward(25_000);
+  await expect(
+    page.locator('.mnode.s-complete'),
+    'a real terminal must displace an unknown the page is holding'
+  ).toHaveCount(1);
+
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});

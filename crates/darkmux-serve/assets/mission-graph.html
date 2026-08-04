@@ -630,6 +630,9 @@ function stepMeterEl(meter){
 // anything genuinely running. A generous window on purpose: a false "stalled"
 // on a slow-but-live seat is a worse failure than a late-clearing animation.
 var STEP_LIVENESS_WINDOW_MS = 1200 * 1000;
+// (#1643) stepId -> wall-clock ms of the last record seen for it, ANY record.
+// Deliberately outside React state: see `applyRecordToMetrics`.
+var STEP_LAST_RX = Object.create(null);
 function stepStartMs(step, m){
   if (m && m.startTs) return m.startTs;
   return tsToMs(step.startedTs);
@@ -661,7 +664,7 @@ function stepMeterFor(step, metrics, now){
   // the runtime's own inactivity watchdog, which HARD-KILLS a dispatch that
   // goes `inactivity_timeout_seconds` (default 600) without proof-of-work:
   // past twice that, nothing is left alive that could have produced work.
-  var lastSignal = (m && m.lastRx) ? m.lastRx : 0;
+  var lastSignal = STEP_LAST_RX[step.id] || (m && m.lastRx) || 0;
   var startedAt = stepStartMs(step, m);
   var freshEnough = lastSignal
     ? (now - lastSignal) < STEP_LIVENESS_WINDOW_MS
@@ -915,13 +918,31 @@ var STATUS_RANK = { planned: 0, running: 1, complete: 2, error: 2, abandoned: 2,
 // MISSING value; this one actively DISCARDS a present, correctly delivered one
 // because the ratchet cannot rank it.
 //
-// Deliberately ABOVE every known rank: an unknown value is newer than what
-// this build knows, and the disk snapshot is the more recent authority, so it
-// wins the merge. Being shown a status we cannot style is a small confusion.
-// Being shown a lie is not.
+// Above every known rank so an unknown value wins on ARRIVAL. It must not win
+// once HELD — see `keepPageStatus`, which is what the merge actually calls.
 var UNKNOWN_STATUS_RANK = 99;
 function statusRank(s){
   return STATUS_RANK[s] !== undefined ? STATUS_RANK[s] : UNKNOWN_STATUS_RANK;
+}
+function isUnknownStatus(s){ return STATUS_RANK[s] === undefined; }
+// (#1643) Whether a merge should KEEP the page's current value over an
+// incoming disk one.
+//
+// A single rank cannot express what unknown needs. Ranking it 99 (the first
+// cut) made it an ABSORBING state: it beat every known status as incoming —
+// correct — but then beat every known status FOREVER as the held value, so a
+// real terminal arriving later could never displace it. Reproduced across the
+// reconcile poll, a second merge, and the manual refresh; only a full browser
+// reload cleared it, which this page cannot assume (it runs as a chromeless
+// home-screen shortcut).
+//
+// The asymmetry is the whole point: an unknown value is NEWER than what this
+// build knows, so it wins on arrival — and it is also the value we understand
+// LEAST, so it must never outrank a fresh reading we do understand. Whenever
+// either side is unrankable, the disk snapshot is the authority.
+function keepPageStatus(oldStatus, incoming){
+  if (isUnknownStatus(oldStatus) || isUnknownStatus(incoming)) return false;
+  return statusRank(oldStatus) >= statusRank(incoming);
 }
 
 // Merge a freshly-fetched disk snapshot into the page's current graph
@@ -953,13 +974,13 @@ function mergeGraphs(prevGraph, fresh){
     // value stands (identical when the statuses match; when two terminal
     // states disagree, the SSE delta that set the page's is more recent
     // than the disk snapshot).
-    var merged = (old !== undefined && statusRank(old) >= statusRank(n.status))
+    var merged = (old !== undefined && keepPageStatus(old, n.status))
       ? Object.assign({}, n, {status: old})
       : n;
     if (merged.steps && merged.steps.length) {
       var steps = merged.steps.map(function(s){
         var oldS = prevStepStatus[s.id];
-        return (oldS !== undefined && statusRank(oldS) >= statusRank(s.status))
+        return (oldS !== undefined && keepPageStatus(oldS, s.status))
           ? Object.assign({}, s, {status: oldS})
           : s;
       });
@@ -1046,14 +1067,31 @@ function applyRecordToMetrics(metrics, rec, idx){
   var sid = stepForRecord(rec, idx);
   if (!sid) return metrics;
   var p = rec.payload || {};
+    // (#1643) Arrival time is recorded BEFORE the no-change guard below, and in
+  // a plain ref rather than in this React-state object.
+  //
+  // The first cut stamped `lastRx` inside `next` — which the guard then threw
+  // away, because it compares only counters and bookends. Every record that
+  // moves no counter was discarded WITHOUT recording that we heard from the
+  // step: `dispatch.turn.heartbeat` (35,136 of them in this machine's real
+  // flow files — the runtime's DESIGNATED proof-of-work signal),
+  // `dispatch.reasoning` (5,909), `telemetry.context` (4,187).
+  //
+  // So a live seat 25 minutes into a long turn, heartbeating the whole way,
+  // read as stalled. The liveness comment two hundred lines down says a false
+  // "stalled" on a slow-but-live seat is worse than a late-clearing animation,
+  // and the guard produced precisely that.
+  //
+  // It cannot simply join the comparison: `lastRx` changes on EVERY record, so
+  // including it would defeat the guard entirely and churn React state twice a
+  // second. Recency is not display state — the 1s ticker already re-renders —
+  // so it lives outside, mutated in place, read at render.
+  STEP_LAST_RX[sid] = Date.now();
   var cur = metrics[sid] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, localOk:false, startTs:0, endTs:0, lastRx:0 };
   var next = { tokRun:cur.tokRun, tokFinal:cur.tokFinal, turnRun:cur.turnRun, turnFinal:cur.turnFinal,
                toolRun:cur.toolRun||0, toolFinal:cur.toolFinal||0,
                cloud:cur.cloud, localOk:cur.localOk||false, startTs:cur.startTs, endTs:cur.endTs,
-               // (#1639) WALL-CLOCK arrival, not the record's own ts — the
-               // question is "did we hear from this step recently", and a
-               // replayed or clock-skewed record must not read as freshness.
-               lastRx: Date.now() };
+               lastRx: cur.lastRx || 0 };
   var action = rec.action || "";
   var isTok = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
   var isTurn = action === "dispatch.turn";
@@ -1735,7 +1773,10 @@ function App(){
       // source wins on equal rank" reasoning. The invariant is now enforced
       // at BOTH ingest points instead of relying on record ordering.
       var advance = function(oldStatus){
-        return statusRank(newStatus) >= statusRank(oldStatus) ? newStatus : oldStatus;
+        // (#1643) Same asymmetry as `keepPageStatus`, expressed from the
+        // other side: take the incoming unless the page's value legitimately
+        // outranks it. An unknown on either side means take the incoming.
+        return keepPageStatus(oldStatus, newStatus) ? oldStatus : newStatus;
       };
       if (idx.nodeIds.has(handle)) {
         // A phase (or task) node id directly — flip that node's own status.
