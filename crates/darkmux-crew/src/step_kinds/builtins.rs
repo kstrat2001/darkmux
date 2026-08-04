@@ -1751,6 +1751,13 @@ fn map_hosted_item(
     let mut served_model: Option<String> = None;
     let mut empty_budget = retry_on_empty;
     let mut error_budget = retry_on_error;
+    // (#1605 QA finding) The error that sent us into a retry, kept so the
+    // fallthrough below cannot report success for an item whose only real
+    // dispatch FAILED. Before the retry arm existed, `Err` returned
+    // immediately and the fallthrough's `ok: true` was sound — the only way
+    // to reach it was a dispatched-but-empty reply. Retrying widened the set
+    // of states that reach it without re-deriving that honesty.
+    let mut last_error: Option<String> = None;
     let mut error_retries_used = 0u32;
     let mut attempt: u32 = 0;
     loop {
@@ -1779,6 +1786,13 @@ fn map_hosted_item(
                 };
             }
             // A retry the bucket can no longer fund — stop, keep what fired.
+            // (#1605 QA finding) Reachable ONLY on a retry, which means the
+            // first attempt errored: sibling steps sharing this bucket_group
+            // can drain it during the backoff window. Falling through to the
+            // `ok: true` tail here would report a clean empty draw for an
+            // item that only ever failed — and downstream that is counted as
+            // a fired draw, suppressing both the "dispatch failed" warning
+            // and the all-draws-failed gate this very PR hardens.
             break;
         };
         let req = HostedSingleShotRequest {
@@ -1868,16 +1882,20 @@ fn map_hosted_item(
                 }
                 error_budget -= 1;
                 error_retries_used += 1;
+                last_error = Some(format!("{e:#}"));
                 std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
         attempt += 1;
     }
+    // (#1605 QA finding) `ok` is a claim about what actually happened. An
+    // item that reaches here after an errored attempt (the bucket-starved
+    // retry path) must report that error, not an empty success.
     MapItemResult {
         index,
-        ok: true,
+        ok: last_error.is_none(),
         content: String::new(),
-        error: None,
+        error: last_error,
         total_tokens: item_total_tokens(any_usage, sum),
         prompt_tokens: item_split_tokens(any_split, psum),
         completion_tokens: item_split_tokens(any_split, csum),
@@ -2472,6 +2490,66 @@ mod tests {
         b.settle(g2, 60_000); // now 120k >= 100k (the endpoint reported above its grant)
         assert!(b.admit_reserve(60_000).is_none(), "over budget -> skip");
         assert_eq!(b.skipped(), 1);
+    }
+
+    #[test]
+    fn a_bucket_starved_retry_reports_the_error_not_a_fabricated_empty_success() {
+        // (#1605 QA finding) The regression the retry arm introduced. Before
+        // `retry_on_error`, an `Err` returned immediately, so the loop's
+        // fallthrough could only be reached after a dispatched-but-EMPTY
+        // reply — `ok: true, error: None` was honest there. Retrying widened
+        // the reachable set without re-deriving that: if the bucket is
+        // drained during the 200ms backoff (siblings sharing a `bucket_group`
+        // run concurrently — exactly the near-exhaustion regime), the retry's
+        // admit is refused, the loop breaks, and the item fell through
+        // claiming a clean empty draw for a dispatch that only ever FAILED.
+        //
+        // Downstream that is counted as a fired draw: no "dispatch failed"
+        // warning, and the all-draws-failed gate — the very thing #1605
+        // hardens — is suppressed. An error laundered into reduced coverage,
+        // on the path built to stop exactly that.
+        //
+        // The race is driven deterministically: the override errors on the
+        // first call and drains the shared bucket from inside that call, so
+        // by the time the retry asks to be admitted there is nothing left.
+        let budget = 10_000u64;
+        let bucket = Arc::new(Mutex::new(MapRemoteBucket::new(budget)));
+        let drain = Arc::clone(&bucket);
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            *seen.lock().unwrap() += 1;
+            // Consume the rest of the allowance mid-call, the way a
+            // concurrent sibling step would.
+            if let Ok(mut b) = drain.lock() {
+                if let Some(g) = b.admit_reserve(budget as u32) {
+                    b.settle(g, budget);
+                }
+            }
+            anyhow::bail!("endpoint refused the draw")
+        });
+        let endpoint = darkmux_types::ModelEndpoint {
+            url: Some("http://127.0.0.1:1".to_string()),
+            ..Default::default()
+        };
+
+        let out = map_hosted_item(
+            0, &bucket, &endpoint, "gpt-5.1", "sys", "user", 1_000, 1, 0, 1, Some(&ovr),
+        );
+
+        assert!(
+            !out.ok,
+            "an item whose only dispatch errored must never report ok: {out:?}"
+        );
+        assert!(
+            out.error.is_some(),
+            "the error must survive the bucket-starved retry, not be dropped: {out:?}"
+        );
+        assert!(
+            out.error.as_deref().unwrap_or_default().contains("endpoint refused the draw"),
+            "and it must be the REAL error, not a generic budget message: {out:?}"
+        );
+        assert_eq!(*calls.lock().unwrap(), 1, "the retry was starved, so only one call fired");
     }
 
     #[test]

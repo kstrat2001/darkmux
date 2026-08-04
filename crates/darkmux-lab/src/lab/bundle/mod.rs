@@ -105,6 +105,16 @@ pub enum SkipReason {
     /// common real-world cause (darkmux#1605): a diff dominated by JSON
     /// config, lockfiles, or fixture data never had a chance to bundle.
     NonCodeExtension,
+    /// A source file the bundler deliberately EXCLUDES rather than fails to
+    /// understand: `scan::ts_file` rejects `tests/` and any basename
+    /// containing "test". Split from [`SkipReason::NonCodeExtension`]
+    /// (#1605 QA finding) because collapsing them made the operator-facing
+    /// no-op comment describe a pure-test-file PR as "non-code content such
+    /// as fixtures, lockfiles, or generated config" — which is false about
+    /// real code, in a comment whose entire job is to be honest about why
+    /// nothing was reviewed. Still BENIGN (the exclusion is deliberate, not
+    /// a failure), just accurately named.
+    TestFileExcluded,
     /// `source.read_file(rel)` returned `None` — the worktree/GitHub source
     /// doesn't have this file's content (a checkout desync, a file deleted
     /// on the reviewed ref, or an API fetch miss). Distinct from
@@ -432,8 +442,15 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
 
     for (rel, hunks) in &files {
         if !scan::ts_file(rel) {
-            skip.files_skipped
-                .push(SkippedFile { path: rel.clone(), reason: SkipReason::NonCodeExtension });
+            // (#1605 QA finding) Distinguish "not code I understand" from
+            // "code I deliberately exclude" — a `.ts`/`.tsx` file rejected
+            // here was rejected for being a TEST, not for being data.
+            let reason = if rel.ends_with(".ts") || rel.ends_with(".tsx") {
+                SkipReason::TestFileExcluded
+            } else {
+                SkipReason::NonCodeExtension
+            };
+            skip.files_skipped.push(SkippedFile { path: rel.clone(), reason });
             continue;
         }
         let Some(content) = source.read_file(rel)? else {
@@ -878,6 +895,48 @@ mod tests {
         let paths: Vec<&str> = set.skip.files_skipped.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"package-lock.json"));
         assert!(paths.contains(&"fixtures/sample.json"));
+    }
+
+    #[test]
+    fn build_bundles_separates_excluded_test_files_from_non_code_data() {
+        // (#1605 QA finding) `scan::ts_file` rejects BOTH data files and
+        // TypeScript TEST files, and the first cut tagged them identically —
+        // so a pure-test-file PR got a no-op comment calling its `.test.ts`
+        // sources "fixtures, lockfiles, or generated config". Benign either
+        // way; the LABEL was false, in the one comment whose entire purpose
+        // is explaining honestly why nothing was reviewed.
+        //
+        // This drives the real `build_bundles` ASSIGNMENT. A sibling test in
+        // review_tests.rs pins the CLASSIFIER for the same case — that one
+        // constructs the reason directly, so on its own it would pass against
+        // an implementation that never produces `TestFileExcluded` at all.
+        // Both halves are needed; neither alone is evidence.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "src/foo.test.ts", "export const a = 1;\n");
+        write(dir.path(), "package-lock.json", "{}\n");
+        let diff = "+++ b/src/foo.test.ts\n\
+@@ -1,1 +1,1 @@\n\
++export const a = 2;\n\
++++ b/package-lock.json\n\
+@@ -1,1 +1,1 @@\n\
++{\"v\": 2}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+
+        let by_path: std::collections::BTreeMap<&str, SkipReason> =
+            set.skip.files_skipped.iter().map(|f| (f.path.as_str(), f.reason)).collect();
+        assert_eq!(
+            by_path.get("src/foo.test.ts"),
+            Some(&SkipReason::TestFileExcluded),
+            "a .test.ts file is EXCLUDED code, not non-code data: {:?}",
+            set.skip
+        );
+        assert_eq!(
+            by_path.get("package-lock.json"),
+            Some(&SkipReason::NonCodeExtension),
+            "a lockfile is genuinely non-code and must keep that reason: {:?}",
+            set.skip
+        );
     }
 
     #[test]

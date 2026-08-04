@@ -6623,6 +6623,40 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     }
 
     #[test]
+    fn a_pure_test_file_diff_is_benign_but_is_not_called_non_code() {
+        // (#1605 QA finding) `scan::ts_file` rejects `tests/` and any
+        // basename containing "test" — real TypeScript the bundler
+        // deliberately excludes. Collapsing that into NonCodeExtension made
+        // the no-op comment tell the author their test files were "fixtures,
+        // lockfiles, or generated config". Benign is right; the LABEL was a
+        // lie, in the one comment whose whole job is honesty about why
+        // nothing was reviewed.
+        let report = BundleSkipReport {
+            files_considered: 2,
+            files_skipped: vec![
+                SkippedFile {
+                    path: "src/foo.test.ts".to_string(),
+                    reason: SkipReason::TestFileExcluded,
+                },
+                SkippedFile {
+                    path: "tests/bar.ts".to_string(),
+                    reason: SkipReason::TestFileExcluded,
+                },
+            ],
+        };
+        let (msg, kind) = classify_zero_bundle_degenerate(&Some(report));
+        assert_eq!(kind, DegenerateKind::BenignEmpty, "a deliberate exclusion is benign");
+        assert!(
+            msg.contains("test file"),
+            "the breakdown must name the real reason, not 'non-code extension': {msg}"
+        );
+        assert!(
+            !msg.contains("non-code extension"),
+            "a .ts test file must never be reported as a non-code extension: {msg}"
+        );
+    }
+
+    #[test]
     fn classify_zero_bundle_degenerate_every_skip_non_code_extension_is_benign() {
         let skip = skip_report(vec![
             ("package-lock.json", SkipReason::NonCodeExtension),

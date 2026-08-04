@@ -259,11 +259,11 @@ fn render_benign_noop_comment(env: &ReviewEnvelope, footer: &str) -> String {
     };
     format!(
         "### 🤖 PR review — nothing to review\n\n\
-         This diff touched {considered} file(s) — {listing} — and none of them contained code \
-         this reviewer bundles (non-code content such as fixtures, lockfiles, or generated \
-         config). There is nothing here for an automated code review to check. **This is a \
-         neutral note, not an approval** — it reflects what the diff contained, not a judgment \
-         on the change.{footer}"
+         This diff touched {considered} file(s) — {listing} — and none of them are files this \
+         reviewer bundles: it covers TypeScript source, and deliberately excludes data \
+         (fixtures, lockfiles, generated config) and test files. There is nothing here for an \
+         automated code review to check. **This is a neutral note, not an approval** — it \
+         reflects what the diff contained, not a judgment on the change.{footer}"
     )
 }
 

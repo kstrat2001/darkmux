@@ -814,7 +814,11 @@ pub enum DegenerateKind {
 /// distinguish "diff was entirely non-code" from "bundler bug" from "diff
 /// exceeded some internal bound" (darkmux#1605).
 ///
-/// Benign iff every skipped file's reason is [`SkipReason::NonCodeExtension`]
+/// Benign iff every skipped file's reason is deliberate-and-expected —
+/// [`SkipReason::NonCodeExtension`] or [`SkipReason::TestFileExcluded`]
+/// (#1605 QA finding: the bundler EXCLUDES test files rather than failing
+/// to understand them; both are benign, but they must be named differently
+/// or the no-op comment calls real test code "fixtures and lockfiles") —
 /// AND at least one file WAS skipped — an empty `files_skipped` (no skip
 /// data at all, e.g. `bundle_override`/an external bundler) stays `Error`:
 /// the honest "can't explain this" default, never a guessed benign
@@ -824,11 +828,14 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
         return ("no bundles produced from the diff".to_string(), DegenerateKind::Error);
     };
     let benign = !report.files_skipped.is_empty()
-        && report.files_skipped.iter().all(|f| f.reason == SkipReason::NonCodeExtension);
+        && report.files_skipped.iter().all(|f| {
+            matches!(f.reason, SkipReason::NonCodeExtension | SkipReason::TestFileExcluded)
+        });
     let mut by_reason: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
     for f in &report.files_skipped {
         let label = match f.reason {
             SkipReason::NonCodeExtension => "non-code extension",
+            SkipReason::TestFileExcluded => "test file (excluded by the bundler)",
             SkipReason::UnreadableInWorktree => "unreadable in worktree",
             SkipReason::NoSurvivingLines => "no surviving lines",
             SkipReason::NoEnclosingFunction => "no enclosing function",
