@@ -2798,6 +2798,36 @@
     /// `#[serial]` guards the shared env var (other flow tests mutate it).
     /// (#717) Read every flow record the default sink wrote to a tempdir
     /// day-file. Shared helper for the bookend-guard tests below.
+    /// (#1544) Every record in `dir` that belongs to `session` — the shape
+    /// an assertion should almost always use.
+    ///
+    /// `DARKMUX_FLOWS_DIR` is process-global, and while a `#[serial]` test
+    /// holds it pointed at its own tempdir, EVERY concurrently-running
+    /// non-serial test that emits a flow record writes into that tempdir
+    /// too. (Verified: 31 of the 166 tests in this file emit without setting
+    /// the var or taking the serial lock.) `#[serial]` cannot prevent this —
+    /// it only excludes other serial tests, and the polluters are precisely
+    /// the ones that never opted in.
+    ///
+    /// So an unscoped `drain_flow_records` + an exact-count assertion is a
+    /// race by construction: it passes or fails on test-scheduling luck.
+    /// That is #1544, and it has cost six CI runs. Scoping the read to the
+    /// test's OWN session makes the assertion immune to anything a sibling
+    /// writes, which is the property the test actually wanted all along.
+    ///
+    /// This is a containment fix, not the cure. The cure is injecting a sink
+    /// per dispatch instead of resolving a process-global env var at write
+    /// time — a real refactor, tracked on #1544.
+    fn drain_flow_records_for_session(
+        dir: &std::path::Path,
+        session: &str,
+    ) -> Vec<serde_json::Value> {
+        drain_flow_records(dir)
+            .into_iter()
+            .filter(|v| v["session_id"] == session)
+            .collect()
+    }
+
     fn drain_flow_records(dir: &std::path::Path) -> Vec<serde_json::Value> {
         std::fs::read_dir(dir)
             .unwrap()
@@ -2863,7 +2893,7 @@
             }
         }
 
-        let rec = drain_flow_records(tmp.path())
+        let rec = drain_flow_records_for_session(tmp.path(), "sess-orphan")
             .into_iter()
             .find(|v| v["action"] == "dispatch error")
             .expect("armed guard should emit a dispatch.error terminal on drop");
@@ -2923,7 +2953,7 @@
             }
         }
 
-        let emitted = drain_flow_records(tmp.path())
+        let emitted = drain_flow_records_for_session(tmp.path(), "sess-clean")
             .into_iter()
             .any(|v| v["action"] == "dispatch error");
         assert!(!emitted, "disarmed guard must not emit any terminal record");
@@ -2984,7 +3014,7 @@
             }
         }
 
-        let rec = drain_flow_records(tmp.path())
+        let rec = drain_flow_records_for_session(tmp.path(), "sess-panic")
             .into_iter()
             .find(|v| v["action"] == "dispatch error")
             .expect("guard should emit a dispatch.error terminal on panic unwind");
@@ -3105,7 +3135,7 @@
             }
         }
 
-        let records = drain_flow_records(tmp.path());
+        let records = drain_flow_records_for_session(tmp.path(), "sess-tokens");
         let tokens: Vec<&serde_json::Value> = records
             .iter()
             .filter(|v| v["category"] == "telemetry" && v["source"] == "tokens")
@@ -3257,7 +3287,7 @@
             }
         }
 
-        let records = drain_flow_records(tmp.path());
+        let records = drain_flow_records_for_session(tmp.path(), "sess-oneoff");
         let turn = records
             .iter()
             .find(|v| v["action"] == "dispatch.turn")
