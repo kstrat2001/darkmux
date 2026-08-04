@@ -341,7 +341,7 @@
   .logsearch{display:flex;align-items:center;gap:10px;margin-top:8px}
   .searchbox{position:relative;flex:1;min-width:0;display:flex;align-items:center}
   .searchbox .sicon{position:absolute;left:9px;font-size:14px;line-height:1;color:var(--muted);pointer-events:none;transition:color .15s}
-  /* (#1641) 16px, not 12px. iOS Safari ZOOMS THE WHOLE PAGE when a text input
+  /* (#1640) 16px, not 12px. iOS Safari ZOOMS THE WHOLE PAGE when a text input
      with font-size < 16px takes focus, and there is no viewport
      `maximum-scale` mitigation here (deliberately — that one breaks pinch-zoom
      for everyone). The operator reads this dashboard on a phone over the
@@ -652,7 +652,7 @@
   .fgroup label{display:inline-flex;align-items:center;gap:6px;margin:0 14px 7px 0;font:12px 'JetBrains Mono',monospace;color:var(--text);cursor:pointer}
   .fgroup input{accent-color:var(--accent);cursor:pointer}
   .mft{display:flex;gap:10px;margin-top:8px}
-  /* (#1641) 16px for the same reason as `.searchbox input` above — the filter
+  /* (#1640) 16px for the same reason as `.searchbox input` above — the filter
      modal's search field is the other focusable text input in this file. */
   .mft input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:4px;padding:8px 10px;font:16px 'JetBrains Mono',monospace}
   .clr{background:var(--bg);border:1px solid var(--accent-dim);color:var(--text);border-radius:4px;padding:8px 12px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
@@ -2873,7 +2873,7 @@ $("sclear").onclick=()=>{setQuery("");const lq=$("logq");if(lq)lq.focus();};
 // generic path is a no-op when it has nothing remembered.
 const MODAL_IDS=["modalbg","nmodalbg","imodalbg"];
 let MODAL_RETURN_FOCUS=null;
-// (#1642) EXACTLY ONE dialog may be open. Two could be before this: nothing
+// (#1640) EXACTLY ONE dialog may be open. Two could be before this: nothing
 // checked, and tabbing out of an open modal (see the focus trap below) reached
 // the version chip and the notes link, either of which opens another.
 //
@@ -2905,7 +2905,7 @@ function isModalOpen(id){
   const m=$(id);
   return !!(m&&m.style.display!=="none"&&m.style.display!=="");
 }
-// (#1642) Keep Tab inside the open dialog.
+// (#1640) Keep Tab inside the open dialog.
 //
 // The overlays are opaque `position:fixed;inset:0`, but nothing stopped Tab
 // walking out of one — 31 presses from an open Filters landed on the page
@@ -2934,7 +2934,7 @@ function restoreModalFocus(){
 }
 // Closes the one open dialog, whichever it is. Returns true if it closed
 // something, so Escape can fall through to the catalog panel otherwise.
-// (#1642) `opts.restore:false` closes without returning focus — used when
+// (#1640) `opts.restore:false` closes without returning focus — used when
 // swapping one dialog for another, where the original target must survive.
 function closeOpenModal(opts){
   const restore=!opts||opts.restore!==false;

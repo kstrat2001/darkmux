@@ -420,7 +420,7 @@
        tabs sit on a common center line instead of reading as a pile of
        differently-sized boxes. */
     .nav a,.mstatus,.livepill,.evbtn,.legbtn{display:inline-flex;align-items:center;min-height:30px;box-sizing:border-box}
-    /* (#1641) The back link is the SOLE way out of this page — it runs as a
+    /* (#1640) The back link is the SOLE way out of this page — it runs as a
        chromeless home-screen shortcut, so browser back cannot be assumed. It
        was the one navigation-critical control in the file sized below the 44px
        this project uses everywhere else for exactly this class (viewer.html's
@@ -624,13 +624,13 @@ function stepMeterEl(meter){
 }
 // (#1483) The dispatch's start epoch-ms: the live bookend from `metrics` when
 // present, else the server-stamped `started_ts` (camelCase on the wire).
-// (#1639) How long a `running` step may go without a signal before this page
+// (#1640) How long a `running` step may go without a signal before this page
 // stops CLAIMING it is live. Twice the runtime's default inactivity budget
 // (600s), which is the point at which the watchdog would already have killed
 // anything genuinely running. A generous window on purpose: a false "stalled"
 // on a slow-but-live seat is a worse failure than a late-clearing animation.
 var STEP_LIVENESS_WINDOW_MS = 1200 * 1000;
-// (#1643) stepId -> wall-clock ms of the last record seen for it, ANY record.
+// (#1640) stepId -> wall-clock ms of the last record seen for it, ANY record.
 // Deliberately outside React state: see `applyRecordToMetrics`.
 var STEP_LAST_RX = Object.create(null);
 function stepStartMs(step, m){
@@ -647,7 +647,7 @@ function stepMeterFor(step, metrics, now){
   // (#1483) Generating = the step's own status is running — an OPEN dispatch
   // (SSE flips it on `step start`, off on the terminal). The elapsed clock
   // reads from the dispatch-start bookend (metrics) or the server started_ts.
-  // (#1639) `status === "running"` is what the SERVER last WROTE, not evidence
+  // (#1640) `status === "running"` is what the SERVER last WROTE, not evidence
   // the step is running NOW. A hard-killed dispatch — sleep gone wrong,
   // `kill -9`, power loss — never writes its terminal, so the status stays
   // `running` on disk forever and this page pulsed a dot and ticked a clock
@@ -925,7 +925,7 @@ function statusRank(s){
   return STATUS_RANK[s] !== undefined ? STATUS_RANK[s] : UNKNOWN_STATUS_RANK;
 }
 function isUnknownStatus(s){ return STATUS_RANK[s] === undefined; }
-// (#1643) Whether a merge should KEEP the page's current value over an
+// (#1640) Whether a merge should KEEP the page's current value over an
 // incoming disk one.
 //
 // A single rank cannot express what unknown needs. Ranking it 99 (the first
@@ -1067,7 +1067,7 @@ function applyRecordToMetrics(metrics, rec, idx){
   var sid = stepForRecord(rec, idx);
   if (!sid) return metrics;
   var p = rec.payload || {};
-    // (#1643) Arrival time is recorded BEFORE the no-change guard below, and in
+    // (#1640) Arrival time is recorded BEFORE the no-change guard below, and in
   // a plain ref rather than in this React-state object.
   //
   // The first cut stamped `lastRx` inside `next` — which the guard then threw
@@ -1773,7 +1773,7 @@ function App(){
       // source wins on equal rank" reasoning. The invariant is now enforced
       // at BOTH ingest points instead of relying on record ordering.
       var advance = function(oldStatus){
-        // (#1643) Same asymmetry as `keepPageStatus`, expressed from the
+        // (#1640) Same asymmetry as `keepPageStatus`, expressed from the
         // other side: take the incoming unless the page's value legitimately
         // outranks it. An unknown on either side means take the incoming.
         return keepPageStatus(oldStatus, newStatus) ? oldStatus : newStatus;

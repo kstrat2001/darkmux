@@ -1,4 +1,4 @@
-// (#1642) The first keyboard tests in this suite.
+// (#1640) The first keyboard tests in this suite.
 //
 // `grep -rn "\.press(\|keyboard\." tests/e2e/*.spec.js` returned ZERO before
 // this file. Not one spec had ever pressed a key — despite the source carrying

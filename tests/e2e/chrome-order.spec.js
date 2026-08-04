@@ -133,7 +133,7 @@ test('the panel asks for a column count the phone can actually show', async ({ p
   ).toBeLessThan(60);
 });
 
-// (#1641) Touch and input sizing on a phone.
+// (#1640) Touch and input sizing on a phone.
 //
 // One of these two is testable here and one is not, and the difference is worth
 // stating: the iOS auto-zoom heuristic is WebKit-only, so Chromium will never

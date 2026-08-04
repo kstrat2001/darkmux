@@ -261,7 +261,7 @@ test('the graph page never scrolls sideways on a phone', async ({ page }) => {
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-// ── (#1639) A dead dispatch must stop claiming to be live ───────────────────
+// ── (#1640) A dead dispatch must stop claiming to be live ───────────────────
 
 test('a step running since long ago stops pulsing and stops counting', async ({ page }) => {
   // The seventh instance of one root cause: a lifecycle state INFERRED rather
@@ -310,13 +310,13 @@ test('a step that just started still reads as live', async ({ page }) => {
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-// ── (#1643) The two ways my own #1639/#1628 fixes were wrong ────────────────
+// ── (#1640) The two ways my own #1640/#1628 fixes were wrong ────────────────
 //
 // Found by a frontier audit told to assume my fixes carried the same error rate
 // as my tests. It was right twice.
 
 test('a heartbeat keeps a slow seat alive — the signal that moves no counter', async ({ page }) => {
-  // #1639's first cut stamped arrival time INSIDE the metrics object, which the
+  // #1640's first cut stamped arrival time INSIDE the metrics object, which the
   // no-change guard then discarded: it compares counters and bookends only, so
   // every record that moves no counter was thrown away without recording that
   // we heard from the step.
