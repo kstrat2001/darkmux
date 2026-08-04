@@ -1,0 +1,73 @@
+{
+  "generated_at_ms": 1893456600000,
+  "runs": [
+    {
+      "id": "healthy/live",
+      "kind": "lab",
+      "status": "running",
+      "machine": "demo-machine",
+      "updated_ts": 1893456590,
+      "tracked": true
+    },
+    {
+      "id": "healthy/done",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "demo-machine",
+      "started_ts": 1893450000,
+      "completed_ts": 1893456000,
+      "updated_ts": 1893456000,
+      "tracked": true
+    },
+    {
+      "id": "degraded/abandoned-stale",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "demo-machine",
+      "updated_ts": 1893440000,
+      "tracked": true
+    },
+    {
+      "id": "degraded/no-status-field",
+      "kind": "lab",
+      "machine": "demo-machine",
+      "updated_ts": 1893440000,
+      "tracked": true
+    },
+    {
+      "id": "degraded/no-kind-field",
+      "status": "complete",
+      "updated_ts": 1893440000,
+      "tracked": true
+    },
+    {
+      "id": "degraded/no-timestamps-at-all",
+      "kind": "dispatch",
+      "status": "complete",
+      "tracked": true
+    },
+    {
+      "id": "degraded/untracked-ghost",
+      "kind": "dispatch",
+      "status": "error",
+      "updated_ts": 1893440000,
+      "tracked": false
+    },
+    {
+      "id": "degraded/status-from-a-newer-darkmux",
+      "kind": "lab",
+      "status": "quiesced",
+      "machine": "demo-machine",
+      "updated_ts": 1893440000,
+      "tracked": true
+    },
+    {
+      "id": "degraded/<img src=x onerror=alert(1)>",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "<b>evil</b>",
+      "updated_ts": 1893440000,
+      "tracked": true
+    }
+  ]
+}
