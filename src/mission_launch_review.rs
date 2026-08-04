@@ -521,6 +521,36 @@ fn config_detail() -> String {
     )
 }
 
+/// (#1520) The remote ROUTE this review will run on, as the flow record's
+/// `payload.endpoint` label — or `None` when every seat is local.
+///
+/// Judge-first, then the first remote probe, mirroring
+/// `lab_staffing_role_model_route`'s precedence: the judge is the
+/// load-bearing seat, so when seats disagree its route is the honest
+/// headline. Uses `remote_route_label` — the same single-source shape the
+/// TERMINAL bookend stamps (host + model, never the full URL, never auth)
+/// so the two bookends agree byte-for-byte and the viewer's
+/// start-or-complete resolution can never disagree with itself.
+///
+/// Pure and separate from the launcher so the precedence is testable
+/// without standing up a dispatch.
+fn crew_route_label(crew: &ResolvedReviewRoles) -> Option<String> {
+    let (ep, model) = crew
+        .judge
+        .pm
+        .endpoint
+        .as_ref()
+        .map(|ep| (ep, crew.judge.pm.id.as_str()))
+        .or_else(|| {
+            crew.probes
+                .iter()
+                .find_map(|s| s.pm.endpoint.as_ref().map(|ep| (ep, s.pm.id.as_str())))
+        })?;
+    let url = ep.base_url();
+    let host = url.split("://").nth(1).and_then(|h| h.split('/').next()).unwrap_or("remote");
+    Some(darkmux_flow::remote_route_label(host, model))
+}
+
 /// NON-SECRET liveness detail for `crew-resolved` — crew name, seat count,
 /// and the distinct endpoint HOSTS of the remote seats. HOST ONLY: never
 /// the full URL, never any credential.
@@ -877,6 +907,19 @@ fn run_dispatch(
     let mut dispatch_start_extra = json!({ "exec_mode": mode_str });
     if let Some(bundles) = &charges_bundles {
         dispatch_start_extra["bundles"] = json!(bundles.len());
+    }
+    // (#1520) Stamp the route on the START record, not only the terminal.
+    //
+    // `payload.endpoint` is the ONLY field the viewer reads to classify a
+    // session as cloud vs local. The review path stamped it exclusively on
+    // `dispatch complete`, so #1518's viewer fix (resolve from start OR
+    // complete) repaired every FINISHED remote review and left the live one
+    // broken: an in-flight Azure review has no terminal record yet, so it
+    // renders as a local LMStudio run — wrong route, plus a phantom
+    // `model (lms)` residency — for its whole duration, which is exactly
+    // when the operator is watching it.
+    if let Some(label) = crew_route_label(&crew) {
+        dispatch_start_extra["endpoint"] = json!(label);
     }
 
     let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
@@ -1690,6 +1733,71 @@ mod tests {
             selector: None,
             provenance: None,
         }
+    }
+
+    fn remote_staffing(model_id: &str, host: &str) -> ResolvedSeatStaffing {
+        let mut st = staffing(model_id);
+        st.pm.endpoint = Some(darkmux_types::ModelEndpoint {
+            url: Some(format!("https://{host}/openai/deployments/{model_id}")),
+            ..Default::default()
+        });
+        st
+    }
+
+    #[test]
+    fn crew_route_label_is_none_when_every_seat_is_local() {
+        // (#1520) A fully-local review must NOT stamp `payload.endpoint` —
+        // that field is the viewer's cloud-vs-local switch, so inventing one
+        // here would misclassify a local run as remote. The bug being fixed
+        // is the absence of a TRUE label, never the presence of a false one.
+        let roles = ResolvedReviewRoles {
+            probes: vec![staffing("darkmux:probe")],
+            judge: staffing("darkmux:judge"),
+            verify: None,
+            request_changes: false,
+            warnings: Vec::new(),
+        };
+        assert_eq!(crew_route_label(&roles), None);
+    }
+
+    #[test]
+    fn crew_route_label_prefers_the_judge_and_matches_the_terminal_shape() {
+        // (#1520) Byte-identical to what the TERMINAL bookend stamps — the
+        // viewer resolves `payload.endpoint` from start OR complete (#1518),
+        // so if the two bookends disagreed the classification would flip
+        // mid-run. Judge-first because it is the load-bearing seat.
+        let roles = ResolvedReviewRoles {
+            probes: vec![remote_staffing("gpt-4o-mini", "probes.cognitiveservices.azure.com")],
+            judge: remote_staffing("gpt-4o", "myorg.cognitiveservices.azure.com"),
+            verify: None,
+            request_changes: false,
+            warnings: Vec::new(),
+        };
+        assert_eq!(
+            crew_route_label(&roles).as_deref(),
+            Some("azure:myorg.cognitiveservices.azure.com/gpt-4o"),
+            "the judge's route wins, in the same shape `dispatch complete` stamps"
+        );
+    }
+
+    #[test]
+    fn crew_route_label_falls_back_to_a_remote_probe_when_the_judge_is_local() {
+        // A mixed crew is still a remote run — the operator is spending
+        // tokens off-machine and the live view must say so.
+        let roles = ResolvedReviewRoles {
+            probes: vec![
+                staffing("darkmux:local-probe"),
+                remote_staffing("gpt-4o-mini", "probes.cognitiveservices.azure.com"),
+            ],
+            judge: staffing("darkmux:local-judge"),
+            verify: None,
+            request_changes: false,
+            warnings: Vec::new(),
+        };
+        assert_eq!(
+            crew_route_label(&roles).as_deref(),
+            Some("azure:probes.cognitiveservices.azure.com/gpt-4o-mini")
+        );
     }
 
     #[test]
