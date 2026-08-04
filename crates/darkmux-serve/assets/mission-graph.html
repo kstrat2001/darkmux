@@ -1060,7 +1060,7 @@ function isAiKind(kind){
 // with one of this page's steps (two missions launched from the SAME
 // config share those — see `crates/darkmux-crew/src/scheduler.rs`'s
 // `step_lifecycle_record` doc). When `rec.mission_id` is ABSENT (every
-// pre-#1641 record, and anything the two known producer-side gaps still
+// pre-#1641 record, and anything the two known producer-side gaps (#1645) still
 // miss), fall back to the proxy matching below unchanged — this is what
 // keeps historical/legacy records (and the demo data) rendering exactly as
 // before.
@@ -1279,7 +1279,7 @@ function missionTotals(metrics){
 // below, so a record correctly stamped for a DIFFERENT mission can't sneak
 // in via a `handle`/`session_id` collision (two missions launched from the
 // same config share those). Only an ABSENT `mission_id` (every pre-#1641
-// record, and anything the two known producer-side gaps still miss) falls
+// record, and anything the two known producer-side gaps (#1645) still miss) falls
 // back to the proxy matching — this is what keeps historical/legacy
 // records (and the demo data) rendering exactly as before.
 function recordInMission(rec, idx, missionId){
@@ -1784,6 +1784,17 @@ function App(){
       var newStatus = statusFromRecord(rec);
       var handle = rec.handle;
       if (!newStatus || !handle) return;
+      // (#1641 QA finding) The status-flip ingest needs the SAME mission gate
+      // as the metrics fold above — step-lifecycle handles are the config-
+      // scoped step id, identical across missions launched from the same
+      // config, and those records are exactly what the launchers now stamp.
+      // Without this, mission B's `step complete` flips A's still-running
+      // step to complete, and the rank ratchet then makes the lie sticky:
+      // when A's step later errors, error-vs-complete is an equal-rank tie
+      // the page's wrong value survives. Absent mission_id (legacy records)
+      // still flows through — same present-is-authoritative rule as
+      // stepForRecord.
+      if (rec.mission_id && rec.mission_id !== missionId) return;
       // (#1403 gate remediation) SSE flips are rank-guarded with the SAME
       // monotone rule the reconcile poll's mergeGraphs applies: a delta may
       // never regress a status to a lower rank (a stale or replayed record

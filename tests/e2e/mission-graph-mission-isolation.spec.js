@@ -125,6 +125,47 @@ test('a record stamped for a DIFFERENT mission does not move this mission\'s ste
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
+test('a foreign step-lifecycle record does not flip this mission\'s step status', async ({ page }) => {
+  // (#1641 QA finding) The FIRST version of this fix gated the metrics fold
+  // and the events panel but not the STATUS-FLIP ingest — and this spec's
+  // foreign records used dispatch-vocabulary actions, which statusFromRecord
+  // maps to null, so the unguarded path was never driven and the suite
+  // stayed green over a live remnant of the bug. This test exists to close
+  // that exact blind spot: `step complete` IS in STATUS_ACTIONS, its handle
+  // is the config-scoped step id both missions share, and before the gate it
+  // flipped mission A's still-running step to "complete" — stickily, because
+  // the rank ratchet then treats A's real terminal as an equal-rank tie and
+  // keeps the page's wrong value.
+  const RECORDS = [
+    rec({ action: 'dispatch start', mission_id: MISSION_ID, payload: {} }),
+    // Own-mission tokens so the meter renders (the shared open() helper
+    // waits on .mmeter, which appears only once something folds).
+    rec({
+      action: 'telemetry.tokens', category: 'telemetry', source: 'tokens',
+      mission_id: MISSION_ID, payload: { total_tokens: 1000 },
+    }),
+    // Mission B finishes ITS copy of step s1. Stamped, foreign, and in
+    // STATUS_ACTIONS — the exact record shape the launchers now emit.
+    rec({ action: 'step complete', mission_id: OTHER_MISSION_ID, payload: {} }),
+  ];
+  const errors = await open(page, RECORDS);
+
+  // A step row renders its status as an `s-<status>` class on `.steprow`
+  // (see MissionNode's `"steprow mn-step-row s-" + s.status`) — assert on
+  // that, the thing statusFromRecord actually mutates. A first draft used
+  // invented selectors (`.sstatus`, `[data-stepid]`) that exist nowhere in
+  // the page and would have passed or failed for fixture reasons.
+  const stepRow = page.locator('.steprow').first();
+  await expect(stepRow).toBeVisible();
+  await expect(
+    stepRow,
+    'mission A\'s step must still be running — a foreign step-complete flipped it'
+  ).toHaveClass(/s-running/);
+  await expect(stepRow).not.toHaveClass(/s-complete/);
+
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});
+
 test('a record with NO mission_id still correlates — the legacy path', async ({ page }) => {
   const RECORDS = [
     // Every record here is UNSTAMPED (no mission_id at all) — the shape of
