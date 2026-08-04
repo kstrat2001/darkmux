@@ -762,6 +762,99 @@ pub struct ReviewEnvelope {
     /// was at or below the threshold — small sets render raw.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needs_check_clusters: Vec<NeedsCheckCluster>,
+    /// (#1605) The bundler's own per-file decline accounting for this run's
+    /// diff — `None` only when the bundle stage never ran with real
+    /// bookkeeping available (`bundle_override` test seam, or an external
+    /// `--bundler` plugin, which carries no notion of this crate's internal
+    /// decline reasons). Populated by `ReviewBundleStepKind::run_streaming`
+    /// alongside `bundles` itself. This is the data `degenerate`'s own
+    /// message is built from when `bundles == 0`, and what
+    /// [`ReviewEnvelope::degenerate_kind`] classifies against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_skip: Option<BundleSkipReport>,
+    /// (#1605) Distinguishes a genuinely EMPTY-but-honest diff (every
+    /// touched file declined for a benign reason — non-code content, no
+    /// signal to review) from a real ERROR/unexplained degenerate outcome
+    /// (a bundler bug, an internal limit hit, every probe draw failing, a
+    /// judge with no usable ruling). `None` when the run isn't degenerate at
+    /// all. The workflow/render layer branches on this typed field instead
+    /// of string-matching `degenerate`'s prose — see
+    /// [`crate::lab::review::classify_zero_bundle_degenerate`] for how a
+    /// zero-bundle run is classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degenerate_kind: Option<DegenerateKind>,
+    /// (#1605) Total number of probe draws that recovered on a bounded
+    /// transient-error retry (see [`darkmux_crew::step_kinds::builtins`]'s
+    /// `retry_on_error` — the probe stage's `dispatch.map` step opts in;
+    /// nothing downstream of a successful probe run does). Zero (and never
+    /// serialized) on a run where no retry fired — a retry that happened is
+    /// recorded here rather than only inferable from wall-clock.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub probe_retries: usize,
+}
+
+/// (#1605) See [`ReviewEnvelope::degenerate_kind`]'s doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegenerateKind {
+    /// Every touched file declined for a reason that means "nothing here to
+    /// review" (today: every skip is [`SkipReason::NonCodeExtension`]) —
+    /// posted as a neutral no-op comment, never a red/failed run.
+    BenignEmpty,
+    /// Anything else: a bundler bug candidate, an internal limit
+    /// (`OverSizeCap`), an unreadable file, every probe draw erroring, or a
+    /// judge phase with no usable ruling. Stays the existing loud,
+    /// never-a-silent-pass "degraded" treatment.
+    Error,
+}
+
+/// (#1605) Classify a `bundles == 0` run from its skip breakdown and build
+/// the degenerate message as a SUMMARY of that breakdown — replacing the
+/// old fixed "no bundles produced from the diff" string, which couldn't
+/// distinguish "diff was entirely non-code" from "bundler bug" from "diff
+/// exceeded some internal bound" (darkmux#1605).
+///
+/// Benign iff every skipped file's reason is deliberate-and-expected —
+/// [`SkipReason::NonCodeExtension`] or [`SkipReason::TestFileExcluded`]
+/// (#1605 QA finding: the bundler EXCLUDES test files rather than failing
+/// to understand them; both are benign, but they must be named differently
+/// or the no-op comment calls real test code "fixtures and lockfiles") —
+/// AND at least one file WAS skipped — an empty `files_skipped` (no skip
+/// data at all, e.g. `bundle_override`/an external bundler) stays `Error`:
+/// the honest "can't explain this" default, never a guessed benign
+/// classification.
+pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -> (String, DegenerateKind) {
+    let Some(report) = skip else {
+        return ("no bundles produced from the diff".to_string(), DegenerateKind::Error);
+    };
+    let benign = !report.files_skipped.is_empty()
+        && report.files_skipped.iter().all(|f| {
+            matches!(f.reason, SkipReason::NonCodeExtension | SkipReason::TestFileExcluded)
+        });
+    let mut by_reason: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for f in &report.files_skipped {
+        let label = match f.reason {
+            SkipReason::NonCodeExtension => "non-code extension",
+            SkipReason::TestFileExcluded => "test file (excluded by the bundler)",
+            SkipReason::UnreadableInWorktree => "unreadable in worktree",
+            SkipReason::NoSurvivingLines => "no surviving lines",
+            SkipReason::NoEnclosingFunction => "no enclosing function",
+            SkipReason::OverSizeCap => "over the bundler's size cap",
+        };
+        *by_reason.entry(label).or_insert(0) += 1;
+    }
+    let breakdown = if by_reason.is_empty() {
+        "no per-file breakdown available".to_string()
+    } else {
+        by_reason.iter().map(|(reason, n)| format!("{n} {reason}")).collect::<Vec<_>>().join(", ")
+    };
+    let msg = format!(
+        "no bundles produced from the diff — {} file(s) considered, {} skipped ({breakdown})",
+        report.files_considered,
+        report.files_skipped.len()
+    );
+    let kind = if benign { DegenerateKind::BenignEmpty } else { DegenerateKind::Error };
+    (msg, kind)
 }
 
 /// Serde helper for the skip-if-zero count fields — keeps envelopes from
@@ -3185,6 +3278,7 @@ fn finish_review(
     // same guarded form, keep them matched.
     if gate.degenerate_reason.is_some() {
         env.degenerate = gate.degenerate_reason;
+        env.degenerate_kind = Some(DegenerateKind::Error);
     }
 
     // (#1260) The optional verify stage — one adjudication per confirmed
@@ -3274,6 +3368,7 @@ pub fn run_judge_only(
     obs.step_result("review.bundle", "bundle", json!({ "items_out": bundles.len() }));
     if flags.is_empty() {
         env.degenerate = Some("--charges-file carried zero flags".to_string());
+        env.degenerate_kind = Some(DegenerateKind::Error);
         return Ok(env);
     }
 
@@ -3344,7 +3439,10 @@ use std::sync::Mutex as StdMutex;
 // (#1530) The real bundler — `review-bundle-step`'s `run_streaming` now
 // calls these directly (moved out of `src/mission_launch_review.rs`'s
 // pre-graph prelude); see `ReviewBundleStepKind`'s doc.
-use super::bundle::{build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, FileSource};
+use super::bundle::{
+    build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, BundleSkipReport,
+    FileSource, SkipReason,
+};
 use std::path::{Path, PathBuf};
 
 // ─── #1530 Packets 0/1/3a: run-scoped ArtifactBus artifact names ──────────
@@ -4002,6 +4100,13 @@ impl StepKind for ReviewBundleStepKind {
         // `mission launch review` path — see its own doc) skips all of it
         // for a hermetic graph test, or lets `review_bench.rs` hand in
         // bundles it still computes eagerly for its own reasons.
+        // (#1605) `bundle_skip` carries the bundler's own per-file decline
+        // accounting out of the `else` branch below (where `bundle_set`
+        // lives) so it can be stamped onto the shared envelope alongside
+        // `bundles` itself. Stays `None` on the `bundle_override` test seam
+        // — that path hands in `Vec<BundleInput>` directly, with no
+        // `BundleSet` (and so no skip bookkeeping) behind it.
+        let mut bundle_skip: Option<BundleSkipReport> = None;
         let bundle_inputs: Vec<BundleInput> = if let Some(over) = &ctx.bundle_override {
             over()?
         } else {
@@ -4022,6 +4127,7 @@ impl StepKind for ReviewBundleStepKind {
                 }
                 None => build_bundles(&source, &ctx.diff)?,
             };
+            bundle_skip = Some(bundle_set.skip.clone());
             bundle_inputs_from_set(&bundle_set, &source)?
         };
 
@@ -4044,12 +4150,17 @@ impl StepKind for ReviewBundleStepKind {
         // well before `ReviewSynthesisStepKind` reads `env.bundles` (the
         // "no bundles produced from the diff" degenerate gate) or serializes
         // its own envelope snapshot, so both see the real count.
-        run_ctx
-            .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
-            .expect("review-dedup-task's provides() materializes review.envelope")
-            .lock()
-            .expect("shared review envelope mutex poisoned")
-            .bundles = bundle_inputs.len();
+        {
+            let env_artifact = run_ctx
+                .artifact::<StdMutex<ReviewEnvelope>>(REVIEW_ENVELOPE_ARTIFACT)
+                .expect("review-dedup-task's provides() materializes review.envelope");
+            let mut env = env_artifact.lock().expect("shared review envelope mutex poisoned");
+            env.bundles = bundle_inputs.len();
+            // (#1605) Stamped alongside `bundles` for the same reason — the
+            // synthesis step's zero-bundle degenerate gate reads this to
+            // build a REASONED message instead of a bare count.
+            env.bundle_skip = bundle_skip;
+        }
 
         let output = serde_json::to_string(&bundle_inputs).context("serializing bundles")?;
         emit_review_step_result(
@@ -4312,6 +4423,11 @@ pub(crate) struct ProbeReconstruction {
     /// through instead, so the gate lands here as a NAMED degenerate
     /// reason — loud, never a silent zero-flag "clean pass".)
     pub(crate) all_draws_failed: Option<String>,
+    /// (#1605) Total `retry_on_error` attempts consumed across every probe
+    /// draw (summed from each item's own [`MapItemResult::retried`]) — how
+    /// many transient dispatch errors self-healed on the probe stage's
+    /// bounded retry, folded into [`ReviewEnvelope::probe_retries`].
+    pub(crate) retries: u32,
 }
 
 /// (#1442 ship-2b) Rebuild the probe stage's domain results from the
@@ -4368,6 +4484,10 @@ pub(crate) fn reconstruct_probe_stage(
     let mut total_fired = 0u32;
     let mut total_errors = 0u32;
     let mut first_error: Option<String> = None;
+    // (#1605) Summed `MapItemResult::retried` across every probe draw —
+    // how many transient dispatch errors self-healed on the bounded
+    // `retry_on_error` retry, folded into `ReviewEnvelope::probe_retries`.
+    let mut total_retries = 0u32;
 
     for spec in specs {
         let mut per_draw: Vec<Vec<MapItemResult>> = Vec::with_capacity(spec.draw_task_ids.len());
@@ -4461,6 +4581,7 @@ pub(crate) fn reconstruct_probe_stage(
                 draws += 1;
                 tokens += item.total_tokens.unwrap_or(0);
                 wall_ms += item.wall_ms;
+                total_retries += item.retried;
                 if served_model.is_none() {
                     served_model = item.served_model.clone();
                 }
@@ -4540,7 +4661,7 @@ pub(crate) fn reconstruct_probe_stage(
             first_error.unwrap_or_default()
         )
     });
-    Ok(ProbeReconstruction { flags, members, warnings, budget_row, all_draws_failed })
+    Ok(ProbeReconstruction { flags, members, warnings, budget_row, all_draws_failed, retries: total_retries })
 }
 
 // ─── investigate: dedup (terminal step of the phase) ────────────────────
@@ -4711,8 +4832,10 @@ impl StepKind for ReviewDedupStepKind {
             if env.degenerate.is_none() {
                 if let Some(reason) = recon.all_draws_failed {
                     env.degenerate = Some(reason);
+                    env.degenerate_kind = Some(DegenerateKind::Error);
                 }
             }
+            env.probe_retries += recon.retries as usize;
         }
         let (deduped, _stats) = dedup_flags(raw, &ctx.diff);
         let wall_ms = t0.elapsed().as_millis() as u64;
@@ -5053,6 +5176,7 @@ impl StepKind for ReviewJudgeStepKind {
             }
             if gate.degenerate_reason.is_some() {
                 env.degenerate = gate.degenerate_reason;
+                env.degenerate_kind = Some(DegenerateKind::Error);
             }
         }
 
@@ -5709,9 +5833,18 @@ impl StepKind for ReviewSynthesisStepKind {
         // actual cause; see the doc there.
         if env.degenerate.is_none() {
             if env.bundles == 0 {
-                env.degenerate = Some("no bundles produced from the diff".to_string());
+                // (#1605) The classifier reads `env.bundle_skip` (stamped by
+                // `ReviewBundleStepKind::run_streaming`, above) to build a
+                // REASONED summary and decide benign-vs-error — replacing
+                // the old fixed string, which could not distinguish "diff
+                // was entirely non-code" from "bundler bug" from "diff
+                // exceeded some internal bound".
+                let (msg, kind) = classify_zero_bundle_degenerate(&env.bundle_skip);
+                env.degenerate = Some(msg);
+                env.degenerate_kind = Some(kind);
             } else if env.deduped_flags == 0 {
                 env.degenerate = Some("zero flags from all probe draws — never a silent pass".to_string());
+                env.degenerate_kind = Some(DegenerateKind::Error);
             }
         }
 
@@ -5734,6 +5867,7 @@ impl StepKind for ReviewSynthesisStepKind {
                     "judge produced no usable ruling on any of {} flags (all errored/unparsed)",
                     env.judged.len()
                 ));
+                env.degenerate_kind = Some(DegenerateKind::Error);
             }
         }
 
@@ -6352,6 +6486,18 @@ pub fn build_review_graph_from_config(
             "max_tokens": max_tokens,
             "timeout_seconds": ctx.timeout_seconds,
             "retry_on_empty": 1,
+            // (#1605 cause 2 — "every probe draw errored") ONE bounded retry
+            // (with a short backoff, `RETRY_ON_ERROR_BACKOFF` in
+            // `darkmux-crew`'s `dispatch.map` builtin) on a probe draw's
+            // dispatch ERROR, not just an empty reply. The sampled darkmux#1605
+            // failures showed batches where EVERY draw errored together —
+            // reads like a transient endpoint-side blip, not a structural
+            // break — so the probe stage alone opts into this generic,
+            // default-off `dispatch.map` knob. Deliberately NOT set on the
+            // verify map step below: retrying anything downstream of a
+            // successful probe run re-runs paid inference to chase a flaky
+            // post, which the issue explicitly rules out.
+            "retry_on_error": 1,
             "bucket_group": "probe",
             "bucket_budget": remote_budget,
         });
@@ -6807,6 +6953,7 @@ pub fn run_review_graph(
         Err(e) => {
             let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();
             env.degenerate = Some(format!("review graph scheduling failed: {e:#}"));
+            env.degenerate_kind = Some(DegenerateKind::Error);
             for sample in telemetry.rx.try_iter().collect::<Vec<_>>() {
                 emitter.emit(sample);
             }
@@ -6877,6 +7024,7 @@ pub fn run_review_graph(
                     env.bundles
                 ),
             );
+            env.degenerate_kind = Some(DegenerateKind::Error);
         }
         env
     } else {
@@ -6894,6 +7042,7 @@ pub fn run_review_graph(
         // running work, never a silent Clean.
         if env.degenerate.is_none() {
             env.degenerate = Some(errored_steps_degenerate_reason(&report.errored, &steps));
+            env.degenerate_kind = Some(DegenerateKind::Error);
         }
         // (#1530) Say it on STDERR too, not only in the envelope. Since
         // bundling moved into the graph, a launch MISCONFIGURATION (a typo'd

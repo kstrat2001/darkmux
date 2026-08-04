@@ -78,6 +78,87 @@ pub struct Bundle {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BundleSet {
     pub bundles: Vec<Bundle>,
+    /// Per-file decline accounting (#1605) — WHY a file present in the diff
+    /// contributed zero bundles, so a `bundles: 0` result is self-diagnosing
+    /// instead of a bare count. `#[serde(default)]` so an `external_bundles`
+    /// plugin's JSON (which has no notion of this bookkeeping) deserializes
+    /// to the honest empty report rather than failing — a zero-bundle result
+    /// from a THIRD-PARTY bundler stays correctly unexplained (never
+    /// misclassified as a benign/non-code diff it can't actually attest to).
+    #[serde(default)]
+    pub skip: BundleSkipReport,
+}
+
+/// (#1605) WHY a file the diff touched ended up contributing zero bundles.
+/// Enumerated from `build_bundles`'s own decline points below — every early
+/// `continue` (or equivalent "produced nothing" outcome) in that function has
+/// a matching variant here, so this can never silently omit a real decline
+/// path. Kept flat (no catch-all `Other`) on purpose: a NEW decline path
+/// added to `build_bundles` without a matching variant here is a compile
+/// error at the call site that constructs it, not a silent gap in the
+/// breakdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// `scan::ts_file(rel)` is false — the file isn't one of the extensions
+    /// the (TypeScript-only) built-in bundler understands at all. The most
+    /// common real-world cause (darkmux#1605): a diff dominated by JSON
+    /// config, lockfiles, or fixture data never had a chance to bundle.
+    NonCodeExtension,
+    /// A source file the bundler deliberately EXCLUDES rather than fails to
+    /// understand: `scan::ts_file` rejects `tests/` and any basename
+    /// containing "test". Split from [`SkipReason::NonCodeExtension`]
+    /// (#1605 QA finding) because collapsing them made the operator-facing
+    /// no-op comment describe a pure-test-file PR as "non-code content such
+    /// as fixtures, lockfiles, or generated config" — which is false about
+    /// real code, in a comment whose entire job is to be honest about why
+    /// nothing was reviewed. Still BENIGN (the exclusion is deliberate, not
+    /// a failure), just accurately named.
+    TestFileExcluded,
+    /// `source.read_file(rel)` returned `None` — the worktree/GitHub source
+    /// doesn't have this file's content (a checkout desync, a file deleted
+    /// on the reviewed ref, or an API fetch miss). Distinct from
+    /// `NonCodeExtension`: this file WOULD have been considered, but its
+    /// content wasn't available to read.
+    UnreadableInWorktree,
+    /// The hunk carried only removed lines — no surviving added/context line
+    /// in the new-side file at all (e.g. a function deleted in its
+    /// entirety). There is no post-image content left to bundle.
+    NoSurvivingLines,
+    /// Every changed new-side line in this file fell outside any function
+    /// `scan::find_all_functions_in_text` could locate (e.g. a diff that
+    /// only touches top-level statements/imports). Nothing changed-and-
+    /// function-shaped for the bundler to anchor on.
+    NoEnclosingFunction,
+    /// Every function the scanner found for this file's changed lines
+    /// exceeded the bundler's per-function size cap
+    /// (`end0 - start0 > 300` lines) — a real, internal-limit decline, NOT a
+    /// benign "nothing here" (the issue's "diff exceeded some internal
+    /// bound" case, distinct from both of the above).
+    OverSizeCap,
+}
+
+/// One file the diff touched that ended up contributing zero bundles, with
+/// the mechanical reason why (#1605).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedFile {
+    pub path: String,
+    pub reason: SkipReason,
+}
+
+/// The bundler's full per-file decline accounting for one `build_bundles`
+/// run (#1605). `files_considered` is every file `diff::parse_diff` found in
+/// the diff (before any filtering); `files_skipped` names each one that
+/// contributed zero bundles, with why. A file NOT in `files_skipped`
+/// contributed at least one bundle. `bundles: 0` with an EMPTY
+/// `files_skipped` (only possible when `files_considered == 0`, i.e. the
+/// diff itself parsed to no files) is the one case this report can't
+/// explain further — see [`BundleSet::skip`]'s own doc for why an external
+/// bundler's zero-bundle result stays in that same unexplained state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BundleSkipReport {
+    pub files_considered: usize,
+    pub files_skipped: Vec<SkippedFile>,
 }
 
 /// Returns `Some(full_end1)` when `r` shows LESS than the full extent of
@@ -336,6 +417,11 @@ fn build_manifest(
 /// bookkeeping (#1222 packet 3).
 pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> {
     let files = diff::parse_diff(diff_text);
+    // (#1605) Per-file decline accounting — see `BundleSkipReport`'s doc.
+    // `files_considered` is the diff's own file count, fixed up front; every
+    // early `continue` below that leaves a file with zero bundles records WHY
+    // into `skip.files_skipped` before moving on.
+    let mut skip = BundleSkipReport { files_considered: files.len(), files_skipped: Vec::new() };
     let candidate_files = source
         .candidate_files(diff_text)
         .context("resolving candidate files for the repo-wide function index")?;
@@ -356,9 +442,20 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
 
     for (rel, hunks) in &files {
         if !scan::ts_file(rel) {
+            // (#1605 QA finding) Distinguish "not code I understand" from
+            // "code I deliberately exclude" — a `.ts`/`.tsx` file rejected
+            // here was rejected for being a TEST, not for being data.
+            let reason = if rel.ends_with(".ts") || rel.ends_with(".tsx") {
+                SkipReason::TestFileExcluded
+            } else {
+                SkipReason::NonCodeExtension
+            };
+            skip.files_skipped.push(SkippedFile { path: rel.clone(), reason });
             continue;
         }
         let Some(content) = source.read_file(rel)? else {
+            skip.files_skipped
+                .push(SkippedFile { path: rel.clone(), reason: SkipReason::UnreadableInWorktree });
             continue;
         };
         let lines: Vec<String> = content.lines().map(str::to_string).collect();
@@ -368,6 +465,8 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
             changed_new_lines.extend(h.new_lines.iter().copied());
         }
         if changed_new_lines.is_empty() {
+            skip.files_skipped
+                .push(SkippedFile { path: rel.clone(), reason: SkipReason::NoSurvivingLines });
             continue;
         }
 
@@ -385,7 +484,21 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
                 found_fns.push((fndef.start0, fndef.end0, fndef.header.clone(), fndef.name.clone()));
             }
         }
+        if found_fns.is_empty() {
+            skip.files_skipped
+                .push(SkippedFile { path: rel.clone(), reason: SkipReason::NoEnclosingFunction });
+            continue;
+        }
 
+        // (#1605) Did THIS file contribute at least one bundle? Every
+        // function that survives the size cap below unconditionally pushes
+        // at least one `Bundle` (the "hunk" fallback family at the bottom of
+        // this loop fires whenever none of param-flow/differential/siblings
+        // did) — so the only way a non-empty `found_fns` ends with zero new
+        // bundles for this file is every one of its functions hitting the
+        // size cap (or, vanishingly rarely, colliding with a function
+        // already bundled from an earlier file in this same run).
+        let bundles_before_file = bundles.len();
         for (start0, end0, _header, name) in found_fns {
             let seen_key = (rel.clone(), start0, end0);
             if seen_fns.contains(&seen_key) {
@@ -526,9 +639,16 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
                 });
             }
         }
+        // (#1605) `found_fns` was non-empty (checked above) but nothing got
+        // pushed for this file — every candidate function hit the size cap
+        // (see this block's own doc, just above the `bundles_before_file`
+        // snapshot).
+        if bundles.len() == bundles_before_file {
+            skip.files_skipped.push(SkippedFile { path: rel.clone(), reason: SkipReason::OverSizeCap });
+        }
     }
 
-    Ok(BundleSet { bundles })
+    Ok(BundleSet { bundles, skip })
 }
 
 #[cfg(test)]
@@ -722,6 +842,162 @@ mod tests {
         assert!(set.bundles.is_empty(), "a non-TS-file-only diff must yield zero bundles, got: {:?}", set.bundles);
     }
 
+    // ── (#1605) bundler decline-path accounting ────────────────────────
+    //
+    // darkmux#1605: `bundles: 0` plus a fixed string couldn't distinguish
+    // "diff was entirely non-code" from "bundler bug" from "diff exceeded
+    // an internal bound". These tests pin the structured breakdown
+    // (`BundleSet::skip`) that now makes each decline path self-diagnosing
+    // — asserting the REASON tallies, not just the zero-bundles total.
+
+    #[test]
+    fn build_bundles_on_diff_of_only_non_code_files_reports_skip_breakdown_by_reason() {
+        // Two non-code files (a lockfile-shaped JSON, a config-shaped JSON)
+        // — the darkmux#1605 report's own example ("diffs dominated by
+        // JSON/fixture content"). Every file must land in `files_skipped`
+        // tagged `NonCodeExtension`, and `files_considered` must match the
+        // diff's real file count.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "package-lock.json", "{\"lockfileVersion\": 2}\n");
+        write(dir.path(), "fixtures/sample.json", "{\"a\": 1}\n");
+        let diff = "+++ b/package-lock.json\n\
+@@ -1,1 +1,1 @@\n\
++{\"lockfileVersion\": 3}\n\
++++ b/fixtures/sample.json\n\
+@@ -1,1 +1,1 @@\n\
++{\"a\": 2}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(set.bundles.is_empty(), "a non-code-only diff must still yield zero bundles");
+        assert_eq!(
+            set.skip.files_considered, 2,
+            "both diffed files must be counted as considered, got: {:?}",
+            set.skip
+        );
+        assert_eq!(
+            set.skip.files_skipped.len(),
+            2,
+            "both files must be recorded as skipped, got: {:?}",
+            set.skip
+        );
+        let non_code_extension_count = set
+            .skip
+            .files_skipped
+            .iter()
+            .filter(|f| f.reason == SkipReason::NonCodeExtension)
+            .count();
+        assert_eq!(
+            non_code_extension_count, 2,
+            "both skips must carry the NonCodeExtension reason specifically \
+             (never just a bare total), got: {:?}",
+            set.skip
+        );
+        let paths: Vec<&str> = set.skip.files_skipped.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"package-lock.json"));
+        assert!(paths.contains(&"fixtures/sample.json"));
+    }
+
+    #[test]
+    fn build_bundles_separates_excluded_test_files_from_non_code_data() {
+        // (#1605 QA finding) `scan::ts_file` rejects BOTH data files and
+        // TypeScript TEST files, and the first cut tagged them identically —
+        // so a pure-test-file PR got a no-op comment calling its `.test.ts`
+        // sources "fixtures, lockfiles, or generated config". Benign either
+        // way; the LABEL was false, in the one comment whose entire purpose
+        // is explaining honestly why nothing was reviewed.
+        //
+        // This drives the real `build_bundles` ASSIGNMENT. A sibling test in
+        // review_tests.rs pins the CLASSIFIER for the same case — that one
+        // constructs the reason directly, so on its own it would pass against
+        // an implementation that never produces `TestFileExcluded` at all.
+        // Both halves are needed; neither alone is evidence.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "src/foo.test.ts", "export const a = 1;\n");
+        write(dir.path(), "package-lock.json", "{}\n");
+        let diff = "+++ b/src/foo.test.ts\n\
+@@ -1,1 +1,1 @@\n\
++export const a = 2;\n\
++++ b/package-lock.json\n\
+@@ -1,1 +1,1 @@\n\
++{\"v\": 2}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+
+        let by_path: std::collections::BTreeMap<&str, SkipReason> =
+            set.skip.files_skipped.iter().map(|f| (f.path.as_str(), f.reason)).collect();
+        assert_eq!(
+            by_path.get("src/foo.test.ts"),
+            Some(&SkipReason::TestFileExcluded),
+            "a .test.ts file is EXCLUDED code, not non-code data: {:?}",
+            set.skip
+        );
+        assert_eq!(
+            by_path.get("package-lock.json"),
+            Some(&SkipReason::NonCodeExtension),
+            "a lockfile is genuinely non-code and must keep that reason: {:?}",
+            set.skip
+        );
+    }
+
+    #[test]
+    fn build_bundles_reports_unreadable_file_skip_reason() {
+        // The diff names a file that was never written to the worktree —
+        // `source.read_file` returns `None` — distinct from a non-code
+        // extension: this file WOULD have been considered.
+        let dir = TempDir::new().unwrap();
+        let diff = "+++ b/src/missing.ts\n\
+@@ -1,1 +1,1 @@\n\
++export const x = 2;\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(set.bundles.is_empty());
+        assert_eq!(set.skip.files_skipped.len(), 1);
+        assert_eq!(set.skip.files_skipped[0].reason, SkipReason::UnreadableInWorktree);
+    }
+
+    #[test]
+    fn build_bundles_reports_no_enclosing_function_skip_reason() {
+        // Every changed line sits at top level (no function wraps it) — the
+        // scanner finds functions in the file, but none of them enclose a
+        // changed line.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "src/consts.ts",
+            "export const A = 1;\nexport function untouched() {\n  return 0;\n}\n",
+        );
+        let diff = "+++ b/src/consts.ts\n\
+@@ -1,1 +1,1 @@\n\
++export const A = 2;\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(set.bundles.is_empty());
+        assert_eq!(set.skip.files_skipped.len(), 1);
+        assert_eq!(set.skip.files_skipped[0].reason, SkipReason::NoEnclosingFunction);
+    }
+
+    #[test]
+    fn build_bundles_reports_over_size_cap_skip_reason() {
+        // A single changed function whose body exceeds the 300-line cap —
+        // real code, mechanically declined for an internal size limit, not
+        // a benign "nothing here".
+        let dir = TempDir::new().unwrap();
+        let mut body = String::from("export function hugeFn(x) {\n");
+        for i in 0..320 {
+            body.push_str(&format!("  console.log({i});\n"));
+        }
+        body.push_str("  return x;\n}\n");
+        write(dir.path(), "src/huge.ts", &body);
+        let diff = "+++ b/src/huge.ts\n\
+@@ -1,1 +1,1 @@\n\
++  console.log(0);\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(set.bundles.is_empty(), "an over-cap function must yield zero bundles, got: {:?}", set.bundles);
+        assert_eq!(set.skip.files_skipped.len(), 1);
+        assert_eq!(set.skip.files_skipped[0].reason, SkipReason::OverSizeCap);
+    }
+
     #[test]
     fn build_bundles_skips_wholly_removed_function_no_context() {
         // A hunk with ONLY removed lines and no surviving context/added
@@ -745,6 +1021,11 @@ mod tests {
             "a hunk with only removed lines (no context/added line) must yield zero bundles, got: {:?}",
             set.bundles
         );
+        // (#1605) The decline reason is NoSurvivingLines specifically, not a
+        // bare zero — this is a real, honest decline, never mistaken for
+        // NonCodeExtension or a bundler bug.
+        assert_eq!(set.skip.files_skipped.len(), 1);
+        assert_eq!(set.skip.files_skipped[0].reason, SkipReason::NoSurvivingLines);
     }
 
     #[test]

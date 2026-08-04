@@ -12,6 +12,9 @@
     // (not review.rs's production `use` block) so a non-test build never
     // warns about it going unused.
     use darkmux_crew::step_kinds::ArtifactBus;
+    // (#1605) Test-only — production review.rs code never constructs a
+    // `SkippedFile` directly (only `build_bundles` does, in `bundle/mod.rs`).
+    use super::super::bundle::SkippedFile;
 
     // ── fixtures ────────────────────────────────────────────────────
 
@@ -2165,6 +2168,9 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             warnings: Vec::new(),
             remote_budgets: Vec::new(),
             needs_check_clusters: Vec::new(),
+            bundle_skip: None,
+            degenerate_kind: None,
+            probe_retries: 0,
         };
 
         let json = serde_json::to_string_pretty(&env).expect("serialize");
@@ -4805,6 +4811,82 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         }
     }
 
+    /// (#1605 cause 2 — "every probe draw errored") The probe stage's
+    /// `dispatch.map` step opts into a bounded ONE-retry via
+    /// `retry_on_error: 1` (stamped in `build_review_graph_from_config`);
+    /// the verify stage does not. Both ride through the SAME
+    /// `ctx.chat_override` transport (`review_dispatch_override` adapts one
+    /// override for every `dispatch.map` step in the graph), so this test
+    /// proves the DIFFERENCE is real config, not an accident of the mock:
+    /// the probe seat's first dispatch errors and its retry succeeds (two
+    /// calls, recovered), while the verify seat's dispatch errors ONCE and
+    /// is never retried (one call, isolated) — exactly the "transient cause
+    /// retries, the non-transient one doesn't" contract.
+    #[test]
+    fn graph_probe_retries_a_transient_error_once_but_verify_never_retries() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![graph_staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![graph_staffing("fast", "verify-model", 1)]),
+        ]);
+        let probe_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let verify_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_calls_inner = probe_calls.clone();
+        let verify_calls_inner = verify_calls.clone();
+        let ctx = step_ctx_with_chat(&crew, vec![bundle_input("a.ts")], move |call: &ChatCall| {
+            if call.system.contains("verify") {
+                // (#1605) The verify seat's own dispatch failure is the
+                // NON-transient case in this test — it must never retry, no
+                // matter how many times the graph would call back in here.
+                verify_calls_inner.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("verify endpoint unavailable");
+            } else if call.model == "darkmux:judge-model" {
+                Ok(SingleShotReply {
+                    content: CONFIRM_JSON.to_string(),
+                    total_tokens: Some(10),
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: None,
+                })
+            } else {
+                // The probe seat's dispatch: FIRST call errors (a transient
+                // blip), the RETRY succeeds.
+                let n = probe_calls_inner.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    anyhow::bail!("transient: connection reset");
+                }
+                Ok(SingleShotReply {
+                    content: "a real defect".to_string(),
+                    total_tokens: Some(10),
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: None,
+                })
+            }
+        });
+        let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
+
+        assert_eq!(
+            probe_calls.load(Ordering::SeqCst),
+            2,
+            "the transient cause retries exactly once: the failed attempt + one retry"
+        );
+        assert_eq!(
+            verify_calls.load(Ordering::SeqCst),
+            1,
+            "the non-transient cause (verify) never retries: exactly one call"
+        );
+        assert_eq!(
+            env.probe_retries, 1,
+            "the envelope records that a probe retry happened"
+        );
+        assert!(
+            env.degenerate.is_none(),
+            "the probe recovered on retry — this must not read as a degenerate run: {:?}",
+            env.degenerate
+        );
+    }
+
     /// Was `remote_probe_budget_exhaustion_is_reduced_coverage_not_a_dead_
     /// run`. The probe stage's remote bucket IS threaded through to
     /// `env.remote_budgets` on the graph path (`BuiltReviewGraph::
@@ -5836,6 +5918,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             completion_tokens: None,
             served_model: ok.then(|| "gpt-served".to_string()),
             wall_ms: 5,
+            retried: 0,
         };
         // draw 0: b1 flags, b2 dispatch-errors. draw 1: b1 budget-skipped,
         // b2 empty-but-dispatched.
@@ -5914,6 +5997,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             completion_tokens: None,
             served_model: None,
             wall_ms: 3,
+            retried: 1,
         }];
         let mut input = BTreeMap::new();
         input.insert("t-draw0".to_string(), serde_json::to_string(&items).unwrap());
@@ -5926,6 +6010,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(reason.contains("errored"), "{reason}");
         assert!(reason.contains("network down"), "the first error is named: {reason}");
         assert!(recon.budget_row.is_none(), "local-only stage carries no budget row");
+        // (#1605) The item's own `retried: 1` (it consumed its one
+        // `retry_on_error` attempt before still failing) sums into the
+        // reconstruction's `retries` — the figure `run_review_graph` folds
+        // into `ReviewEnvelope::probe_retries`.
+        assert_eq!(recon.retries, 1, "the item's retried attempt must be summed, not dropped");
     }
 
     /// (#1541) THE no-op proof: what `ReviewProbeRenderStepKind::run_streaming`
@@ -6074,6 +6163,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 completion_tokens: None,
                 served_model: None,
                 wall_ms: 3,
+                retried: 0,
             },
             MapItemResult {
                 index: 1,
@@ -6085,6 +6175,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 completion_tokens: None,
                 served_model: None,
                 wall_ms: 3,
+                retried: 0,
             },
         ];
         let mut input = BTreeMap::new();
@@ -6510,4 +6601,117 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
         }
         assert!(found, "expected a telemetry.tokens record on disk after dispatch_chat");
+    }
+
+    // ── (#1605) classify_zero_bundle_degenerate: benign-empty vs error ──
+    //
+    // darkmux#1605 cause 1: `bundles: 0` plus a fixed string couldn't
+    // distinguish "diff was entirely non-code" (benign — nothing to
+    // review) from "bundler bug"/"internal limit hit" (a real degenerate
+    // outcome). `ReviewEnvelope::degenerate_kind` is the typed field the
+    // workflow/render layer branches on instead of string-matching
+    // `degenerate`'s prose.
+
+    fn skip_report(entries: Vec<(&str, SkipReason)>) -> BundleSkipReport {
+        BundleSkipReport {
+            files_considered: entries.len(),
+            files_skipped: entries
+                .into_iter()
+                .map(|(path, reason)| SkippedFile { path: path.to_string(), reason })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_pure_test_file_diff_is_benign_but_is_not_called_non_code() {
+        // (#1605 QA finding) `scan::ts_file` rejects `tests/` and any
+        // basename containing "test" — real TypeScript the bundler
+        // deliberately excludes. Collapsing that into NonCodeExtension made
+        // the no-op comment tell the author their test files were "fixtures,
+        // lockfiles, or generated config". Benign is right; the LABEL was a
+        // lie, in the one comment whose whole job is honesty about why
+        // nothing was reviewed.
+        let report = BundleSkipReport {
+            files_considered: 2,
+            files_skipped: vec![
+                SkippedFile {
+                    path: "src/foo.test.ts".to_string(),
+                    reason: SkipReason::TestFileExcluded,
+                },
+                SkippedFile {
+                    path: "tests/bar.ts".to_string(),
+                    reason: SkipReason::TestFileExcluded,
+                },
+            ],
+        };
+        let (msg, kind) = classify_zero_bundle_degenerate(&Some(report));
+        assert_eq!(kind, DegenerateKind::BenignEmpty, "a deliberate exclusion is benign");
+        assert!(
+            msg.contains("test file"),
+            "the breakdown must name the real reason, not 'non-code extension': {msg}"
+        );
+        assert!(
+            !msg.contains("non-code extension"),
+            "a .ts test file must never be reported as a non-code extension: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_zero_bundle_degenerate_every_skip_non_code_extension_is_benign() {
+        let skip = skip_report(vec![
+            ("package-lock.json", SkipReason::NonCodeExtension),
+            ("fixtures/sample.json", SkipReason::NonCodeExtension),
+        ]);
+        let (msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(kind, DegenerateKind::BenignEmpty, "every skip was non-code — this is benign, not an error");
+        assert!(msg.contains("2 file(s) considered"), "{msg}");
+        assert!(msg.contains("2 skipped"), "{msg}");
+        assert!(msg.contains("non-code extension"), "the summary must name the reason, not just a count: {msg}");
+    }
+
+    #[test]
+    fn classify_zero_bundle_degenerate_mixed_reasons_stay_error() {
+        // One benign skip, one that isn't (unreadable) — a MIX must never
+        // be classified benign, because the non-benign file's absence is
+        // unexplained-by-benignity even though the other one is fine.
+        let skip = skip_report(vec![
+            ("package-lock.json", SkipReason::NonCodeExtension),
+            ("src/missing.ts", SkipReason::UnreadableInWorktree),
+        ]);
+        let (msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(kind, DegenerateKind::Error, "a mix of benign and non-benign reasons must stay Error");
+        assert!(msg.contains("unreadable in worktree"), "{msg}");
+        assert!(msg.contains("non-code extension"), "{msg}");
+    }
+
+    #[test]
+    fn classify_zero_bundle_degenerate_over_size_cap_is_error_not_benign() {
+        // darkmux#1605's third distinguished case ("diff exceeded some
+        // internal bound") is real code the bundler declined on policy —
+        // never a benign "nothing here".
+        let skip = skip_report(vec![("src/huge.ts", SkipReason::OverSizeCap)]);
+        let (msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(kind, DegenerateKind::Error);
+        assert!(msg.contains("over the bundler's size cap"), "{msg}");
+    }
+
+    #[test]
+    fn classify_zero_bundle_degenerate_no_skip_data_stays_error_never_guesses_benign() {
+        // `bundle_override`/an external `--bundler` plugin carries no skip
+        // bookkeeping at all — the honest default is "can't explain this",
+        // never a guessed benign classification.
+        let (msg, kind) = classify_zero_bundle_degenerate(&None);
+        assert_eq!(kind, DegenerateKind::Error);
+        assert_eq!(msg, "no bundles produced from the diff");
+    }
+
+    #[test]
+    fn classify_zero_bundle_degenerate_empty_skip_list_stays_error() {
+        // `files_considered > 0` but nothing recorded as skipped is
+        // internally inconsistent (every considered file should have
+        // either contributed a bundle or been skipped) — never guess
+        // benign from an empty breakdown.
+        let skip = BundleSkipReport { files_considered: 3, files_skipped: Vec::new() };
+        let (_msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(kind, DegenerateKind::Error);
     }
