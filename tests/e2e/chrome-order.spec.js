@@ -132,3 +132,32 @@ test('the panel asks for a column count the phone can actually show', async ({ p
     'a 390px phone must ask for fewer than the old 60-column floor'
   ).toBeLessThan(60);
 });
+
+// (#1640) Touch and input sizing on a phone.
+//
+// One of these two is testable here and one is not, and the difference is worth
+// stating: the iOS auto-zoom heuristic is WebKit-only, so Chromium will never
+// reproduce it and no assertion here can prove the fix works — only that the
+// font-size that triggers it is gone. That is a proxy, and it is named as one.
+
+test('no text input is small enough to trigger iOS auto-zoom on focus', async ({ page }) => {
+  // iOS Safari zooms the whole page when a text input with font-size < 16px
+  // takes focus. The operator reads this over the tailnet on a phone, so the
+  // stream filter yanked the layout every time he typed.
+  //
+  // PROXY ASSERTION: this checks the computed font-size, not the zoom. Chromium
+  // does not implement the heuristic, so the real behaviour is unobservable in
+  // this harness. Asserting the trigger condition is the most this suite can
+  // honestly do.
+  await page.goto('/index-lab.html');
+  const sizes = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).map((el) => ({
+      id: el.id || el.className,
+      px: parseFloat(getComputedStyle(el).fontSize),
+    }))
+  );
+  expect(sizes.length, 'no text inputs found — the check would be vacuous').toBeGreaterThan(0);
+  for (const s of sizes) {
+    expect(s.px, `input \`${s.id}\` is ${s.px}px — iOS will zoom the page on focus`).toBeGreaterThanOrEqual(16);
+  }
+});
