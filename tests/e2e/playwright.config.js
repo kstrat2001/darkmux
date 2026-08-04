@@ -83,6 +83,13 @@ const PORT = 47823;
     '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-flow-src" content="./xss-flow.jsonl">\n<meta name="darkmux-lab-runs-src" content="./lab-runs-fixture.json">\n<meta name="darkmux-runs-src" content="./runs-fixture.json">'
   );
   fs.writeFileSync(path.join(SERVED, 'index-lab.html'), lab);
+  // (#1639) A page with NO flow-src — the shape a real daemon serves.
+  // Every other harness variant injects `darkmux-flow-src`, and boot skips
+  // `catalogQuery()` whenever one is present, so no BOOT-TIME deep link
+  // (`#session=`, `#mission=`) was reachable from a test at all: a whole
+  // class of production entry point with structurally zero coverage. Specs
+  // using this page stub the daemon's flow endpoints via page.route.
+  fs.writeFileSync(path.join(SERVED, 'index-live.html'), viewer);
   fs.writeFileSync(
     path.join(SERVED, 'lab-runs-fixture.json'),
     fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'lab-runs-fixture.json'), 'utf8')

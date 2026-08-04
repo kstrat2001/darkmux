@@ -3279,6 +3279,21 @@ function labQuery(){
 function syncLabHash(inLab, inMachine, inConsole){
   const raw=(location.hash||"").replace(/^#/,"");
   const isBareDate=/^\d{4}-\d{2}-\d{2}$/.test(raw);
+  // (#1639) The session drill-down is a real destination and has to be
+  // addressable like every other lens. Before this it was the ONE level with
+  // no URL representation: drilling in left the hash untouched, so a reload,
+  // a backgrounded PWA relaunch, or a tab reopened from history silently
+  // dropped the operator back to the fleet hero. Handled ahead of the
+  // clear-lens-params branch below, which would otherwise treat a
+  // subsystem-level render as "outside the lenses" and leave a stale hash.
+  if(!inLab&&!inMachine&&!inConsole&&state.level==="subsystem"&&state.session){
+    const p=isBareDate?new URLSearchParams():new URLSearchParams(raw);
+    p.set("session",state.session);
+    p.delete("lens");p.delete("run");p.delete("kind");p.delete("panel");p.delete("mission");
+    const next=p.toString();
+    if(next!==raw)history.replaceState(null,"","#"+next);
+    return;
+  }
   if(!inLab&&!inMachine&&!inConsole){
     // Outside the lab/machine lenses, only touch the hash when it carries
     // lens params to REMOVE — a bare-date or #mission=/#session= hash the
@@ -3287,8 +3302,11 @@ function syncLabHash(inLab, inMachine, inConsole){
     // render after boot).
     if(!raw||isBareDate)return;
     const p=new URLSearchParams(raw);
-    if(!p.has("lens")&&!p.has("run")&&!p.has("kind"))return;
-    p.delete("lens");p.delete("run");p.delete("kind");
+    // (#1639) `session` joins the params this branch clears — navigating UP
+    // out of a session must not leave its id in the address bar, or the next
+    // reload drops the operator back into a view they already left.
+    if(!p.has("lens")&&!p.has("run")&&!p.has("kind")&&!p.has("session"))return;
+    p.delete("lens");p.delete("run");p.delete("kind");p.delete("session");
     const next=p.toString();
     history.replaceState(null,"",next?("#"+next):location.pathname+location.search);
     return;
@@ -3298,17 +3316,21 @@ function syncLabHash(inLab, inMachine, inConsole){
     // Addressable like every other lens: what the operator is looking at is
     // what they copy out of the address bar. The phone dashboard is a
     // first-class consumer of that (a bookmarked panel is the whole point).
-    p.set("lens","console");p.delete("run");p.delete("kind");
+    p.set("lens","console");p.delete("run");p.delete("kind");p.delete("session");
     const pid=state.panelId||"mission-status";
     if(pid==="mission-status")p.delete("panel"); else p.set("panel",pid);
   }else if(inMachine){
-    p.set("lens","machine");p.delete("run");
+    p.set("lens","machine");p.delete("run");p.delete("session");
   }else{
     // (#1584) Always writes the CURRENT spelling — an operator who arrived on
     // a legacy `lens=lab` link has their address bar upgraded to
     // `lens=runs&kind=lab` (the same view, addressably named), so what they
     // re-copy is the current form.
     p.set("lens","runs");
+    // (#1639) Moving BETWEEN lenses leaves the session just as much as
+    // going up to fleet does — a lingering id would send the next reload
+    // back into a view the operator deliberately navigated away from.
+    p.delete("session");
     if(state.runsKind&&state.runsKind!=="all")p.set("kind",state.runsKind);
     else p.delete("kind");
     if(state.level==="lab-run"&&state.labRunDir!=null)p.set("run",state.labRunDir);
@@ -3865,6 +3887,13 @@ async function boot(){
   // (#1584) The boot filter is applied BEFORE either entry point so a legacy
   // `#lens=lab` link lands pre-filtered to Lab, and a `kind=` link lands on
   // exactly the slice it names.
+  // (#1639) `#session=<id>` names the session exactly and the daemon already
+  // returns correctly-scoped records for it — but boot only ever redirected
+  // the `mission` kind, so the data arrived and the page rendered the fleet
+  // hero anyway. Restore the level the URL names. Lower precedence than the
+  // lens deep links below by the same rule they use on each other: a URL
+  // carrying both is contradictory, and the explicit lens wins.
+  if(!lq&&!mq&&nq==null&&cq&&cq.kind==="session"){ drillSession(cq.id); }
   if(lq){ state.runsKind=lq.kind||"all"; if(lq.run!=null) drillLabRun(lq.run); else goRuns(); }
   // (#1508 deep-link) Boot straight into the unified machine page (local).
   else if(mq){ goMachine(); }
