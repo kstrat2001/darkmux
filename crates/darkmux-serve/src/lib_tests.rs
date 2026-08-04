@@ -3875,6 +3875,7 @@
             tokens_final: None,
             turns_final: None,
             cloud: None,
+            local_ok: None,
             model: None,
         };
         let v = serde_json::to_value(&row).unwrap();
@@ -3905,6 +3906,7 @@
             tokens_final: None,
             turns_final: None,
             cloud: None,
+            local_ok: None,
             model: Some("darkmux:qwen/qwen3.6-27b".to_string()),
         };
         let v = serde_json::to_value(&row).unwrap();

@@ -1125,25 +1125,33 @@ function seedMetricsFromGraph(metrics, g){
       var tf = (typeof s.tokensFinal === "number") ? s.tokensFinal : 0;
       var nf = (typeof s.turnsFinal === "number") ? s.turnsFinal : 0;
       var cl = !!s.cloud;
+      // (#1626) The backfill's own local evidence. Without this the seeded
+      // metrics had NO `localOk` at all, so every step on a page opened AFTER
+      // a run finished — which is most viewing, since SSE is tail-from-now —
+      // read as unattributed. That would have replaced a wrong number with a
+      // useless one. `localOk` is emitted by the server only when a clean
+      // terminal carried no endpoint, so absence still means "no evidence".
+      var lok = !!s.localOk;
       var st = tsToMs(s.startedTs);
       // (#1483) `toolsFinal` seeds the same way turns/tokens do, so a page
       // opened after an agentic seat closed still shows its tool-call total if
       // the server ever folds it (absent today -> 0, no behavior change; the
       // key must exist so the live fold's `Math.max` never sees `undefined`).
       var cf = (typeof s.toolsFinal === "number") ? s.toolsFinal : 0;
-      if (!tf && !nf && !cf && !cl && !st) return;
-      var cur = out[s.id] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, startTs:0 };
+      if (!tf && !nf && !cf && !cl && !lok && !st) return;
+      var cur = out[s.id] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, localOk:false, startTs:0 };
       var ntf = Math.max(cur.tokFinal, tf);
       var nnf = Math.max(cur.turnFinal, nf);
       var ncf = Math.max(cur.toolFinal||0, cf);
       var ncl = cur.cloud || cl;
+      var nlok = cur.localOk || lok;
       // Keep the EARLIEST known start; 0 means unknown, so a real `st` always
       // wins over 0 (and a live start bookend already set wins by min).
       var curSt = cur.startTs || 0;
       var nst = curSt ? (st ? Math.min(curSt, st) : curSt) : st;
-      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncf === (cur.toolFinal||0) && ncl === cur.cloud && nst === curSt) return;
+      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncf === (cur.toolFinal||0) && ncl === cur.cloud && nlok === (cur.localOk||false) && nst === curSt) return;
       if (out === metrics) out = Object.assign({}, metrics);
-      out[s.id] = Object.assign({ toolRun:0 }, cur, { tokFinal:ntf, turnFinal:nnf, toolFinal:ncf, cloud:ncl, startTs:nst });
+      out[s.id] = Object.assign({ toolRun:0 }, cur, { tokFinal:ntf, turnFinal:nnf, toolFinal:ncf, cloud:ncl, localOk:nlok, startTs:nst });
     });
   });
   return out;
