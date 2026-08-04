@@ -71,7 +71,7 @@
     },
     {
       "name": "passes",
-      "description": "(#1266) The judge seat's consensus DEPTH (passes) \u2014 1 single / 2 double-confirm / N unanimous. Governs the JUDGE seat only (the sole consumer; the probe/verify seats ignore it). Absent -> the resolver's default (2, double-confirm). Validated `>= 1` at resolution time (a zero-pass judge makes no ruling); lenient on read otherwise (contract 7). Threaded to the already-parameterized `multi_pass_confirm` pass count via `ResolvedSeatStaffing.passes`.",
+      "description": "(#1266) The judge seat's consensus DEPTH (passes) — 1 single / 2 double-confirm / N unanimous. Governs the JUDGE seat only (the sole consumer; the probe/verify seats ignore it). Absent -> the resolver's default (2, double-confirm). Validated `>= 1` at resolution time (a zero-pass judge makes no ruling); lenient on read otherwise (contract 7). Threaded to the already-parameterized `multi_pass_confirm` pass count via `ResolvedSeatStaffing.passes`.",
       "required": false
     },
     {
@@ -147,7 +147,7 @@
         {
           "id": "review-probe-high-task",
           "display_name": "Probe high",
-          "description": "probe role `review-probe-high` \u2014 one role, one task (#1512); parallelism with the other two probe tasks is emergent from all three depending only on review-bundle-task",
+          "description": "probe role `review-probe-high` — one role, one task (#1512); parallelism with the other two probe tasks is emergent from all three depending only on review-bundle-task",
           "role_id": "review-probe-high",
           "depends_on": [
             "review-bundle-task"
@@ -171,7 +171,7 @@
         {
           "id": "review-probe-mid-task",
           "display_name": "Probe mid",
-          "description": "probe role `review-probe-mid` \u2014 one role, one task (#1512)",
+          "description": "probe role `review-probe-mid` — one role, one task (#1512)",
           "role_id": "review-probe-mid",
           "depends_on": [
             "review-bundle-task"
@@ -192,7 +192,7 @@
         {
           "id": "review-probe-low-task",
           "display_name": "Probe low",
-          "description": "probe role `review-probe-low` \u2014 one role, one task (#1512)",
+          "description": "probe role `review-probe-low` — one role, one task (#1512)",
           "role_id": "review-probe-low",
           "depends_on": [
             "review-bundle-task"
@@ -213,7 +213,7 @@
         {
           "id": "review-dedup-task",
           "display_name": "Dedup",
-          "description": "dedup probe flags \u2014 mechanism-family keying + anchor matching. (#1512, #1513 review) `depends_on` below is build_review_graph's CLAIM/PRUNE boundary, NOT the probe role registry: a resolved staffing claims its declared task by role_id, and any declared task nobody claims is pruned (loudly, with a warning). Probe roles are discovered separately, by resolve_review_roles walking every task in this document and classifying each by its step kind. Adding/removing a probe task here (with its own role_id, and its entry in this depends_on list) still changes the probe count with zero Rust changes.",
+          "description": "dedup probe flags — mechanism-family keying + anchor matching. (#1512, #1513 review) `depends_on` below is build_review_graph's CLAIM/PRUNE boundary, NOT the probe role registry: a resolved staffing claims its declared task by role_id, and any declared task nobody claims is pruned (loudly, with a warning). Probe roles are discovered separately, by resolve_review_roles walking every task in this document and classifying each by its step kind. Adding/removing a probe task here (with its own role_id, and its entry in this depends_on list) still changes the probe count with zero Rust changes.",
           "depends_on": [
             "review-probe-high-task",
             "review-probe-mid-task",
@@ -237,7 +237,7 @@
         {
           "id": "review-judge-task",
           "display_name": "Judge",
-          "description": "double-confirm judge \u2014 internal pass1/pass2 loop over deduped flags",
+          "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
           "role_id": "review-judge",
           "steps": [
             {
@@ -262,7 +262,7 @@
         {
           "id": "review-verify-task",
           "display_name": "Verify",
-          "description": "verify \u2014 render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
+          "description": "verify — render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
           "role_id": "review-verify",
           "steps": [
             {
@@ -287,7 +287,7 @@
         {
           "id": "review-synthesis-task",
           "display_name": "Synthesis",
-          "description": "synthesis \u2014 apply verify adjudications, finalize tier counts + needs-check clustering",
+          "description": "synthesis — apply verify adjudications, finalize tier counts + needs-check clustering",
           "depends_on": [
             "review-verify-task"
           ],

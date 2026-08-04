@@ -191,7 +191,8 @@ fn task_status(task: &Task, steps: &BTreeMap<String, Step>) -> NodeStatus {
 
 /// `true` iff `step` is ready to run: itself `Planned`, AND —
 /// - if it's the FIRST step of `task` (or `task.step_ids` doesn't list it
-///   at all — defensive): every Task named in `task.depends_on` has
+///   at all — defensive): every Task named in `task.depends_on` OR
+///   `task.reads` (#1619 — the ledger relation orders identically) has
 ///   `task_status(..) == Complete`;
 /// - otherwise (a later step in a multi-step Task): the step immediately
 ///   before it in `task.step_ids` is `Complete`.
@@ -232,7 +233,8 @@ fn step_is_ready(
 
 /// The `input` map `step`'s job should receive:
 /// - If `step` is the FIRST step of `task`: one entry per `task.depends_on`
-///   Task id whose LAST step is `Complete` and has recorded `output`,
+///   OR `task.reads` (#1619 — deduped when both name the same task) Task id
+///   whose LAST step is `Complete` and has recorded `output`,
 ///   keyed by that dependency TASK's id (#1341 — Task is the
 ///   dependency-declaring unit now; see `Task::depends_on`'s doc for the
 ///   "only the first step receives upstream Task output" design choice).
