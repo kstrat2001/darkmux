@@ -1,16 +1,16 @@
-// The mission graph's status vocabulary (#1626, #1627).
+// The mission graph's status vocabulary (#1627, #1627).
 //
 // Found by a coverage-gap audit, not by the suite — which is the point. Three
 // defects, and the first two were created by the fix for the third:
 //
-//   #1626 split `mission abort` from `mission close` on the Rust side, and
+//   #1627 split `mission abort` from `mission close` on the Rust side, and
 //   shipped without teaching this file either the new ACTION or the new
 //   STATUS. So an abort record resolved to null and was dropped, `aborted`
 //   ranked 0 (level with `planned`), and an aborted mission's own graph page
 //   kept flying a "● live" pill. The lie the fix was filed to kill, one file
 //   over, introduced by the fix.
 //
-//   #1627 is the general form and is worse: `statusRank` returned 0 for ANY
+//   #1628 is the general form and is worse: `statusRank` returned 0 for ANY
 //   unrecognized status, and the merge ratchet keeps the page's value when
 //   rank(old) >= rank(new). A `running` phase whose disk status became a value
 //   this build has never heard of kept rendering `running` forever. That is
@@ -103,7 +103,7 @@ test('aborted is visually distinct from finalized, not just textually', async ({
   // Colour is the fast read a status badge exists for. Without its own rule
   // `aborted` fell through to the same muted grey as `finalized`, so a
   // teardown and a success looked identical to anyone scanning rather than
-  // reading — the #1626 defect on the surface built to prevent it.
+  // reading — the #1627 defect on the surface built to prevent it.
   const { errors } = await open(page, [graph('aborted', 'abandoned')]);
   const aborted = await page
     .locator('.mstatus')
@@ -124,7 +124,7 @@ test('aborted is visually distinct from finalized, not just textually', async ({
 test('a status this build does not know wins the merge instead of being swallowed', async ({
   page,
 }) => {
-  // (#1627) The ratchet, exercised through the 20s reconcile — the only path
+  // (#1628) The ratchet, exercised through the 20s reconcile — the only path
   // where a disk snapshot merges into the page's live state, and a path no
   // spec had ever driven.
   //

@@ -262,7 +262,7 @@ pub enum MissionStatus {
     /// Terminal (FAILURE path). A mission the operator tore down with
     /// `mission abort`, or one reconciled after its process died.
     ///
-    /// (#1626) Before this existed, `abort` wrote `Finalized` — the status
+    /// (#1627) Before this existed, `abort` wrote `Finalized` — the status
     /// whose own doc, one line up, calls it the SUCCESS path. So a review that
     /// completed and a review someone killed were the same value on disk, and
     /// the board could not tell them apart: 6 of 51 phase-bearing missions on

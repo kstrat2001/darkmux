@@ -89,7 +89,7 @@
   .mstatus{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted)}
   .mstatus.active{color:var(--good);border-color:var(--good)}
   .mstatus.finalized{color:var(--muted)}
-  /* (#1626) Aborted is a TERMINAL, but not a success. Without its own rule it
+  /* (#1627) Aborted is a TERMINAL, but not a success. Without its own rule it
      fell through to the base muted grey — pixel-identical to `finalized`, so
      an operator scanning badges by colour saw a torn-down mission and a
      completed one as the same thing. Warn-toned: ended, not achieved. */
@@ -836,11 +836,11 @@ var STATUS_ACTIONS = {
   "step start": "running", "step complete": "complete", "step error": "error",
   "phase start": "running", "phase complete": "complete", "phase abandon": "abandoned",
   "mission start": "active", "mission close": "finalized", "mission pause": "paused", "mission resume": "active",
-  // (#1626) `mission abort` is its OWN terminal, not a flavor of close. The
+  // (#1627) `mission abort` is its OWN terminal, not a flavor of close. The
   // fix that split them on the Rust side shipped without this line, so an
   // abort record resolved to `null` here and was silently dropped — the
   // aborted mission's own graph page kept flying a "● live" pill. Exactly the
-  // lie #1626 was filed to kill, reproduced one file over by its own fix.
+  // lie #1627 was filed to kill, reproduced one file over by its own fix.
   "mission abort": "aborted",
 };
 function statusFromRecord(rec){
@@ -863,10 +863,10 @@ function normalizeMissionStatus(s){
 // a page-side "complete" is never overwritten by a disk-side "error" or
 // vice versa on rank alone (equal rank keeps the page's value; the SSE
 // delta that set it is more recent than the disk snapshot).
-// (#1626) `aborted` ranks 2 — TERMINAL, alongside finalized/abandoned.
+// (#1627) `aborted` ranks 2 — TERMINAL, alongside finalized/abandoned.
 var STATUS_RANK = { planned: 0, running: 1, complete: 2, error: 2, abandoned: 2,
                     active: 1, finalized: 2, closed: 2, aborted: 2, paused: 1 };
-// (#1627) An unrecognized status must NOT rank 0.
+// (#1628) An unrecognized status must NOT rank 0.
 //
 // Ranking it 0 put it level with `planned`, and the ratchet keeps the PAGE's
 // value whenever `rank(old) >= rank(new)`. So a phase showing `running`
@@ -874,7 +874,7 @@ var STATUS_RANK = { planned: 0, running: 1, complete: 2, error: 2, abandoned: 2,
 // a newer darkmux, a version-skewed peer, a variant added later — kept
 // rendering `running`, pulsing dot and all, indefinitely.
 //
-// Worse than the absence-inference class (#1620/#1621/#1626): those misread a
+// Worse than the absence-inference class (#1620/#1621/#1627): those misread a
 // MISSING value; this one actively DISCARDS a present, correctly delivered one
 // because the ratchet cannot rank it.
 //

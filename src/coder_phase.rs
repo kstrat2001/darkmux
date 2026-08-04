@@ -1412,7 +1412,7 @@ fn terminate_mission(mission_id: &str, kind: MissionTerminal, reasoning: Option<
     // Close the mission. Best-effort against an already-terminal mission (a
     // graph/review run may have auto-closed it) — surface, don't fail.
     //
-    // (#1626) The terminal reflects WHICH verb ran. `abort` used to write
+    // (#1627) The terminal reflects WHICH verb ran. `abort` used to write
     // `Finalized` — the success terminal — so a torn-down mission and a
     // completed one were the same value on disk and the board could not tell
     // them apart. `kind` has always known the difference; it just wasn't

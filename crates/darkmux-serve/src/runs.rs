@@ -468,7 +468,7 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg]) -> RunStatus 
             }
             RunStatus::Running
         }
-        // (#1626) A torn-down mission is NOT a completed one, and must never
+        // (#1627) A torn-down mission is NOT a completed one, and must never
         // resolve through the envelope branch below — an abort leaves whatever
         // envelope the run had written before it died, so reading it would let
         // a killed run inherit a success verdict it never earned.

@@ -944,7 +944,7 @@ pub fn mission_close_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
     mission_terminal_with_reasoning(id, MissionStatus::Finalized, reasoning)
 }
 
-/// (#1626) Drive a mission to a TERMINAL status — `Finalized` for the success
+/// (#1627) Drive a mission to a TERMINAL status — `Finalized` for the success
 /// path, `Aborted` for a teardown.
 ///
 /// Both were `Finalized` before this, so a review that completed and a review
@@ -1580,7 +1580,7 @@ mod tests {
     /// `mission_status.rs`'s drift detector already knows about (#1463's own
     /// finding), now prevented structurally at the source instead of merely
     /// detected after the fact.
-    /// (#1626) A torn-down mission is a DISTINCT terminal from a completed one.
+    /// (#1627) A torn-down mission is a DISTINCT terminal from a completed one.
     ///
     /// `abort` used to write `Finalized` — the status whose own doc calls it
     /// the SUCCESS path — so a review that finished and a review someone killed

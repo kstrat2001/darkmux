@@ -474,7 +474,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
             MissionStatus::Active,
             MissionStatus::Paused,
             MissionStatus::Finalized,
-            // (#1626) Its own section, last: a torn-down mission is terminal but
+            // (#1627) Its own section, last: a torn-down mission is terminal but
             // is NOT a success, and folding it under FINALIZED is what let 6 of
             // 51 phase-bearing missions read as finished work that never ran.
             MissionStatus::Aborted,
@@ -733,7 +733,7 @@ fn last_activity(m: &Mission) -> u64 {
 /// outranks a derived one).
 fn default_limit(group: MissionStatus) -> usize {
     match group {
-        // (#1626) Aborted is closed history like Finalized — recent context,
+        // (#1627) Aborted is closed history like Finalized — recent context,
         // not the question the board answers.
         MissionStatus::Finalized | MissionStatus::Aborted => 3,
         MissionStatus::Active | MissionStatus::Paused => 10,

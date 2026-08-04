@@ -1758,7 +1758,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         assert_eq!(phase_status_now("p1"), PhaseStatus::Abandoned, "Planned → Abandoned");
         assert_eq!(phase_status_now("p2"), PhaseStatus::Abandoned, "Running → Abandoned");
-        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Aborted);  // (#1626) abort writes its OWN terminal
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Aborted);  // (#1627) abort writes its OWN terminal
     }
 
     #[test]
@@ -1788,7 +1788,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(abort(ab, None).unwrap(), 0);
         assert_eq!(phase_status_now("a1"), PhaseStatus::Complete, "Complete is left as-is, never flipped to Abandoned");
         assert_eq!(phase_status_now("a2"), PhaseStatus::Abandoned, "Abandoned stays Abandoned");
-        assert_eq!(mission_status_now(ab), crew::types::MissionStatus::Aborted);  // (#1626) abort writes its OWN terminal
+        assert_eq!(mission_status_now(ab), crew::types::MissionStatus::Aborted);  // (#1627) abort writes its OWN terminal
     }
 
     #[test]
@@ -1849,7 +1849,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         assert_eq!(abort(mid, None).unwrap(), 0);
         assert!(every_phase_terminal(mid), "abort must leave EVERY phase terminal");
-        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Aborted);  // (#1626) abort writes its OWN terminal
+        assert_eq!(mission_status_now(mid), crew::types::MissionStatus::Aborted);  // (#1627) abort writes its OWN terminal
     }
 
     // ── (#1463 CONSIDER 6) branch force-delete guard (pure) ──────────────────
