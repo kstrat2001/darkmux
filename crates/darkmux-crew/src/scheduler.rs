@@ -88,7 +88,10 @@ pub fn detect_cycles(tasks: &BTreeMap<String, Task>) -> Result<()> {
         colors.insert(id.to_string(), Color::Gray);
         path.push(id.to_string());
         if let Some(task) = tasks.get(id) {
-            for dep in &task.depends_on {
+            // (#1619) `reads` is an ordering relation too — a reads loop is
+            // exactly as unschedulable as a depends_on loop, so the cycle
+            // walk covers the union.
+            for dep in task.depends_on.iter().chain(task.reads.iter()) {
                 visit(dep, tasks, colors, path)?;
             }
         }
@@ -144,7 +147,8 @@ pub fn shared_workdir_warnings(tasks: &BTreeMap<String, Task>) -> Vec<String> {
 /// `true` iff `from` depends on `target`, directly or transitively, via
 /// `Task.depends_on` edges.
 fn task_depends_transitively(from: &Task, target: &str, tasks: &BTreeMap<String, Task>) -> bool {
-    let mut stack: Vec<&str> = from.depends_on.iter().map(String::as_str).collect();
+    let mut stack: Vec<&str> =
+        from.depends_on.iter().chain(from.reads.iter()).map(String::as_str).collect();
     let mut seen: HashSet<&str> = HashSet::new();
     while let Some(id) = stack.pop() {
         if id == target {
@@ -154,7 +158,9 @@ fn task_depends_transitively(from: &Task, target: &str, tasks: &BTreeMap<String,
             continue;
         }
         if let Some(t) = tasks.get(id) {
-            stack.extend(t.depends_on.iter().map(String::as_str));
+            // (#1619) reads orders like depends_on — same union as the
+            // cycle walk above.
+            stack.extend(t.depends_on.iter().chain(t.reads.iter()).map(String::as_str));
         }
     }
     false
@@ -185,7 +191,8 @@ fn task_status(task: &Task, steps: &BTreeMap<String, Step>) -> NodeStatus {
 
 /// `true` iff `step` is ready to run: itself `Planned`, AND —
 /// - if it's the FIRST step of `task` (or `task.step_ids` doesn't list it
-///   at all — defensive): every Task named in `task.depends_on` has
+///   at all — defensive): every Task named in `task.depends_on` OR
+///   `task.reads` (#1619 — the ledger relation orders identically) has
 ///   `task_status(..) == Complete`;
 /// - otherwise (a later step in a multi-step Task): the step immediately
 ///   before it in `task.step_ids` is `Complete`.
@@ -209,9 +216,15 @@ fn step_is_ready(
             .get(&task.step_ids[i - 1])
             .map(|s| s.status == NodeStatus::Complete)
             .unwrap_or(false),
+        // (#1619) `reads` joins `depends_on` in readiness: a task can no
+        // more start before an output it READS exists than before an
+        // explicit dependency completes. This is what lets the ledger
+        // relation carry data without a rendered edge and stay correct —
+        // ordering is enforced HERE, not by the graph drawing.
         _ => task
             .depends_on
             .iter()
+            .chain(task.reads.iter())
             .all(|dep_id| tasks.get(dep_id).map(|t| task_status(t, steps) == NodeStatus::Complete).unwrap_or(false)),
     }
 }
@@ -220,7 +233,8 @@ fn step_is_ready(
 
 /// The `input` map `step`'s job should receive:
 /// - If `step` is the FIRST step of `task`: one entry per `task.depends_on`
-///   Task id whose LAST step is `Complete` and has recorded `output`,
+///   OR `task.reads` (#1619 — deduped when both name the same task) Task id
+///   whose LAST step is `Complete` and has recorded `output`,
 ///   keyed by that dependency TASK's id (#1341 — Task is the
 ///   dependency-declaring unit now; see `Task::depends_on`'s doc for the
 ///   "only the first step receives upstream Task output" design choice).
@@ -247,9 +261,14 @@ pub fn gather_inputs(
                 .map(|output| [(prev_id.clone(), output)].into_iter().collect())
                 .unwrap_or_default()
         }
+        // (#1619) `reads` entries deliver exactly like `depends_on` entries —
+        // the dependency task's LAST step output, keyed by that task's id.
+        // The BTreeMap collect dedups a task named in both relations (legal
+        // during config migration) to one entry.
         _ => task
             .depends_on
             .iter()
+            .chain(task.reads.iter())
             .filter_map(|dep_task_id| {
                 let dep_task = tasks.get(dep_task_id)?;
                 let last_step_id = dep_task.step_ids.last()?;
@@ -825,6 +844,7 @@ fn synthetic_task(step: &Step) -> Task {
         display_name: None,
         step_ids: vec![step.id.clone()],
         depends_on: Vec::new(),
+        reads: Vec::new(),
         role_id: None,
         profile_name: None,
         workdir: None,
@@ -931,6 +951,7 @@ mod tests {
             display_name: None,
             step_ids: vec![step_id.clone()],
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,
@@ -1052,6 +1073,7 @@ mod tests {
             display_name: None,
             step_ids: vec!["multi-0".to_string(), "multi-1".to_string()],
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,
@@ -1081,6 +1103,98 @@ mod tests {
         let steps: BTreeMap<String, Step> =
             [("multi-0".to_string(), step0), ("multi-1".to_string(), step1.clone())].into_iter().collect();
         assert!(step_is_ready(&step1, &task, &tasks, &steps));
+    }
+
+    // ─── the output ledger (#1619 — `Task.reads`) ───────────────────
+
+    /// `task_and_step` with `reads` instead of `depends_on`.
+    fn task_and_step_reading(id: &str, reads: &[&str]) -> (Task, Step) {
+        let (mut task, step) = task_and_step(id, &[]);
+        task.reads = reads.iter().map(|s| s.to_string()).collect();
+        (task, step)
+    }
+
+    #[test]
+    fn a_task_never_starts_before_the_output_it_reads_exists() {
+        // (#1619) The ledger relation carries data WITHOUT a rendered edge,
+        // which is only safe because ordering is enforced HERE: `reads`
+        // joins `depends_on` in readiness. If this chain link is dropped,
+        // the review config's judge — which now names dedup via `reads`
+        // alone — dispatches against an empty docket.
+        let (task_a, step_a) = task_and_step("a", &[]); // still Planned
+        let (task_b, step_b) = task_and_step_reading("b", &["a"]);
+        let (tasks, steps) = graph(vec![(task_a, step_a), (task_b.clone(), step_b.clone())]);
+        assert!(
+            !step_is_ready(&steps["b-step"], &task_b, &tasks, &steps),
+            "b reads a's output — it must not be ready while a is incomplete"
+        );
+
+        let (task_a2, mut step_a2) = task_and_step("a", &[]);
+        step_a2.status = NodeStatus::Complete;
+        let (tasks, steps) = graph(vec![(task_a2, step_a2), (task_b.clone(), step_b)]);
+        assert!(
+            step_is_ready(&steps["b-step"], &task_b, &tasks, &steps),
+            "once a completes, b becomes ready"
+        );
+    }
+
+    #[test]
+    fn gather_inputs_delivers_read_outputs_keyed_by_task_id() {
+        // (#1619) A `reads` entry delivers exactly like a `depends_on`
+        // entry — the ledger is the same steps map, only the access rule
+        // widened. Asserted on the delivered VALUE, keyed by the read
+        // task's id.
+        let (task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.status = NodeStatus::Complete;
+        step_a.output = Some("dedup docket".to_string());
+        let (task_b, step_b) = task_and_step_reading("b", &["a"]);
+        let (tasks, steps) = graph(vec![(task_a, step_a), (task_b.clone(), step_b.clone())]);
+        let input = gather_inputs(&step_b, &task_b, &tasks, &steps);
+        assert_eq!(
+            input.get("a").map(String::as_str),
+            Some("dedup docket"),
+            "the read task's output must arrive in the input map"
+        );
+    }
+
+    #[test]
+    fn gather_inputs_dedups_a_task_named_in_both_relations() {
+        // Legal during config migration: the same upstream in `depends_on`
+        // AND `reads` must deliver ONE entry, not two copies.
+        let (task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.status = NodeStatus::Complete;
+        step_a.output = Some("once".to_string());
+        let (mut task_b, step_b) = task_and_step("b", &["a"]);
+        task_b.reads = vec!["a".to_string()];
+        let (tasks, steps) = graph(vec![(task_a, step_a), (task_b.clone(), step_b.clone())]);
+        let input = gather_inputs(&step_b, &task_b, &tasks, &steps);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input.get("a").map(String::as_str), Some("once"));
+    }
+
+    #[test]
+    fn a_reads_cycle_is_rejected_like_a_depends_on_cycle() {
+        // (#1619) `reads` orders execution, so a reads loop deadlocks the
+        // graph identically — it must fail at load, not hang at run.
+        let (mut task_a, step_a) = task_and_step("a", &[]);
+        task_a.reads = vec!["b".to_string()];
+        let (task_b, step_b) = task_and_step_reading("b", &["a"]);
+        let (tasks, _steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
+        let err = detect_cycles(&tasks).expect_err("a↔b reads loop must be detected");
+        assert!(
+            err.to_string().contains("cycle"),
+            "the error names the cycle: {err}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_depends_reads_cycle_is_rejected() {
+        // A cycle that crosses relations (a depends_on b, b reads a) is the
+        // subtle variant — each relation alone is acyclic.
+        let (task_a, step_a) = task_and_step("a", &["b"]);
+        let (task_b, step_b) = task_and_step_reading("b", &["a"]);
+        let (tasks, _steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
+        detect_cycles(&tasks).expect_err("a mixed depends_on/reads loop must be detected");
     }
 
     // ─── gather_inputs ──────────────────────────────────────────────
@@ -1114,6 +1228,7 @@ mod tests {
             display_name: None,
             step_ids: vec!["multi-0".to_string(), "multi-1".to_string()],
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,

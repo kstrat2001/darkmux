@@ -2889,25 +2889,29 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(graph.steps["review-verify-render-step"].kind, "review.verify-render");
         assert_eq!(graph.steps["review-verify-step"].kind, "dispatch.map");
 
-        // (#1341) Cross-phase dependency now lives on `Task.depends_on`
-        // (Steps have none of their own) — adjudicate's judge TASK depends
-        // on investigate's dedup TASK, no special cross-phase mechanism.
+        // (#1619) Cross-phase DATA now rides `Task.reads` (the output
+        // ledger); `depends_on` is left for the ordering the graph should
+        // DRAW. Judge still receives dedup's docket and still cannot start
+        // early — `reads` orders identically in the scheduler — but the
+        // investigate→adjudicate task connector no longer renders.
         let tasks_by_id: std::collections::BTreeMap<&str, &Task> =
             graph.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         let dedup_step_id = "review-dedup-step";
         let judge_task = tasks_by_id["review-judge-task"];
-        assert_eq!(judge_task.depends_on, vec!["review-dedup-task".to_string()]);
+        assert_eq!(judge_task.depends_on, Vec::<String>::new());
+        assert_eq!(judge_task.reads, vec!["review-dedup-task".to_string()]);
         assert_eq!(graph.phase_id_of_step[dedup_step_id], "investigate");
         assert_eq!(graph.phase_id_of_step["review-judge-step"], "adjudicate");
 
-        // report's synthesis TASK depends on dedup (investigate), judge
+        // report's synthesis TASK still receives dedup (investigate), judge
         // (adjudicate — #1442: the judged docket arrives directly, since
         // verify's own output is now the generic map's result array), and
-        // verify (report) — graph-native cross-phase data flow.
+        // verify (report) — the cross-phase pair via the ledger, the
+        // same-phase verify via the one remaining drawn edge.
         let synth_task = tasks_by_id["review-synthesis-task"];
-        assert!(synth_task.depends_on.contains(&"review-dedup-task".to_string()));
-        assert!(synth_task.depends_on.contains(&"review-judge-task".to_string()));
-        assert!(synth_task.depends_on.contains(&"review-verify-task".to_string()));
+        assert!(synth_task.reads.contains(&"review-dedup-task".to_string()));
+        assert!(synth_task.reads.contains(&"review-judge-task".to_string()));
+        assert_eq!(synth_task.depends_on, vec!["review-verify-task".to_string()]);
         assert_eq!(graph.phase_id_of_step["review-synthesis-step"], "report");
 
         // Every step's `kind` resolves through the SAME registry — the
@@ -4324,6 +4328,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             display_name: None,
             step_ids: vec!["judge-step".to_string()],
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,
@@ -5580,6 +5585,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             display_name: None,
             step_ids: vec!["review-verify-render-step".to_string()],
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,
@@ -5695,6 +5701,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             display_name: None,
             step_ids: vec!["review-probe-high-render-step".to_string(), "review-probe-high-step".to_string()],
             depends_on: vec!["review-bundle-task".to_string()],
+            reads: Vec::new(),
             role_id: Some("review-probe-high".to_string()),
             profile_name: None,
             workdir: None,
@@ -5772,6 +5779,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             display_name: None,
             step_ids: vec!["review-probe-high-render-step".to_string(), "review-probe-high-step".to_string()],
             depends_on: vec!["review-bundle-task".to_string()],
+            reads: Vec::new(),
             role_id: Some("review-probe-high".to_string()),
             profile_name: None,
             workdir: None,
@@ -6002,6 +6010,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             display_name: None,
             step_ids: vec!["review-probe-high-render-step".to_string(), "review-probe-high-step".to_string()],
             depends_on: vec!["review-bundle-task".to_string()],
+            reads: Vec::new(),
             role_id: Some("review-probe-high".to_string()),
             profile_name: None,
             workdir: None,
@@ -6201,6 +6210,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             display_name: None,
             step_ids: vec!["review-bundle-step".to_string()],
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,
@@ -6303,6 +6313,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             display_name: None,
             step_ids: vec!["review-bundle-step".to_string()],
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,
@@ -6348,6 +6359,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             display_name: None,
             step_ids: vec!["review-judge-step".to_string()],
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,

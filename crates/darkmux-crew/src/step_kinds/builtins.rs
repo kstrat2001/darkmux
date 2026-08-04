@@ -1982,6 +1982,7 @@ mod tests {
             display_name: None,
             step_ids: vec!["s1".to_string()],
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,

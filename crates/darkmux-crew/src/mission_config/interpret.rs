@@ -260,8 +260,9 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
         }
     }
 
-    // Second pass: resolve every TaskConfig's `depends_on` now that
-    // `expansion_of` is complete for the WHOLE document — a dependency
+    // Second pass: resolve every TaskConfig's `depends_on` AND `reads`
+    // (#1619 — the ledger relation resolves identically) now that
+    // `expansion_of` is complete for the WHOLE document — a reference
     // that named a template task's id resolves to ALL of that template's
     // real expanded copies (dedup depending on every real probe task,
     // never just the template's single placeholder id).
@@ -269,24 +270,34 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
         tasks.iter().enumerate().map(|(i, t)| (t.id.clone(), i)).collect();
     for phase in &config.phases {
         for task_cfg in &phase.tasks {
-            let mut resolved_depends: Vec<String> = Vec::new();
-            for dep in &task_cfg.depends_on {
-                match expansion_of.get(dep) {
-                    Some(real_ids) => resolved_depends.extend(real_ids.iter().cloned()),
-                    None => bail!(
-                        "task `{}` depends_on unknown task id `{dep}` — the config must \
-                         validate cleanly (MissionConfig::validate) before interpretation",
-                        task_cfg.id
-                    ),
+            let resolve = |relation: &str, entries: &[String]| -> anyhow::Result<Vec<String>> {
+                let mut resolved: Vec<String> = Vec::new();
+                for dep in entries {
+                    match expansion_of.get(dep) {
+                        Some(real_ids) => resolved.extend(real_ids.iter().cloned()),
+                        None => bail!(
+                            "task `{}` {relation} unknown task id `{dep}` — the config must \
+                             validate cleanly (MissionConfig::validate) before interpretation",
+                            task_cfg.id
+                        ),
+                    }
                 }
-            }
-            if resolved_depends.is_empty() {
+                Ok(resolved)
+            };
+            let resolved_depends = resolve("depends_on", &task_cfg.depends_on)?;
+            let resolved_reads = resolve("reads", &task_cfg.reads)?;
+            if resolved_depends.is_empty() && resolved_reads.is_empty() {
                 continue;
             }
             if let Some(real_ids) = expansion_of.get(&task_cfg.id) {
                 for real_id in real_ids {
                     if let Some(&idx) = real_index.get(real_id.as_str()) {
-                        tasks[idx].depends_on = resolved_depends.clone();
+                        if !resolved_depends.is_empty() {
+                            tasks[idx].depends_on = resolved_depends.clone();
+                        }
+                        if !resolved_reads.is_empty() {
+                            tasks[idx].reads = resolved_reads.clone();
+                        }
                     }
                 }
             }
@@ -452,6 +463,7 @@ fn push_task(
         display_name,
         step_ids,
         depends_on: Vec::new(),
+        reads: Vec::new(),
         role_id,
         profile_name,
         workdir,
@@ -505,6 +517,7 @@ mod tests {
             description: Some(format!("do {id}")),
             display_name: None,
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+            reads: Vec::new(),
             role_id: role_id.map(String::from),
             steps,
             expand: None,
@@ -706,6 +719,7 @@ mod tests {
                 description: None,
                 display_name: None,
                 depends_on: vec![],
+                reads: Vec::new(),
                 role_id: Some("fallback-role".to_string()),
                 steps: vec![step("probe-template-step", "dispatch.map", serde_json::Value::Null)],
                 expand: Some(ExpansionSpec {
@@ -750,6 +764,7 @@ mod tests {
                     description: Some("PLACEHOLDER".to_string()),
                     display_name: None,
                     depends_on: vec!["review-bundle-task".to_string()],
+                    reads: Vec::new(),
                     role_id: None,
                     steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
                     expand: Some(ExpansionSpec {
@@ -816,6 +831,7 @@ mod tests {
                     description: None,
                     display_name: None,
                     depends_on: vec![],
+                    reads: Vec::new(),
                     role_id: None,
                     steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
                     expand: Some(ExpansionSpec {
@@ -865,6 +881,7 @@ mod tests {
                 description: None,
                 display_name: None,
                 depends_on: vec![],
+                reads: Vec::new(),
                 role_id: None,
                 steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
                 expand: Some(ExpansionSpec {
@@ -904,6 +921,7 @@ mod tests {
                 description: None,
                 display_name: None,
                 depends_on: vec![],
+                reads: Vec::new(),
                 role_id: None,
                 steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
                 expand: Some(ExpansionSpec {
@@ -1039,6 +1057,7 @@ mod tests {
             description: None,
             display_name: None,
             depends_on: vec![],
+            reads: Vec::new(),
             role_id: None,
             steps,
             expand: Some(ExpansionSpec {

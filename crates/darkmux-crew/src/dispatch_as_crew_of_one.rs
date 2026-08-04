@@ -314,6 +314,7 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str, session_id: &str) -> (Miss
         display_name: Some(opts.role_id.clone()),
         step_ids: vec![step_id.clone()],
         depends_on: Vec::new(),
+        reads: Vec::new(),
         role_id: Some(opts.role_id.clone()),
         profile_name: opts.profile_name.clone(),
         workdir: opts.workdir.clone(),

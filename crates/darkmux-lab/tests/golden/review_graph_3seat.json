@@ -18,21 +18,27 @@
       "config": {
         "probe_specs": [
           {
-            "draw_task_ids": ["review-probe-high-task"],
+            "draw_task_ids": [
+              "review-probe-high-task"
+            ],
             "endpoint_host": null,
             "identifier": "darkmux:probe-model-a",
             "name": "phigh",
             "remote": false
           },
           {
-            "draw_task_ids": ["review-probe-mid-task"],
+            "draw_task_ids": [
+              "review-probe-mid-task"
+            ],
             "endpoint_host": null,
             "identifier": "darkmux:probe-model-b",
             "name": "pmid",
             "remote": false
           },
           {
-            "draw_task_ids": ["review-probe-low-task"],
+            "draw_task_ids": [
+              "review-probe-low-task"
+            ],
             "endpoint_host": null,
             "identifier": "darkmux:probe-model-c",
             "name": "plow",
@@ -249,9 +255,7 @@
       ]
     },
     {
-      "depends_on": [
-        "review-dedup-task"
-      ],
+      "depends_on": [],
       "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
       "display_name": "Judge",
       "id": "review-judge-task",
@@ -259,12 +263,13 @@
       "step_ids": [
         "review-judge-step"
       ],
-      "role_id": "review-judge"
+      "role_id": "review-judge",
+      "reads": [
+        "review-dedup-task"
+      ]
     },
     {
-      "depends_on": [
-        "review-judge-task"
-      ],
+      "depends_on": [],
       "description": "verify — render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
       "display_name": "Verify",
       "id": "review-verify-task",
@@ -273,12 +278,13 @@
         "review-verify-render-step",
         "review-verify-step"
       ],
-      "role_id": "review-verify"
+      "role_id": "review-verify",
+      "reads": [
+        "review-judge-task"
+      ]
     },
     {
       "depends_on": [
-        "review-dedup-task",
-        "review-judge-task",
         "review-verify-task"
       ],
       "description": "synthesis — apply verify adjudications, finalize tier counts + needs-check clustering",
@@ -287,6 +293,10 @@
       "phase_id": "pr-review-golden-report",
       "step_ids": [
         "review-synthesis-step"
+      ],
+      "reads": [
+        "review-dedup-task",
+        "review-judge-task"
       ]
     }
   ]

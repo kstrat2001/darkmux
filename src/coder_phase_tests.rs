@@ -856,6 +856,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             display_name: None,
             step_ids: vec![format!("{id}-step")],
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,
