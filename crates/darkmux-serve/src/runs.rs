@@ -491,6 +491,20 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) 
                 }
                 return RunStatus::Running;
             }
+            // (#1642) A PAUSED mission is deliberately idle, so the staleness
+            // gate must not touch it. The gate reads "went quiet without
+            // finishing" as abandonment, which is honest for an Active
+            // mission and a lie for a paused one — it would relabel the
+            // operator's own intent as a failure the moment a pause outlasts
+            // the inactivity budget (`mission launch` → `mission pause` →
+            // lunch → the board says Abandoned). Not decaying is the lesser
+            // error: `RunStatus` has no `Paused` variant, so some imprecision
+            // is unavoidable here, and over-reporting a mission the operator
+            // KNOWS they paused costs nothing, while calling it abandoned
+            // actively misinforms.
+            if mission.status == MissionStatus::Paused {
+                return RunStatus::Running;
+            }
             let live = if sessions.is_empty() {
                 let idle_ms = now_ms.saturating_sub(started_ts.saturating_mul(1_000));
                 idle_ms <= stale_after_ms()
@@ -1738,6 +1752,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_flow_session_index_keeps_the_newest_activity_not_the_last_seen() {
+        // (#1642) The test above visits records in chronological order, so it
+        // passes against a naive "keep whatever I saw last" implementation as
+        // readily as against the newest-wins compare it means to assert. That
+        // is the exact defect class this codebase keeps hitting: an assertion
+        // that holds for a reason other than the one it names.
+        //
+        // Records are NOT guaranteed chronological within a day file — a
+        // concurrent writer interleaves sessions, and a per-session view of
+        // that stream can land out of order. Feed them out of order so the
+        // compare is the only thing that can produce a pass.
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-07-24T10:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "outoforder-sess",
+                    "handle": "coder",
+                }),
+                serde_json::json!({
+                    "ts": "2026-07-24T10:30:00Z",
+                    "action": "dispatch.turn.heartbeat",
+                    "session_id": "outoforder-sess",
+                }),
+                // Older than the one above, and written after it.
+                serde_json::json!({
+                    "ts": "2026-07-24T10:05:00Z",
+                    "action": "tool.completed",
+                    "session_id": "outoforder-sess",
+                }),
+            ],
+        );
+        let idx = build_flow_session_index(tmp.path());
+        let agg = idx.get("outoforder-sess").expect("session indexed");
+        assert_eq!(
+            agg.last_activity_ts.as_deref(),
+            Some("2026-07-24T10:30:00Z"),
+            "an older record arriving late must not rewind the liveness clock — \
+             rewinding it would age a live session into Abandoned"
+        );
+    }
+
+    #[test]
+    fn a_paused_mission_never_decays_into_abandoned() {
+        // (#1642) `mission pause` is an operator verb, and a paused mission is
+        // deliberately idle — so the staleness gate, which reads "went quiet
+        // without finishing" as abandonment, must not touch it. Without this,
+        // `mission launch` → `mission pause` → lunch makes the board report
+        // the operator's own intent as a failure.
+        //
+        // Asserted at an absurd `now` so it cannot pass by sitting inside the
+        // budget: if the gate applied to Paused at all, this fails.
+        let mut mission = minimal_mission("paused-1", vec![], None);
+        mission.status = MissionStatus::Paused;
+        mission.started_ts = Some(parse_flow_ts("2000-01-01T00:00:00Z").unwrap());
+
+        let ancient = SessionAgg {
+            has_start: true,
+            terminal_status: None,
+            last_activity_ts: Some("2000-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let now_ms = u64::from(u32::MAX) * 1_000;
+
+        assert_eq!(
+            mission_run_status(&mission, &[], now_ms),
+            RunStatus::Running,
+            "a paused mission with no sessions must not read as abandoned"
+        );
+        assert_eq!(
+            mission_run_status(&mission, &[&ancient], now_ms),
+            RunStatus::Running,
+            "a paused mission with a long-quiet open session must not read as abandoned"
+        );
+
+        // And the control: the SAME shape while Active does decay. Without
+        // this line the test above would still pass if the gate were removed
+        // outright, which would silently undo #1642.
+        mission.status = MissionStatus::Active;
+        assert_eq!(
+            mission_run_status(&mission, &[&ancient], now_ms),
+            RunStatus::Abandoned,
+            "the pause exemption must not disable the gate for Active missions"
+        );
+    }
+
     // ── dedup: a mission-internal session is never ALSO a ghost ─────────
 
     #[test]
@@ -1867,12 +1971,18 @@ mod tests {
 
     #[test]
     fn lab_mission_and_ghost_agree_on_liveness_at_the_same_idle_age() {
-        // (#1642, #1633) The regression this guards against: it must be
-        // structurally impossible for a future FOURTH `Run` kind to reopen
-        // this hole by drifting from the other three's threshold. All three
-        // EXISTING sources are judged at the exact same idle age off the
-        // exact same `stale_after_ms` budget and must reach the same
-        // verdict, every time.
+        // (#1642, #1633) The regression this guards against: a future FOURTH
+        // `Run` kind reopening this hole by drifting from the other three's
+        // threshold. All three EXISTING sources are judged at the exact same
+        // idle age off the exact same `stale_after_ms` budget and must reach
+        // the same verdict, every time.
+        //
+        // Honest about its own reach: this is a CONVENTION TRIPWIRE, not a
+        // structural guarantee. A fourth kind has to be added to the asserts
+        // below by hand, and nothing in the compiler makes anyone do it —
+        // whoever adds one is expected to find this test by grepping the
+        // shared helper. Claiming more than that would be the same
+        // over-promise that let three kinds drift apart in the first place.
         const REF_TS: &str = "2000-01-01T00:00:00Z"; // the known reference point
         let ref_secs = parse_flow_ts(REF_TS).unwrap();
         let ref_ms = ref_secs * 1_000;
@@ -1893,6 +2003,13 @@ mod tests {
         for (label, now_ms, want) in [
             ("just inside the budget", ref_ms + stale_after_ms() - 1_000, RunStatus::Running),
             ("just outside the budget", ref_ms + stale_after_ms() + 1_000, RunStatus::Abandoned),
+            // (#1642) EXACTLY at the budget. The ±1s cases above cannot
+            // detect an inclusivity drift (`<` vs `<=`) between two kinds —
+            // both sides agree at ±1s no matter which comparison each uses,
+            // so the one boundary where the kinds can silently disagree is
+            // the only one the other two rows structurally cannot see. That
+            // drift is precisely the class this test exists to prevent.
+            ("exactly at the budget", ref_ms + stale_after_ms(), RunStatus::Running),
         ] {
             assert_eq!(lab_run_status(&lab_summary, now_ms), want, "lab disagreed {label}");
             assert_eq!(mission_run_status(&mission, &[&session], now_ms), want, "mission disagreed {label}");
