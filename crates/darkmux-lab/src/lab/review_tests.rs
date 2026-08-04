@@ -2530,7 +2530,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             timeout_seconds: 30,
             chat_override: None,
             bundle_override: Some(Arc::new(move || Ok(bundles.clone()))),
-            mission_id: None,
+            mission_id: Some("mission-token-test".to_string()),
         })
     }
 
@@ -6443,7 +6443,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 })
             })),
             bundle_override: None,
-            mission_id: Some("mission-token-test".to_string()),
+            mission_id: None,
         };
         let call = ChatCall {
             model: "test-model",
@@ -6473,6 +6473,20 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             for line in contents.lines() {
                 let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else { continue };
                 if rec.get("action").and_then(|v| v.as_str()) != Some("telemetry.tokens") {
+                    continue;
+                }
+                // (#1544-family hermeticity) Scope to THIS test's records via
+                // its own case id (the telemetry record's session_id). The
+                // flow sink is env-var global and `#[serial]` only serializes
+                // tests that OPT IN — a concurrent non-serial test that
+                // dispatches writes ITS records into this test's tempdir
+                // during the window, and an unscoped scan then asserts
+                // against a foreign record. Observed live: the coverage CI
+                // run failed this test on another test's `case-1` /
+                // `darkmux:judge-model` record.
+                if rec.get("session_id").and_then(|v| v.as_str())
+                    != Some("case-mission-token-test")
+                {
                     continue;
                 }
                 assert_eq!(
