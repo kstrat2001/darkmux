@@ -341,7 +341,15 @@
   .logsearch{display:flex;align-items:center;gap:10px;margin-top:8px}
   .searchbox{position:relative;flex:1;min-width:0;display:flex;align-items:center}
   .searchbox .sicon{position:absolute;left:9px;font-size:14px;line-height:1;color:var(--muted);pointer-events:none;transition:color .15s}
-  .searchbox input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:7px 28px;font:12px 'JetBrains Mono',monospace;transition:border-color .15s,box-shadow .15s}
+  /* (#1641) 16px, not 12px. iOS Safari ZOOMS THE WHOLE PAGE when a text input
+     with font-size < 16px takes focus, and there is no viewport
+     `maximum-scale` mitigation here (deliberately — that one breaks pinch-zoom
+     for everyone). The operator reads this dashboard on a phone over the
+     tailnet, so typing in the stream filter yanked the layout every time.
+     Structurally invisible to this project's e2e suite: the heuristic is
+     WebKit-only and Chromium does not reproduce it, so no Playwright assertion
+     could ever have caught it. Found by reading the CSS, not by a test. */
+  .searchbox input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:7px 28px;font:16px 'JetBrains Mono',monospace;transition:border-color .15s,box-shadow .15s}
   .searchbox input::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none}
   .searchbox input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(109,241,255,.12)}
   .searchbox input:focus-visible{outline:none}
@@ -644,7 +652,9 @@
   .fgroup label{display:inline-flex;align-items:center;gap:6px;margin:0 14px 7px 0;font:12px 'JetBrains Mono',monospace;color:var(--text);cursor:pointer}
   .fgroup input{accent-color:var(--accent);cursor:pointer}
   .mft{display:flex;gap:10px;margin-top:8px}
-  .mft input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:4px;padding:8px 10px;font:12px 'JetBrains Mono',monospace}
+  /* (#1641) 16px for the same reason as `.searchbox input` above — the filter
+     modal's search field is the other focusable text input in this file. */
+  .mft input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:4px;padding:8px 10px;font:16px 'JetBrains Mono',monospace}
   .clr{background:var(--bg);border:1px solid var(--accent-dim);color:var(--text);border-radius:4px;padding:8px 12px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
 
   /* ---- Mobile phase 1 — survival #634 -------------------------------
@@ -2570,7 +2580,14 @@ function renderCrumb(){
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||state.filters.act.size<FACTS.length||!!state.filters.q;}
 function updateFbtn(){const a=filtersActive();const b=$("fbtn");b.className="fbtn"+(a?" on":"");b.innerHTML=ICON.filter+(a?'<span class="fdot">•</span>':'');b.title=a?"filters (active)":"filters";b.setAttribute("aria-label",b.title);}
 function syncTransport(){
-  $("range").value=Math.round((state.t-tMin)/(tMax-tMin)*100);
+  // (#1640) `tMax===tMin` when every record shares one timestamp (or there is
+  // exactly one), making this `0/0` -> NaN. An invalid range assignment does
+  // not throw — the browser silently substitutes its own fallback, so the
+  // scrubber lands somewhere arbitrary rather than at the end of a window that
+  // is entirely "now". Same one-item class as the `11:38:41-11:38:41` range
+  // label this codebase already fixed, in a spot that did not get the fix.
+  const span = tMax - tMin;
+  $("range").value = span > 0 ? Math.round((state.t - tMin) / span * 100) : 100;
   $("clock").textContent=fmt(state.t-tMin)+" / "+fmt(tMax-tMin)+"  ·  "+visible().length+"/"+DATA.length+" rec";
 }
 function render(){
@@ -4655,10 +4672,18 @@ function labFeedRow(r){
   }
   return `<div class="labfeedrow"><span class="labfeedts">${tt}</span><span class="labfeedtext">${esc(r.action||"")}</span></div>`;
 }
+// (#1640) The cap is NAMED so the header can disclose it. It was a bare 500
+// inside a `.slice()`, while the header above printed `LAB_EVENTS.length` —
+// the TRUE total, fully paginated in from the server. So a run with 900 events
+// announced "900 records" above a list showing the newest 500, with nothing
+// saying so. A truncation presented as a total is the one thing CLAUDE.md's
+// no-silent-caps rule forbids, and every other cap in this file (RUNS_CAP,
+// RECENT_CAP, CATALOG_MISSION_CAP, the unfiltered-log 50) already discloses.
+var LAB_FEED_CAP = 500;
 function renderLabFeed(events){
   if(!events.length) return `<div class="none">no events yet.</div>`;
   // Newest at top (issue #1247's "watch it think" narrative).
-  return events.slice().reverse().slice(0,500).map(labFeedRow).join("");
+  return events.slice().reverse().slice(0,LAB_FEED_CAP).map(labFeedRow).join("");
 }
 // The copy-pasteable CLI hint (#915 convention). `--workdirs`/the cases dir
 // aren't recorded in the artifact today (a known gap — the harness doesn't
@@ -4687,7 +4712,7 @@ function renderLabRun(){
     <div class="labpipe">${renderLabPipeline(pipe, env)}</div>
     <div class="labcli"><span class="labclilbl">try it yourself</span><code>${esc(labCliHint(env, scores))}</code></div>
     <div class="labfeedwrap">
-      <div class="labfeedhdr">event feed${finished?" (playback)":" — live, polling"} · ${LAB_EVENTS.length} record${LAB_EVENTS.length===1?"":"s"}</div>
+      <div class="labfeedhdr">event feed${finished?" (playback)":" — live, polling"} · ${LAB_EVENTS.length > LAB_FEED_CAP ? `newest ${LAB_FEED_CAP} of ${LAB_EVENTS.length}` : `${LAB_EVENTS.length} record${LAB_EVENTS.length===1?"":"s"}`}</div>
       <div class="labfeed">${renderLabFeed(LAB_EVENTS)}</div>
     </div>`;
 }

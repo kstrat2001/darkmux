@@ -420,6 +420,13 @@
        tabs sit on a common center line instead of reading as a pile of
        differently-sized boxes. */
     .nav a,.mstatus,.livepill,.evbtn,.legbtn{display:inline-flex;align-items:center;min-height:30px;box-sizing:border-box}
+    /* (#1641) The back link is the SOLE way out of this page — it runs as a
+       chromeless home-screen shortcut, so browser back cannot be assumed. It
+       was the one navigation-critical control in the file sized below the 44px
+       this project uses everywhere else for exactly this class (viewer.html's
+       `.fbtn`/`.follow` cite WCAG 2.5.8 and get 44px; this file's own
+       `.tlt-hd` gets 44px). Measured at 76x30 before this. */
+    .nav a{min-height:44px}
     .nav a{padding:6px 8px}
     /* The token readout leads row 2 and pushes the tabs to the right edge; keep
        it on ONE line (it wrapped to "170k / tok" when squeezed) and drop the
@@ -617,6 +624,12 @@ function stepMeterEl(meter){
 }
 // (#1483) The dispatch's start epoch-ms: the live bookend from `metrics` when
 // present, else the server-stamped `started_ts` (camelCase on the wire).
+// (#1639) How long a `running` step may go without a signal before this page
+// stops CLAIMING it is live. Twice the runtime's default inactivity budget
+// (600s), which is the point at which the watchdog would already have killed
+// anything genuinely running. A generous window on purpose: a false "stalled"
+// on a slow-but-live seat is a worse failure than a late-clearing animation.
+var STEP_LIVENESS_WINDOW_MS = 1200 * 1000;
 function stepStartMs(step, m){
   if (m && m.startTs) return m.startTs;
   return tsToMs(step.startedTs);
@@ -631,7 +644,29 @@ function stepMeterFor(step, metrics, now){
   // (#1483) Generating = the step's own status is running — an OPEN dispatch
   // (SSE flips it on `step start`, off on the terminal). The elapsed clock
   // reads from the dispatch-start bookend (metrics) or the server started_ts.
-  var generating = step.status === "running";
+  // (#1639) `status === "running"` is what the SERVER last WROTE, not evidence
+  // the step is running NOW. A hard-killed dispatch — sleep gone wrong,
+  // `kill -9`, power loss — never writes its terminal, so the status stays
+  // `running` on disk forever and this page pulsed a dot and ticked a clock
+  // upward indefinitely for work that had stopped.
+  //
+  // This codebase already wrote the lesson down, on the sibling surface:
+  // viewer.html's runs badge says `running` there means "no terminal artifact",
+  // which is not the same claim as "running right now" (#1621). The claim made
+  // HERE is stronger — an animation and a live counter — so it needs at least
+  // as much evidence, and had none.
+  //
+  // Evidence is a record for this step arriving recently, or failing that a
+  // start recent enough that silence is still plausible. The window mirrors
+  // the runtime's own inactivity watchdog, which HARD-KILLS a dispatch that
+  // goes `inactivity_timeout_seconds` (default 600) without proof-of-work:
+  // past twice that, nothing is left alive that could have produced work.
+  var lastSignal = (m && m.lastRx) ? m.lastRx : 0;
+  var startedAt = stepStartMs(step, m);
+  var freshEnough = lastSignal
+    ? (now - lastSignal) < STEP_LIVENESS_WINDOW_MS
+    : (!!startedAt && (now - startedAt) < STEP_LIVENESS_WINDOW_MS);
+  var generating = step.status === "running" && freshEnough;
   var startMs = stepStartMs(step, m);
   var elapsedMs = (generating && startMs && now) ? Math.max(0, now - startMs) : 0;
   return { show: show || generating, tokens: d.tokens, turns: d.turns, tools: d.tools, cloud: d.cloud,
@@ -1011,10 +1046,14 @@ function applyRecordToMetrics(metrics, rec, idx){
   var sid = stepForRecord(rec, idx);
   if (!sid) return metrics;
   var p = rec.payload || {};
-  var cur = metrics[sid] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, localOk:false, startTs:0, endTs:0 };
+  var cur = metrics[sid] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, localOk:false, startTs:0, endTs:0, lastRx:0 };
   var next = { tokRun:cur.tokRun, tokFinal:cur.tokFinal, turnRun:cur.turnRun, turnFinal:cur.turnFinal,
                toolRun:cur.toolRun||0, toolFinal:cur.toolFinal||0,
-               cloud:cur.cloud, localOk:cur.localOk||false, startTs:cur.startTs, endTs:cur.endTs };
+               cloud:cur.cloud, localOk:cur.localOk||false, startTs:cur.startTs, endTs:cur.endTs,
+               // (#1639) WALL-CLOCK arrival, not the record's own ts — the
+               // question is "did we hear from this step recently", and a
+               // replayed or clock-skewed record must not read as freshness.
+               lastRx: Date.now() };
   var action = rec.action || "";
   var isTok = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
   var isTurn = action === "dispatch.turn";

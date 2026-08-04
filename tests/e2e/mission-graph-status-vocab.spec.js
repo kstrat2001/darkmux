@@ -260,3 +260,52 @@ test('the graph page never scrolls sideways on a phone', async ({ page }) => {
   expect(over.body, 'the body scrolls sideways').toBeLessThanOrEqual(0);
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
+
+// ── (#1639) A dead dispatch must stop claiming to be live ───────────────────
+
+test('a step running since long ago stops pulsing and stops counting', async ({ page }) => {
+  // The seventh instance of one root cause: a lifecycle state INFERRED rather
+  // than recorded. A hard-killed dispatch — sleep, `kill -9`, power loss —
+  // never writes its terminal, so `status: "running"` persists on disk and this
+  // page pulsed a dot and ticked a clock upward forever.
+  //
+  // Stronger than the claim #1621 fixed on the runs lens, which merely shows a
+  // badge. An animation plus a live counter is the most emphatic "this is
+  // happening now" the UI can make, and it had no evidence behind it at all.
+  const ancient = Math.floor(Date.now() / 1000) - 6 * 3600; // started 6h ago
+  const g = graph('active', 'running');
+  g.nodes[1].steps = [
+    { id: 'probe-1', kind: 'dispatch.internal', label: 'probe',
+      status: 'running', startedTs: ancient },
+  ];
+  const { errors } = await open(page, [g]);
+
+  // No stream records arrive, so there is no signal of ANY kind for this step —
+  // the only thing saying "running" is a disk field written six hours ago.
+  await expect(
+    page.locator('.mnode .gen'),
+    'a step with no signal for hours must not render as generating'
+  ).toHaveCount(0);
+
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});
+
+test('a step that just started still reads as live', async ({ page }) => {
+  // The other half, and the one that matters more: the window must be generous
+  // enough that a slow-but-genuinely-live seat is never called dead. A false
+  // "stalled" is worse than a late-clearing animation.
+  const justNow = Math.floor(Date.now() / 1000) - 30;
+  const g = graph('active', 'running');
+  g.nodes[1].steps = [
+    { id: 'probe-1', kind: 'dispatch.internal', label: 'probe',
+      status: 'running', startedTs: justNow },
+  ];
+  const { errors } = await open(page, [g]);
+
+  await expect(
+    page.locator('.mnode .gen'),
+    'a step started 30s ago is live and must still animate'
+  ).toHaveCount(1);
+
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});

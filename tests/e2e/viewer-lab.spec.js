@@ -368,3 +368,16 @@ test('an empty lab slice explains WHERE it scanned, and only when empty', async 
 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
+
+// (#1640) NOT TESTED HERE, deliberately, and this is the finding.
+//
+// The lab event feed's cap disclosure cannot be reached in this harness: the
+// feed lives behind a lab-run drill-down that needs a real `/lab/run/detail`
+// selection, and `.labfeedhdr` renders zero times from a route-mock alone. I
+// wrote the test, probed it, and it was vacuous — an `if (await hdr.count())`
+// that never entered its body while reporting green.
+//
+// Removing it rather than shipping a seventh test that passes for a reason it
+// does not name. The fix itself (a named `LAB_FEED_CAP` and a "newest N of M"
+// header) is in viewer.html and reviewable there; the harness work needed to
+// exercise the drill-down is tracked with the other fixture gaps.
