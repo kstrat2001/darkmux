@@ -1248,7 +1248,7 @@ mod tests {
         let mission = minimal_mission(
             "m1",
             vec!["p1".to_string(), "p2".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "x".to_string() }),
+            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "x".to_string(), origin: None }),
         );
         let phases_by_id = HashMap::new();
         let (kind, shape) = classify_mission(&mission, &phases_by_id);
@@ -1263,7 +1263,7 @@ mod tests {
         let mission = minimal_mission(
             "m2",
             vec!["p1".to_string()],
-            Some(MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "x".to_string() }),
+            Some(MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "x".to_string(), origin: None }),
         );
         let phases_by_id = HashMap::new();
         let (kind, _) = classify_mission(&mission, &phases_by_id);
@@ -2037,7 +2037,7 @@ mod tests {
         let mission = minimal_mission(
             "dispatch-coder-1",
             vec!["dispatch-coder-1-phase".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp".to_string() }),
+            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase(
@@ -2106,7 +2106,7 @@ mod tests {
         let mission = minimal_mission(
             "generic-config-1",
             vec!["p-generic".to_string()],
-            Some(MissionSpec { config_id: "some-custom-config".to_string(), inputs_fingerprint: "fpg".to_string() }),
+            Some(MissionSpec { config_id: "some-custom-config".to_string(), inputs_fingerprint: "fpg".to_string(), origin: None }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase("p-generic", "generic-config-1", vec!["t-generic".to_string()]);
@@ -2162,7 +2162,7 @@ mod tests {
         let mission = minimal_mission(
             "review-1700000000-abcdef",
             vec!["p-investigate".to_string()],
-            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpr".to_string() }),
+            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpr".to_string(), origin: None }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase("p-investigate", "review-1700000000-abcdef", vec![]);
@@ -2220,7 +2220,7 @@ mod tests {
         let mission = minimal_mission(
             "dispatch-crashed-1",
             vec!["p-crash".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fpc".to_string() }),
+            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fpc".to_string(), origin: None }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase("p-crash", "dispatch-crashed-1", vec!["t-crash".to_string()]);
@@ -2264,7 +2264,7 @@ mod tests {
         let mission = minimal_mission(
             "dispatch-coder-2",
             vec!["p-2".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp2".to_string() }),
+            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp2".to_string(), origin: None }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase("p-2", "dispatch-coder-2", vec!["t-2".to_string()]);

@@ -288,6 +288,9 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str, session_id: &str) -> (Miss
         spec: Some(MissionSpec {
             config_id: "dispatch".to_string(),
             inputs_fingerprint: spec_fingerprint(opts),
+            // (#1562) The crew-of-one dispatch config is shipped, never
+    // operator-authored — always a run instance on the board.
+    origin: Some(crate::types::MissionSpecOrigin::Builtin),
         }),
     };
 

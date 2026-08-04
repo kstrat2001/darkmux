@@ -185,6 +185,16 @@ fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
 /// through so `mission_launch_review::launch` can resolve `None` -> 3600
 /// (the retired `pr-review run`'s per-call default — a 600s ceiling would
 /// silently degrade any review whose judge pass runs long).
+/// (#1562) [`MissionConfigSource`] → the recorded [`MissionSpecOrigin`]:
+/// only the user tier is operator-owned; `OnDisk` is a repo/templates-dir
+/// copy of a SHIPPED config, so it classifies with `Embedded` as builtin.
+fn spec_origin_for(source: crew::mission_config::MissionConfigSource) -> crew::types::MissionSpecOrigin {
+    match source {
+        crew::mission_config::MissionConfigSource::User => crew::types::MissionSpecOrigin::UserConfig,
+        _ => crew::types::MissionSpecOrigin::Builtin,
+    }
+}
+
 pub fn launch(
     config_id: &str,
     input_file: Option<&Path>,
@@ -257,7 +267,13 @@ pub fn launch(
     // graph + every declared `role_id` off the document), so the only thing
     // the old id-literal gated was the NAME, never a capability.
     if config_uses_review_kinds(config) {
-        return crate::mission_launch_review::launch(config, input_file, params, timeout_seconds);
+        return crate::mission_launch_review::launch(
+            config,
+            input_file,
+            params,
+            timeout_seconds,
+            spec_origin_for(loaded.source),
+        );
     }
 
     println!(
@@ -316,6 +332,9 @@ pub fn launch(
     let spec = MissionSpec {
         config_id: config_id.to_string(),
         inputs_fingerprint: spec_fingerprint(&collected)?,
+        // (#1562) Recorded at mint so the board never has to guess — a
+        // user-tier config's launches are the operator's named work.
+        origin: Some(spec_origin_for(loaded.source)),
     };
     let mut collected = collected;
     if config.inputs.iter().any(|i| i.name == "mission_id") {
@@ -2141,8 +2160,12 @@ mod tests {
             Some(MissionSpec {
                 config_id: "freeform-test-mission".to_string(),
                 inputs_fingerprint: expected_fingerprint.clone(),
+                // (#1562) This test launches a USER-tier config (it writes the
+                // config into the user mission-configs dir), so the recorded
+                // origin must be UserConfig — the named-work classification.
+                origin: Some(darkmux_crew::types::MissionSpecOrigin::UserConfig),
             }),
-            "spec must record the config id + inputs fingerprint as grouping metadata"
+            "spec must record the config id + inputs fingerprint + origin as grouping metadata"
         );
 
         for real_phase_id in &mission.phase_ids {

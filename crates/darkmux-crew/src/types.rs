@@ -352,11 +352,36 @@ pub struct MissionSpec {
     /// The mission config id this run was launched from (e.g. `coder-phase`,
     /// `review`).
     pub config_id: String,
+    /// (#1562) Which TIER the launched config came from — recorded at mint,
+    /// because the mission board classifies on it and a board-time registry
+    /// lookup would go stale the moment the operator deletes or renames the
+    /// config. `UserConfig` = the operator's own config (a `mission propose`
+    /// product, or hand-authored under the user mission-configs dir): its
+    /// launches are the operator's NAMED engagement work and stay on the
+    /// default board. `Builtin` = a shipped config (`review`, `coder-phase`,
+    /// the `dispatch` crew-of-one): its launches are run instances the board
+    /// collapses. `None` = a mission minted before this field existed —
+    /// every such spec-bearing mission was a launched run, so readers treat
+    /// absent as `Builtin`-equivalent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<MissionSpecOrigin>,
     /// A compact fingerprint over the resolved inputs — the blake3 digest
     /// that, pre-#1503, WAS the mission id. Two runs of the same config with
     /// the same inputs fingerprint identically (they group); different
     /// inputs fingerprint differently.
     pub inputs_fingerprint: String,
+}
+
+/// (#1562) See [`MissionSpec::origin`]. Lowercase on the wire, lenient on
+/// read (an unrecognized future value deserializes as if absent via the
+/// field's `Option` + default — contract 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MissionSpecOrigin {
+    /// Launched from the operator's own config (user tier).
+    UserConfig,
+    /// Launched from a shipped built-in config.
+    Builtin,
 }
 
 /// Status of a phase.
@@ -895,10 +920,10 @@ mod tests {
     /// differing on either field makes them distinct groups.
     #[test]
     fn mission_spec_groups_on_config_and_fingerprint_equality() {
-        let a = MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "abc123".to_string() };
-        let b = MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "abc123".to_string() };
-        let different_inputs = MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "def456".to_string() };
-        let different_config = MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "abc123".to_string() };
+        let a = MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "abc123".to_string(), origin: None };
+        let b = MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "abc123".to_string(), origin: None };
+        let different_inputs = MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "def456".to_string(), origin: None };
+        let different_config = MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "abc123".to_string(), origin: None };
         assert_eq!(a, b, "same config + same fingerprint must be equal (they group)");
         assert_ne!(a, different_inputs, "different fingerprint must not be equal (distinct groups)");
         assert_ne!(a, different_config, "different config must not be equal (distinct groups)");
