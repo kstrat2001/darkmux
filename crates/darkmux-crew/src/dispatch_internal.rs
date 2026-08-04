@@ -2101,17 +2101,48 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (the #1135 silent-truncation mechanism on the path that exists to SAVE
     // long dispatches), and the bare load fails `is_darkmux_owned` so `model
     // eject` can't reclaim it (a RAM leak on the always-on hub). Loading it
-    // here at the compaction context window, under `darkmux:`, closes both.
+    // here — at ITS OWN declared context, under `darkmux:`, closes both.
+    //
+    // (#1616) `compaction.context_window` is the PRIMARY model's declared
+    // `n_ctx` (see `CompactionDispatchArgs::from_profile` — it reads
+    // `profile.default_model_id()`'s window, needed for the compaction
+    // TRIGGER formula). Passing that same number as the LOAD ctx for a
+    // DIFFERENT model — the compactor — was the bug: a `deep` profile's 4B
+    // compactor silently loaded at the primary's 262144-token window instead
+    // of its own declared 120000. `resolve_compactor_n_ctx_internal` looks the
+    // compactor's id up in the active profile's own `models[]`; the primary's
+    // window is used ONLY when the compactor declares none there, and that
+    // fallback is named in the load message (operator sovereignty, #44) —
+    // never silently substituted.
+    //
     // Best-effort (warn, don't abort — a compaction-less short dispatch still
     // runs); skipped for the mock-model harness (no real LMStudio to load into,
     // same gate as the dispatch model's residency).
     if opts.model_base_url_override.is_none() {
-        if let Some(warning) = ensure_utility_resident(
-            compaction.compactor_model.as_deref(),
-            compaction.context_window,
-            ensure_model_loaded_at_ctx,
-        ) {
-            eprintln!("{warning}");
+        if let Some(compactor_id) = compaction.compactor_model.clone() {
+            let compactor_n_ctx = resolve_compactor_n_ctx_internal(
+                opts.profile_name.as_deref(),
+                opts.config_path.as_deref(),
+                &compactor_id,
+            )?;
+            let (load_window, used_fallback) =
+                resolve_compactor_load_window(compactor_n_ctx, compaction.context_window);
+            if let Some(window) = load_window {
+                if used_fallback {
+                    eprintln!(
+                        "darkmux dispatch: compactor `{compactor_id}` declares no `n_ctx` in the \
+                         active profile; loading it at the primary model's context window \
+                         ({window}) as a fallback. (#1616)"
+                    );
+                }
+                if let Some(warning) = ensure_utility_resident(
+                    Some(compactor_id.as_str()),
+                    Some(window),
+                    ensure_model_loaded_at_ctx,
+                ) {
+                    eprintln!("{warning}");
+                }
+            }
         }
     }
 
@@ -3950,6 +3981,20 @@ pub fn resolve_context_window_internal(
     profile_override: Option<&str>,
     config_path: Option<&str>,
 ) -> Result<Option<u32>> {
+    let profile = resolve_active_profile_internal(profile_override, config_path)?;
+    Ok(profile.and_then(|p| crate::dispatch::CompactionDispatchArgs::from_profile(&p).context_window))
+}
+
+/// (#1616) The registry-resolution half of `resolve_context_window_internal`,
+/// extracted so a second caller — `resolve_compactor_n_ctx_internal` — can
+/// read the SAME active profile's `models[]` for a DIFFERENT model's `n_ctx`
+/// without duplicating the quarantine/fallback logic (and risking the two
+/// callers disagreeing about which profile is "active"). Owned `Profile`
+/// (not a borrow of `loaded`) since `loaded` doesn't outlive this call.
+fn resolve_active_profile_internal(
+    profile_override: Option<&str>,
+    config_path: Option<&str>,
+) -> Result<Option<darkmux_types::Profile>> {
     let Ok(loaded) = darkmux_profiles::profiles::load_registry(config_path) else {
         return Ok(None);
     };
@@ -3974,7 +4019,48 @@ pub fn resolve_context_window_internal(
         }
         return Ok(None);
     };
-    Ok(crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window)
+    Ok(Some(profile.clone()))
+}
+
+/// (#1616) The compactor/utility model's OWN declared `n_ctx`, looked up by
+/// id in the ACTIVE profile's `models[]` — never the primary/default model's
+/// context window `resolve_context_window_internal` returns (that value
+/// feeds the compaction TRIGGER formula and belongs to a DIFFERENT model).
+/// `None` when the active profile carries no entry for this model id, or an
+/// entry with no `n_ctx` declared — the caller (`resolve_compactor_load_
+/// window`) then falls back to the primary's window and must say so.
+///
+/// `bare_model_key`-normalized on both sides: a profile entry may name the
+/// model as either the bare key or the `darkmux:`-namespaced identifier (the
+/// same tolerance `ensure_model_loaded_at_ctx` already applies), and the
+/// machine-level `internal.utility` binding this id comes from is typically
+/// namespaced.
+fn resolve_compactor_n_ctx_internal(
+    profile_override: Option<&str>,
+    config_path: Option<&str>,
+    compactor_model_id: &str,
+) -> Result<Option<u32>> {
+    let profile = resolve_active_profile_internal(profile_override, config_path)?;
+    let want = bare_model_key(compactor_model_id);
+    Ok(profile.and_then(|p| {
+        p.models.iter().find(|m| bare_model_key(&m.id) == want).and_then(|m| m.n_ctx)
+    }))
+}
+
+/// (#1616) Pick the window the compactor loads at: its OWN declared `n_ctx`
+/// when the active profile has an entry for it, else the primary's
+/// `context_window` as a NAMED fallback (`used_fallback` tells the caller to
+/// say so in the load message — operator sovereignty, #44, never a silent
+/// substitution). Pure so the precedence itself is unit-testable without a
+/// live registry.
+fn resolve_compactor_load_window(
+    compactor_n_ctx: Option<u32>,
+    primary_context_window: Option<u32>,
+) -> (Option<u32>, bool) {
+    match compactor_n_ctx {
+        Some(n) => (Some(n), false),
+        None => (primary_context_window, true),
+    }
 }
 
 /// (#632) Guard that the runtime always receives a context window. Some

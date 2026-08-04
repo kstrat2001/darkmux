@@ -793,6 +793,138 @@
         assert_eq!(window, Some(32000));
     }
 
+    // ─── #1616: the compactor loads at ITS OWN declared n_ctx ──────────
+
+    #[test]
+    fn resolve_compactor_load_window_prefers_the_compactor_s_own_n_ctx() {
+        // THE bug: a two-model profile (a big-context primary, a
+        // small-context compactor) must load the compactor at ITS OWN
+        // declared size, never the primary's.
+        let (window, used_fallback) = resolve_compactor_load_window(Some(120_000), Some(262_144));
+        assert_eq!(window, Some(120_000));
+        assert!(!used_fallback, "the compactor's own n_ctx must not be reported as a fallback");
+    }
+
+    #[test]
+    fn resolve_compactor_load_window_falls_back_to_the_primary_s_window_when_undeclared() {
+        // A model with NO declaration falls back to the current (pre-#1616)
+        // behavior — the primary's context window — but the fallback is
+        // NAMED so the caller can say so in the load message.
+        let (window, used_fallback) = resolve_compactor_load_window(None, Some(262_144));
+        assert_eq!(window, Some(262_144));
+        assert!(used_fallback, "borrowing the primary's window must be reported as a fallback");
+    }
+
+    #[test]
+    fn resolve_compactor_load_window_is_none_when_neither_side_declares_one() {
+        let (window, used_fallback) = resolve_compactor_load_window(None, None);
+        assert_eq!(window, None);
+        assert!(used_fallback, "still a fallback attempt, even though it resolved to nothing");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_compactor_n_ctx_internal_reads_the_compactor_s_own_registry_entry() {
+        // (#1616 reproduction) The `deep`-shaped profile: a big-context
+        // primary PLUS a small-context compactor, both declared in the same
+        // profile's `models[]`. Pre-fix, `resolve_context_window_internal`
+        // (the primary's window) was reused as the compactor's LOAD ctx —
+        // this resolver must instead find the compactor's OWN entry.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "deep":{"default_model":"primary-big","models":[
+                        {"id":"primary-big","n_ctx":262144},
+                        {"id":"darkmux:util-4b","n_ctx":120000}
+                    ]}
+                },
+                "default_profile":"deep"}"#,
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_PROFILES").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
+        let compactor_n_ctx =
+            resolve_compactor_n_ctx_internal(None, pf.to_str(), "darkmux:util-4b").unwrap();
+        let primary_window = resolve_context_window_internal(None, pf.to_str()).unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+                None => std::env::remove_var("DARKMUX_PROFILES"),
+            }
+        }
+        assert_eq!(compactor_n_ctx, Some(120_000), "must read the compactor's OWN entry, not the primary's");
+        assert_eq!(primary_window, Some(262_144), "the primary's own resolver must be untouched by the fix");
+        assert_ne!(compactor_n_ctx, primary_window, "precondition: the two models declare different sizes");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_compactor_n_ctx_internal_matches_across_the_darkmux_namespace() {
+        // The machine-level `internal.utility` binding is typically
+        // namespaced (`darkmux:qwen3-4b-instruct-2507`), but an operator's
+        // profile entry may name the model either way — both must resolve
+        // to the same declared n_ctx.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "deep":{"default_model":"primary-big","models":[
+                        {"id":"primary-big","n_ctx":262144},
+                        {"id":"util-4b","n_ctx":120000}
+                    ]}
+                },
+                "default_profile":"deep"}"#,
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_PROFILES").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
+        // Ask with the NAMESPACED form; the registry entry is bare.
+        let compactor_n_ctx =
+            resolve_compactor_n_ctx_internal(None, pf.to_str(), "darkmux:util-4b").unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+                None => std::env::remove_var("DARKMUX_PROFILES"),
+            }
+        }
+        assert_eq!(compactor_n_ctx, Some(120_000));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_compactor_n_ctx_internal_is_none_when_the_profile_has_no_entry_for_it() {
+        // The compactor is a machine-wide binding, decoupled from any
+        // profile — a profile that never lists it must resolve `None`, not
+        // an error, so the caller falls back to the primary's window.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"model-a","n_ctx":32000}]}
+                },
+                "default_profile":"fast"}"#,
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_PROFILES").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
+        let compactor_n_ctx =
+            resolve_compactor_n_ctx_internal(None, pf.to_str(), "darkmux:util-4b").unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+                None => std::env::remove_var("DARKMUX_PROFILES"),
+            }
+        }
+        assert_eq!(compactor_n_ctx, None);
+    }
+
     #[test]
     fn apply_volume_mounts_emits_workspace_and_out_dir() {
         // The runtime's OWN bookkeeping goes to `/darkmux-out`, SEPARATE

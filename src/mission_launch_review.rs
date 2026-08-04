@@ -642,6 +642,10 @@ pub(crate) fn launch(
     input_file: Option<&Path>,
     params: &[String],
     timeout_seconds: Option<u32>,
+    // (#1562) The launched config's tier, recorded onto `MissionSpec.origin`
+    // at mint — a user-tier review variant (`review-lean` in the operator's
+    // own dir) is named work; the shipped `review` is a run instance.
+    spec_origin: crew::types::MissionSpecOrigin,
 ) -> Result<i32> {
     let timeout_seconds = timeout_seconds.unwrap_or(REVIEW_DEFAULT_TIMEOUT_SECONDS);
     let collected = mission_launch::collect_inputs(input_file, params)?;
@@ -708,7 +712,7 @@ pub(crate) fn launch(
                 format!("parsing from_envelope {} as a review envelope", path.display())
             })?
         }
-        None => run_dispatch(config, &collected, &diff_file, &diff_text, timeout_seconds)?,
+        None => run_dispatch(config, &collected, &diff_file, &diff_text, timeout_seconds, spec_origin)?,
     };
 
     if let Some(path) = &envelope_out {
@@ -756,6 +760,7 @@ fn run_dispatch(
     diff_file: &Path,
     diff_text: &str,
     timeout_seconds: u32,
+    spec_origin: crew::types::MissionSpecOrigin,
 ) -> Result<ReviewEnvelope> {
     let case = derive_case_id(collected);
 
@@ -1019,6 +1024,9 @@ fn run_dispatch(
         let spec = crew::types::MissionSpec {
             config_id: "review".to_string(),
             inputs_fingerprint: mission_launch::spec_fingerprint(&id_input)?,
+            // (#1562) Recorded at mint — a user-tier review variant is the
+            // operator's named work; the shipped `review` is a run instance.
+            origin: Some(spec_origin),
         };
 
         let ctx = Arc::new(ReviewStepContext {
@@ -1773,6 +1781,7 @@ mod tests {
         let spec = crew::types::MissionSpec {
             config_id: "review".to_string(),
             inputs_fingerprint: mission_launch::spec_fingerprint(&id_input).unwrap(),
+            origin: Some(crew::types::MissionSpecOrigin::Builtin),
         };
         // Same call shape as `run_dispatch` (must-fix 2 provenance).
         let description = format!("PR review — {case_id} (crew `test-crew`)");
@@ -2160,7 +2169,7 @@ mod tests {
         collected.insert("profiles".to_string(), Value::String(profiles_path.display().to_string()));
 
         let diff_file = worktree_dir.path().join("unused.diff");
-        let result = run_dispatch(&config, &collected, &diff_file, "", 60);
+        let result = run_dispatch(&config, &collected, &diff_file, "", 60, crew::types::MissionSpecOrigin::Builtin);
 
         let err = result.expect_err("a renamed phase id must fail, not silently interpret");
         let msg = format!("{err:#}");
@@ -2254,7 +2263,7 @@ mod tests {
         // Empty diff -> empty bundle set -> a degenerate run with zero model
         // dispatches. The staffing snapshot is still resolved and recorded,
         // which is all this assertion needs.
-        let env = run_dispatch(&config, &collected, &diff_file, "", 60)
+        let env = run_dispatch(&config, &collected, &diff_file, "", 60, crew::types::MissionSpecOrigin::Builtin)
             .expect("an empty-diff variant run still produces an envelope");
 
         let staffing = env.staffing.as_ref().expect("a dispatching run records its staffing");
