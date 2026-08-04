@@ -172,6 +172,34 @@ fn short_handle(id: &str) -> Option<&str> {
 /// matching and the column fills with noise.
 const MIN_HANDLE_HEX: usize = 4;
 
+/// (#1562) Whether `m` is a machine-minted run instance (`mission launch
+/// <config>` / `dispatch <role>`) rather than a mission the operator named
+/// (`mission propose`, or hand-authored JSON). The default board hides
+/// minted runs behind a summary line — see `hidden_run_summary` — because on
+/// a real 59-mission board they outnumber named missions (32 of 59) and
+/// drown the work the operator actually named.
+///
+/// **A recorded discriminator, not a string match.** Every mint site
+/// (`mission_launch::ensure_mission_and_phases_with_provenance`'s `spec`
+/// argument, and `dispatch_as_crew_of_one::build_graph`) stamps
+/// `Mission.spec: Some(MissionSpec { .. })` at mint time — see that type's
+/// own doc. `mission propose`'s `ProposedMission` has no `spec` field at
+/// all, so an operator-named mission is `spec: None` by construction.
+/// `spec.is_some()` therefore answers "was this minted" directly; it is not
+/// a proxy standing in for the real signal.
+///
+/// The id-shape fallback exists ONLY for missions written before `spec`
+/// existed (#1503): a pre-#1503 `dispatch-code-reviewer-...` mission reads
+/// `spec: None` off disk today but is still very much a run instance, never
+/// something an operator typed. `short_handle` already implements exactly
+/// the needed shape test — a trailing hex discriminator every mint site
+/// appends, that a hand-authored id like `doom-loop-m4` never has (see its
+/// own doc) — so it is reused here rather than re-deriving a second
+/// heuristic.
+fn is_minted_run(m: &Mission) -> bool {
+    m.spec.is_some() || short_handle(&m.id).is_some()
+}
+
 /// (#1612) Compact "how long ago", in at most `AGE_COLS` columns.
 ///
 /// One unit, never two — `3d` not `3d 4h`. The board answers "what needs me
@@ -424,22 +452,44 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
         .collect();
     views.sort_by(board_order);
 
+    // (#1562) `--json` is deliberately NEVER filtered by the named-first
+    // default below, regardless of `--all` — this branch returns before
+    // `partition_visibility` even runs, so a machine reader always gets the
+    // whole board (`record exhaustively, display selectively`: the filter is
+    // display-only). `--limit`/pagination already followed this same rule.
     if json {
         return run_json(&views);
     }
 
-    let attention: usize = views.iter().filter(|v| !v.drifts.is_empty()).count();
+    // Resolved once, above the early return, so every prose line in this
+    // renderer — including the empty-board hint — wraps to the same width.
+    let width = style::terminal_width();
+    if views.is_empty() {
+        // (#1582) The prose wraps; the command does not. Same rule the drift
+        // suggestions follow, for the same reason — this is the one command a
+        // brand-new operator will copy, and it is the worst possible one to
+        // break across a line with an indent injected into the middle.
+        for line in wrap_indented("no missions yet — propose one with:", 2, width) {
+            println!("{}", style::dim(&line));
+        }
+        println!("  {} darkmux mission propose", style::dim("→"));
+        return Ok(0);
+    }
+
+    // (#1562) Named-first default: machine-minted run instances collapse
+    // into a footer summary instead of a full row, so the missions the
+    // operator actually named aren't drowned by pipeline/dispatch noise.
+    // `--all` restores every mission — the pre-#1562 everything-shown board.
+    let (visible, hidden) = partition_visibility(&views, all);
+
     println!(
         "{}",
         style::header(&format!(
             "mission status — {} mission{}",
-            views.len(),
-            if views.len() == 1 { "" } else { "s" }
+            visible.len(),
+            if visible.len() == 1 { "" } else { "s" }
         ))
     );
-    // Resolved once, above the early return, so every prose line in this
-    // renderer — including the empty-board hint — wraps to the same width.
-    let width = style::terminal_width();
     // (#1569 packet A) Resolved ONCE per board, not per row: on a hub/peer
     // this may spawn `tailscale serve status --json`, and doing that 82 times
     // for an 82-mission board would be absurd. It short-circuits to loopback
@@ -455,17 +505,6 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
     // it goes to the same place from every group, and Active + Paused +
     // Finalized all overflowing would otherwise stack three identical rows.
     let mut all_link_shown = false;
-    if views.is_empty() {
-        // (#1582) The prose wraps; the command does not. Same rule the drift
-        // suggestions follow, for the same reason — this is the one command a
-        // brand-new operator will copy, and it is the worst possible one to
-        // break across a line with an indent injected into the middle.
-        for line in wrap_indented("no missions yet — propose one with:", 2, width) {
-            println!("{}", style::dim(&line));
-        }
-        println!("  {} darkmux mission propose", style::dim("→"));
-        return Ok(0);
-    }
 
     // Section membership first, so the layout can be planned from exactly the
     // rows that will be printed (and stay aligned across every section).
@@ -480,7 +519,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
             MissionStatus::Aborted,
         ]
             .into_iter()
-            .map(|group| (group, views.iter().filter(|v| v.m.status == group).collect()))
+            .map(|group| (group, visible.iter().filter(|v| v.m.status == group).copied().collect()))
             .filter(|(_, g): &(_, Vec<&MissionView>)| !g.is_empty())
             .collect();
 
@@ -623,36 +662,136 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
         }
     }
 
+    // (#1562) The named-first default's own footer: names what was collapsed
+    // above (count + how many of those need attention) so a hidden actionable
+    // run can never read as silently gone — operator sovereignty (#44).
+    // `--all` leaves `hidden` empty, so this never prints on a full board.
+    let hidden_attention = hidden.iter().filter(|v| !v.drifts.is_empty()).count();
+    if let Some(line) = hidden_run_summary(hidden.len(), hidden_attention) {
+        println!();
+        for l in wrap_indented(&line, 0, width) {
+            println!("{}", style::dim(&l));
+        }
+    }
+    // A hidden run needing attention is exactly the same "some are hidden"
+    // situation a per-section `--limit` already warns about below — folded
+    // into the same flag rather than a second, competing qualifier.
+    let any_drift_hidden = any_drift_hidden || hidden_attention > 0;
+
     println!();
-    if attention == 0 {
-        for line in wrap_indented("✓ board is clean — every mission's phases are reconciled", 0, width) {
-            println!("{}", style::success(&line));
-        }
-    } else {
-        // "above" is only true for the drifted missions that were PRINTED; a
-        // section limit can leave others unshown (each section warns), so the
-        // rollup admits it rather than pointing at commands that never appeared.
-        let summary = format!(
-            "{} mission{} {} attention — run the suggested commands above to reconcile{}",
-            attention,
-            if attention == 1 { "" } else { "s" },
-            if attention == 1 { "needs" } else { "need" },
-            if !any_drift_hidden {
-                ""
-            } else if all_link.is_some() {
-                " (some are hidden — open the full board above)"
-            } else {
-                " (some are hidden — `--all` to see them)"
-            }
-        );
-        for line in wrap_indented(&summary, 0, width) {
-            println!("{}", style::warn(&line));
-        }
+    // "above" is only true for the drifted missions that were PRINTED as full
+    // rows; a section limit or the named-first default can leave others
+    // unshown (each warns its own way above), so the rollup admits it rather
+    // than pointing at commands that never appeared.
+    let visible_attention: usize = visible.iter().filter(|v| !v.drifts.is_empty()).count();
+    let (clean, summary) =
+        attention_rollup(visible_attention, hidden_attention, any_drift_hidden, all_link.is_some());
+    for line in wrap_indented(&summary, 0, width) {
+        println!("{}", if clean { style::success(&line) } else { style::warn(&line) });
     }
     Ok(0)
 }
 
-fn run_json(views: &[MissionView]) -> Result<i32> {
+/// (#1562) Split `views` into (visible, hidden) for the named-first default
+/// vs `--all`. `all == true` returns every mission visible and nothing
+/// hidden — the pre-#1562 everything-shown board. `all == false` hides
+/// machine-minted run instances (`is_minted_run`) so the missions an
+/// operator actually named aren't drowned by pipeline/dispatch noise. Pure
+/// and borrowing, so it's unit-testable without any disk I/O.
+fn partition_visibility<'a>(
+    views: &'a [MissionView<'a>],
+    all: bool,
+) -> (Vec<&'a MissionView<'a>>, Vec<&'a MissionView<'a>>) {
+    if all {
+        return (views.iter().collect(), Vec::new());
+    }
+    views.iter().partition(|v| !is_minted_run(v.m))
+}
+
+/// (#1562) The board-footer line naming what the named-first default
+/// collapsed — `None` when nothing was hidden (an `--all` board, or a board
+/// with no minted runs at all). `hidden_attention` is named explicitly: a
+/// hidden run needing `mission abort`/`finalize` must never vanish
+/// silently, it just isn't rendered as a full row with its own
+/// copy-pasteable commands (operator sovereignty, #44).
+fn hidden_run_summary(hidden_len: usize, hidden_attention: usize) -> Option<String> {
+    if hidden_len == 0 {
+        return None;
+    }
+    let plural = if hidden_len == 1 { "" } else { "s" };
+    if hidden_attention == 0 {
+        return Some(format!(
+            "+{hidden_len} run instance{plural} — `--all` for every mission, or the runs lens"
+        ));
+    }
+    let verb = if hidden_attention == 1 { "needs" } else { "need" };
+    Some(format!(
+        "+{hidden_len} run instance{plural}, {hidden_attention} {verb} attention — `--all` for every \
+         mission, or the runs lens"
+    ))
+}
+
+/// (#1562) The final "N missions need attention" line (or the clean
+/// checkmark) — extracted so its three distinct cases are each directly
+/// testable without a real board:
+///   - nothing anywhere → the clean checkmark;
+///   - something ONLY among hidden (collapsed) runs → the rollup must still
+///     say so, since nothing about that is visible above it;
+///   - something on-screen → the existing "run the suggested commands
+///     above" wording, with `any_drift_hidden`'s tail unchanged.
+///
+/// Returns `(is_clean, message)`; the caller picks `style::success` /
+/// `style::warn` from `is_clean`.
+fn attention_rollup(
+    visible_attention: usize,
+    hidden_attention: usize,
+    any_drift_hidden: bool,
+    all_link_present: bool,
+) -> (bool, String) {
+    if visible_attention == 0 && hidden_attention == 0 {
+        return (true, "✓ board is clean — every mission's phases are reconciled".to_string());
+    }
+    if visible_attention == 0 {
+        // Nothing printed above needs action, but a collapsed run does —
+        // point at `--all` rather than "commands above", since there are
+        // none above to run.
+        let plural = if hidden_attention == 1 { "" } else { "s" };
+        let verb = if hidden_attention == 1 { "needs" } else { "need" };
+        let it = if hidden_attention == 1 { "it" } else { "them" };
+        return (
+            false,
+            format!(
+                "{hidden_attention} hidden run instance{plural} {verb} attention — run `darkmux mission \
+                 status --all` to see {it} and {its} reconcile command{plural}",
+                its = if hidden_attention == 1 { "its" } else { "their" },
+            ),
+        );
+    }
+    let tail = if !any_drift_hidden {
+        ""
+    } else if all_link_present {
+        " (some are hidden — open the full board above)"
+    } else {
+        " (some are hidden — `--all` to see them)"
+    };
+    (
+        false,
+        format!(
+            "{visible_attention} mission{s} {verb} attention — run the suggested commands above to \
+             reconcile{tail}",
+            s = if visible_attention == 1 { "" } else { "s" },
+            verb = if visible_attention == 1 { "needs" } else { "need" },
+        ),
+    )
+}
+
+/// (#1562) The `--json` payload's data — extracted from `run_json` purely so
+/// its COMPLETENESS is directly unit-testable: this takes the same
+/// unfiltered `views` slice `run()` builds before it ever computes
+/// `partition_visibility`, so a test can assert the mission count here
+/// matches the input slice regardless of what a human-board `--all` would
+/// show. No I/O, no printing.
+fn board_json(views: &[MissionView]) -> serde_json::Value {
     let arr: Vec<serde_json::Value> = views
         .iter()
         .map(|v| {
@@ -671,13 +810,14 @@ fn run_json(views: &[MissionView]) -> Result<i32> {
         })
         .collect();
     let attention = views.iter().filter(|v| !v.drifts.is_empty()).count();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "missions": arr,
-            "summary": { "total": views.len(), "needs_attention": attention },
-        }))?
-    );
+    serde_json::json!({
+        "missions": arr,
+        "summary": { "total": views.len(), "needs_attention": attention },
+    })
+}
+
+fn run_json(views: &[MissionView]) -> Result<i32> {
+    println!("{}", serde_json::to_string_pretty(&board_json(views))?);
     Ok(0)
 }
 
@@ -976,6 +1116,7 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crew::types::MissionSpec;
 
     fn mission(id: &str, status: MissionStatus) -> Mission {
         Mission {
@@ -1969,5 +2110,174 @@ mod tests {
         assert_eq!(progress_bar(1, 1), "▓▓▓▓");
         assert_eq!(progress_bar(1, 2), "▓▓░░");
         assert_eq!(progress_bar(0, 0), "····");
+    }
+
+    // ── (#1562) Named-first default: minted-run classification + collapse ──
+
+    fn minted_spec() -> MissionSpec {
+        MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "x".to_string() }
+    }
+
+    #[test]
+    fn is_minted_run_trusts_the_recorded_spec_over_id_shape() {
+        // A hand-authored id (no trailing hex discriminator) with spec:None
+        // must read as operator-named — the id-shape check must not
+        // override an absent spec into "minted" on its own.
+        let mut m = mission("doom-loop-m4", MissionStatus::Active);
+        assert!(!is_minted_run(&m), "operator-named id with spec:None must not read as minted");
+
+        // spec:Some is the RECORDED discriminator and must win regardless of
+        // what the id looks like.
+        m.spec = Some(minted_spec());
+        assert!(is_minted_run(&m), "spec:Some must be trusted as the ground truth");
+    }
+
+    #[test]
+    fn is_minted_run_falls_back_to_id_shape_for_pre_1503_records() {
+        // Real minted shapes written before `spec` existed (#1503) carry
+        // spec:None on disk today but are still run instances, not
+        // something an operator typed.
+        let review = mission("review-1785400940-136e76", MissionStatus::Active);
+        assert!(review.spec.is_none(), "precondition: no recorded spec");
+        assert!(is_minted_run(&review), "pre-#1503 review-shaped id must still classify as minted");
+
+        let dispatch = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Finalized);
+        assert!(dispatch.spec.is_none(), "precondition: no recorded spec");
+        assert!(is_minted_run(&dispatch), "pre-#1503 dispatch-shaped id must still classify as minted");
+    }
+
+    #[test]
+    fn is_minted_run_is_false_for_hand_authored_ids_with_no_spec() {
+        for id in ["doom-loop-m4", "104-daemon-observability"] {
+            let m = mission(id, MissionStatus::Active);
+            assert!(m.spec.is_none());
+            assert!(!is_minted_run(&m), "`{id}` must read as operator-named");
+        }
+    }
+
+    #[test]
+    fn partition_visibility_keeps_named_and_collapses_minted_by_default() {
+        let named = mission("doom-loop-m4", MissionStatus::Active);
+        let mut minted = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Active);
+        minted.spec = Some(minted_spec());
+        let views = [view(&named, 1, 0), view(&minted, 1, 0)];
+
+        let (visible, hidden) = partition_visibility(&views, false);
+        assert_eq!(visible.iter().map(|v| v.m.id.as_str()).collect::<Vec<_>>(), vec!["doom-loop-m4"]);
+        assert_eq!(
+            hidden.iter().map(|v| v.m.id.as_str()).collect::<Vec<_>>(),
+            vec!["dispatch-code-reviewer-1785589698-5d6a-0"]
+        );
+    }
+
+    #[test]
+    fn partition_visibility_all_shows_everything_and_hides_nothing() {
+        let named = mission("doom-loop-m4", MissionStatus::Active);
+        let mut minted = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Active);
+        minted.spec = Some(minted_spec());
+        let views = [view(&named, 1, 0), view(&minted, 1, 0)];
+
+        let (visible, hidden) = partition_visibility(&views, true);
+        assert_eq!(visible.len(), 2, "`--all` must show every mission, minted or named");
+        assert!(hidden.is_empty(), "`--all` must hide nothing");
+    }
+
+    #[test]
+    fn hidden_run_summary_is_none_when_nothing_is_hidden() {
+        assert_eq!(hidden_run_summary(0, 0), None);
+    }
+
+    #[test]
+    fn hidden_run_summary_names_the_count_and_pluralizes() {
+        assert_eq!(
+            hidden_run_summary(1, 0).unwrap(),
+            "+1 run instance — `--all` for every mission, or the runs lens"
+        );
+        assert_eq!(
+            hidden_run_summary(32, 0).unwrap(),
+            "+32 run instances — `--all` for every mission, or the runs lens"
+        );
+    }
+
+    #[test]
+    fn hidden_run_summary_surfaces_hidden_actionable_runs() {
+        // THE needs-attention requirement: a hidden stalled run that needs
+        // `mission abort` must not become invisible just because it was
+        // collapsed out of the section it would have rendered in.
+        assert_eq!(
+            hidden_run_summary(32, 2).unwrap(),
+            "+32 run instances, 2 need attention — `--all` for every mission, or the runs lens"
+        );
+        assert_eq!(
+            hidden_run_summary(3, 1).unwrap(),
+            "+3 run instances, 1 needs attention — `--all` for every mission, or the runs lens"
+        );
+    }
+
+    #[test]
+    fn attention_rollup_is_clean_only_when_both_counts_are_zero() {
+        let (clean, msg) = attention_rollup(0, 0, false, false);
+        assert!(clean);
+        assert_eq!(msg, "✓ board is clean — every mission's phases are reconciled");
+    }
+
+    #[test]
+    fn attention_rollup_names_a_hidden_only_attention_item() {
+        // Nothing printed above needs action, but a collapsed run does — the
+        // board must not read as clean, and must point at `--all` since
+        // there are no commands above it to run.
+        let (clean, msg) = attention_rollup(0, 1, true, false);
+        assert!(!clean, "a hidden actionable run must never look like a clean board");
+        assert!(msg.contains("1 hidden run instance needs attention"), "{msg}");
+        assert!(msg.contains("--all"), "{msg}");
+
+        let (clean, msg) = attention_rollup(0, 2, true, false);
+        assert!(!clean);
+        assert!(msg.contains("2 hidden run instances need attention"), "{msg}");
+    }
+
+    #[test]
+    fn attention_rollup_uses_the_existing_wording_when_visible_missions_need_attention() {
+        let (clean, msg) = attention_rollup(3, 0, false, false);
+        assert!(!clean);
+        assert_eq!(msg, "3 missions need attention — run the suggested commands above to reconcile");
+
+        let (_, msg) = attention_rollup(1, 0, false, false);
+        assert_eq!(msg, "1 mission needs attention — run the suggested commands above to reconcile");
+    }
+
+    #[test]
+    fn attention_rollup_tail_reflects_hidden_drift_and_panel_presence() {
+        let (_, msg) = attention_rollup(3, 2, true, false);
+        assert!(msg.ends_with("(some are hidden — `--all` to see them)"), "{msg}");
+
+        let (_, msg) = attention_rollup(3, 2, true, true);
+        assert!(msg.ends_with("(some are hidden — open the full board above)"), "{msg}");
+
+        let (_, msg) = attention_rollup(3, 0, false, false);
+        assert!(!msg.contains("hidden"), "{msg}");
+    }
+
+    #[test]
+    fn board_json_is_complete_regardless_of_what_a_human_board_would_hide() {
+        // The JSON path is built from the SAME unfiltered `views` slice
+        // `run()` passes it, before `partition_visibility` ever runs — this
+        // pins that a mix of named + minted missions all survive into the
+        // payload, and that a minted mission's drift is still counted.
+        let named = mission("doom-loop-m4", MissionStatus::Active);
+        let mut minted = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Active);
+        minted.spec = Some(minted_spec());
+        let views = vec![view(&named, 1, 0), drifted(&minted)];
+
+        let payload = board_json(&views);
+        let ids: Vec<&str> =
+            payload["missions"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 2, "both named and minted missions must be present");
+        assert!(ids.contains(&"doom-loop-m4"));
+        assert!(ids.contains(&"dispatch-code-reviewer-1785589698-5d6a-0"));
+        assert_eq!(payload["summary"]["total"], 2);
+        // The minted mission carries drift (via `drifted`) — `--json` must
+        // never hide an actionable item behind the display-only filter.
+        assert_eq!(payload["summary"]["needs_attention"], 1);
     }
 }
