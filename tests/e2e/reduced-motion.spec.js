@@ -4,6 +4,12 @@
 // (the badge stays green + "● live" labeled, just not pulsing).
 const { test, expect } = require('@playwright/test');
 
+// (#1622) Every other spec collects uncaught errors; this one did not, so a
+// throw during render would go unreported while the assertions still passed.
+test.beforeEach(async ({ page }) => {
+  page.on('pageerror', (e) => { throw new Error(`uncaught page error: ${e}`); });
+});
+
 test('prefers-reduced-motion neutralizes the live-badge pulse animation', async ({ page }) => {
   await page.goto('/index.html'); // demo harness — any viewer page carries the CSS
   await page.emulateMedia({ reducedMotion: 'reduce' });

@@ -212,6 +212,8 @@
   .mmeter b{color:var(--accent);font-weight:700}
   .mmeter .split{color:var(--muted)}
   .mmeter .cloud{color:var(--warn)}
+  /* (#1626) Unattributed reads as a caution, not as a saving. */
+  .mmeter .unknown{color:var(--muted);font-style:italic}
 
   /* (#1403) Per-step token/turn meter on an AI-dispatching step row. */
   .mn-step-meter{margin-left:auto;flex:0 0 auto;display:inline-flex;gap:6px;font:10px/1 'JetBrains Mono',monospace;color:var(--muted);white-space:nowrap}
@@ -1009,10 +1011,10 @@ function applyRecordToMetrics(metrics, rec, idx){
   var sid = stepForRecord(rec, idx);
   if (!sid) return metrics;
   var p = rec.payload || {};
-  var cur = metrics[sid] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, startTs:0, endTs:0 };
+  var cur = metrics[sid] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, localOk:false, startTs:0, endTs:0 };
   var next = { tokRun:cur.tokRun, tokFinal:cur.tokFinal, turnRun:cur.turnRun, turnFinal:cur.turnFinal,
                toolRun:cur.toolRun||0, toolFinal:cur.toolFinal||0,
-               cloud:cur.cloud, startTs:cur.startTs, endTs:cur.endTs };
+               cloud:cur.cloud, localOk:cur.localOk||false, startTs:cur.startTs, endTs:cur.endTs };
   var action = rec.action || "";
   var isTok = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
   var isTurn = action === "dispatch.turn";
@@ -1035,7 +1037,24 @@ function applyRecordToMetrics(metrics, rec, idx){
   var recMs = tsToMs(rec.ts);
   if (isStart && recMs) { next.startTs = next.startTs ? Math.min(next.startTs, recMs) : recMs; }
   if (isTerminal && recMs) { next.endTs = Math.max(next.endTs, recMs); }
+  // (#1626) THREE states, not two — the same correction #1607 made in the
+  // viewer's savings hero, which this surface never received.
+  //
+  // The old rule was `endpoint present -> cloud, absent -> local`, and that
+  // DEFAULT was the defect: "could not determine" was reported as "off the
+  // meter", the one direction this number must never err in. A hosted step's
+  // `dispatch start` carries no endpoint (only a clean `dispatch complete`
+  // does), so a hosted seat read as LOCAL for its entire live duration; and a
+  // hosted seat that ERRORED never emitted an endpoint at all, so its tokens
+  // were credited to local permanently.
+  //
+  // `local` now requires POSITIVE evidence — a clean terminal with no endpoint
+  // — exactly as `localSids` does in viewer.html. Everything else is unknown
+  // and is excluded from the local claim rather than inflating it.
   if (p.endpoint) next.cloud = true;
+  if (action === "dispatch complete" || action === "dispatch.complete") {
+    if (!p.endpoint) next.localOk = true;
+  }
   // (#1445 gate) Finalized token totals read `total_tokens` first, falling
   // back to `tokens` — the review vocabulary's probe/judge/verify step
   // results carry `tokens`, never `total_tokens`, and without the fallback
@@ -1106,25 +1125,33 @@ function seedMetricsFromGraph(metrics, g){
       var tf = (typeof s.tokensFinal === "number") ? s.tokensFinal : 0;
       var nf = (typeof s.turnsFinal === "number") ? s.turnsFinal : 0;
       var cl = !!s.cloud;
+      // (#1626) The backfill's own local evidence. Without this the seeded
+      // metrics had NO `localOk` at all, so every step on a page opened AFTER
+      // a run finished — which is most viewing, since SSE is tail-from-now —
+      // read as unattributed. That would have replaced a wrong number with a
+      // useless one. `localOk` is emitted by the server only when a clean
+      // terminal carried no endpoint, so absence still means "no evidence".
+      var lok = !!s.localOk;
       var st = tsToMs(s.startedTs);
       // (#1483) `toolsFinal` seeds the same way turns/tokens do, so a page
       // opened after an agentic seat closed still shows its tool-call total if
       // the server ever folds it (absent today -> 0, no behavior change; the
       // key must exist so the live fold's `Math.max` never sees `undefined`).
       var cf = (typeof s.toolsFinal === "number") ? s.toolsFinal : 0;
-      if (!tf && !nf && !cf && !cl && !st) return;
-      var cur = out[s.id] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, startTs:0 };
+      if (!tf && !nf && !cf && !cl && !lok && !st) return;
+      var cur = out[s.id] || { tokRun:0, tokFinal:0, turnRun:0, turnFinal:0, toolRun:0, toolFinal:0, cloud:false, localOk:false, startTs:0 };
       var ntf = Math.max(cur.tokFinal, tf);
       var nnf = Math.max(cur.turnFinal, nf);
       var ncf = Math.max(cur.toolFinal||0, cf);
       var ncl = cur.cloud || cl;
+      var nlok = cur.localOk || lok;
       // Keep the EARLIEST known start; 0 means unknown, so a real `st` always
       // wins over 0 (and a live start bookend already set wins by min).
       var curSt = cur.startTs || 0;
       var nst = curSt ? (st ? Math.min(curSt, st) : curSt) : st;
-      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncf === (cur.toolFinal||0) && ncl === cur.cloud && nst === curSt) return;
+      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncf === (cur.toolFinal||0) && ncl === cur.cloud && nlok === (cur.localOk||false) && nst === curSt) return;
       if (out === metrics) out = Object.assign({}, metrics);
-      out[s.id] = Object.assign({ toolRun:0 }, cur, { tokFinal:ntf, turnFinal:nnf, toolFinal:ncf, cloud:ncl, startTs:nst });
+      out[s.id] = Object.assign({ toolRun:0 }, cur, { tokFinal:ntf, turnFinal:nnf, toolFinal:ncf, cloud:ncl, localOk:nlok, startTs:nst });
     });
   });
   return out;
@@ -1137,17 +1164,24 @@ function stepDisplayMetrics(m){
   var turns = m.turnFinal || m.turnRun || 0;
   // (#1483) Tool-calls: finalized when folded, else the running live count.
   var tools = m.toolFinal || m.toolRun || 0;
-  return { tokens: tokens, turns: turns, tools: tools, cloud: !!m.cloud, has: tokens > 0 || turns > 0 || tools > 0 };
+  return { tokens: tokens, turns: turns, tools: tools, cloud: !!m.cloud, localOk: !!m.localOk,
+           has: tokens > 0 || turns > 0 || tools > 0 };
 }
 function missionTotals(metrics){
-  var local = 0, cloud = 0, turns = 0;
+  // (#1626) local / cloud / UNKNOWN. `unknown` shrinking toward zero is the
+  // visible signal that the remaining producers have started emitting their
+  // bookends — the same read the savings hero gives.
+  var local = 0, cloud = 0, unknown = 0, turns = 0;
   for (var k in metrics) {
     if (!Object.prototype.hasOwnProperty.call(metrics, k)) continue;
     var d = stepDisplayMetrics(metrics[k]);
-    if (d.cloud) cloud += d.tokens; else local += d.tokens;
+    if (d.cloud) cloud += d.tokens;
+    else if (d.localOk) local += d.tokens;
+    else unknown += d.tokens;
     turns += d.turns;
   }
-  return { local: local, cloud: cloud, total: local + cloud, turns: turns };
+  return { local: local, cloud: cloud, unknown: unknown,
+           total: local + cloud + unknown, turns: turns };
 }
 // Does this record belong to THIS mission? (the events panel filter). Matches
 // on any handle/id/session/mission the page already knows from the snapshot.
@@ -1844,10 +1878,19 @@ function App(){
   }
 
   // (#1403) Mission-scoped live token readout, local vs cloud honesty split.
+  // (#1626) The split now renders whenever ANY token is attributed — not only
+  // when `cloud` is non-zero. Gating on cloud meant a mission whose tokens were
+  // entirely UNKNOWN showed a bare total with no hint that none of it had been
+  // attributed, which is the same silence the old two-way split produced.
+  var attributed = tot.cloud || tot.unknown;
   var meterEl = tot.total || tot.turns ? h("span", {className:"mmeter"},
     tot.total ? h("b", null, fmtTok(tot.total) + " tok") : null,
-    (tot.total && tot.cloud) ? h("span", {className:"split"},
-      fmtTok(tot.local) + " local + ", h("span", {className:"cloud"}, fmtTok(tot.cloud) + " cloud")) : null,
+    (tot.total && attributed) ? h("span", {className:"split"},
+      fmtTok(tot.local) + " local",
+      tot.cloud ? h("span", {key:"c"}, " + ", h("span", {className:"cloud"}, fmtTok(tot.cloud) + " cloud")) : null,
+      // Unattributed tokens are named, never folded into local. Watching this
+      // shrink is how an operator sees producers start emitting their bookends.
+      tot.unknown ? h("span", {key:"u", className:"unknown"}, " + " + fmtTok(tot.unknown) + " unattributed") : null) : null,
     tot.turns ? h("span", {className:"split"}, "· " + tot.turns + (tot.turns === 1 ? " turn" : " turns")) : null
   ) : null;
 

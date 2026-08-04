@@ -37,6 +37,9 @@ function panelBody(ansi, over = {}) {
 test.use({ viewport: PHONE });
 
 test.beforeEach(async ({ page }) => {
+  // (#1622) Every other spec collects uncaught errors; these two did not, so a
+  // throw during render would go unreported while the assertions still passed.
+  page.on('pageerror', (e) => { throw new Error(`uncaught page error: ${e}`); });
   await page.route('**/panel/**', (route) =>
     route.fulfill({ contentType: 'application/json', body: JSON.stringify(panelBody(BOARD_52)) })
   );
