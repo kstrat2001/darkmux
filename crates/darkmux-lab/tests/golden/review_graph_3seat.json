@@ -18,21 +18,27 @@
       "config": {
         "probe_specs": [
           {
-            "draw_task_ids": ["review-probe-high-task"],
+            "draw_task_ids": [
+              "review-probe-high-task"
+            ],
             "endpoint_host": null,
             "identifier": "darkmux:probe-model-a",
             "name": "phigh",
             "remote": false
           },
           {
-            "draw_task_ids": ["review-probe-mid-task"],
+            "draw_task_ids": [
+              "review-probe-mid-task"
+            ],
             "endpoint_host": null,
             "identifier": "darkmux:probe-model-b",
             "name": "pmid",
             "remote": false
           },
           {
-            "draw_task_ids": ["review-probe-low-task"],
+            "draw_task_ids": [
+              "review-probe-low-task"
+            ],
             "endpoint_host": null,
             "identifier": "darkmux:probe-model-c",
             "name": "plow",
@@ -196,7 +202,7 @@
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe role `review-probe-high` — one role, one task (#1512); parallelism with the other two probe tasks is emergent from all three depending only on review-bundle-task",
+      "description": "probe role `review-probe-high` \u2014 one role, one task (#1512); parallelism with the other two probe tasks is emergent from all three depending only on review-bundle-task",
       "display_name": "Probe high",
       "id": "review-probe-high-task",
       "phase_id": "pr-review-golden-investigate",
@@ -210,7 +216,7 @@
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe role `review-probe-mid` — one role, one task (#1512)",
+      "description": "probe role `review-probe-mid` \u2014 one role, one task (#1512)",
       "display_name": "Probe mid",
       "id": "review-probe-mid-task",
       "phase_id": "pr-review-golden-investigate",
@@ -224,7 +230,7 @@
       "depends_on": [
         "review-bundle-task"
       ],
-      "description": "probe role `review-probe-low` — one role, one task (#1512)",
+      "description": "probe role `review-probe-low` \u2014 one role, one task (#1512)",
       "display_name": "Probe low",
       "id": "review-probe-low-task",
       "phase_id": "pr-review-golden-investigate",
@@ -240,7 +246,7 @@
         "review-probe-mid-task",
         "review-probe-low-task"
       ],
-      "description": "dedup probe flags — mechanism-family keying + anchor matching. (#1512, #1513 review) `depends_on` below is build_review_graph's CLAIM/PRUNE boundary, NOT the probe role registry: a resolved staffing claims its declared task by role_id, and any declared task nobody claims is pruned (loudly, with a warning). Probe roles are discovered separately, by resolve_review_roles walking every task in this document and classifying each by its step kind. Adding/removing a probe task here (with its own role_id, and its entry in this depends_on list) still changes the probe count with zero Rust changes.",
+      "description": "dedup probe flags \u2014 mechanism-family keying + anchor matching. (#1512, #1513 review) `depends_on` below is build_review_graph's CLAIM/PRUNE boundary, NOT the probe role registry: a resolved staffing claims its declared task by role_id, and any declared task nobody claims is pruned (loudly, with a warning). Probe roles are discovered separately, by resolve_review_roles walking every task in this document and classifying each by its step kind. Adding/removing a probe task here (with its own role_id, and its entry in this depends_on list) still changes the probe count with zero Rust changes.",
       "display_name": "Dedup",
       "id": "review-dedup-task",
       "phase_id": "pr-review-golden-investigate",
@@ -249,23 +255,22 @@
       ]
     },
     {
-      "depends_on": [
-        "review-dedup-task"
-      ],
-      "description": "double-confirm judge — internal pass1/pass2 loop over deduped flags",
+      "depends_on": [],
+      "description": "double-confirm judge \u2014 internal pass1/pass2 loop over deduped flags",
       "display_name": "Judge",
       "id": "review-judge-task",
       "phase_id": "pr-review-golden-adjudicate",
       "step_ids": [
         "review-judge-step"
       ],
-      "role_id": "review-judge"
+      "role_id": "review-judge",
+      "reads": [
+        "review-dedup-task"
+      ]
     },
     {
-      "depends_on": [
-        "review-judge-task"
-      ],
-      "description": "verify — render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
+      "depends_on": [],
+      "description": "verify \u2014 render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
       "display_name": "Verify",
       "id": "review-verify-task",
       "phase_id": "pr-review-golden-report",
@@ -273,20 +278,25 @@
         "review-verify-render-step",
         "review-verify-step"
       ],
-      "role_id": "review-verify"
+      "role_id": "review-verify",
+      "reads": [
+        "review-judge-task"
+      ]
     },
     {
       "depends_on": [
-        "review-dedup-task",
-        "review-judge-task",
         "review-verify-task"
       ],
-      "description": "synthesis — apply verify adjudications, finalize tier counts + needs-check clustering",
+      "description": "synthesis \u2014 apply verify adjudications, finalize tier counts + needs-check clustering",
       "display_name": "Synthesis",
       "id": "review-synthesis-task",
       "phase_id": "pr-review-golden-report",
       "step_ids": [
         "review-synthesis-step"
+      ],
+      "reads": [
+        "review-dedup-task",
+        "review-judge-task"
       ]
     }
   ]

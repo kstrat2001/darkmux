@@ -566,6 +566,14 @@ pub struct Task {
     /// applies only once a real multi-step Task exists.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// (#1619) The output-ledger reads resolved from `TaskConfig::reads` at
+    /// interpret time (template references already expanded to real task
+    /// ids). Orders execution like `depends_on` and feeds this task's first
+    /// step's input, but is NOT drawn as a graph edge — see
+    /// `TaskConfig::reads` for the full design. Serde-defaulted so missions
+    /// stored before the field existed read cleanly (contract 5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
     /// (#1230/#1341) A Task is the ASSIGNABLE unit — like a Jira ticket
     /// assigned to one crew member, the assignee/environment/profile are
     /// properties of the whole job, fixed for its duration, not

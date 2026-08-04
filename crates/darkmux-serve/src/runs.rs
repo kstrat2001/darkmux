@@ -1213,6 +1213,7 @@ mod tests {
             display_name: None,
             step_ids,
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: role_id.map(String::from),
             profile_name: None,
             workdir: None,

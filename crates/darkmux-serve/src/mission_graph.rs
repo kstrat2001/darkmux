@@ -1327,6 +1327,7 @@ mod tests {
             display_name: None,
             step_ids: step_ids.iter().map(|s| s.to_string()).collect(),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,

@@ -60,7 +60,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// role per expanded task). Bump discipline (see `CLAUDE.md`'s "Versioning" —
 /// same rule, different data shape): additive field/section → minor;
 /// rename/retype/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "1.3";
+pub const MISSION_CONFIG_SCHEMA: &str = "1.4";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -190,6 +190,28 @@ pub struct TaskConfig {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// (#1619, schema 1.4) Task ids whose LAST STEP OUTPUT this task's first
+    /// step receives as input — the run-scoped OUTPUT LEDGER made nameable.
+    /// Every completed task's output is available to any later task by
+    /// naming it here; no `depends_on` edge is needed to receive data.
+    ///
+    /// `reads` ORDERS execution exactly like `depends_on` (you cannot read
+    /// an output that hasn't been written — the scheduler waits for every
+    /// `reads` target to complete) but it is NOT a rendered graph edge: the
+    /// mission-graph lens draws only `depends_on`. That split is the whole
+    /// point. Before this field, `depends_on` was the ONLY way to receive an
+    /// upstream task's output, so the built-in review config had to declare
+    /// cross-phase task edges (synthesis → dedup two phases back) that
+    /// rendered as phase bypasses — the operator read them as design
+    /// short-circuits. Data flow now rides the ledger invisibly; `depends_on`
+    /// is left for ordering the graph should SHOW (typically intra-phase).
+    ///
+    /// Like `depends_on`, entries are DOCUMENT-WIDE task ids, may name a
+    /// template task (resolving to all its expanded copies), and join the
+    /// same cycle detection — a `reads` loop is as unschedulable as a
+    /// `depends_on` loop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
     /// Default crew role this task dispatches, e.g. `"coder"`. Not
     /// necessarily final — Packet 3's launcher may let a `MissionInput`
     /// override it per-launch (the built-in `coder-phase` config declares
@@ -441,22 +463,29 @@ impl MissionConfig {
                     });
                 }
 
-                for dep in &task.depends_on {
-                    if dep == &task.id {
-                        findings.push(ValidationFinding {
-                            severity: FindingSeverity::Error,
-                            path: format!("{task_path}.depends_on"),
-                            message: format!("task \"{}\" depends_on itself", task.id),
-                        });
-                    } else if !all_task_ids.contains(dep.as_str()) {
-                        findings.push(ValidationFinding {
-                            severity: FindingSeverity::Error,
-                            path: format!("{task_path}.depends_on"),
-                            message: format!(
-                                "task \"{}\" depends_on unknown task id \"{dep}\"",
-                                task.id
-                            ),
-                        });
+                // (#1619) `reads` gets the SAME structural checks as
+                // `depends_on` — it orders execution identically, so a
+                // dangling or self-referential entry is exactly as fatal.
+                for (relation, entries) in
+                    [("depends_on", &task.depends_on), ("reads", &task.reads)]
+                {
+                    for dep in entries {
+                        if dep == &task.id {
+                            findings.push(ValidationFinding {
+                                severity: FindingSeverity::Error,
+                                path: format!("{task_path}.{relation}"),
+                                message: format!("task \"{}\" {relation} itself", task.id),
+                            });
+                        } else if !all_task_ids.contains(dep.as_str()) {
+                            findings.push(ValidationFinding {
+                                severity: FindingSeverity::Error,
+                                path: format!("{task_path}.{relation}"),
+                                message: format!(
+                                    "task \"{}\" {relation} unknown task id \"{dep}\"",
+                                    task.id
+                                ),
+                            });
+                        }
                     }
                 }
 
@@ -690,6 +719,7 @@ mod tests {
             description: None,
             display_name: None,
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+            reads: Vec::new(),
             role_id: None,
             steps,
             expand: None,
@@ -761,6 +791,57 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| f.severity == FindingSeverity::Error && f.message.contains("depends_on itself")));
+    }
+
+    #[test]
+    fn dangling_and_self_referential_reads_are_caught() {
+        // (#1619) `reads` orders execution exactly like `depends_on`, so a
+        // dangling or self-referential entry gets the SAME error tier —
+        // failing at validate, never hanging at run.
+        let mut t = task("t1", &[], vec![step("s1", "dispatch.internal")]);
+        t.reads = vec!["nonexistent".to_string()];
+        let cfg = doc(vec![phase("p1", vec![t])]);
+        let findings = cfg.validate(&["dispatch.internal"]);
+        assert!(
+            findings.iter().any(|f| f.severity == FindingSeverity::Error
+                && f.message.contains("reads unknown task id \"nonexistent\"")),
+            "expected a dangling reads error, got {findings:?}"
+        );
+
+        let mut t = task("t1", &[], vec![step("s1", "dispatch.internal")]);
+        t.reads = vec!["t1".to_string()];
+        let cfg = doc(vec![phase("p1", vec![t])]);
+        let findings = cfg.validate(&["dispatch.internal"]);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == FindingSeverity::Error && f.message.contains("reads itself")),
+            "expected a self-read error, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_without_reads_still_parses_and_a_reads_config_round_trips() {
+        // (#1619, contract 5) Additive minor: every pre-1.4 document omits
+        // `reads` and must parse identically; a document that declares it
+        // must survive a serialize→parse round trip without losing it.
+        let mut t = task("t2", &[], vec![step("s2", "dispatch.internal")]);
+        t.reads = vec!["t1".to_string()];
+        let cfg = doc(vec![
+            phase("p1", vec![task("t1", &[], vec![step("s1", "dispatch.internal")])]),
+            phase("p2", vec![t]),
+        ]);
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: MissionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.phases[1].tasks[0].reads, vec!["t1"]);
+        assert!(back.is_valid(&["dispatch.internal"]));
+
+        // The omitting shape: strip the field wholesale, still parses, reads
+        // defaults empty.
+        let stripped = json.replace("\"reads\":[\"t1\"],", "").replace(",\"reads\":[\"t1\"]", "");
+        assert!(!stripped.contains("reads"), "precondition: field removed");
+        let old: MissionConfig = serde_json::from_str(&stripped).unwrap();
+        assert!(old.phases[1].tasks[0].reads.is_empty());
     }
 
     #[test]
@@ -879,6 +960,7 @@ mod tests {
             description: None,
             display_name: None,
             depends_on: vec![],
+            reads: Vec::new(),
             role_id: None,
             steps,
             expand: Some(ExpansionSpec {
@@ -1058,7 +1140,12 @@ mod tests {
         let adjudicate = &cfg.phases[1];
         assert_eq!(adjudicate.tasks.len(), 1);
         assert_eq!(adjudicate.tasks[0].id, "review-judge-task");
-        assert_eq!(adjudicate.tasks[0].depends_on, vec!["review-dedup-task"]);
+        // (#1619) Cross-phase DATA rides the ledger (`reads`), not a rendered
+        // `depends_on` edge — judge still receives dedup's docket and still
+        // cannot start before dedup completes, but the graph no longer draws
+        // an investigate→adjudicate task connector that read as a bypass.
+        assert_eq!(adjudicate.tasks[0].depends_on, Vec::<String>::new());
+        assert_eq!(adjudicate.tasks[0].reads, vec!["review-dedup-task"]);
         assert_eq!(adjudicate.tasks[0].steps[0].kind, "review.judge");
         // (#1475 packet 2) The judge task assigns the `review-judge` role — the
         // role→profile flip's model source (the crew is the task→role→profile
@@ -1080,14 +1167,16 @@ mod tests {
         let verify_step_kinds: Vec<&str> =
             report.tasks[0].steps.iter().map(|s| s.kind.as_str()).collect();
         assert_eq!(verify_step_kinds, vec!["review.verify-render", "dispatch.map"]);
-        // synthesis depends on dedup, judge (#1442 — the judged docket flows
-        // directly from the judge; verify's own output is the map's result
-        // array), and verify — the cross-phase edges `build_review_graph`
-        // wires (see that function's doc).
-        assert_eq!(
-            report.tasks[1].depends_on,
-            vec!["review-dedup-task", "review-judge-task", "review-verify-task"]
-        );
+        // (#1619) synthesis still receives all three upstream outputs (#1442 —
+        // the judged docket flows directly from the judge; verify's own
+        // output is the map's result array), but the CROSS-PHASE pair now
+        // rides the ledger (`reads`) while the same-phase verify edge stays
+        // `depends_on` — the one connector the graph SHOULD draw. This is
+        // the exact config the operator read as "dedup going direct into
+        // synthesis... looks like the design includes short circuits":
+        // same data, no more phantom bypass arrows.
+        assert_eq!(report.tasks[1].depends_on, vec!["review-verify-task"]);
+        assert_eq!(report.tasks[1].reads, vec!["review-dedup-task", "review-judge-task"]);
     }
 
     #[test]
@@ -1246,9 +1335,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_1_3() {
-        // (#1475 packet 2) Additive minor bump for the ExpansionSpec
-        // `role_pattern` field (per-expanded-copy role_id).
-        assert_eq!(MISSION_CONFIG_SCHEMA, "1.3");
+    fn schema_version_constant_is_1_4() {
+        // (#1619) Additive minor bump for `TaskConfig.reads` — the output
+        // ledger relation (data + ordering without a rendered edge).
+        assert_eq!(MISSION_CONFIG_SCHEMA, "1.4");
     }
 }

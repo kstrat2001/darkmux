@@ -2118,6 +2118,7 @@ mod task_step_storage_tests {
             display_name: None,
             step_ids: Vec::new(),
             depends_on: Vec::new(),
+            reads: Vec::new(),
             role_id: None,
             profile_name: None,
             workdir: None,
