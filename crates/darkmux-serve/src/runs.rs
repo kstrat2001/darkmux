@@ -173,6 +173,16 @@ pub(crate) fn build_runs(flows_dir: &StdPath, lab_dir: Option<&StdPath>) -> Vec<
     // archive with many missions would make genuinely slow).
     let mission_id_index = build_mission_id_index(&flow_index);
 
+    // (#1621, widened #1642/#1633) Read the clock ONCE for the whole build,
+    // so every row in a response — mission, lab, OR ghost — is judged
+    // against the same instant, and so the SAME staleness decision
+    // (`stale_after_ms`/`session_is_live`) gates all three `Run` kinds
+    // rather than just lab runs.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
     let missions = darkmux_crew::loader::load_missions().unwrap_or_default();
     let phases_by_id: HashMap<String, Phase> = darkmux_crew::loader::load_phases()
         .unwrap_or_default()
@@ -199,7 +209,15 @@ pub(crate) fn build_runs(flows_dir: &StdPath, lab_dir: Option<&StdPath>) -> Vec<
         // mission_id gap crew-of-one dispatches do (see module doc, gap 2).
         let step_sessions = collect_mission_step_sessions(mission);
         known_session_ids.extend(step_sessions.iter().cloned());
-        let run = mission_to_run(mission, kind, shape.as_ref(), &step_sessions, &mission_id_index, &flow_index);
+        let run = mission_to_run(
+            mission,
+            kind,
+            shape.as_ref(),
+            &step_sessions,
+            &mission_id_index,
+            &flow_index,
+            now_ms,
+        );
         runs.push(run);
     }
 
@@ -208,19 +226,12 @@ pub(crate) fn build_runs(flows_dir: &StdPath, lab_dir: Option<&StdPath>) -> Vec<
     // re-read config for each one.
     let lab_machine = darkmux_types::config_access::machine_id();
     if let Some(dir) = lab_dir {
-        // (#1621) Read the clock ONCE for the whole scan, so every row in a
-        // response is judged against the same instant — otherwise two runs with
-        // identical mtimes could straddle the staleness edge within one payload.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         for summary in crate::scan_lab_runs(dir) {
             runs.push(lab_summary_to_run(&summary, lab_machine.clone(), now_ms));
         }
     }
 
-    runs.extend(ghost_runs(&flow_index, &known_mission_ids, &known_session_ids));
+    runs.extend(ghost_runs(&flow_index, &known_mission_ids, &known_session_ids, now_ms));
 
     runs
 }
@@ -350,6 +361,7 @@ fn mission_to_run(
     step_sessions: &HashSet<String>,
     mission_id_index: &HashMap<String, Vec<String>>,
     flow_index: &HashMap<String, SessionAgg>,
+    now_ms: u64,
 ) -> Run {
     // Prefer the structural Task.role_id (the operator's REQUESTED role,
     // always present by construction for a Dispatch-kind mission) over the
@@ -401,7 +413,7 @@ fn mission_to_run(
     Run {
         id: mission.id.clone(),
         kind,
-        status: mission_run_status(mission, &sessions),
+        status: mission_run_status(mission, &sessions, now_ms),
         machine,
         route,
         role,
@@ -452,12 +464,24 @@ fn mission_to_run(
 /// this branch — it didn't; staying `Running` there matches `mission
 /// status`'s existing "drift, needs `mission finalize`" framing rather than
 /// claiming a success that was never recorded).
-fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg]) -> RunStatus {
+///
+/// **(#1642, #1633) The staleness gate — same one `lab_run_status` and
+/// `ghost_runs` apply.** The CONSIDER-3 branch above only catches a crash
+/// once every known session already reached a terminal; a mission whose
+/// sessions are still nominally "open" (no terminal ever landed, because the
+/// process died mid-dispatch) fell straight through to the plain `Running`
+/// at the bottom, forever. [`session_is_live`] closes that: when the
+/// all-terminal branch doesn't apply, the mission is `Running` only while
+/// SOME known session shows recent proof-of-work; otherwise `Abandoned`. A
+/// just-launched mission with `started_ts` set but no sessions dispatched
+/// yet is real and must not be misread as abandoned — `started_ts` itself
+/// is the activity anchor for that case.
+fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) -> RunStatus {
     match mission.status {
         MissionStatus::Active | MissionStatus::Paused => {
-            if mission.started_ts.is_none() {
+            let Some(started_ts) = mission.started_ts else {
                 return RunStatus::Planned;
-            }
+            };
             if !sessions.is_empty() && sessions.iter().all(|s| s.terminal_status.is_some()) {
                 if sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Abandoned)) {
                     return RunStatus::Abandoned;
@@ -465,8 +489,33 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg]) -> RunStatus 
                 if sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Error)) {
                     return RunStatus::Error;
                 }
+                return RunStatus::Running;
             }
-            RunStatus::Running
+            // (#1642) A PAUSED mission is deliberately idle, so the staleness
+            // gate must not touch it. The gate reads "went quiet without
+            // finishing" as abandonment, which is honest for an Active
+            // mission and a lie for a paused one — it would relabel the
+            // operator's own intent as a failure the moment a pause outlasts
+            // the inactivity budget (`mission launch` → `mission pause` →
+            // lunch → the board says Abandoned). Not decaying is the lesser
+            // error: `RunStatus` has no `Paused` variant, so some imprecision
+            // is unavoidable here, and over-reporting a mission the operator
+            // KNOWS they paused costs nothing, while calling it abandoned
+            // actively misinforms.
+            if mission.status == MissionStatus::Paused {
+                return RunStatus::Running;
+            }
+            let live = if sessions.is_empty() {
+                let idle_ms = now_ms.saturating_sub(started_ts.saturating_mul(1_000));
+                idle_ms <= stale_after_ms()
+            } else {
+                sessions.iter().any(|s| session_is_live(s, now_ms))
+            };
+            if live {
+                RunStatus::Running
+            } else {
+                RunStatus::Abandoned
+            }
         }
         // (#1627) A torn-down mission is NOT a completed one, and must never
         // resolve through the envelope branch below — an abort leaves whatever
@@ -565,6 +614,25 @@ fn stale_after_ms() -> u64 {
     darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(2_000)
 }
 
+/// (#1642, #1633) The ONE liveness decision every `/runs` source — lab,
+/// mission, AND ghost — shares, keyed on [`SessionAgg::last_activity_ts`]
+/// against the SAME [`stale_after_ms`] budget [`lab_run_status`] already
+/// uses. Before this, only lab runs were gated: `mission_run_status` and
+/// `ghost_runs` had no per-session activity signal to gate on at all
+/// (`SessionAgg` tracked only `start_ts`/`terminal_ts`), so a mission or
+/// ghost row whose underlying work died without ever reaching a terminal
+/// read as `Running` forever — the exact #1621 defect, reopened for two of
+/// the three `Run` kinds. A session with no activity timestamp at all
+/// (shouldn't happen for anything actually indexed, but never assume) can't
+/// be judged live — absence of evidence is not evidence of life.
+fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
+    let Some(last_activity_secs) = agg.last_activity_ts.as_deref().and_then(parse_flow_ts) else {
+        return false;
+    };
+    let idle_ms = now_ms.saturating_sub(last_activity_secs.saturating_mul(1_000));
+    idle_ms <= stale_after_ms()
+}
+
 /// Representative role/model/route for a lab run's `/runs` row, off its
 /// `StaffingSnapshot` — the judge seat (the load-bearing one) when present,
 /// else the first probe. `route` specifically prefers a REMOTE seat's
@@ -634,6 +702,14 @@ struct SessionAgg {
     /// (see [`terminal_status_for_action`]) — `None` while still running.
     terminal_status: Option<RunStatus>,
     terminal_ts: Option<String>,
+    /// (#1642, #1633) The newest `ts` seen on ANY record for this session —
+    /// not just lifecycle records. Heartbeats and telemetry are exactly the
+    /// proof-of-work [`session_is_live`] needs; restricting this to
+    /// lifecycle records would blind the liveness gate to a session that's
+    /// still actively ticking between its start and its (not-yet-written)
+    /// terminal. Same raw-ISO-string convention as `start_ts`/`terminal_ts`
+    /// — parsed via [`parse_flow_ts`] only where a numeric is needed.
+    last_activity_ts: Option<String>,
 }
 
 /// One pass over every flow record within [`RUNS_FLOW_SCAN_WINDOW_DAYS`],
@@ -680,6 +756,22 @@ fn build_flow_session_index(flows_dir: &StdPath) -> HashMap<String, SessionAgg> 
 
         let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
         let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+
+        // (#1642, #1633) EVERY record for this session updates the liveness
+        // clock — not just lifecycle ones (see `SessionAgg::last_activity_ts`'s
+        // doc). ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` sorts correctly as a plain
+        // string (same property `earliest_by_start` relies on), so a lexical
+        // compare is enough to keep the NEWEST seen even if records are ever
+        // visited out of chronological order.
+        if !ts.is_empty() {
+            let is_newer = match agg.last_activity_ts.as_deref() {
+                Some(current) => ts > current,
+                None => true,
+            };
+            if is_newer {
+                agg.last_activity_ts = Some(ts.to_string());
+            }
+        }
 
         // Check EVERY dispatch lifecycle record's payload for `endpoint` —
         // not just start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
@@ -766,10 +858,19 @@ fn earliest_by_start<'a>(sessions: &[&'a SessionAgg]) -> Option<&'a SessionAgg> 
 /// [`RUNS_FLOW_SCAN_WINDOW_DAYS`] because `flow_index` itself is (built by
 /// [`build_flow_session_index`]) — a session older than the window was
 /// never indexed at all, so it can't reach this function to begin with.
+///
+/// **(#1642, #1633) The staleness gate.** No terminal seen yet used to mean
+/// "still running", unconditionally — the SAME #1621 defect `lab_run_status`
+/// was fixed for, still open here: a ghost whose session died mid-dispatch
+/// with no terminal ever written read as `Running` forever. A missing
+/// terminal now means "running" only while [`session_is_live`] says so;
+/// otherwise `Abandoned`. A terminal status, when present, always wins —
+/// staleness never relabels a run that already reached a real verdict.
 fn ghost_runs(
     flow_index: &HashMap<String, SessionAgg>,
     known_mission_ids: &HashSet<String>,
     known_session_ids: &HashSet<String>,
+    now_ms: u64,
 ) -> Vec<Run> {
     let mut out = Vec::new();
     for (session_id, agg) in flow_index {
@@ -787,9 +888,15 @@ fn ghost_runs(
         out.push(Run {
             id: session_id.clone(),
             kind: RunKind::Dispatch,
-            // No terminal seen yet -> still running; see
-            // `terminal_status_for_action` for the three terminal shapes.
-            status: agg.terminal_status.unwrap_or(RunStatus::Running),
+            // A terminal status always wins over the liveness gate; only a
+            // session with NO terminal yet falls through to it.
+            status: agg.terminal_status.unwrap_or_else(|| {
+                if session_is_live(agg, now_ms) {
+                    RunStatus::Running
+                } else {
+                    RunStatus::Abandoned
+                }
+            }),
             machine: agg.machine.clone(),
             route: agg.endpoint.clone(),
             role: agg.role.clone(),
@@ -1232,10 +1339,15 @@ mod tests {
 
     #[test]
     fn mission_run_status_active_and_paused_are_running() {
+        // `minimal_mission` stamps `started_ts` with the real "now" — judge
+        // it against that same instant (idle ~0) so this stays a pure
+        // "Active/Paused reads Running" test, independent of the staleness
+        // gate exercised separately below.
+        let now_ms = now_unix() * 1_000;
         let mut m = minimal_mission("m5", vec![], None);
-        assert_eq!(mission_run_status(&m, &[]), RunStatus::Running);
+        assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Running);
         m.status = MissionStatus::Paused;
-        assert_eq!(mission_run_status(&m, &[]), RunStatus::Running);
+        assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Running);
     }
 
     #[test]
@@ -1244,7 +1356,7 @@ mod tests {
         // dead `Planned` variant made reachable.
         let mut m = minimal_mission("m5b", vec![], None);
         m.started_ts = None;
-        assert_eq!(mission_run_status(&m, &[]), RunStatus::Planned);
+        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Planned);
     }
 
     #[test]
@@ -1253,22 +1365,34 @@ mod tests {
         // known to have made already reached a terminal, yet the mission
         // record itself never got finalized (the process died first).
         let m = minimal_mission("m5c", vec![], None);
+        let now_ms = now_unix() * 1_000;
         let abandoned = SessionAgg { terminal_status: Some(RunStatus::Abandoned), ..Default::default() };
-        assert_eq!(mission_run_status(&m, &[&abandoned]), RunStatus::Abandoned);
+        assert_eq!(mission_run_status(&m, &[&abandoned], now_ms), RunStatus::Abandoned);
 
         let errored = SessionAgg { terminal_status: Some(RunStatus::Error), ..Default::default() };
-        assert_eq!(mission_run_status(&m, &[&errored]), RunStatus::Error);
+        assert_eq!(mission_run_status(&m, &[&errored], now_ms), RunStatus::Error);
     }
 
     #[test]
     fn mission_run_status_active_with_a_still_running_session_stays_running() {
         // A partially-complete multi-session mission (one phase done, one
         // still dispatching) must NOT be flagged as crashed just because
-        // ONE of its sessions has a terminal.
+        // ONE of its sessions has a terminal — and the still-dispatching one
+        // must show GENUINE recent activity now that liveness is gated
+        // (#1642), not just the absence of a terminal.
         let m = minimal_mission("m5d", vec![], None);
         let done = SessionAgg { terminal_status: Some(RunStatus::Complete), ..Default::default() };
-        let still_running = SessionAgg { terminal_status: None, has_start: true, ..Default::default() };
-        assert_eq!(mission_run_status(&m, &[&done, &still_running]), RunStatus::Running);
+        let still_running = SessionAgg {
+            terminal_status: None,
+            has_start: true,
+            last_activity_ts: Some("2000-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        // Judged at exactly that instant — idle 0, unambiguously live.
+        assert_eq!(
+            mission_run_status(&m, &[&done, &still_running], 946_684_800_000),
+            RunStatus::Running
+        );
     }
 
     #[test]
@@ -1280,7 +1404,12 @@ mod tests {
         // `mission status`'s existing "drift" framing.
         let m = minimal_mission("m5e", vec![], None);
         let done = SessionAgg { terminal_status: Some(RunStatus::Complete), ..Default::default() };
-        assert_eq!(mission_run_status(&m, &[&done]), RunStatus::Running);
+        // (#1642) Terminal-Complete-not-Abandoned/Error must win over the
+        // staleness gate outright — judged FAR in the future (no possible
+        // reading of "recent activity") and still Running, because the
+        // all-terminal branch returns before the gate is ever consulted.
+        let far_future_ms = (now_unix() + 999_999_999) * 1_000;
+        assert_eq!(mission_run_status(&m, &[&done], far_future_ms), RunStatus::Running);
     }
 
     #[test]
@@ -1291,13 +1420,14 @@ mod tests {
 
         let mut m = minimal_mission("m6", vec![], None);
         m.status = MissionStatus::Finalized;
+        let now_ms = now_unix() * 1_000;
 
         // No envelope written yet -> degrades to Complete.
-        assert_eq!(mission_run_status(&m, &[]), RunStatus::Complete);
+        assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Complete);
 
         let clean_env = MissionEnvelope::new("m6", MissionOutcomeStatus::Clean, &[]);
         darkmux_crew::envelope::finalize_mission(&clean_env);
-        assert_eq!(mission_run_status(&m, &[]), RunStatus::Complete);
+        assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Complete);
     }
 
     #[test]
@@ -1310,7 +1440,60 @@ mod tests {
 
         let err_env = MissionEnvelope::new("m7", MissionOutcomeStatus::Error, &[]);
         darkmux_crew::envelope::finalize_mission(&err_env);
-        assert_eq!(mission_run_status(&m, &[]), RunStatus::Error);
+        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Error);
+    }
+
+    // ── mission_run_status: the staleness gate (#1642, #1633) ───────────
+
+    #[test]
+    fn mission_run_status_active_no_sessions_fresh_started_ts_is_running() {
+        // The edge case named in #1642: a mission with `started_ts` set but
+        // NO sessions dispatched yet at all. A just-launched mission
+        // legitimately looks like this — falling straight to `Abandoned`
+        // here would be a fresh lie in the opposite direction, so
+        // `started_ts` itself is the activity anchor when there are no
+        // sessions to consult.
+        let m = minimal_mission("m5f", vec![], None); // started_ts = now_unix()
+        let now_ms = now_unix() * 1_000;
+        assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Running);
+    }
+
+    #[test]
+    fn mission_run_status_active_no_sessions_stale_started_ts_is_abandoned() {
+        // Same shape, but `started_ts` itself has aged past the budget with
+        // still no session ever dispatched — genuinely dead, not a
+        // just-launched mission.
+        let mut m = minimal_mission("m5g", vec![], None);
+        m.started_ts = Some(946_684_800); // 2000-01-01T00:00:00Z
+        let stale_now_ms = 946_684_800_000 + stale_after_ms() + 1_000;
+        assert_eq!(mission_run_status(&m, &[], stale_now_ms), RunStatus::Abandoned);
+    }
+
+    #[test]
+    fn mission_run_status_active_all_sessions_stale_is_abandoned() {
+        // Every known session is still nominally "open" (no terminal ever
+        // landed — the process died mid-dispatch before writing one), and
+        // none of them show recent activity. This is the #1642 defect
+        // itself: previously this fell straight through to `Running`
+        // forever because "not all sessions terminal" was the only check.
+        let mut m = minimal_mission("m5h", vec![], None);
+        m.started_ts = Some(946_684_800);
+        let stale_a = SessionAgg {
+            has_start: true,
+            terminal_status: None,
+            last_activity_ts: Some("2000-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let stale_b = SessionAgg {
+            has_start: true,
+            terminal_status: None,
+            last_activity_ts: Some("2000-01-01T00:00:01Z".to_string()),
+            ..Default::default()
+        };
+        // Comfortably past the budget even accounting for `stale_b`'s
+        // 1-second-newer activity — both must read as dead.
+        let now_ms = 946_684_800_000 + stale_after_ms() + 5_000;
+        assert_eq!(mission_run_status(&m, &[&stale_a, &stale_b], now_ms), RunStatus::Abandoned);
     }
 
     // ── lab normalization ───────────────────────────────────────────────
@@ -1534,6 +1717,131 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_flow_session_index_tracks_last_activity_from_a_non_lifecycle_record() {
+        // (#1642, #1633) A heartbeat/telemetry record — NOT `dispatch
+        // start`/`complete`/`error` — is exactly the proof-of-work the
+        // staleness gate needs between a session's start and its (possibly
+        // never-written) terminal. Restricting `last_activity_ts` to
+        // lifecycle records would blind `session_is_live` to a session
+        // that's genuinely still ticking.
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-07-24T10:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "ticking-sess",
+                    "handle": "coder",
+                }),
+                serde_json::json!({
+                    "ts": "2026-07-24T10:15:00Z",
+                    "action": "tool.completed",
+                    "session_id": "ticking-sess",
+                }),
+            ],
+        );
+        let idx = build_flow_session_index(tmp.path());
+        let agg = idx.get("ticking-sess").expect("session indexed");
+        assert_eq!(
+            agg.last_activity_ts.as_deref(),
+            Some("2026-07-24T10:15:00Z"),
+            "a non-lifecycle record must still advance the liveness clock"
+        );
+    }
+
+    #[test]
+    fn build_flow_session_index_keeps_the_newest_activity_not_the_last_seen() {
+        // (#1642) The test above visits records in chronological order, so it
+        // passes against a naive "keep whatever I saw last" implementation as
+        // readily as against the newest-wins compare it means to assert. That
+        // is the exact defect class this codebase keeps hitting: an assertion
+        // that holds for a reason other than the one it names.
+        //
+        // Records are NOT guaranteed chronological within a day file — a
+        // concurrent writer interleaves sessions, and a per-session view of
+        // that stream can land out of order. Feed them out of order so the
+        // compare is the only thing that can produce a pass.
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-07-24T10:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "outoforder-sess",
+                    "handle": "coder",
+                }),
+                serde_json::json!({
+                    "ts": "2026-07-24T10:30:00Z",
+                    "action": "dispatch.turn.heartbeat",
+                    "session_id": "outoforder-sess",
+                }),
+                // Older than the one above, and written after it.
+                serde_json::json!({
+                    "ts": "2026-07-24T10:05:00Z",
+                    "action": "tool.completed",
+                    "session_id": "outoforder-sess",
+                }),
+            ],
+        );
+        let idx = build_flow_session_index(tmp.path());
+        let agg = idx.get("outoforder-sess").expect("session indexed");
+        assert_eq!(
+            agg.last_activity_ts.as_deref(),
+            Some("2026-07-24T10:30:00Z"),
+            "an older record arriving late must not rewind the liveness clock — \
+             rewinding it would age a live session into Abandoned"
+        );
+    }
+
+    #[test]
+    fn a_paused_mission_never_decays_into_abandoned() {
+        // (#1642) `mission pause` is an operator verb, and a paused mission is
+        // deliberately idle — so the staleness gate, which reads "went quiet
+        // without finishing" as abandonment, must not touch it. Without this,
+        // `mission launch` → `mission pause` → lunch makes the board report
+        // the operator's own intent as a failure.
+        //
+        // Asserted at an absurd `now` so it cannot pass by sitting inside the
+        // budget: if the gate applied to Paused at all, this fails.
+        let mut mission = minimal_mission("paused-1", vec![], None);
+        mission.status = MissionStatus::Paused;
+        mission.started_ts = Some(parse_flow_ts("2000-01-01T00:00:00Z").unwrap());
+
+        let ancient = SessionAgg {
+            has_start: true,
+            terminal_status: None,
+            last_activity_ts: Some("2000-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let now_ms = u64::from(u32::MAX) * 1_000;
+
+        assert_eq!(
+            mission_run_status(&mission, &[], now_ms),
+            RunStatus::Running,
+            "a paused mission with no sessions must not read as abandoned"
+        );
+        assert_eq!(
+            mission_run_status(&mission, &[&ancient], now_ms),
+            RunStatus::Running,
+            "a paused mission with a long-quiet open session must not read as abandoned"
+        );
+
+        // And the control: the SAME shape while Active does decay. Without
+        // this line the test above would still pass if the gate were removed
+        // outright, which would silently undo #1642.
+        mission.status = MissionStatus::Active;
+        assert_eq!(
+            mission_run_status(&mission, &[&ancient], now_ms),
+            RunStatus::Abandoned,
+            "the pause exemption must not disable the gate for Active missions"
+        );
+    }
+
     // ── dedup: a mission-internal session is never ALSO a ghost ─────────
 
     #[test]
@@ -1550,7 +1858,7 @@ mod tests {
         );
         let mut known_missions = HashSet::new();
         known_missions.insert("real-mission-1".to_string());
-        let ghosts = ghost_runs(&idx, &known_missions, &HashSet::new());
+        let ghosts = ghost_runs(&idx, &known_missions, &HashSet::new(), now_unix() * 1_000);
         assert!(ghosts.is_empty(), "a session covered by a loaded mission must not double-list");
     }
 
@@ -1566,7 +1874,7 @@ mod tests {
         );
         let mut known_sessions = HashSet::new();
         known_sessions.insert("crew-dispatch-coder-abc".to_string());
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &known_sessions);
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &known_sessions, now_unix() * 1_000);
         assert!(ghosts.is_empty());
     }
 
@@ -1581,10 +1889,14 @@ mod tests {
                 role: Some("coder".to_string()),
                 model: Some("qwen3.6".to_string()),
                 start_ts: Some("2026-07-24T10:00:00Z".to_string()),
+                last_activity_ts: Some("2026-07-24T10:00:00Z".to_string()),
                 ..Default::default()
             },
         );
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new());
+        // Judged at exactly the session's own activity instant — idle 0,
+        // unambiguously live.
+        let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), now_ms);
         assert_eq!(ghosts.len(), 1);
         let g = &ghosts[0];
         assert_eq!(g.id, "orphan-sess");
@@ -1601,8 +1913,109 @@ mod tests {
             "no-start-sess".to_string(),
             SessionAgg { has_start: false, ..Default::default() },
         );
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new());
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), now_unix() * 1_000);
         assert!(ghosts.is_empty());
+    }
+
+    // ── ghost_runs: the staleness gate (#1642, #1633) ───────────────────
+
+    #[test]
+    fn ghost_runs_fresh_session_is_running_stale_session_is_abandoned() {
+        let base_ts = "2000-01-01T00:00:00Z";
+        let base_ms = parse_flow_ts(base_ts).unwrap() * 1_000;
+        let mut idx = HashMap::new();
+        idx.insert(
+            "fresh-or-stale".to_string(),
+            SessionAgg {
+                has_start: true,
+                terminal_status: None,
+                last_activity_ts: Some(base_ts.to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Just inside the budget: still live.
+        let inside_ms = base_ms + stale_after_ms() - 1_000;
+        let fresh = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), inside_ms);
+        assert_eq!(fresh[0].status, RunStatus::Running, "no terminal + recent activity must read live");
+
+        // Past the budget: the trail stops, and that is evidence of
+        // abandonment — the #1642/#1633 defect this test guards.
+        let outside_ms = base_ms + stale_after_ms() + 1_000;
+        let stale = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), outside_ms);
+        assert_eq!(
+            stale[0].status,
+            RunStatus::Abandoned,
+            "a ghost whose session died with no terminal must not read as live forever"
+        );
+    }
+
+    #[test]
+    fn ghost_runs_terminal_status_always_wins_over_the_staleness_gate() {
+        // A session that DID reach a real terminal must never be relabeled
+        // by staleness, however old it is — a completed run stays completed.
+        let mut idx = HashMap::new();
+        idx.insert(
+            "long-done".to_string(),
+            SessionAgg {
+                has_start: true,
+                terminal_status: Some(RunStatus::Complete),
+                last_activity_ts: Some("2000-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        );
+        let far_future_ms = (now_unix() + 999_999_999) * 1_000;
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), far_future_ms);
+        assert_eq!(ghosts[0].status, RunStatus::Complete, "a terminal verdict must never decay into Abandoned");
+    }
+
+    #[test]
+    fn lab_mission_and_ghost_agree_on_liveness_at_the_same_idle_age() {
+        // (#1642, #1633) The regression this guards against: a future FOURTH
+        // `Run` kind reopening this hole by drifting from the other three's
+        // threshold. All three EXISTING sources are judged at the exact same
+        // idle age off the exact same `stale_after_ms` budget and must reach
+        // the same verdict, every time.
+        //
+        // Honest about its own reach: this is a CONVENTION TRIPWIRE, not a
+        // structural guarantee. A fourth kind has to be added to the asserts
+        // below by hand, and nothing in the compiler makes anyone do it —
+        // whoever adds one is expected to find this test by grepping the
+        // shared helper. Claiming more than that would be the same
+        // over-promise that let three kinds drift apart in the first place.
+        const REF_TS: &str = "2000-01-01T00:00:00Z"; // the known reference point
+        let ref_secs = parse_flow_ts(REF_TS).unwrap();
+        let ref_ms = ref_secs * 1_000;
+
+        let mut mission = minimal_mission("agree-1", vec![], None);
+        mission.started_ts = Some(ref_secs);
+        let session = SessionAgg {
+            has_start: true,
+            terminal_status: None,
+            last_activity_ts: Some(REF_TS.to_string()),
+            ..Default::default()
+        };
+        let mut lab_summary = minimal_lab_summary("agree-1-lab", false, false);
+        lab_summary.mtime_ms = ref_ms;
+        let mut ghost_idx = HashMap::new();
+        ghost_idx.insert("agree-1-ghost".to_string(), session.clone());
+
+        for (label, now_ms, want) in [
+            ("just inside the budget", ref_ms + stale_after_ms() - 1_000, RunStatus::Running),
+            ("just outside the budget", ref_ms + stale_after_ms() + 1_000, RunStatus::Abandoned),
+            // (#1642) EXACTLY at the budget. The ±1s cases above cannot
+            // detect an inclusivity drift (`<` vs `<=`) between two kinds —
+            // both sides agree at ±1s no matter which comparison each uses,
+            // so the one boundary where the kinds can silently disagree is
+            // the only one the other two rows structurally cannot see. That
+            // drift is precisely the class this test exists to prevent.
+            ("exactly at the budget", ref_ms + stale_after_ms(), RunStatus::Running),
+        ] {
+            assert_eq!(lab_run_status(&lab_summary, now_ms), want, "lab disagreed {label}");
+            assert_eq!(mission_run_status(&mission, &[&session], now_ms), want, "mission disagreed {label}");
+            let ghosts = ghost_runs(&ghost_idx, &HashSet::new(), &HashSet::new(), now_ms);
+            assert_eq!(ghosts[0].status, want, "ghost disagreed {label}");
+        }
     }
 
     // ── build_runs end to end: mission + ghost, no double-listing ───────
@@ -1861,6 +2274,12 @@ mod tests {
         let step = minimal_step("s-2", "t-2", Some("crew-dispatch-coder-known"));
         darkmux_crew::lifecycle::save_step("dispatch-coder-2", "p-2", &step).unwrap();
 
+        // (#1642) `build_runs` now gates a ghost's liveness against the REAL
+        // wall clock (it computes `now_ms` from `SystemTime::now()`, not a
+        // fixture), so the orphan's `ts` must be genuinely recent — not the
+        // old hardcoded literal — or it would read `Abandoned` on any run of
+        // this suite, defeating the assertion below.
+        let orphan_ts = darkmux_flow::ts_utc_now();
         write_day_file(
             flows.path(),
             &today(),
@@ -1873,7 +2292,7 @@ mod tests {
                 }),
                 // A genuinely orphaned session — no mission ever minted.
                 serde_json::json!({
-                    "ts": "2026-07-24T11:00:00Z",
+                    "ts": orphan_ts,
                     "action": "dispatch start",
                     "session_id": "crew-dispatch-reviewer-orphan",
                     "handle": "reviewer",
