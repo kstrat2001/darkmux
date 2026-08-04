@@ -470,7 +470,15 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
     // Section membership first, so the layout can be planned from exactly the
     // rows that will be printed (and stay aligned across every section).
     let groups: Vec<(MissionStatus, Vec<&MissionView>)> =
-        [MissionStatus::Active, MissionStatus::Paused, MissionStatus::Finalized]
+        [
+            MissionStatus::Active,
+            MissionStatus::Paused,
+            MissionStatus::Finalized,
+            // (#1627) Its own section, last: a torn-down mission is terminal but
+            // is NOT a success, and folding it under FINALIZED is what let 6 of
+            // 51 phase-bearing missions read as finished work that never ran.
+            MissionStatus::Aborted,
+        ]
             .into_iter()
             .map(|group| (group, views.iter().filter(|v| v.m.status == group).collect()))
             .filter(|(_, g): &(_, Vec<&MissionView>)| !g.is_empty())
@@ -725,7 +733,9 @@ fn last_activity(m: &Mission) -> u64 {
 /// outranks a derived one).
 fn default_limit(group: MissionStatus) -> usize {
     match group {
-        MissionStatus::Finalized => 3,
+        // (#1627) Aborted is closed history like Finalized — recent context,
+        // not the question the board answers.
+        MissionStatus::Finalized | MissionStatus::Aborted => 3,
         MissionStatus::Active | MissionStatus::Paused => 10,
     }
 }
@@ -927,6 +937,7 @@ fn status_word(s: MissionStatus) -> &'static str {
         MissionStatus::Active => "active",
         MissionStatus::Paused => "paused",
         MissionStatus::Finalized => "finalized",
+        MissionStatus::Aborted => "aborted",
     }
 }
 

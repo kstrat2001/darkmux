@@ -89,6 +89,11 @@
   .mstatus{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted)}
   .mstatus.active{color:var(--good);border-color:var(--good)}
   .mstatus.finalized{color:var(--muted)}
+  /* (#1627) Aborted is a TERMINAL, but not a success. Without its own rule it
+     fell through to the base muted grey — pixel-identical to `finalized`, so
+     an operator scanning badges by colour saw a torn-down mission and a
+     completed one as the same thing. Warn-toned: ended, not achieved. */
+  .mstatus.aborted{color:var(--warn);border-color:var(--warn)}
   .mstatus.paused{color:var(--warn);border-color:var(--warn)}
   .livepill{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);padding:3px 8px;border-radius:3px}
   @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.5}}
@@ -831,6 +836,12 @@ var STATUS_ACTIONS = {
   "step start": "running", "step complete": "complete", "step error": "error",
   "phase start": "running", "phase complete": "complete", "phase abandon": "abandoned",
   "mission start": "active", "mission close": "finalized", "mission pause": "paused", "mission resume": "active",
+  // (#1627) `mission abort` is its OWN terminal, not a flavor of close. The
+  // fix that split them on the Rust side shipped without this line, so an
+  // abort record resolved to `null` here and was silently dropped — the
+  // aborted mission's own graph page kept flying a "● live" pill. Exactly the
+  // lie #1627 was filed to kill, reproduced one file over by its own fix.
+  "mission abort": "aborted",
 };
 function statusFromRecord(rec){
   return normalizeMissionStatus(STATUS_ACTIONS[rec.action] || null);
@@ -852,10 +863,28 @@ function normalizeMissionStatus(s){
 // a page-side "complete" is never overwritten by a disk-side "error" or
 // vice versa on rank alone (equal rank keeps the page's value; the SSE
 // delta that set it is more recent than the disk snapshot).
+// (#1627) `aborted` ranks 2 — TERMINAL, alongside finalized/abandoned.
 var STATUS_RANK = { planned: 0, running: 1, complete: 2, error: 2, abandoned: 2,
-                    active: 1, finalized: 2, closed: 2, paused: 1 };
+                    active: 1, finalized: 2, closed: 2, aborted: 2, paused: 1 };
+// (#1628) An unrecognized status must NOT rank 0.
+//
+// Ranking it 0 put it level with `planned`, and the ratchet keeps the PAGE's
+// value whenever `rank(old) >= rank(new)`. So a phase showing `running`
+// (rank 1) whose disk status became a value this build has never heard of —
+// a newer darkmux, a version-skewed peer, a variant added later — kept
+// rendering `running`, pulsing dot and all, indefinitely.
+//
+// Worse than the absence-inference class (#1620/#1621/#1627): those misread a
+// MISSING value; this one actively DISCARDS a present, correctly delivered one
+// because the ratchet cannot rank it.
+//
+// Deliberately ABOVE every known rank: an unknown value is newer than what
+// this build knows, and the disk snapshot is the more recent authority, so it
+// wins the merge. Being shown a status we cannot style is a small confusion.
+// Being shown a lie is not.
+var UNKNOWN_STATUS_RANK = 99;
 function statusRank(s){
-  return STATUS_RANK[s] !== undefined ? STATUS_RANK[s] : 0;
+  return STATUS_RANK[s] !== undefined ? STATUS_RANK[s] : UNKNOWN_STATUS_RANK;
 }
 
 // Merge a freshly-fetched disk snapshot into the page's current graph

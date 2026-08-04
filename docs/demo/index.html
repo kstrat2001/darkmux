@@ -451,7 +451,7 @@
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
   /* (#1071) status convention — running=yellow(pulse), complete=green,
      canceled=orange, failed=red, anomaly=cyan. */
-  .pill.run{background:#2a2410;color:var(--run);animation:lpulse 1.6s ease-in-out infinite}.pill.done{background:#16261d;color:var(--good)}.pill.util{background:var(--bg2);color:var(--accent-dim);border:1px solid var(--line)}
+  .pill.run{background:#2a2410;color:var(--run);animation:lpulse 1.6s ease-in-out infinite}.pill.done{background:#16271d;color:var(--good)}.pill.util{background:var(--bg2);color:var(--accent-dim);border:1px solid var(--line)}
   .pill.canceled{background:#241a12;color:var(--warn)}
   .pill.muted{background:var(--panel);color:var(--muted)} /* neutral (e.g. utility-model residency states), not a dispatch verdict */
   .pill.warn{background:#241a12;color:var(--warn)}
@@ -603,6 +603,9 @@
      (the missions index + the static mission summary) still renders it. */
   .mstat{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:2px 8px;border-radius:3px;border:1px solid var(--line);color:var(--muted);vertical-align:middle}
   .mstat.active{color:var(--good);border-color:var(--good)}.mstat.finalized{color:var(--muted)}.mstat.paused{color:var(--warn);border-color:var(--warn)}
+  /* (#1627) See mission-graph.html's .mstatus.aborted — a teardown must not
+     read as a success in the fast colour scan. */
+  .mstat.aborted{color:var(--warn);border-color:var(--warn)}
   .preview-text{color:var(--muted);font-style:italic}
   .rec.sel .preview-text{color:rgba(232,230,227,0.7)}
   /* Per-activity glyph on each log line — scannable "what's the model doing". */

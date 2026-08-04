@@ -468,6 +468,11 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg]) -> RunStatus 
             }
             RunStatus::Running
         }
+        // (#1627) A torn-down mission is NOT a completed one, and must never
+        // resolve through the envelope branch below — an abort leaves whatever
+        // envelope the run had written before it died, so reading it would let
+        // a killed run inherit a success verdict it never earned.
+        MissionStatus::Aborted => RunStatus::Abandoned,
         MissionStatus::Finalized => {
             let envelope = darkmux_crew::lifecycle::load_envelope(&mission.id)
                 .ok()

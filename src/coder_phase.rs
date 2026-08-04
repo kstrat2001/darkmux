@@ -1409,9 +1409,19 @@ fn terminate_mission(mission_id: &str, kind: MissionTerminal, reasoning: Option<
         println!("{}", style::dim("all phases already terminal — nothing to tear down"));
     }
 
-    // Close the mission. Best-effort against an already-Finalized mission (a
+    // Close the mission. Best-effort against an already-terminal mission (a
     // graph/review run may have auto-closed it) — surface, don't fail.
-    match crew::lifecycle::mission_close_with_reasoning(mission_id, reasoning) {
+    //
+    // (#1627) The terminal reflects WHICH verb ran. `abort` used to write
+    // `Finalized` — the success terminal — so a torn-down mission and a
+    // completed one were the same value on disk and the board could not tell
+    // them apart. `kind` has always known the difference; it just wasn't
+    // reaching the status.
+    let terminal = match kind {
+        MissionTerminal::Abort => crew::types::MissionStatus::Aborted,
+        _ => crew::types::MissionStatus::Finalized,
+    };
+    match crew::lifecycle::mission_terminal_with_reasoning(mission_id, terminal, reasoning) {
         Ok(m) => {
             let started = m.started_ts.unwrap_or(0);
             let finalized = m.finalized_ts.unwrap_or(0);
@@ -2269,6 +2279,7 @@ fn mission_status_label(s: crew::types::MissionStatus) -> &'static str {
     match s {
         Active => "active",
         Finalized => "finalized",
+        Aborted => "aborted",
         Paused => "paused",
     }
 }
