@@ -1,0 +1,187 @@
+name: quality
+
+# (#1635) Two checks the ordinary suite structurally cannot make about ITSELF.
+#
+# `cargo test` answers "does the code do what the tests say". It cannot answer
+# "do the tests say anything" — a test that passes against a broken
+# implementation is indistinguishable from one that passes against a correct
+# one, and on 2026-08-04 SIX tests written in a single day passed or failed for
+# a reason other than the one they named. Every one was caught by hand, by
+# reverting the fix underneath it. This automates that.
+#
+#   mutation — flips a comparison, deletes a branch, replaces a return value.
+#              A mutant that SURVIVES is a line no test constrains.
+#   coverage — reports which lines executed at all. Three defects that shipped
+#              (#1618, #1631, and the ghost-runs half of #1621) lived in regions
+#              with literally zero test execution.
+#
+# Both are ADVISORY on PRs and neither blocks a merge. They surface a number
+# and a diff; the operator decides. Making them gates before anyone has seen
+# their baseline would fail honest PRs for pre-existing debt.
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly full sweep. The PR job only mutates the diff (seconds); the whole
+    # workspace is ~1410 mutants and does not belong in anyone's review loop.
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants-in-diff:
+    name: mutation — tests that cannot fail (PR diff only)
+    runs-on: macos-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `--in-diff` needs the merge base to compute the changed lines.
+          fetch-depth: 0
+
+      - name: Install Rust stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Diff against the merge base
+        run: |
+          git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr.diff
+          echo "changed Rust lines: $(grep -c '^+' /tmp/pr.diff || echo 0)"
+
+      - name: Mutate only what this PR touched
+        id: mutants
+        continue-on-error: true
+        run: |
+          cargo mutants --in-diff /tmp/pr.diff -j 4 --timeout 120 \
+            --output mutants-out || true
+
+      - name: Report survivors
+        if: always()
+        run: |
+          OUT=mutants-out/mutants.out
+          if [ ! -d "$OUT" ] && [ ! -f "$OUT/caught.txt" ]; then OUT=mutants.out; fi
+          MISSED="$OUT/missed.txt"
+          {
+            echo "## Mutation testing — this PR's changed lines"
+            echo
+            if [ -s "$MISSED" ]; then
+              N=$(wc -l < "$MISSED" | tr -d ' ')
+              echo "**$N surviving mutant(s).** Each is a change to your code that NO test noticed."
+              echo
+              echo 'Advisory, not a gate — some survivors are genuinely untestable (a log line, a'
+              echo 'display string). But a survivor on a branch that decides a STATUS or a NUMBER is'
+              echo 'the "test that cannot fail" shape, and worth one minute before merging.'
+              echo
+              echo '```'
+              cat "$MISSED"
+              echo '```'
+            else
+              echo 'No surviving mutants on the changed lines. Every mutation this PR made testable'
+              echo 'was caught by a test.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-in-diff
+          path: |
+            mutants-out/**
+            mutants.out/**
+          if-no-files-found: ignore
+
+  coverage:
+    name: coverage — which lines never execute
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Measure
+        run: |
+          cargo llvm-cov --workspace --summary-only --json --output-path cov.json
+          cargo llvm-cov --workspace --summary-only
+
+      - name: Report, and name the zero-coverage regions
+        if: always()
+        run: python3 scripts/ci-coverage-summary.py cov.json >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-json
+          path: cov.json
+          if-no-files-found: ignore
+
+  mutants-full:
+    name: mutation — full workspace sweep (nightly)
+    runs-on: macos-latest
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants-full
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Sweep
+        continue-on-error: true
+        run: cargo mutants -j 4 --timeout 120 --output mutants-out || true
+
+      - name: Summarize
+        if: always()
+        run: |
+          OUT=$(ls -d mutants-out/mutants.out mutants.out 2>/dev/null | head -1)
+          {
+            echo "## Nightly mutation sweep"
+            echo
+            for f in caught missed timeout unviable; do
+              [ -f "$OUT/$f.txt" ] && echo "- **$f**: $(wc -l < "$OUT/$f.txt" | tr -d ' ')"
+            done
+            echo
+            echo 'A surviving ("missed") mutant is a line no test constrains. This is the'
+            echo 'backlog number — not something to fix in one pass, but the direction of travel'
+            echo 'should be down.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-full
+          path: |
+            mutants-out/**
+            mutants.out/**
+          if-no-files-found: ignore

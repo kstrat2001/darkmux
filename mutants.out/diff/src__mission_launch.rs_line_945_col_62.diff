@@ -1,0 +1,21 @@
+--- src/mission_launch.rs
++++ delete field image from struct TaskOverride expression in build_launch_params
+@@ -937,17 +937,17 @@
+                         image: image.map(String::from),
+                         description: Some(format!("dispatch `{role}` into the worktree")),
+                         ..Default::default()
+                     },
+                 );
+             } else if workdir.is_some() || image.is_some() {
+                 task_overrides.insert(
+                     coder_task,
+-                    TaskOverride { workdir: workdir.clone(), image: image.map(String::from), ..Default::default() },
++                    TaskOverride { workdir: workdir.clone(),  /* ~ changed by cargo-mutants ~ */ ..Default::default() },
+                 );
+             }
+         }
+         if let (Some(workdir), Some(verify_task)) = (workdir, verify_task) {
+             task_overrides.insert(verify_task, TaskOverride { workdir: Some(workdir), ..Default::default() });
+         }
+     }
+ 

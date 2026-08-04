@@ -1,0 +1,23 @@
+--- src/mission_status.rs
++++ replace short_handle -> Option<&str> with Some("")
+@@ -157,19 +157,17 @@
+ /// dispatch path emits `dispatch-<role>-<secs>-<hex>-<n>`.
+ ///
+ /// So: scan segments right-to-left for the first all-hex run of at least
+ /// `MIN_HANDLE_HEX` chars. A HEURISTIC, deliberately — the two formats are not
+ /// one, and hand-authored ids (`doom-loop-m4`, `104-daemon-observability`) match
+ /// nothing and correctly yield `None`. It is display-only and drops to nothing
+ /// on no match, so a wrong guess costs a column, never correctness.
+ fn short_handle(id: &str) -> Option<&str> {
+-    id.rsplit('-').find(|seg| {
+-        seg.len() >= MIN_HANDLE_HEX && seg.chars().all(|c| c.is_ascii_hexdigit())
+-    })
++    Some("") /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Shortest run of hex that reads as a deliberate discriminator rather than an
+ /// accident. Below 4, ordinary id fragments (`-0`, `-5`, a version `-2`) start
+ /// matching and the column fills with noise.
+ const MIN_HANDLE_HEX: usize = 4;
+ 
+ /// (#1612) Compact "how long ago", in at most `AGE_COLS` columns.

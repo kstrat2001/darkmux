@@ -1,0 +1,2752 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Success",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 18.721265833,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 95.986891708,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:129:5: replace display_label -> &str with \"\"",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "display_label",
+            "return_type": "-> &str",
+            "span": {
+              "start": {
+                "line": 107,
+                "column": 1
+              },
+              "end": {
+                "line": 134,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 129,
+              "column": 5
+            },
+            "end": {
+              "line": 133,
+              "column": 46
+            }
+          },
+          "replacement": "\"\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_129_col_5.log",
+      "diff_path": "diff/src__mission_status.rs_line_129_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.32889,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.447772417,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:129:5: replace display_label -> &str with \"xyzzy\"",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "display_label",
+            "return_type": "-> &str",
+            "span": {
+              "start": {
+                "line": 107,
+                "column": 1
+              },
+              "end": {
+                "line": 134,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 129,
+              "column": 5
+            },
+            "end": {
+              "line": 133,
+              "column": 46
+            }
+          },
+          "replacement": "\"xyzzy\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_129_col_5_001.log",
+      "diff_path": "diff/src__mission_status.rs_line_129_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.231433458,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 6.755228125,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:144:5: replace kind_glyph -> &'static str with \"\"",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "kind_glyph",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 136,
+                "column": 1
+              },
+              "end": {
+                "line": 149,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 144,
+              "column": 5
+            },
+            "end": {
+              "line": 148,
+              "column": 6
+            }
+          },
+          "replacement": "\"\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_144_col_5.log",
+      "diff_path": "diff/src__mission_status.rs_line_144_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.264621833,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 6.094816667,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:144:5: replace kind_glyph -> &'static str with \"xyzzy\"",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "kind_glyph",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 136,
+                "column": 1
+              },
+              "end": {
+                "line": 149,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 144,
+              "column": 5
+            },
+            "end": {
+              "line": 148,
+              "column": 6
+            }
+          },
+          "replacement": "\"xyzzy\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_144_col_5_001.log",
+      "diff_path": "diff/src__mission_status.rs_line_144_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.199560292,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.819498375,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:144:21: replace > with == in kind_glyph",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "kind_glyph",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 136,
+                "column": 1
+              },
+              "end": {
+                "line": 149,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 144,
+              "column": 21
+            },
+            "end": {
+              "line": 144,
+              "column": 22
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_144_col_21.log",
+      "diff_path": "diff/src__mission_status.rs_line_144_col_21.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.449227333,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.8313102919999995,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:144:21: replace > with < in kind_glyph",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "kind_glyph",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 136,
+                "column": 1
+              },
+              "end": {
+                "line": 149,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 144,
+              "column": 21
+            },
+            "end": {
+              "line": 144,
+              "column": 22
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_144_col_21_001.log",
+      "diff_path": "diff/src__mission_status.rs_line_144_col_21_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.232756083,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 6.561660458,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:144:21: replace > with >= in kind_glyph",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "kind_glyph",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 136,
+                "column": 1
+              },
+              "end": {
+                "line": 149,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 144,
+              "column": 21
+            },
+            "end": {
+              "line": 144,
+              "column": 22
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_144_col_21_002.log",
+      "diff_path": "diff/src__mission_status.rs_line_144_col_21_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.288021584,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.919212625,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:165:5: replace short_handle -> Option<&str> with None",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "short_handle",
+            "return_type": "-> Option<&str>",
+            "span": {
+              "start": {
+                "line": 151,
+                "column": 1
+              },
+              "end": {
+                "line": 168,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 165,
+              "column": 5
+            },
+            "end": {
+              "line": 167,
+              "column": 7
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_165_col_5.log",
+      "diff_path": "diff/src__mission_status.rs_line_165_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.3784522080000001,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.512326792,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:165:5: replace short_handle -> Option<&str> with Some(\"\")",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "short_handle",
+            "return_type": "-> Option<&str>",
+            "span": {
+              "start": {
+                "line": 151,
+                "column": 1
+              },
+              "end": {
+                "line": 168,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 165,
+              "column": 5
+            },
+            "end": {
+              "line": 167,
+              "column": 7
+            }
+          },
+          "replacement": "Some(\"\")",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_165_col_5_001.log",
+      "diff_path": "diff/src__mission_status.rs_line_165_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.303909166,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.755071083,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:165:5: replace short_handle -> Option<&str> with Some(\"xyzzy\")",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "short_handle",
+            "return_type": "-> Option<&str>",
+            "span": {
+              "start": {
+                "line": 151,
+                "column": 1
+              },
+              "end": {
+                "line": 168,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 165,
+              "column": 5
+            },
+            "end": {
+              "line": 167,
+              "column": 7
+            }
+          },
+          "replacement": "Some(\"xyzzy\")",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_165_col_5_002.log",
+      "diff_path": "diff/src__mission_status.rs_line_165_col_5_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.264021708,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 6.317056625,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:166:37: replace && with || in short_handle",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "short_handle",
+            "return_type": "-> Option<&str>",
+            "span": {
+              "start": {
+                "line": 151,
+                "column": 1
+              },
+              "end": {
+                "line": 168,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 166,
+              "column": 37
+            },
+            "end": {
+              "line": 166,
+              "column": 39
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_166_col_37.log",
+      "diff_path": "diff/src__mission_status.rs_line_166_col_37.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.501505208,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 6.305260958,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:166:19: replace >= with < in short_handle",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "short_handle",
+            "return_type": "-> Option<&str>",
+            "span": {
+              "start": {
+                "line": 151,
+                "column": 1
+              },
+              "end": {
+                "line": 168,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 166,
+              "column": 19
+            },
+            "end": {
+              "line": 166,
+              "column": 21
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_166_col_19.log",
+      "diff_path": "diff/src__mission_status.rs_line_166_col_19.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.288220292,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.295950375,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:182:5: replace relative_age -> String with String::new()",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "relative_age",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 175,
+                "column": 1
+              },
+              "end": {
+                "line": 190,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 182,
+              "column": 5
+            },
+            "end": {
+              "line": 189,
+              "column": 6
+            }
+          },
+          "replacement": "String::new()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_182_col_5.log",
+      "diff_path": "diff/src__mission_status.rs_line_182_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.413977875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.763290875,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:182:5: replace relative_age -> String with \"xyzzy\".into()",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "relative_age",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 175,
+                "column": 1
+              },
+              "end": {
+                "line": 190,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 182,
+              "column": 5
+            },
+            "end": {
+              "line": 189,
+              "column": 6
+            }
+          },
+          "replacement": "\"xyzzy\".into()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_182_col_5_001.log",
+      "diff_path": "diff/src__mission_status.rs_line_182_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.2794978750000001,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.772898708,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:184:9: delete match arm 0..= 59 in relative_age",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "relative_age",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 175,
+                "column": 1
+              },
+              "end": {
+                "line": 190,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 184,
+              "column": 9
+            },
+            "end": {
+              "line": 184,
+              "column": 37
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_184_col_9.log",
+      "diff_path": "diff/src__mission_status.rs_line_184_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.5311264169999999,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 6.290352125,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:185:9: delete match arm 60..= 3_599 in relative_age",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "relative_age",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 175,
+                "column": 1
+              },
+              "end": {
+                "line": 190,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 185,
+              "column": 9
+            },
+            "end": {
+              "line": 185,
+              "column": 49
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_185_col_9.log",
+      "diff_path": "diff/src__mission_status.rs_line_185_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.318158625,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 6.123532666,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:186:9: delete match arm 3_600..= 86_399 in relative_age",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "relative_age",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 175,
+                "column": 1
+              },
+              "end": {
+                "line": 190,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 186,
+              "column": 9
+            },
+            "end": {
+              "line": 186,
+              "column": 56
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_186_col_9.log",
+      "diff_path": "diff/src__mission_status.rs_line_186_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.306735375,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 6.568985125,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_status.rs:187:9: delete match arm 86_400..= 2_591_999 in relative_age",
+          "package": "darkmux",
+          "file": "src/mission_status.rs",
+          "function": {
+            "function_name": "relative_age",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 175,
+                "column": 1
+              },
+              "end": {
+                "line": 190,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 187,
+              "column": 9
+            },
+            "end": {
+              "line": 187,
+              "column": 61
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_status.rs_line_187_col_9.log",
+      "diff_path": "diff/src__mission_status.rs_line_187_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.419984916,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.709113792,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:935:25: delete field role_id from struct TaskOverride expression in build_launch_params",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "build_launch_params",
+            "return_type": "-> LaunchParams",
+            "span": {
+              "start": {
+                "line": 898,
+                "column": 1
+              },
+              "end": {
+                "line": 960,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 935,
+              "column": 25
+            },
+            "end": {
+              "line": 935,
+              "column": 57
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_935_col_25.log",
+      "diff_path": "diff/src__mission_launch.rs_line_935_col_25.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.3622883749999999,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.854761333,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:936:25: delete field workdir from struct TaskOverride expression in build_launch_params",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "build_launch_params",
+            "return_type": "-> LaunchParams",
+            "span": {
+              "start": {
+                "line": 898,
+                "column": 1
+              },
+              "end": {
+                "line": 960,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 936,
+              "column": 25
+            },
+            "end": {
+              "line": 936,
+              "column": 50
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_936_col_25.log",
+      "diff_path": "diff/src__mission_launch.rs_line_936_col_25.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.377710083,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.409133708,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:937:25: delete field image from struct TaskOverride expression in build_launch_params",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "build_launch_params",
+            "return_type": "-> LaunchParams",
+            "span": {
+              "start": {
+                "line": 898,
+                "column": 1
+              },
+              "end": {
+                "line": 960,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 937,
+              "column": 25
+            },
+            "end": {
+              "line": 937,
+              "column": 56
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__mission_launch.rs_line_937_col_25.log",
+      "diff_path": "diff/src__mission_launch.rs_line_937_col_25.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.403210916,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 44.843551875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:938:25: delete field description from struct TaskOverride expression in build_launch_params",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "build_launch_params",
+            "return_type": "-> LaunchParams",
+            "span": {
+              "start": {
+                "line": 898,
+                "column": 1
+              },
+              "end": {
+                "line": 960,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 938,
+              "column": 25
+            },
+            "end": {
+              "line": 938,
+              "column": 91
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__mission_launch.rs_line_938_col_25.log",
+      "diff_path": "diff/src__mission_launch.rs_line_938_col_25.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.227514041,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 44.38764825,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:945:36: delete field workdir from struct TaskOverride expression in build_launch_params",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "build_launch_params",
+            "return_type": "-> LaunchParams",
+            "span": {
+              "start": {
+                "line": 898,
+                "column": 1
+              },
+              "end": {
+                "line": 960,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 945,
+              "column": 36
+            },
+            "end": {
+              "line": 945,
+              "column": 61
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__mission_launch.rs_line_945_col_36.log",
+      "diff_path": "diff/src__mission_launch.rs_line_945_col_36.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.530687375,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 43.5242275,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:945:62: delete field image from struct TaskOverride expression in build_launch_params",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "build_launch_params",
+            "return_type": "-> LaunchParams",
+            "span": {
+              "start": {
+                "line": 898,
+                "column": 1
+              },
+              "end": {
+                "line": 960,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 945,
+              "column": 62
+            },
+            "end": {
+              "line": 945,
+              "column": 93
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__mission_launch.rs_line_945_col_62.log",
+      "diff_path": "diff/src__mission_launch.rs_line_945_col_62.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.42149,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 52.321830542,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1649:20: replace != with == in lazy_start_phase_for_step",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_start_phase_for_step",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 1611,
+                "column": 1
+              },
+              "end": {
+                "line": 1671,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1649,
+              "column": 20
+            },
+            "end": {
+              "line": 1649,
+              "column": 22
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_1649_col_20.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1649_col_20.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.802615,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 8.515778334,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:950:63: delete field workdir from struct TaskOverride expression in build_launch_params",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "build_launch_params",
+            "return_type": "-> LaunchParams",
+            "span": {
+              "start": {
+                "line": 898,
+                "column": 1
+              },
+              "end": {
+                "line": 960,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 950,
+              "column": 63
+            },
+            "end": {
+              "line": 950,
+              "column": 86
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_950_col_63.log",
+      "diff_path": "diff/src__mission_launch.rs_line_950_col_63.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 34.137978959,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 22.465596167,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1648:5: replace lazy_start_phase_for_step -> bool with false",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_start_phase_for_step",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 1611,
+                "column": 1
+              },
+              "end": {
+                "line": 1671,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1648,
+              "column": 5
+            },
+            "end": {
+              "line": 1670,
+              "column": 9
+            }
+          },
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_1648_col_5.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1648_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 40.00177225,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 20.429698417,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1648:5: replace lazy_start_phase_for_step -> bool with true",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_start_phase_for_step",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 1611,
+                "column": 1
+              },
+              "end": {
+                "line": 1671,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1648,
+              "column": 5
+            },
+            "end": {
+              "line": 1670,
+              "column": 9
+            }
+          },
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_1648_col_5_001.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1648_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 41.886556584,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 18.883350292,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1652:31: delete ! in lazy_start_phase_for_step",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_start_phase_for_step",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 1611,
+                "column": 1
+              },
+              "end": {
+                "line": 1671,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1652,
+              "column": 31
+            },
+            "end": {
+              "line": 1652,
+              "column": 32
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_1652_col_31.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1652_col_31.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 3.267451916,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.489873583,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1701:5: replace lazy_close_prior_phases with ()",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_close_prior_phases",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 1673,
+                "column": 1
+              },
+              "end": {
+                "line": 1750,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1701,
+              "column": 5
+            },
+            "end": {
+              "line": 1749,
+              "column": 6
+            }
+          },
+          "replacement": "()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_1701_col_5.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1701_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.711803916,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.328596542,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1702:54: replace == with != in lazy_close_prior_phases",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_close_prior_phases",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 1673,
+                "column": 1
+              },
+              "end": {
+                "line": 1750,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1702,
+              "column": 54
+            },
+            "end": {
+              "line": 1702,
+              "column": 56
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_1702_col_54.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1702_col_54.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.75376625,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 9.977964084,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1706:12: delete ! in lazy_close_prior_phases",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_close_prior_phases",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 1673,
+                "column": 1
+              },
+              "end": {
+                "line": 1750,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1706,
+              "column": 12
+            },
+            "end": {
+              "line": 1706,
+              "column": 13
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_1706_col_12.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1706_col_12.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.497245167,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.999045,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1728:13: replace || with && in lazy_close_prior_phases",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_close_prior_phases",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 1673,
+                "column": 1
+              },
+              "end": {
+                "line": 1750,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1728,
+              "column": 13
+            },
+            "end": {
+              "line": 1728,
+              "column": 15
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_1728_col_13.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1728_col_13.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.480736791,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.889795083,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1710:12: delete ! in lazy_close_prior_phases",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_close_prior_phases",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 1673,
+                "column": 1
+              },
+              "end": {
+                "line": 1750,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1710,
+              "column": 12
+            },
+            "end": {
+              "line": 1710,
+              "column": 13
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_1710_col_12.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1710_col_12.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.7999240840000001,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.671716917,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1736:13: delete match arm crew::envelope::PhaseOutcomeKind::Complete in lazy_close_prior_phases",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_close_prior_phases",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 1673,
+                "column": 1
+              },
+              "end": {
+                "line": 1750,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1736,
+              "column": 13
+            },
+            "end": {
+              "line": 1736,
+              "column": 98
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__mission_launch.rs_line_1736_col_13.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1736_col_13.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.4889935,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.792079375,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/mission_launch.rs:1652:28: replace || with && in lazy_start_phase_for_step",
+          "package": "darkmux",
+          "file": "src/mission_launch.rs",
+          "function": {
+            "function_name": "lazy_start_phase_for_step",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 1611,
+                "column": 1
+              },
+              "end": {
+                "line": 1671,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1652,
+              "column": 28
+            },
+            "end": {
+              "line": 1652,
+              "column": 30
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__mission_launch.rs_line_1652_col_28.log",
+      "diff_path": "diff/src__mission_launch.rs_line_1652_col_28.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.819062916,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 52.200344792,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/skills.rs:302:9: delete field targets from struct InstallReport expression in install_from_disk",
+          "package": "darkmux",
+          "file": "src/skills.rs",
+          "function": {
+            "function_name": "install_from_disk",
+            "return_type": "-> Result<InstallReport>",
+            "span": {
+              "start": {
+                "line": 295,
+                "column": 1
+              },
+              "end": {
+                "line": 356,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 302,
+              "column": 9
+            },
+            "end": {
+              "line": 302,
+              "column": 45
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__skills.rs_line_302_col_9.log",
+      "diff_path": "diff/src__skills.rs_line_302_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.120794,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 59.505630125,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/skills.rs:157:9: delete field source from struct InstallReport expression in install_skills",
+          "package": "darkmux",
+          "file": "src/skills.rs",
+          "function": {
+            "function_name": "install_skills",
+            "return_type": "-> Result<InstallReport>",
+            "span": {
+              "start": {
+                "line": 150,
+                "column": 1
+              },
+              "end": {
+                "line": 226,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 157,
+              "column": 9
+            },
+            "end": {
+              "line": 157,
+              "column": 32
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/src__skills.rs_line_157_col_9.log",
+      "diff_path": "diff/src__skills.rs_line_157_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.431111875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.012975375,
+          "process_status": "Timeout",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/skills.rs:158:9: delete field targets from struct InstallReport expression in install_skills",
+          "package": "darkmux",
+          "file": "src/skills.rs",
+          "function": {
+            "function_name": "install_skills",
+            "return_type": "-> Result<InstallReport>",
+            "span": {
+              "start": {
+                "line": 150,
+                "column": 1
+              },
+              "end": {
+                "line": 226,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 158,
+              "column": 9
+            },
+            "end": {
+              "line": 158,
+              "column": 34
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/src__skills.rs_line_158_col_9.log",
+      "diff_path": "diff/src__skills.rs_line_158_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.566208708,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.040078042,
+          "process_status": "Timeout",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/skills.rs:360:9: delete field source from struct InstallReport expression in install_from_embedded",
+          "package": "darkmux",
+          "file": "src/skills.rs",
+          "function": {
+            "function_name": "install_from_embedded",
+            "return_type": "-> Result<InstallReport>",
+            "span": {
+              "start": {
+                "line": 358,
+                "column": 1
+              },
+              "end": {
+                "line": 393,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 360,
+              "column": 9
+            },
+            "end": {
+              "line": 360,
+              "column": 45
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__skills.rs_line_360_col_9.log",
+      "diff_path": "diff/src__skills.rs_line_360_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.274924416,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 51.98756525,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/skills.rs:301:9: delete field source from struct InstallReport expression in install_from_disk",
+          "package": "darkmux",
+          "file": "src/skills.rs",
+          "function": {
+            "function_name": "install_from_disk",
+            "return_type": "-> Result<InstallReport>",
+            "span": {
+              "start": {
+                "line": 295,
+                "column": 1
+              },
+              "end": {
+                "line": 356,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 301,
+              "column": 9
+            },
+            "end": {
+              "line": 301,
+              "column": 38
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/src__skills.rs_line_301_col_9.log",
+      "diff_path": "diff/src__skills.rs_line_301_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.224715625,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.014990209,
+          "process_status": "Timeout",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/skills.rs:361:9: delete field targets from struct InstallReport expression in install_from_embedded",
+          "package": "darkmux",
+          "file": "src/skills.rs",
+          "function": {
+            "function_name": "install_from_embedded",
+            "return_type": "-> Result<InstallReport>",
+            "span": {
+              "start": {
+                "line": 358,
+                "column": 1
+              },
+              "end": {
+                "line": 393,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 361,
+              "column": 9
+            },
+            "end": {
+              "line": 361,
+              "column": 45
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__skills.rs_line_361_col_9.log",
+      "diff_path": "diff/src__skills.rs_line_361_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 6.3700475,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 52.023228042,
+          "process_status": "Success",
+          "argv": [
+            "/Users/kain/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=darkmux@2.4.0"
+          ]
+        }
+      ]
+    }
+  ],
+  "total_mutants": 42,
+  "missed": 8,
+  "caught": 31,
+  "timeout": 3,
+  "unviable": 0,
+  "success": 0,
+  "start_time": "2026-08-04T07:25:27.421112Z",
+  "end_time": "2026-08-04T07:40:56.028732Z",
+  "cargo_mutants_version": "27.1.0"
+}

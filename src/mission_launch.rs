@@ -3024,6 +3024,45 @@ mod tests {
         assert!(!config_uses_review_kinds(&config_with_kind("review", "dispatch.single_shot")));
     }
 
+    /// (#1635) Killed a mutant `cargo-mutants` found surviving in
+    /// `lazy_start_phase_for_step`: flipping `||` to `&&` in the guard
+    ///
+    /// ```ignore
+    /// if phase_id.is_empty() || !started.insert(phase_id.to_string()) {
+    /// ```
+    ///
+    /// changed when a phase starts, and NO test noticed — every phase test
+    /// passes a non-empty id, so the empty-string arm was unconstrained.
+    ///
+    /// An empty `phase_id` is not hypothetical: the generic launcher's persist
+    /// closure derives it via `.unwrap_or_default()` when a step's task is not
+    /// in the map, so a graph with a dangling task reference reaches here with
+    /// `""`. Under the mutant that would `phase_start("")` and mint lifecycle
+    /// records against a phase that does not exist.
+    #[test]
+    #[serial_test::serial]
+    fn an_empty_phase_id_never_starts_anything() {
+        let _guard = LaunchTestGuard::new();
+        let mut started = std::collections::HashSet::new();
+
+        assert!(
+            !lazy_start_phase_for_step("some-mission", "", NodeStatus::Running, &mut started),
+            "an empty phase id must never report a phase as newly started"
+        );
+        assert!(
+            started.is_empty(),
+            "and must not be recorded as started — a later real phase with a derived empty \
+             id would then be silently skipped"
+        );
+
+        // The other arm of the same guard: a real id starts exactly once.
+        assert!(lazy_start_phase_for_step("some-mission", "p1", NodeStatus::Running, &mut started));
+        assert!(
+            !lazy_start_phase_for_step("some-mission", "p1", NodeStatus::Running, &mut started),
+            "a second step in the same phase must not re-report it as newly started"
+        );
+    }
+
     /// (#1632) The invariant, asserted at the LIFECYCLE level rather than for
     /// one launcher's phase count.
     ///

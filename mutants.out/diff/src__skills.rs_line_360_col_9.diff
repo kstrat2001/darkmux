@@ -1,0 +1,21 @@
+--- src/skills.rs
++++ delete field source from struct InstallReport expression in install_from_embedded
+@@ -352,17 +352,17 @@
+         }
+     }
+ 
+     Ok(report)
+ }
+ 
+ fn install_from_embedded(target: &Path, opts: &InstallOptions) -> Result<InstallReport> {
+     let mut report = InstallReport {
+-        source: PathBuf::from("<embedded>"),
++         /* ~ changed by cargo-mutants ~ */
+         targets: vec![target.to_path_buf()],
+         ..Default::default()
+     };
+ 
+     for (skill_name, body) in EMBEDDED_SKILLS {
+         let dst_skill_dir = target.join(skill_name);
+         let dst_skill_md = dst_skill_dir.join("SKILL.md");
+ 

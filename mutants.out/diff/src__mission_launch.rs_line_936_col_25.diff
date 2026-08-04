@@ -1,0 +1,21 @@
+--- src/mission_launch.rs
++++ delete field workdir from struct TaskOverride expression in build_launch_params
+@@ -928,17 +928,17 @@
+         let coder_task = task_id_declaring_step_kind(config, "mission.coder");
+         let verify_task = task_id_declaring_step_kind(config, "mission.verify");
+         if let Some(coder_task) = coder_task {
+             if let Some(role) = role {
+                 task_overrides.insert(
+                     coder_task,
+                     TaskOverride {
+                         role_id: Some(role.to_string()),
+-                        workdir: workdir.clone(),
++                         /* ~ changed by cargo-mutants ~ */
+                         image: image.map(String::from),
+                         description: Some(format!("dispatch `{role}` into the worktree")),
+                         ..Default::default()
+                     },
+                 );
+             } else if workdir.is_some() || image.is_some() {
+                 task_overrides.insert(
+                     coder_task,

@@ -1,0 +1,21 @@
+--- src/mission_launch.rs
++++ delete ! in lazy_close_prior_phases
+@@ -1702,17 +1702,17 @@
+     let Some(at) = phase_order.iter().position(|p| p == newly_started) else {
+         return;
+     };
+     for prior in &phase_order[..at] {
+         if !closed.insert(prior.clone()) {
+             continue;
+         }
+         let status = load_phase_for_brief(mission_id, prior).map(|p| p.status);
+-        if !matches!(status, Ok(PhaseStatus::Running)) {
++        if  /* ~ changed by cargo-mutants ~ */matches!(status, Ok(PhaseStatus::Running)) {
+             continue;
+         }
+         let Ok(steps) = crew::lifecycle::load_steps_for_phase(mission_id, prior) else {
+             closed.remove(prior);
+             continue;
+         };
+         // (#1620) NO steps on disk is absence of evidence, not evidence of
+         // failure — and `phase_finalization` reads an empty slice as "the

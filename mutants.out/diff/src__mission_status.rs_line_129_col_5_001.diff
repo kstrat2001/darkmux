@@ -1,0 +1,25 @@
+--- src/mission_status.rs
++++ replace display_label -> &str with "xyzzy"
+@@ -121,21 +121,17 @@
+ /// glyph already distinguishes a single-role dispatch from a graph, so it is
+ /// stripped. The id is not lost: the row is an OSC 8 link, so it is one click
+ /// away, and any row that needs an id typed carries it verbatim in the drift
+ /// suggestion printed directly beneath it.
+ ///
+ /// Falls back to the id when a description is genuinely absent — an id is a
+ /// poor label but never a wrong one.
+ fn display_label(m: &Mission) -> &str {
+-    let d = m.description.trim();
+-    if d.is_empty() {
+-        return &m.id;
+-    }
+-    d.strip_prefix("dispatch: ").unwrap_or(d)
++    "xyzzy" /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// (#1612) Single-role dispatch vs multi-phase graph, in one column-safe glyph.
+ ///
+ /// The operator asked whether a row could say "graph" versus "role" and floated
+ /// an emoji. Emoji are DOUBLE-WIDTH, and every column budget in this module is
+ /// exact arithmetic over `chars().count()` — one emoji would silently overflow
+ /// every row it appeared on. These two are single-width, so the distinction is
