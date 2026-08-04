@@ -551,7 +551,21 @@ pub fn launch(
         &est,
         1,
         &crew::concurrent_dispatch::lms_host_factory,
-        &mut |record| {
+        // (#1641) The launcher knows its own `mission_id` — stamp it onto
+        // every record this run's `run_step_graph` call produces that
+        // doesn't already carry a more specific one (`get_or_insert`, never
+        // overwrite). Without this, the scheduler's generic step-lifecycle
+        // records (`step_lifecycle_record`, `crates/darkmux-crew/src/
+        // scheduler.rs`) and any `StepKind`'s own `mission_id: None`-
+        // stamped records (e.g. `dispatch.map`'s per-item "step result")
+        // carry NO instance-scoped identity, so two missions launched from
+        // the SAME config collide on their shared CONFIG-scoped
+        // `session_id`/`handle` (e.g. `task-review-probe-mid-task` /
+        // `review-probe-mid-step`) in the viewer — one mission's step
+        // absorbing another's token counts, a dead step resurrected to
+        // "running" by the other mission's heartbeat.
+        &mut |mut record| {
+            record.mission_id.get_or_insert_with(|| mission_id.clone());
             let _ = flow::record(record);
         },
         &mut |step| {
@@ -2063,6 +2077,37 @@ mod tests {
         ids.into_iter().next().unwrap()
     }
 
+    /// (#1641) Every flow record written to the isolated `DARKMUX_FLOWS_DIR`
+    /// so far, across every per-day JSONL file `LaunchTestGuard` set up —
+    /// read raw off disk rather than through any in-process buffer, so this
+    /// exercises the SAME on-disk shape a real `mission-graph` page's
+    /// backfill fetch would see.
+    fn read_all_flow_records() -> Vec<serde_json::Value> {
+        let dir = std::env::var("DARKMUX_FLOWS_DIR")
+            .expect("DARKMUX_FLOWS_DIR must be set by an active LaunchTestGuard");
+        let mut out = Vec::new();
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => return out,
+        };
+        for entry in rd.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            for line in contents.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    out.push(v);
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     #[serial_test::serial]
     fn freeform_launch_mints_instance_and_leaves_phases_manual() {
@@ -2134,6 +2179,105 @@ mod tests {
         assert_eq!(
             mission2.spec, mission.spec,
             "same config + same inputs must fingerprint identically — the two runs group"
+        );
+    }
+
+    /// (#1641) Two missions launched from the SAME config share every
+    /// CONFIG-scoped identity a step-lifecycle record carries —
+    /// `session_id::task(&step.task_id)` and `handle: step.id` are literal
+    /// strings straight out of the document, byte-identical across both
+    /// runs (`crates/darkmux-crew/src/scheduler.rs`'s `step_lifecycle_record`
+    /// doc names this exact collision — real flow data measured only 0.2%
+    /// of dispatch/token records carrying `mission_id` before this fix).
+    /// This proves the launcher's `emit`-wrap closes it: same session_id and
+    /// handle across both runs, but `mission_id` disambiguates them.
+    #[test]
+    #[serial_test::serial]
+    fn two_launches_of_the_same_config_produce_step_lifecycle_records_distinguishable_by_mission_id() {
+        const STEPPED_CONFIG: &str = r#"{
+            "id": "twin-mission-test",
+            "name": "Twin Mission Test",
+            "schema_version": "1.1",
+            "phases": [
+                {
+                    "id": "p1",
+                    "description": "one real, hermetic step — no model, no dispatch",
+                    "tasks": [
+                        { "id": "t1", "steps": [{ "id": "s1", "kind": "procedural.noop" }] }
+                    ]
+                }
+            ]
+        }"#;
+        let guard = LaunchTestGuard::new();
+        guard.write_config("twin-mission-test", STEPPED_CONFIG);
+
+        let exit1 = launch("twin-mission-test", None, &[], None).expect("first launch should succeed");
+        assert_eq!(exit1, 0);
+        let first_id = single_mission_id();
+
+        let exit2 = launch("twin-mission-test", None, &[], None).expect("second launch should succeed");
+        assert_eq!(exit2, 0);
+        let ids = all_mission_ids();
+        assert_eq!(ids.len(), 2, "two launches of the same config must mint two missions");
+        let second_id = ids.into_iter().find(|id| id != &first_id).unwrap();
+        assert_ne!(first_id, second_id, "two launches must never collapse onto one mission id");
+
+        // Every "step start"/"step complete" record the scheduler emitted
+        // across BOTH runs, straight off the isolated flow sink.
+        let flow_records = read_all_flow_records();
+        let step_records: Vec<&serde_json::Value> = flow_records
+            .iter()
+            .filter(|r| {
+                let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let source = r.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                source == "scheduler" && (action == "step start" || action == "step complete")
+            })
+            .collect();
+        assert!(
+            step_records.len() >= 4,
+            "expected `step start`+`step complete` for `s1` from BOTH runs (>=4 records total), \
+             got {}: {step_records:#?}",
+            step_records.len()
+        );
+
+        // The config-scoped collision that made the bug possible: BOTH runs'
+        // step-lifecycle records share the exact same `session_id`/`handle`.
+        let session_ids: std::collections::BTreeSet<&str> = step_records
+            .iter()
+            .filter_map(|r| r.get("session_id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            session_ids,
+            std::collections::BTreeSet::from(["task-t1"]),
+            "both runs' step-lifecycle records must share the SAME config-scoped session_id \
+             (session_id::task(\"t1\") = \"task-t1\") — this is the collision surface, got {session_ids:?}"
+        );
+        let handles: std::collections::BTreeSet<&str> =
+            step_records.iter().filter_map(|r| r.get("handle").and_then(|v| v.as_str())).collect();
+        assert_eq!(
+            handles,
+            std::collections::BTreeSet::from(["s1"]),
+            "both runs' step-lifecycle records must share the SAME handle, got {handles:?}"
+        );
+
+        // ...but `mission_id` DOES distinguish them now — the actual fix
+        // under test. Assert on `mission_id` itself, not any downstream or
+        // coincidental value.
+        for r in &step_records {
+            assert!(
+                r.get("mission_id").and_then(|v| v.as_str()).is_some(),
+                "every step-lifecycle record must carry a non-null mission_id, got {r:#?}"
+            );
+        }
+        let mission_ids_seen: std::collections::BTreeSet<&str> = step_records
+            .iter()
+            .filter_map(|r| r.get("mission_id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            mission_ids_seen,
+            std::collections::BTreeSet::from([first_id.as_str(), second_id.as_str()]),
+            "step-lifecycle records must carry BOTH real, distinct mission ids — same \
+             session_id/handle, but mission_id tells the two runs apart"
         );
     }
 

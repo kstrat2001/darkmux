@@ -262,10 +262,40 @@ fn parse_exec_mode(mode: &str) -> Result<ExecMode> {
 /// per-run-local JSONL sink (lab-vs-fleet scope boundary). Failure to
 /// record is swallowed (`let _ =`) — same discipline as every other flow
 /// emit site; a flow-record write failure must never abort a review.
-struct FleetFlowEmitter;
+///
+/// `mission_id` (#1641): the launcher's own run identity, stamped in
+/// AFTER `mission_launch::mint_run_id` mints it (`None` for the whole
+/// `--charges-file` judge-only path, which mints no Mission at all — see
+/// [`review_bookend_record`]'s doc). `emit` uses `get_or_insert`-style
+/// semantics — a record that already carries a `mission_id` (the dispatch
+/// bookends, which `review_bookend_record` stamps explicitly) is never
+/// overwritten; this only backfills the records that don't, which is most
+/// of them: `run_step_graph`'s own generic step-lifecycle bookends
+/// (`crates/darkmux-crew/src/scheduler.rs`'s `step_lifecycle_record`) and
+/// any `StepKind`'s own records built with a hardcoded `mission_id: None`
+/// (e.g. `dispatch.map`'s per-item "step result", which streams through
+/// this same emitter via `StepRunCtx::emit`). Before this fix, every one
+/// of those records carried NO instance-scoped identity, so two review
+/// missions launched from the SAME config (the `review.json` built-in) —
+/// hence sharing the exact same CONFIG-scoped `session_id`/`handle`, e.g.
+/// `task-review-probe-mid-task` / `review-probe-mid-step` — collided in
+/// the mission-graph viewer: one mission's step absorbing another's token
+/// counts, a dead step resurrected to "running" by the other mission's
+/// heartbeat.
+struct FleetFlowEmitter {
+    mission_id: Option<String>,
+}
 
 impl ReviewEmitter for FleetFlowEmitter {
-    fn emit(&mut self, record: darkmux_flow::FlowRecord) {
+    fn emit(&mut self, mut record: darkmux_flow::FlowRecord) {
+        // `get_or_insert`-style: only backfills an ABSENT `mission_id`,
+        // never overwrites one a record already carries (see this struct's
+        // doc). `self.mission_id` itself may be `None` (the
+        // `--charges-file` judge-only path mints no Mission) — that's a
+        // no-op here, matching pre-fix behavior exactly for that path.
+        if record.mission_id.is_none() {
+            record.mission_id = self.mission_id.clone();
+        }
         let _ = darkmux_flow::record(record);
     }
 }
@@ -884,7 +914,12 @@ fn run_dispatch(
     let model_for_bookends = crew_model_summary(&crew);
     let remote_max_tokens_per_execution = darkmux_types::config_access::remote_max_tokens_per_execution();
 
-    let mut emitter = FleetFlowEmitter;
+    // (#1641) `mission_id` starts unset — `--charges-file` never mints a
+    // Mission, so it stays `None` on that path. The real-launch branch
+    // below sets it right after `mission_launch::mint_run_id` mints one,
+    // before `emitter` is handed to `run_review_graph`/`with_dispatch_
+    // bookends` — see [`FleetFlowEmitter`]'s doc.
+    let mut emitter = FleetFlowEmitter { mission_id: None };
 
     liveness_case("flow-sinks-up", &case);
     liveness_detail(
@@ -961,6 +996,31 @@ fn run_dispatch(
         let judge_identifier = seat_identifier(&judge.pm);
         let request_changes = crew.request_changes;
 
+        // (#1503) The run id is minted fresh — never derived from
+        // `case_id`. A re-run of the same case (a new commit push, a
+        // manual re-trigger) is a genuinely different run — AI work is
+        // non-deterministic — so it gets its own id; `id_input`'s
+        // fingerprint still groups same-case runs together via
+        // `Mission.spec`, just as metadata rather than identity.
+        //
+        // (#1641) Minted BEFORE `ctx`/`emitter` below (moved up from after)
+        // so both can carry it from construction: `ctx.mission_id` reaches
+        // this pipeline's OWN directly-emitted records (`emit_review_step_
+        // result` et al, which write straight to the global sink and can't
+        // hold `emitter` — see `ReviewStepContext::mission_id`'s doc), and
+        // `emitter.mission_id` backfills everything routed through
+        // `run_step_graph`'s `emit` closure instead (see
+        // `FleetFlowEmitter`'s doc). Neither depends on anything computed
+        // between the old and new position.
+        let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
+        id_input.insert("case_id".to_string(), Value::String(case_id_for_bookends.clone()));
+        let mission_id = mission_launch::mint_run_id("review")?;
+        emitter.mission_id = Some(mission_id.clone());
+        let spec = crew::types::MissionSpec {
+            config_id: "review".to_string(),
+            inputs_fingerprint: mission_launch::spec_fingerprint(&id_input)?,
+        };
+
         let ctx = Arc::new(ReviewStepContext {
             case_id: case_id_for_bookends.clone(),
             roles: crew.clone(),
@@ -979,21 +1039,9 @@ fn run_dispatch(
             // (stamped from `bundle_spec` below) — the test-only seam stays
             // `None` here (see `ReviewStepContext::bundle_override`'s doc).
             bundle_override: None,
+            // (#1641) See `ReviewStepContext::mission_id`'s doc.
+            mission_id: Some(mission_id.clone()),
         });
-
-        // (#1503) The run id is minted fresh — never derived from
-        // `case_id`. A re-run of the same case (a new commit push, a
-        // manual re-trigger) is a genuinely different run — AI work is
-        // non-deterministic — so it gets its own id; `id_input`'s
-        // fingerprint still groups same-case runs together via
-        // `Mission.spec`, just as metadata rather than identity.
-        let mut id_input: BTreeMap<String, Value> = BTreeMap::new();
-        id_input.insert("case_id".to_string(), Value::String(case_id_for_bookends.clone()));
-        let mission_id = mission_launch::mint_run_id("review")?;
-        let spec = crew::types::MissionSpec {
-            config_id: "review".to_string(),
-            inputs_fingerprint: mission_launch::spec_fingerprint(&id_input)?,
-        };
 
         // (#1417) Resolve the phase ids and build the review graph BEFORE
         // minting the Mission — `derive_phase_ids` is a pure, no-I/O

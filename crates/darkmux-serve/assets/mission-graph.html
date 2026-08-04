@@ -1054,7 +1054,18 @@ function isAiKind(kind){
       || kind.indexOf("review.verify") === 0) return true;
   return false;
 }
-function stepForRecord(rec, idx){
+// (#1641) `missionId`: when `rec.mission_id` is PRESENT, it is authoritative
+// — a record stamped for a DIFFERENT mission never resolves to a step on
+// THIS page, full stop, even if its `session_id`/`handle` happen to collide
+// with one of this page's steps (two missions launched from the SAME
+// config share those — see `crates/darkmux-crew/src/scheduler.rs`'s
+// `step_lifecycle_record` doc). When `rec.mission_id` is ABSENT (every
+// pre-#1641 record, and anything the two known producer-side gaps still
+// miss), fall back to the proxy matching below unchanged — this is what
+// keeps historical/legacy records (and the demo data) rendering exactly as
+// before.
+function stepForRecord(rec, idx, missionId){
+  if (rec.mission_id && rec.mission_id !== missionId) return null;
   var p = rec.payload;
   if (p && p.step_id && idx.stepIds.has(p.step_id)) return p.step_id;
   if (rec.session_id && idx.sessionToStep[rec.session_id]) return idx.sessionToStep[rec.session_id];
@@ -1063,8 +1074,8 @@ function stepForRecord(rec, idx){
 }
 // Fold one record into the per-step metric accumulator, returning a NEW object
 // only when something changed (so a no-op record doesn't churn React state).
-function applyRecordToMetrics(metrics, rec, idx){
-  var sid = stepForRecord(rec, idx);
+function applyRecordToMetrics(metrics, rec, idx, missionId){
+  var sid = stepForRecord(rec, idx, missionId);
   if (!sid) return metrics;
   var p = rec.payload || {};
     // (#1640) Arrival time is recorded BEFORE the no-change guard below, and in
@@ -1262,8 +1273,17 @@ function missionTotals(metrics){
 }
 // Does this record belong to THIS mission? (the events panel filter). Matches
 // on any handle/id/session/mission the page already knows from the snapshot.
+//
+// (#1641) `rec.mission_id`, when present, is AUTHORITATIVE — decides the
+// match one way or the other and never falls through to the proxy checks
+// below, so a record correctly stamped for a DIFFERENT mission can't sneak
+// in via a `handle`/`session_id` collision (two missions launched from the
+// same config share those). Only an ABSENT `mission_id` (every pre-#1641
+// record, and anything the two known producer-side gaps still miss) falls
+// back to the proxy matching — this is what keeps historical/legacy
+// records (and the demo data) rendering exactly as before.
 function recordInMission(rec, idx, missionId){
-  if (rec.mission_id && rec.mission_id === missionId) return true;
+  if (rec.mission_id) return rec.mission_id === missionId;
   if (rec.phase_id && idx.phaseIds.has(rec.phase_id)) return true;
   if (rec.handle && (idx.nodeIds.has(rec.handle) || idx.stepIds.has(rec.handle))) return true;
   if (rec.session_id && idx.sessions.has(rec.session_id)) return true;
@@ -1747,7 +1767,7 @@ function App(){
       // not just status transitions — token/turn records carry no status, and
       // the events panel wants every record for this mission. Run these BEFORE
       // the status-transition early-return below.
-      setMetrics(function(prev){ return applyRecordToMetrics(prev, rec, idx); });
+      setMetrics(function(prev){ return applyRecordToMetrics(prev, rec, idx, missionId); });
       if (recordInMission(rec, idx, missionId)) {
         var seq = evSeqRef.current++;
         setEvents(function(prev){

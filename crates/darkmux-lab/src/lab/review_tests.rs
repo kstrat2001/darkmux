@@ -2530,6 +2530,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             timeout_seconds: 30,
             chat_override: None,
             bundle_override: Some(Arc::new(move || Ok(bundles.clone()))),
+            mission_id: None,
         })
     }
 
@@ -2773,6 +2774,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             chat_override: Some(Arc::new(chat_fn)),
             // (#1530) See `step_ctx`'s own doc — same `bundle_override` wiring.
             bundle_override: Some(Arc::new(move || Ok(bundles.clone()))),
+            mission_id: None,
         })
     }
 
@@ -6169,6 +6171,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             timeout_seconds: 30,
             chat_override: None,
             bundle_override: None,
+            mission_id: None,
         });
         let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
         let mut bus = ArtifactBus::new();
@@ -6270,6 +6273,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             timeout_seconds: 30,
             chat_override: None,
             bundle_override: None,
+            mission_id: None,
         });
         let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
         let mut bus = ArtifactBus::new();
@@ -6354,4 +6358,130 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             "an empty bundle set must still skip the judge model load, exactly like the retired \
              ctx.bundles.is_empty() check did"
         );
+    }
+
+    // ── #1641: this pipeline's OWN directly-emitted records carry a real
+    //    mission identity instead of a hardcoded `None` ─────────────────
+
+    /// (#1641) `review_step_result_record` — and by extension every
+    /// `emit_review_step_result`/`apply_verify_results` call site that
+    /// writes straight to the global flow sink (bypassing the caller-
+    /// injected `ReviewEmitter` entirely, since those run on `run_bounded`
+    /// worker threads — see `emit_review_step_result`'s own doc) — must
+    /// carry a real `mission_id` when the caller's `ReviewStepContext`
+    /// supplies one, rather than the pre-fix hardcoded `None`. This is the
+    /// "review dispatch opts carry a phase/mission identity" requirement:
+    /// asserting on `FlowRecord.mission_id` directly, not any downstream or
+    /// coincidental field.
+    #[test]
+    fn review_step_result_record_carries_mission_id_when_the_context_supplies_one() {
+        let with_mission = review_step_result_record(
+            "review.judge",
+            "review-judge-step",
+            "case-1",
+            Some("mission-xyz"),
+            serde_json::json!({ "items_out": 3 }),
+        );
+        assert_eq!(
+            with_mission.mission_id.as_deref(),
+            Some("mission-xyz"),
+            "a supplied mission_id must land on the record's own mission_id field, not be dropped"
+        );
+
+        // The `--charges-file`/lab-bench honest-`None` case (no Mission ever
+        // minted) must still produce `None`, not a fabricated value.
+        let without_mission = review_step_result_record(
+            "review.judge",
+            "review-judge-step",
+            "case-1",
+            None,
+            serde_json::json!({ "items_out": 3 }),
+        );
+        assert_eq!(without_mission.mission_id, None);
+    }
+
+    /// (#1641) The same threading, exercised through the ACTUAL production
+    /// call path: `dispatch_chat` -> `emit_review_token_telemetry` ->
+    /// `build_telemetry_record`, driven by `ReviewStepContext::mission_id`
+    /// rather than the function being called directly. Uses
+    /// `chat_override` (the existing #1355 dispatch seam) so no real
+    /// LMStudio call happens; `emit_review_token_telemetry` writes to the
+    /// GLOBAL flow sink (it can't hold an injected emitter — see its own
+    /// doc), so this test points `DARKMUX_FLOWS_DIR` at a fresh tempdir and
+    /// reads the record back off disk, the same way the mission-graph
+    /// viewer's backfill would.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_chat_stamps_mission_id_onto_the_token_telemetry_record() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe {
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let crew = valid_crew();
+        let ctx = ReviewStepContext {
+            case_id: "case-mission-token-test".to_string(),
+            roles: crew,
+            intent_title: String::new(),
+            intent_body: String::new(),
+            diff: DIFF.to_string(),
+            probe_system: String::new(),
+            probe_role_prompts: BTreeMap::new(),
+            judge_system: String::new(),
+            verify_system: String::new(),
+            remote_max_tokens_per_execution: 500_000,
+            timeout_seconds: 30,
+            chat_override: Some(Arc::new(|_call: &ChatCall| {
+                Ok(SingleShotReply {
+                    content: "ok".to_string(),
+                    total_tokens: Some(15),
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(5),
+                    model: None,
+                })
+            })),
+            bundle_override: None,
+            mission_id: Some("mission-token-test".to_string()),
+        };
+        let call = ChatCall {
+            model: "test-model",
+            system: "sys",
+            user: "hello",
+            temperature: 0.0,
+            max_tokens: 100,
+            endpoint: None,
+        };
+        dispatch_chat(&ctx, &call).expect("mocked dispatch_chat must succeed");
+
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe {
+            match &prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        let mut found = false;
+        for entry in std::fs::read_dir(tmp.path()).expect("read flows dir").filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            for line in contents.lines() {
+                let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                if rec.get("action").and_then(|v| v.as_str()) != Some("telemetry.tokens") {
+                    continue;
+                }
+                assert_eq!(
+                    rec.get("mission_id").and_then(|v| v.as_str()),
+                    Some("mission-token-test"),
+                    "the telemetry.tokens record must carry the context's mission_id, got {rec:#?}"
+                );
+                found = true;
+            }
+        }
+        assert!(found, "expected a telemetry.tokens record on disk after dispatch_chat");
     }
