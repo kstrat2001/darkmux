@@ -1514,7 +1514,7 @@ function eventsPanelEls(events, total, srvTruncated, closePanel){
 
 function App(){
   var missionId = missionIdFromPath();
-  var _s = React.useState({loading:true, error:null, errorNotFound:false, graph:null});
+  var _s = React.useState({loading:true, error:null, errorNotFound:false, ownedBy:null, graph:null});
   var state = _s[0], setState = _s[1];
   var _live = React.useState(false);
   var live = _live[0], setLive = _live[1];
@@ -1607,6 +1607,34 @@ function App(){
         return r.json();
       });
   }
+
+  // (#1466) Which MACHINE a mission ran on, when this one can't render it.
+  //
+  // Three surfaces disagree about where mission data lives: `/flow/:date`
+  // and its SSE stream are Redis-MERGED (fleet-wide), the viewer builds its
+  // selectable mission list from that merged stream, and the graph builder
+  // reads LOCAL DISK only. So a peer's mission is offered in the picker and
+  // 404s when opened — the UI advertising a door it can't open.
+  //
+  // The honest interim (operator's call, #1466 option c): say WHERE it ran
+  // instead of implying it's gone. The merged flow stream already carries
+  // `machine_id` on every record, so attribution needs no new endpoint and
+  // no peer round-trip. Rendering the peer's graph HERE is the real fix and
+  // stays open on #1466 — it needs peer routing plus the shared serve token,
+  // which is a fleet feature, not an error message.
+  var lookupOwningMachine = React.useCallback(function(){
+    return fetch("/flow/" + todayUtc(), {headers:{accept:"application/json"}})
+      .then(function(r){ return r.ok ? r.json() : []; })
+      .then(function(rows){
+        if (!Array.isArray(rows)) return null;
+        for (var i = rows.length - 1; i >= 0; i--) {
+          var rec = rows[i];
+          if (rec && rec.mission_id === missionId && rec.machine_id) return rec.machine_id;
+        }
+        return null;
+      })
+      .catch(function(){ return null; });
+  }, [missionId]);
 
   // (#1471/#1480) Fetch today's flow records, filter to THIS mission, and merge
   // (dedup) into the events buffer. Extracted so the load-time backfill, the
@@ -1720,7 +1748,23 @@ function App(){
       setState({loading:false, error:null, errorNotFound:false, graph:g});
     }).catch(function(e){
       if (cancelled) return;
-      setState({loading:false, error:String(e.message||e), errorNotFound:!!e.notFound, graph:null});
+      var notFound = !!e.notFound;
+      setState({loading:false, error:String(e.message||e), errorNotFound:notFound, ownedBy:null, graph:null});
+      // (#1466) A 404 here is very often "this mission ran on a PEER" — the
+      // picker offered it because the flow stream is fleet-wide while the
+      // graph is local-disk-only. Attribute it rather than implying the run
+      // vanished. Best-effort and asynchronous: the calm message renders
+      // immediately and gains the machine name when the lookup lands, so a
+      // slow or unavailable flow endpoint degrades to today's wording
+      // instead of blocking the page.
+      if (notFound) {
+        lookupOwningMachine().then(function(machine){
+          if (cancelled || !machine) return;
+          setState(function(prev){
+            return prev.errorNotFound ? Object.assign({}, prev, {ownedBy: machine}) : prev;
+          });
+        });
+      }
     });
     return function(){ cancelled = true; };
   }, [missionId]);
@@ -1948,7 +1992,14 @@ function App(){
     // non-404 branch (network failure, 500, malformed id) where the detail
     // is actually diagnostic.
     var errMsg = state.errorNotFound
-      ? "This mission's graph data isn't available — it may have been an ephemeral or cleared run."
+      ? (state.ownedBy
+          // (#1466) Name the machine. "Isn't available" was true but
+          // unhelpful for the common case — the run is fine, it's just not
+          // HERE, and the operator can act on knowing which box to open.
+          ? "This mission ran on `" + state.ownedBy + "`, not on this machine. "
+            + "Its graph is built from local mission data, so open darkmux on `"
+            + state.ownedBy + "` to see it."
+          : "This mission's graph data isn't available — it may have been an ephemeral or cleared run.")
       : "darkmux mission graph: " + state.error;
     return h(React.Fragment, null,
       minimalTopBar(true),
