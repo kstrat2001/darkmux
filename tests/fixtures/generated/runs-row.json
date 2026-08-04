@@ -1,0 +1,12 @@
+{
+  "id": "review-1785400940-136e76",
+  "kind": "mission",
+  "status": "running",
+  "machine": "macbook-pro",
+  "route": "https://example.cognitiveservices.azure.com",
+  "role": "pr-reviewer",
+  "model": "gpt-oss-120b",
+  "started_ts": 1785400940,
+  "updated_ts": 1785401200,
+  "tracked": true
+}

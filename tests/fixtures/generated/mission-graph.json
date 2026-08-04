@@ -1,0 +1,83 @@
+{
+  "mission_id": "review-1785400940-136e76",
+  "mission_status": "active",
+  "nodes": [
+    {
+      "id": "phase-investigate",
+      "label": "Investigate",
+      "kind": "phase",
+      "status": "complete",
+      "startedTs": 1785400940,
+      "completedTs": 1785404428,
+      "depth": 0,
+      "description": "Bundle, probe, dedup"
+    },
+    {
+      "id": "phase-adjudicate",
+      "label": "Adjudicate",
+      "kind": "phase",
+      "status": "running",
+      "startedTs": 1785404428,
+      "depth": 1
+    },
+    {
+      "id": "task-judge",
+      "label": "Judge",
+      "kind": "task",
+      "status": "running",
+      "parentId": "phase-adjudicate",
+      "startedTs": 1785404428,
+      "depth": 0,
+      "steps": [
+        {
+          "id": "judge-cloud",
+          "label": "Judge",
+          "kind": "review.judge",
+          "status": "complete",
+          "startedTs": 1785404428,
+          "completedTs": 1785404600,
+          "tokensFinal": 5000,
+          "turnsFinal": 1,
+          "cloud": true,
+          "model": "gpt-oss-120b"
+        },
+        {
+          "id": "judge-local",
+          "label": "Judge",
+          "kind": "review.judge",
+          "status": "complete",
+          "startedTs": 1785404428,
+          "completedTs": 1785404610,
+          "tokensFinal": 3000,
+          "turnsFinal": 1,
+          "localOk": true,
+          "model": "qwen3.6-35b-a3b"
+        },
+        {
+          "id": "judge-unknown",
+          "label": "Judge",
+          "kind": "review.judge",
+          "status": "error",
+          "startedTs": 1785404428,
+          "tokensFinal": 7000
+        },
+        {
+          "id": "verify-planned",
+          "label": "Verify",
+          "kind": "review.verify",
+          "status": "planned"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "phase-investigate->phase-adjudicate",
+      "source": "phase-investigate",
+      "target": "phase-adjudicate",
+      "kind": "phase_order"
+    }
+  ],
+  "legacy": false,
+  "generated_at_ms": 1785404700000
+}

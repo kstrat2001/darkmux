@@ -43,6 +43,11 @@ pub mod mission_graph;
 /// pins against) — `runs_handler` below is this module's only caller.
 mod panel;
 mod runs;
+// (#1637) Golden-file generation for the wire types the browser specs consume.
+// Test-only: it exists so a Playwright fixture cannot drift from the shape the
+// server actually emits.
+#[cfg(test)]
+mod wire_fixtures;
 
 /// (#925) Per-route request timeout for the NON-streaming routes. Bounds a
 /// slow/hung request; the long-lived `/flow/:date/stream` SSE route is
