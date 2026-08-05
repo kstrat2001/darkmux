@@ -19,11 +19,34 @@ mod e2e;
 use e2e::harness::{FleetHarness, NodeSpec};
 
 fn redis_available() -> bool {
-    std::process::Command::new("redis-server")
+    let ok = std::process::Command::new("redis-server")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    // (#1662) In CI, a missing redis is a HARD FAILURE, never a skip.
+    //
+    // The skip exists so a contributor without redis installed isn't
+    // blocked locally. But CI is this project's merge gate (local runs are
+    // targeted-module by doctrine), and for the entire life of this harness
+    // no workflow installed redis-server — so every e2e test on every run
+    // returned early and reported `ok`. A real boot pays a release build
+    // plus two daemon spawns; `dual_node_harness_boots_cleanly` was
+    // finishing in 8 milliseconds. The fleet layer was guarded by nothing,
+    // loudly reporting that it was guarded.
+    //
+    // A dependency that silently converts "did not run" into "passed" is
+    // the same defect class as a status inferred rather than recorded: the
+    // absence of evidence rendered as evidence of absence. So in CI it
+    // panics with the fix, and the skip stays available everywhere else.
+    if !ok && std::env::var("CI").is_ok() {
+        panic!(
+            "redis-server is not on PATH, but CI must never silently skip the fleet e2e \
+             suite (#1662). Install it in the workflow (`apt-get install -y redis-server`) \
+             or fix the runner image — do NOT relax this back into a skip."
+        );
+    }
+    ok
 }
 
 /// Populate node-a's roster with both spawned machines via the existing
