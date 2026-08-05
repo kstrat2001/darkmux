@@ -1262,7 +1262,23 @@
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
-            feedback_injection: true,
+            // (#1548 QA finding) FALSE here, deliberately. The sibling
+            // full-argv test uses `true`, and its comment claimed the two
+            // "together pin BOTH string forms" — which was not true: nothing
+            // asserted the false form host-side. A comment claiming coverage
+            // that doesn't exist is the same defect class this PR removes, so
+            // the fix is to make the claim true rather than delete it.
+            //
+            // The forms are load-bearing and the asymmetry is the reason:
+            // the runtime parses `"0"|"off"|"false"|"no"` as falsy and
+            // EVERYTHING ELSE as on (runtime/src/feedback.rs). So the OFF
+            // state is the fragile one — any rendering outside that set
+            // (`False`, `disabled`, a debug-formatted `Some(false)`) reads
+            // as ON, and the opt-out silently stops working while the ON
+            // case keeps looking fine. Pinning `true` alone would not have
+            // caught it, which is exactly why the sibling test's claim to
+            // cover "both string forms" mattered.
+            feedback_injection: false,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1270,10 +1286,13 @@
 
         let argv = build_docker_run_argv(&config);
 
-        // (#1548) The env var is always forwarded, minimal dispatch included.
+        // (#1548) The env var is ALWAYS forwarded — minimal dispatch
+        // included, and in its off state too. An opt-out that silently
+        // stops being transmitted is indistinguishable from the bug.
         assert!(
-            argv.contains(&"DARKMUX_FEEDBACK_INJECTION=true".to_string()),
-            "feedback_injection must always be forwarded, even on a minimal dispatch: {argv:?}"
+            argv.contains(&"DARKMUX_FEEDBACK_INJECTION=false".to_string()),
+            "the OFF state must be forwarded verbatim — the runtime only honors \
+             `0|off|false|no`, so any other rendering silently re-enables it: {argv:?}"
         );
 
         // Should NOT contain optional flags

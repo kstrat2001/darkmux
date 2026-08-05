@@ -341,8 +341,24 @@ pub(crate) fn load_role_prompt(role_id: &str) -> Option<String> {
 /// wondering which of the two lookups failed.
 pub(crate) fn load_role_prompt_for(role: &Role) -> Option<String> {
     if let Some(p) = &role.prompt_path {
-        if let Ok(content) = fs::read_to_string(p) {
-            return Some(content);
+        match fs::read_to_string(p) {
+            Ok(content) => return Some(content),
+            // (#1550 QA finding) SAY SO. Falling through silently recreates,
+            // in this function's own failure arm, the exact trap the rest of
+            // this change removes: a role whose id shadows a builtin gets
+            // dispatched with the EMBEDDED prompt while `role show` keeps
+            // displaying the operator's `prompt_path` — declared, displayed,
+            // and not honored. The operator then debugs a prompt the model
+            // never saw. Loud beats quiet; the dispatch still proceeds on the
+            // conventional prompt, because refusing to run over a bad path
+            // would be worse than running with a named substitution.
+            Err(e) => eprintln!(
+                "darkmux: role `{}` declares prompt_path `{}` but it could not be read \
+                 ({e}); falling back to the conventional prompt for `{}`",
+                role.id,
+                p.display(),
+                role.id
+            ),
         }
     }
     load_role_prompt(&role.id)
