@@ -28,6 +28,41 @@
         }
     }
 
+    /// (#1550 cluster item 4) Every review-pipeline role's manifest
+    /// `description` must disclose that the review dispatch path
+    /// (`ChatCall`, not `dispatch_internal`/`DispatchOpts`) only reads the
+    /// sibling `.md` persona — `tool_palette`/`output_schema`/
+    /// `bail_after_compactions`/`feedback_templates` are inert there. Before
+    /// this note, `review-judge.json` read as if "deliberately no
+    /// output_schema" were an enforced contract (it isn't — the review path
+    /// never consumes the field at all, enforced or not), which is exactly
+    /// the trap: an operator adding `output_schema` to a review role
+    /// manifest, expecting grammar-constrained output, gets no error and no
+    /// effect.
+    #[test]
+    fn review_role_manifests_disclose_the_chatcall_path_limitation() {
+        for id in [
+            "review-judge",
+            "review-verify",
+            "review-probe",
+            "review-probe-high",
+            "review-probe-mid",
+            "review-probe-low",
+        ] {
+            let json = BUILTIN_ROLES
+                .iter()
+                .find(|(rid, _)| *rid == id)
+                .map(|(_, j)| *j)
+                .unwrap_or_else(|| panic!("{id} manifest must be embedded"));
+            let role: Role = serde_json::from_str(json).unwrap_or_else(|e| panic!("{id} must parse: {e}"));
+            assert!(
+                role.description.contains("Review-path note"),
+                "{id}.json's description must disclose the ChatCall-path limitation (#1550 cluster item 4): {}",
+                role.description
+            );
+        }
+    }
+
     /// (#1053) The pr-reviewer prompt must carry the intent-assessment
     /// directive — the cross-tier-validated lever against "restate-the-fix"
     /// false positives (a reviewer flagging the very bug a PR fixes). The
@@ -628,6 +663,84 @@
             np.prompt_path.is_none(),
             "prompt_path should be None when .md doesn't exist"
         );
+    }
+
+    /// (#1550 cluster item 3) RED case this fix closes: a role manifest
+    /// declaring `prompt_path` pointing OUTSIDE the conventional
+    /// `<crew_root>/roles/<id>.md` location. Before `load_role_prompt_for`,
+    /// `role show` displayed this exact path (via `load_roles`'s
+    /// keep-as-is-when-no-sibling-.md branch — see `prompt_path_none_when_
+    /// md_absent` for the sibling-absent case this is layered on top of),
+    /// but `load_role_prompt`/`dispatch` never consulted it — only the
+    /// conventional sibling-file/embedded search — so dispatch failed with
+    /// "role has no .md system prompt" despite `role show` naming a real
+    /// file. Plain `load_role_prompt(&role.id)` must NOT find this content
+    /// (proving the gap this test guards); `load_role_prompt_for(&role)`
+    /// must.
+    #[serial_test::serial]
+    #[test]
+    fn load_role_prompt_for_honors_an_explicit_prompt_path_outside_the_conventional_location() {
+        let guard = CrewDirGuard::new(TempDir::new().unwrap());
+        let roles_dir = guard.path().join("roles");
+        fs::create_dir_all(&roles_dir).unwrap();
+        // The prompt file lives SOMEWHERE ELSE — a sibling dir, not
+        // `roles_dir()/external-prompt.md`.
+        let external_dir = guard.path().join("external-prompts");
+        fs::create_dir_all(&external_dir).unwrap();
+        let external_path = external_dir.join("my-role.md");
+        fs::write(&external_path, "# External Prompt\nLives outside roles_dir.").unwrap();
+        let role_json = format!(
+            r#"{{"id":"external-prompt","description":"role with an explicit prompt_path","skills":[],"tool_palette":{{"allow":["read"],"deny":[]}},"escalation_contract":"bail-with-explanation","prompt_path":{}}}"#,
+            serde_json::to_string(external_path.to_str().unwrap()).unwrap()
+        );
+        fs::write(roles_dir.join("external-prompt.json"), role_json).unwrap();
+        // Deliberately NO sibling `external-prompt.md` under roles_dir — the
+        // conventional search must find nothing.
+
+        let roles = load_roles().unwrap();
+        let role = roles.iter().find(|r| r.id == "external-prompt").expect("role should load");
+        assert_eq!(
+            role.prompt_path.as_deref(),
+            Some(external_path.as_path()),
+            "load_roles must preserve the manifest's explicit prompt_path when no sibling .md exists"
+        );
+
+        // The RED half: the conventional-search-only primitive finds nothing.
+        assert!(
+            load_role_prompt(&role.id).is_none(),
+            "load_role_prompt (conventional search only) must NOT find a prompt outside roles_dir"
+        );
+        // The fix: load_role_prompt_for honors prompt_path first.
+        let content = load_role_prompt_for(role).expect("load_role_prompt_for must read the explicit prompt_path");
+        assert!(content.contains("External Prompt"), "got: {content}");
+    }
+
+    /// An explicit `prompt_path` that's unreadable (moved/deleted since
+    /// `load_roles` ran) falls through to the conventional search rather
+    /// than erroring inside the resolver — the call sites' own error
+    /// messages name `prompt_path` when it's set, so the operator isn't
+    /// left silently misled either way.
+    #[serial_test::serial]
+    #[test]
+    fn load_role_prompt_for_falls_through_when_explicit_path_is_unreadable() {
+        let guard = CrewDirGuard::new(TempDir::new().unwrap());
+        let roles_dir = guard.path().join("roles");
+        fs::create_dir_all(&roles_dir).unwrap();
+        let ghost_path = guard.path().join("ghost").join("gone.md");
+        let role_json = format!(
+            r#"{{"id":"coder","description":"builtin id with a broken override path","skills":[],"tool_palette":{{"allow":["read"],"deny":[]}},"escalation_contract":"bail-with-explanation","prompt_path":{}}}"#,
+            serde_json::to_string(ghost_path.to_str().unwrap()).unwrap()
+        );
+        fs::write(roles_dir.join("coder.json"), role_json).unwrap();
+
+        let roles = load_roles().unwrap();
+        let role = roles.iter().find(|r| r.id == "coder").expect("coder should load");
+        assert_eq!(role.prompt_path.as_deref(), Some(ghost_path.as_path()));
+
+        // ghost_path doesn't exist -> falls through to the embedded builtin
+        // coder prompt rather than returning None outright.
+        let content = load_role_prompt_for(role).expect("must fall through to the embedded/conventional search");
+        assert!(!content.is_empty());
     }
 
     #[serial_test::serial]

@@ -20,6 +20,7 @@
     "model_load_timeout_seconds": 600,
     "strict_selection": false,
     "log_level": "info",
+    "feedback_injection": true,
     "check_updates": true,
     "daemon_auth_enabled": false,
     "injected_context_fraction": 0.15

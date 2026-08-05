@@ -1036,6 +1036,15 @@ impl StepKind for MissionVerifyStepKind {
     fn run_streaming(
         &self,
         _step: &crew::types::Step,
+        // (#1550 cluster item 5) `_task.role_id` is never read — the
+        // reviewer role is hardcoded to `code-reviewer` below (via
+        // `phase_review_output_at`) regardless of what `coder-phase.json`'s
+        // `build-verify` task declares. See that task's own `notes` entry
+        // for why this is documented-decorative rather than wired: the
+        // reviewer prompt's TEXT also self-identifies as "the darkmux
+        // `code-reviewer` role" (src/phase_cli.rs), so making this
+        // role-configurable is a real feature (a role-agnostic prompt), not
+        // a one-field wire.
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
@@ -1081,6 +1090,9 @@ impl StepKind for MissionVerifyStepKind {
     fn residency(
         &self,
         _step: &crew::types::Step,
+        // (#1550 cluster item 5) Same decorative `role_id` as `run_streaming`
+        // above — the residency hint below is computed for `code-reviewer`
+        // unconditionally, never `_task.role_id`.
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
         run_ctx: &StepRunCtx,

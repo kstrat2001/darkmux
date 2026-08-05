@@ -66,10 +66,6 @@
               "kind": "mission.coder",
               "config": null
             }
-          ],
-          "notes": [
-            "role_id here is the DEFAULT; the `role` input can override it at launch time (default_phase_graph's `role` parameter is caller-supplied, not fixed to \"coder\").",
-            "`coder` in the description is likewise the default role name -- the Rust builder writes the description dynamically (`dispatch \\`{role}\\` into the worktree`), so the launcher substitutes the resolved role at launch."
           ]
         },
         {
@@ -85,6 +81,10 @@
               "kind": "mission.verify",
               "config": null
             }
+          ],
+          "notes": [
+            "role_id here is DECORATIVE, unlike build-coder's sibling role_id above (which the `role` launch input genuinely overrides). MissionVerifyStepKind (src/coder_phase.rs) hardcodes `code-reviewer` in two places -- resolve_local_placement's residency() call and phase_review_output_at's DispatchOpts -- and its run()/run_streaming() signatures never read `_task.role_id` at all. Editing this field changes NOTHING about which role actually dispatches (#1550 cluster item 5).",
+            "Why hardcoded rather than wired: phase_review_output_at's USER-FACING PROMPT TEXT self-identifies as \"the darkmux `code-reviewer` role\" (src/phase_cli.rs) -- threading role_id through would also require making that prompt text role-agnostic, a bigger change than this field alone. Filed as a real feature gap, not fixed here; if you need a different QA reviewer role, dispatch it directly (`darkmux dispatch design-reviewer ...`) rather than editing this field."
           ]
         }
       ]

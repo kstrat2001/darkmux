@@ -214,6 +214,13 @@ pub struct RuntimeBehaviorConfig {
     // carries a secret at any level. Resolved via `config_access::log_level`
     // (`env(DARKMUX_LOG) > this > "info"`); surfaced by `darkmux doctor`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub log_level: Option<String>,
+    /// (#1548) Whether the runtime injects feedback (nudge) messages into a
+    /// struggling dispatch's next turn. Resolved via
+    /// `config_access::feedback_injection()` — env, then this field, then
+    /// `true` by default; the docker-spawn site forwards the resolved value
+    /// into the container, which is the ONLY thing `runtime/src/feedback.rs`
+    /// actually reads (it can't depend on `config_access` directly — the
+    /// runtime crate isn't a workspace member).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub feedback_injection: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub default_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub check_updates: Option<bool>,
@@ -386,11 +393,6 @@ impl DarkmuxConfig {
     /// - caps (`max_turns`/`max_tokens`/`max_tokens_per_call`), `default_role`,
     ///   `daemon_cors_origins` — absent is a real behavior (uncapped / the
     ///   runtime's built-in per-call default), not a value to default.
-    /// - `feedback_injection` — read in-container directly from
-    ///   `DARKMUX_FEEDBACK_INJECTION` (the runtime crate can't depend on
-    ///   `config_access`), so it does NOT yet honor the `config.json` tier
-    ///   (#661). Writing it here would advertise a knob that silently no-ops;
-    ///   omitted until the flag is plumbed. Absent = the env default (on).
     /// - `orchestrator` is written as `""` (visible but unset; empty config
     ///   strings are treated as unset, so the per-session env override drives).
     ///
@@ -428,7 +430,10 @@ impl DarkmuxConfig {
                 max_tokens_per_call: None,
                 strict_selection: Some(false),
                 log_level: Some("info".to_string()),
-                feedback_injection: None,
+                // (#1548) Now wired end-to-end (config_access accessor +
+                // docker-spawn forwarding) — a visible `true` default, same
+                // treatment as strict_selection/check_updates above.
+                feedback_injection: Some(true),
                 default_role: None,
                 check_updates: Some(true),
                 daemon_cors_origins: None,
@@ -563,9 +568,12 @@ mod tests {
         // Fields where a written literal would be wrong stay absent.
         assert!(cfg.dirs.is_none(), "dirs are derived → surfaced by doctor, not frozen");
         assert!(cfg.runtime.as_ref().unwrap().max_turns.is_none(), "uncapped, not defaulted");
-        assert!(
-            cfg.runtime.as_ref().unwrap().feedback_injection.is_none(),
-            "feedback_injection is env-only (not yet config_access-backed, #661) → omitted, not advertised"
+        // (#1548) Now fully wired (config_access accessor + docker-spawn
+        // forwarding) — a visible `true` default, same as strict_selection.
+        assert_eq!(
+            cfg.runtime.as_ref().unwrap().feedback_injection,
+            Some(true),
+            "feedback_injection is config_access-backed as of #1548 → written visibly, default on"
         );
         // `enabled` reads at the TOP of each feature block.
         let json = serde_json::to_string_pretty(&cfg).unwrap();

@@ -1,7 +1,7 @@
 {
   "id": "review-probe",
   "role_family": "specialist",
-  "description": "Probe seat of the review pipeline (#1222 Phase B): given one bundle (a code slice plus its fact sheet) already established to contain a defect, finds and describes the most serious one. Dispatched once per bundle at temp 0.2 via the container-free single-shot chat primitive (no agent loop, no tools) — the pipeline de-duplicates and hands every surviving flag to the judge for confirmation. Deliberately tool-less (the bundle is the whole record; nothing to explore) and deliberately no output_schema (free prose, not a grammar-locked flag object).",
+  "description": "Probe seat of the review pipeline (#1222 Phase B): given one bundle (a code slice plus its fact sheet) already established to contain a defect, finds and describes the most serious one. Dispatched once per bundle at temp 0.2 via the container-free single-shot chat primitive (no agent loop, no tools) — the pipeline de-duplicates and hands every surviving flag to the judge for confirmation. Deliberately tool-less (the bundle is the whole record; nothing to explore) and deliberately no output_schema (free prose, not a grammar-locked flag object). Review-path note (#1550 cluster item 4): this role dispatches through the review pipeline's `ChatCall` primitive (model/system/user/temperature/max_tokens/endpoint only), not `dispatch_internal`/`DispatchOpts` — only the sibling `.md` persona is actually read on this path. `tool_palette`/`output_schema`/`bail_after_compactions`/`feedback_templates` below describe the role's intent for a human reader; they are NOT enforced or consumed by a review run.",
   "skills": [
     "code-reviewing"
   ],
