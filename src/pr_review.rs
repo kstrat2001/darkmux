@@ -258,12 +258,15 @@ fn render_benign_noop_comment(env: &ReviewEnvelope, footer: &str) -> String {
         None => (0, "no files".to_string()),
     };
     format!(
-        "### 🤖 PR review — nothing to review\n\n\
-         This diff touched {considered} file(s) — {listing} — and none of them are files this \
-         reviewer bundles: it covers TypeScript source, and deliberately excludes data \
-         (fixtures, lockfiles, generated config) and test files. There is nothing here for an \
-         automated code review to check. **This is a neutral note, not an approval** — it \
-         reflects what the diff contained, not a judgment on the change.{footer}"
+        "### 🤖 PR review — no reviewable bundle\n\n\
+         **The bundler ran and worked as expected. This is not a failure, and re-running will \
+         produce the same result.**\n\n\
+         This diff touched {considered} file(s) — {listing} — and none of them produced a \
+         darkmux-reviewable bundle. The bundler covers TypeScript source and deliberately \
+         excludes data (fixtures, lockfiles, generated config) and test files, so there was \
+         nothing here for an automated code review to read.\n\n\
+         **This is a neutral note, not an approval** — it reflects what the diff contained, \
+         not a judgment on the change.{footer}"
     )
 }
 
@@ -1449,6 +1452,26 @@ mod tests {
         assert!(
             c.to_lowercase().contains("neutral") || c.to_lowercase().contains("not an approval"),
             "must explicitly disclaim this is not an approval: {c}"
+        );
+        // (#1605 operator direction) The comment's PRIMARY audience is the
+        // agent session waiting on this review, not a human skimming the PR.
+        // A session that can't tell "nothing to review" from "broken, try
+        // again" re-runs — and a benign diff becomes a retry LOOP, since
+        // every attempt produces the identical empty result. So the comment
+        // has to say, in words, that the bundler worked and that re-running
+        // changes nothing. Asserted rather than left to prose drift: this is
+        // now the load-bearing sentence in the whole message.
+        let lower = c.to_lowercase();
+        assert!(
+            lower.contains("worked as expected") || lower.contains("not a failure"),
+            "the comment must state the bundler WORKED — otherwise a waiting session reads \
+             an empty result as breakage: {c}"
+        );
+        assert!(
+            lower.contains("re-running will produce the same result")
+                || lower.contains("re-run"),
+            "the comment must tell a waiting session NOT to retry — an unbounded retry loop \
+             on a permanently-empty diff is the failure mode this wording exists to prevent: {c}"
         );
     }
 
