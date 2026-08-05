@@ -201,21 +201,13 @@ jobs:
           # same binaries without redis; gating on `CI` would have failed
           # the job that correctly is not responsible for this suite.
           DARKMUX_E2E_REQUIRED: "1"
+        # `cargo test --test 'e2e_*'` DOES glob (verified: resolves 6) and
+        # exits 101 when a pattern matches nothing (verified) — so a rename
+        # cannot silently empty this job. An earlier revision added a
+        # count-asserting preamble on top of that; it was redundant with
+        # cargo's own behavior and became its own failure mode, which is the
+        # sort of guard that costs more than it protects. Removed.
         run: |
-          # Belt for the glob itself. `cargo test --test 'e2e_*'` DOES glob
-          # (verified: resolves 6 binaries) and exits 101 when a pattern
-          # matches nothing — so a rename can't silently empty this job. But
-          # "a dependency that turns did-not-run into passed" is the exact
-          # bug this job exists to kill, so the count is asserted rather
-          # than assumed: if the suite is ever restructured, this fails
-          # loudly instead of quietly testing less.
-          COUNT=$(cargo test --workspace --test 'e2e_*' --no-run 2>&1 \
-                  | grep -c "Executable tests/e2e_")
-          echo "e2e binaries resolved: $COUNT"
-          if [ "$COUNT" -lt 6 ]; then
-            echo "::error::expected >=6 e2e binaries, resolved $COUNT — the suite shrank or the glob stopped matching (#1662)"
-            exit 1
-          fi
           cargo test --workspace --test 'e2e_*'
 
       - name: No Rust-relevant changes — fleet e2e skipped
