@@ -595,7 +595,27 @@ fn review_result_to_mission_envelope(
 
     match result {
         Ok(env) => {
-            let status = if env.degenerate.is_some() {
+            // (#1654, operator direction) A BENIGN-empty run is not a
+            // degenerate one. `Degenerate` is a retry signal — it tells the
+            // session waiting on this review that something went wrong and
+            // the run is worth repeating. For a diff that legitimately
+            // contained no reviewable code, every repeat produces the
+            // identical empty result, so mapping it to `Degenerate`
+            // manufactures an unbounded retry loop out of a correct outcome.
+            // Same reasoning as the posted comment's "re-running will
+            // produce the same result", applied one layer up: the board and
+            // the comment must agree, or the operator reads a friendly note
+            // on the PR and a red phase on the board for the same run.
+            //
+            // `Clean` rather than a new outcome variant: the review ran, the
+            // bundler worked, nothing was wrong. The envelope still carries
+            // `degenerate` + `DegenerateKind::BenignEmpty` and the reason
+            // string below, so the "why zero findings" provenance is intact
+            // for anyone who looks — this narrows what gets FLAGGED, not
+            // what gets RECORDED.
+            let benign_empty =
+                env.degenerate_kind == Some(darkmux_lab::lab::review::DegenerateKind::BenignEmpty);
+            let status = if env.degenerate.is_some() && !benign_empty {
                 MissionOutcomeStatus::Degenerate
             } else if !env.warnings.is_empty() {
                 MissionOutcomeStatus::Degraded
@@ -1742,6 +1762,49 @@ mod tests {
             ..Default::default()
         });
         st
+    }
+
+    #[test]
+    fn a_benign_empty_review_is_clean_not_degenerate() {
+        // (#1654, operator direction) `Degenerate` is a RETRY SIGNAL — it
+        // tells the session waiting on this review that the run is worth
+        // repeating. A diff that legitimately contained no reviewable code
+        // produces the identical empty result on every repeat, so flagging
+        // it degenerate manufactures an unbounded retry loop out of a
+        // correct outcome. The posted comment already says "re-running will
+        // produce the same result"; the board has to agree, or the operator
+        // reads a friendly note on the PR and a red phase for one run.
+        let env = ReviewEnvelope {
+            degenerate: Some("no bundles produced from the diff — 2 skipped (2 non-code)".into()),
+            degenerate_kind: Some(darkmux_lab::lab::review::DegenerateKind::BenignEmpty),
+            ..Default::default()
+        };
+        let out = review_result_to_mission_envelope("m-1", &["p-1"], &Ok(env));
+        assert_eq!(
+            out.status,
+            crew::envelope::MissionOutcomeStatus::Clean,
+            "a benign-empty review must not read as a failure the session should retry"
+        );
+        assert!(
+            out.reason.as_deref().unwrap_or_default().contains("no bundles"),
+            "the WHY is still recorded — this narrows what gets flagged, not what gets kept: {:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn an_error_empty_review_is_still_degenerate() {
+        // The control, and the more important half: a real failure must
+        // KEEP prompting a re-run. If the benign carve-out widened to every
+        // zero-bundle run, genuine breakage would go quiet — the same
+        // silent-miss failure the classifier fails closed to prevent.
+        let env = ReviewEnvelope {
+            degenerate: Some("no bundles produced from the diff".into()),
+            degenerate_kind: Some(darkmux_lab::lab::review::DegenerateKind::Error),
+            ..Default::default()
+        };
+        let out = review_result_to_mission_envelope("m-1", &["p-1"], &Ok(env));
+        assert_eq!(out.status, crew::envelope::MissionOutcomeStatus::Degenerate);
     }
 
     #[test]
