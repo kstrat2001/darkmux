@@ -1056,6 +1056,58 @@ edit loop detected on src/widget.rs in an earlier dispatch
         }
     }
 
+    #[test]
+    fn the_abort_echo_says_aborted_and_the_finalize_echo_says_finalized() {
+        // (#1660) THE bug: #1627 made a teardown store `Aborted` so it stops
+        // reading as a success — and the line printed right beside that
+        // write still said "Finalized" for both verbs. Three tests pinned
+        // the disk value; none read the echo, which is how one action came
+        // to tell two stories.
+        //
+        // A frontier session parsing this stdout is the reader that matters:
+        // it sees a green check plus the success terminal and concludes the
+        // mission completed.
+        let mut m = mission("m-1", "d");
+        m.started_ts = Some(1_000);
+        m.finalized_ts = Some(1_060);
+
+        let aborted = terminal_echo_line(&m, crew::types::MissionStatus::Aborted);
+        assert!(
+            aborted.contains("→ Aborted"),
+            "an abort must announce the terminal it WRITES: {aborted}"
+        );
+        assert!(
+            !aborted.contains("Finalized"),
+            "and must never claim the success terminal: {aborted}"
+        );
+
+        let finalized = terminal_echo_line(&m, crew::types::MissionStatus::Finalized);
+        assert!(finalized.contains("→ Finalized"), "{finalized}");
+        assert!(!finalized.contains("Aborted"), "{finalized}");
+
+        // The control: the fix must not have broken the ordinary duration.
+        assert!(finalized.contains("duration=60s"), "{finalized}");
+    }
+
+    #[test]
+    fn a_mission_that_never_started_reports_no_duration_instead_of_56_years() {
+        // (#1660) `started_ts.unwrap_or(0)` treated the epoch as a start
+        // time, so a mission finalized without ever starting printed
+        // `duration=1785…s` — about 56 years. A number that cannot be true
+        // is worse than an honest absence, and this one appears in the same
+        // line an agent parses for the outcome.
+        let mut m = mission("m-2", "d");
+        m.started_ts = None;
+        m.finalized_ts = Some(1_785_000_000);
+
+        let line = terminal_echo_line(&m, crew::types::MissionStatus::Finalized);
+        assert!(line.contains("duration=n/a"), "{line}");
+        assert!(
+            !line.contains("duration=1785"),
+            "the epoch must never be rendered as elapsed time: {line}"
+        );
+    }
+
     // (#1463) `commit_subject_*` and `pr_body_*` tests retired with the
     // `commit_subject`/`pr_body` helpers — those only fed the retired `ship`
     // verb's commit/PR authoring, now the frontier orchestrator's job.
