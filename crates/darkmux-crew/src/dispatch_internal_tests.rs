@@ -793,6 +793,83 @@
         assert_eq!(window, Some(32000));
     }
 
+    // ─── #1547: role_profiles map reaches dispatch model resolution ────
+    // `resolve_role_aware_profile` (the impure, config_access-reading
+    // wrapper `resolve_dispatch_model_internal`/`resolve_selected_profile_model`
+    // both chain through) can't be exercised end-to-end here: `config_access`
+    // is hard-empty under `test`/`test-support` builds (#811), so
+    // `config_access::role_profile(role_id)` always returns `None` inside
+    // this crate's own test binary regardless of what a real `config.json`
+    // holds. `resolve_role_aware_profile_with` is the pure core that takes
+    // the mapped binding as an explicit argument instead of reading it live —
+    // these tests exercise every precedence arm through IT, proving the
+    // actual resolution logic #1547 wires in (not just that a config setter
+    // "worked" — the setter already worked before #1547; the bug was that
+    // nothing downstream ever READ the value).
+
+    fn role_profiles_test_registry() -> darkmux_types::ProfileRegistry {
+        serde_json::from_str(
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"model-fast","n_ctx":32000}]},
+                    "big":{"models":[{"id":"model-big","n_ctx":128000}]}
+                },
+                "default_profile":"fast"}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_role_aware_profile_with_honors_the_mapped_binding_when_unmapped_by_override() {
+        let reg = role_profiles_test_registry();
+        let resolved = resolve_role_aware_profile_with("coder", None, Some("big".to_string()), &reg)
+            .unwrap()
+            .expect("a mapped role must resolve to its bound profile, not fall through to None");
+        assert_eq!(resolved.0, "big", "role_profiles.coder=big must resolve to the `big` profile, not `default_profile`");
+        assert_eq!(resolved.1.models[0].id, "model-big");
+    }
+
+    #[test]
+    fn resolve_role_aware_profile_with_explicit_override_wins_over_the_map() {
+        // (#1054/#1475 precedence) An explicit `--profile fast` on THIS call
+        // wins even when role_profiles maps the role to a different profile —
+        // matching the review launcher's existing precedence for this map.
+        let reg = role_profiles_test_registry();
+        let resolved = resolve_role_aware_profile_with("coder", Some("fast"), Some("big".to_string()), &reg)
+            .unwrap()
+            .expect("an explicit override must still resolve");
+        assert_eq!(resolved.0, "fast", "explicit --profile must win over the role_profiles map binding");
+    }
+
+    #[test]
+    fn resolve_role_aware_profile_with_falls_to_default_profile_when_unmapped() {
+        // No override, no mapped binding -> default_profile (the fresh-user
+        // floor), matching `resolve_active(None)`'s existing behavior.
+        let reg = role_profiles_test_registry();
+        let resolved = resolve_role_aware_profile_with("coder", None, None, &reg)
+            .unwrap()
+            .expect("default_profile must still resolve when unmapped");
+        assert_eq!(resolved.0, "fast");
+    }
+
+    #[test]
+    fn resolve_role_aware_profile_with_dangling_mapped_binding_is_a_loud_error() {
+        // (#1547 doc: "a role BOUND to a profile that doesn't exist in the
+        // registry is a LOUD error, config-leniency contract 7") — matches
+        // `resolve_role_profile_with`'s existing posture for the SAME map on
+        // the review launcher path; dispatch must not silently fall through
+        // to default_profile for a typo'd binding.
+        let reg = role_profiles_test_registry();
+        let err = resolve_role_aware_profile_with("coder", None, Some("ghost-profile".to_string()), &reg)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("coder"), "names the role: {msg}");
+        assert!(msg.contains("ghost-profile"), "names the dangling profile: {msg}");
+        assert!(
+            msg.contains("config set role_profiles.coder"),
+            "hint names the fix: {msg}"
+        );
+    }
+
     // ─── #1616: the compactor loads at ITS OWN declared n_ctx ──────────
 
     #[test]
@@ -1038,6 +1115,10 @@
                 "error": "An error occurred."
             }),
             cache_dir: PathBuf::from("/home/op/.darkmux/cache"),
+            // (#1548) true here (vs the other assertion test's false) so the
+            // two tests together pin BOTH string forms the container's
+            // falsy-set reader must distinguish.
+            feedback_injection: true,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1093,64 +1174,71 @@
         assert_eq!(argv[19], "-e");
         assert_eq!(argv[20], "PIP_CACHE_DIR=/darkmux-cache/pip");
 
+        // 5b. (#1548) Verify the feedback-injection env var is forwarded —
+        // the fix for the #1548 dead surface (`config.feedback_injection: true`
+        // in this test's config → `DARKMUX_FEEDBACK_INJECTION=true` on argv).
+        assert_eq!(argv[21], "-e");
+        assert_eq!(argv[22], "DARKMUX_FEEDBACK_INJECTION=true");
+
         // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[21], "-v");
+        assert_eq!(argv[23], "-v");
         assert_eq!(
-            argv[22],
+            argv[24],
             "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
         );
-        assert_eq!(argv[23], "--entrypoint");
-        assert_eq!(argv[24], "/darkmux-runtime");
+        assert_eq!(argv[25], "--entrypoint");
+        assert_eq!(argv[26], "/darkmux-runtime");
 
         // 7. Verify `--` + image + runtime CLI args
-        assert_eq!(argv[25], "--");
-        assert_eq!(argv[26], "rust:slim"); // image
-        assert_eq!(argv[27], "run"); // runtime subcommand
-        assert_eq!(argv[28], "--model");
-        assert_eq!(argv[29], "llama3-8b");
-        assert_eq!(argv[30], "--system");
-        assert_eq!(argv[31], "You are a coding assistant.");
+        assert_eq!(argv[27], "--");
+        assert_eq!(argv[28], "rust:slim"); // image
+        assert_eq!(argv[29], "run"); // runtime subcommand
+        assert_eq!(argv[30], "--model");
+        assert_eq!(argv[31], "llama3-8b");
+        assert_eq!(argv[32], "--system");
+        assert_eq!(argv[33], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[32], "--prompt-file");
-        assert_eq!(argv[33], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[34], "--prompt-file");
+        assert_eq!(argv[35], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[34], "--json");
+        assert_eq!(argv[36], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[35], "--allowed-tools");
-        assert_eq!(argv[36], "exec,edit");
+        assert_eq!(argv[37], "--allowed-tools");
+        assert_eq!(argv[38], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[37], "--compact-threshold-tokens");
-        assert_eq!(argv[38], "4096");
-        assert_eq!(argv[39], "--compactor-model");
-        assert_eq!(argv[40], "util-model");
-        assert_eq!(argv[41], "--compact-threshold-ratio");
-        assert_eq!(argv[42], "0.75");
-        assert_eq!(argv[43], "--context-window");
-        assert_eq!(argv[44], "32000");
-        assert_eq!(argv[45], "--compact-strategy");
-        assert_eq!(argv[46], "structured-slot");
-        assert_eq!(argv[47], "--bail-after-compactions");
-        assert_eq!(argv[48], "10");
-        assert_eq!(argv[49], "--compactor-custom-instructions");
-        assert_eq!(argv[50], "Be terse.");
+        assert_eq!(argv[39], "--compact-threshold-tokens");
+        assert_eq!(argv[40], "4096");
+        assert_eq!(argv[41], "--compactor-model");
+        assert_eq!(argv[42], "util-model");
+        assert_eq!(argv[43], "--compact-threshold-ratio");
+        assert_eq!(argv[44], "0.75");
+        assert_eq!(argv[45], "--context-window");
+        assert_eq!(argv[46], "32000");
+        assert_eq!(argv[47], "--compact-strategy");
+        assert_eq!(argv[48], "structured-slot");
+        assert_eq!(argv[49], "--bail-after-compactions");
+        assert_eq!(argv[50], "10");
+        assert_eq!(argv[51], "--compactor-custom-instructions");
+        assert_eq!(argv[52], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[51], "--feedback-templates-json");
+        assert_eq!(argv[53], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[52].contains("error"));
-        assert!(argv[52].contains("An error occurred"));
+        assert!(argv[54].contains("error"));
+        assert!(argv[54].contains("An error occurred"));
 
-        // Total arg count: 53 (0..=52)
-        assert_eq!(argv.len(), 53);
+        // Total arg count: 55 (0..=54) — 53 pre-#1548, +2 for the new
+        // `-e DARKMUX_FEEDBACK_INJECTION=<v>` pair.
+        assert_eq!(argv.len(), 55);
     }
 
     #[test]
@@ -1174,12 +1262,19 @@
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
+            feedback_injection: true,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
         };
 
         let argv = build_docker_run_argv(&config);
+
+        // (#1548) The env var is always forwarded, minimal dispatch included.
+        assert!(
+            argv.contains(&"DARKMUX_FEEDBACK_INJECTION=true".to_string()),
+            "feedback_injection must always be forwarded, even on a minimal dispatch: {argv:?}"
+        );
 
         // Should NOT contain optional flags
         assert!(
@@ -1256,6 +1351,7 @@
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
+            feedback_injection: true,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1301,6 +1397,7 @@
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
+            feedback_injection: true,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1535,6 +1632,7 @@
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
+            feedback_injection: true,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,

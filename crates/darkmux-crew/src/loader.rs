@@ -319,6 +319,35 @@ pub(crate) fn load_role_prompt(role_id: &str) -> Option<String> {
     None
 }
 
+/// (#1550 cluster item 3) Resolve a role's system-prompt text, honoring an
+/// explicit `Role.prompt_path` FIRST — before falling to the conventional
+/// search [`load_role_prompt`] performs (sibling `<crew_root>/roles/<id>.md`,
+/// then the embedded table).
+///
+/// Before this, `prompt_path` was preserved from a user manifest (see
+/// `load_roles`'s sibling-file resolution above), persisted to the role
+/// index, and displayed verbatim by `darkmux role show` — but nothing that
+/// actually DISPATCHED ever read it: `load_role_prompt` only ever checked
+/// the conventional sibling-file location. A role authored with
+/// `"prompt_path": "/Users/me/prompts/my-role.md"` (a location OTHER than
+/// the conventional one) showed that exact path in `role show`, then failed
+/// to dispatch with "role has no .md system prompt" — a loud error that
+/// directly contradicted what the tool had just displayed.
+///
+/// When `prompt_path` is set but unreadable (moved, permissions, a bad
+/// manual edit since load), this falls through to the conventional search
+/// rather than erroring here — the caller's own error message names
+/// `prompt_path` explicitly when set, so the operator isn't left
+/// wondering which of the two lookups failed.
+pub(crate) fn load_role_prompt_for(role: &Role) -> Option<String> {
+    if let Some(p) = &role.prompt_path {
+        if let Ok(content) = fs::read_to_string(p) {
+            return Some(content);
+        }
+    }
+    load_role_prompt(&role.id)
+}
+
 /// Public accessor for [`load_role_prompt`] (#1222 Phase B packet 5
 /// reconciliation). `darkmux mission launch review` (the `darkmux` binary
 /// crate, `src/mission_launch_review.rs`) dispatches `review-probe`/`review-judge` through
@@ -702,27 +731,11 @@ pub(crate) fn load_skills() -> Result<Vec<Skill>> {
     Ok(map.into_values().collect())
 }
 
-/// Resolve the prompt file path for a role at runtime. Used when an operator
-/// needs to read the actual system prompt text (the loader only stores path).
-///
-/// TODO(Beat-33 dual-read): this function takes a `DarkmuxPaths` and joins
-/// `paths.crew.join("roles")` directly, bypassing the canonical-vs-legacy
-/// fallback that `roles_dir()` performs. Currently `#[allow(dead_code)]` —
-/// when revived, migrate to use `roles_dir()` (and either drop the
-/// `paths` arg or document that it's only consulted for `prompt_path`'s
-/// absolute-path passthrough).
-#[allow(dead_code)]
-pub(crate) fn resolve_role_prompt_path(
-    role: &Role,
-    paths: &darkmux_types::paths::DarkmuxPaths,
-) -> Option<PathBuf> {
-    if let Some(p) = &role.prompt_path {
-        return Some(p.clone());
-    }
-    let roles_dir = paths.crew.join("roles");
-    let md_path = roles_dir.join(format!("{}.md", role.id));
-    if md_path.is_file() { Some(md_path) } else { None }
-}
+// (#1550 cluster item 3) `resolve_role_prompt_path` — a stale,
+// never-revived `#[allow(dead_code)]` helper with its own TODO (it bypassed
+// `roles_dir()`'s canonical-vs-legacy fallback) — was removed here. Its
+// intended purpose (honor an explicit `Role.prompt_path`) is now live via
+// `load_role_prompt_for` above, which the two real dispatch call sites use.
 
 #[cfg(test)]
 #[path = "loader_tests.rs"]

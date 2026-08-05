@@ -22,8 +22,10 @@ pub enum ConfigCmd {
     /// Set a config key (dotted path) to a value, e.g.
     /// `darkmux config set redis.host 100.74.208.36`,
     /// `darkmux config set fleet.mode hub`, or
-    /// `darkmux config set role_profiles.judge qwen35b` (bind a role to a
-    /// profile — #1475).
+    /// `darkmux config set role_profiles.review-judge qwen35b` (bind a role to
+    /// a profile — #1475). The role id must be a real one (`darkmux role
+    /// list`) — a typo'd or invented role id is settable but resolves nothing
+    /// (#1547; `darkmux doctor` flags it).
     Set {
         /// Dotted config key (e.g. `redis.host`, `fleet.mode`,
         /// `runtime.strict_selection`, `role_profiles.<role-id>`).
@@ -375,17 +377,27 @@ mod tests {
     /// round-trips through set → get → list and the written file parses back as
     /// a `DarkmuxConfig` with the role bound to the profile name. Many roles may
     /// name one profile.
+    ///
+    /// (#1547) Uses REAL role ids (`review-judge`, `review-verify`,
+    /// `review-probe-high`, `analyst`) — the pre-#1547 version of this test used
+    /// bare `judge`/`verify`/`probe-high`, none of which are real role ids, which
+    /// was itself an instance of the trap #1547 fixes: a doc/test example that
+    /// reads as live config but no-ops on every dispatch path. `set_at` itself
+    /// only validates the KEY SHAPE (one role segment) — that the role id is
+    /// real is a resolution-time / `darkmux doctor` concern (config-leniency
+    /// contract 7), so this test still isn't the place that would catch a typo'd
+    /// role id; that's `role_profiles_status` in `darkmux-doctor`.
     #[test]
     fn role_profiles_dynamic_key_round_trips() {
         let f = tmp();
         let p = f.path();
-        set_at(p, "role_profiles.judge", "qwen35b").unwrap();
-        set_at(p, "role_profiles.verify", "qwen35b").unwrap();
-        set_at(p, "role_profiles.probe-high", "qwen27b").unwrap();
+        set_at(p, "role_profiles.review-judge", "qwen35b").unwrap();
+        set_at(p, "role_profiles.review-verify", "qwen35b").unwrap();
+        set_at(p, "role_profiles.review-probe-high", "qwen27b").unwrap();
 
         // get reads the stored value back.
-        assert!(get_at(p, "role_profiles.judge").unwrap().contains("qwen35b"));
-        assert!(get_at(p, "role_profiles.probe-high").unwrap().contains("qwen27b"));
+        assert!(get_at(p, "role_profiles.review-judge").unwrap().contains("qwen35b"));
+        assert!(get_at(p, "role_profiles.review-probe-high").unwrap().contains("qwen27b"));
         // An unbound role reports unset (falls through to default_profile).
         assert!(get_at(p, "role_profiles.analyst").unwrap().contains("unset"));
 
@@ -397,8 +409,8 @@ mod tests {
         let cfg: DarkmuxConfig =
             serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         let map = cfg.role_profiles.unwrap();
-        assert_eq!(map.get("judge").map(String::as_str), Some("qwen35b"));
-        assert_eq!(map.get("verify").map(String::as_str), Some("qwen35b"), "many roles -> one profile");
+        assert_eq!(map.get("review-judge").map(String::as_str), Some("qwen35b"));
+        assert_eq!(map.get("review-verify").map(String::as_str), Some("qwen35b"), "many roles -> one profile");
     }
 
     /// The `role_profiles` map is one level deep: a blank role or a deeper path

@@ -430,6 +430,28 @@ pub fn check_updates() -> bool {
     config().runtime.as_ref().and_then(|r| r.check_updates).unwrap_or(true)
 }
 
+/// (#1548) Whether the internal runtime should inject feedback (nudge)
+/// messages into a struggling dispatch's next turn — an **opt-out**:
+/// `env(DARKMUX_FEEDBACK_INJECTION)` falsy (`0`/`off`/`false`/`no`) disables >
+/// `config.runtime.feedback_injection` > `true` (default on).
+///
+/// Before #1548 this had NO accessor here — `runtime.feedback_injection` was
+/// settable and typed, but the `config.json` tier was never consulted by
+/// anything: the sole reader was `runtime/src/feedback.rs`, reading the raw
+/// `DARKMUX_FEEDBACK_INJECTION` env var directly inside the container, and the
+/// host never forwarded that var into `docker run` — so neither tier reached
+/// the runtime and injection was unconditionally on. This accessor closes the
+/// `config.json` half; the docker-spawn site (`dispatch_internal.rs`) forwards
+/// its resolved value as `-e DARKMUX_FEEDBACK_INJECTION=<v>` so the container's
+/// own reader (whose falsy set this mirrors) sees the resolved tier, not just
+/// a host-side env override.
+pub fn feedback_injection() -> bool {
+    if let Some(s) = env_str("DARKMUX_FEEDBACK_INJECTION") {
+        return !matches!(s.as_str(), "0" | "off" | "false" | "no");
+    }
+    config().runtime.as_ref().and_then(|r| r.feedback_injection).unwrap_or(true)
+}
+
 // ── Mission board (#1230 Packet 5) ──
 /// How many days an Active mission may sit with zero `Complete` phases
 /// before `darkmux mission status`'s drift detector flags it as stale.
@@ -1042,6 +1064,32 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_CHECK_UPDATES", v),
                 None => std::env::remove_var("DARKMUX_CHECK_UPDATES"),
+            }
+        }
+    }
+
+    /// (#1548) `feedback_injection` mirrors `check_updates`'s opt-out shape:
+    /// falsy env disables, any other value (or unset) leaves it on by
+    /// default. Before #1548 this accessor didn't exist at all — the
+    /// `config.json` tier was never consulted by anything, so this test's
+    /// mere existence is part of the fix (a RED run pre-fix is "function not
+    /// found", not a failing assertion).
+    #[serial_test::serial]
+    #[test]
+    fn feedback_injection_env_optout_then_default_on() {
+        let prev = std::env::var("DARKMUX_FEEDBACK_INJECTION").ok();
+        for off in ["0", "off", "false", "no"] {
+            unsafe { std::env::set_var("DARKMUX_FEEDBACK_INJECTION", off); }
+            assert!(!feedback_injection(), "{off} → disabled");
+        }
+        unsafe { std::env::set_var("DARKMUX_FEEDBACK_INJECTION", "1"); }
+        assert!(feedback_injection(), "non-falsy value → on");
+        unsafe { std::env::remove_var("DARKMUX_FEEDBACK_INJECTION"); }
+        assert!(feedback_injection(), "unset → on (default)");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FEEDBACK_INJECTION", v),
+                None => std::env::remove_var("DARKMUX_FEEDBACK_INJECTION"),
             }
         }
     }

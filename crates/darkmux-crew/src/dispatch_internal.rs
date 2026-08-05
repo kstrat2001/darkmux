@@ -16,7 +16,7 @@
 
 use crate::dispatch::DispatchResult;
 use crate::dispatch::DispatchOpts;
-use crate::loader::{load_autonomous_dispatch_preamble, load_role_prompt, load_roles};
+use crate::loader::{load_autonomous_dispatch_preamble, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -433,6 +433,14 @@ pub struct DockerRunConfig {
     /// cache). Resolved + created at the call site so the inner verify loop
     /// reuses downloaded deps across dispatches (#703 Slice 3).
     pub cache_dir: std::path::PathBuf,
+    /// (#1548) The resolved `feedback_injection` setting
+    /// (`darkmux_types::config_access::feedback_injection()`), forwarded into
+    /// the container as `-e DARKMUX_FEEDBACK_INJECTION=<true|false>`. Before
+    /// #1548 this was never forwarded at all — `runtime/src/feedback.rs`
+    /// read the raw env var straight off the host process, which `docker run`
+    /// never received, so the container always saw it unset and injection was
+    /// unconditionally on regardless of `config.json` or a host-side export.
+    pub feedback_injection: bool,
     /// (#1187) When Some, this dispatch's "brain" is a remote OpenAI-compatible
     /// endpoint rather than local LMStudio — passed to the container as
     /// `--chat-url`. Set for a role whose tool_palette grants at least one
@@ -509,6 +517,17 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // (no host:container colon) would be an anonymous volume discarded on
     // --rm — i.e. no caching at all.
     apply_cache_mount(&mut args, &config.cache_dir);
+
+    // (#1548) Forward the resolved `feedback_injection` setting into the
+    // container — the piece that was missing pre-#1548: the config accessor
+    // existed nowhere, and even a host-side `export DARKMUX_FEEDBACK_INJECTION=0`
+    // never reached `docker run` (only the three cache vars above did), so
+    // `runtime/src/feedback.rs`'s reader always saw the var unset and
+    // injection was unconditionally on. Always emitted (not gated) so the
+    // container's own default-true reading is overridden by the HOST's
+    // resolved value on every dispatch, not just when the operator overrides.
+    args.push("-e".to_string());
+    args.push(format!("DARKMUX_FEEDBACK_INJECTION={}", config.feedback_injection));
 
     // Runtime binary injection (non-default images only)
     if config.inject {
@@ -824,6 +843,84 @@ fn write_remote_auth_header_stdin(
 // Keychain credential is the keymaster.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// (#1547) Resolve which profile a dispatch for `role_id` should use,
+/// honoring the machine-local `role_profiles` map BEFORE falling to
+/// `default_profile` — the shared "step 1" both `resolve_selected_profile_model`
+/// (the remote branch-decision path, below) and `resolve_dispatch_model_internal`
+/// (the container path) chain through, so the two consumers can never disagree
+/// about which profile a role resolved to.
+///
+/// Before this, `role_profiles` had exactly ONE production reader — the review
+/// launcher (`mission_launch_review.rs`) — so `darkmux config set
+/// role_profiles.<role> <profile>` succeeded, `darkmux doctor` reported the
+/// binding as fine, and `darkmux dispatch <role>` / `lab run` / the coder-phase
+/// seat silently ignored it and ran on `default_profile` anyway. Wiring the map
+/// in here (rather than duplicating the lookup at each call site) is also what
+/// keeps the remote-vs-local branch decision honest: a role bound to a REMOTE
+/// profile now takes the light single-shot hosted path instead of resolving
+/// "local" up front (via the old default-profile-only view) and only
+/// discovering the mismatch once the container path re-resolves.
+///
+/// Precedence — matches the review launcher's existing precedence for the same
+/// map (`mission_launch_review.rs`, #1475):
+/// 1. `profile_override` — an explicit `--profile <p>` on THIS call always
+///    wins. Unchanged #1054 soft-fallback semantics: a name undefined on this
+///    machine warns (at the call site) and falls to `default_profile`, since a
+///    machine-agnostic caller may name a profile only some machines define.
+/// 2. The `role_profiles.<role_id>` map. A role BOUND to a profile that
+///    doesn't exist in the registry is a LOUD error (config-leniency contract
+///    7 — semantic validation at resolution, never a silent fallback),
+///    exactly the posture `resolve_role_profile_with` already gives the
+///    review launcher for this same map.
+/// 3. `default_profile`, via the existing `resolve_active(None)` handling
+///    (soft: `None` when nothing resolves, letting the caller fall back to
+///    `probe_loaded_model()`).
+///
+/// Impure wrapper: reads the `role_profiles` map live via `config_access`
+/// (test builds see an always-empty config by construction, #811 — see
+/// `resolve_role_aware_profile_with`, the pure core below, for a version
+/// unit tests can actually drive through the mapped-binding arm).
+fn resolve_role_aware_profile<'a>(
+    role_id: &str,
+    profile_override: Option<&str>,
+    registry: &'a darkmux_types::ProfileRegistry,
+) -> Result<Option<(String, &'a darkmux_types::Profile)>> {
+    let mapped = if profile_override.is_none() {
+        darkmux_types::config_access::role_profile(role_id)
+    } else {
+        None
+    };
+    resolve_role_aware_profile_with(role_id, profile_override, mapped, registry)
+}
+
+/// (#1547) Pure core of [`resolve_role_aware_profile`] — the `role_profiles`
+/// map binding is supplied explicitly (`mapped`) rather than read live from
+/// `config_access`, so every precedence arm is unit-testable without the
+/// process-wide config tier (which is hard-empty under `test`/`test-support`
+/// builds per #811 — see `darkmux_types::config_access`'s module doc). Same
+/// layering as `darkmux_profiles::profiles::resolve_role_profile` (impure) /
+/// `resolve_role_profile_with` (pure core) — this mirrors that split one
+/// level up, at the profile_override-vs-map precedence decision.
+fn resolve_role_aware_profile_with<'a>(
+    role_id: &str,
+    profile_override: Option<&str>,
+    mapped: Option<String>,
+    registry: &'a darkmux_types::ProfileRegistry,
+) -> Result<Option<(String, &'a darkmux_types::Profile)>> {
+    if profile_override.is_none() {
+        if let Some(mapped) = mapped {
+            let binding = darkmux_profiles::profiles::RoleBinding::Mapped(mapped);
+            let resolved = darkmux_profiles::profiles::resolve_role_profile_with(
+                role_id, &binding, registry,
+            )?;
+            return Ok(Some((resolved.profile_name, resolved.profile)));
+        }
+    }
+    Ok(registry
+        .resolve_active(profile_override)
+        .map(|(name, profile)| (name.to_string(), profile)))
+}
+
 /// Resolve the selected model's `ProfileModel` (with its endpoint) WITHOUT
 /// loading anything in LMStudio — so `dispatch` can branch to the hosted path
 /// before the container/load machinery. `Ok(None)` ⇒ no profile model resolves
@@ -852,7 +949,9 @@ fn resolve_selected_profile_model(
             bail!(msg);
         }
     }
-    let Some((_name, profile)) = loaded.registry.resolve_active(profile_override) else {
+    // (#1547) Role-aware: honors `role_profiles.<role.id>` before falling to
+    // `default_profile` when no explicit `--profile` was given.
+    let Some((_name, profile)) = resolve_role_aware_profile(&role.id, profile_override, &loaded.registry)? else {
         // (#1282) Same for a quarantined `default_profile` — without this,
         // the dispatch falls through to the container path's
         // `probe_loaded_model()` and runs against whatever LMStudio has
@@ -979,10 +1078,17 @@ fn try_resolve_remote_target(
         Some(pm) if pm.endpoint.as_ref().is_some_and(|e| e.is_remote()) => pm,
         _ => return Ok(None), // local ⇒ container path
     };
-    let role_prompt = load_role_prompt(&opts.role_id).ok_or_else(|| {
+    // (#1550 cluster item 3) `load_role_prompt_for` honors an explicit
+    // `role.prompt_path` (if the manifest set one) before falling to the
+    // conventional sibling-file/embedded search — `load_role_prompt` alone
+    // never checked it, which let `darkmux role show` display a path that
+    // dispatch then couldn't find.
+    let role_prompt = crate::loader::load_role_prompt_for(&role).ok_or_else(|| {
         anyhow!(
-            "role '{}' has no .md system prompt — hosted dispatch requires one",
-            opts.role_id
+            "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
+             conventional roles dir, and the embedded table) — hosted dispatch requires one",
+            opts.role_id,
+            role.prompt_path
         )
     })?;
     let system_prompt = if role.is_specialist() {
@@ -1720,10 +1826,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .iter()
         .find(|r| r.id == opts.role_id)
         .ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
-    let role_prompt = load_role_prompt(&opts.role_id).ok_or_else(|| {
+    // (#1550 cluster item 3) See the hosted-dispatch call site's comment —
+    // `load_role_prompt_for` honors an explicit `role.prompt_path` first.
+    let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
         anyhow!(
-            "role '{}' has no .md system prompt — internal runtime requires one",
-            opts.role_id
+            "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
+             conventional roles dir, and the embedded table) — internal runtime requires one",
+            opts.role_id,
+            role.prompt_path
         )
     })?;
     // (#425) Prepend the autonomous-dispatch preamble for specialist
@@ -2172,6 +2282,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         compaction: compaction.clone(),
         feedback_templates: feedback_json,
         cache_dir: cache_dir.clone(),
+        feedback_injection: darkmux_types::config_access::feedback_injection(),
         remote_chat_url: agentic_pm
             .as_ref()
             .and_then(|pm| pm.endpoint.as_ref())
@@ -3817,13 +3928,17 @@ fn resolve_dispatch_model_internal(
     // `default_profile` (the machine-agnostic-caller contract — a workflow
     // names the profile it wants; each machine maps it to a lab-validated
     // model or degrades to its default). When nothing resolves, probe.
-    let (active_name, profile) = match loaded.registry.resolve_active(profile_override) {
+    // (#1547) Role-aware: when no `--profile` override is given, this now
+    // honors the `role_profiles.<role.id>` map before falling to
+    // `default_profile` — the same precedence the review launcher already
+    // applies to this map, now honored on the container dispatch path too.
+    let (active_name, profile) = match resolve_role_aware_profile(&role.id, profile_override, &loaded.registry)? {
         Some(pair) => {
             // Surface the fallback so the operator isn't surprised which model
             // ran: an explicit `--profile X` that resolved to a different name
             // means X wasn't defined here.
             if let Some(req) = profile_override {
-                if req != pair.0 {
+                if req != pair.0.as_str() {
                     eprintln!(
                         "darkmux dispatch: requested profile `{req}` is not defined \
                          on this machine; using default_profile `{}` instead. Define \
