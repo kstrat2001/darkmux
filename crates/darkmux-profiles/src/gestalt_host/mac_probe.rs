@@ -23,10 +23,18 @@
 //! speculative as available because it reports *pressure* for observation —
 //! the two answer different questions, deliberately.
 
-use darkmux_gestalt::{PoolFact, PoolId, Pools, ProbeError, ResourceProbe};
+use darkmux_gestalt::{Pools, ProbeError, ResourceProbe};
+// (#1662) `PoolFact`/`PoolId` are constructed ONLY by `unified_pool`, which
+// is macOS-gated — so importing them unconditionally is an unused import on
+// every other platform, and this crate denies warnings. Gated alongside their
+// single consumer rather than blanket-allowed, so the import list keeps
+// telling the truth about what each platform actually uses.
+#[cfg(target_os = "macos")]
+use darkmux_gestalt::{PoolFact, PoolId};
 
 /// The single pool name this probe emits. Named per the #1274 pools-as-data
 /// vocabulary ("unified" on Apple Silicon).
+#[cfg(target_os = "macos")]
 pub const UNIFIED_POOL: &str = "unified";
 
 /// macOS unified-memory probe. Stateless; each [`ResourceProbe::pools`] call
@@ -82,6 +90,7 @@ fn run_ok(cmd: &mut std::process::Command) -> Option<String> {
 // ── pure parsers (canned-output tests below; compiled on every platform) ──
 
 /// Parse `sysctl -n hw.memsize` output (a bare integer, possibly padded).
+#[cfg(target_os = "macos")]
 fn parse_memsize(s: &str) -> Option<u64> {
     s.trim().parse::<u64>().ok()
 }
@@ -92,6 +101,7 @@ fn parse_memsize(s: &str) -> Option<u64> {
 /// host-telemetry sampler's `mem_percent_from_vm_stat`: page size from
 /// vm_stat's own header (`page size of N bytes`), defaulting to 16384 on
 /// Apple Silicon; field values are `NNN.`-suffixed counts.
+#[cfg(target_os = "macos")]
 fn parse_vm_stat_free_bytes(vm_stat: &str) -> Option<u64> {
     let page = vm_stat
         .lines()
@@ -109,6 +119,7 @@ fn parse_vm_stat_free_bytes(vm_stat: &str) -> Option<u64> {
 }
 
 /// Assemble the one-pool `Pools` map.
+#[cfg(target_os = "macos")]
 fn unified_pool(capacity_bytes: u64, available_bytes: u64) -> Pools {
     Pools::from([(
         PoolId(UNIFIED_POOL.to_string()),

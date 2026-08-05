@@ -115,6 +115,105 @@ jobs:
         if: steps.filter.outputs.rust != 'true'
         run: echo "No Rust / Cargo / template / workflow changes detected; test+lint skipped (reports green)."
 
+  fleet-e2e:
+    name: fleet e2e (ubuntu-latest, real redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # (#1662) These tests existed and had NEVER RUN AT A GATE.
+    #
+    # All seven `tests/e2e_*.rs` binaries open with a `redis_available()`
+    # guard whose false arm `eprintln!`s and `return`s — a SILENT PASS. No
+    # workflow installed redis-server, so every e2e test on every CI run
+    # since the harness landed reported `ok` without executing: a real boot
+    # pays a release build plus two daemon spawns, and `dual_node_harness_
+    # boots_cleanly` was completing in 8 MILLISECONDS.
+    #
+    # Since CI is the merge gate here (local runs are targeted-module by
+    # doctrine), the entire fleet layer — daemon boot, RedisSink XADD,
+    # dispatch fan-out + re-dispatch gating, partial-publish atomicity,
+    # `machine list --deep` token forwarding — was guarded by nothing. That
+    # is #975's shape (a broken dispatch path riding four releases of green
+    # CI) with a wider surface.
+    #
+    # UBUNTU, not the macos job that runs the rest of the workspace. Three
+    # reasons: apt installs redis in seconds where brew takes tens of them;
+    # the harness has no macOS dependency (no Keychain, no `lms`, no
+    # `target_os` gate); and isolating the release build keeps it off the
+    # 15-minute cap of the main job.
+    #
+    # A SERVICE CONTAINER WOULD NOT WORK HERE, which is worth recording so
+    # nobody "simplifies" it into one: the harness spawns its OWN
+    # `redis-server` on a random free port PER TEST (see harness.rs's
+    # `spawn_redis`) for isolation. It needs the BINARY on PATH, not a
+    # server on 6379.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Rust-relevant changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'src/**'
+              - 'crates/**'
+              - 'tests/**'
+              - 'templates/**'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust stable toolchain
+        if: steps.filter.outputs.rust == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.filter.outputs.rust == 'true'
+        with:
+          key: fleet-e2e
+
+      - name: Install redis-server
+        if: steps.filter.outputs.rust == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq redis-server
+          redis-server --version
+
+      # The harness builds the release binary INSIDE `cargo test` unless
+      # told otherwise, which would serialize a full release build behind
+      # the test timer. `DARKMUX_E2E_BIN` (harness.rs) exists for exactly
+      # this: build once here, point the harness at the artifact.
+      - name: Build the release binary the harness will drive
+        if: steps.filter.outputs.rust == 'true'
+        run: cargo build --release --bin darkmux
+
+      - name: Fleet e2e (real daemons, real redis)
+        if: steps.filter.outputs.rust == 'true'
+        env:
+          DARKMUX_E2E_BIN: ${{ github.workspace }}/target/release/darkmux
+          # (#1662) Turns the silent skip into a hard failure — but ONLY
+          # here. Keyed on this var rather than `CI` because GitHub sets
+          # `CI` on every runner, and the macOS workspace job runs these
+          # same binaries without redis; gating on `CI` would have failed
+          # the job that correctly is not responsible for this suite.
+          DARKMUX_E2E_REQUIRED: "1"
+        # `cargo test --test 'e2e_*'` DOES glob (verified: resolves 6) and
+        # exits 101 when a pattern matches nothing (verified) — so a rename
+        # cannot silently empty this job. An earlier revision added a
+        # count-asserting preamble on top of that; it was redundant with
+        # cargo's own behavior and became its own failure mode, which is the
+        # sort of guard that costs more than it protects. Removed.
+        run: |
+          cargo test --workspace --test 'e2e_*'
+
+      - name: No Rust-relevant changes — fleet e2e skipped
+        if: steps.filter.outputs.rust != 'true'
+        run: echo "No Rust-relevant changes; fleet e2e skipped (reports green)."
+
   runtime-test-lint:
     name: runtime crate — test + lint (macos-latest)
     runs-on: macos-latest

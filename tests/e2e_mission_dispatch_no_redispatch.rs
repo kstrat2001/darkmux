@@ -20,11 +20,43 @@ mod e2e;
 use e2e::harness::{FleetHarness, NodeSpec};
 
 fn redis_available() -> bool {
-    std::process::Command::new("redis-server")
+    let ok = std::process::Command::new("redis-server")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    // (#1662) Where the suite is REQUIRED, a missing redis is a HARD
+    // FAILURE, never a skip.
+    //
+    // The skip exists so a contributor without redis installed isn't
+    // blocked locally. But CI is this project's merge gate (local runs are
+    // targeted-module by doctrine), and for the entire life of this harness
+    // no workflow installed redis-server — so every e2e test on every run
+    // returned early and reported `ok`. A real boot pays a release build
+    // plus two daemon spawns; `dual_node_harness_boots_cleanly` was
+    // finishing in 8 milliseconds. The fleet layer was guarded by nothing,
+    // loudly reporting that it was guarded.
+    //
+    // A dependency that silently converts "did not run" into "passed" is
+    // the same defect class as a status inferred rather than recorded: the
+    // absence of evidence rendered as evidence of absence.
+    //
+    // Keyed on DARKMUX_E2E_REQUIRED, deliberately NOT on `CI`. GitHub sets
+    // `CI` on EVERY runner, and the macOS workspace job runs these same
+    // binaries via `cargo test --workspace` without installing redis — so a
+    // `CI` gate would have failed the job that is correctly not responsible
+    // for this suite. The env var names the actual requirement ("this job
+    // opted in to running the fleet e2e") instead of a proxy for it, and
+    // only `fleet-e2e` sets it.
+    if !ok && std::env::var("DARKMUX_E2E_REQUIRED").is_ok() {
+        panic!(
+            "redis-server is not on PATH, but DARKMUX_E2E_REQUIRED is set — the job that \
+             opted in must never silently skip the fleet e2e suite (#1662). Install it \
+             (`apt-get install -y redis-server`) or fix the runner image — do NOT relax \
+             this back into a skip."
+        );
+    }
+    ok
 }
 
 fn write_mission_fixture(crew_root: &std::path::Path, mission_id: &str, phase_ids: &[&str]) {
