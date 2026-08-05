@@ -469,11 +469,32 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     if req.uri().path() == "/health" {
         return next.run(req).await;
     }
+    // (#1663) FAIL CLOSED. An absent `ConnectInfo` means "treat as remote",
+    // i.e. require the token — the opposite of what this did.
+    //
+    // It used to `unwrap_or(false)` (absent ⇒ loopback ⇒ auth-exempt) as a
+    // convenience for the oneshot test path. That made the ENTIRE remote gate
+    // rest on one wiring call: `into_make_service_with_connect_info` in
+    // `run()`, guarded only by a comment asking the next person not to change
+    // it. Downgrade that to `into_make_service()` in any refactor and every
+    // peer looks loopback — a tailnet-exposed daemon then serves flow
+    // records, machine specs, mission state, and worktree summaries
+    // unauthenticated, with every test still green and nothing visible to the
+    // operator (the viewer keeps working; loopback is exempt either way).
+    //
+    // Now that same refactor produces 401s on the first remote request
+    // instead of silence. Tests inject `ConnectInfo` explicitly — see
+    // `loopback_conn_info` — so the exemption is something a test STATES
+    // rather than something it inherits by omission.
+    //
+    // Same instinct `bind_requires_token` already applies just below: a bind
+    // string that doesn't parse is treated as non-loopback, so a typo can't
+    // sneak past the gate. Absence is not evidence of safety.
     let is_remote = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| !ci.0.ip().is_loopback())
-        .unwrap_or(false);
+        .unwrap_or(true);
     if !is_remote || request_token_ok(req.headers()) {
         next.run(req).await
     } else {

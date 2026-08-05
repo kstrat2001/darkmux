@@ -1274,6 +1274,18 @@
         ConnectInfo("10.0.0.9:5555".parse::<SocketAddr>().unwrap())
     }
 
+    /// (#1663) The loopback twin of [`remote_peer`], and the reason it now
+    /// exists: `auth_mw` used to treat an ABSENT `ConnectInfo` as loopback,
+    /// so a test got the auth exemption by saying nothing. That made the
+    /// whole remote gate depend on one wiring call in `run()`, guarded only
+    /// by a comment. The middleware now fails closed, so a test that wants
+    /// the loopback exemption has to STATE it — which is also the honest
+    /// thing for the test to say, since the production loopback path always
+    /// has a peer address.
+    fn loopback_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap())
+    }
+
     /// (#1387) `/worktree-summary/:session_id` (the numbers-only replacement
     /// for the retired `/diff/:session_id`) must ride the SAME remote-only
     /// bearer gate as the rest of the read surface — there is no longer a
@@ -1303,15 +1315,13 @@
     async fn worktree_summary_open_on_loopback_even_with_token() {
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
         let app = build_router(PathBuf::new());
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/worktree-summary/some-session")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+        // (#1663) Loopback stated, not inherited from an absent ConnectInfo.
+        let mut req = Request::builder()
+            .uri("/worktree-summary/some-session")
+            .body(Body::empty())
             .unwrap();
+        req.extensions_mut().insert(loopback_peer());
+        let resp = app.oneshot(req).await.unwrap();
         unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -1319,12 +1329,69 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn flow_open_on_loopback_even_with_token() {
-        // The router-wide gate exempts loopback peers; a oneshot request has no
-        // ConnectInfo and is treated as loopback.
+        // The router-wide gate exempts loopback peers. (#1663) The peer is
+        // now INJECTED rather than implied by an absent `ConnectInfo` — the
+        // exemption is a thing this test states, not one it inherits from a
+        // fail-open default.
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        let mut req = Request::builder().uri("/flow-days").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(loopback_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_absent_peer_address_requires_the_token_rather_than_assuming_loopback() {
+        // (#1663) THE regression this fix exists to make impossible.
+        //
+        // `auth_mw` used to treat an absent `ConnectInfo` as loopback, so the
+        // entire remote gate depended on one wiring call —
+        // `into_make_service_with_connect_info` in `run()` — guarded by
+        // nothing but a comment asking the next person not to change it.
+        // Downgrading that to `into_make_service()` in any refactor makes
+        // every peer look loopback: a tailnet-exposed daemon then serves flow
+        // records, machine specs, mission state, and worktree summaries
+        // unauthenticated, with all tests green and NOTHING visible to the
+        // operator — the viewer keeps working, because loopback was exempt
+        // either way. The bypass is visible only to whoever is on the tailnet.
+        //
+        // Failing closed converts that silent, invisible hole into 401s on
+        // the first remote request. This test pins the direction: no peer
+        // information means no exemption.
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        // Deliberately NO ConnectInfo — the shape a de-wired router produces.
+        let resp = app
+            .oneshot(Request::builder().uri("/flow-days").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unknown peer must be treated as remote — absence of evidence is not evidence of loopback"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_absent_peer_address_still_passes_when_it_carries_the_token() {
+        // The control: failing closed must not break a legitimate remote
+        // client. Unknown peer + valid token is still authorized, so this is
+        // a gate, not a blanket refusal.
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
         let app = build_router(PathBuf::new());
         let resp = app
-            .oneshot(Request::builder().uri("/flow-days").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/flow-days")
+                    .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
