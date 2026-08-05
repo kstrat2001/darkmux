@@ -248,7 +248,9 @@ pub(crate) enum Cmd {
         sub: RoleCmd,
     },
     /// Mission lifecycle — transition missions through their state machine.
-    /// Mission status flows: Active ↔ Paused → Finalized. All transitions are
+    /// Mission status flows: Active ↔ Paused → Finalized (success) or
+    /// Aborted (teardown — #1627: a teardown is not a success, and the two
+    /// are distinct terminals on disk). All transitions are
     /// operator-explicit; nothing auto-decides a mission is paused or done.
     /// Wall-clock UI consumes mission timestamps via `darkmux serve`.
     Mission {

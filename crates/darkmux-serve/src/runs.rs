@@ -436,9 +436,16 @@ fn mission_to_run(
 /// cross-checked against its joined flow `sessions` for two cases the
 /// mission record alone can't see (#1523 gate CONSIDERs 3 + 4).
 ///
-/// `MissionStatus` has no separate `Abandoned` variant — `mission abort`
-/// and `mission finalize` both drive a mission to `Finalized` (terminal);
-/// they're told apart only by the mission's `MissionEnvelope`'s outcome
+/// (#1627, corrected #1660) `mission abort` writes its OWN terminal,
+/// `MissionStatus::Aborted`, which `mission_run_status` maps straight to
+/// `RunStatus::Abandoned` — this comment previously claimed both verbs
+/// drove a mission to `Finalized`, which stopped being true when a
+/// teardown stopped being recorded as a success. The envelope reading
+/// below applies to a genuinely FINALIZED mission; an abort never reaches
+/// it, precisely so a killed run can't inherit a verdict it never earned.
+///
+/// A `Finalized` mission is told apart from a degraded one by its
+/// `MissionEnvelope`'s outcome
 /// (`Error`/`Degenerate` for an abort-shaped close, `Clean`/`Degraded` for a
 /// happy finalize — see `darkmux_crew::envelope`'s own doc). So a
 /// `Finalized` mission's flat status is read off its envelope; a mission

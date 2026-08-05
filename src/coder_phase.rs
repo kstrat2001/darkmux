@@ -1371,6 +1371,41 @@ fn teardown_and_terminate_phase(
 /// exists; only the recorded truth differs. Already-terminal phases are left
 /// untouched (their recorded outcome — a prior Complete or Abandoned — stays
 /// honest). Cues the debrief ceremony after finalize.
+/// (#1660) The one-line terminal echo, as a PURE function so the rendered
+/// string is testable.
+///
+/// It wasn't, and that is exactly how the bug shipped: #1627 changed the
+/// stored terminal so a teardown stops reading as a success, three tests
+/// pinned the new value ON DISK, and nothing read the line printed beside
+/// it — so `mission abort` kept announcing `✓ … → Finalized` while writing
+/// `Aborted`. One action, two stories.
+///
+/// It misleads more than a human reader: a frontier session parsing this
+/// stdout sees a green check and the success terminal and concludes the
+/// mission completed cleanly.
+fn terminal_echo_line(m: &crew::types::Mission, terminal: crew::types::MissionStatus) -> String {
+    let verb = match terminal {
+        crew::types::MissionStatus::Aborted => "Aborted",
+        _ => "Finalized",
+    };
+    let finalized = m.finalized_ts.unwrap_or(0);
+    // A mission that never started has no meaningful duration.
+    // `started_ts.unwrap_or(0)` rendered the epoch as elapsed time —
+    // `duration=1785…s`, about 56 years. Say "n/a" rather than print a
+    // number that cannot be true.
+    match m.started_ts {
+        Some(started) => format!(
+            "✓ mission {} → {verb}  duration={}s  finalized_ts={finalized}",
+            m.id,
+            finalized.saturating_sub(started)
+        ),
+        None => format!(
+            "✓ mission {} → {verb}  duration=n/a (never started)  finalized_ts={finalized}",
+            m.id
+        ),
+    }
+}
+
 fn terminate_mission(mission_id: &str, kind: MissionTerminal, reasoning: Option<&str>) -> Result<i32> {
     use crew::loader::{load_missions, load_phases};
     use crew::types::PhaseStatus;
@@ -1435,16 +1470,18 @@ fn terminate_mission(mission_id: &str, kind: MissionTerminal, reasoning: Option<
     };
     match crew::lifecycle::mission_terminal_with_reasoning(mission_id, terminal, reasoning) {
         Ok(m) => {
-            let started = m.started_ts.unwrap_or(0);
-            let finalized = m.finalized_ts.unwrap_or(0);
-            let dur = finalized.saturating_sub(started);
-            println!(
-                "{}",
-                style::success(&format!(
-                    "✓ mission {} → Finalized  duration={}s  finalized_ts={}",
-                    m.id, dur, finalized
-                ))
-            );
+            // (#1660) Echo the terminal that was actually WRITTEN. #1627 made
+            // `abort` store `Aborted` precisely so a teardown and a success
+            // are distinguishable — and this line kept printing "Finalized"
+            // for both. The board then filed the same mission under ABORTED,
+            // so one action told two stories.
+            //
+            // It misleads more than a human reader: a frontier session
+            // parsing this stdout sees a green check and the success
+            // terminal, and concludes the mission completed. `mission
+            // status` is the durable truth; this is the immediate one, and
+            // they have to agree.
+            println!("{}", style::success(&terminal_echo_line(&m, terminal)));
         }
         Err(e) => eprintln!(
             "{}",
