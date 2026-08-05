@@ -23,7 +23,14 @@
 //! speculative as available because it reports *pressure* for observation —
 //! the two answer different questions, deliberately.
 
-use darkmux_gestalt::{PoolFact, PoolId, Pools, ProbeError, ResourceProbe};
+use darkmux_gestalt::{Pools, ProbeError, ResourceProbe};
+// (#1662) `PoolFact`/`PoolId` are constructed ONLY by `unified_pool`, which
+// is macOS-gated — so importing them unconditionally is an unused import on
+// every other platform, and this crate denies warnings. Gated alongside their
+// single consumer rather than blanket-allowed, so the import list keeps
+// telling the truth about what each platform actually uses.
+#[cfg(target_os = "macos")]
+use darkmux_gestalt::{PoolFact, PoolId};
 
 /// The single pool name this probe emits. Named per the #1274 pools-as-data
 /// vocabulary ("unified" on Apple Silicon).
