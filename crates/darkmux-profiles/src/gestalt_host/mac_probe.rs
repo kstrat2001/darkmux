@@ -27,6 +27,7 @@ use darkmux_gestalt::{PoolFact, PoolId, Pools, ProbeError, ResourceProbe};
 
 /// The single pool name this probe emits. Named per the #1274 pools-as-data
 /// vocabulary ("unified" on Apple Silicon).
+#[cfg(target_os = "macos")]
 pub const UNIFIED_POOL: &str = "unified";
 
 /// macOS unified-memory probe. Stateless; each [`ResourceProbe::pools`] call
@@ -82,6 +83,7 @@ fn run_ok(cmd: &mut std::process::Command) -> Option<String> {
 // ── pure parsers (canned-output tests below; compiled on every platform) ──
 
 /// Parse `sysctl -n hw.memsize` output (a bare integer, possibly padded).
+#[cfg(target_os = "macos")]
 fn parse_memsize(s: &str) -> Option<u64> {
     s.trim().parse::<u64>().ok()
 }
@@ -92,6 +94,7 @@ fn parse_memsize(s: &str) -> Option<u64> {
 /// host-telemetry sampler's `mem_percent_from_vm_stat`: page size from
 /// vm_stat's own header (`page size of N bytes`), defaulting to 16384 on
 /// Apple Silicon; field values are `NNN.`-suffixed counts.
+#[cfg(target_os = "macos")]
 fn parse_vm_stat_free_bytes(vm_stat: &str) -> Option<u64> {
     let page = vm_stat
         .lines()
@@ -109,6 +112,7 @@ fn parse_vm_stat_free_bytes(vm_stat: &str) -> Option<u64> {
 }
 
 /// Assemble the one-pool `Pools` map.
+#[cfg(target_os = "macos")]
 fn unified_pool(capacity_bytes: u64, available_bytes: u64) -> Pools {
     Pools::from([(
         PoolId(UNIFIED_POOL.to_string()),
