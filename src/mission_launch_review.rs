@@ -535,16 +535,26 @@ fn config_detail() -> String {
 /// Pure and separate from the launcher so the precedence is testable
 /// without standing up a dispatch.
 fn crew_route_label(crew: &ResolvedReviewRoles) -> Option<String> {
+    // (#1660) `.filter(|e| e.is_remote())` is NOT optional, and omitting it
+    // was a bug: `is_remote()` is just `url.is_some()`, so a profile carrying
+    // a bare `"endpoint": {}` (legal under the lenient schema) makes
+    // `base_url()` fall back to the LOCAL LMStudio URL. Without the filter
+    // this stamps a cloud label on a fully-local run — the exact inverted
+    // misclassification `crew_route_label_is_none_when_every_seat_is_local`
+    // claims to prevent, which its `endpoint: None` fixture structurally
+    // could not see. Same filter the terminal side (`seat_endpoint_host`)
+    // has always applied.
     let (ep, model) = crew
         .judge
         .pm
         .endpoint
         .as_ref()
+        .filter(|e| e.is_remote())
         .map(|ep| (ep, crew.judge.pm.id.as_str()))
         .or_else(|| {
-            crew.probes
-                .iter()
-                .find_map(|s| s.pm.endpoint.as_ref().map(|ep| (ep, s.pm.id.as_str())))
+            crew.probes.iter().find_map(|s| {
+                s.pm.endpoint.as_ref().filter(|e| e.is_remote()).map(|ep| (ep, s.pm.id.as_str()))
+            })
         })?;
     let url = ep.base_url();
     let host = url.split("://").nth(1).and_then(|h| h.split('/').next()).unwrap_or("remote");
@@ -1755,6 +1765,13 @@ mod tests {
         }
     }
 
+    fn remote_staffing_url(model_id: &str, url: &str) -> ResolvedSeatStaffing {
+        let mut st = staffing(model_id);
+        st.pm.endpoint =
+            Some(darkmux_types::ModelEndpoint { url: Some(url.to_string()), ..Default::default() });
+        st
+    }
+
     fn remote_staffing(model_id: &str, host: &str) -> ResolvedSeatStaffing {
         let mut st = staffing(model_id);
         st.pm.endpoint = Some(darkmux_types::ModelEndpoint {
@@ -1805,6 +1822,58 @@ mod tests {
         };
         let out = review_result_to_mission_envelope("m-1", &["p-1"], &Ok(env));
         assert_eq!(out.status, crew::envelope::MissionOutcomeStatus::Degenerate);
+    }
+
+    #[test]
+    fn crew_route_label_never_leaks_url_userinfo() {
+        // (#1660) A profile url may legitimately carry userinfo — some
+        // LiteLLM/proxy setups document `https://tok@host/v1` — and this
+        // label rides into flow records and the run envelope, which CI
+        // uploads as a PUBLIC artifact. The terminal side has stripped it
+        // since #1530 with a comment explaining exactly this; the start side
+        // did not, because every fixture used clean hosts. Sanitizing now
+        // happens at the shared `remote_route_label` chokepoint, so this
+        // holds for every caller, not just this one.
+        let roles = ResolvedReviewRoles {
+            probes: vec![],
+            judge: remote_staffing_url(
+                "gpt-4o",
+                "https://sk-secret-token@myorg.cognitiveservices.azure.com/v1",
+            ),
+            verify: None,
+            request_changes: false,
+            warnings: Vec::new(),
+        };
+        let label = crew_route_label(&roles).expect("a remote judge yields a label");
+        assert!(
+            !label.contains("sk-secret-token") && !label.contains('@'),
+            "the route label must never carry URL userinfo — it rides to public artifacts: {label}"
+        );
+        assert_eq!(label, "azure:myorg.cognitiveservices.azure.com/gpt-4o");
+    }
+
+    #[test]
+    fn crew_route_label_ignores_an_endpoint_that_is_not_actually_remote() {
+        // (#1660) `is_remote()` is just `url.is_some()`, so a bare
+        // `"endpoint": {}` — legal under the lenient schema — makes
+        // `base_url()` fall back to the LOCAL LMStudio url. Without the
+        // filter this stamped a CLOUD label on a fully-local run: the exact
+        // inverse of the bug #1520 fixed, and invisible to the
+        // `endpoint: None` fixture that claimed to cover it.
+        let mut judge = staffing("darkmux:local-judge");
+        judge.pm.endpoint = Some(darkmux_types::ModelEndpoint::default());
+        let roles = ResolvedReviewRoles {
+            probes: vec![],
+            judge,
+            verify: None,
+            request_changes: false,
+            warnings: Vec::new(),
+        };
+        assert_eq!(
+            crew_route_label(&roles),
+            None,
+            "an endpoint with no url is not remote — stamping a cloud route here is a lie"
+        );
     }
 
     #[test]
