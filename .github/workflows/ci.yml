@@ -195,11 +195,12 @@ jobs:
         if: steps.filter.outputs.rust == 'true'
         env:
           DARKMUX_E2E_BIN: ${{ github.workspace }}/target/release/darkmux
-          # (#1662) Turns the silent skip into a hard failure. Without this
-          # the guard's false arm is indistinguishable from a pass, which is
-          # the entire bug — a missing dependency must never again read as
-          # green.
-          CI: "true"
+          # (#1662) Turns the silent skip into a hard failure — but ONLY
+          # here. Keyed on this var rather than `CI` because GitHub sets
+          # `CI` on every runner, and the macOS workspace job runs these
+          # same binaries without redis; gating on `CI` would have failed
+          # the job that correctly is not responsible for this suite.
+          DARKMUX_E2E_REQUIRED: "1"
         run: |
           # Belt for the glob itself. `cargo test --test 'e2e_*'` DOES glob
           # (verified: resolves 6 binaries) and exits 101 when a pattern

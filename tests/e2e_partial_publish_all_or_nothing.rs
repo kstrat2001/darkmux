@@ -25,7 +25,8 @@ fn redis_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    // (#1662) In CI, a missing redis is a HARD FAILURE, never a skip.
+    // (#1662) Where the suite is REQUIRED, a missing redis is a HARD
+    // FAILURE, never a skip.
     //
     // The skip exists so a contributor without redis installed isn't
     // blocked locally. But CI is this project's merge gate (local runs are
@@ -38,13 +39,21 @@ fn redis_available() -> bool {
     //
     // A dependency that silently converts "did not run" into "passed" is
     // the same defect class as a status inferred rather than recorded: the
-    // absence of evidence rendered as evidence of absence. So in CI it
-    // panics with the fix, and the skip stays available everywhere else.
-    if !ok && std::env::var("CI").is_ok() {
+    // absence of evidence rendered as evidence of absence.
+    //
+    // Keyed on DARKMUX_E2E_REQUIRED, deliberately NOT on `CI`. GitHub sets
+    // `CI` on EVERY runner, and the macOS workspace job runs these same
+    // binaries via `cargo test --workspace` without installing redis — so a
+    // `CI` gate would have failed the job that is correctly not responsible
+    // for this suite. The env var names the actual requirement ("this job
+    // opted in to running the fleet e2e") instead of a proxy for it, and
+    // only `fleet-e2e` sets it.
+    if !ok && std::env::var("DARKMUX_E2E_REQUIRED").is_ok() {
         panic!(
-            "redis-server is not on PATH, but CI must never silently skip the fleet e2e \
-             suite (#1662). Install it in the workflow (`apt-get install -y redis-server`) \
-             or fix the runner image — do NOT relax this back into a skip."
+            "redis-server is not on PATH, but DARKMUX_E2E_REQUIRED is set — the job that \
+             opted in must never silently skip the fleet e2e suite (#1662). Install it \
+             (`apt-get install -y redis-server`) or fix the runner image — do NOT relax \
+             this back into a skip."
         );
     }
     ok
