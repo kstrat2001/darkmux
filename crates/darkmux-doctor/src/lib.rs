@@ -2678,12 +2678,17 @@ fn check_mission_config_registry() -> Check {
                 // (#1284 review round 2, consider 7) A USER-tier copy whose
                 // schema MINOR trails the binary's is silently missing
                 // additive fields newer launchers rely on — concretely, a
-                // 1.0-era user copy of "review" has no typed `expand` block,
-                // so the probe stage interprets to ZERO probe tasks. Major
-                // drift is `validate()`'s job (either direction); this
-                // minor-trailing check is user-tier-only because the
-                // embedded/on-disk built-ins ship with the binary and can't
-                // trail it.
+                // pre-1.4 user copy of "review" has no `reads` field on any
+                // task, so cross-phase data delivery that relies on it (see
+                // schema 1.4's #1619) silently doesn't happen. (#1550 cluster
+                // item 2: the ORIGINAL illustration named the `expand`
+                // primitive, but `expand` was retired in schema 2.0 — a MAJOR
+                // bump, see `MISSION_CONFIG_SCHEMA`'s doc — so pointing at it
+                // here would itself be a stale reference to a field that no
+                // longer exists.) Major drift is `validate()`'s job (either
+                // direction); this minor-trailing check is user-tier-only
+                // because the embedded/on-disk built-ins ship with the binary
+                // and can't trail it.
                 if loaded.source == mission_config::MissionConfigSource::User {
                     if let Some((doc_major, doc_minor)) = loaded
                         .config
@@ -2699,10 +2704,11 @@ fn check_mission_config_registry() -> Check {
                                 "\"{id}\": user-tier copy declares schema {doc_major}.{doc_minor}, \
                                  but this binary's mission-config schema is \
                                  {bin_major}.{bin_minor} — the user copy predates additive \
-                                 fields newer launchers rely on (e.g. a 1.0-era \"review\" \
-                                 copy has no `expand` block, so its probe stage interprets \
-                                 to zero probe tasks); re-derive it from the current \
-                                 built-in or delete it to fall back to the embedded tier"
+                                 fields newer launchers rely on (e.g. a pre-1.4 \"review\" copy \
+                                 has no `reads` field on any task, so cross-phase data delivery \
+                                 that relies on it — see schema 1.4's #1619 — silently doesn't \
+                                 happen); re-derive it from the current built-in or delete it to \
+                                 fall back to the embedded tier"
                             ));
                         }
                         // (#1648) The MIRROR direction, and the more dangerous
@@ -5436,20 +5442,30 @@ mod tests {
         assert!(check.message.contains("\"bad\""), "{}", check.message);
     }
 
-    /// (#1284 review round 2, consider 7) A USER-tier copy of a built-in
-    /// whose schema MINOR trails the binary's warns loudly — the concrete
-    /// hazard: a 1.0-era user copy of "review" has no typed `expand` block,
-    /// so its probe stage interprets to ZERO probe tasks; doctor should say
-    /// so BEFORE a launch does. Same-major-lower-minor only — a same-version
-    /// copy (or major drift, which `validate()` already covers) doesn't
-    /// trip this.
+    /// (#1284 review round 2, consider 7 / #1550 cluster item 2) A USER-tier
+    /// copy of a built-in authored against an OLDER schema is not silently
+    /// accepted. This test originally pinned the SAME-MAJOR-lower-minor path
+    /// (`doc_major == bin_major && doc_minor < bin_minor`) with a concrete
+    /// hazard: a 1.0-era "review" copy had no typed `expand` block, so its
+    /// probe stage interpreted to ZERO probe tasks. `expand` itself retired
+    /// in schema 2.0 (a MAJOR bump — see `MISSION_CONFIG_SCHEMA`'s doc), and
+    /// 2.0 is the new major's floor, so there is currently no real
+    /// SAME-MAJOR-lower-minor schema to fixture (nothing parses below
+    /// "2.0"). A user's genuinely stale "1.0" copy now takes the GENERIC
+    /// major-mismatch path instead (`validate()`'s own schema_version
+    /// check) — still a loud Warn, just the generic message rather than the
+    /// specific "predates additive fields" one. This test now pins THAT
+    /// behavior (the operator must still be warned); the specific
+    /// same-major-lower-minor message becomes reachable — and worth
+    /// re-testing directly — again once a real 2.1 exists.
     #[serial_test::serial]
     #[test]
-    fn check_mission_config_registry_warns_when_user_tier_minor_trails_the_binary() {
+    fn check_mission_config_registry_warns_when_user_tier_copy_is_on_an_older_major() {
         let guard = CrewRootGuard::new();
         std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
-        // A structurally-valid 1.0-era user override of the "review"
-        // built-in (schema major matches the binary's, minor trails it).
+        // A stale pre-2.0 user override of the "review" built-in — same
+        // scenario the original 1.0-era fixture modeled, now a MAJOR
+        // mismatch rather than a same-major minor trail (see the doc above).
         std::fs::write(
             guard.path().join("mission-configs").join("review.json"),
             r#"{"id":"review","name":"PR Review (stale user copy)","schema_version":"1.0"}"#,
@@ -5458,8 +5474,13 @@ mod tests {
 
         let check = check_mission_config_registry();
         assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("user-tier copy declares schema 1.0"), "{}", check.message);
-        assert!(check.message.contains("zero probe tasks"), "{}", check.message);
+        assert!(check.message.contains("schema_version \"1.0\" (major 1)"), "{}", check.message);
+        assert!(
+            check.message.contains("MISSION_CONFIG_SCHEMA \"2.0\" (major 2)"),
+            "{}",
+            check.message
+        );
+        assert!(check.message.contains("major-version mismatch"), "{}", check.message);
     }
 
     /// (#1648) The MIRROR direction — a user-tier copy on a NEWER minor than

@@ -1,23 +1,35 @@
 //! Config → executable graph interpreter (#1284 Packet 3, closes #1356's
-//! promise structurally — see the module doc on `mission_config` and
-//! `crates/darkmux-crew/src/mission_config/mod.rs`'s `ExpansionSpec`).
+//! promise structurally — see the module doc on `mission_config`).
 //!
 //! [`interpret`] turns a parsed [`super::MissionConfig`] plus launch-time
 //! [`LaunchParams`] into the `Vec<Task>` + `BTreeMap<String, Step>` shape
 //! `darkmux-crew`'s `scheduler::run_step_graph` consumes — the SAME shape
 //! `build_review_graph` (`darkmux-lab::lab::review`) and `default_phase_graph`
 //! (`src/coder_phase.rs`) used to build by hand. This module owns exactly
-//! three things, and only these three (per the packet's own scope — Tier 3
+//! two things, and only these two (per the packet's own scope — Tier 3
 //! `StepKind` construction/registration stays mission-owned, #1352):
 //!
 //!   1. the placeholder-prefix phase-id substitution rule ([`TaskConfig`]'s
 //!      doc in `mod.rs`) applied to every task/step id;
-//!   2. `depends_on` edge resolution, INCLUDING rewriting a dependency that
-//!      named a template task's id into the full set of that task's
-//!      expanded real copies;
-//!   3. the expansion primitive itself ([`super::ExpansionSpec`]) — turning
-//!      one `TaskConfig` template into N real Task/Step copies, one per
-//!      named item in a launcher-supplied collection.
+//!   2. `depends_on`/`reads` edge resolution.
+//!
+//! (#1550 cluster item 2) A THIRD thing — a generic "one `TaskConfig`
+//! template expands into N real Task/Step copies, one per launcher-supplied
+//! collection item" primitive (`ExpansionSpec`/`expand`/`LaunchParams::
+//! expansions`) — lived here from Packet 3 (schema 1.1) through #1512's
+//! review dissolution, then retired here: BOTH production launchers
+//! (`build_review_graph` and `src/mission_launch.rs`) always constructed
+//! `LaunchParams` with an empty `expansions` map, so a document declaring
+//! `expand` interpreted to ZERO real copies on every real run — fully
+//! specified, fully interpreted, never actually fed. #1512's dissolution is
+//! WHY: the review probe stage that motivated this primitive moved to
+//! static, explicitly-declared probe tasks (one `role_id` per task,
+//! discovered structurally — see `darkmux_crew::resourcing`'s module doc),
+//! so the one real consumer stopped needing runtime expansion. Retired
+//! rather than wired to a still-nonexistent second use case (pre-1.0, small
+//! audience — no deprecation shim); a document that still declares `expand`
+//! now just carries an inert key (lenient-on-read `extras` overflow,
+//! contract 7) instead of silently interpreting to zero tasks.
 //!
 //! [`interpret`] does NOT construct `StepKind` instances, does NOT build a
 //! `StepKindRegistry`, and does NOT know what any `Step.kind` id actually
@@ -41,7 +53,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Per-task overrides a launcher supplies at interpretation time, keyed by
-/// the [`TaskConfig`]'s OWN (pre-substitution, pre-expansion) `id` — stable
+/// the [`TaskConfig`]'s OWN (pre-substitution) `id` — stable
 /// across launches since it's the literal string in the document, unlike
 /// the composed real id (which depends on the launcher's own real phase
 /// id). Every field defaults to "keep the document's own value" — a
@@ -82,33 +94,20 @@ pub struct LaunchParams {
     /// decision for why the static JSON value is a documented default
     /// only, never load-bearing at launch).
     pub step_config_overrides: BTreeMap<String, serde_json::Value>,
-    /// [`super::ExpansionSpec::over`] → the ordered item NAMES the launcher
-    /// resolved for that collection (e.g. every staffed probe seat's name,
-    /// in staffing order). A task whose `expand.over` names a collection
-    /// missing from this map interprets as an EMPTY expansion (zero real
-    /// copies) — the same "reduced coverage, not a hard error" posture a
-    /// zero-seat crew already takes elsewhere in the review pipeline.
-    ///
-    /// (#1418) That leniency is for a genuinely EMPTY collection under a
-    /// KEY THE LAUNCHER DOES SUPPLY (e.g. a zero-seat crew still inserts
-    /// `"probe_seats" -> []`). A key ABSENT from this map entirely
-    /// (nothing under that name at all) is a different, likelier-a-typo
-    /// shape: [`interpret`] treats both as zero real copies (leniency is
-    /// unchanged), but names the absent case in its returned warnings so
-    /// the launcher can surface it instead of the run silently examining
-    /// nothing.
-    pub expansions: BTreeMap<String, Vec<String>>,
 }
 
-/// What [`interpret`] returns: the real `Vec<Task>` (document order,
-/// expanded tasks appearing in place of their template) + `BTreeMap<String,
-/// Step>` a `StepKindRegistry`-equipped caller hands to
-/// `scheduler::run_step_graph`, + (#1418) any non-fatal warnings worth the
-/// caller printing, currently just the absent-`expand.over`-key case (see
-/// [`LaunchParams::expansions`]'s doc). Warnings are empty on a normal
-/// interpretation; `interpret` has no printing/logging channel of its own,
-/// so returning them is the smallest honest mechanism for a caller to
-/// surface them.
+/// What [`interpret`] returns: the real `Vec<Task>` (document order) +
+/// `BTreeMap<String, Step>` a `StepKindRegistry`-equipped caller hands to
+/// `scheduler::run_step_graph`, + any non-fatal warnings worth the caller
+/// printing. `interpret` has no printing/logging channel of its own, so
+/// returning them is the smallest honest mechanism for a caller to surface
+/// them. (#1550 cluster item 2) Always empty today — the one warning kind
+/// this ever carried (an absent `expand.over` collection) went with the
+/// retired expansion primitive; kept as a `Vec` (not removed) since it's
+/// part of this function's public return shape and a genuinely-useful
+/// mechanism for a FUTURE non-fatal interpretation finding, not a lying
+/// surface — an always-empty Vec is an honest "nothing to report," never a
+/// promise the caller can't verify.
 pub type InterpretedGraph = (Vec<Task>, BTreeMap<String, Step>, Vec<String>);
 
 /// See the module doc and [`InterpretedGraph`].
@@ -117,155 +116,49 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
 
     let mut tasks: Vec<Task> = Vec::new();
     let mut steps: BTreeMap<String, Step> = BTreeMap::new();
-    let mut warnings: Vec<String> = Vec::new();
-    // Document-level TaskConfig.id -> the real Task id(s) it produced (len
-    // 1 for a non-expanding task, len N for an expanding one). Drives BOTH
-    // the depends_on rewrite pass below AND is how a dependent task's
-    // reference to a template resolves to every real expanded copy.
+    let warnings: Vec<String> = Vec::new();
+    // Document-level TaskConfig.id -> the real Task id it produced. Always
+    // len 1 per entry today (#1550 cluster item 2 retired the expansion
+    // primitive that could produce more than one) — kept as a `Vec<String>`
+    // rather than a bare `String` so the `depends_on`/`reads` rewrite pass
+    // below (which `.extend()`s from it) doesn't need a second shape.
     let mut expansion_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for phase in &config.phases {
         let real_phase_id = substitute_phase_id(&phase.id, params);
         for task_cfg in &phase.tasks {
             let override_ = params.task_overrides.get(&task_cfg.id);
-            match &task_cfg.expand {
-                Some(spec) => {
-                    // (#1284 review round 2) A multi-step template would
-                    // silently drop every step after the first — refuse it
-                    // loudly instead. `validate()` flags the same document
-                    // shape ahead of time; this is the interpret-side guard
-                    // for a caller that skipped validation.
-                    if task_cfg.steps.len() > 1 {
-                        bail!(
-                            "task `{}` declares `expand` with {} steps — an expanding \
-                             template task must have exactly ONE step (the expansion \
-                             primitive clones one task/step pair per item; extra steps \
-                             would be silently dropped)",
-                            task_cfg.id,
-                            task_cfg.steps.len()
-                        );
-                    }
-                    let step_cfg = task_cfg.steps.first().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "task `{}` declares `expand` but has no steps to expand",
-                            task_cfg.id
-                        )
-                    })?;
-                    // (#1418) Absent vs empty: a key genuinely present with
-                    // an empty Vec (a zero-seat crew, e.g.) stays silent;
-                    // that leniency is deliberate and pinned by
-                    // `zero_items_in_the_expansion_collection_produces_zero_
-                    // real_copies_and_an_empty_dependency` below. A key with
-                    // NO entry at all in `params.expansions` is a likelier
-                    // config typo (the launcher meant to supply a collection
-                    // under this exact name and didn't): same lenient
-                    // zero-copy behavior, but named in `warnings` so the
-                    // caller can print it instead of the run silently
-                    // examining nothing.
-                    let items = match params.expansions.get(&spec.over) {
-                        Some(items) => items.clone(),
-                        None => {
-                            warnings.push(format!(
-                                "task `{}` declares `expand.over: \"{}\"`, which has no \
-                                 matching entry in the launcher's supplied expansions; \
-                                 treated as zero real copies (leniency preserved), but an \
-                                 absent key usually means a typo; a genuinely empty \
-                                 collection is supplied as an explicit empty list",
-                                task_cfg.id, spec.over
-                            ));
-                            Vec::new()
-                        }
-                    };
-                    let mut real_ids = Vec::with_capacity(items.len());
-                    for (index, name) in items.iter().enumerate() {
-                        let real_task_id = render(&spec.task_id_pattern, index, name);
-                        let real_step_id = render(&spec.step_id_pattern, index, name);
-                        let real_kind = render_kind(&spec.kind_pattern, &step_cfg.kind, index, name);
-                        let description = spec
-                            .description_pattern
-                            .as_deref()
-                            .map(|p| render(p, index, name))
-                            .or_else(|| task_cfg.description.clone())
-                            .unwrap_or_default();
-                        // (#1398) Same optional-pattern-with-unrendered-fallback
-                        // shape as `description_pattern` above — an expanding
-                        // template usually doesn't need a per-copy label
-                        // (`display_name_pattern` absent falls back to the
-                        // template's own `display_name` verbatim, unrendered).
-                        let display_name = spec
-                            .display_name_pattern
-                            .as_deref()
-                            .map(|p| render(p, index, name))
-                            .or_else(|| task_cfg.display_name.clone());
-                        // (#1475 packet 2) Per-copy role_id: `role_pattern`
-                        // renders one DISTINCT role per expanded copy (the
-                        // review probe stage binds copy 0 → review-probe-high,
-                        // etc.); absent falls back to the template's single
-                        // `role_id` (the pre-1.3 shared-role behavior).
-                        let copy_role_id = spec
-                            .role_pattern
-                            .as_deref()
-                            .map(|p| render(p, index, name))
-                            .or_else(|| task_cfg.role_id.clone());
-                        push_task(
-                            &mut tasks,
-                            &real_task_id,
-                            &real_phase_id,
-                            description,
-                            display_name,
-                            vec![real_step_id.clone()],
-                            override_,
-                            copy_role_id.as_deref(),
-                        )?;
-                        push_step(
-                            &mut steps,
-                            &real_step_id,
-                            &real_task_id,
-                            &real_kind,
-                            step_config_for(step_cfg, params),
-                        )?;
-                        real_ids.push(real_task_id);
-                    }
-                    expansion_of.insert(task_cfg.id.clone(), real_ids);
-                }
-                None => {
-                    let real_task_id = substitute_id(&task_cfg.id, &phase.id, &real_phase_id);
-                    let mut step_ids = Vec::with_capacity(task_cfg.steps.len());
-                    for step_cfg in &task_cfg.steps {
-                        let real_step_id = substitute_id(&step_cfg.id, &phase.id, &real_phase_id);
-                        step_ids.push(real_step_id.clone());
-                        push_step(
-                            &mut steps,
-                            &real_step_id,
-                            &real_task_id,
-                            &step_cfg.kind,
-                            step_config_for(step_cfg, params),
-                        )?;
-                    }
-                    let description =
-                        task_cfg.description.clone().unwrap_or_default();
-                    push_task(
-                        &mut tasks,
-                        &real_task_id,
-                        &real_phase_id,
-                        description,
-                        task_cfg.display_name.clone(),
-                        step_ids,
-                        override_,
-                        task_cfg.role_id.as_deref(),
-                    )?;
-                    expansion_of.insert(task_cfg.id.clone(), vec![real_task_id]);
-                }
+            let real_task_id = substitute_id(&task_cfg.id, &phase.id, &real_phase_id);
+            let mut step_ids = Vec::with_capacity(task_cfg.steps.len());
+            for step_cfg in &task_cfg.steps {
+                let real_step_id = substitute_id(&step_cfg.id, &phase.id, &real_phase_id);
+                step_ids.push(real_step_id.clone());
+                push_step(
+                    &mut steps,
+                    &real_step_id,
+                    &real_task_id,
+                    &step_cfg.kind,
+                    step_config_for(step_cfg, params),
+                )?;
             }
+            let description = task_cfg.description.clone().unwrap_or_default();
+            push_task(
+                &mut tasks,
+                &real_task_id,
+                &real_phase_id,
+                description,
+                task_cfg.display_name.clone(),
+                step_ids,
+                override_,
+                task_cfg.role_id.as_deref(),
+            )?;
+            expansion_of.insert(task_cfg.id.clone(), vec![real_task_id]);
         }
     }
 
     // Second pass: resolve every TaskConfig's `depends_on` AND `reads`
     // (#1619 — the ledger relation resolves identically) now that
-    // `expansion_of` is complete for the WHOLE document — a reference
-    // that named a template task's id resolves to ALL of that template's
-    // real expanded copies (dedup depending on every real probe task,
-    // never just the template's single placeholder id).
+    // `expansion_of` is complete for the WHOLE document.
     let real_index: BTreeMap<String, usize> =
         tasks.iter().enumerate().map(|(i, t)| (t.id.clone(), i)).collect();
     for phase in &config.phases {
@@ -324,15 +217,11 @@ fn check_params_reference_the_document(config: &MissionConfig, params: &LaunchPa
         config.phases.iter().map(|p| p.id.as_str()).collect();
     let mut task_ids = std::collections::BTreeSet::new();
     let mut step_ids = std::collections::BTreeSet::new();
-    let mut expansion_names = std::collections::BTreeSet::new();
     for phase in &config.phases {
         for task_cfg in &phase.tasks {
             task_ids.insert(task_cfg.id.as_str());
             for step_cfg in &task_cfg.steps {
                 step_ids.insert(step_cfg.id.as_str());
-            }
-            if let Some(spec) = &task_cfg.expand {
-                expansion_names.insert(spec.over.as_str());
             }
         }
     }
@@ -367,16 +256,6 @@ fn check_params_reference_the_document(config: &MissionConfig, params: &LaunchPa
             );
         }
     }
-    for key in params.expansions.keys() {
-        if !expansion_names.contains(key.as_str()) {
-            bail!(
-                "LaunchParams.expansions names collection `{key}`, which no task's \
-                 `expand.over` in mission config `{}` declares — a dangling key would \
-                 silently expand nothing",
-                config.id
-            );
-        }
-    }
     Ok(())
 }
 
@@ -406,17 +285,6 @@ fn substitute_id(id: &str, doc_phase_id: &str, real_phase_id: &str) -> String {
     }
 }
 
-fn render(pattern: &str, index: usize, name: &str) -> String {
-    pattern.replace("{index}", &index.to_string()).replace("{name}", name)
-}
-
-fn render_kind(pattern: &str, template_kind: &str, index: usize, name: &str) -> String {
-    pattern
-        .replace("{kind}", template_kind)
-        .replace("{index}", &index.to_string())
-        .replace("{name}", name)
-}
-
 fn step_config_for(step_cfg: &StepConfig, params: &LaunchParams) -> serde_json::Value {
     params
         .step_config_overrides
@@ -436,17 +304,13 @@ fn push_task(
     override_: Option<&TaskOverride>,
     doc_role_id: Option<&str>,
 ) -> Result<()> {
-    // (#1284 review round 2, consider 5) Post-substitution/expansion FINAL
-    // ids must be unique — an expansion pattern with neither `{index}` nor
-    // `{name}` (or a substitution collision) would otherwise produce
-    // same-id copies, and only this collision check catches the rendered
-    // (post-pattern) form. `Vec::contains` over a graph-sized Vec is fine —
+    // (#1284 review round 2, consider 5) Post-substitution FINAL ids must be
+    // unique — a phase-id substitution collision (two documents composed
+    // under the same real phase id) would otherwise produce same-id
+    // task/step pairs. `Vec::contains` over a graph-sized Vec is fine —
     // graphs here are tens of tasks, not thousands.
     if tasks.iter().any(|t| t.id == real_task_id) {
-        bail!(
-            "interpreted graph produced duplicate task id `{real_task_id}` — expansion \
-             patterns must render a distinct id per item (include `{{index}}` or `{{name}}`)"
-        );
+        bail!("interpreted graph produced duplicate task id `{real_task_id}`");
     }
     let role_id = override_
         .and_then(|o| o.role_id.clone())
@@ -493,10 +357,7 @@ fn push_step(
     // keep exactly one of two same-id steps — detect the collision on the
     // rendered final id instead (see `push_task`'s twin check).
     if steps.insert(real_step_id.to_string(), step).is_some() {
-        bail!(
-            "interpreted graph produced duplicate step id `{real_step_id}` — expansion \
-             patterns must render a distinct id per item (include `{{index}}` or `{{name}}`)"
-        );
+        bail!("interpreted graph produced duplicate step id `{real_step_id}`");
     }
     Ok(())
 }
@@ -504,7 +365,7 @@ fn push_step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mission_config::{ExpansionSpec, PhaseConfig, TaskConfig};
+    use crate::mission_config::{PhaseConfig, TaskConfig};
     use std::collections::BTreeMap as Map;
 
     fn step(id: &str, kind: &str, config: serde_json::Value) -> StepConfig {
@@ -520,7 +381,6 @@ mod tests {
             reads: Vec::new(),
             role_id: role_id.map(String::from),
             steps,
-            expand: None,
             extras: Map::new(),
         }
     }
@@ -706,248 +566,19 @@ mod tests {
         assert_eq!(steps["review-judge-step"].config, serde_json::json!({"concurrency": 1}));
     }
 
-    /// (#1475 packet 2) `role_pattern` renders a DISTINCT `role_id` per
-    /// expanded copy from the item — the mechanism the review probe stage uses
-    /// to bind copy 0 → review-probe-high, copy 1 → review-probe-mid, etc.
-    /// Absent, every copy shares the template's single `role_id`.
-    #[test]
-    fn expansion_role_pattern_renders_a_distinct_role_per_copy() {
-        let cfg = doc(vec![phase(
-            "investigate",
-            vec![TaskConfig {
-                id: "probe-template".to_string(),
-                description: None,
-                display_name: None,
-                depends_on: vec![],
-                reads: Vec::new(),
-                role_id: Some("fallback-role".to_string()),
-                steps: vec![step("probe-template-step", "dispatch.map", serde_json::Value::Null)],
-                expand: Some(ExpansionSpec {
-                    over: "probe_roles".to_string(),
-                    task_id_pattern: "probe-{index}-task".to_string(),
-                    step_id_pattern: "probe-{index}-step".to_string(),
-                    kind_pattern: "{kind}".to_string(),
-                    description_pattern: None,
-                    display_name_pattern: None,
-                    role_pattern: Some("{name}".to_string()),
-                    extras: Map::new(),
-                }),
-                extras: Map::new(),
-            }],
-        )]);
-        let mut phase_ids = Map::new();
-        phase_ids.insert("investigate".to_string(), "investigate".to_string());
-        let mut expansions = Map::new();
-        expansions.insert(
-            "probe_roles".to_string(),
-            vec!["review-probe-high".to_string(), "review-probe-mid".to_string()],
-        );
-        let params = LaunchParams { phase_ids, expansions, ..Default::default() };
-        let (tasks, _steps, _warnings) = interpret(&cfg, &params).unwrap();
-        let by_id: BTreeMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-        assert_eq!(by_id["probe-0-task"].role_id.as_deref(), Some("review-probe-high"));
-        assert_eq!(by_id["probe-1-task"].role_id.as_deref(), Some("review-probe-mid"));
-    }
-
-    /// The expansion primitive's central case — a template task expanding
-    /// into N real copies, one per staffed seat, AND a dependent task's
-    /// `depends_on` rewriting from the template id to every real expanded
-    /// id. Mirrors review.json's probe stage exactly.
-    #[test]
-    fn expansion_primitive_produces_one_copy_per_item_and_rewrites_dependents() {
-        let cfg = doc(vec![phase(
-            "investigate",
-            vec![
-                task("review-bundle-task", &[], None, vec![step("review-bundle-step", "review.bundle", serde_json::Value::Null)]),
-                TaskConfig {
-                    id: "review-probe-template-task".to_string(),
-                    description: Some("PLACEHOLDER".to_string()),
-                    display_name: None,
-                    depends_on: vec!["review-bundle-task".to_string()],
-                    reads: Vec::new(),
-                    role_id: None,
-                    steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
-                    expand: Some(ExpansionSpec {
-                        over: "probe_seats".to_string(),
-                        task_id_pattern: "review-probe-{index}-task".to_string(),
-                        step_id_pattern: "review-probe-{index}-step".to_string(),
-                        kind_pattern: "{kind}:{name}".to_string(),
-                        description_pattern: Some("probe seat `{name}`".to_string()),
-                        display_name_pattern: Some("Probe `{name}`".to_string()),
-                        role_pattern: None,
-                        extras: Map::new(),
-                    }),
-                    extras: Map::new(),
-                },
-                task(
-                    "review-dedup-task",
-                    &["review-probe-template-task"],
-                    None,
-                    vec![step("review-dedup-step", "review.dedup", serde_json::Value::Null)],
-                ),
-            ],
-        )]);
-        let mut phase_ids = Map::new();
-        phase_ids.insert("investigate".to_string(), "investigate".to_string());
-        let mut expansions = Map::new();
-        expansions.insert("probe_seats".to_string(), vec!["alpha".to_string(), "bravo".to_string()]);
-        let params = LaunchParams { phase_ids, expansions, ..Default::default() };
-
-        let (tasks, steps, _warnings) = interpret(&cfg, &params).unwrap();
-
-        // bundle + 2 expanded probes + dedup = 4 real tasks.
-        assert_eq!(tasks.len(), 4);
-        let by_id: BTreeMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-        assert!(by_id.contains_key("review-probe-0-task"));
-        assert!(by_id.contains_key("review-probe-1-task"));
-        assert_eq!(by_id["review-probe-0-task"].description, "probe seat `alpha`");
-        assert_eq!(by_id["review-probe-1-task"].description, "probe seat `bravo`");
-        assert_eq!(by_id["review-probe-0-task"].depends_on, vec!["review-bundle-task".to_string()]);
-        assert_eq!(by_id["review-probe-1-task"].depends_on, vec!["review-bundle-task".to_string()]);
-
-        assert_eq!(steps["review-probe-0-step"].kind, "review.probe:alpha");
-        assert_eq!(steps["review-probe-1-step"].kind, "review.probe:bravo");
-
-        // (#1398) `display_name_pattern` renders per-copy, same as
-        // `description_pattern` does.
-        assert_eq!(by_id["review-probe-0-task"].display_name.as_deref(), Some("Probe `alpha`"));
-        assert_eq!(by_id["review-probe-1-task"].display_name.as_deref(), Some("Probe `bravo`"));
-
-        // the dedup task's depends_on rewrote from the SINGLE template id
-        // to BOTH real expanded probe task ids.
-        assert_eq!(
-            by_id["review-dedup-task"].depends_on,
-            vec!["review-probe-0-task".to_string(), "review-probe-1-task".to_string()]
-        );
-    }
+    // (#1550 cluster item 2) The expansion primitive's tests
+    // (`expansion_role_pattern_renders_a_distinct_role_per_copy`,
+    // `expansion_primitive_produces_one_copy_per_item_and_rewrites_dependents`,
+    // `zero_items_in_the_expansion_collection_produces_zero_real_copies_and_an_empty_dependency`,
+    // `absent_expand_over_key_surfaces_a_warning_but_stays_lenient`,
+    // `present_but_empty_expansion_key_stays_silent`) were removed here along
+    // with `ExpansionSpec`/`TaskConfig::expand`/`LaunchParams::expansions` —
+    // see the module doc's #1550 note for why (both production launchers
+    // always fed an empty `expansions` map, so a document declaring `expand`
+    // interpreted to zero real copies on every real run).
 
     #[test]
-    fn zero_items_in_the_expansion_collection_produces_zero_real_copies_and_an_empty_dependency() {
-        let cfg = doc(vec![phase(
-            "investigate",
-            vec![
-                TaskConfig {
-                    id: "review-probe-template-task".to_string(),
-                    description: None,
-                    display_name: None,
-                    depends_on: vec![],
-                    reads: Vec::new(),
-                    role_id: None,
-                    steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
-                    expand: Some(ExpansionSpec {
-                        over: "probe_seats".to_string(),
-                        task_id_pattern: "review-probe-{index}-task".to_string(),
-                        step_id_pattern: "review-probe-{index}-step".to_string(),
-                        kind_pattern: "{kind}:{name}".to_string(),
-                        description_pattern: None,
-                        display_name_pattern: None,
-                        role_pattern: None,
-                        extras: Map::new(),
-                    }),
-                    extras: Map::new(),
-                },
-                task(
-                    "review-dedup-task",
-                    &["review-probe-template-task"],
-                    None,
-                    vec![step("review-dedup-step", "review.dedup", serde_json::Value::Null)],
-                ),
-            ],
-        )]);
-        // NO "probe_seats" entry in expansions at all -- an ABSENT key,
-        // which (#1418) is exactly the case `interpret` now also names in
-        // its returned `warnings` (see the sibling test right below). The
-        // ZERO-COPY behavior pinned here is unchanged, only the silence is
-        // gone.
-        let params = LaunchParams::default();
-
-        let (tasks, _steps, _warnings) = interpret(&cfg, &params).unwrap();
-        let by_id: BTreeMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-        assert!(!by_id.contains_key("review-probe-0-task"), "zero seats -> zero expanded copies");
-        assert!(by_id["review-dedup-task"].depends_on.is_empty(), "an empty expansion resolves to an empty dependency, not a dangling reference");
-    }
-
-    /// (#1418) The sibling of the pinned test above: an ABSENT
-    /// `expand.over` key (nothing under that name in `params.expansions`
-    /// at all) surfaces a warning naming the task and the missing key,
-    /// while keeping the SAME lenient zero-real-copies behavior. Leniency
-    /// stays, silence goes.
-    #[test]
-    fn absent_expand_over_key_surfaces_a_warning_but_stays_lenient() {
-        let cfg = doc(vec![phase(
-            "investigate",
-            vec![TaskConfig {
-                id: "review-probe-template-task".to_string(),
-                description: None,
-                display_name: None,
-                depends_on: vec![],
-                reads: Vec::new(),
-                role_id: None,
-                steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
-                expand: Some(ExpansionSpec {
-                    over: "probe_seats".to_string(),
-                    task_id_pattern: "review-probe-{index}-task".to_string(),
-                    step_id_pattern: "review-probe-{index}-step".to_string(),
-                    kind_pattern: "{kind}:{name}".to_string(),
-                    description_pattern: None,
-                    display_name_pattern: None,
-                    role_pattern: None,
-                    extras: Map::new(),
-                }),
-                extras: Map::new(),
-            }],
-        )]);
-        // NO "probe_seats" entry at all -- the ABSENT-key path.
-        let params = LaunchParams::default();
-
-        let (tasks, _steps, warnings) = interpret(&cfg, &params).unwrap();
-        assert!(tasks.is_empty(), "an absent key still produces zero real copies (leniency preserved)");
-        assert_eq!(warnings.len(), 1, "the absent key names exactly one warning: {warnings:?}");
-        assert!(warnings[0].contains("review-probe-template-task"), "{}", warnings[0]);
-        assert!(warnings[0].contains("probe_seats"), "{}", warnings[0]);
-    }
-
-    /// (#1418) The other half of the distinction: a key that IS present,
-    /// mapped to a genuinely empty `Vec` (e.g. a real zero-seat crew),
-    /// produces the SAME zero-real-copies result but NO warning. The
-    /// leniency for a truly empty collection stays silent, only an absent
-    /// key is named.
-    #[test]
-    fn present_but_empty_expansion_key_stays_silent() {
-        let cfg = doc(vec![phase(
-            "investigate",
-            vec![TaskConfig {
-                id: "review-probe-template-task".to_string(),
-                description: None,
-                display_name: None,
-                depends_on: vec![],
-                reads: Vec::new(),
-                role_id: None,
-                steps: vec![step("review-probe-template-step", "review.probe", serde_json::Value::Null)],
-                expand: Some(ExpansionSpec {
-                    over: "probe_seats".to_string(),
-                    task_id_pattern: "review-probe-{index}-task".to_string(),
-                    step_id_pattern: "review-probe-{index}-step".to_string(),
-                    kind_pattern: "{kind}:{name}".to_string(),
-                    description_pattern: None,
-                    display_name_pattern: None,
-                    role_pattern: None,
-                    extras: Map::new(),
-                }),
-                extras: Map::new(),
-            }],
-        )]);
-        let mut expansions = Map::new();
-        expansions.insert("probe_seats".to_string(), Vec::new());
-        let params = LaunchParams { expansions, ..Default::default() };
-
-        let (tasks, _steps, warnings) = interpret(&cfg, &params).unwrap();
-        assert!(tasks.is_empty(), "a present-but-empty key still produces zero real copies");
-        assert!(warnings.is_empty(), "a genuinely empty collection under a present key stays silent: {warnings:?}");
-    }
-
-    #[test]
-    fn cross_phase_depends_on_resolves_through_expansion_map() {
+    fn cross_phase_depends_on_resolves_across_phases() {
         // Mirrors `build_review_graph`'s synthesis -> dedup (investigate) +
         // verify (report) cross-phase edge.
         let cfg = doc(vec![
@@ -1032,15 +663,6 @@ mod tests {
     }
 
     #[test]
-    fn dangling_expansion_key_bails_naming_the_key() {
-        let mut expansions = Map::new();
-        expansions.insert("probe_seatz".to_string(), vec!["alpha".to_string()]);
-        let params = LaunchParams { expansions, ..Default::default() };
-        let err = interpret(&simple_doc(), &params).unwrap_err();
-        assert!(err.to_string().contains("probe_seatz"), "{err:#}");
-    }
-
-    #[test]
     fn dangling_phase_id_key_bails_naming_the_key() {
         let mut phase_ids = Map::new();
         phase_ids.insert("p1-typo".to_string(), "real-p1".to_string());
@@ -1049,68 +671,14 @@ mod tests {
         assert!(err.to_string().contains("p1-typo"), "{err:#}");
     }
 
-    // ── (#1284 review round 2, consider 5) template + collision guards ─
-
-    fn expanding_task(task_id_pattern: &str, step_id_pattern: &str, steps: Vec<StepConfig>) -> TaskConfig {
-        TaskConfig {
-            id: "template".to_string(),
-            description: None,
-            display_name: None,
-            depends_on: vec![],
-            reads: Vec::new(),
-            role_id: None,
-            steps,
-            expand: Some(ExpansionSpec {
-                over: "items".to_string(),
-                task_id_pattern: task_id_pattern.to_string(),
-                step_id_pattern: step_id_pattern.to_string(),
-                kind_pattern: "{kind}:{name}".to_string(),
-                description_pattern: None,
-                display_name_pattern: None,
-                role_pattern: None,
-                extras: Map::new(),
-            }),
-            extras: Map::new(),
-        }
-    }
-
-    fn two_item_params() -> LaunchParams {
-        let mut expansions = Map::new();
-        expansions.insert("items".to_string(), vec!["a".to_string(), "b".to_string()]);
-        LaunchParams { expansions, ..Default::default() }
-    }
-
-    #[test]
-    fn multi_step_template_task_is_a_loud_error_not_a_silent_drop() {
-        let cfg = doc(vec![phase(
-            "p1",
-            vec![expanding_task(
-                "t-{index}",
-                "s-{index}",
-                vec![
-                    step("tpl-s1", "review.probe", serde_json::Value::Null),
-                    step("tpl-s2", "review.probe", serde_json::Value::Null),
-                ],
-            )],
-        )]);
-        let err = interpret(&cfg, &two_item_params()).unwrap_err();
-        assert!(err.to_string().contains("exactly ONE step"), "{err:#}");
-    }
-
-    #[test]
-    fn expansion_patterns_without_placeholders_collide_and_bail() {
-        // Neither {index} nor {name} in the patterns — both copies render
-        // the SAME task/step id; the steps BTreeMap would silently keep one
-        // without the collision check.
-        let cfg = doc(vec![phase(
-            "p1",
-            vec![expanding_task(
-                "t-fixed",
-                "s-fixed",
-                vec![step("tpl-s1", "review.probe", serde_json::Value::Null)],
-            )],
-        )]);
-        let err = interpret(&cfg, &two_item_params()).unwrap_err();
-        assert!(err.to_string().contains("duplicate"), "{err:#}");
-    }
+    // (#1550 cluster item 2) `dangling_expansion_key_bails_naming_the_key`,
+    // `expanding_task`/`two_item_params`, `multi_step_template_task_is_a_
+    // loud_error_not_a_silent_drop`, and `expansion_patterns_without_
+    // placeholders_collide_and_bail` were removed with the expansion
+    // primitive — see the module doc's #1550 note. The duplicate-id
+    // collision guard itself (`push_task`/`push_step`) is still real code
+    // (a phase-id substitution collision could still trigger it), just no
+    // longer reachable via `expand`'s no-placeholder case; there is no
+    // OTHER known way to trigger a same-document-id collision today, so no
+    // replacement test was added for it in isolation.
 }

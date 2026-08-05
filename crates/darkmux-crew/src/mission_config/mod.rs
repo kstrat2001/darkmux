@@ -12,10 +12,12 @@
 //! both over to load their config through this module and call
 //! [`interpret`] instead. Packet 1 built the schema, the loader, the
 //! built-in transcriptions of those two graphs, and the `darkmux doctor`
-//! surface. Packet 3 added [`interpret`] itself plus the typed expansion
-//! primitive ([`ExpansionSpec`]) that replaced review.json's original
-//! `expands_per_staffed_seat` placeholder bool (schema 1.0 → 1.1, additive
-//! per contract 5).
+//! surface. Packet 3 added [`interpret`] itself (schema 1.0 → 1.1, additive
+//! per contract 5) plus, at the time, a typed expansion primitive that
+//! replaced review.json's original `expands_per_staffed_seat` placeholder
+//! bool — retired in schema 2.0 (#1550 cluster item 2; a MAJOR bump — see
+//! [`MISSION_CONFIG_SCHEMA`]'s doc) once #1512's review dissolution moved
+//! the one real consumer to static per-role tasks.
 //!
 //! **Lenient-on-read (contract 7, `CLAUDE.md` "Cross-system contracts"):**
 //! every struct here carries `#[serde(flatten)] extras` overflow, optional
@@ -47,20 +49,47 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (`darkmux-eureka`), `FLOW_SCHEMA_VERSION` (`darkmux-flow`),
 /// `CONFIG_SCHEMA_VERSION` (`darkmux-types::config`). Started at "1.0"
 /// (#1284 Packet 1); bumped to "1.1" in Packet 3 — additive: [`TaskConfig`]
-/// gained the optional `expand` field ([`ExpansionSpec`]), replacing
-/// review.json's original `expands_per_staffed_seat` prose-`notes` bool
-/// placeholder with a typed, interpretable primitive. Bumped to "1.2"
-/// (#1398) — additive: [`PhaseConfig`] and [`TaskConfig`] gained the
-/// optional `display_name` field (an operator-facing short label, split
-/// from `description` which is deliberately long — see each field's own
-/// doc), and [`ExpansionSpec`] gained the optional `display_name_pattern`
-/// twin of its existing `description_pattern`. Bumped to "1.3" (#1475 packet
-/// 2) — additive: [`ExpansionSpec`] gained the optional `role_pattern` (a
-/// per-expanded-copy `role_id`, so the review probe stage binds one distinct
-/// role per expanded task). Bump discipline (see `CLAUDE.md`'s "Versioning" —
-/// same rule, different data shape): additive field/section → minor;
-/// rename/retype/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "1.4";
+/// gained the optional `expand` field (`ExpansionSpec`, since removed — see
+/// below), replacing review.json's original `expands_per_staffed_seat`
+/// prose-`notes` bool placeholder with a typed, interpretable primitive.
+/// Bumped to "1.2" (#1398) — additive: [`PhaseConfig`] and [`TaskConfig`]
+/// gained the optional `display_name` field (an operator-facing short
+/// label, split from `description` which is deliberately long — see each
+/// field's own doc), and `ExpansionSpec` gained the optional
+/// `display_name_pattern` twin of its existing `description_pattern`.
+/// Bumped to "1.3" (#1475 packet 2) — additive: `ExpansionSpec` gained the
+/// optional `role_pattern` (a per-expanded-copy `role_id`, so the review
+/// probe stage binds one distinct role per expanded task). Bumped to "1.4"
+/// (#1619) — additive: [`TaskConfig`] gained the optional `reads` field (the
+/// run-scoped output ledger made nameable).
+///
+/// Bumped to **"2.0"** (#1550 cluster item 2) — a MAJOR bump, not minor:
+/// `TaskConfig::expand`/`ExpansionSpec`/`interpret::LaunchParams::expansions`
+/// were REMOVED (all three retired from this crate — no longer valid
+/// doc-links). Per this constant's own bump discipline (below) — and
+/// `CLAUDE.md`'s "Versioning" section, the same rule applied to a different
+/// data shape — a field REMOVAL is breaking, full stop, regardless of
+/// whether the removed field was ever load-bearing in production. (It
+/// wasn't, as it happens: both production launchers always fed an empty
+/// `expansions` map, so a document declaring `expand` interpreted to ZERO
+/// real copies on every real run — retired per #1512's dissolution, once the
+/// one real consumer, the review probe stage, moved to static per-role
+/// tasks and stopped needing runtime expansion. That history explains WHY
+/// the field was safe to remove; it does not downgrade the bump — a
+/// removed field is major by the rule itself, not by how much a specific
+/// removal happened to matter in practice.)
+///
+/// Lenient-on-read (contract 7) still holds at the wire level: a document
+/// that still declares `expand` parses cleanly — the key overflows into
+/// `extras`, inert — but [`MissionConfig::validate`] now flags it as a loud
+/// `Error` (a REMOVED field silently losing its meaning is never safe to
+/// stay quiet about, unlike an ADDITIVE field a future consumer can safely
+/// ignore per the minor-bump contract).
+///
+/// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
+/// data shape): additive field/section → minor; rename/retype/removed
+/// field/new-required-field → major.
+pub const MISSION_CONFIG_SCHEMA: &str = "2.0";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,8 +213,7 @@ pub struct TaskConfig {
     pub description: Option<String>,
     /// (#1398) Operator-facing short label — same overload split as
     /// [`PhaseConfig::display_name`], one level down. `None` falls back to
-    /// `id` everywhere a Task renders. See [`ExpansionSpec::display_name_pattern`]
-    /// for the expanding-template-task variant.
+    /// `id` everywhere a Task renders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -206,8 +234,7 @@ pub struct TaskConfig {
     /// short-circuits. Data flow now rides the ledger invisibly; `depends_on`
     /// is left for ordering the graph should SHOW (typically intra-phase).
     ///
-    /// Like `depends_on`, entries are DOCUMENT-WIDE task ids, may name a
-    /// template task (resolving to all its expanded copies), and join the
+    /// Like `depends_on`, entries are DOCUMENT-WIDE task ids and join the
     /// same cycle detection — a `reads` loop is as unschedulable as a
     /// `depends_on` loop.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -223,89 +250,15 @@ pub struct TaskConfig {
     /// purely positional intra-task ordering).
     #[serde(default)]
     pub steps: Vec<StepConfig>,
-    /// (#1284 Packet 3, schema 1.1) When present, this `TaskConfig` is a
-    /// TEMPLATE: [`interpret::interpret`] does not emit it as one real
-    /// Task/Step pair — it emits N copies, one per item in the launcher's
-    /// [`interpret::LaunchParams::expansions`] collection named by
-    /// [`ExpansionSpec::over`]. Replaces the pre-1.1 `expands_per_staffed_seat`
-    /// bool + prose `notes` extras review.json originally shipped (#1284
-    /// Packet 1) — this is the typed, actually-interpretable version of
-    /// that same placeholder. See [`ExpansionSpec`]'s own doc for the
-    /// expansion mechanics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expand: Option<ExpansionSpec>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
-/// Declares that the owning [`TaskConfig`] is a TEMPLATE expanded into N
-/// real Task/Step copies at interpretation time — the general primitive
-/// review.json's probe stage needs (one `review.probe:<seat-name>` Task per
-/// STAFFED seat, a count only known once crew staffing resolves at launch)
-/// but written so no field names "probe" or "seat" — any future mission
-/// needing "one Task per item in a launch-resolved collection" reuses this
-/// same shape.
-///
-/// `{index}` (0-based position) and `{name}` (the item's own name) are the
-/// only placeholders every pattern field supports; [`kind_pattern`] also
-/// supports `{kind}` (the template step's own `kind`, e.g. `"review.probe"`
-/// expanding to `"review.probe:alpha"`).
-///
-/// [`kind_pattern`]: ExpansionSpec::kind_pattern
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ExpansionSpec {
-    /// Name of the launch-time collection [`interpret::LaunchParams::expansions`]
-    /// resolves this task's copies from — e.g. `"probe_seats"`. The schema
-    /// only records the NAME; the launcher decides what populates it (the
-    /// review launcher resolves it from `staffing`'s staffed probe
-    /// seats, in staffing order).
-    pub over: String,
-    /// Real Task-id pattern for one expanded copy, e.g.
-    /// `"review-probe-{index}-task"`.
-    pub task_id_pattern: String,
-    /// Real Step-id pattern for one expanded copy's (single) step, e.g.
-    /// `"review-probe-{index}-step"`.
-    pub step_id_pattern: String,
-    /// Real step-kind pattern — e.g. `"{kind}:{name}"` (the default),
-    /// which turns the template step's `kind: "review.probe"` into
-    /// `"review.probe:alpha"` for the `alpha` seat. A mission whose
-    /// per-item `StepKind`s don't need a distinct registered id per copy
-    /// (all copies dispatch through the SAME registered kind, keyed by
-    /// `input`/`config` alone) sets this to the literal `"{kind}"`.
-    #[serde(default = "default_kind_pattern")]
-    pub kind_pattern: String,
-    /// Description pattern for one expanded copy, e.g. "probe seat
-    /// `{name}`" (rendered as an actual seat name at interpretation time).
-    /// Falls back to the template `TaskConfig.description` verbatim
-    /// (unrendered) when absent — adequate for a mission that doesn't need
-    /// a per-copy description.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description_pattern: Option<String>,
-    /// (#1398) Display-name pattern for one expanded copy, e.g. `"probe
-    /// `{name}`"`. Same shape and same fallback as
-    /// [`description_pattern`](Self::description_pattern): falls back to
-    /// the template `TaskConfig.display_name` verbatim (unrendered) when
-    /// absent — adequate for a mission whose expanded copies don't need a
-    /// distinct per-copy label.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name_pattern: Option<String>,
-    /// (#1475 packet 2, schema 1.3) Per-copy `role_id` pattern. When present,
-    /// each expanded copy's `Task.role_id` renders from it (`{name}` = the
-    /// item — for the review probe stage the item IS the probe role id, so
-    /// `role_pattern: "{name}"` binds copy 0 → `review-probe-high`, copy 1 →
-    /// `review-probe-mid`, copy 2 → `review-probe-low`). Absent falls back to
-    /// the template `TaskConfig.role_id` verbatim (every copy shares one role,
-    /// the pre-1.3 behavior) — this is how a config assigns a DISTINCT role
-    /// per expanded task, which the fixed template `role_id` could not.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role_pattern: Option<String>,
-    #[serde(flatten)]
-    pub extras: BTreeMap<String, serde_json::Value>,
-}
-
-fn default_kind_pattern() -> String {
-    "{kind}:{name}".to_string()
-}
+// (#1550 cluster item 2) `ExpansionSpec` — the "one `TaskConfig` template
+// expands into N real Task/Step copies" primitive — and its
+// `default_kind_pattern` helper were removed here. See
+// `MISSION_CONFIG_SCHEMA`'s doc (schema 2.0) for why: fully specified, fully
+// interpreted, but never actually fed by either production launcher.
 
 /// One step, as data. `kind` names a REGISTERED `step_kinds::StepKind` id —
 /// Tier 1 generic (e.g. `"dispatch.internal"`), Tier 2 pattern, or a Tier 3
@@ -489,79 +442,59 @@ impl MissionConfig {
                     }
                 }
 
-                // (#swarm-5) A NON-expanding task with zero steps is a
-                // graph the scheduler can never finish: a task's status
-                // derives from its steps, so with none it can never reach
-                // Complete — it wedges Planned forever, every downstream
-                // `depends_on` never unblocks, and the mission sits
-                // permanently stuck with nothing erroring. That is a
-                // composition mistake, and this is exactly the load-time/
-                // doctor surface composition mistakes are supposed to fail
-                // loudly at (contract 7: lenient on READ, loud at
-                // validate) — not a runtime hang the operator diagnoses
-                // from a frozen graph lens. An EXPANDING task is exempt:
-                // its steps materialize per-item at interpret time, and its
-                // own arm below enforces exactly-one template step.
-                if task.expand.is_none() && task.steps.is_empty() {
+                // (#swarm-5) A task with zero steps is a graph the
+                // scheduler can never finish: a task's status derives from
+                // its steps, so with none it can never reach Complete — it
+                // wedges Planned forever, every downstream `depends_on`
+                // never unblocks, and the mission sits permanently stuck
+                // with nothing erroring. That is a composition mistake, and
+                // this is exactly the load-time/doctor surface composition
+                // mistakes are supposed to fail loudly at (contract 7:
+                // lenient on READ, loud at validate) — not a runtime hang
+                // the operator diagnoses from a frozen graph lens. (#1550
+                // cluster item 2: the EXPANDING-task exemption this check
+                // used to carry — a template task's steps materialize
+                // per-item at interpret time — retired with the expansion
+                // primitive; every task's steps are now real from the
+                // document, so the exemption's premise is gone too.)
+                if task.steps.is_empty() {
                     findings.push(ValidationFinding {
                         severity: FindingSeverity::Error,
                         path: format!("{task_path}.steps"),
                         message: format!(
-                            "task \"{}\" has no steps and no `expand` — the scheduler can \
-                             never complete it, so it would wedge the mission graph forever \
-                             (every task derives completion from its steps)",
+                            "task \"{}\" has no steps — the scheduler can never complete it, \
+                             so it would wedge the mission graph forever (every task derives \
+                             completion from its steps)",
                             task.id
                         ),
                     });
                 }
 
-                // (#1284 review round 2, consider 5) `expand` template
-                // integrity — these mirror `interpret`'s own loud-error
-                // guards so the problems surface at doctor/validate time,
-                // before a launch trips over them.
-                if let Some(spec) = &task.expand {
-                    let expand_path = format!("{task_path}.expand");
-                    if spec.over.trim().is_empty() {
-                        findings.push(ValidationFinding {
-                            severity: FindingSeverity::Error,
-                            path: format!("{expand_path}.over"),
-                            message: format!(
-                                "task \"{}\" declares `expand` with an empty `over` — the \
-                                 launcher has no collection name to resolve",
-                                task.id
-                            ),
-                        });
-                    }
-                    for (field, pattern) in [
-                        ("task_id_pattern", &spec.task_id_pattern),
-                        ("step_id_pattern", &spec.step_id_pattern),
-                    ] {
-                        if !pattern.contains("{index}") && !pattern.contains("{name}") {
-                            findings.push(ValidationFinding {
-                                severity: FindingSeverity::Error,
-                                path: format!("{expand_path}.{field}"),
-                                message: format!(
-                                    "task \"{}\"'s `expand.{field}` \"{pattern}\" contains \
-                                     neither {{index}} nor {{name}} — every expanded copy \
-                                     would render the SAME id and collide",
-                                    task.id
-                                ),
-                            });
-                        }
-                    }
-                    if task.steps.len() > 1 {
-                        findings.push(ValidationFinding {
-                            severity: FindingSeverity::Error,
-                            path: format!("{task_path}.steps"),
-                            message: format!(
-                                "task \"{}\" declares `expand` with {} steps — an expanding \
-                                 template task must have exactly ONE step (the expansion \
-                                 primitive clones one task/step pair per item)",
-                                task.id,
-                                task.steps.len()
-                            ),
-                        });
-                    }
+                // (#1550 cluster item 2, operator correction 2) `expand` was
+                // a REAL field through schema 1.4; `TaskConfig`'s
+                // `#[serde(flatten)] extras` overflow means a document still
+                // declaring it parses cleanly (contract 7, lenient-on-read)
+                // and SILENTLY loses its fan-out — worse than the
+                // additive-newer-minor hazard #1648 guards (there ignoring
+                // an unknown field is at least arguably safe for a FUTURE
+                // schema); there is no future schema where `expand` becomes
+                // meaningful again, so staying silent here is never
+                // appropriate. Loud at validate/doctor time, not a runtime
+                // surprise where the fan-out just never happens.
+                if task.extras.contains_key("expand") {
+                    findings.push(ValidationFinding {
+                        severity: FindingSeverity::Error,
+                        path: format!("{task_path}.expand"),
+                        message: format!(
+                            "task \"{}\" declares `expand`, which was REMOVED in schema 2.0 \
+                             (see MISSION_CONFIG_SCHEMA's doc) — this key now overflows into \
+                             extras and is silently ignored, dropping the fan-out this document \
+                             expected. Declare the expanded tasks explicitly instead, one \
+                             TaskConfig per item (the built-in \"review\" config's probe stage \
+                             is the reference shape, #1512)",
+                            task.id
+                        ),
+                    });
                 }
 
                 for (si, step) in task.steps.iter().enumerate() {
@@ -722,7 +655,6 @@ mod tests {
             reads: Vec::new(),
             role_id: None,
             steps,
-            expand: None,
             extras: BTreeMap::new(),
         }
     }
@@ -912,13 +844,17 @@ mod tests {
         assert_eq!(f.to_string(), "[warning] phases[0].id: test message");
     }
 
-    /// (#swarm-5) A non-expanding task with zero steps can never reach
-    /// Complete (a task derives completion from its steps), so it wedges
-    /// the mission graph forever with nothing erroring. That is a
-    /// composition mistake and must fail HERE — at validate/doctor time —
-    /// not surface as a frozen graph lens mid-run.
+    /// (#swarm-5) A task with zero steps can never reach Complete (a task
+    /// derives completion from its steps), so it wedges the mission graph
+    /// forever with nothing erroring. That is a composition mistake and must
+    /// fail HERE — at validate/doctor time — not surface as a frozen graph
+    /// lens mid-run. (#1550 cluster item 2: the EXPANDING-task exemption
+    /// this test used to also pin was retired along with the expansion
+    /// primitive — every task's steps are real from the document now, so
+    /// there's no "materializes per-item at interpret time" case left to
+    /// exempt.)
     #[test]
-    fn zero_step_non_expanding_task_is_an_error() {
+    fn zero_step_task_is_an_error() {
         let cfg = doc(vec![phase("p1", vec![task("hollow", &[], vec![])])]);
         let findings = cfg.validate(&[]);
         assert!(
@@ -935,110 +871,90 @@ mod tests {
             !ok.validate(&[]).iter().any(|f| f.severity == FindingSeverity::Error),
             "a one-step task must not trip the zero-step error"
         );
+    }
 
-        // An EXPANDING task is exempt: its steps materialize per-item at
-        // interpret time (and its own arm enforces exactly-one template
-        // step) — the zero-step rule must not fire on it.
-        let expanding = doc(vec![phase(
-            "p1",
-            vec![expanding_task_with("bundles", "t-{index}", "s-{index}", vec![step("s1", "dispatch.map")])],
-        )]);
+    // (#1550 cluster item 2) The `ExpansionSpec` validation tests
+    // (`expanding_task_with`, `expand_with_empty_over_is_an_error`,
+    // `expand_patterns_without_index_or_name_are_errors`,
+    // `expand_template_with_more_than_one_step_is_an_error`,
+    // `well_formed_expand_block_validates_clean`) were removed here along
+    // with the expansion primitive itself — see `MISSION_CONFIG_SCHEMA`'s
+    // doc (schema 2.0) for why.
+
+    /// (#1550 cluster item 2, operator correction 2) RED case: a document
+    /// still declaring `expand` on a task parses cleanly (contract 7 —
+    /// `extras` swallows the unknown key) but the key is now DEAD — schema
+    /// 2.0 removed the field entirely, and unlike an additive-minor-ahead
+    /// document (#1648, where ignoring an unknown field is at least
+    /// arguably safe for a FUTURE schema), there is no future schema where
+    /// `expand` means anything again. Silence here would let an operator's
+    /// config keep "declaring" a fan-out that never happens. Must be an
+    /// Error, naming the field, the schema version it was removed in, and
+    /// what to do instead.
+    #[test]
+    fn a_task_still_declaring_expand_is_a_loud_validate_error() {
+        let json = r#"{"id":"m","name":"M","phases":[{"id":"p1","tasks":[
+            {"id":"t1","steps":[{"id":"s1","kind":"dispatch.internal"}],
+             "expand":{"over":"items","task_id_pattern":"t-{index}","step_id_pattern":"s-{index}"}}
+        ]}]}"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        // Parses cleanly — `expand` overflows into extras (contract 7).
+        assert!(cfg.phases[0].tasks[0].extras.contains_key("expand"));
+
+        let findings = cfg.validate(&["dispatch.internal"]);
+        let err = findings
+            .iter()
+            .find(|f| f.severity == FindingSeverity::Error && f.path.ends_with(".expand"))
+            .unwrap_or_else(|| panic!("expected an `expand`-removed error, got {findings:?}"));
+        assert!(err.message.contains("t1"), "names the task: {}", err.message);
         assert!(
-            !expanding
-                .validate(&[])
+            err.message.contains("REMOVED in schema 2.0"),
+            "names the removal + version: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("Declare the expanded tasks explicitly instead"),
+            "says what to do instead: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_task_without_expand_in_extras_does_not_trip_the_removed_field_error() {
+        let cfg = doc(vec![phase("p1", vec![task("t1", &[], vec![step("s1", "dispatch.internal")])])]);
+        assert!(
+            !cfg.validate(&["dispatch.internal"]).iter().any(|f| f.path.ends_with(".expand")),
+            "a document with no `expand` key must never trip this check"
+        );
+
+        // (#1550 QA finding) An empty-extras task alone would not catch a
+        // guard that fired on ANY extras key rather than on `expand`
+        // specifically. Parsed through serde so the extras map is populated
+        // the way production populates it — `notes` is a real key the
+        // built-in review config carries on two tasks, so this is the shape
+        // that would actually regress.
+        let with_other_extras: MissionConfig = serde_json::from_str(
+            r#"{
+                "id": "t", "name": "T",
+                "phases": [{ "id": "p1", "tasks": [{
+                    "id": "t1",
+                    "notes": "an ordinary extras key, not a removed field",
+                    "steps": [{ "id": "s1", "kind": "dispatch.internal" }]
+                }]}]
+            }"#,
+        )
+        .expect("parses");
+        assert!(
+            !with_other_extras.phases[0].tasks[0].extras.is_empty(),
+            "precondition: the task must actually carry an extras key"
+        );
+        assert!(
+            !with_other_extras
+                .validate(&["dispatch.internal"])
                 .iter()
-                .any(|f| f.severity == FindingSeverity::Error && f.message.contains("no steps")),
-            "an expanding task must never trip the zero-step error"
+                .any(|f| f.path.ends_with(".expand")),
+            "the check must key on `expand` specifically, never on extras being non-empty"
         );
-    }
-
-    // ── (#1284 review round 2, consider 5) ExpansionSpec validation ────
-
-    fn expanding_task_with(over: &str, task_pat: &str, step_pat: &str, steps: Vec<StepConfig>) -> TaskConfig {
-        TaskConfig {
-            id: "template".to_string(),
-            description: None,
-            display_name: None,
-            depends_on: vec![],
-            reads: Vec::new(),
-            role_id: None,
-            steps,
-            expand: Some(ExpansionSpec {
-                over: over.to_string(),
-                task_id_pattern: task_pat.to_string(),
-                step_id_pattern: step_pat.to_string(),
-                kind_pattern: "{kind}:{name}".to_string(),
-                description_pattern: None,
-                display_name_pattern: None,
-                role_pattern: None,
-                extras: BTreeMap::new(),
-            }),
-            extras: BTreeMap::new(),
-        }
-    }
-
-    #[test]
-    fn expand_with_empty_over_is_an_error() {
-        let cfg = doc(vec![phase(
-            "p1",
-            vec![expanding_task_with("", "t-{index}", "s-{index}", vec![step("s1", "review.probe")])],
-        )]);
-        let findings = cfg.validate(&[]);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.severity == FindingSeverity::Error && f.path.ends_with(".expand.over")),
-            "expected an empty-over error, got {findings:?}"
-        );
-    }
-
-    #[test]
-    fn expand_patterns_without_index_or_name_are_errors() {
-        let cfg = doc(vec![phase(
-            "p1",
-            vec![expanding_task_with("items", "t-fixed", "s-fixed", vec![step("s1", "review.probe")])],
-        )]);
-        let findings = cfg.validate(&[]);
-        for field in ["task_id_pattern", "step_id_pattern"] {
-            assert!(
-                findings.iter().any(|f| f.severity == FindingSeverity::Error
-                    && f.path.ends_with(&format!(".expand.{field}"))),
-                "expected a collision error on {field}, got {findings:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn expand_template_with_more_than_one_step_is_an_error() {
-        let cfg = doc(vec![phase(
-            "p1",
-            vec![expanding_task_with(
-                "items",
-                "t-{index}",
-                "s-{index}",
-                vec![step("s1", "review.probe"), step("s2", "review.probe")],
-            )],
-        )]);
-        let findings = cfg.validate(&[]);
-        assert!(
-            findings.iter().any(|f| f.severity == FindingSeverity::Error
-                && f.message.contains("exactly ONE step")),
-            "expected a multi-step-template error, got {findings:?}"
-        );
-    }
-
-    #[test]
-    fn well_formed_expand_block_validates_clean() {
-        let cfg = doc(vec![phase(
-            "p1",
-            vec![expanding_task_with(
-                "items",
-                "t-{index}",
-                "s-{name}",
-                vec![step("s1", "review.probe")],
-            )],
-        )]);
-        assert!(cfg.is_valid(&[]));
     }
 
     // ─── Built-in config golden-shape tests (#1284 Packet 1) ──────────
@@ -1084,10 +1000,12 @@ mod tests {
         let phase_ids: Vec<&str> = cfg.phases.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(phase_ids, vec!["investigate", "adjudicate", "report"]);
 
-        // (#1512) No `expand` template — three EXPLICIT one-role probe
-        // tasks, statically declared, each depending only on the bundle
-        // task (parallelism emergent from `depends_on`, never a "parallel"
-        // flag).
+        // (#1512) Three EXPLICIT one-role probe tasks, statically declared
+        // (the expansion primitive that could have made these a dynamic
+        // template was retired in #1550 cluster item 2 — see
+        // `MISSION_CONFIG_SCHEMA`'s doc, schema 2.0), each depending only
+        // on the bundle task (parallelism emergent from `depends_on`, never
+        // a "parallel" flag).
         let investigate = &cfg.phases[0];
         let investigate_task_ids: Vec<&str> =
             investigate.tasks.iter().map(|t| t.id.as_str()).collect();
@@ -1113,7 +1031,6 @@ mod tests {
                 vec!["review-bundle-task".to_string()],
                 "task `{task_id}` depends only on the bundle task"
             );
-            assert!(task.expand.is_none(), "no `expand` template — every probe task is explicit (#1512)");
             // (#1530 follow-on, Packet A1) Each probe task is now TWO
             // sequential steps — the Tier-3 `review.probe-render` step
             // (renders this seat's prompt collection AT RUN TIME), then
@@ -1335,9 +1252,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_1_4() {
-        // (#1619) Additive minor bump for `TaskConfig.reads` — the output
-        // ledger relation (data + ordering without a rendered edge).
-        assert_eq!(MISSION_CONFIG_SCHEMA, "1.4");
+    fn schema_version_constant_is_2_0() {
+        // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
+        // `LaunchParams::expansions` primitive — never fed by either
+        // production launcher. A field REMOVAL is a MAJOR bump per this
+        // constant's own doc (and CLAUDE.md's Versioning section, the same
+        // rule applied to a different data shape) — not the minor 1.5 an
+        // earlier draft of this change used.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "2.0");
     }
 }

@@ -6176,13 +6176,13 @@ pub fn build_review_graph_from_config(
         json!({ "concurrency": judge_concurrency }),
     );
 
-    // (#1512) No expansion collection — the probe stage is static tasks in
-    // the document now, not a template.
+    // (#1512) The probe stage is static tasks in the document, not a
+    // template — no expansion collection to feed (the primitive that would
+    // have needed one was retired in #1550 cluster item 2).
     let params = LaunchParams {
         phase_ids,
         task_overrides: std::collections::BTreeMap::new(),
         step_config_overrides,
-        expansions: std::collections::BTreeMap::new(),
     };
 
     let (mut tasks, mut steps, mut interpret_warnings) = interpret(config, &params)
