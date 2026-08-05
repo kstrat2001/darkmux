@@ -195,6 +195,26 @@ pub type DynBookendGuard<'a> = BookendGuard<'a, dyn BookendSink + 'a>;
 /// hostname always contains `azure`, e.g. `*.cognitiveservices.azure.com`
 /// or `*.openai.azure.com`), and host is all this function is given.
 pub fn remote_route_label(host: &str, model_id: &str) -> String {
+    // (#1660) Strip URL userinfo before the `@`, HERE rather than in each
+    // caller. This function is the single point every route label flows
+    // through, so sanitizing at the chokepoint makes every caller — present
+    // and future — safe by construction instead of by remembering.
+    //
+    // It was previously by remembering, and two of three callers forgot:
+    // `dispatch_internal::remote_endpoint_label` (the dispatch path) and
+    // `mission_launch_review::crew_route_label` both handed over a raw
+    // authority. Only `review.rs`'s `seat_endpoint_host` stripped it, and
+    // its comment spells out why: nothing stops an operator pasting
+    // `https://tok@proxy/v1` into a profile's `url` — some LiteLLM/proxy
+    // setups document exactly that form — and these labels ride into flow
+    // records, `MemberRecord.endpoint`, and the run envelope, which CI
+    // uploads as a PUBLIC artifact. The sanctioned way to carry a key is
+    // `EndpointAuth` (a Keychain item name or an env-var name, never a
+    // value); a URL-embedded token is operator error, but leaking it is
+    // ours.
+    //
+    // Idempotent, so the caller that already strips stays correct.
+    let host = host.rsplit('@').next().unwrap_or(host);
     let kind = if host.contains("azure") { "azure" } else { "openai" };
     format!("{kind}:{host}/{model_id}")
 }
