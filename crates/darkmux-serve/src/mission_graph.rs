@@ -548,7 +548,7 @@ pub fn resolve_step_label(kind: &str, step_id: &str) -> String {
 /// (this read-only path has no access to the launcher's dynamic expansion
 /// inputs), so that arm pattern-matched against the template instead. The
 /// expansion primitive was retired (see `darkmux_crew::mission_config`'s
-/// `MISSION_CONFIG_SCHEMA` doc, schema 1.5); every task's real id is now
+/// `MISSION_CONFIG_SCHEMA` doc, schema 2.0); every task's real id is now
 /// recoverable exactly via the placeholder-prefix substitution alone.
 fn kind_from_config_snapshot(mission_id: &str, real_task_id: &str, real_step_id: &str) -> Option<String> {
     let config = darkmux_crew::lifecycle::load_config_snapshot(mission_id).ok().flatten()?;
@@ -598,7 +598,7 @@ fn substitute_id_placeholder_prefix(id: &str, doc_phase_id: &str, real_phase_id:
 // expansion-pattern structural matcher `kind_from_config_snapshot` used for
 // an EXPANDING template task's real ids — were removed here along with the
 // expansion primitive itself. See `darkmux_crew::mission_config`'s
-// `MISSION_CONFIG_SCHEMA` doc (schema 1.5) for why.
+// `MISSION_CONFIG_SCHEMA` doc (schema 2.0) for why.
 
 /// (#1432 item 4) The finalized token/turn totals folded for one step from
 /// this mission's flow records. Mirrors the page's own

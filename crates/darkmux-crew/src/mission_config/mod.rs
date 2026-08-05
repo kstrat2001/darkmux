@@ -926,6 +926,35 @@ mod tests {
             !cfg.validate(&["dispatch.internal"]).iter().any(|f| f.path.ends_with(".expand")),
             "a document with no `expand` key must never trip this check"
         );
+
+        // (#1550 QA finding) An empty-extras task alone would not catch a
+        // guard that fired on ANY extras key rather than on `expand`
+        // specifically. Parsed through serde so the extras map is populated
+        // the way production populates it — `notes` is a real key the
+        // built-in review config carries on two tasks, so this is the shape
+        // that would actually regress.
+        let with_other_extras: MissionConfig = serde_json::from_str(
+            r#"{
+                "id": "t", "name": "T",
+                "phases": [{ "id": "p1", "tasks": [{
+                    "id": "t1",
+                    "notes": "an ordinary extras key, not a removed field",
+                    "steps": [{ "id": "s1", "kind": "dispatch.internal" }]
+                }]}]
+            }"#,
+        )
+        .expect("parses");
+        assert!(
+            !with_other_extras.phases[0].tasks[0].extras.is_empty(),
+            "precondition: the task must actually carry an extras key"
+        );
+        assert!(
+            !with_other_extras
+                .validate(&["dispatch.internal"])
+                .iter()
+                .any(|f| f.path.ends_with(".expand")),
+            "the check must key on `expand` specifically, never on extras being non-empty"
+        );
     }
 
     // ─── Built-in config golden-shape tests (#1284 Packet 1) ──────────
