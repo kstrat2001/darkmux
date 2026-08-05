@@ -536,20 +536,20 @@ pub fn resolve_step_label(kind: &str, step_id: &str) -> String {
 /// unknown mid-run (`Planned` is the correct default); the KIND was fixed
 /// at mint time and the snapshot is its authority.
 ///
-/// Returns the doc's raw (unrendered) `StepConfig.kind` — for an EXPANDING
-/// template task this is the BASE kind (e.g. `"review.probe"`, not the
-/// per-seat-rendered `"review.probe:alpha"`), since recovering the exact
-/// per-copy name would require re-deriving the launcher's dynamic
-/// expansion inputs (e.g. staffed seat names), which this read-only path
-/// doesn't have. The base kind is enough for [`resolve_step_label`]'s
-/// fallback chain (`review_step_kind_display_name` prefix-matches
-/// `"review.probe"` to the same "Probe" label its per-seat form resolves
-/// to) — see [`pattern_matches`]'s doc for the matching mechanics.
+/// Returns the doc's raw `StepConfig.kind`.
 ///
 /// `None` when the mission has no config-snapshot at all (a hand-authored
 /// mission, or one that predates #1284 Packet 4a) or the given ids don't
 /// match anything in it — the caller's own `"unknown"`-deep-fallback path
 /// still applies in that case, unchanged from before this feature.
+///
+/// (#1550 cluster item 2) This used to branch on `TaskConfig::expand` —
+/// an EXPANDING template task's real ids couldn't be recovered exactly
+/// (this read-only path has no access to the launcher's dynamic expansion
+/// inputs), so that arm pattern-matched against the template instead. The
+/// expansion primitive was retired (see `darkmux_crew::mission_config`'s
+/// `MISSION_CONFIG_SCHEMA` doc, schema 1.5); every task's real id is now
+/// recoverable exactly via the placeholder-prefix substitution alone.
 fn kind_from_config_snapshot(mission_id: &str, real_task_id: &str, real_step_id: &str) -> Option<String> {
     let config = darkmux_crew::lifecycle::load_config_snapshot(mission_id).ok().flatten()?;
     for phase in &config.phases {
@@ -559,29 +559,15 @@ fn kind_from_config_snapshot(mission_id: &str, real_task_id: &str, real_step_id:
         // convention, so it's derivable here with no launch-time state.
         let real_phase_id = format!("{mission_id}-{}", phase.id);
         for task_cfg in &phase.tasks {
-            match &task_cfg.expand {
-                Some(spec) => {
-                    if !pattern_matches(&spec.task_id_pattern, real_task_id) {
-                        continue;
-                    }
-                    if let Some(step_cfg) = task_cfg.steps.first() {
-                        if pattern_matches(&spec.step_id_pattern, real_step_id) {
-                            return Some(step_cfg.kind.clone());
-                        }
-                    }
-                }
-                None => {
-                    let candidate_task_id = substitute_id_placeholder_prefix(&task_cfg.id, &phase.id, &real_phase_id);
-                    if candidate_task_id != real_task_id {
-                        continue;
-                    }
-                    for step_cfg in &task_cfg.steps {
-                        let candidate_step_id =
-                            substitute_id_placeholder_prefix(&step_cfg.id, &phase.id, &real_phase_id);
-                        if candidate_step_id == real_step_id {
-                            return Some(step_cfg.kind.clone());
-                        }
-                    }
+            let candidate_task_id = substitute_id_placeholder_prefix(&task_cfg.id, &phase.id, &real_phase_id);
+            if candidate_task_id != real_task_id {
+                continue;
+            }
+            for step_cfg in &task_cfg.steps {
+                let candidate_step_id =
+                    substitute_id_placeholder_prefix(&step_cfg.id, &phase.id, &real_phase_id);
+                if candidate_step_id == real_step_id {
+                    return Some(step_cfg.kind.clone());
                 }
             }
         }
@@ -608,86 +594,11 @@ fn substitute_id_placeholder_prefix(id: &str, doc_phase_id: &str, real_phase_id:
     }
 }
 
-/// Structural match of an expansion pattern (e.g. `"review-probe-{index}-task"`)
-/// against a candidate real id, treating `{index}`/`{name}` as wildcards —
-/// this read-only path doesn't have the launcher's actual index/name
-/// values (those are dynamic, resolved from crew staffing at launch time),
-/// so it can't RENDER the pattern and compare strings; instead it checks
-/// that `candidate` starts with the pattern's literal text before the
-/// placeholder and ends with the literal text after it (and, for a pattern
-/// with more than one placeholder, that every literal segment between them
-/// appears in order) — sufficient to recognize "this real id plausibly
-/// came from this template" without knowing which specific item it was.
-fn pattern_matches(pattern: &str, candidate: &str) -> bool {
-    let segments = split_on_placeholders(pattern);
-    let mut cur = candidate;
-    let last = segments.len().saturating_sub(1);
-    for (i, seg) in segments.iter().enumerate() {
-        if seg.is_empty() {
-            continue;
-        }
-        let is_first = i == 0;
-        let is_last = i == last;
-        if is_first && is_last {
-            // No placeholder in the pattern at all — a single literal
-            // segment requires an EXACT match, not just a prefix (a
-            // `starts_with`-only check here would let "fixed-task-2"
-            // falsely match the fixed id "fixed-task").
-            if cur != seg.as_str() {
-                return false;
-            }
-            cur = "";
-        } else if is_first {
-            let Some(rest) = cur.strip_prefix(seg.as_str()) else {
-                return false;
-            };
-            cur = rest;
-        } else if is_last {
-            if !cur.ends_with(seg.as_str()) {
-                return false;
-            }
-        } else {
-            match cur.find(seg.as_str()) {
-                Some(pos) => cur = &cur[pos + seg.len()..],
-                None => return false,
-            }
-        }
-    }
-    true
-}
-
-/// Split `pattern` into literal segments around every `{index}`/`{name}`
-/// placeholder occurrence, e.g. `"review-probe-{index}-task"` →
-/// `["review-probe-", "-task"]`. A pattern with no placeholder at all
-/// yields one segment (the whole literal string) — [`pattern_matches`]
-/// then requires an exact `starts_with`+`ends_with` on that single literal,
-/// which for a one-segment list means an exact substring match.
-fn split_on_placeholders(pattern: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut rest = pattern;
-    loop {
-        let next_index = rest.find("{index}");
-        let next_name = rest.find("{name}");
-        let next = match (next_index, next_name) {
-            (Some(i), Some(n)) => Some(i.min(n)),
-            (Some(i), None) => Some(i),
-            (None, Some(n)) => Some(n),
-            (None, None) => None,
-        };
-        match next {
-            None => {
-                segments.push(rest.to_string());
-                break;
-            }
-            Some(pos) => {
-                segments.push(rest[..pos].to_string());
-                let tok_len = if rest[pos..].starts_with("{index}") { 7 } else { 6 };
-                rest = &rest[pos + tok_len..];
-            }
-        }
-    }
-    segments
-}
+// (#1550 cluster item 2) `pattern_matches`/`split_on_placeholders` — the
+// expansion-pattern structural matcher `kind_from_config_snapshot` used for
+// an EXPANDING template task's real ids — were removed here along with the
+// expansion primitive itself. See `darkmux_crew::mission_config`'s
+// `MISSION_CONFIG_SCHEMA` doc (schema 1.5) for why.
 
 /// (#1432 item 4) The finalized token/turn totals folded for one step from
 /// this mission's flow records. Mirrors the page's own
@@ -1870,30 +1781,9 @@ mod tests {
         assert_eq!(resolve_step_label("", ""), "unknown");
     }
 
-    // ─── pattern_matches / split_on_placeholders (#1402) ────────────────
-
-    #[test]
-    fn pattern_matches_single_index_placeholder() {
-        assert!(pattern_matches("review-probe-{index}-task", "review-probe-0-task"));
-        assert!(pattern_matches("review-probe-{index}-task", "review-probe-17-task"));
-        assert!(!pattern_matches("review-probe-{index}-task", "review-dedup-task"));
-    }
-
-    #[test]
-    fn pattern_matches_name_placeholder() {
-        assert!(pattern_matches("review-probe-{name}-task", "review-probe-alpha-task"));
-    }
-
-    #[test]
-    fn pattern_matches_no_placeholder_requires_exact_containment() {
-        assert!(pattern_matches("fixed-task", "fixed-task"));
-        assert!(!pattern_matches("fixed-task", "fixed-task-2"));
-    }
-
-    #[test]
-    fn pattern_matches_rejects_a_candidate_missing_the_suffix() {
-        assert!(!pattern_matches("review-probe-{index}-task", "review-probe-0"));
-    }
+    // (#1550 cluster item 2) `pattern_matches_*` tests removed with the
+    // expansion primitive itself — see the removal site's comment above
+    // `kind_from_config_snapshot`.
 
     // ─── kind_from_config_snapshot (#1402) ──────────────────────────────
 

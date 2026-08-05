@@ -4387,14 +4387,14 @@
         let _guard = CrewDirGuard::new();
         let loaded = darkmux_crew::mission_config::load("review").expect("embedded review config loads");
 
-        // (#1512) No expansion collection — review.json declares its three
-        // probe tasks explicitly now, so `interpret` needs nothing beyond
-        // the document itself to produce the full graph shape.
+        // (#1512) review.json declares its three probe tasks explicitly, so
+        // `interpret` needs nothing beyond the document itself to produce
+        // the full graph shape (the expansion collection this once needed
+        // was retired in #1550 cluster item 2).
         let params = darkmux_crew::mission_config::LaunchParams {
             phase_ids: std::collections::BTreeMap::new(),
             task_overrides: std::collections::BTreeMap::new(),
             step_config_overrides: std::collections::BTreeMap::new(),
-            expansions: std::collections::BTreeMap::new(),
         };
         let (tasks, steps, _warnings) = darkmux_crew::mission_config::interpret(&loaded.config, &params)
             .expect("interpret succeeds against the embedded review config");

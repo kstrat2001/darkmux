@@ -988,7 +988,6 @@ fn build_launch_params(
         phase_ids: real_phase_ids.clone(),
         task_overrides,
         step_config_overrides: BTreeMap::new(),
-        expansions: BTreeMap::new(),
     }
 }
 
