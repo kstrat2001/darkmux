@@ -147,6 +147,32 @@ and the flow/audit stores are unchanged by this release.
   aspiration, and a fresh agent session reading it would confidently propose
   work against backends that do not exist.
 
+### Fixed — caught by this release's own dogfood
+
+The release gate requires verifying each feature live rather than trusting a
+green suite. Running it turned up two false statements, both of which shipped
+would have been this release's own theme happening to it.
+
+- **A posted review no longer claims a runner it has no evidence of** (#1676).
+  The footer's provenance clause has four cases; three are derived from the
+  envelope's member records, and the fourth — *no member records at all* —
+  returned the fixed string "on a self-hosted runner". Launching a review from
+  a laptop shell put that sentence into a public comment. The clause is now
+  omitted entirely when there is nothing to derive it from, which is what the
+  function's own documentation had claimed all along. #1298 fixed the three
+  evidence-derived cases after a footer falsely claimed "no cloud API" about a
+  cloud review; this fourth one survived because the no-dispatch path was rare
+  until #1605 made benign-empty a normal outcome that posts a comment.
+- **`darkmux doctor` no longer prescribes a model load that is unnecessary and
+  namespace-breaking** (#1675). The unloaded-utility-model warning said
+  compaction would fail without a manual load and suggested a bare
+  `lms load <id>`. Since #1616 the dispatch path loads the compactor itself, at
+  its declared context, under the `darkmux:` namespace — and a bare `lms load`
+  creates precisely the un-namespaced resident darkmux will not reuse and
+  `machine eject` cannot reclaim, so following the advice could cause the
+  problem the namespace exists to prevent. The check remains; its remedy now
+  states only what is true.
+
 ## [2.4.0] - 2026-08-03
 
 The observability release: CLI panels in the browser, a mission board that says
