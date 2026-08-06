@@ -306,7 +306,7 @@
 
     #[tokio::test]
     async fn health_returns_200_with_versions() {
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -336,7 +336,7 @@
     #[tokio::test]
     async fn html_documents_carry_cache_validators() {
         for uri in ["/", "/play/2026-07-28", "/mission/m1/graph"] {
-            let app = build_router(PathBuf::new());
+            let app = build_router_local(PathBuf::new());
             let response = app
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                 .await
@@ -361,13 +361,13 @@
     /// reload costs a validator round-trip instead of the whole document.
     #[tokio::test]
     async fn matching_if_none_match_gets_304_with_no_body() {
-        let first = build_router(PathBuf::new())
+        let first = build_router_local(PathBuf::new())
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         let etag = first.headers().get("etag").unwrap().to_str().unwrap().to_string();
 
-        let second = build_router(PathBuf::new())
+        let second = build_router_local(PathBuf::new())
             .oneshot(
                 Request::builder()
                     .uri("/")
@@ -386,7 +386,7 @@
     /// fix would trade "always stale" for "never updates".
     #[tokio::test]
     async fn stale_if_none_match_gets_the_full_document() {
-        let response = build_router(PathBuf::new())
+        let response = build_router_local(PathBuf::new())
             .oneshot(
                 Request::builder()
                     .uri("/")
@@ -406,11 +406,11 @@
     /// browser that loaded one would be told the other is unchanged.
     #[tokio::test]
     async fn live_and_playback_documents_have_distinct_etags() {
-        let live = build_router(PathBuf::new())
+        let live = build_router_local(PathBuf::new())
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let play = build_router(PathBuf::new())
+        let play = build_router_local(PathBuf::new())
             .oneshot(Request::builder().uri("/play/2026-07-28").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -425,7 +425,7 @@
     async fn root_serves_viewer_html() {
         // #554: GET / serves the observability viewer (same-origin host
         // for the viewer's /flow/:date fetches).
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -467,7 +467,7 @@
         // #624 follow-up: GET /play/<date> serves the same viewer HTML with
         // darkmux-mode=play + darkmux-date=<date> so boot() skips the SSE
         // tail and stays in scrubber-replay mode for the captured day.
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -500,7 +500,7 @@
         // check; the daemon returns 200 + empty viewer for it because the
         // resulting /flow/<date> lookup returns no records — that's
         // acceptable. We test only shape-rejection cases here.
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         for bad in ["garbage", "26-6-3", "2026/06/03", "2026-06-3", "2026-6-03"] {
             let response = app
                 .clone()
@@ -542,7 +542,7 @@
         // Adding GET / must not collide with the noun-prefixed API routes.
         // `/health` has no external deps, so a clean 200 here proves the
         // router still dispatches the API surface after `/` was added.
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
@@ -557,7 +557,7 @@
         // beats when it is. The live viewer keys "running" on this, so it must
         // never 500 on a Redis blip. Asserting "200 + is_array" is robust in
         // both environments (content depends on whether a dispatch is live).
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -580,7 +580,7 @@
         // unset/unreachable, the presence beats when it is). The live viewer
         // unions this into machines(), so a Redis blip must degrade to "no
         // live machines", never a 500.
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -604,7 +604,7 @@
         // is the contract the `darkmux machine status <id>` peer read relies
         // on — degraded state shows up as a visible signal, not as a fetch
         // error. (#1426 — route renamed from /model/status.)
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -652,7 +652,7 @@
             std::env::remove_var("DARKMUX_REDIS_URL");
             std::env::remove_var("DARKMUX_MACHINE_ID");
         }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -710,7 +710,7 @@
         unsafe {
             std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms");
         }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -768,7 +768,7 @@
         unsafe {
             std::env::set_var("DARKMUX_REDIS_URL", "redis://user:s3cr3t-p4ss@example.com:6379");
         }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -811,7 +811,7 @@
         unsafe {
             std::env::set_var("DARKMUX_MACHINE_ID", "test-laptop");
         }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -844,7 +844,7 @@
         // "flow records for date X" is an empty collection, not an absent
         // resource. (The old `.jsonl` route returned 404 here; it's retired.)
         let tmp = TempDir::new().unwrap();
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
 
         let response = app
             .oneshot(
@@ -874,7 +874,7 @@
              {\"ts\":\"2026-07-03T00:00:30Z\",\"action\":\"c\",\"session_id\":\"S\"}\n",
         )
         .unwrap();
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
 
         let response = app
             .oneshot(
@@ -903,7 +903,7 @@
              {\"ts\":\"2026-07-03T00:00:20Z\",\"action\":\"b\"}\n",
         )
         .unwrap();
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
 
         let response = app
             .oneshot(
@@ -942,7 +942,7 @@
         fs::write(tmp.path().join("not-a-day.jsonl"), "garbage\n").unwrap();
         fs::write(tmp.path().join("README.txt"), "ignore me\n").unwrap();
 
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
@@ -973,7 +973,7 @@
     #[tokio::test]
     async fn flow_days_empty_dir_is_empty_array() {
         let tmp = TempDir::new().unwrap();
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1006,7 +1006,7 @@
              {\"action\":\"dispatch.start\",\"session_id\":\"S3\",\"mission_id\":\"m2\",\"machine_id\":\"studio\",\"ts\":\"2026-05-14T09:05:00Z\"}\n",
         ).unwrap();
 
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
         let response = app
             .oneshot(Request::builder().uri("/flow-missions").body(Body::empty()).unwrap())
             .await
@@ -1040,7 +1040,7 @@
             "{\"session_id\":\"S2\",\"mission_id\":\"m1\",\"ts\":\"2026-05-14T09:00:00Z\"}\n\
              {\"session_id\":\"S3\",\"mission_id\":\"m2\",\"ts\":\"2026-05-14T09:05:00Z\"}\n",
         ).unwrap();
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
         let response = app
             .oneshot(Request::builder().uri("/flow-mission/m1").body(Body::empty()).unwrap())
             .await
@@ -1064,7 +1064,7 @@
             "{\"session_id\":\"S1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n\
              {\"session_id\":\"S2\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:05:00Z\"}\n",
         ).unwrap();
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
         let response = app
             .oneshot(Request::builder().uri("/flow-session/S1").body(Body::empty()).unwrap())
             .await
@@ -1080,7 +1080,7 @@
     #[tokio::test]
     async fn flow_catalog_rejects_invalid_id() {
         let tmp = TempDir::new().unwrap();
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
         let long = "a".repeat(200); // > 128-char cap → invalid
         let response = app
             .oneshot(
@@ -1097,7 +1097,7 @@
     #[tokio::test]
     async fn flow_returns_400_for_malformed_date() {
         let tmp = TempDir::new().unwrap();
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
 
         // Non-date shape → rejected by the format validator.
         let response = app
@@ -1142,7 +1142,7 @@
         let content = "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n{\"action\":\"x\",\"handle\":\"test\"}\n";
         fs::write(tmp.path().join("2026-05-14.jsonl"), content).unwrap();
 
-        let app = build_router(tmp.path().to_path_buf());
+        let app = build_router_local(tmp.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1191,7 +1191,7 @@
     async fn cors_denies_localhost_origin_by_default() {
         // Defensive — make sure no inherited env from another test changes the default behavior.
         unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1215,7 +1215,7 @@
     #[serial_test::serial]
     async fn cors_denies_loopback_ip_origin_by_default() {
         unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1245,7 +1245,7 @@
                 "http://localhost:5173,http://localhost:3000",
             );
         }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1295,7 +1295,7 @@
     #[serial_test::serial]
     async fn worktree_summary_requires_token_from_remote_peer() {
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let mut req = Request::builder()
             .uri("/worktree-summary/some-session")
             .body(Body::empty())
@@ -1314,7 +1314,7 @@
     #[serial_test::serial]
     async fn worktree_summary_open_on_loopback_even_with_token() {
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         // (#1663) Loopback stated, not inherited from an absent ConnectInfo.
         let mut req = Request::builder()
             .uri("/worktree-summary/some-session")
@@ -1334,7 +1334,7 @@
         // exemption is a thing this test states, not one it inherits from a
         // fail-open default.
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let mut req = Request::builder().uri("/flow-days").body(Body::empty()).unwrap();
         req.extensions_mut().insert(loopback_peer());
         let resp = app.oneshot(req).await.unwrap();
@@ -1362,6 +1362,9 @@
         // the first remote request. This test pins the direction: no peer
         // information means no exemption.
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        // The BARE router, deliberately — NOT `build_router_local`. This test
+        // is about what happens when no peer is known, so the harness must not
+        // supply one; with the loopback layer it would assert nothing.
         let app = build_router(PathBuf::new());
         // Deliberately NO ConnectInfo — the shape a de-wired router produces.
         let resp = app
@@ -1383,6 +1386,8 @@
         // client. Unknown peer + valid token is still authorized, so this is
         // a gate, not a blanket refusal.
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        // Bare router for the same reason as its sibling above: the absent
+        // peer IS the condition under test.
         let app = build_router(PathBuf::new());
         let resp = app
             .oneshot(
@@ -1402,7 +1407,7 @@
     #[serial_test::serial]
     async fn flow_requires_token_from_remote_peer() {
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let mut req = Request::builder().uri("/flow-days").body(Body::empty()).unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
@@ -1418,7 +1423,7 @@
     #[serial_test::serial]
     async fn lab_runs_requires_token_from_remote_peer() {
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let mut req = Request::builder().uri("/lab/runs").body(Body::empty()).unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
@@ -1430,7 +1435,7 @@
     #[serial_test::serial]
     async fn flow_accepts_remote_peer_with_token() {
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let mut req = Request::builder()
             .uri("/flow-days")
             .header("Authorization", format!("Bearer {TEST_TOKEN}"))
@@ -1446,7 +1451,7 @@
     #[serial_test::serial]
     async fn health_exempt_from_remote_gate() {
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let mut req = Request::builder().uri("/health").body(Body::empty()).unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
@@ -1566,7 +1571,7 @@
                 "http://localhost:5173/", // trailing slash
             );
         }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1597,7 +1602,7 @@
                 "HTTP://Localhost:5173",
             );
         }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1625,7 +1630,7 @@
     #[serial_test::serial]
     async fn cors_env_rejects_literal_wildcard() {
         unsafe { std::env::set_var("DARKMUX_DAEMON_CORS_ORIGINS", "*"); }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1722,7 +1727,7 @@
                 "http://localhost:5173",
             );
         }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1744,7 +1749,7 @@
     /// `null` origin = topology viewer opened directly from disk (file://).
     #[tokio::test]
     async fn cors_allows_file_protocol_origin() {
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1768,7 +1773,7 @@
     /// browser to block the script from reading it.
     #[tokio::test]
     async fn cors_denies_external_origin() {
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -1898,7 +1903,7 @@
 
     #[tokio::test]
     async fn stream_returns_400_for_malformed_date() {
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -2181,7 +2186,7 @@
             unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
 
             let tmp = TempDir::new().unwrap();
-            let app = build_router(tmp.path().to_path_buf());
+            let app = build_router_local(tmp.path().to_path_buf());
             let response = app
                 .oneshot(
                     Request::builder()
@@ -2316,7 +2321,7 @@
             unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://127.0.0.1:1"); }
 
             let started = std::time::Instant::now();
-            let app = build_router(tmp.path().to_path_buf());
+            let app = build_router_local(tmp.path().to_path_buf());
             let response = app
                 .oneshot(
                     Request::builder()
@@ -2360,7 +2365,7 @@
 
             unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://127.0.0.1:1"); }
 
-            let app = build_router(tmp.path().to_path_buf());
+            let app = build_router_local(tmp.path().to_path_buf());
             let response = app
                 .oneshot(
                     Request::builder()
@@ -2403,7 +2408,7 @@
 
             unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
 
-            let app = build_router(tmp.path().to_path_buf());
+            let app = build_router_local(tmp.path().to_path_buf());
             let response = app
                 .oneshot(
                     Request::builder()
@@ -2688,7 +2693,7 @@
             unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
 
             let tmp = TempDir::new().unwrap();
-            let app = build_router(tmp.path().to_path_buf());
+            let app = build_router_local(tmp.path().to_path_buf());
             let response = app
                 .oneshot(
                     Request::builder()
@@ -2984,7 +2989,7 @@
         )
         .unwrap();
 
-        let app = build_router_with_worktrees_base(
+        let app = build_router_with_worktrees_base_local(
             flows_dir.path().to_path_buf(),
             wt_base.path().to_path_buf(),
         );
@@ -3027,7 +3032,7 @@
         let flows_dir = TempDir::new().unwrap();
         // No records at all.
 
-        let app = build_router(flows_dir.path().to_path_buf());
+        let app = build_router_local(flows_dir.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
@@ -3393,7 +3398,7 @@
     #[tokio::test]
     async fn lab_runs_handler_reports_unconfigured_when_no_lab_dir() {
         let flows = TempDir::new().unwrap();
-        let app = build_router_full(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
         let response = app
             .oneshot(Request::builder().uri("/lab/runs").body(Body::empty()).unwrap())
             .await
@@ -3410,7 +3415,7 @@
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        let app = build_router_full(
+        let app = build_router_full_local(
             flows.path().to_path_buf(),
             worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
@@ -3434,7 +3439,7 @@
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        let app = build_router_full(
+        let app = build_router_full_local(
             flows.path().to_path_buf(),
             worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
@@ -3468,7 +3473,7 @@
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         write_synthetic_funnel_run(lab.path(), "demo-case-root", "demo-crew");
-        let app = build_router_full(
+        let app = build_router_full_local(
             flows.path().to_path_buf(),
             worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
@@ -3493,7 +3498,7 @@
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        let app = build_router_full(
+        let app = build_router_full_local(
             flows.path().to_path_buf(),
             worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
@@ -3513,7 +3518,7 @@
     #[tokio::test]
     async fn lab_run_detail_handler_404s_when_not_configured() {
         let flows = TempDir::new().unwrap();
-        let app = build_router_full(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -3532,7 +3537,7 @@
         let lab = TempDir::new().unwrap();
         let run_dir = lab.path().join("live/gate-1");
         write_synthetic_live_run(&run_dir, "demo-case-b", "demo-gate-crew");
-        let app = build_router_full(
+        let app = build_router_full_local(
             flows.path().to_path_buf(),
             worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
@@ -3598,7 +3603,7 @@
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         write_synthetic_live_run(&lab.path().join("live/gate-1"), "demo-case-b", "demo-gate-crew");
-        let app = build_router_full(
+        let app = build_router_full_local(
             flows.path().to_path_buf(),
             worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
@@ -3618,7 +3623,7 @@
     #[tokio::test]
     async fn lab_run_events_handler_404s_when_not_configured() {
         let flows = TempDir::new().unwrap();
-        let app = build_router_full(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -3729,7 +3734,7 @@
         save_test_mission(&mission);
 
         let flows = TempDir::new().unwrap();
-        let app = build_router_full(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
         let response = app
             .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
             .await
@@ -3760,7 +3765,7 @@
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        let app = build_router_full(
+        let app = build_router_full_local(
             flows.path().to_path_buf(),
             worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
@@ -3786,7 +3791,7 @@
     async fn runs_handler_never_errors_with_no_sources_configured() {
         let _guard = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
-        let app = build_router_full(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
         let response = app
             .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
             .await
@@ -3799,7 +3804,7 @@
 
     #[tokio::test]
     async fn mission_graph_html_serves_the_page() {
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -3828,7 +3833,7 @@
 
     #[tokio::test]
     async fn vendor_reactflow_js_served_with_correct_content_type() {
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -3851,7 +3856,7 @@
 
     #[tokio::test]
     async fn vendor_reactflow_css_served_with_correct_content_type() {
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -3872,7 +3877,7 @@
     /// installed home-screen shortcut opens chromeless).
     #[tokio::test]
     async fn web_manifest_served_standalone() {
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(Request::builder().uri("/manifest.webmanifest").body(Body::empty()).unwrap())
             .await
@@ -3891,7 +3896,7 @@
     #[tokio::test]
     async fn app_icons_served_as_png() {
         for path in ["/apple-touch-icon.png", "/icon-192.png", "/icon-512.png"] {
-            let app = build_router(PathBuf::new());
+            let app = build_router_local(PathBuf::new());
             let response = app
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
@@ -3991,7 +3996,7 @@
         unsafe {
             std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN);
         }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let mut req = Request::builder()
             .uri("/mission/some-mission/graph.json")
             .body(Body::empty())
@@ -4012,7 +4017,7 @@
         unsafe {
             std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN);
         }
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         for uri in ["/mission/some-mission/graph", "/vendor/reactflow-bundle.min.js", "/vendor/reactflow-bundle.min.css"] {
             let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
             req.extensions_mut().insert(remote_peer());
@@ -4028,7 +4033,7 @@
     #[serial_test::serial]
     async fn mission_graph_json_returns_404_for_unknown_mission() {
         let _guard = CrewDirGuard::new();
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4045,7 +4050,7 @@
     #[serial_test::serial]
     async fn mission_graph_json_rejects_invalid_id() {
         let _guard = CrewDirGuard::new();
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4070,7 +4075,7 @@
         save_test_mission(&mission);
         save_test_phase(&minimal_phase("only-phase", "legacy-mission"));
 
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4184,7 +4189,7 @@
             darkmux_crew::lifecycle::save_step(mission_id, "p1", s).unwrap();
         }
 
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4323,7 +4328,7 @@
         }
         // Deliberately NO save_step calls — the mid-run disk state.
 
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4479,7 +4484,7 @@
             darkmux_crew::lifecycle::save_step(mission_id, &tasks.iter().find(|t| t.id == step.task_id).unwrap().phase_id, step).unwrap();
         }
 
-        let app = build_router(PathBuf::new());
+        let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4601,7 +4606,7 @@
         )
         .unwrap();
 
-        let app = build_router(flows.path().to_path_buf());
+        let app = build_router_local(flows.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4674,7 +4679,7 @@
 
         // Empty flows_dir (like the test router's own PathBuf::new()).
         let empty = TempDir::new().unwrap();
-        let app = build_router(empty.path().to_path_buf());
+        let app = build_router_local(empty.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4769,7 +4774,7 @@
         )
         .unwrap();
 
-        let app = build_router(flows.path().to_path_buf());
+        let app = build_router_local(flows.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
