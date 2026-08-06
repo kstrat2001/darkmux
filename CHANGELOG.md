@@ -11,6 +11,142 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-08-06
+
+The honesty release. Nearly every fix here is one defect wearing different
+clothes: **something was lost or wrong, and nothing said so.** A dead run that
+read `running` forever. An errored dispatch that reported `ok: true`. A green
+review with zero findings and no explanation. A config knob that was settable,
+typed, documented, and read by nothing. A fleet boot test that takes 63 seconds
+when it actually runs, reporting `ok` in eight milliseconds. The tests meant to
+catch these had their own version of the same problem — passing for reasons
+other than the ones they named.
+
+### Breaking
+
+- **Mission-config schema 2.0 — the `expand` primitive is retired** (#1550).
+  Its only consumer moved to explicit per-role tasks in 2.3.0, leaving a
+  declared, documented, unfeedable field. Removal is the breaking part: because
+  `TaskConfig` carries a `#[serde(flatten)]` overflow, a config still declaring
+  `expand` would have **parsed perfectly and silently lost its fan-out** — no
+  error, a graph quietly missing tasks. `validate` now emits an **Error**
+  naming the field, the schema that removed it, and the migration. Lenient on
+  read, loud at validate. See **Migration** below.
+- **A dangling `role_profiles` binding is now an error** (#1547). It used to
+  fall through to `default_profile` in silence, so a typo'd role id bound
+  nothing and looked fine.
+- **The serve daemon's auth gate fails closed** (#1663). A request that carries
+  no peer address is treated as **remote** (token required), not as loopback.
+  It previously did the opposite, which meant the entire remote gate rested on
+  a single wiring call in `run()` guarded by nothing but a comment: downgrade
+  it in any refactor and every peer looks like loopback, serving flow records,
+  machine specs, mission state, and worktree summaries unauthenticated — with
+  every test green and nothing visible to the operator, because the viewer
+  keeps working either way. That same refactor now produces 401s on the first
+  remote request instead of silence. **Loopback-only installs are unaffected**
+  — with no token configured the gate isn't in the stack at all.
+
+### Migration — mission configs
+
+After upgrading, `darkmux doctor` warns once per user-tier mission config whose
+`schema_version` is a 1.x major. The configs still **load and run**; the warning
+is about interpretation drift, not breakage. Two cases:
+
+1. **Your config does not declare `expand`** (the common case — it had no way to
+   be fed since 2.3.0). Migration is the version line alone:
+
+   ```bash
+   # what still needs migrating
+   grep -L '"schema_version": *"2' ~/.darkmux/mission-configs/*.json
+
+   # any config that genuinely uses the retired primitive — handle these by hand
+   grep -l '"expand"' ~/.darkmux/mission-configs/*.json
+
+   # bump the rest
+   for f in ~/.darkmux/mission-configs/*.json; do
+     grep -q '"expand"' "$f" && { echo "skip (declares expand): $f"; continue; }
+     python3 - "$f" <<'PY'
+   import json, sys
+   p = sys.argv[1]
+   d = json.load(open(p))
+   d["schema_version"] = "2.0"
+   json.dump(d, open(p, "w"), indent=2)
+   open(p, "a").write("\n")
+   print("bumped", p)
+   PY
+   done
+
+   darkmux doctor    # confirms clean
+   ```
+
+2. **Your config declares `expand`.** Replace the template task with the tasks
+   it used to fan out into, written explicitly — one task per expansion, each
+   naming its own `role_id`. The built-in review config's probe stage is the
+   reference shape (`templates/builtin/mission-configs/review.json`), and
+   `darkmux doctor` names every offending file and field until it's done.
+
+Nothing else in `~/.darkmux/` needs touching; `config.json`, `profiles.json`,
+and the flow/audit stores are unchanged by this release.
+
+### Added
+
+- **`Task.reads` — a run-scoped output ledger** (#1619). A task can read any
+  completed task's output without a dependency edge being drawn between them,
+  so cross-phase data flow stops requiring cross-phase arrows in the graph.
+  The review config's judge/verify/synthesis stages moved onto it.
+- **Mutation testing and coverage in CI** (#1635) — the suite could not audit
+  itself. Mutation runs on the PR diff every time and sweeps the workspace
+  nightly; coverage reports which lines never execute.
+- **Browser fixtures generated from the wire types** (#1637), so a viewer test
+  and the Rust struct it renders cannot drift apart.
+- **The fleet e2e suite actually runs** (#1662). All six `e2e_*` binaries opened
+  with a `redis_available()` guard whose false arm printed and **returned** — a
+  silent pass — and no workflow ever installed redis. The daemon boot test that
+  takes 63 seconds locally was completing in eight milliseconds on CI, which is
+  this project's merge gate: the whole fleet layer was guarded by nothing while
+  loudly reporting that it was guarded. They now run against a real redis on an
+  ubuntu runner, and a missing redis in CI is a hard failure rather than a skip.
+  Finding this required compiling darkmux on **Linux**, which had never once
+  happened because every workspace-compiling job was macOS. It did not compile.
+  Now it does.
+
+### Fixed
+
+- **Runs, missions, and phases agree on what "alive" means** (#1642, #1633,
+  #1621, #1632). One liveness decision now serves all three run kinds; a dead
+  lab run stops reading `running`; and the generic launcher closes its phases
+  like the bespoke ones always did.
+- **A benign-empty review no longer reads as retry-worthy** (#1605, #1654). A
+  PR with nothing reviewable produced the same signal as a broken run, so the
+  session waiting on it would re-run — and since the input is unchanged, that is
+  an unbounded retry loop. The PR comment now leads with the fact (the bundler
+  ran and worked as expected; re-running will produce the same result), and the
+  board reads `Clean` rather than `Degenerate`. An **error**-empty run still
+  reads `Degenerate` — the carve-out narrows what gets flagged, never what gets
+  recorded.
+- **URL userinfo is stripped from route labels** (PR #1661). A route label rides
+  to public artifacts; two of its three construction paths left sanitizing to
+  the caller and would have carried an endpoint credential into one. The
+  chokepoint now strips it regardless of who calls.
+- **`mission_id` is stamped at the producer** (#1641) rather than inferred
+  downstream, and `mission abort` announces the terminal it actually writes
+  (#1660) — it printed `→ Finalized` while storing `Aborted`.
+- **Three dead operator surfaces became real** (#1548, #1547, #1550):
+  `runtime.feedback_injection` had no reachable off switch — no accessor host
+  side, and the host never forwarded it into the container, so both tiers were
+  inert.
+- **A user-tier mission config newer than the binary now warns** (#1648)
+  instead of being read with fields silently dropped.
+- **Viewer**: a peer's mission says where it ran instead of 404ing (#1466); the
+  session drill-down is addressable (#1639); the mission-graph header stopped
+  crediting unattributable tokens to local (#1626); a teardown stopped reading
+  as a success (#1627, #1628); plus liveness, silent truncation, mobile input
+  zoom, and the first keyboard tests (#1640).
+- **Docs state the backend truthfully** (#316) — darkmux drives LMStudio, and
+  only LMStudio. The prior claim of "LMStudio + Ollama + llama.cpp" was
+  aspiration, and a fresh agent session reading it would confidently propose
+  work against backends that do not exist.
+
 ## [2.4.0] - 2026-08-03
 
 The observability release: CLI panels in the browser, a mission board that says
@@ -132,6 +268,7 @@ schema changes (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`).
   "ready" with no time reference at all, indistinguishable from a fleet that
   had never dispatched.
 
+[2.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.5.0
 [2.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.4.0
 [2.3.1]: https://github.com/kstrat2001/darkmux/releases/tag/v2.3.1
 
