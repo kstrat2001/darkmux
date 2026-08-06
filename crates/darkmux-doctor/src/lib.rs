@@ -823,18 +823,34 @@ fn utility_binding_status(
                     name,
                     status: Status::Warn,
                     message: format!("utility model `{id}` registered but NOT loaded"),
-                    // (#1676/#1616) This used to say compaction would FAIL
-                    // without a manual load, and suggest a bare `lms load
-                    // <id>`. Both aged badly. `dispatch_internal` self-loads
-                    // the compactor at its own declared `n_ctx` under the
-                    // `darkmux:` namespace (#1616), so the dispatch path needs
-                    // nothing done first — and a BARE `lms load` produces the
-                    // non-namespaced resident the namespace contract calls the
-                    // #1135 ghost: unknown load config, never reused, and
-                    // invisible to `machine eject`. Following the old advice
-                    // could create the problem the namespace exists to prevent.
+                    // (#1676/#1616) This hint has now been wrong twice, in
+                    // opposite directions, so the mechanism is worth stating.
+                    //
+                    // Originally it claimed compaction would FAIL without a
+                    // manual load, and suggested a bare `lms load <id>`. Both
+                    // aged badly: #1616 made the internal dispatch path
+                    // self-load the compactor at its own declared `n_ctx`
+                    // under the `darkmux:` namespace, and a BARE `lms load`
+                    // produces the non-namespaced resident the namespace
+                    // contract calls the #1135 ghost (unknown load config,
+                    // never reused, invisible to `machine eject`) — so
+                    // following it could CREATE the problem the namespace
+                    // exists to prevent.
+                    //
+                    // The first correction then drew a contrast that does not
+                    // exist: "not needed for dispatch, but needed for the
+                    // utility-agent verbs". `utility_model_id()` has exactly
+                    // three consumers — this check, a serve-side display read,
+                    // and `apply_utility_model`, which sets `compactor_model`.
+                    // That is ALL the binding does. `mission propose` and
+                    // `lab notebook draft` resolve their own model from the
+                    // profile and reach the SAME self-loading dispatch path,
+                    // so no verb needs this resident first.
+                    //
+                    // What remains true is only that a hand-load moves the
+                    // cost earlier. Say that and nothing more.
                     hint: Some(
-                        "Not needed for `dispatch`/`mission launch` — those load the compactor themselves, at its declared `n_ctx`, under the `darkmux:` namespace (#1616). It matters for the utility-agent verbs that use the global `internal.utility` binding (`mission propose`, `lab notebook draft`). If you do load it by hand, keep the namespace — `lms load <id> --identifier darkmux:<id>` — since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616)".into(),
+                        "No verb needs this loaded first — the binding's only job is to name the compactor, and every dispatch path self-loads it at its declared `n_ctx` under the `darkmux:` namespace (#1616). Loading it by hand just pays that cost now instead of during the first dispatch; if you do, keep the namespace and the context — `lms load <id> --context-length <n> --identifier darkmux:<id>` — since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616, #1675)".into(),
                     ),
                 }
             }
@@ -4779,14 +4795,29 @@ mod tests {
             !hint.contains("Load it before dispatching"),
             "dispatch needs nothing done first: {hint}"
         );
+        // (#1675 gate finding) Pin the COMMAND, not the prose. A bare
+        // `contains("darkmux:")` was satisfied by the sentence "under the
+        // `darkmux:` namespace" even if the suggested invocation regressed to
+        // a namespace-dropping `lms load <id>` — i.e. the assertion whose
+        // comment promised the namespace didn't actually check it.
         assert!(
-            hint.contains("darkmux:"),
-            "any suggested manual load must keep the namespace, or it makes a #1135 ghost: {hint}"
+            hint.contains("--identifier darkmux:"),
+            "a suggested manual load must carry the namespace flag, or it makes a #1135 ghost: {hint}"
         );
         assert!(
-            hint.contains("internal.utility"),
-            "the remedy must name who actually needs it resident: {hint}"
+            hint.contains("--context-length"),
+            "and the declared context, or the hand-load lands at the model default: {hint}"
         );
+        // The hint must not resurrect the false contrast that replaced the
+        // original false claim: `utility_model_id()` only ever names the
+        // compactor, and `mission propose` / `lab notebook draft` reach the
+        // same self-loading path as every other verb.
+        for verb in ["mission propose", "lab notebook draft"] {
+            assert!(
+                !hint.contains(verb),
+                "no verb needs this resident first — naming {verb:?} implies one does: {hint}"
+            );
+        }
     }
 
     // ─── role_profiles coherence (#1475 packet 1, #1547) ─────────────────
