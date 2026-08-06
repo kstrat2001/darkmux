@@ -17,6 +17,8 @@ The release binary lands at `target/release/darkmux`. To install it on `$PATH`:
 cargo install --path .
 ```
 
+This produces a self-contained binary: built-in workloads (`templates/builtin/workloads/`) are embedded at compile time, so the binary works from any directory without the source tree.
+
 **Enable the repo's git hooks** (one-time, per clone):
 
 ```bash
@@ -26,10 +28,8 @@ git config core.hooksPath .githooks
 This wires up `.githooks/pre-commit`, which regenerates `docs/demo/index.html`
 whenever you commit a change to `crates/darkmux-serve/assets/viewer.html`.
 darkmux.com/demo **is** that viewer in playback mode (see
-`scripts/build-demo.sh`), and CI fails on drift — the hook keeps you from
+`scripts/build-demo.sh`), and CI fails on drift; the hook keeps you from
 having to remember. `git commit --no-verify` bypasses it.
-
-This produces a self-contained binary — built-in workloads (`templates/builtin/workloads/`) are embedded at compile time, so the binary works from any directory without the source tree.
 
 ## Development loop
 
@@ -41,18 +41,18 @@ cargo clippy             # lint
 cargo fmt                # format
 ```
 
-If you modify the embedded workload manifests under `templates/builtin/workloads/`, you must rebuild — `include_str!` resolves at compile time.
+If you modify the embedded workload manifests under `templates/builtin/workloads/`, you must rebuild; `include_str!` resolves at compile time.
 
 **Testing:** `cargo nextest run -p <crate>` is the iteration loop (the
 `darkmux-serve` suite is ~5s); `cargo nextest run --workspace` is the pre-push
 gate (2600+ tests in ~75s, against ~10 minutes for `cargo test --workspace`).
 `.config/nextest.toml` sets a per-test `terminate-after`, so a test that HANGS
-fails loudly instead of wedging the run — install with
+fails loudly instead of wedging the run. Install with
 `cargo install cargo-nextest --locked`.
 
 **Working on the viewer?** Verify it by reloading the page, not by running the
 suite: `viewer.html` is an `include_str!`'d asset, so the Rust tests never
-render it. `cargo build -p darkmux-serve` + restart the daemon is the loop —
+render it. `cargo build -p darkmux-serve` + restart the daemon is the loop;
 `cargo install --path .` is a full release build and far slower than you need.
 
 ## Code style
@@ -62,7 +62,7 @@ render it. `cargo build -p darkmux-serve` + restart the daemon is the loop —
 - `cargo clippy` clean (warnings tolerated in legacy dead-code paths; new warnings in changed files must be fixed)
 - Single-purpose PRs
 - Conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`)
-- New external dependencies are scrutinized — darkmux deliberately keeps the dep surface small (see `Cargo.toml`). If a 10-line inline module avoids a crate, prefer that.
+- New external dependencies are scrutinized: darkmux deliberately keeps the dep surface small (see `Cargo.toml`). If a 10-line inline module avoids a crate, prefer that.
 
 ## Tests
 
@@ -98,11 +98,11 @@ When filing a bug, please include:
 
 ## Project structure
 
-darkmux is a Cargo **workspace** — most code lives in focused crates under `crates/` (`darkmux-types`, `darkmux-profiles`, `darkmux-crew`, `darkmux-flow`, `darkmux-lab`, `darkmux-serve`, `darkmux-eureka`, `darkmux-doctor`, `darkmux-fleet`, …), with the agent runtime as its own excluded crate at `runtime/`. The thin binary entrypoint and the CLI verb modules (`flow_cli.rs`, `mission_propose.rs`, `role_cli.rs`, `phase_cli.rs`, …) live in `src/`. Embedded assets (workload / role / skill manifests + prompts) live under `templates/builtin/`; integration tests are several `*.rs` files under `tests/` that spawn the compiled binary via `assert_cmd`.
+darkmux is a Cargo **workspace**: most code lives in focused crates under `crates/` (`darkmux-types`, `darkmux-profiles`, `darkmux-crew`, `darkmux-flow`, `darkmux-lab`, `darkmux-serve`, `darkmux-eureka`, `darkmux-doctor`, `darkmux-fleet`, …), with the agent runtime as its own excluded crate at `runtime/`. The thin binary entrypoint and the CLI verb modules (`flow_cli.rs`, `mission_propose.rs`, `role_cli.rs`, `phase_cli.rs`, …) live in `src/`. Embedded assets (workload / role / skill manifests + prompts) live under `templates/builtin/`; integration tests are several `*.rs` files under `tests/` that spawn the compiled binary via `assert_cmd`.
 
-The **authoritative, kept-current** map of where each module lives is the **"Where things live"** section of [`CLAUDE.md`](CLAUDE.md) — refer to it rather than a parallel list here. A duplicated map is exactly what drifts: this section previously described a pre-workspace `src/` monolith that no longer exists.
+The **authoritative, kept-current** map of where each module lives is the **"Where things live"** section of [`CLAUDE.md`](CLAUDE.md); refer to it rather than a parallel list here. A duplicated map is exactly what drifts: this section previously described a pre-workspace `src/` monolith that no longer exists.
 
-For the **conceptual model** the code implements — role families, the mission/phase lifecycle, the internal runtime + compaction, telemetry, and the flow record, each with a `path:line` citation and a shipped-vs-planned line — see [`docs/architecture/CONCEPTS.md`](docs/architecture/CONCEPTS.md). It's the source of truth a new contributor (or agent) should read before changing any of those surfaces.
+For the **conceptual model** the code implements (role families, the mission/phase lifecycle, the internal runtime + compaction, telemetry, and the flow record, each with a `path:line` citation and a shipped-vs-planned line), see [`docs/architecture/CONCEPTS.md`](docs/architecture/CONCEPTS.md). It's the source of truth a new contributor (or agent) should read before changing any of those surfaces.
 
 ## Releases
 

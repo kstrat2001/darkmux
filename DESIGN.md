@@ -1,4 +1,4 @@
-# darkmux — design notes
+# darkmux design notes
 
 ## What darkmux is
 
@@ -12,11 +12,11 @@ The through-line is the doctrine in [`CLAUDE.md`](CLAUDE.md): *optimization, not
 
 This document is the **why**: the decisions, and the data behind them. darkmux's architecture wasn't designed up front; it was **measured into existence**. Nearly every section names the lab run, dogfood, or research finding that drove the choice, because [that's how we decide](#how-we-decide).
 
-## How it got here — the evolution
+## How it got here: the evolution
 
 darkmux's shape is the record of a sequence of decisions, each one forced by data. Kept here as history because the *why* is easy to lose once the *what* is built.
 
-### v0.1 — the swap tool (the smallest useful thing)
+### v0.1: the swap tool (the smallest useful thing)
 
 darkmux started as ~200 lines that collapsed a manual sequence:
 
@@ -24,29 +24,29 @@ darkmux started as ~200 lines that collapsed a manual sequence:
 lms unload <model> ; lms load <model> --context-length N --identifier <id>   # repeated per model, per profile
 ```
 
-into one `darkmux` profile-multiplexer command. No proxy, no classifier, no daemon. The bet was modest: switching local-model *stacks* (model + context window + compaction settings together) is enough recurring friction that a one-command profile multiplexer earns its keep. It did — and in 2.0 that multiplexer moved inside gestalt (the residency arbiter loads what each dispatch's staffing declares; the manual `swap` verb retired, #1426). The profile stack remains the floor, and everything since builds up from it rather than replacing it.
+into one `darkmux` profile-multiplexer command. No proxy, no classifier, no daemon. The bet was modest: switching local-model *stacks* (model + context window + compaction settings together) is enough recurring friction that a one-command profile multiplexer earns its keep. It did. In 2.0 that multiplexer moved inside gestalt (the residency arbiter loads what each dispatch's staffing declares; the manual `swap` verb retired, #1426). The profile stack remains the floor, and everything since builds up from it rather than replacing it.
 
-### The pivot — "check the harness before the model"
+### The pivot: "check the harness before the model"
 
 The first real finding reframed the whole project. Measuring local-agent runs (Genesis [Articles 1–2](https://darklyenergized.substack.com)) showed that **large wall-clock regressions that look like model problems are usually *harness* problems**: a compaction misconfig, a context-window mismatch, loaded-state drift between the profile and what's actually resident. The model wasn't slow; the harness was wrong.
 
 That inverted the priority order and gave darkmux a reason to exist beyond swapping. If the harness is the dominant variable, then the tool that *owns the harness* and makes it measurable is where the leverage is. "Harness before model" is doctrine now ([`CLAUDE.md`](CLAUDE.md)); it's why `darkmux doctor` exists and why darkmux became a lab, not just a switch.
 
-### Compaction — the biggest lever, measured
+### Compaction: the biggest lever, measured
 
 Of all the harness knobs, **compaction had the largest measured wall-clock impact**, so it earned the most defensive engineering. The data pointed somewhere specific: a small, dedicated compactor at a modest context (~68K) cut wall-clock substantially versus reusing a large all-purpose model, and the `default` strategy beat the more conservative `safeguard` one for local models. Those aren't taste; they're [measured defaults](#compaction-tiers-structured-slots-and-graceful-degradation), and the anti-patterns doc warns against deviating from them without naming the empirical reason.
 
 The deeper bet, that **a small model fills labeled slots more reliably than it writes good prose**, produced structured-slot compaction. [That section](#compaction-tiers-structured-slots-and-graceful-degradation) is the template for how darkmux decisions get made: a hypothesis, a measurement, a typed design that degrades gracefully instead of failing.
 
-### The bake-off — how models get hired
+### The bake-off: how models get hired
 
 Choosing which local model fills a role isn't preference, it's a [documented head-to-head per hardware tier](https://github.com/kstrat2001/darkmux/issues/159) with criteria written *before* the runs. A 128GB-tier bake-off named a 35B-A3B MoE for routine coding (fast, only ~3B active parameters), held a larger dense model as a heavy-reasoning reserve, and kept a coder-specialist for single-shot prose. The methodology outlasts any single pick: models turn over constantly, so the *bake-off* is the durable artifact, not the winner. (When you characterize "the local layer's" behavior, name the model on test, because what's loaded may not be the recommended hire; see the anti-patterns in [`CLAUDE.md`](CLAUDE.md).)
 
-### The internal runtime — owning the loop
+### The internal runtime: owning the loop
 
-Early dispatch shelled out to an external agent runtime (openclaw). darkmux now ships its **own** container-bounded runtime: a Rust agent loop in a per-dispatch Docker container. Owning the loop is what makes everything downstream possible: kernel-enforced workspace isolation, a trajectory format darkmux fully controls, and telemetry emitted straight into the flow stream rather than scraped back out of someone else's logs. The openclaw shell-out path stayed first-class for a while as an opt-in alternative, but was removed on the 2.0 track ([#1405](https://github.com/kstrat2001/darkmux/issues/1405)) to keep the build and test surface small — the internal runtime is now the only dispatch path. The filter for what the internal runtime *adds* is [workflow-fit, not feature-parity](#scope-of-the-internal-runtime-workflow-fit-not-feature-parity) — a principle that outlived the comparison it was coined for.
+Early dispatch shelled out to an external agent runtime (openclaw). darkmux now ships its **own** container-bounded runtime: a Rust agent loop in a per-dispatch Docker container. Owning the loop is what makes everything downstream possible: kernel-enforced workspace isolation, a trajectory format darkmux fully controls, and telemetry emitted straight into the flow stream rather than scraped back out of someone else's logs. The openclaw shell-out path stayed first-class for a while as an opt-in alternative, but was removed on the 2.0 track ([#1405](https://github.com/kstrat2001/darkmux/issues/1405)) to keep the build and test surface small; the internal runtime is now the only dispatch path. The filter for what the internal runtime *adds* is [workflow-fit, not feature creep](#scope-of-the-internal-runtime-workflow-fit-not-feature-creep), a principle that outlived the comparison it was coined for.
 
-### The dispatch-to-PR loop — the defining capability
+### The dispatch-to-PR loop: the defining capability
 
 Owning the runtime turned darkmux from a configuration tool into a **work** tool. The loop:
 
@@ -62,11 +62,11 @@ This is what the [M4 roadmap charter](docs/roadmap/M4.md) hardens, and it's grou
 
 darkmux drives this loop on **real production work** (FinSys, FinHub, and FinXtract, the finance products at [finhub.finhero.asia](https://finhub.finhero.asia)) and on darkmux itself. The recursive case is the strongest evidence: darkmux's own observability features were built *through* `mission launch`, so the data those features visualize is the data the loop produced while building them. One self-building phase ran 106 turns and ~5.2M prompt tokens with **zero compactions** (context peaked near 70K of a 262K window), which retired a standing question by turning it into a measurement: on a window that large the compaction threshold is a *cost* knob, not a correctness one.
 
-### Observability — from a telemetry sketch to a unified stream
+### Observability: from a telemetry sketch to a unified stream
 
-The original observability idea was a per-request telemetry hook: useful, but bolted on. It became something better: a **single typed flow stream** every dispatch emits into (tokens, context occupancy, detector firings, runtime events), read by one daemon and one drill-down viewer ([#557](https://github.com/kstrat2001/darkmux/issues/557)). The token view is the payoff, splitting the fleet's usage into **local tokens** (your hardware, no API bill) and **cloud tokens** (the paid endpoint you chose — [#1186](https://github.com/kstrat2001/darkmux/issues/1186)) — **tokens only, never currency, on either tier** (claiming to save or cost another person money is a liability we don't take on; the operator multiplies by their own rate). A dogfood day's data taught its own lesson, that the bulk of a long dispatch's tokens are *re-read* context, not generated output, which is itself a compaction-design input.
+The original observability idea was a per-request telemetry hook: useful, but bolted on. It became something better: a **single typed flow stream** every dispatch emits into (tokens, context occupancy, detector firings, runtime events), read by one daemon and one drill-down viewer ([#557](https://github.com/kstrat2001/darkmux/issues/557)). The token view is the payoff, splitting the fleet's usage into **local tokens** (your hardware, no API bill) and **cloud tokens** (the paid endpoint you chose; [#1186](https://github.com/kstrat2001/darkmux/issues/1186)). **Tokens only, never currency, on either tier**: claiming to save or cost another person money is a liability we don't take on; the operator multiplies by their own rate. A dogfood day's data taught its own lesson, that the bulk of a long dispatch's tokens are *re-read* context, not generated output, which is itself a compaction-design input.
 
-### Fleet — many machines become one
+### Fleet: many machines become one
 
 The multi-machine substrate (the v0.4 line, current) lets a single operator's couple of Macs over a tailnet function as one development environment, [detailed below](#multi-machine-substrate). The design target is deliberately **heterogeneous**: a high-memory laptop as the inference peer, a smaller always-on machine as the hub. That heterogeneity is the white space. Nearly all distributed-agent research assumes cloud or homogeneous hardware, so a heterogeneous local fleet of Apple-Silicon Macs is darkmux's to define rather than follow (see the [roadmap](ROADMAP.md)).
 
@@ -88,7 +88,7 @@ Single-operator multi-machine is the design target. The operator owns a couple o
 - **Single-stream dispatch routing** ([#590](https://github.com/kstrat2001/darkmux/issues/590)): all dispatches publish onto the one global `darkmux:work` stream and the first available runner claims any job. `darkmux dispatch <role> --machine <id>` is an *advisory* hint: any runner may still claim, and a non-target runner logs a soft warning and proceeds (no NACK/requeue). With no `--machine`, the dispatch runs locally; there is no tier auto-route. The `--machine` path still emits a `dispatch route` flow record (`target_machine` + `decision`) so the topology UI + audit chain capture *why* work went where. Capability-based auto-routing is the planned successor.
 - **Per-machine introspection**: `GET /machine/specs` returns version, machine_id, RAM total/free, CPU brand, OS, loaded models from `lms ps`, redacted Redis URL. Consumed by `darkmux machine list --deep` (HTTP fan-out across reachable peers).
 - **Daemon resilience**: the SSE Redis tail at `GET /flow/<date>/stream` is bounded. Connect wedges bounded by `REDIS_CONNECT_TIMEOUT`, persistent failures exit cleanly via a synthetic `stream.error` record, and the producer→consumer channel is capped with drop-newest semantics. Concurrent SSE streams are capped and per-route requests are timed out, so a misbehaving viewer tab can't exhaust the daemon. Non-loopback binds require a bearer token (Keychain-stored); loopback stays open ([#881](https://github.com/kstrat2001/darkmux/issues/881)).
-- **CORS posture**: default `null` (file://) only — the bundled viewer from disk works; arbitrary localhost dev-server origins are denied. Operator opts in to specific origins via `DARKMUX_DAEMON_CORS_ORIGINS` (exact-match, normalized). Literal `*` is rejected with a stderr hint.
+- **CORS posture**: default `null` (file://) only. The bundled viewer from disk works; arbitrary localhost dev-server origins are denied. Operator opts in to specific origins via `DARKMUX_DAEMON_CORS_ORIGINS` (exact-match, normalized). Literal `*` is rejected with a stderr hint.
 
 **Out of scope (today; may revisit)**:
 
@@ -99,7 +99,7 @@ Single-operator multi-machine is the design target. The operator owns a couple o
 
 ## What darkmux is NOT
 
-- Not a model-swap optimizer (LMStudio handles the actual load — we orchestrate).
+- Not a model-swap optimizer (LMStudio handles the actual load; we orchestrate).
 - Not an inference framework (vLLM/SGLang have that covered).
 - Not an agent framework (LangChain/AutoGen have that covered).
 - Not a prompt router across cloud providers (LiteLLM has that covered, and it's cloud-oriented).
@@ -107,13 +107,13 @@ Single-operator multi-machine is the design target. The operator owns a couple o
 
 ## History: the openclaw shell-out path (removed in 2.0)
 
-Through the 0.x line, darkmux ran dispatches through either its own internal container-bounded runtime (the default) or an opt-in shell-out to a separately-installed openclaw process (`--runtime openclaw`), with a `crew sync` verb keeping openclaw's `agents.list[]` aligned with darkmux's role manifests. The two paths were deliberately schema-isolated — darkmux never translated its profile fields into openclaw's config shape, and vice versa — so an upstream openclaw schema change had zero impact on darkmux.
+Through the 0.x line, darkmux ran dispatches through either its own internal container-bounded runtime (the default) or an opt-in shell-out to a separately-installed openclaw process (`--runtime openclaw`), with a `crew sync` verb keeping openclaw's `agents.list[]` aligned with darkmux's role manifests. The two paths were deliberately schema-isolated (darkmux never translated its profile fields into openclaw's config shape, and vice versa), so an upstream openclaw schema change had zero impact on darkmux.
 
 The openclaw path was removed on the 2.0 track ([#1405](https://github.com/kstrat2001/darkmux/issues/1405), operator decision on [#1386](https://github.com/kstrat2001/darkmux/issues/1386) theme 5) to keep the build and test surface small: the internal runtime is now the only dispatch path, and the schema-isolation doctrine below continues to apply to it on its own terms.
 
 ### Scope of the internal runtime: workflow-fit, not feature creep
 
-When deciding what to add to the internal runtime, the filter is **workflow-fit** — does the feature serve darkmux's own workflow, not "does some other agent runtime have it." darkmux is shaped by three load-bearing decisions:
+When deciding what to add to the internal runtime, the filter is **workflow-fit**: does the feature serve darkmux's own workflow, not "does some other agent runtime have it." darkmux is shaped by three load-bearing decisions:
 
 - **Mission-as-contract.** A phase is a bounded unit of work with explicit inputs (prior phase outputs, scope file), explicit outputs (typed text file persisted to disk), and explicit verify criteria. Cross-phase memory is file-mediated by design, so the frontier orchestrator sees what state moves between phases. Hidden session-state that survives across dispatches breaks this contract.
 - **Utility/specialist split.** Utility agents (4B-class: compactor, scribe, estimator, mission-compiler) handle bounded structured work at high throughput. Specialist agents (35B+: coder, code-reviewer, analyst) handle judgment-dependent work at lower throughput. Features that push specialists toward utility work (mid-dispatch planning, todo tracking, autonomous replanning) collapse the layering that makes the split valuable, turning judgment-bearing work into hidden utility work.
@@ -123,11 +123,11 @@ The filter for any proposed internal-runtime feature: **does this reinforce miss
 
 ### Schema isolation: darkmux owns its own config
 
-Every field an operator sees in a darkmux profile maps to a darkmux-typed schema entry the internal runtime consumes — no decorative fields that look tunable but have no effect. The internal-runtime path (`src/crew/dispatch_internal.rs`, `runtime/src/`) reads only darkmux-native typed fields from `profile.runtime.*`; darkmux owns these field names, their semantics, and their evolution. An untyped `extras` map exists for forward-compat parse only (so an older binary tolerates a newer config); nothing in the internal-runtime path reads from it (enforced by explicit "must not auto-populate" tests). This discipline predates and outlived the openclaw path — it started as "don't let openclaw's config shape leak into darkmux's," and now stands on its own as "the profile schema is purely darkmux-typed, full stop."
+Every field an operator sees in a darkmux profile maps to a darkmux-typed schema entry the internal runtime consumes: no decorative fields that look tunable but have no effect. The internal-runtime path (`src/crew/dispatch_internal.rs`, `runtime/src/`) reads only darkmux-native typed fields from `profile.runtime.*`; darkmux owns these field names, their semantics, and their evolution. An untyped `extras` map exists for forward-compat parse only (so an older binary tolerates a newer config); nothing in the internal-runtime path reads from it (enforced by explicit "must not auto-populate" tests). This discipline predates and outlived the openclaw path: it started as "don't let openclaw's config shape leak into darkmux's," and now stands on its own as "the profile schema is purely darkmux-typed, full stop."
 
 ## Lab reproducibility: fixtures + content hashing
 
-The lab harness only earns the word "measurement" if a run is reproducible. The fixture cluster ([#487](https://github.com/kstrat2001/darkmux/issues/487)) closed the two gaps that made earlier `coding-task` numbers untrustworthy: runs mutating their own inputs, and no way to prove two runs started — or ended — in the same place.
+The lab harness only earns the word "measurement" if a run is reproducible. The fixture cluster ([#487](https://github.com/kstrat2001/darkmux/issues/487)) closed the two gaps that made earlier `coding-task` numbers untrustworthy: runs mutating their own inputs, and no way to prove two runs started (or ended) in the same place.
 
 - **Per-run COW isolation.** Each run operates on a copy-on-write clone of the source fixture, never the source. The clone is cheap on COW filesystems (`clonefile` on APFS, `--reflink` on btrfs/xfs/zfs) and falls back to a deep copy elsewhere. The provider trait is unchanged: providers see a sandbox path and don't know it's a clone. This eliminated the cross-run baseline drift observed in earlier lab runs.
 - **Content hashing as proof, not policy.** `baseline_hash` (source state at clone time) and `final_hash` (post-dispatch sandbox state) are BLAKE3 over a deterministic walk that excludes derived dirs (`.git`, `node_modules`, `target`, `__pycache__`, `.darkmux-runtime`). Determinism is the point: same content + same layout → same hash, independent of mtimes or inode order. Equal `final_hash` across two runs is the strongest reproducibility signal the lab can emit. Hashing is best-effort: a failure logs and records `null` rather than aborting the dispatch.
@@ -182,20 +182,20 @@ Three choices shape it:
 
 **Visible defaults, not hidden code-defaults.** `darkmux init` writes the common knobs *into the file* with their default values, rather than leaving them implicit in the binary. The cost is that a default written today doesn't silently change on upgrade, but that's the point: the operator can *see* what's configurable without reading source, and *change* a default with a file edit instead of a recompile. A config meant to replace env-var sprawl has to be discoverable, or it isn't a config at all.
 
-**Off-by-default features are `enabled`-gated blocks, not presence-gated.** Redis coordination and the audit log are written as complete blocks with `"enabled": false` and every connection knob populated. The block's *presence* doesn't turn the feature on — the `enabled` flag does. So the whole surface is discoverable (you see exactly what Redis would need) and one edit from on, without darkmux guessing intent from whether a `host` happens to be set.
+**Off-by-default features are `enabled`-gated blocks, not presence-gated.** Redis coordination and the audit log are written as complete blocks with `"enabled": false` and every connection knob populated. The block's *presence* doesn't turn the feature on; the `enabled` flag does. So the whole surface is discoverable (you see exactly what Redis would need) and one edit from on, without darkmux guessing intent from whether a `host` happens to be set.
 
-**Secrets are carved out — never plaintext config.** A `config.json` is a file an operator writes, edits, and might share or commit. So the one thing it never holds is a password: the Redis password and the serve-daemon bearer token live in the macOS Keychain, read at runtime and wrapped so they can only ever reach a log redacted. `config.redis` holds the non-secret connection bits; the Keychain holds the secret. (One other carve-out, for a different reason: `DARKMUX_HOME` — the pointer that *locates* the config root — stays an env var, because it can't live inside the file it's there to find.)
+**Secrets are carved out, never plaintext config.** A `config.json` is a file an operator writes, edits, and might share or commit. So the one thing it never holds is a password: the Redis password and the serve-daemon bearer token live in the macOS Keychain, read at runtime and wrapped so they can only ever reach a log redacted. `config.redis` holds the non-secret connection bits; the Keychain holds the secret. (One other carve-out, for a different reason: `DARKMUX_HOME`, the pointer that *locates* the config root, stays an env var because it can't live inside the file it's there to find.)
 
-The schema is lenient on read (every field optional, unknown keys preserved), so a newer config never bricks an older binary and a hand-edited file never panics the CLI — loud validation is `darkmux doctor`'s job, not the hot load path. Additive schema changes are a minor version bump; the operator's file keeps working across them.
+The schema is lenient on read (every field optional, unknown keys preserved), so a newer config never bricks an older binary and a hand-edited file never panics the CLI. Loud validation is `darkmux doctor`'s job, not the hot load path. Additive schema changes are a minor version bump; the operator's file keeps working across them.
 
 ## How we decide
 
-darkmux's design decisions are **grounded in data and in published research where it exists** — we'd rather cite a measurement or a paper than assert from intuition. The framing is *convergence, not priority*: independent research and this project keep arriving at the same architecture (fresh-context review, verifiable-check termination, structured compaction), and the citations explain *why* it works. See the roadmap's [*How we decide*](ROADMAP.md#how-we-decide) for the citation-verification discipline (every cited source re-fetched and confirmed — a confident citation under a correctly-recalled label is exactly where fabrication hides).
+darkmux's design decisions are **grounded in data and in published research where it exists**: we'd rather cite a measurement or a paper than assert from intuition. The framing is *convergence, not priority*: independent research and this project keep arriving at the same architecture (fresh-context review, verifiable-check termination, structured compaction), and the citations explain *why* it works. See the roadmap's [*How we decide*](ROADMAP.md#how-we-decide) for the citation-verification discipline (every cited source re-fetched and confirmed; a confident citation under a correctly-recalled label is exactly where fabrication hides).
 
 The data comes from three places, and the lab notebook captures the *evidence* behind each call so the reasoning survives even when the underlying work is private:
 
-- **Lab runs** — reproducible workloads against registered fixtures, with content-hash proof that two runs started and ended in the same state. This is where harness hypotheses get tested one variable at a time (baseline → single change → re-measure → compare → record).
-- **Bake-offs** — documented per-hardware-tier model comparisons with criteria fixed before the runs.
-- **Dogfood** — darkmux run against real work, including darkmux building itself through `mission launch` and real production projects (FinSys, FinHub, FinXtract). The failure modes those runs surface — a fabricated sign-off, a confidently-wrong review, a doom loop — are the specs for the next hardening pass. The *data* is what's load-bearing; the sensitive work behind it never has to appear here.
+- **Lab runs**: reproducible workloads against registered fixtures, with content-hash proof that two runs started and ended in the same state. This is where harness hypotheses get tested one variable at a time (baseline → single change → re-measure → compare → record).
+- **Bake-offs**: documented per-hardware-tier model comparisons with criteria fixed before the runs.
+- **Dogfood**: darkmux run against real work, including darkmux building itself through `mission launch` and real production projects (FinSys, FinHub, FinXtract). The failure modes those runs surface (a fabricated sign-off, a confidently-wrong review, a doom loop) are the specs for the next hardening pass. The *data* is what's load-bearing; the sensitive work behind it never has to appear here.
 
-When a decision can't point to a measurement, a citation, or a dogfood observation, that's a flag — not a reason to ship it on intuition.
+When a decision can't point to a measurement, a citation, or a dogfood observation, that's a flag, not a reason to ship it on intuition.

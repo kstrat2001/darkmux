@@ -1,4 +1,4 @@
-# darkmux concepts — the source of truth
+# darkmux concepts: the source of truth
 
 **Status:** living reference · **Last verified against code:** 2026-06-01 (`main`)
 
@@ -16,7 +16,7 @@ a bug to fix, not a footnote. The one discipline that matters most here:
 
 > **Shipped vs. planned is load-bearing.** A capability described in the present
 > tense is in the current binary. Anything not yet built lives in
-> [§8 Planned](#8-planned--not-yet-shipped), clearly fenced and issue-linked.
+> [§8 Planned](#8-planned-not-yet-shipped), clearly fenced and issue-linked.
 > This doc never describes unbuilt work as if it ships today. That's the
 > failure mode it exists to prevent.
 
@@ -52,7 +52,7 @@ division of labor concrete.
 
 ---
 
-## 2. Role families — specialist vs utility
+## 2. Role families: specialist vs utility
 
 darkmux defines exactly **two** crew role families. The defining axis is
 **scope**: a *specialist* works the **mission/phases** (the deliverable); a
@@ -122,7 +122,7 @@ loader keeps rejecting the retired name for forward-compat.
 
 ## 3. Mission → Crew → Phase
 
-The structured-work model. **Note the actual field shapes** — this is where
+The structured-work model. **Note the actual field shapes**: this is where
 informal summaries tend to drift.
 
 ### Mission
@@ -131,8 +131,8 @@ A mission groups a body of work. Its fields
 (`crates/darkmux-crew/src/types.rs:267-318`):
 
 - `id`, `description`
-- `status` — `Active` / `Paused` / `Finalized` (default `Active`; renamed from
-  `Closed` for terminology consistency with the `mission finalize` verb — #1463)
+- `status`: `Active` / `Paused` / `Finalized` (default `Active`; renamed from
+  `Closed` for terminology consistency with the `mission finalize` verb, #1463)
 - `phase_ids: Vec<String>`
 - timestamps: `created_ts`, `started_ts`, `paused_ts`, `finalized_ts`
 
@@ -157,7 +157,7 @@ indexed and queryable.
 mission's ready phases onto the single global work stream, where the first
 available runner claims each one (#590). The operator names the role per
 dispatch; dynamic per-mission crew assembly is
-[planned](#8-planned--not-yet-shipped), not shipped.
+[planned](#8-planned-not-yet-shipped), not shipped.
 
 ### Phase
 
@@ -165,24 +165,24 @@ A phase is one unit of work within a mission. Its fields
 (`crates/darkmux-crew/src/types.rs:339-366`):
 
 - `id`, `mission_id`, `description`
-- `status` — `Planned` / `Running` / `Complete` / `Abandoned` (default `Planned`)
+- `status`: `Planned` / `Running` / `Complete` / `Abandoned` (default `Planned`)
 - `depends_on: Vec<String>`: phase ids this one waits on
 - timestamps: `created_ts`, `started_ts`, `completed_ts`, `abandoned_ts`
 
 There is **no `estimate`, `assignee`, or `burn-down` field** on a phase.
-Burn-down/remaining-work tracking is [planned](#8-planned--not-yet-shipped).
+Burn-down/remaining-work tracking is [planned](#8-planned-not-yet-shipped).
 
 ### Lifecycle state machines
 
 - **Mission:** `Active ⇄ Paused → Finalized` (terminal). Operator verbs: `start`,
-  `pause`, `resume`, and the two terminals — `finalize` (success: drive
+  `pause`, `resume`, and the two terminals, `finalize` (success: drive
   non-terminal phases → Complete, tear down worktrees, mission → Finalized) and
   `abort` (kill: the same teardown, phases → Abandoned). Each persisted with
   operator reasoning.
 - **Phase:** `Planned → Running → Complete | Abandoned`. Phase status is
   **derived by the mission graph** and reconciled by `mission finalize` /
   `mission abort` (#1463 retired the manual `phase start/complete/abandon`
-  verbs — the graph, not the operator, drives per-phase transitions now).
+  verbs; the graph, not the operator, drives per-phase transitions now).
 
 `darkmux mission add-phase` inserts a phase with cross-reference validation
 (mission exists, `depends_on` ids resolve, no id collision).
@@ -235,7 +235,7 @@ Supporting mechanisms, all shipped:
   via `ModelRole::Compactor` in the profile. Compaction config is passed as
   explicit CLI args (`--compact-threshold-tokens`, `--compact-strategy`,
   `--compactor-model`, `--compactor-custom-instructions`) sourced from
-  `profile.runtime.compaction.*` — **not** env vars
+  `profile.runtime.compaction.*`, **not** env vars
   (`runtime/src/compaction.rs:28-30, 165-269`).
   *Direction (#590): the compactor model moves out of the `ModelRole::Compactor`
   profile slot into the `[internal] utility` binding (#450); compaction becomes
@@ -260,7 +260,7 @@ Supporting mechanisms, all shipped:
 
 ### What is measured per dispatch
 
-The runtime records per-dispatch metrics — a top-line summary in `metrics.json`
+The runtime records per-dispatch metrics: a top-line summary in `metrics.json`
 (the `Metrics` struct) plus per-event detail (including token `usage`) in
 `trajectory.jsonl` (`runtime/src/trajectory.rs:32-58`;
 `runtime/src/loop_runner.rs:181-194`):
@@ -271,7 +271,7 @@ The runtime records per-dispatch metrics — a top-line summary in `metrics.json
 - **compaction count**
 
 > Context-usage *as a percentage of the loaded model's window* is **not** a
-> stored metric — only absolute counts are recorded. A "% of window" view is
+> stored metric; only absolute counts are recorded. A "% of window" view is
 > something a viewer derives from absolute tokens + the loaded model's `n_ctx`;
 > treat any such chart as a derived visualization, not a captured signal.
 
@@ -339,7 +339,7 @@ and coordination substrate. The schema version is **`1.9.0`**
   `DARKMUX_MACHINE_ID`), `orchestrator` (from `DARKMUX_ORCHESTRATOR`). *(The
   `machine_tier` provenance field was removed in schema 1.9.0, #587: the
   {inference/hub/client} machine-capacity tier is retired; see #590.)*
-- **Audit chain (`AuditFileSink` only):** `prev_hash`, `hash` — a BLAKE3 hash
+- **Audit chain (`AuditFileSink` only):** `prev_hash` and `hash`, a BLAKE3 hash
   chain whose post-hoc edits are detectable via `darkmux flow integrity-check`
   (#163). Deliberately *not* "chain-of-custody": that claim needs external
   timestamping and custodial controls darkmux does not provide, as
@@ -374,7 +374,7 @@ optional fields are minor bumps that older viewers safely ignore (the
   tail (Redis `XREAD`) (`crates/darkmux-serve/src/lib.rs:630-692, 707-732, 740-841`).
 - The daemon **does not serve HTML**: there is no `ServeDir`, `fallback`, or
   `nest`, and unmapped paths `404`. The single-page observability viewer is
-  [planned](#8-planned--not-yet-shipped) (#554), not shipped.
+  [planned](#8-planned-not-yet-shipped) (#554), not shipped.
 
 ### Lab telemetry transport (today)
 
@@ -383,11 +383,11 @@ emit it as `category=telemetry` flow records on the flow stream (sources: `lms`,
 `process`, `detector`, `runtime`, `context`, `compaction`). There is no sidecar
 file and no flag: the standalone `instruments.jsonl` sidecar and the `--instrument`
 flag on `darkmux lab run` were retired as part of the
-[observability-unification](#8-planned--not-yet-shipped) work (#557).
+[observability-unification](#8-planned-not-yet-shipped) work (#557).
 
 ---
 
-## 8. Planned — not yet shipped
+## 8. Planned (not yet shipped)
 
 Everything below is **issue-tracked and not in the current binary**, except the
 darkmux.com demo, which is a website playback fixture, not a binary
@@ -398,15 +398,15 @@ behavior. The observability items are the
 
 | Planned | Status | Tracking |
 |---|---|---|
-| **Stream unification** — fold lab telemetry into the flow stream as an event family; make instrumentation always-on; retire `instruments.jsonl` + `--instrument`. | in progress | [#557](https://github.com/kstrat2001/darkmux/issues/557) |
-| **Unified drill-down viewer** — one app (fleet → machine → subsystem), replacing the `topology`/`flow`/`lab` pages. | website demo only | [#558](https://github.com/kstrat2001/darkmux/issues/558) |
+| **Stream unification**: fold lab telemetry into the flow stream as an event family; make instrumentation always-on; retire `instruments.jsonl` + `--instrument`. | in progress | [#557](https://github.com/kstrat2001/darkmux/issues/557) |
+| **Unified drill-down viewer**: one app (fleet → machine → subsystem), replacing the `topology`/`flow`/`lab` pages. | website demo only | [#558](https://github.com/kstrat2001/darkmux/issues/558) |
 | **Daemon hosts the viewer** at its own origin (`GET /`), making CORS/mixed-content impossible by construction. | not started | [#554](https://github.com/kstrat2001/darkmux/issues/554) |
 | **darkmux.com demo** as an explicit badged playback fixture (live at `darkmux.com/demo`). | live on the website | [#559](https://github.com/kstrat2001/darkmux/issues/559) |
-| **`select_model` capability scoring** — per-role-optimal model routing. Today a Phase-1 stub returns the Primary model (`crates/darkmux-crew/src/select.rs:60-74`). | stub | — |
-| **Dynamic per-mission crew composition** — assemble a crew for a dispatch. Today the operator names one role explicitly. | not started | — |
-| **Mission-level scope / phase burn-down / per-phase estimate tracking** — stored attributes for the above (intentionally absent today). | not started | — |
+| **`select_model` capability scoring**: per-role-optimal model routing. Today a Phase-1 stub returns the Primary model (`crates/darkmux-crew/src/select.rs:60-74`). | stub | — |
+| **Dynamic per-mission crew composition**: assemble a crew for a dispatch. Today the operator names one role explicitly. | not started | — |
+| **Mission-level scope / phase burn-down / per-phase estimate tracking**: stored attributes for the above (intentionally absent today). | not started | — |
 | **Context-usage as % of window** as a captured telemetry signal (today: derived from absolute counts). | not started | — |
-| **Detector-driven behavior change** — bail/escalate on cycle, etc. (today: observability-only). | not started | — |
+| **Detector-driven behavior change**: bail/escalate on cycle, etc. (today: observability-only). | not started | — |
 | **Tier-1 access-pattern eviction + operator-tunable per-slot compaction caps.** | schema only | [#352](https://github.com/kstrat2001/darkmux/issues/352) |
 
 ---
