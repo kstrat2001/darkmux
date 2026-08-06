@@ -404,6 +404,76 @@ pub(crate) fn build_router_full(
     router.layer(local_only_cors()).with_state(state)
 }
 
+/// (#1663) Test-only: state the loopback peer that a `oneshot` request has no
+/// way to carry.
+///
+/// A real request always arrives on a connection, so `run()`'s
+/// `into_make_service_with_connect_info` always supplies a peer address. A
+/// `oneshot` call has no connection and therefore no `ConnectInfo`, which used
+/// to be papered over inside `auth_mw` itself (absent ⇒ loopback ⇒ exempt) —
+/// the fail-open default this issue removed.
+///
+/// With the middleware failing closed, the convenience has to live where it
+/// belongs: in the test harness, as something a test SAYS. This layer inserts
+/// the loopback peer **only when one is absent**, so a test that injects
+/// `remote_peer()` still gets exactly the peer it asked for.
+///
+/// Deliberately NOT used by the two `an_absent_peer_address_*` tests — those
+/// need the bare router, or they would pass for the wrong reason.
+///
+/// **Keep this `#[cfg(test)]`.** It is the fail-open behavior #1663 removed,
+/// alive on purpose inside this crate's own test harness and nowhere else —
+/// `cfg(test)` does not propagate to dependent crates or release builds. The
+/// one way it could escape: adding a `tests/` integration directory or a
+/// `test-util` feature would tempt someone to widen this to
+/// `#[cfg(any(test, feature = "test-util"))]`, which would ship a
+/// loopback-assuming layer behind a flag. Don't; give the integration test a
+/// real peer address instead.
+#[cfg(test)]
+async fn assume_loopback_peer(mut req: Request, next: Next) -> Response {
+    if req.extensions().get::<ConnectInfo<SocketAddr>>().is_none() {
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+    }
+    next.run(req).await
+}
+
+/// (#1663) [`build_router`] plus the stated-loopback layer — the default for
+/// tests that are not themselves about auth.
+///
+/// Why this exists: a serve token resolves from the process-global
+/// `DARKMUX_SERVE_TOKEN`, and `#[serial]` only excludes OTHER serial tests. So
+/// while one of the eleven token-setting tests holds that variable, every
+/// concurrent non-serial test runs against an auth-on router — and once the
+/// gate fails closed, a peerless `oneshot` from an unrelated test gets a 401
+/// instead of its assertion. That is a harness defect, not a production one:
+/// the router under test is correct, the request is simply less specific than
+/// a real one. Stating the peer fixes the specificity rather than reopening
+/// the hole.
+#[cfg(test)]
+pub(crate) fn build_router_local(flows_dir: PathBuf) -> Router {
+    build_router(flows_dir).layer(from_fn(assume_loopback_peer))
+}
+
+/// (#1663) [`build_router_with_worktrees_base`] plus the stated-loopback layer.
+#[cfg(test)]
+pub(crate) fn build_router_with_worktrees_base_local(
+    flows_dir: PathBuf,
+    worktrees_base: PathBuf,
+) -> Router {
+    build_router_with_worktrees_base(flows_dir, worktrees_base).layer(from_fn(assume_loopback_peer))
+}
+
+/// (#1663) [`build_router_full`] plus the stated-loopback layer.
+#[cfg(test)]
+pub(crate) fn build_router_full_local(
+    flows_dir: PathBuf,
+    worktrees_base: PathBuf,
+    lab_dir: Option<PathBuf>,
+) -> Router {
+    build_router_full(flows_dir, worktrees_base, lab_dir).layer(from_fn(assume_loopback_peer))
+}
+
 /// (#881) Build a `401 Unauthorized` with a `WWW-Authenticate: Bearer` hint.
 fn unauthorized() -> Response {
     (
@@ -457,8 +527,9 @@ fn request_token_ok(headers: &axum::http::HeaderMap) -> bool {
 /// pass (the operator's own machine + the bundled same-origin viewer keep
 /// working with zero friction); non-loopback peers must present the token.
 /// `/health` is always exempt so doctor's reachability probe (and external
-/// liveness checks) keep working. A missing `ConnectInfo` (the `oneshot` test
-/// path, which has no connection) is treated as loopback.
+/// liveness checks) keep working. (#1663) A missing `ConnectInfo` is treated as
+/// REMOTE — see the fail-closed reasoning in the body. Tests that want the
+/// loopback exemption state it, via `build_router_local`.
 ///
 /// **Trust assumption:** "loopback is trusted" holds for darkmux's deployment —
 /// bound directly (no reverse proxy) over a Tailscale tailnet that preserves the
@@ -469,11 +540,32 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     if req.uri().path() == "/health" {
         return next.run(req).await;
     }
+    // (#1663) FAIL CLOSED. An absent `ConnectInfo` means "treat as remote",
+    // i.e. require the token — the opposite of what this did.
+    //
+    // It used to `unwrap_or(false)` (absent ⇒ loopback ⇒ auth-exempt) as a
+    // convenience for the oneshot test path. That made the ENTIRE remote gate
+    // rest on one wiring call: `into_make_service_with_connect_info` in
+    // `run()`, guarded only by a comment asking the next person not to change
+    // it. Downgrade that to `into_make_service()` in any refactor and every
+    // peer looks loopback — a tailnet-exposed daemon then serves flow
+    // records, machine specs, mission state, and worktree summaries
+    // unauthenticated, with every test still green and nothing visible to the
+    // operator (the viewer keeps working; loopback is exempt either way).
+    //
+    // Now that same refactor produces 401s on the first remote request
+    // instead of silence. Tests inject `ConnectInfo` explicitly — see
+    // `loopback_peer` and `build_router_local` — so the exemption is
+    // something a test STATES rather than something it inherits by omission.
+    //
+    // Same instinct `bind_requires_token` already applies just below: a bind
+    // string that doesn't parse is treated as non-loopback, so a typo can't
+    // sneak past the gate. Absence is not evidence of safety.
     let is_remote = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| !ci.0.ip().is_loopback())
-        .unwrap_or(false);
+        .unwrap_or(true);
     if !is_remote || request_token_ok(req.headers()) {
         next.run(req).await
     } else {
@@ -977,13 +1069,19 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             let _ = shutdown_rx_axum.wait_for(|&v| v).await;
         };
 
-        // (#881) SECURITY-LOAD-BEARING: `into_make_service_with_connect_info`
-        // populates each request's `ConnectInfo<SocketAddr>` from the real TCP
-        // peer — that's how `auth_mw` tells a remote peer (token required) from a
-        // loopback one (exempt). If this is ever downgraded to a plain
-        // `into_make_service()`, `auth_mw` sees no `ConnectInfo`, treats EVERY
-        // peer as loopback, and the remote gate becomes a silent no-op. Do not
-        // change without re-checking `auth_mw`.
+        // (#881) `into_make_service_with_connect_info` populates each request's
+        // `ConnectInfo<SocketAddr>` from the real TCP peer — that's how
+        // `auth_mw` tells a remote peer (token required) from a loopback one
+        // (exempt).
+        //
+        // (#1663) This used to be SECURITY-load-bearing: `auth_mw` treated an
+        // absent `ConnectInfo` as loopback, so downgrading to a plain
+        // `into_make_service()` made every peer look exempt and turned the
+        // remote gate into a SILENT no-op. It fails closed now, so the same
+        // downgrade is loud instead — every peerless request 401s, including
+        // the operator's own loopback viewer once a token is configured.
+        // Still don't change it without re-reading `auth_mw`; the failure just
+        // announces itself now rather than hiding.
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
