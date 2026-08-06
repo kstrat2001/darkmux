@@ -420,6 +420,15 @@ pub(crate) fn build_router_full(
 ///
 /// Deliberately NOT used by the two `an_absent_peer_address_*` tests — those
 /// need the bare router, or they would pass for the wrong reason.
+///
+/// **Keep this `#[cfg(test)]`.** It is the fail-open behavior #1663 removed,
+/// alive on purpose inside this crate's own test harness and nowhere else —
+/// `cfg(test)` does not propagate to dependent crates or release builds. The
+/// one way it could escape: adding a `tests/` integration directory or a
+/// `test-util` feature would tempt someone to widen this to
+/// `#[cfg(any(test, feature = "test-util"))]`, which would ship a
+/// loopback-assuming layer behind a flag. Don't; give the integration test a
+/// real peer address instead.
 #[cfg(test)]
 async fn assume_loopback_peer(mut req: Request, next: Next) -> Response {
     if req.extensions().get::<ConnectInfo<SocketAddr>>().is_none() {
@@ -546,8 +555,8 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     //
     // Now that same refactor produces 401s on the first remote request
     // instead of silence. Tests inject `ConnectInfo` explicitly — see
-    // `loopback_conn_info` — so the exemption is something a test STATES
-    // rather than something it inherits by omission.
+    // `loopback_peer` and `build_router_local` — so the exemption is
+    // something a test STATES rather than something it inherits by omission.
     //
     // Same instinct `bind_requires_token` already applies just below: a bind
     // string that doesn't parse is treated as non-loopback, so a typo can't
@@ -1060,13 +1069,19 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             let _ = shutdown_rx_axum.wait_for(|&v| v).await;
         };
 
-        // (#881) SECURITY-LOAD-BEARING: `into_make_service_with_connect_info`
-        // populates each request's `ConnectInfo<SocketAddr>` from the real TCP
-        // peer — that's how `auth_mw` tells a remote peer (token required) from a
-        // loopback one (exempt). If this is ever downgraded to a plain
-        // `into_make_service()`, `auth_mw` sees no `ConnectInfo`, treats EVERY
-        // peer as loopback, and the remote gate becomes a silent no-op. Do not
-        // change without re-checking `auth_mw`.
+        // (#881) `into_make_service_with_connect_info` populates each request's
+        // `ConnectInfo<SocketAddr>` from the real TCP peer — that's how
+        // `auth_mw` tells a remote peer (token required) from a loopback one
+        // (exempt).
+        //
+        // (#1663) This used to be SECURITY-load-bearing: `auth_mw` treated an
+        // absent `ConnectInfo` as loopback, so downgrading to a plain
+        // `into_make_service()` made every peer look exempt and turned the
+        // remote gate into a SILENT no-op. It fails closed now, so the same
+        // downgrade is loud instead — every peerless request 401s, including
+        // the operator's own loopback viewer once a token is configured.
+        // Still don't change it without re-reading `auth_mw`; the failure just
+        // announces itself now rather than hiding.
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
