@@ -823,8 +823,34 @@ fn utility_binding_status(
                     name,
                     status: Status::Warn,
                     message: format!("utility model `{id}` registered but NOT loaded"),
+                    // (#1676/#1616) This hint has now been wrong twice, in
+                    // opposite directions, so the mechanism is worth stating.
+                    //
+                    // Originally it claimed compaction would FAIL without a
+                    // manual load, and suggested a bare `lms load <id>`. Both
+                    // aged badly: #1616 made the internal dispatch path
+                    // self-load the compactor at its own declared `n_ctx`
+                    // under the `darkmux:` namespace, and a BARE `lms load`
+                    // produces the non-namespaced resident the namespace
+                    // contract calls the #1135 ghost (unknown load config,
+                    // never reused, invisible to `machine eject`) — so
+                    // following it could CREATE the problem the namespace
+                    // exists to prevent.
+                    //
+                    // The first correction then drew a contrast that does not
+                    // exist: "not needed for dispatch, but needed for the
+                    // utility-agent verbs". `utility_model_id()` has exactly
+                    // three consumers — this check, a serve-side display read,
+                    // and `apply_utility_model`, which sets `compactor_model`.
+                    // That is ALL the binding does. `mission propose` and
+                    // `lab notebook draft` resolve their own model from the
+                    // profile and reach the SAME self-loading dispatch path,
+                    // so no verb needs this resident first.
+                    //
+                    // What remains true is only that a hand-load moves the
+                    // cost earlier. Say that and nothing more.
                     hint: Some(
-                        "Load it before dispatching — compaction summons the utility model mid-dispatch; if it isn't resident the compactor call fails. Run `lms load <id>`, or register it as `internal.utility` so a dispatch loads it automatically. (#590)".into(),
+                        "No verb needs this loaded first — the binding's only job is to name the compactor, and every dispatch path self-loads it at its declared `n_ctx` under the `darkmux:` namespace (#1616). Loading it by hand just pays that cost now instead of during the first dispatch; if you do, keep the namespace and the context — `lms load <id> --context-length <n> --identifier darkmux:<id>` — since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616, #1675)".into(),
                     ),
                 }
             }
@@ -4743,13 +4769,55 @@ mod tests {
         assert_eq!(c2.status, Status::Pass);
     }
 
+    /// (#1676) The warning stands — an unloaded utility model still matters
+    /// for the verbs that read the global `internal.utility` binding — but its
+    /// REMEDY must not describe the pre-#1616 world.
+    ///
+    /// Two claims were wrong and one was actively harmful. Wrong: that
+    /// compaction fails without a manual load (`dispatch_internal` self-loads
+    /// the compactor at its declared `n_ctx`). Harmful: suggesting a bare `lms
+    /// load <id>`, which creates the non-namespaced resident the namespace
+    /// contract calls the #1135 ghost — unknown load config, never reused by
+    /// darkmux, unreachable by `machine eject`. Following the hint could cause
+    /// the thing the namespace exists to prevent.
     #[test]
-    fn utility_binding_registered_but_not_loaded_warns() {
+    fn utility_binding_not_loaded_hint_does_not_prescribe_a_bare_manual_load() {
         let loaded = vec![lm("worker", "worker-35b")];
         let c = super::utility_binding_status(Some("util-4b"), Some(&loaded));
-        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.status, Status::Warn, "an unloaded utility binding is still worth surfacing");
         assert!(c.message.contains("registered but NOT loaded"));
-        assert!(c.hint.unwrap().contains("Load it before dispatching"));
+        let hint = c.hint.expect("a warn carries a remedy");
+        assert!(
+            !hint.contains("the compactor call fails"),
+            "the dispatch path self-loads the compactor since #1616: {hint}"
+        );
+        assert!(
+            !hint.contains("Load it before dispatching"),
+            "dispatch needs nothing done first: {hint}"
+        );
+        // (#1675 gate finding) Pin the COMMAND, not the prose. A bare
+        // `contains("darkmux:")` was satisfied by the sentence "under the
+        // `darkmux:` namespace" even if the suggested invocation regressed to
+        // a namespace-dropping `lms load <id>` — i.e. the assertion whose
+        // comment promised the namespace didn't actually check it.
+        assert!(
+            hint.contains("--identifier darkmux:"),
+            "a suggested manual load must carry the namespace flag, or it makes a #1135 ghost: {hint}"
+        );
+        assert!(
+            hint.contains("--context-length"),
+            "and the declared context, or the hand-load lands at the model default: {hint}"
+        );
+        // The hint must not resurrect the false contrast that replaced the
+        // original false claim: `utility_model_id()` only ever names the
+        // compactor, and `mission propose` / `lab notebook draft` reach the
+        // same self-loading path as every other verb.
+        for verb in ["mission propose", "lab notebook draft"] {
+            assert!(
+                !hint.contains(verb),
+                "no verb needs this resident first — naming {verb:?} implies one does: {hint}"
+            );
+        }
     }
 
     // ─── role_profiles coherence (#1475 packet 1, #1547) ─────────────────

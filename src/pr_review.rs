@@ -284,11 +284,21 @@ fn review_footer(env: &ReviewEnvelope, attribution: Option<&str>) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(REVIEW_TAGLINE);
-    format!(
-        "\n\n---\n<sub>Automated review — {} — {tagline} \
-         · [Powered by darkmux](https://darkmux.com)</sub>",
-        dispatch_provenance(env)
-    )
+    // (#1676) The provenance clause is present only when the envelope carries
+    // evidence for it. With no member records there is nothing to say about
+    // where anything ran, so the clause drops out entirely rather than being
+    // filled with a default — which is what "asserts neither local nor cloud"
+    // has to mean on an audit surface.
+    match dispatch_provenance(env) {
+        Some(provenance) => format!(
+            "\n\n---\n<sub>Automated review — {provenance} — {tagline} \
+             · [Powered by darkmux](https://darkmux.com)</sub>"
+        ),
+        None => format!(
+            "\n\n---\n<sub>Automated review — {tagline} \
+             · [Powered by darkmux](https://darkmux.com)</sub>"
+        ),
+    }
 }
 
 /// (#1298) The dispatch-provenance clause: WHERE the review's seats actually
@@ -300,19 +310,33 @@ fn review_footer(env: &ReviewEnvelope, attribution: Option<&str>) -> String {
 ///   for that phrase).
 /// - Any seat remote → names the hosted model(s); never "no cloud API".
 /// - Mixed crew → names both the local and the hosted seat models.
-/// - No member records → asserts neither local nor cloud (stays honest).
-fn dispatch_provenance(env: &ReviewEnvelope) -> String {
+/// - No member records → **`None`**: the clause is omitted, asserting nothing.
+///
+/// (#1676) That last arm used to return the literal `"on a self-hosted
+/// runner"` — a hardcoded claim about the execution environment, made in the
+/// one branch where the envelope holds no evidence that anything executed at
+/// all. The doc above already said it "asserts neither local nor cloud"; the
+/// code didn't. A v2.5.0 release dogfood launched `mission launch review` from
+/// a laptop shell and got a public-facing footer saying it ran on a
+/// self-hosted runner.
+///
+/// It survived #1298 (which fixed the three evidence-derived arms) because the
+/// no-dispatch path was rare — until #1605 made benign-empty a normal outcome
+/// that POSTS a comment. A rare branch became a common one and its content was
+/// never re-read. The other three arms are derived from member records and are
+/// unchanged.
+fn dispatch_provenance(env: &ReviewEnvelope) -> Option<String> {
     let local = unique_seat_models(env, false);
     let remote = unique_seat_models(env, true);
     match (local.is_empty(), remote.is_empty()) {
-        (true, true) => "on a self-hosted runner".to_string(),
-        (false, true) => format!("on a local model, no cloud API ({})", local.join(", ")),
-        (true, false) => format!("via a hosted cloud endpoint ({})", remote.join(", ")),
-        (false, false) => format!(
+        (true, true) => None,
+        (false, true) => Some(format!("on a local model, no cloud API ({})", local.join(", "))),
+        (true, false) => Some(format!("via a hosted cloud endpoint ({})", remote.join(", "))),
+        (false, false) => Some(format!(
             "on a mixed crew (local: {}; hosted cloud endpoint: {})",
             local.join(", "),
             remote.join(", ")
-        ),
+        )),
     }
 }
 
@@ -1541,6 +1565,46 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    /// (#1676) With NO member records the envelope holds no evidence that
+    /// anything ran, so the footer must make no claim about where it ran. It
+    /// used to say "on a self-hosted runner" — a hardcoded environment claim
+    /// in the one branch with zero evidence, on a surface whose whole job is
+    /// audit integrity. A v2.5.0 dogfood launched from a laptop shell and got
+    /// exactly that sentence posted.
+    ///
+    /// The tagline, the darkmux attribution, and the rest of the footer must
+    /// survive — this drops a false clause, it doesn't drop the footer.
+    #[test]
+    fn footer_with_no_member_records_claims_no_execution_environment() {
+        let body = footer_body_for(vec![]);
+        assert!(
+            !body.contains("self-hosted runner"),
+            "an envelope with no member records must not claim a runner: {body}"
+        );
+        for claim in ["no cloud API", "hosted cloud endpoint", "mixed crew", "on a local model"] {
+            assert!(
+                !body.contains(claim),
+                "no member records ⇒ no provenance claim, but found {claim:?}: {body}"
+            );
+        }
+        assert!(body.contains(REVIEW_TAGLINE), "the tagline still renders: {body}");
+        assert!(body.contains("Powered by darkmux"), "the attribution still renders: {body}");
+        assert!(body.contains("Automated review"), "the footer is still a footer: {body}");
+    }
+
+    /// The inverted case, so the test above cannot pass merely because the
+    /// footer stopped rendering provenance for everyone: an envelope that DOES
+    /// carry a member record still names where that seat ran.
+    #[test]
+    fn footer_with_a_member_record_still_names_where_it_ran() {
+        let body = footer_body_for(vec![judge_member("darkmux:qwen-judge", false)]);
+        assert!(
+            body.contains("on a local model, no cloud API"),
+            "evidence present ⇒ the clause must still render: {body}"
+        );
+        assert!(body.contains("darkmux:qwen-judge"), "and name the model: {body}");
     }
 
     #[test]
