@@ -599,6 +599,10 @@ fn build_mission_config(
         schema_version: Some(MISSION_CONFIG_SCHEMA.to_string()),
         inputs: Vec::new(),
         phases,
+        // (#1684) `mission propose` mints operator-scoped/freeform configs —
+        // never panel-advertised by default. The operator opts a proposed
+        // config into the panel by hand-editing its saved JSON afterward.
+        panel: None,
         extras,
     }
 }

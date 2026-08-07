@@ -14,6 +14,13 @@ use cli::*;
 
 // SPIKE (#1388) — `darkmux acp`. See src/acp.rs module docs.
 mod acp;
+// (#1684) Registry-advertised panel commands + ephemeral procedural
+// launches — the merged mission-config registry enumeration, command
+// routing decision, and in-process ephemeral graph runner `acp.rs`'s
+// session/new and session/prompt handlers call into. Split out of acp.rs
+// itself so the ACP wire-protocol plumbing and the registry/scheduler
+// wiring stay independently readable.
+mod acp_panel;
 
 // #463 workspace split — crew extracted to its own crate (the velocity-debt
 // target: touching dispatch_internal.rs now rebuilds only darkmux-crew + the

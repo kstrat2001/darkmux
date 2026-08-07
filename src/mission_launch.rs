@@ -1024,7 +1024,13 @@ fn config_uses_coder_phase_kinds(config: &MissionConfig) -> bool {
 /// `REVIEW_TIER3_KINDS` step is a review-pipeline config and must go through
 /// the driver that owns review bundling/staffing/side-paths, whether it is
 /// named `review`, `review-lean`, or anything else the operator stored.
-fn config_uses_review_kinds(config: &MissionConfig) -> bool {
+///
+/// `pub(crate)` (#1684 QA finding) — `src/acp_panel.rs`'s panel-command
+/// router uses the SAME structural test to decide whether an invoked
+/// command routes to `acp.rs`'s bespoke `run_review` path, rather than an
+/// `id == "review"` string-literal check that would miss a renamed
+/// variant exactly the way this function's own doc warns against.
+pub(crate) fn config_uses_review_kinds(config: &MissionConfig) -> bool {
     config.phases.iter().any(|p| {
         p.tasks
             .iter()
@@ -2979,6 +2985,7 @@ mod tests {
                 input("image", Some(false)),
             ],
             phases: Vec::new(),
+            panel: None,
             extras: BTreeMap::new(),
         };
         let missing = missing_required_inputs(&cfg, &BTreeMap::new());
