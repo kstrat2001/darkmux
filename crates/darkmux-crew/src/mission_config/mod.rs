@@ -95,10 +95,20 @@ use std::collections::{BTreeMap, BTreeSet};
 /// stay quiet about, unlike an ADDITIVE field a future consumer can safely
 /// ignore per the minor-bump contract).
 ///
+/// Bumped to **"2.2"** (#1684 Packet 2) — additive: [`StepConfig`] gained
+/// the optional `gate` field (recognized value today: `"operator"`) — the
+/// operator sign-off gate. Presence blocks the step at run time until the
+/// caller-supplied gate handler approves it (`darkmux_crew::gate`); absence
+/// (every pre-2.2 document) is a pure no-op. A future consumer that doesn't
+/// understand the field can safely ignore it per the minor-bump contract —
+/// but a document that DOES declare an unrecognized gate VALUE is never
+/// silently treated as ungated (see `StepConfig::gate`'s own doc on the
+/// fail-closed contract).
+///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "2.1";
+pub const MISSION_CONFIG_SCHEMA: &str = "2.2";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -335,6 +345,26 @@ pub struct StepConfig {
     pub kind: String,
     #[serde(default)]
     pub config: serde_json::Value,
+    /// (#1684 Packet 2, schema 2.2) The operator sign-off gate. `None` (the
+    /// default; every pre-2.2 document) means the step runs exactly as
+    /// before — `darkmux-crew`'s `scheduler::run_step_graph` never invokes
+    /// a gate handler for an ungated step. The only value RECOGNIZED today
+    /// is the literal string `"operator"` (`darkmux_crew::gate::
+    /// crate::gate::GATE_KIND_OPERATOR`) — [`interpret::interpret`] threads this field
+    /// onto the executable `crew::types::Step::gate` verbatim (no
+    /// resolution/validation happens here; that's [`MissionConfig::validate`]'s
+    /// job — see the `gate` finding it emits for an unrecognized value).
+    ///
+    /// **Fail-closed contract.** A value other than `"operator"` is NOT
+    /// silently treated as ungated — [`MissionConfig::validate`] surfaces it
+    /// as a `Warning` (lenient-on-read; a future minor bump may recognize
+    /// more gate kinds), and at RUN time `gate::resolve_gate` refuses the
+    /// step outright (never invokes the caller's handler for a kind it
+    /// doesn't understand) rather than running it unattended. An operator
+    /// typo in this field therefore blocks the step, never silently skips
+    /// the sign-off it was meant to require.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
@@ -599,6 +629,34 @@ impl MissionConfig {
                             ),
                         });
                     }
+
+                    // (#1684 Packet 2) `gate` is lenient-on-read (contract 7:
+                    // an unrecognized value still PARSES) but the only value
+                    // this binary actually understands today is
+                    // `crate::gate::GATE_KIND_OPERATOR`. A `Warning`, not an `Error` — a
+                    // future minor bump may recognize more gate kinds, and
+                    // the RUN-time behavior for an unrecognized value is
+                    // never "silently ungated" regardless of this finding
+                    // (see `gate::resolve_gate`'s fail-closed contract on
+                    // `crew::types::Step::gate`) — this is an authoring
+                    // hint, not the enforcement mechanism.
+                    if let Some(g) = &step.gate {
+                        if g != crate::gate::GATE_KIND_OPERATOR {
+                            findings.push(ValidationFinding {
+                                severity: FindingSeverity::Warning,
+                                path: format!("{step_path}.gate"),
+                                message: format!(
+                                    "step \"{}\" declares gate \"{g}\", which this binary does \
+                                     not recognize (only \"{}\" is understood today) — at run \
+                                     time an unrecognized gate FAILS CLOSED (the step is refused, \
+                                     never silently run ungated), so this is not a config that \
+                                     quietly does nothing; fix the value or drop the field",
+                                    step.id,
+                                    crate::gate::GATE_KIND_OPERATOR
+                                ),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -711,8 +769,13 @@ mod tests {
             id: id.to_string(),
             kind: kind.to_string(),
             config: serde_json::Value::Null,
+            gate: None,
             extras: BTreeMap::new(),
         }
+    }
+
+    fn gated_step(id: &str, kind: &str, gate: &str) -> StepConfig {
+        StepConfig { gate: Some(gate.to_string()), ..step(id, kind) }
     }
 
     fn task(id: &str, depends_on: &[&str], steps: Vec<StepConfig>) -> TaskConfig {
@@ -1283,6 +1346,7 @@ mod tests {
                     id: "s1".to_string(),
                     kind: "dispatch.internal".to_string(),
                     config: serde_json::json!({"role": "coder"}),
+                    gate: None,
                     extras: BTreeMap::new(),
                 }],
             )],
@@ -1290,6 +1354,61 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: MissionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    // ─── `gate` field (#1684 Packet 2, schema 2.2) ─────────────────────
+
+    #[test]
+    fn a_pre_2_2_document_with_no_gate_field_parses_clean() {
+        // The exact minimal 2.1-shaped step document — no `gate` key at
+        // all. Lenient-on-read (contract 7): must parse identically to
+        // before this packet, `gate` defaulting to `None`.
+        let json = r#"{"id":"m","name":"M","phases":[{"id":"p1","tasks":[
+            {"id":"t1","steps":[{"id":"s1","kind":"procedural.noop"}]}
+        ]}]}"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.phases[0].tasks[0].steps[0].gate, None);
+        assert!(cfg.validate(&["procedural.noop"]).is_empty());
+    }
+
+    #[test]
+    fn a_gate_operator_step_round_trips_through_json() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![task("t1", &[], vec![gated_step("s1", "procedural.noop", crate::gate::GATE_KIND_OPERATOR)])],
+        )]);
+        assert_eq!(cfg.phases[0].tasks[0].steps[0].gate.as_deref(), Some(crate::gate::GATE_KIND_OPERATOR));
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"gate\":\"operator\""), "{json}");
+        let back: MissionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+        assert!(
+            cfg.validate(&["procedural.noop"]).is_empty(),
+            "a recognized gate value must validate clean: {:?}",
+            cfg.validate(&["procedural.noop"])
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_gate_value_is_a_validate_time_warning_not_an_error() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![task("t1", &[], vec![gated_step("s1", "procedural.noop", "some-future-kind")])],
+        )]);
+        let findings = cfg.validate(&["procedural.noop"]);
+        let f = findings
+            .iter()
+            .find(|f| f.path.ends_with(".gate"))
+            .unwrap_or_else(|| panic!("expected a `.gate` finding, got {findings:?}"));
+        assert_eq!(f.severity, FindingSeverity::Warning, "unrecognized ≠ malformed — a Warning, not an Error");
+        assert!(f.message.contains("some-future-kind"), "{}", f.message);
+        assert!(
+            f.message.contains("FAILS CLOSED"),
+            "the finding must say the RUN-time behavior is fail-closed, not silently ungated: {}",
+            f.message
+        );
+        // Never blocks USABILITY — `is_valid` stays true for a Warning.
+        assert!(cfg.is_valid(&["procedural.noop"]));
     }
 
     // ── (#1398) display_name schema field ───────────────────────────────
@@ -1322,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_2_1() {
+    fn schema_version_constant_is_2_2() {
         // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
         // `LaunchParams::expansions` primitive — never fed by either
         // production launcher. A field REMOVAL is a MAJOR bump per this
@@ -1330,9 +1449,12 @@ mod tests {
         // rule applied to a different data shape) — not the minor 1.5 an
         // earlier draft of this change used.
         //
-        // (#1684) Bumped again to "2.1" — additive (`panel`), so still a
+        // (#1684 Packet 1) Bumped to "2.1" — additive (`panel`), so still a
         // minor bump on top of the 2.0 major.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "2.1");
+        //
+        // (#1684 Packet 2) Bumped again to "2.2" — additive (`StepConfig::
+        // gate`), same minor-bump discipline.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "2.2");
     }
 
     // ── (#1684) `panel` schema field ─────────────────────────────────────

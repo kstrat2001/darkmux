@@ -358,6 +358,30 @@ pub fn run_step_graph(
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
     emit: &mut dyn FnMut(FlowRecord),
     persist: &mut dyn FnMut(&Step),
+    // (#1684 Packet 2) The operator sign-off gate handler — mirrors
+    // `persist`'s caller-supplied-seam shape immediately above. Invoked
+    // (via `gate::resolve_gate`) for every READY step whose `gate` field
+    // is `Some("operator")`, BEFORE that step ever flips `Planned` ->
+    // `Running` — the check happens synchronously on this (the main)
+    // thread, once per gated ready step, before this wave's jobs are
+    // built, so a blocking handler (a tty prompt, an ACP `session/
+    // request_permission` round-trip) can never race a sibling step's
+    // dispatch. A step whose gate DECLINES never runs at all: it goes
+    // straight from `Planned` to `Error` (see the wave loop below), and
+    // every downstream dependent skips it exactly like any other failed
+    // step. `None` is a valid, fail-CLOSED default (see `gate::
+    // resolve_gate`'s own doc) — production callers with no gated steps
+    // in their own graphs (the review driver, `dispatch_as_crew_of_one`,
+    // most scheduler unit tests) pass `None`.
+    //
+    // (#1684 QA CONSIDER) The gate pass runs SERIALLY over every ready
+    // step BEFORE any of this wave's jobs are built — a gated step ready
+    // alongside N ungated siblings in the SAME wave holds all N of them
+    // waiting behind the operator's decision, not just the gated one. This
+    // is a deliberate simplicity trade-off (no per-step concurrent gate
+    // resolution in Packet 2), not an oversight: answering the dialog is
+    // on the critical path of every sibling in that wave.
+    mut gate: Option<&mut crate::gate::GateHandler<'_>>,
     // (#1442 ship-2b) Optional dispatch interceptor threaded into every
     // step's `StepRunCtx` — `None` on every production path; a test
     // harness passes `Some` so `dispatch.map` items dispatch through the
@@ -541,6 +565,64 @@ pub fn run_step_graph(
 
         if ready_ids.is_empty() {
             break;
+        }
+
+        // (#1684 Packet 2) Evaluate every ready step's operator sign-off
+        // gate BEFORE it ever flips to `Running` — see this parameter's
+        // own doc above and `gate::resolve_gate`. A step whose gate
+        // Declines is removed from `ready_ids` here and never reaches the
+        // `Running` flip below, never dispatches, and never invokes
+        // `kinds.get(...)`/`run_streaming` — it fails exactly like a step
+        // that was invalid before it ever ran. `apply_step_terminal` is the
+        // SAME function the wave-drain path below uses for a real
+        // dispatch's `Err` outcome, so a declined step is byte-for-byte
+        // indistinguishable, downstream, from any other failed step: same
+        // `NodeStatus::Error`, same `report.errored` membership, same
+        // "step error" flow record, same durable `persist` call, same
+        // "downstream dependent never becomes ready" consequence via
+        // `step_is_ready`/`task_status`.
+        let ready_ids: Vec<String> = {
+            let mut approved: Vec<String> = Vec::with_capacity(ready_ids.len());
+            for id in ready_ids {
+                let step_snapshot = steps.get(&id).expect("id came from `steps` itself").clone();
+                let task_snapshot = tasks
+                    .get(&step_snapshot.task_id)
+                    .cloned()
+                    .unwrap_or_else(|| synthetic_task(&step_snapshot));
+                let facts = gather_inputs(&step_snapshot, &task_snapshot, tasks, steps);
+                // (#1684 QA CONSIDER) `resolve_gate` can block for an
+                // arbitrarily long time (a tty prompt, an ACP round trip)
+                // — the completion timestamp below is sampled AFTER it
+                // returns, never before the loop starts, so a step
+                // declined after a five-minute dialog doesn't carry a
+                // `completed_ts` from five minutes in the past.
+                match crate::gate::resolve_gate(&step_snapshot, &facts, gate.as_deref_mut()) {
+                    None | Some(crate::gate::GateDecision::Approved) => approved.push(id),
+                    Some(crate::gate::GateDecision::Declined { reason }) => {
+                        apply_step_terminal(
+                            steps,
+                            &mut report,
+                            &mut *emit,
+                            &mut *persist,
+                            &id,
+                            now_unix(),
+                            Err(reason),
+                            Vec::new(),
+                        );
+                    }
+                }
+            }
+            approved
+        };
+
+        if ready_ids.is_empty() {
+            // Every step ready this wave was gate-declined — nothing left
+            // to run THIS wave, but a later wave may still have work (a
+            // sibling task the decline didn't touch). Loop back to
+            // `step_is_ready` rather than falling through the empty-wave
+            // machinery below for no reason.
+            report.iterations += 1;
+            continue;
         }
 
         let now = now_unix();
@@ -960,6 +1042,7 @@ mod tests {
         let step = Step {
             id: step_id,
             task_id: id.to_string(),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: NodeStatus::Planned,
             config: json!(null),
@@ -1082,6 +1165,7 @@ mod tests {
         let step0 = Step {
             id: "multi-0".to_string(),
             task_id: "multi".to_string(),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: NodeStatus::Complete,
             config: json!(null),
@@ -1092,6 +1176,7 @@ mod tests {
         let step1 = Step {
             id: "multi-1".to_string(),
             task_id: "multi".to_string(),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: NodeStatus::Planned,
             config: json!(null),
@@ -1237,6 +1322,7 @@ mod tests {
         let step0 = Step {
             id: "multi-0".to_string(),
             task_id: "multi".to_string(),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: NodeStatus::Complete,
             config: json!(null),
@@ -1247,6 +1333,7 @@ mod tests {
         let step1 = Step {
             id: "multi-1".to_string(),
             task_id: "multi".to_string(),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: NodeStatus::Planned,
             config: json!(null),
@@ -1360,9 +1447,229 @@ mod tests {
             &mut |r| emitted.push(r),
             &mut |_step| {},
             None,
+            None,
             &[],
         )
         .unwrap()
+    }
+
+    // ─── run_step_graph gate wiring (#1684 Packet 2) ───────────────────
+    //
+    // `gate::resolve_gate` itself is unit-tested in `crate::gate`'s own
+    // test module (the handler CONTRACT: ungated never invokes, recognized
+    // invokes, unrecognized fails closed without invoking, the facts map
+    // passes through verbatim). These tests are the SCHEDULER-level
+    // integration proof: that `run_step_graph`'s wave loop actually wires
+    // the ready-step gate check correctly — a declined step never flips to
+    // `Running`, its downstream dependent stays `Planned` exactly like any
+    // other failed-dependency case, and a gate with no handler supplied
+    // still fails closed end to end (not just at the `gate` module's own
+    // unit-test level).
+
+    #[test]
+    fn run_step_graph_never_invokes_the_gate_handler_for_an_ungated_step() {
+        let (task_a, step_a) = task_and_step("a", &[]); // gate: None (task_and_step's default)
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut calls = 0;
+        let mut handler = |_s: &Step, _f: &BTreeMap<String, String>| {
+            calls += 1;
+            crate::gate::GateDecision::Approved
+        };
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(calls, 0, "an ungated step must never reach the gate handler");
+        assert_eq!(steps["a-step"].status, NodeStatus::Complete);
+        assert_eq!(report.completed, vec!["a-step".to_string()]);
+    }
+
+    #[test]
+    fn run_step_graph_runs_the_step_when_the_gate_approves() {
+        let (mut task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        task_a.description = "gated task".to_string();
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut handler = |_s: &Step, _f: &BTreeMap<String, String>| crate::gate::GateDecision::Approved;
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(steps["a-step"].status, NodeStatus::Complete, "an approved gated step must still run");
+        assert_eq!(report.completed, vec!["a-step".to_string()]);
+        assert!(steps["a-step"].started_ts.is_some(), "an approved step actually ran (started_ts set)");
+    }
+
+    #[test]
+    fn run_step_graph_declined_gate_fails_the_step_and_downstream_never_becomes_ready() {
+        let (mut task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        task_a.description = "gated task".to_string();
+        let (task_b, step_b) = task_and_step("b", &["a"]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut emitted: Vec<FlowRecord> = Vec::new();
+        let mut handler = |_s: &Step, _f: &BTreeMap<String, String>| crate::gate::GateDecision::Declined {
+            reason: "operator declined".to_string(),
+        };
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |r| emitted.push(r),
+            &mut |_s| {},
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+
+        // The declined step: terminal Error, byte-for-byte the same shape
+        // any other failed step gets — never `Running` first (started_ts
+        // stays unset — it never actually dispatched).
+        assert_eq!(steps["a-step"].status, NodeStatus::Error);
+        assert_eq!(steps["a-step"].output.as_deref(), Some("operator declined"));
+        assert!(steps["a-step"].started_ts.is_none(), "a declined step never flips to Running");
+        assert!(report.errored.contains(&"a-step".to_string()));
+        assert!(
+            emitted.iter().any(|r| r.action == "step error" && r.handle == "a-step"),
+            "a declined step still emits the ordinary \"step error\" lifecycle record: {emitted:?}"
+        );
+        assert!(
+            !emitted.iter().any(|r| r.action == "step start" && r.handle == "a-step"),
+            "a declined step never emits \"step start\" — it never started: {emitted:?}"
+        );
+
+        // The downstream dependent: exactly the "downstream of an errored
+        // task never becomes ready" behavior any other failed step gets.
+        assert_eq!(steps["b-step"].status, NodeStatus::Planned);
+        assert!(!report.completed.contains(&"b-step".to_string()));
+        assert!(!report.errored.contains(&"b-step".to_string()));
+    }
+
+    #[test]
+    fn run_step_graph_gate_with_no_handler_supplied_fails_closed() {
+        let (mut task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        task_a.description = "gated task".to_string();
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        let report = run_test_graph(&tasks, &mut steps); // passes `None` for gate
+
+        assert_eq!(
+            steps["a-step"].status,
+            NodeStatus::Error,
+            "a gated step with no handler supplied must fail closed, never silently run"
+        );
+        assert!(steps["a-step"].output.as_deref().unwrap_or("").contains("operator sign-off"));
+        assert!(report.errored.contains(&"a-step".to_string()));
+    }
+
+    #[test]
+    fn run_step_graph_unrecognized_gate_kind_fails_closed_without_invoking_the_handler() {
+        let (mut task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.gate = Some("some-future-kind".to_string());
+        task_a.description = "gated task".to_string();
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut calls = 0;
+        let mut handler = |_s: &Step, _f: &BTreeMap<String, String>| {
+            calls += 1;
+            crate::gate::GateDecision::Approved
+        };
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(calls, 0, "an unrecognized gate kind must never reach the handler");
+        assert_eq!(steps["a-step"].status, NodeStatus::Error);
+        assert!(report.errored.contains(&"a-step".to_string()));
+    }
+
+    #[test]
+    fn run_step_graph_gate_handler_receives_the_composed_upstream_facts() {
+        let (task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.status = NodeStatus::Complete;
+        step_a.output = Some("gathered facts here".to_string());
+        let (mut task_b, mut step_b) = task_and_step("b", &["a"]);
+        step_b.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        task_b.description = "gated task".to_string();
+        let (tasks, mut steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut received: Option<BTreeMap<String, String>> = None;
+        let mut handler = |_s: &Step, f: &BTreeMap<String, String>| {
+            received = Some(f.clone());
+            crate::gate::GateDecision::Approved
+        };
+        run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            received.as_ref().and_then(|f| f.get("a")).map(String::as_str),
+            Some("gathered facts here"),
+            "the gate handler's facts map must be the SAME composed upstream input the step \
+             would run with (the dialog-body contract) — got {received:?}"
+        );
     }
 
     #[test]
@@ -1477,6 +1784,7 @@ mod tests {
             &mut |_r| {},
             &mut |_s| {},
             None,
+            None,
             &[],
         )
         .expect("the scheduler returns Ok even when a step panics — the panic is a per-step error");
@@ -1538,6 +1846,7 @@ mod tests {
             &mut |r| emitted.push(r),
             &mut |_step| {},
             None,
+            None,
             &[],
         )
         .unwrap_err();
@@ -1566,6 +1875,7 @@ mod tests {
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
+            None,
             None,
             &[],
         )
@@ -1615,6 +1925,7 @@ mod tests {
             &mut |r| emitted.push(r),
             &mut |step| persisted.push(step.clone()),
             None,
+            None,
             &[],
         )
         .unwrap();
@@ -1649,6 +1960,7 @@ mod tests {
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |step| persisted.push(step.clone()),
+            None,
             None,
             &[],
         )
@@ -1744,6 +2056,7 @@ mod tests {
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
+            None,
             None,
             &[],
         )
@@ -1896,6 +2209,7 @@ mod tests {
             &mock_host_factory,
             &mut |_r| {},
             &mut |_step| {},
+            None,
             None,
             &[],
         )
@@ -2057,6 +2371,7 @@ mod tests {
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
+            None,
             Some(override_fn),
             &[],
         )
@@ -2233,7 +2548,8 @@ mod tests {
         kinds.register(Arc::new(EmitCollectionKind)).unwrap();
         let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}, None, &[]).unwrap();
+        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {},
+            None, None, &[]).unwrap();
 
         assert!(loads.lock().unwrap().is_empty(), "empty-collection dispatch.map loads no model");
         assert_eq!(steps["map-step"].status, NodeStatus::Complete, "the empty map short-circuits to Complete");
@@ -2277,7 +2593,8 @@ mod tests {
         kinds.register(Arc::new(EmitCollectionKind)).unwrap();
         let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {}, None, &[]).unwrap();
+        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {},
+            None, None, &[]).unwrap();
 
         unsafe {
             match prev_url {
@@ -2330,8 +2647,8 @@ mod tests {
 
         let err = run_step_graph(
             &mut steps, &tasks, &kinds, &facts, &est, 1, &factory,
-            &mut |_r| {}, &mut |_s| {}, None, &[],
-        )
+            &mut |_r| {}, &mut |_s| {},
+            None, None, &[])
         .expect_err("an unmet required artifact must fail the run");
         let msg = format!("{err:#}");
         assert!(msg.contains("test.absent"), "must name the missing artifact: {msg}");
@@ -2366,8 +2683,8 @@ mod tests {
 
         run_step_graph(
             &mut steps, &tasks, &kinds, &facts, &est, 1, &factory,
-            &mut |_r| {}, &mut |_s| {}, None, &seed,
-        )
+            &mut |_r| {}, &mut |_s| {},
+            None, None, &seed)
         .expect("a seeded artifact satisfies the requirement");
         assert_eq!(steps["needy-step"].status, NodeStatus::Complete);
     }

@@ -176,6 +176,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
             }
         },
         None,
+        None,
         &[],
     );
 
@@ -345,6 +346,7 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str, session_id: &str) -> (Miss
     let step = Step {
         id: step_id,
         task_id,
+        gate: None,
         kind: STEP_KIND.to_string(),
         status: NodeStatus::Planned,
         config,

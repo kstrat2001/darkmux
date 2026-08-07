@@ -4158,6 +4158,7 @@
         let step_a = darkmux_crew::types::Step {
             id: "task-a-step".to_string(),
             task_id: "task-a".to_string(),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: darkmux_crew::types::NodeStatus::Complete,
             config: serde_json::Value::Null,
@@ -4168,6 +4169,7 @@
         let step_b = darkmux_crew::types::Step {
             id: "task-b-step".to_string(),
             task_id: "task-b".to_string(),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: darkmux_crew::types::NodeStatus::Running,
             config: serde_json::Value::Null,
@@ -4178,6 +4180,7 @@
         let step_c = darkmux_crew::types::Step {
             id: "task-c-step".to_string(),
             task_id: "task-c".to_string(),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: darkmux_crew::types::NodeStatus::Planned,
             config: serde_json::Value::Null,
@@ -4576,6 +4579,7 @@
         let mk_step = |id: &str, status: NodeStatus| Step {
             id: id.to_string(),
             task_id: format!("{id}-task"),
+            gate: None,
             kind: "dispatch.internal".to_string(),
             status,
             config: serde_json::Value::Null,
@@ -4667,6 +4671,7 @@
             &Step {
                 id: "s1".to_string(),
                 task_id: "t1".to_string(),
+                gate: None,
                 kind: "dispatch.internal".to_string(),
                 status: NodeStatus::Complete,
                 config: serde_json::Value::Null,
@@ -4747,6 +4752,7 @@
             &Step {
                 id: "review-verify-step".to_string(),
                 task_id: "verify-task".to_string(),
+                gate: None,
                 kind: "dispatch.map".to_string(),
                 status: NodeStatus::Planned,
                 config: serde_json::Value::Null,

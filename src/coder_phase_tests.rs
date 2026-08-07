@@ -1218,6 +1218,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let step = crew::types::Step {
             id: "s1-worktree-step".to_string(),
             task_id: "s1-worktree".to_string(),
+            gate: None,
             kind: "mission.worktree".to_string(),
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,
@@ -1302,6 +1303,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let step = crew::types::Step {
             id: "s1-verify-step".to_string(),
             task_id: "s1-verify".to_string(),
+            gate: None,
             kind: "mission.verify".to_string(),
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,

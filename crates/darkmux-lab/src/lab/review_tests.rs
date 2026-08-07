@@ -3949,6 +3949,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             &host_factory,
             &mut |_record| {},
             &mut |_step| {},
+            None,
             // (#1442 ship-2b) The same ctx-mock adapter `run_review_graph`
             // threads — the verify dispatch.map step dispatches through the
             // test's `chat_override` on the worker thread.
@@ -4010,6 +4011,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let mk = |id: &str, output: Option<&str>| Step {
             id: id.to_string(),
             task_id: format!("{id}-task"),
+            gate: None,
             kind: "dispatch.map".to_string(),
             status: NodeStatus::Error,
             config: serde_json::json!({}),
@@ -4112,6 +4114,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             &host_factory,
             &mut |_record| {},
             &mut |_step| {},
+            None,
             review_dispatch_override(&ctx),
             &seed_artifacts,
         )
@@ -4320,6 +4323,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let step = darkmux_crew::types::Step {
             id: "judge-step".to_string(),
             task_id: "judge-task".to_string(),
+            gate: None,
             kind: "review.judge".to_string(),
             status: NodeStatus::default(),
             config: judge_config,
@@ -5653,6 +5657,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let step = darkmux_crew::types::Step {
             id: "review-verify-render-step".to_string(),
             task_id: "review-verify-task".to_string(),
+            gate: None,
             kind: "review.verify-render".to_string(),
             status: NodeStatus::default(),
             config: serde_json::json!({ "verify_seat_staffed": ctx.roles.verify.is_some() }),
@@ -5766,6 +5771,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let step = darkmux_crew::types::Step {
             id: "review-probe-high-render-step".to_string(),
             task_id: "review-probe-high-task".to_string(),
+            gate: None,
             kind: "review.probe-render".to_string(),
             status: NodeStatus::default(),
             config: serde_json::json!({
@@ -5847,6 +5853,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let step = darkmux_crew::types::Step {
             id: "review-probe-high-render-step".to_string(),
             task_id: "review-probe-high-task".to_string(),
+            gate: None,
             kind: "review.probe-render".to_string(),
             status: NodeStatus::default(),
             config: serde_json::json!({ "selector": null, "role_id": "review-probe-high" }),
@@ -6082,6 +6089,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let step = darkmux_crew::types::Step {
             id: "review-probe-high-render-step".to_string(),
             task_id: "review-probe-high-task".to_string(),
+            gate: None,
             kind: "review.probe-render".to_string(),
             status: NodeStatus::default(),
             config: serde_json::json!({
@@ -6283,6 +6291,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let step = darkmux_crew::types::Step {
             id: "review-bundle-step".to_string(),
             task_id: "review-bundle-task".to_string(),
+            gate: None,
             kind: "review.bundle".to_string(),
             status: NodeStatus::default(),
             config: serde_json::json!({
@@ -6386,6 +6395,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let step = darkmux_crew::types::Step {
             id: "review-bundle-step".to_string(),
             task_id: "review-bundle-task".to_string(),
+            gate: None,
             kind: "review.bundle".to_string(),
             status: NodeStatus::default(),
             config: serde_json::json!({
@@ -6432,6 +6442,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let judge_step = darkmux_crew::types::Step {
             id: "review-judge-step".to_string(),
             task_id: "review-judge-task".to_string(),
+            gate: None,
             kind: "review.judge".to_string(),
             status: NodeStatus::default(),
             config: serde_json::json!({

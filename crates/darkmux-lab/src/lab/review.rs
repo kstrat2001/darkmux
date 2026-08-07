@@ -6923,6 +6923,13 @@ pub fn run_review_graph(
             emitter.emit(record);
         },
         persist,
+        // (#1684 Packet 2) No gate handler — the built-in `review` config
+        // declares no `gate: "operator"` step, and this driver is never
+        // pointed at an operator-authored config that might. `None` still
+        // fails CLOSED (never silently ungated) if a gated step somehow
+        // reached this graph — see `darkmux_crew::gate::resolve_gate`'s
+        // `None`-handler fallback.
+        None,
         // (#1442 ship-2b) The ctx-mock adapter — `None` in production; a
         // mocked test's probe/verify `dispatch.map` items dispatch through
         // the same `chat_override` every bespoke review kind uses.

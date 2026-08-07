@@ -28,13 +28,17 @@
 //! - Session state (the cwd per ACP session) lives in an in-memory map that
 //!   is never pruned. A long-lived `darkmux acp` process leaks one entry
 //!   per `session/new` — fine for a spike where the process is one Zed tab.
-//! - No cancellation support. `session/cancel` is unhandled, and the
-//!   `session/prompt` handler awaits the whole review subprocess in place
-//!   (blocking the connection's event loop for the duration — see
-//!   `ConnectionTo::spawn`'s docs on why that's normally avoided). A real
-//!   implementation would `cx.spawn` the review and wire up
-//!   `RequestCancellation` so the user's Zed "stop" button actually stops
-//!   the subprocess.
+//! - No cancellation support. `session/cancel` is unhandled — a real
+//!   implementation would wire up `RequestCancellation` so the user's Zed
+//!   "stop" button actually stops the subprocess. (#1684 Packet 2 — QA
+//!   MUST-FIX: the `session/prompt` handler used to await the whole
+//!   command in place, blocking the connection's dispatch loop for the
+//!   duration; it now runs on a `cx.spawn`'d task instead, which this
+//!   packet needed anyway so a gated command's `session/request_permission`
+//!   round trip doesn't deadlock the very loop that would deliver its
+//!   reply. The loop no longer blocks, but `session/cancel` still isn't
+//!   wired to actually tear down the spawned task — that's the cancellation
+//!   gap this bullet still names.)
 //! - The `case_id` passed to the review mission is derived from the diff's
 //!   content hash + the cwd's directory name (see [`derive_case_id`]) —
 //!   deterministic (no `Date`/random per the task brief) but not
@@ -66,14 +70,15 @@
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock,
-    ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, Plan,
-    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, SessionId,
-    SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallId, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionId,
+    SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Stdio as AcpStdio};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio as ProcStdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -256,36 +261,76 @@ async fn serve() -> Result<()> {
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 };
 
-                // Robustness rule (see the task brief): NOTHING from here
-                // down may panic or propagate a hard error across the
-                // protocol boundary. A crashed-looking agent in Zed has no
-                // explanation; a chunk of error text does.
-                let run_result = match plan {
-                    // `review` keeps its EXISTING bespoke path, byte-for-byte
-                    // unchanged (#1684 rule C) — only routed to differently.
-                    // `config_id` (#1695 merge-gate MUST FIX) is the
-                    // REGISTRY-RESOLVABLE id `route_command` decided on —
-                    // never a hardcoded `"review"` — so a panel-advertised
-                    // review VARIANT launches itself, not the built-in.
-                    crate::acp_panel::RoutePlan::Review(config_id) => {
-                        run_review(&session_id, &config_id, &args, &cwd, &cx).await
+                // (#1684 Packet 2 — QA MUST-FIX) The actual command
+                // execution runs on a SEPARATELY SPAWNED task via
+                // `cx.spawn`, never `.await`ed inline in this closure's
+                // own future. Why this is load-bearing, not style: this
+                // closure's future is polled DIRECTLY inside the
+                // connection's incoming-message dispatch loop
+                // (`agent_client_protocol`'s `jsonrpc::incoming_actor`
+                // iterates incoming frames and does `dispatch_dispatch(...)
+                // .await?` — a plain inline await, not a spawn — for every
+                // Request entry; that SAME loop is also the only place an
+                // incoming Response entry gets routed to a pending
+                // `SentRequest`). A gated command's `acp_gate_handler`
+                // blocks (via `spawn_blocking` + a channel recv) waiting
+                // for the client's `session/request_permission` REPLY —
+                // and that reply can only ever be delivered by THIS loop.
+                // Awaiting the command inline here would therefore
+                // deadlock: the loop can't process the incoming reply that
+                // would unblock the very future it's still awaiting (the
+                // crate's own `SentRequest::block_task` docs name exactly
+                // this failure mode as "Unsafe Usage (in handlers — will
+                // deadlock!)", and its "Safe Usage" shape is precisely
+                // "spawn a task, respond independently" — moving the WHOLE
+                // command, `responder` included, into `cx.spawn` is that
+                // shape applied to a response that itself depends on the
+                // round trip's outcome, not just the round trip alone).
+                // `cx.spawn` returns as soon as the task is REGISTERED
+                // (not once it finishes), so this closure's own future
+                // resolves immediately either way — the dispatch loop is
+                // free again right away, gated or not.
+                //
+                // Side effect (intentional, not just tolerated): this also
+                // retires the pre-#1684 spike limitation this module's own
+                // doc named ("the `session/prompt` handler awaits the
+                // whole review subprocess in place, blocking the
+                // connection's event loop for the duration") — `review`'s
+                // own multi-minute subprocess run no longer blocks the
+                // loop from handling other sessions/notifications either.
+                let cx_task = cx.clone();
+                cx.spawn(async move {
+                    // Robustness rule (see the task brief): NOTHING from
+                    // here down may panic or propagate a hard error across
+                    // the protocol boundary. A crashed-looking agent in
+                    // Zed has no explanation; a chunk of error text does.
+                    let run_result = match plan {
+                        // `review` keeps its EXISTING bespoke path, byte-for-byte
+                        // unchanged (#1684 rule C) — only routed to differently.
+                        // `config_id` (#1695 merge-gate MUST FIX) is the
+                        // REGISTRY-RESOLVABLE id `route_command` decided on —
+                        // never a hardcoded `"review"` — so a panel-advertised
+                        // review VARIANT launches itself, not the built-in.
+                        crate::acp_panel::RoutePlan::Review(config_id) => {
+                            run_review(&session_id, &config_id, &args, &cwd, &cx_task).await
+                        }
+                        crate::acp_panel::RoutePlan::Ephemeral(config) => {
+                            run_ephemeral_command(&session_id, *config, args, cwd.clone(), &cx_task).await
+                        }
+                        crate::acp_panel::RoutePlan::Launch(config_id) => {
+                            run_launch_command(&session_id, &config_id, &args, &cwd, &cx_task).await
+                        }
+                    };
+                    if let Err(err) = run_result {
+                        eprintln!("[darkmux-acp] session/prompt: command failed: {err:#}");
+                        let _ = cx_task.send_notification(agent_chunk(
+                            &session_id,
+                            format!("darkmux acp: command failed: {err:#}"),
+                        ));
                     }
-                    crate::acp_panel::RoutePlan::Ephemeral(config) => {
-                        run_ephemeral_command(&session_id, *config, args, cwd.clone(), &cx).await
-                    }
-                    crate::acp_panel::RoutePlan::Launch(config_id) => {
-                        run_launch_command(&session_id, &config_id, &args, &cwd, &cx).await
-                    }
-                };
-                if let Err(err) = run_result {
-                    eprintln!("[darkmux-acp] session/prompt: command failed: {err:#}");
-                    let _ = cx.send_notification(agent_chunk(
-                        &session_id,
-                        format!("darkmux acp: command failed: {err:#}"),
-                    ));
-                }
 
-                responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    responder.respond(PromptResponse::new(StopReason::EndTurn))
+                })
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -561,11 +606,191 @@ async fn run_ephemeral_command(
     cwd: PathBuf,
     cx: &ConnectionTo<Client>,
 ) -> Result<()> {
-    let text = tokio::task::spawn_blocking(move || crate::acp_panel::run_ephemeral(&config, &args, &cwd))
-        .await
-        .context("joining the ephemeral panel-command task")??;
+    // (#1684 Packet 2) The ACP surface's operator sign-off gate handler —
+    // see `acp_gate_handler`'s own doc. Built here (on the connection's
+    // async task, which owns `cx`/`session_id`) and moved into the
+    // `spawn_blocking` closure below; the ephemeral runner calls it
+    // synchronously from the blocking thread for any step in `config`'s
+    // graph that declares `"gate": "operator"`.
+    let mut gate = acp_gate_handler(cx.clone(), session_id.clone());
+    let text = tokio::task::spawn_blocking(move || {
+        crate::acp_panel::run_ephemeral(&config, &args, &cwd, Some(&mut gate))
+    })
+    .await
+    .context("joining the ephemeral panel-command task")??;
     cx.send_notification(agent_chunk(session_id, text))?;
     Ok(())
+}
+
+/// (#1684 Packet 2) Build the ACP surface's operator sign-off gate handler
+/// — the `darkmux_crew::gate::GateHandler` the ephemeral runner invokes,
+/// via `darkmux_crew::scheduler::run_step_graph`, for any step whose
+/// `gate` field is `"operator"`.
+///
+/// The returned closure is `FnMut` but runs SYNCHRONOUSLY on a
+/// `spawn_blocking` thread (see `run_ephemeral`'s own doc on why the
+/// ephemeral runner is blocking, and `run_ephemeral_command` above for
+/// where this closure gets handed in) — it cannot itself `.await` the ACP
+/// round-trip. Per call it: (1) builds a `session/request_permission`
+/// request naming the step + rendering its composed input facts as the
+/// dialog body, with two options (allow/reject) — the #1685 spec's "ACP →
+/// native session/request_permission dialog"; (2) spawns a NEW async task
+/// via `cx.spawn` that awaits the response and forwards the decision back
+/// over a one-shot `std::sync::mpsc` channel; (3) blocks (a plain
+/// synchronous `Receiver::recv`, fine here — we are ALREADY on a
+/// `spawn_blocking` thread, never the connection's own dispatch-loop task)
+/// until that decision arrives.
+///
+/// **Why the `cx.spawn` in step (2) is actually safe here (read before
+/// touching this).** `SentRequest::block_task`'s own doc calls calling it
+/// directly inside a request handler an "Unsafe Usage… will deadlock" —
+/// the deadlock is real, and the crate's own `incoming_actor` loop is why:
+/// it `.await`s every `on_receive_request` handler INLINE (one at a time),
+/// and that SAME loop is the only place an incoming response gets routed
+/// back to a pending `block_task().await`. Spawning `block_task` alone,
+/// while the caller of THIS handler is still `.await`ing this whole
+/// closure inline in that loop, would NOT escape the deadlock — the
+/// spawned task's reply still can't be delivered until the loop is free,
+/// and the loop isn't free until the caller's await resolves. What
+/// actually makes this safe is the CALLER: `src/acp.rs`'s `PromptRequest`
+/// handler moves the ENTIRE command (this handler's caller chain included)
+/// into ITS OWN `cx.spawn`, with `responder` carried into that spawned
+/// task rather than the handler's own inline future — see that call
+/// site's doc for the full reasoning. That is what frees the dispatch
+/// loop early, which is what lets the loop actually deliver the
+/// `session/request_permission` response this function's own `cx.spawn`
+/// is waiting on. This function's `cx.spawn` alone, without that caller-
+/// side restructure, would still deadlock.
+///
+/// Fails closed (Declined) if `cx.spawn` itself errors (the connection is
+/// closing) or the response channel is dropped before a decision arrives
+/// (the spawned task panicked, or `session/cancel` tore down the turn) —
+/// never silently approves on any of those paths. No timeout is enforced
+/// on the wait itself (#1684 QA CONSIDER — a stalled/never-responding
+/// client hangs this gate indefinitely rather than failing closed on a
+/// deadline; acceptable for a v1 given the dispatch loop itself is no
+/// longer at risk, worth revisiting once a real timeout mechanism exists
+/// elsewhere in this file to mirror).
+fn acp_gate_handler(
+    cx: ConnectionTo<Client>,
+    session_id: SessionId,
+) -> impl FnMut(&crate::crew::types::Step, &BTreeMap<String, String>) -> crate::crew::gate::GateDecision {
+    move |step, facts| {
+        let step_id = step.id.clone();
+        let facts_text = render_gate_facts(facts);
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<crate::crew::gate::GateDecision>();
+        let cx2 = cx.clone();
+        let session_id2 = session_id.clone();
+        let step_id2 = step_id.clone();
+        let spawn_result = cx.spawn(async move {
+            let decision = request_operator_sign_off(&cx2, &session_id2, &step_id2, &facts_text).await;
+            // The blocking side may have given up waiting (channel dropped)
+            // if this task somehow outlives it — a dropped-receiver send
+            // error is not this task's problem to report.
+            let _ = resp_tx.send(decision);
+            Ok(())
+        });
+        if let Err(e) = spawn_result {
+            return crate::crew::gate::GateDecision::Declined {
+                reason: format!(
+                    "step `{step_id}` — could not schedule the operator sign-off request on the \
+                     ACP connection: {e}"
+                ),
+            };
+        }
+        match resp_rx.recv() {
+            Ok(decision) => decision,
+            Err(_) => crate::crew::gate::GateDecision::Declined {
+                reason: format!(
+                    "step `{step_id}` — the sign-off response channel closed before Zed replied \
+                     (the connection may have closed, or the turn was cancelled)"
+                ),
+            },
+        }
+    }
+}
+
+/// Render a step's composed upstream input facts as the `session/
+/// request_permission` dialog body — one `key: value` line per fact,
+/// sorted (the map is already a `BTreeMap`, so iteration order IS sort
+/// order — no separate sort needed). A step with no upstream facts (e.g.
+/// the FIRST step in a panel command's graph) still gets a dialog, just
+/// with an explicit "no upstream facts" line rather than a blank body.
+fn render_gate_facts(facts: &BTreeMap<String, String>) -> String {
+    if facts.is_empty() {
+        return "(no upstream facts)".to_string();
+    }
+    facts.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n")
+}
+
+/// Raise `session/request_permission` to the connected client and await its
+/// decision — the async half of [`acp_gate_handler`]. Runs on a freshly
+/// spawned, concurrent task (never inline inside a request handler — see
+/// `acp_gate_handler`'s own doc on the deadlock this avoids).
+async fn request_operator_sign_off(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    step_id: &str,
+    facts_text: &str,
+) -> crate::crew::gate::GateDecision {
+    const ALLOW: &str = "allow";
+    const REJECT: &str = "reject";
+
+    // (#1684 QA CONSIDER) This `ToolCallId` is never announced via a prior
+    // `SessionUpdate::ToolCall` before this request — unlike `run_review`'s
+    // stage tool calls (`stage_tool_call_id`), which always send a
+    // `ToolCall` notification before referencing that id again. Per the
+    // schema, `RequestPermissionRequest.tool_call` is a `ToolCallUpdate`
+    // (an upsert, not an update-only reference), so this SHOULD be fine on
+    // a spec-compliant client — but this is the same class of "Zed drops
+    // a message naming something it doesn't know about yet" surprise the
+    // Packet-1 wire-ordering finding hit for `AvailableCommandsUpdate` (see
+    // `session/new`'s handler comment above). Verify the dialog body
+    // actually renders in a live Zed dogfood before relying on this.
+    let tool_call = ToolCallUpdate::new(
+        ToolCallId::new(format!("darkmux-gate-{step_id}")),
+        ToolCallUpdateFields::new()
+            .title(format!("darkmux — operator sign-off required: `{step_id}`"))
+            .kind(ToolKind::Execute)
+            .status(ToolCallStatus::Pending)
+            .content(vec![ToolCallContent::from(facts_text.to_string())]),
+    );
+    let options = vec![
+        PermissionOption::new(ALLOW, "Allow", PermissionOptionKind::AllowOnce),
+        PermissionOption::new(REJECT, "Reject", PermissionOptionKind::RejectOnce),
+    ];
+    let request = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
+
+    match cx.send_request(request).block_task().await {
+        Ok(response) => match response.outcome {
+            RequestPermissionOutcome::Selected(sel) if &*sel.option_id.0 == ALLOW => {
+                crate::crew::gate::GateDecision::Approved
+            }
+            RequestPermissionOutcome::Selected(sel) => crate::crew::gate::GateDecision::Declined {
+                reason: format!(
+                    "step `{step_id}` — operator selected `{}` at the sign-off dialog",
+                    sel.option_id
+                ),
+            },
+            RequestPermissionOutcome::Cancelled => crate::crew::gate::GateDecision::Declined {
+                reason: format!("step `{step_id}` — the sign-off request was cancelled"),
+            },
+            // `RequestPermissionOutcome` is `#[non_exhaustive]` (the schema
+            // crate may add a variant in a future minor release this
+            // binary's pinned version predates) — an outcome this match
+            // doesn't recognize is exactly a "no sign-off received" case,
+            // so it fails closed like `Cancelled` rather than panicking on
+            // an unmatched arm.
+            _ => crate::crew::gate::GateDecision::Declined {
+                reason: format!(
+                    "step `{step_id}` — the client returned an unrecognized sign-off outcome"
+                ),
+            },
+        },
+        Err(e) => crate::crew::gate::GateDecision::Declined {
+            reason: format!("step `{step_id}` — the sign-off request to the client failed: {e}"),
+        },
+    }
 }
 
 /// (#1684 rule D) Launch a panel command whose graph has at least one
@@ -596,6 +821,24 @@ async fn run_ephemeral_command(
 /// delivery mechanism (however #1685 chooses to shape it — task_overrides,
 /// a generic step-config substitution, or something else) is that packet's
 /// job, not this one's.
+///
+/// **A gated step in this route can never be approved (#1684 QA
+/// CONSIDER, a deliberate boundary, not a bug).** The subprocess below
+/// spawns with `stdin(ProcStdio::null())` — headless by construction — so
+/// `mission_launch::cli_gate_handler` always resolves to the
+/// non-interactive `refusal_handler`, and any `"gate": "operator"` step
+/// in this config's graph refuses itself immediately. This is CORRECT
+/// fail-closed behavior (never silently ungated), but it is also an
+/// invisible capability boundary worth naming explicitly: a panel command
+/// whose graph mixes a model-dispatching step (which routes it here, past
+/// `is_procedural_only`) WITH a gated step is structurally unapprovable
+/// from the panel today. Every gated example verb #1685 documents
+/// (`pr-merge`, `pr-approve`) is procedural-only by design, so it takes
+/// the ACP ephemeral route (`run_ephemeral_command`, with the real
+/// `session/request_permission` handler) instead — this boundary is not
+/// expected to bite in practice, but a future config author combining the
+/// two would silently lose the ability to approve, so it's named here for
+/// when that's revisited.
 async fn run_launch_command(
     session_id: &SessionId,
     config_id: &str,
