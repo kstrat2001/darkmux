@@ -8,12 +8,15 @@
 //! that are deliberately spike-grade here (a real feature would do these
 //! differently):
 //!
-//! - Only ONE command is implemented (`/review`). Anything else gets a
-//!   fixed "not supported" reply.
-//! - The `review` command is HARDCODED rather than discovered from the
-//!   mission-config registry the way `darkmux mission status` enumerates
-//!   configs — reading the registry properly was more than a few minutes of
-//!   work for this pass.
+//! - (#1684, Packet 1 — RESOLVED) Commands used to be limited to a single
+//!   HARDCODED `/review` with a fixed "not supported" reply for anything
+//!   else. `session/new` now advertises every mission config in the merged
+//!   registry (built-ins + `~/.darkmux/mission-configs/`) that declares a
+//!   `panel` block — see `src/acp_panel.rs`, which owns the registry
+//!   enumeration, the ephemeral-vs-mission-launch routing decision, and the
+//!   in-process ephemeral graph runner. `review` itself now reaches this
+//!   file's bespoke [`run_review`] through that SAME routing path (rather
+//!   than a hand-rolled string match), unchanged otherwise.
 //! - Review-stage progress ("bundle", "probe", ...) is recognized by
 //!   pattern-matching known substrings out of the review subprocess's
 //!   stderr (see [`REVIEW_STAGES`] and [`recognize_stage`]). This is
@@ -62,11 +65,11 @@
 //! logs panel.
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, ContentBlock, ContentChunk,
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, SessionId,
+    AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock,
+    ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, SessionId,
     SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallId, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Stdio as AcpStdio};
 use anyhow::{Context, Result};
@@ -94,16 +97,6 @@ const REVIEW_STAGES: &[(&str, &str)] = &[
     ("verif", "verify"),
     ("synthes", "synthesis"),
 ];
-
-/// The only command this spike advertises via `session/update` →
-/// `AvailableCommandsUpdate`.
-const REVIEW_COMMAND_NAME: &str = "review";
-const REVIEW_COMMAND_DESCRIPTION: &str =
-    "Review the working-tree diff with darkmux's local-model review crew";
-
-const NOT_A_REVIEW_PROMPT: &str = "darkmux acp is a spike (#1388) that only implements one \
-     command today: `/review`, which reviews this working tree's uncommitted diff with \
-     darkmux's local review crew. Try `/review` (or just `review`).";
 
 /// Per-session state this spike tracks: just the `cwd` the client handed us
 /// in `session/new`, keyed by the session id we minted for it.
@@ -180,12 +173,36 @@ async fn serve() -> Result<()> {
                 // update on the wire.
                 responder.respond(NewSessionResponse::new(session_id.clone()))?;
 
-                // Spike-grade: HARDCODED single command. See module docs
-                // for why this doesn't read the mission-config registry.
-                let commands = AvailableCommandsUpdate::new(vec![AvailableCommand::new(
-                    REVIEW_COMMAND_NAME,
-                    REVIEW_COMMAND_DESCRIPTION,
-                )]);
+                // (#1684) Registry-driven advertising — every mission
+                // config in the merged registry (built-ins +
+                // `~/.darkmux/mission-configs/`) that declares a `panel`
+                // block, via `acp_panel::list_panel_commands` (the SAME
+                // resolution `darkmux mission launch`/`mission status`
+                // already use). This REPLACES the pre-#1684 hardcoded
+                // single `/review` command — `review` is no longer special
+                // here at all; it's advertised because the built-in
+                // `review.json` now carries a `panel` block like any other
+                // config would.
+                let panel_commands = crate::acp_panel::list_panel_commands();
+                eprintln!(
+                    "[darkmux-acp] session/new: advertising {} panel command(s): {}",
+                    panel_commands.len(),
+                    panel_commands.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
+                );
+                let commands = AvailableCommandsUpdate::new(
+                    panel_commands
+                        .iter()
+                        .map(|c| {
+                            let cmd = AvailableCommand::new(c.id.clone(), c.description.clone());
+                            match &c.hint {
+                                Some(hint) => cmd.input(AvailableCommandInput::Unstructured(
+                                    UnstructuredCommandInput::new(hint.clone()),
+                                )),
+                                None => cmd,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 cx.send_notification(SessionNotification::new(
                     session_id,
                     SessionUpdate::AvailableCommandsUpdate(commands),
@@ -198,13 +215,30 @@ async fn serve() -> Result<()> {
                 let session_id = request.session_id.clone();
                 let text = extract_text(&request.prompt);
 
-                if !is_review_command(&text) {
+                // (#1684) Registry-driven command dispatch — replaces the
+                // pre-#1684 hardcoded `is_review_command` string match.
+                // `advertised` is recomputed HERE, per prompt, rather than
+                // reused from `session/new` — the registry can change
+                // between the two (an operator edits/adds a mission-config
+                // file mid-session).
+                let advertised = crate::acp_panel::list_panel_commands();
+                let route = crate::acp_panel::parse_command(&text)
+                    .and_then(|(cmd, args)| {
+                        crate::acp_panel::route_command(&advertised, &cmd).map(|plan| (plan, args))
+                    });
+
+                let Some((plan, args)) = route else {
                     // Never hang, never bounce an error across the
                     // protocol boundary for an input we just don't support
-                    // yet — reply plainly and end the turn.
-                    let _ = cx.send_notification(agent_chunk(&session_id, NOT_A_REVIEW_PROMPT));
+                    // yet — reply plainly and end the turn. Lists the
+                    // CURRENTLY advertised commands instead of hardcoding
+                    // `/review`.
+                    let _ = cx.send_notification(agent_chunk(
+                        &session_id,
+                        crate::acp_panel::not_a_command_message(&advertised),
+                    ));
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
-                }
+                };
 
                 let cwd = sessions_for_prompt
                     .lock()
@@ -226,11 +260,22 @@ async fn serve() -> Result<()> {
                 // down may panic or propagate a hard error across the
                 // protocol boundary. A crashed-looking agent in Zed has no
                 // explanation; a chunk of error text does.
-                if let Err(err) = run_review(&session_id, &cwd, &cx).await {
-                    eprintln!("[darkmux-acp] session/prompt: review failed: {err:#}");
+                let run_result = match plan {
+                    // `review` keeps its EXISTING bespoke path, byte-for-byte
+                    // unchanged (#1684 rule C) — only routed to differently.
+                    crate::acp_panel::RoutePlan::Review => run_review(&session_id, &cwd, &cx).await,
+                    crate::acp_panel::RoutePlan::Ephemeral(config) => {
+                        run_ephemeral_command(&session_id, *config, args, cwd.clone(), &cx).await
+                    }
+                    crate::acp_panel::RoutePlan::Launch(config_id) => {
+                        run_launch_command(&session_id, &config_id, &args, &cwd, &cx).await
+                    }
+                };
+                if let Err(err) = run_result {
+                    eprintln!("[darkmux-acp] session/prompt: command failed: {err:#}");
                     let _ = cx.send_notification(agent_chunk(
                         &session_id,
-                        format!("darkmux acp: review failed: {err:#}"),
+                        format!("darkmux acp: command failed: {err:#}"),
                     ));
                 }
 
@@ -461,6 +506,108 @@ async fn run_review(session_id: &SessionId, cwd: &Path, cx: &ConnectionTo<Client
     Ok(())
 }
 
+/// (#1684 rule D) Drive a procedural-only panel command's graph in-process
+/// via `acp_panel::run_ephemeral` — no mission instance minted, no
+/// lifecycle records. `run_ephemeral` is fully synchronous (it shells out
+/// to `std::process::Command::output()` for `procedural.shell` steps), so
+/// it runs on a `spawn_blocking` thread rather than the connection's own
+/// async task — the same "never stall the ACP event loop" concern
+/// `run_review`'s own module-doc note names for its (accepted, spike-grade)
+/// blocking-in-place subprocess await.
+///
+/// `acp_panel::run_ephemeral` prints NOTHING to this process's own
+/// stdout — the ACP wire — by construction (it never touches
+/// `std::io::stdout`; `procedural.shell` captures its child's output via
+/// `Command::output()`, and every flow record it emits rides
+/// `crate::flow::record`, never a println). The rendered result reaches
+/// Zed only via the `agent_chunk` notification below.
+async fn run_ephemeral_command(
+    session_id: &SessionId,
+    config: crate::crew::mission_config::MissionConfig,
+    args: String,
+    cwd: PathBuf,
+    cx: &ConnectionTo<Client>,
+) -> Result<()> {
+    let text = tokio::task::spawn_blocking(move || crate::acp_panel::run_ephemeral(&config, &args, &cwd))
+        .await
+        .context("joining the ephemeral panel-command task")??;
+    cx.send_notification(agent_chunk(session_id, text))?;
+    Ok(())
+}
+
+/// (#1684 rule D) Launch a panel command whose graph has at least one
+/// model-dispatching step as a normal `darkmux mission launch <id>`
+/// subprocess — a full instance, same pattern [`run_review`] uses for its
+/// own subprocess (this process's own executable, re-invoked, cwd = the
+/// session's cwd, stdout/stderr captured as pipes — never inherited, so
+/// nothing but this file's own `agent_chunk` notifications reaches the ACP
+/// wire). Unlike `run_review`, there is no bespoke stage/liveness parsing
+/// here — that machinery is `review`'s own; a generic panel command
+/// renders its subprocess's stdout (trimmed) as the final message on
+/// success, or its stderr on failure. Sends an up-front "launched…" chunk
+/// before awaiting the subprocess (#1684 QA finding — CONSIDER 12): unlike
+/// `run_review`, which streams a `Plan` immediately, this route would
+/// otherwise leave Zed showing nothing but a spinner for however long the
+/// launched mission's own model dispatches take.
+///
+/// **`args` honesty note (#1684 QA finding — MUST-FIX 5).** The raw text
+/// forwards as `--param args=<raw>` (omitted when empty) — the standard
+/// `mission launch` CLI mechanism (`collect_inputs`). This is a
+/// forward-compatible HOOK, not (yet) a wired delivery: today NO shipped
+/// config declares `args` as a `MissionInput` or consumes it via
+/// `task_overrides` (`build_launch_params` only produces overrides for the
+/// coder-phase-shaped kinds), so a Launch-routed panel command that takes
+/// arguments will see `mission launch` warn on stderr about an undeclared
+/// input and the value will not reach any step's config. #1685's verb
+/// configs are expected to declare `args` for real; wiring the actual
+/// delivery mechanism (however #1685 chooses to shape it — task_overrides,
+/// a generic step-config substitution, or something else) is that packet's
+/// job, not this one's.
+async fn run_launch_command(
+    session_id: &SessionId,
+    config_id: &str,
+    args: &str,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving darkmux's own executable path")?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(["mission", "launch", config_id]);
+    if !args.trim().is_empty() {
+        cmd.args(["--param", &format!("args={args}")]);
+    }
+
+    eprintln!(
+        "[darkmux-acp] session/prompt: spawning `mission launch {config_id}` cwd={}",
+        cwd.display()
+    );
+    let _ = cx.send_notification(agent_chunk(session_id, format!("darkmux: launching `{config_id}`…")));
+
+    let output = cmd
+        .current_dir(cwd)
+        .stdin(ProcStdio::null())
+        .stdout(ProcStdio::piped())
+        .stderr(ProcStdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("spawning `darkmux mission launch {config_id}` subprocess"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let text = if output.status.success() {
+        if stdout.is_empty() {
+            format!("darkmux: `{config_id}` completed.")
+        } else {
+            stdout
+        }
+    } else {
+        let detail = if stderr.is_empty() { &stdout } else { &stderr };
+        format!("darkmux: `{config_id}` failed ({}).\n\n{detail}", output.status)
+    };
+    cx.send_notification(agent_chunk(session_id, text))?;
+    Ok(())
+}
+
 fn initial_plan_entries() -> Vec<PlanEntry> {
     REVIEW_STAGES
         .iter()
@@ -665,14 +812,6 @@ fn extract_text(prompt: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Lenient `/review` match per the task brief: trim, strip a leading `/`,
-/// case-insensitive, tolerate the no-slash form too.
-fn is_review_command(text: &str) -> bool {
-    let trimmed = text.trim();
-    let without_slash = trimmed.strip_prefix('/').unwrap_or(trimmed);
-    without_slash.to_ascii_lowercase().starts_with(REVIEW_COMMAND_NAME)
 }
 
 fn agent_chunk(session_id: &SessionId, text: impl Into<String>) -> SessionNotification {

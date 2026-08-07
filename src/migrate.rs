@@ -300,6 +300,7 @@ fn synthesize_config_snapshot(mission_id: &str) -> Result<()> {
         schema_version: Some(MISSION_CONFIG_SCHEMA.to_string()),
         inputs: Vec::new(),
         phases,
+        panel: None,
         extras: BTreeMap::new(),
     };
     lifecycle::save_config_snapshot(mission_id, &config)

@@ -397,6 +397,7 @@ mod tests {
             schema_version: None,
             inputs: Vec::new(),
             phases,
+            panel: None,
             extras: Map::new(),
         }
     }

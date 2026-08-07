@@ -5543,12 +5543,54 @@ mod tests {
         let check = check_mission_config_registry();
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("schema_version \"1.0\" (major 1)"), "{}", check.message);
+        // (#1684) Asserted against the CONSTANT rather than a hardcoded
+        // "2.0" literal — the schema bumped to 2.1 in the same change that
+        // added this comment's own "once a real 2.1 exists" callout below,
+        // and a literal here would have gone stale exactly the way this
+        // one did.
         assert!(
-            check.message.contains("MISSION_CONFIG_SCHEMA \"2.0\" (major 2)"),
+            check.message.contains(&format!(
+                "MISSION_CONFIG_SCHEMA \"{}\" (major 2)",
+                darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA
+            )),
             "{}",
             check.message
         );
         assert!(check.message.contains("major-version mismatch"), "{}", check.message);
+    }
+
+    /// (#1684) The same-major-lower-minor trail this file's own
+    /// `check_mission_config_registry_warns_when_user_tier_copy_is_on_an_older_major`
+    /// doc comment named as "worth re-testing directly again once a real
+    /// 2.1 exists" — #1684's additive `panel` field is exactly that: the
+    /// mission-config schema bumped `2.0` -> `2.1` in the SAME change that
+    /// introduces this test, making a user-tier "2.0" copy of `review` a
+    /// live, reachable same-major-minor-trail case for the first time
+    /// since the 2.0 major bump. A pre-2.1 user copy is missing the
+    /// `panel` block, so it silently stops being ACP-advertisable — the
+    /// concrete hazard this finding exists to name (a same-major
+    /// minor-trail finding is a loud `Status::Warn`, same tier as every
+    /// other entry `check_mission_config_registry`'s `blocking` vec
+    /// collects — see that function's own `if blocking.is_empty()` branch).
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_blocks_a_user_tier_copy_trailing_the_current_minor() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("review.json"),
+            r#"{"id":"review","name":"PR Review (pre-panel user copy)","schema_version":"2.0"}"#,
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("declares schema 2.0"), "{}", check.message);
+        assert!(
+            check.message.contains("predates additive fields"),
+            "must name the hazard, not just the version delta: {}",
+            check.message
+        );
     }
 
     /// (#1648) The MIRROR direction — a user-tier copy on a NEWER minor than

@@ -63,6 +63,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (#1619) — additive: [`TaskConfig`] gained the optional `reads` field (the
 /// run-scoped output ledger made nameable).
 ///
+/// Bumped to **"2.1"** (#1684) — additive: [`MissionConfig`] gained the
+/// optional `panel` field ([`PanelConfig`]). Presence of the block is what
+/// makes `darkmux acp` advertise this config as a slash command in the
+/// editor's agent panel — absence means the config stays launch-only
+/// (`darkmux mission launch <id>`/`darkmux mission propose`), never
+/// panel-visible. `PanelConfig` itself carries `#[serde(flatten)] extras`
+/// overflow (contract 7), so a future sub-field is safe to add without
+/// another schema bump.
+///
 /// Bumped to **"2.0"** (#1550 cluster item 2) — a MAJOR bump, not minor:
 /// `TaskConfig::expand`/`ExpansionSpec`/`interpret::LaunchParams::expansions`
 /// were REMOVED (all three retired from this crate — no longer valid
@@ -89,7 +98,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "2.0";
+pub const MISSION_CONFIG_SCHEMA: &str = "2.1";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,11 +127,66 @@ pub struct MissionConfig {
     /// one" is purely positional).
     #[serde(default)]
     pub phases: Vec<PhaseConfig>,
+    /// (#1684, schema 2.1) Presence of this block is what makes `darkmux
+    /// acp` advertise this config as a slash command in the editor's agent
+    /// panel — `None` (the default; every pre-2.1 document) keeps the
+    /// config launch-only. See [`PanelConfig`]'s own doc for the field(s)
+    /// it carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<PanelConfig>,
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer document read by an older binary).
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
+
+/// (#1684, schema 2.1) The panel-advertising block on a [`MissionConfig`].
+/// Presence — not any particular field value — is the signal `darkmux acp`
+/// reads at `session/new` to decide whether to advertise this config's `id`
+/// as a slash command (see `src/acp_panel.rs` in the `darkmux` binary
+/// crate, which enumerates the merged mission-config registry and filters
+/// on `panel.is_some()`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PanelConfig {
+    /// A short, UI-facing label for the command palette. `MissionConfig.
+    /// description` is deliberately long-form dev prose (provenance,
+    /// design rationale — see that field's own callers), unsuitable to
+    /// render verbatim in an editor's slash-command list. `None` falls
+    /// back to `MissionConfig.name`, NEVER to `MissionConfig.description`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional input hint shown in the editor before the user has typed
+    /// anything after the command name — the ACP `UnstructuredCommandInput`
+    /// hint text. `None` advertises the command with no input hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// Lenient-on-read overflow (contract 7) — a future sub-field on this
+    /// block is safe to add without another schema bump.
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+/// (#1684) The reserved task id a panel-invoked config's task can name in
+/// its own `reads`/`depends_on` to receive the raw text typed after the
+/// command name — never a real document-declared task, always resolved at
+/// RUN time by the panel-command caller (`src/acp_panel.rs`'s ephemeral
+/// runner injects a real `procedural.noop` task under this id into a
+/// CLONE of the document before `interpret` runs; the launch/subprocess
+/// path forwards the same raw text as `--param args=<raw>`). Double-
+/// underscore-wrapped (matching the injected phase id
+/// `__panel_args_phase__`) to keep collisions with an operator's own task
+/// ids vanishingly unlikely.
+///
+/// [`MissionConfig::validate`] treats a `reads`/`depends_on` entry naming
+/// this EXACT id as always-resolvable (never "dangling unknown task id"),
+/// even though it never appears as a real [`TaskConfig`] in the document
+/// itself — without this carve-out, a config declaring `reads:
+/// ["__panel_args__"]` would fail `validate()` (and therefore `darkmux
+/// doctor`'s mission-config check, and `darkmux mission launch`, which
+/// runs `validate()` before minting) purely because the reference looks
+/// dangling to a check that only knows about the STATIC document, never
+/// this runtime-injected convention.
+pub const PANEL_ARGS_TASK_ID: &str = "__panel_args__";
 
 /// A declared runtime-only input a mission config's LAUNCHER must supply
 /// (Packet 3+) — a value that is genuinely per-launch (a diff, a worktree
@@ -429,6 +493,11 @@ impl MissionConfig {
                                 path: format!("{task_path}.{relation}"),
                                 message: format!("task \"{}\" {relation} itself", task.id),
                             });
+                        } else if dep.as_str() == PANEL_ARGS_TASK_ID {
+                            // (#1684) The reserved panel-args id is never a
+                            // real document task — it resolves at RUN time
+                            // (see PANEL_ARGS_TASK_ID's own doc). Not
+                            // dangling; deliberately exempted here.
                         } else if !all_task_ids.contains(dep.as_str()) {
                             findings.push(ValidationFinding {
                                 severity: FindingSeverity::Error,
@@ -677,6 +746,7 @@ mod tests {
             schema_version: Some(MISSION_CONFIG_SCHEMA.to_string()),
             inputs: Vec::new(),
             phases,
+            panel: None,
             extras: BTreeMap::new(),
         }
     }
@@ -1252,13 +1322,131 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_2_0() {
+    fn schema_version_constant_is_2_1() {
         // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
         // `LaunchParams::expansions` primitive — never fed by either
         // production launcher. A field REMOVAL is a MAJOR bump per this
         // constant's own doc (and CLAUDE.md's Versioning section, the same
         // rule applied to a different data shape) — not the minor 1.5 an
         // earlier draft of this change used.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "2.0");
+        //
+        // (#1684) Bumped again to "2.1" — additive (`panel`), so still a
+        // minor bump on top of the 2.0 major.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "2.1");
+    }
+
+    // ── (#1684) `panel` schema field ─────────────────────────────────────
+
+    #[test]
+    fn a_document_without_panel_still_parses_and_validates_clean() {
+        // Every pre-2.1 document omits `panel` — must parse identically
+        // (contract 5, additive minor) and never trip a validate() error.
+        let cfg = doc(vec![]);
+        assert!(cfg.panel.is_none());
+        assert!(cfg.validate(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_document_with_panel_round_trips_through_json() {
+        let mut cfg = doc(vec![]);
+        cfg.panel = Some(PanelConfig {
+            description: Some("PR view".to_string()),
+            hint: Some("<pr number>".to_string()),
+            extras: BTreeMap::new(),
+        });
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: MissionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+        assert_eq!(back.panel.unwrap().hint.as_deref(), Some("<pr number>"));
+    }
+
+    #[test]
+    fn panel_with_no_hint_parses_and_round_trips() {
+        // `hint` is itself optional — a config can advertise as a panel
+        // command with no input hint at all.
+        let json = r#"{"id":"x","name":"X","panel":{}}"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.panel.is_some());
+        assert_eq!(cfg.panel.as_ref().unwrap().hint, None);
+        let back = serde_json::to_string(&cfg).unwrap();
+        let cfg2: MissionConfig = serde_json::from_str(&back).unwrap();
+        assert_eq!(cfg, cfg2);
+    }
+
+    #[test]
+    fn unknown_fields_inside_panel_are_tolerated_lenient_on_read() {
+        // (contract 7) Unrecognized keys inside `panel` overflow into its
+        // own `extras`, never fail parsing — a future sub-field a fresh
+        // binary doesn't know yet is safe.
+        let json = r#"{"id":"x","name":"X","panel":{"hint":"h","futureField":{"a":1}}}"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        let panel = cfg.panel.expect("panel block present");
+        assert_eq!(panel.hint.as_deref(), Some("h"));
+        assert_eq!(panel.extras.get("futureField"), Some(&serde_json::json!({"a": 1})));
+    }
+
+    #[test]
+    fn review_builtin_declares_a_panel_block() {
+        // (#1684) `review` picks up panel advertising the same way any
+        // other config would — no more hardcoded single command in
+        // `src/acp.rs`.
+        let cfg = embedded_config("review");
+        let panel = cfg.panel.expect("the built-in review config must declare a panel block");
+        assert!(panel.hint.is_some(), "review's panel block should carry an input hint");
+        // (QA finding) `panel.description` must be a SHORT UI label, never
+        // the ~2KB provenance essay `MissionConfig.description` carries —
+        // that essay is developer-facing prose, not a command-palette
+        // label.
+        let panel_description = panel.description.expect("review's panel block should carry a short description");
+        assert!(
+            panel_description.len() < 120,
+            "panel.description must stay a short UI label, got {} chars: {panel_description}",
+            panel_description.len()
+        );
+        assert_ne!(
+            Some(panel_description),
+            cfg.description,
+            "panel.description must never equal the long-form MissionConfig.description"
+        );
+    }
+
+    #[test]
+    fn panel_description_round_trips_and_is_distinct_from_top_level_description() {
+        let mut cfg = doc(vec![]);
+        cfg.description = Some("a long developer-facing provenance essay".to_string());
+        cfg.panel = Some(PanelConfig {
+            description: Some("Short UI label".to_string()),
+            hint: None,
+            extras: BTreeMap::new(),
+        });
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: MissionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.panel.as_ref().unwrap().description.as_deref(), Some("Short UI label"));
+    }
+
+    // ── (#1684 QA finding) reserved `__panel_args__` never dangles ─────
+
+    #[test]
+    fn reads_naming_the_reserved_panel_args_id_never_dangles() {
+        let mut t = task("t1", &[], vec![step("s1", "procedural.shell")]);
+        t.reads = vec![PANEL_ARGS_TASK_ID.to_string()];
+        let cfg = doc(vec![phase("p1", vec![t])]);
+        let findings = cfg.validate(&["procedural.shell"]);
+        assert!(
+            findings.iter().all(|f| f.severity != FindingSeverity::Error),
+            "a reads entry naming the reserved panel-args id must never be treated as dangling: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn depends_on_naming_the_reserved_panel_args_id_never_dangles() {
+        let mut t = task("t1", &[], vec![step("s1", "procedural.shell")]);
+        t.depends_on = vec![PANEL_ARGS_TASK_ID.to_string()];
+        let cfg = doc(vec![phase("p1", vec![t])]);
+        let findings = cfg.validate(&["procedural.shell"]);
+        assert!(
+            findings.iter().all(|f| f.severity != FindingSeverity::Error),
+            "a depends_on entry naming the reserved panel-args id must never be treated as dangling: {findings:?}"
+        );
     }
 }
