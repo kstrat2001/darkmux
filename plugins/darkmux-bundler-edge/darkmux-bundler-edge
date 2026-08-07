@@ -53,7 +53,7 @@ def parse_diff(diff_text):
             target = line[4:].strip()
             path = None
             if target != "/dev/null":
-                p = target[2:] if target.startswith("b/") else target
+                p = target.removeprefix("b/")
                 if p.endswith(".edge"):
                     path = p
                     files.setdefault(path, [])
