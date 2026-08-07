@@ -263,7 +263,13 @@ async fn serve() -> Result<()> {
                 let run_result = match plan {
                     // `review` keeps its EXISTING bespoke path, byte-for-byte
                     // unchanged (#1684 rule C) — only routed to differently.
-                    crate::acp_panel::RoutePlan::Review => run_review(&session_id, &cwd, &cx).await,
+                    // `config_id` (#1695 merge-gate MUST FIX) is the
+                    // REGISTRY-RESOLVABLE id `route_command` decided on —
+                    // never a hardcoded `"review"` — so a panel-advertised
+                    // review VARIANT launches itself, not the built-in.
+                    crate::acp_panel::RoutePlan::Review(config_id) => {
+                        run_review(&session_id, &config_id, &args, &cwd, &cx).await
+                    }
                     crate::acp_panel::RoutePlan::Ephemeral(config) => {
                         run_ephemeral_command(&session_id, *config, args, cwd.clone(), &cx).await
                     }
@@ -289,12 +295,30 @@ async fn serve() -> Result<()> {
     Ok(())
 }
 
-/// Drives one `/review` turn end to end: `git diff` → Plan update → spawn
-/// the review subprocess → stream progress → final result chunk. Returns
-/// `Err` only for genuinely internal failures (spawn failed, io error,
-/// mutex poisoned upstream already handled) — the caller turns any `Err`
-/// into a chunk instead of a protocol-level error.
-async fn run_review(session_id: &SessionId, cwd: &Path, cx: &ConnectionTo<Client>) -> Result<()> {
+/// Drives one review-family turn end to end: `git diff` → Plan update →
+/// spawn the review subprocess → stream progress → final result chunk.
+/// Returns `Err` only for genuinely internal failures (spawn failed, io
+/// error, mutex poisoned upstream already handled) — the caller turns any
+/// `Err` into a chunk instead of a protocol-level error.
+///
+/// `config_id` (#1695 merge-gate MUST FIX) is the REGISTRY-RESOLVABLE
+/// mission-config id `acp_panel::route_command` decided this invocation
+/// should launch — `RoutePlan::Review(String)`, never a hardcoded
+/// `"review"` literal. Everything else here is byte-identical for the
+/// plain `/review` case (where `config_id == "review"`); the only new
+/// behavior is that a panel-advertised review VARIANT (an operator config
+/// carrying `review.*` step kinds under a different id, e.g.
+/// `review-lean`) spawns ITSELF instead of silently spawning the built-in
+/// `review` config in its place.
+///
+/// `args` (#1695 merge-gate finding 4) is the raw text typed after the
+/// command name. No review-family config consumes it today (the dedicated
+/// review launcher, `mission_launch_review::launch`, declares no `args`
+/// input), so trailing args are silently accepted by the ACP layer but
+/// have no effect on the dispatched review — the final message says so
+/// explicitly rather than leaving the operator to infer it from the
+/// hint's "(no arguments)" text alone.
+async fn run_review(session_id: &SessionId, config_id: &str, args: &str, cwd: &Path, cx: &ConnectionTo<Client>) -> Result<()> {
     let diff = git_diff(cwd).await?;
     if diff.trim().is_empty() {
         cx.send_notification(agent_chunk(
@@ -326,7 +350,7 @@ async fn run_review(session_id: &SessionId, cwd: &Path, cx: &ConnectionTo<Client
     let bundler_param = choose_bundler(&diff);
 
     eprintln!(
-        "[darkmux-acp] session/prompt: spawning `mission launch review` case={case_id} \
+        "[darkmux-acp] session/prompt: spawning `mission launch {config_id}` case={case_id} \
          diff_file={} bundler={}",
         diff_path.display(),
         bundler_param.as_deref().unwrap_or("(built-in)")
@@ -336,7 +360,7 @@ async fn run_review(session_id: &SessionId, cwd: &Path, cx: &ConnectionTo<Client
     cmd.args([
         "mission",
         "launch",
-        "review",
+        config_id,
         "--param",
         &diff_file_arg,
         "--param",
@@ -353,7 +377,7 @@ async fn run_review(session_id: &SessionId, cwd: &Path, cx: &ConnectionTo<Client
         .stdout(ProcStdio::piped())
         .stderr(ProcStdio::piped())
         .spawn()
-        .context("spawning `darkmux mission launch review` subprocess")?;
+        .with_context(|| format!("spawning `darkmux mission launch {config_id}` subprocess"))?;
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -469,7 +493,7 @@ async fn run_review(session_id: &SessionId, cwd: &Path, cx: &ConnectionTo<Client
     let status = child
         .wait()
         .await
-        .context("waiting on the review subprocess")?;
+        .with_context(|| format!("waiting on the `{config_id}` subprocess"))?;
     let stdout_buf = stdout_task.await.unwrap_or_default();
     let _ = tokio::fs::remove_file(&diff_path).await;
 
@@ -500,7 +524,16 @@ async fn run_review(session_id: &SessionId, cwd: &Path, cx: &ConnectionTo<Client
         ))?;
     }
 
-    let final_text = render_final_message(&stdout_buf, status);
+    let mut final_text = render_final_message(&stdout_buf, status);
+    // (#1695 merge-gate finding 4) No review-family config consumes `args`
+    // today — say so explicitly rather than silently swallowing whatever
+    // the operator typed after the command name.
+    if !args.trim().is_empty() {
+        final_text.push_str(&format!(
+            "\n\n_(arguments `{}` were ignored — `{config_id}` takes none)_",
+            args.trim()
+        ));
+    }
     cx.send_notification(agent_chunk(session_id, final_text))?;
 
     Ok(())

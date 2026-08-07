@@ -154,8 +154,14 @@ pub fn parse_command(text: &str) -> Option<(String, String)> {
 pub enum RoutePlan {
     /// The config's graph uses a review-pipeline step kind
     /// (`config_uses_review_kinds`) — the EXISTING bespoke path in
-    /// `acp.rs` (`run_review`), unchanged by this module.
-    Review,
+    /// `acp.rs` (`run_review`), unchanged by this module. Carries the
+    /// REGISTRY-RESOLVABLE id (#1695 merge-gate MUST FIX) so `run_review`
+    /// spawns `mission launch <this-id>`, never a hardcoded `"review"` —
+    /// a panel-advertised review VARIANT (an operator config carrying
+    /// `review.*` kinds under a different id, e.g. `review-lean`) must
+    /// launch ITSELF, not silently launch the built-in `review` config in
+    /// its place.
+    Review(String),
     /// The config's graph contains ZERO model-dispatching steps (every
     /// step kind is `procedural.*`) — run in-process via [`run_ephemeral`],
     /// no mission instance minted.
@@ -176,6 +182,18 @@ pub enum RoutePlan {
 /// reflects the current registry, so this is defense in depth, not the
 /// primary check.
 ///
+/// Matching is CASE-INSENSITIVE against the advertised registry keys
+/// (#1695 merge-gate finding 2) — `cmd` arrives already lowercased from
+/// [`parse_command`], but a registry key (an on-disk filename stem) keeps
+/// whatever case the operator gave the file, so a naive `==` would make a
+/// mixed-case filename permanently unreachable even though it was
+/// advertised. `advertised` is caller-sorted ([`list_panel_commands`]),
+/// so `.find()`'s first case-insensitive match is deterministic — two
+/// configs that collide only after lowercasing resolve to whichever sorts
+/// first, never a panic. The MATCHED entry's own (correctly-cased) `id` is
+/// what actually gets loaded/launched — never the lowercased `cmd` the
+/// user typed.
+///
 /// The review route is decided STRUCTURALLY — `config_uses_review_kinds`,
 /// the SAME test `src/mission_launch.rs::launch` uses to route a config to
 /// the dedicated review launcher (#1530) — never by an `id == "review"`
@@ -184,17 +202,16 @@ pub enum RoutePlan {
 /// path; an id that merely happens to be named `"review"` but carries no
 /// review kinds does not.
 pub fn route_command(advertised: &[PanelCommand], cmd: &str) -> Option<RoutePlan> {
-    if !advertised.iter().any(|c| c.id == cmd) {
-        return None;
-    }
-    let loaded = mission_config::load(cmd).ok()?;
+    let matched = advertised.iter().find(|c| c.id.eq_ignore_ascii_case(cmd))?;
+    let resolved_id = matched.id.clone();
+    let loaded = mission_config::load(&resolved_id).ok()?;
     if crate::mission_launch::config_uses_review_kinds(&loaded.config) {
-        return Some(RoutePlan::Review);
+        return Some(RoutePlan::Review(resolved_id));
     }
     if is_procedural_only(&loaded.config) {
         Some(RoutePlan::Ephemeral(Box::new(loaded.config)))
     } else {
-        Some(RoutePlan::Launch(cmd.to_string()))
+        Some(RoutePlan::Launch(resolved_id))
     }
 }
 
@@ -280,7 +297,7 @@ pub fn run_ephemeral(config: &MissionConfig, args: &str, cwd: &Path) -> Result<S
     }
 
     let params = LaunchParams::default();
-    let (ordered_tasks, mut steps, _warnings) =
+    let (ordered_tasks, mut steps, interpret_warnings) =
         mission_config::interpret(&config, &params).context("interpreting panel command graph")?;
 
     apply_default_cwd(&mut steps, cwd);
@@ -328,7 +345,7 @@ pub fn run_ephemeral(config: &MissionConfig, args: &str, cwd: &Path) -> Result<S
     )
     .context("running panel command graph")?;
 
-    render_ephemeral_result(&ordered_tasks, &steps, &report)
+    render_ephemeral_result(&ordered_tasks, &steps, &report, &interpret_warnings)
 }
 
 /// Mint a per-invocation flow-record correlation id for an ephemeral
@@ -357,6 +374,20 @@ fn mint_ephemeral_correlation_id(config_id: &str) -> String {
 /// ["__panel_args__"]` must still resolve cleanly through `interpret`, so
 /// this seeds an empty value rather than skipping injection). A config
 /// that never references the reserved id is untouched.
+///
+/// **Reservation collision (#1695 merge-gate finding 1).** If the
+/// operator's OWN document already declares a task literally named
+/// `__panel_args__`, injection is SKIPPED entirely rather than prepending
+/// a second task under the same id — `interpret`'s own duplicate-id check
+/// (`push_task`) would otherwise bail with a bare "duplicate task id"
+/// error that never explains WHY that particular id is special. Skipping
+/// is also the semantically correct choice, not just the safe one:
+/// `interpret` already resolves `reads`/`depends_on` entries against the
+/// document's OWN declared tasks first, so a task reading
+/// `__panel_args__` in a document that declares one under that name
+/// already receives THAT task's real output — operator sovereignty: an
+/// explicit declaration under a reserved name wins over the synthetic
+/// default for that name, silently and correctly, with nothing to inject.
 fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &str) {
     let referenced = config
         .phases
@@ -364,6 +395,11 @@ fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &str) 
         .flat_map(|p| p.tasks.iter())
         .any(|t| t.reads.iter().chain(t.depends_on.iter()).any(|r| r == PANEL_ARGS_TASK_ID));
     if !referenced {
+        return;
+    }
+    let already_declared =
+        config.phases.iter().flat_map(|p| p.tasks.iter()).any(|t| t.id == PANEL_ARGS_TASK_ID);
+    if already_declared {
         return;
     }
     let args_task = TaskConfig {
@@ -423,10 +459,18 @@ fn apply_default_cwd(steps: &mut BTreeMap<String, Step>, cwd: &Path) {
 /// panel message. `ordered_tasks` MUST be the original `Vec<Task>`
 /// `interpret` returned (document order); a `BTreeMap`'s key order is
 /// lexicographic by id, not document order, so it cannot substitute here.
+///
+/// `interpret_warnings` (#1695 merge-gate finding 3) are `interpret`'s own
+/// non-fatal findings (e.g. an absent `expand.over` collection under a
+/// pre-2.0 document — see `InterpretedGraph`'s doc) — `run_ephemeral`
+/// previously bound and dropped them; every other production caller
+/// (`mission_launch.rs`) prints them, so silently discarding them here was
+/// the one place in the codebase where they went nowhere.
 fn render_ephemeral_result(
     ordered_tasks: &[Task],
     steps: &BTreeMap<String, Step>,
     report: &SchedulerReport,
+    interpret_warnings: &[String],
 ) -> Result<String> {
     let referenced: BTreeSet<&str> = ordered_tasks
         .iter()
@@ -475,7 +519,7 @@ fn render_ephemeral_result(
     // step. A clean-looking final message over a partially-failed run is
     // exactly the "silence reads as success" failure this project's own
     // doctrine (CLAUDE.md's "no blind runs") warns against; name it.
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = interpret_warnings.to_vec();
     if !report.errored.is_empty() {
         warnings.push(format!("step(s) errored elsewhere in the graph: {}", report.errored.join(", ")));
     }
@@ -598,7 +642,114 @@ mod tests {
     #[test]
     fn review_always_routes_to_the_review_variant() {
         let advertised = vec![PanelCommand { id: "review".to_string(), description: "d".to_string(), hint: None }];
-        assert!(matches!(route_command(&advertised, "review"), Some(RoutePlan::Review)));
+        let plan = route_command(&advertised, "review").expect("review must route");
+        let RoutePlan::Review(id) = plan else { panic!("expected RoutePlan::Review") };
+        assert_eq!(id, "review");
+    }
+
+    /// (#1695 merge-gate MUST FIX) A panel-advertised review VARIANT — an
+    /// operator config under a DIFFERENT id, carrying real `review.*` step
+    /// kinds — must route to `RoutePlan::Review` carrying ITS OWN id, not
+    /// the built-in `"review"`. Pre-fix, `run_review` hardcoded `mission
+    /// launch review` regardless of which id actually routed here, so a
+    /// variant would advertise and invoke fine while silently launching
+    /// the wrong config underneath.
+    #[test]
+    #[serial_test::serial]
+    fn review_variant_routes_to_review_carrying_its_own_id_not_the_builtin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+
+        let dir = tmp.path().join("mission-configs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("review-lean.json"),
+            serde_json::to_string(&serde_json::json!({
+                "id": "review-lean",
+                "name": "Review Lean",
+                "panel": {"description": "A leaner review"},
+                "phases": [{
+                    "id": "adjudicate",
+                    "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "review.judge"}]}]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let advertised =
+            vec![PanelCommand { id: "review-lean".to_string(), description: "A leaner review".to_string(), hint: None }];
+        let plan = route_command(&advertised, "review-lean").expect("review-lean must route");
+        let RoutePlan::Review(launch_id) = plan else { panic!("expected RoutePlan::Review for a config carrying review.* kinds") };
+        assert_eq!(
+            launch_id, "review-lean",
+            "the routed id must be the VARIANT's own registry key — this is what \
+             `run_review` spawns as `mission launch <launch_id>`, so a wrong id here \
+             means the wrong config launches"
+        );
+
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    /// (#1695 merge-gate finding 2) A mixed-case on-disk config filename
+    /// advertises under its own (correctly-cased) id, but a user typing
+    /// the command lowercases it (`parse_command`'s own normalization) —
+    /// `route_command` must still resolve it, and must resolve/launch
+    /// using the ORIGINAL-CASED registry key, never the lowercased text
+    /// the user typed (a case-sensitive filesystem would 404 on that).
+    #[test]
+    #[serial_test::serial]
+    fn route_command_matches_case_insensitively_and_launches_the_correctly_cased_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+
+        let dir = tmp.path().join("mission-configs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Pr-View.json"),
+            serde_json::to_string(&serde_json::json!({
+                "id": "Pr-View",
+                "name": "PR View",
+                "panel": {"description": "View a PR"},
+                "phases": [{
+                    "id": "p1",
+                    "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.shell", "config": {"command": "echo hi"}}]}]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // The advertised entry keeps the file's own case; the user typed
+        // "/Pr-View", which `parse_command` lowercases to "pr-view" before
+        // it ever reaches `route_command`.
+        let advertised =
+            vec![PanelCommand { id: "Pr-View".to_string(), description: "View a PR".to_string(), hint: None }];
+        let plan = route_command(&advertised, "pr-view").expect("a mixed-case filename must still be invocable");
+        match plan {
+            RoutePlan::Ephemeral(config) => {
+                assert_eq!(config.id, "Pr-View", "the loaded config is the correctly-cased file's own document");
+            }
+            _ => panic!("expected an Ephemeral route for a procedural-only fixture"),
+        }
+
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
     }
 
     // ── (#1684 QA finding — MUST-FIX 2/3) advertised id + description ──
@@ -796,6 +947,52 @@ mod tests {
         assert_eq!(out.trim(), "arg:[]");
     }
 
+    // ── (#1695 merge-gate finding 1) reserved-id collision ──────────────
+
+    #[test]
+    fn ephemeral_run_skips_injection_when_the_document_already_declares_the_reserved_task_id() {
+        // The document itself owns a task literally named "__panel_args__"
+        // — injection must be skipped (never double-inject, which would
+        // collide at interpret()'s own duplicate-id check), and the
+        // reading task must receive the DOCUMENT's own task's real
+        // output, never the synthetic args string.
+        let cfg = config(
+            "reserved-collision",
+            None,
+            vec![phase(
+                "p1",
+                vec![
+                    task(
+                        PANEL_ARGS_TASK_ID,
+                        &[],
+                        &[],
+                        vec![step(
+                            "producer-step",
+                            "procedural.noop",
+                            serde_json::json!({"output": "operator-owned-value"}),
+                        )],
+                    ),
+                    task(
+                        "consumer",
+                        &[],
+                        &[PANEL_ARGS_TASK_ID],
+                        vec![step(
+                            "consumer-step",
+                            "procedural.shell",
+                            serde_json::json!({"command": "echo got: $DARKMUX_STEP_INPUT___PANEL_ARGS__"}),
+                        )],
+                    ),
+                ],
+            )],
+        );
+        let tmp = std::env::temp_dir();
+        // A NON-EMPTY args string — if injection had run anyway (ignoring
+        // the collision), the reading task would see THIS value instead
+        // of the document's own task output.
+        let out = run_ephemeral(&cfg, "this-should-be-ignored", &tmp).expect("ephemeral run succeeds, no duplicate-id bail");
+        assert_eq!(out.trim(), "got: operator-owned-value");
+    }
+
     // ── (#1684 QA finding — CONSIDER 7) validate() runs before interpret ──
 
     #[test]
@@ -813,5 +1010,50 @@ mod tests {
         let tmp = std::env::temp_dir();
         let err = run_ephemeral(&cfg, "", &tmp).expect_err("a zero-step task must fail validate(), not run");
         assert!(err.to_string().contains("failed validation"), "{err:#}");
+    }
+
+    // ── (#1695 merge-gate finding 3) interpret() warnings surfaced ──────
+
+    #[test]
+    fn render_ephemeral_result_appends_interpret_warnings_to_the_output() {
+        // `run_ephemeral` used to bind and drop `interpret`'s own non-fatal
+        // warnings; `render_ephemeral_result` must surface them in the
+        // final message the same way it already surfaces scheduler-level
+        // findings (errored steps, multi-sink branches) — a direct unit
+        // test since `interpret()` itself has no live producer of a
+        // non-empty warnings Vec today (see `InterpretedGraph`'s doc).
+        let t = Task {
+            id: "t1".to_string(),
+            phase_id: "p1".to_string(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec!["s1".to_string()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let mut steps = BTreeMap::new();
+        steps.insert(
+            "s1".to_string(),
+            Step {
+                id: "s1".to_string(),
+                task_id: "t1".to_string(),
+                kind: "procedural.noop".to_string(),
+                status: NodeStatus::Complete,
+                config: serde_json::Value::Null,
+                started_ts: None,
+                completed_ts: None,
+                output: Some("done".to_string()),
+            },
+        );
+        let report = SchedulerReport::default();
+        let interpret_warnings = vec!["absent expand.over collection for task foo".to_string()];
+
+        let out = render_ephemeral_result(&[t], &steps, &report, &interpret_warnings).expect("renders");
+        assert!(out.contains("done"), "{out}");
+        assert!(out.contains("absent expand.over collection for task foo"), "{out}");
     }
 }
