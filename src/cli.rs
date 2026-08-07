@@ -290,6 +290,10 @@ pub(crate) enum Cmd {
         #[arg(long = "lab-dir")]
         lab_dir: Option<std::path::PathBuf>,
     },
+    /// SPIKE (#1388): expose darkmux as an ACP (Agent Client Protocol) agent
+    /// over stdio for editors like Zed. Not a shipped feature yet — see
+    /// `src/acp.rs` module docs for what's spike-grade about it.
+    Acp,
     /// One-command setup: install skills, optionally add session-start hook
     /// and CLAUDE.md integration so Claude Code knows about darkmux. Safe to
     /// re-run; refreshes the bundled skills after a darkmux upgrade (#1426 —
