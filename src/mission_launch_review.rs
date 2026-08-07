@@ -2192,6 +2192,7 @@ mod tests {
         let step = crew::types::Step {
             id: format!("{}-s1", order[0]),
             task_id: format!("{}-t1", order[0]),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: crew::types::NodeStatus::Complete,
             config: serde_json::Value::Null,

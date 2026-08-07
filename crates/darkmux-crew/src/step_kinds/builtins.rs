@@ -2080,6 +2080,7 @@ mod tests {
         Step {
             id: id.to_string(),
             task_id: "t1".to_string(),
+            gate: None,
             kind: kind.to_string(),
             status: crate::types::NodeStatus::Planned,
             config,

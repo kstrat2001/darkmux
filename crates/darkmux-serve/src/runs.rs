@@ -1232,6 +1232,7 @@ mod tests {
         Step {
             id: id.to_string(),
             task_id: task_id.to_string(),
+            gate: None,
             kind: "dispatch.internal".to_string(),
             status: NodeStatus::Complete,
             config: match session_id {

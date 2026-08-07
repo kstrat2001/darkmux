@@ -1485,6 +1485,7 @@ mod tests {
         let s = crate::types::Step {
             id: id.to_string(),
             task_id: format!("{id}-task"),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status,
             config: serde_json::Value::Null,
@@ -2130,6 +2131,7 @@ mod task_step_storage_tests {
         Step {
             id: id.to_string(),
             task_id: task_id.to_string(),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: NodeStatus::Planned,
             config: serde_json::Value::Null,

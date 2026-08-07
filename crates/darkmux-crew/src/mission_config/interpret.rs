@@ -139,6 +139,7 @@ pub fn interpret(config: &MissionConfig, params: &LaunchParams) -> Result<Interp
                     &real_task_id,
                     &step_cfg.kind,
                     step_config_for(step_cfg, params),
+                    step_cfg.gate.clone(),
                 )?;
             }
             let description = task_cfg.description.clone().unwrap_or_default();
@@ -342,11 +343,17 @@ fn push_step(
     real_task_id: &str,
     kind: &str,
     config: serde_json::Value,
+    // (#1684 Packet 2) Threaded straight from `StepConfig::gate` — this
+    // function does no resolution/validation of the value (that's
+    // `MissionConfig::validate`'s job); it just carries the document's
+    // declaration onto the executable `Step` verbatim.
+    gate: Option<String>,
 ) -> Result<()> {
     let step = Step {
         id: real_step_id.to_string(),
         task_id: real_task_id.to_string(),
         kind: kind.to_string(),
+        gate,
         status: NodeStatus::Planned,
         config,
         started_ts: None,
@@ -369,7 +376,11 @@ mod tests {
     use std::collections::BTreeMap as Map;
 
     fn step(id: &str, kind: &str, config: serde_json::Value) -> StepConfig {
-        StepConfig { id: id.to_string(), kind: kind.to_string(), config, extras: Map::new() }
+        StepConfig { id: id.to_string(), kind: kind.to_string(), config, gate: None, extras: Map::new() }
+    }
+
+    fn gated_step(id: &str, kind: &str, config: serde_json::Value, gate: &str) -> StepConfig {
+        StepConfig { gate: Some(gate.to_string()), ..step(id, kind, config) }
     }
 
     fn task(id: &str, depends_on: &[&str], role_id: Option<&str>, steps: Vec<StepConfig>) -> TaskConfig {
@@ -630,6 +641,33 @@ mod tests {
         assert!(s.started_ts.is_none());
         assert!(s.completed_ts.is_none());
         assert!(s.output.is_none());
+    }
+
+    // ── (#1684 Packet 2) `gate` threads onto the executable Step ───────
+
+    #[test]
+    fn interpret_threads_the_gate_field_onto_the_executable_step_verbatim() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![task(
+                "t1",
+                &[],
+                None,
+                vec![gated_step("s1", "procedural.noop", serde_json::Value::Null, "operator")],
+            )],
+        )]);
+        let (_tasks, steps, _warnings) = interpret(&cfg, &LaunchParams::default()).unwrap();
+        assert_eq!(steps["s1"].gate.as_deref(), Some("operator"));
+    }
+
+    #[test]
+    fn interpret_leaves_gate_none_for_an_ungated_step() {
+        let cfg = doc(vec![phase(
+            "p1",
+            vec![task("t1", &[], None, vec![step("s1", "procedural.noop", serde_json::Value::Null)])],
+        )]);
+        let (_tasks, steps, _warnings) = interpret(&cfg, &LaunchParams::default()).unwrap();
+        assert_eq!(steps["s1"].gate, None);
     }
 
     // ── (#1284 review round 2, consider 4) dangling launcher keys ─────

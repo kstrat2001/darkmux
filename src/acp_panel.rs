@@ -266,7 +266,23 @@ pub fn is_procedural_only(config: &MissionConfig) -> bool {
 /// synchronous. `acp.rs`'s caller runs this on a `tokio::task::
 /// spawn_blocking` thread rather than the connection's own async task, so
 /// it never stalls the ACP event loop.
-pub fn run_ephemeral(config: &MissionConfig, args: &str, cwd: &Path) -> Result<String> {
+///
+/// `gate` (#1684 Packet 2) is the operator sign-off gate handler for any
+/// step in `config`'s graph that declares `"gate": "operator"` (e.g. the
+/// `pr-merge`/`pr-approve` example verbs — see `mission_config::StepConfig::
+/// gate`). `acp.rs`'s `session/prompt` handler wires the ACP `session/
+/// request_permission` handler here (a channel round-trip back to the
+/// connection's async task — see `acp.rs`'s own doc on why that shape is
+/// required from a `spawn_blocking` thread); `None` (no handler at all)
+/// still fails CLOSED rather than silently ungated — a gated step with no
+/// handler wired refuses itself via `crew::gate::resolve_gate`'s own
+/// `None` fallback.
+pub fn run_ephemeral(
+    config: &MissionConfig,
+    args: &str,
+    cwd: &Path,
+    gate: Option<&mut crate::crew::gate::GateHandler<'_>>,
+) -> Result<String> {
     let mut config = config.clone();
     inject_panel_args_task_if_referenced(&mut config, args);
 
@@ -340,6 +356,7 @@ pub fn run_ephemeral(config: &MissionConfig, args: &str, cwd: &Path) -> Result<S
             // instance, so there is no `<mission>/<phase>/steps/<id>.json`
             // to persist a Step transition into (rule D).
         },
+        gate,
         None,
         &[],
     )
@@ -413,6 +430,7 @@ fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &str) 
             id: format!("{PANEL_ARGS_TASK_ID}-step"),
             kind: "procedural.noop".to_string(),
             config: serde_json::json!({"output": args}),
+            gate: None,
             extras: BTreeMap::new(),
         }],
         extras: BTreeMap::new(),
@@ -545,7 +563,11 @@ mod tests {
     use std::collections::BTreeMap as Map;
 
     fn step(id: &str, kind: &str, config: serde_json::Value) -> StepConfig {
-        StepConfig { id: id.to_string(), kind: kind.to_string(), config, extras: Map::new() }
+        StepConfig { id: id.to_string(), kind: kind.to_string(), config, gate: None, extras: Map::new() }
+    }
+
+    fn gated_step(id: &str, kind: &str, config: serde_json::Value, gate: &str) -> StepConfig {
+        StepConfig { gate: Some(gate.to_string()), ..step(id, kind, config) }
     }
 
     fn task(id: &str, depends_on: &[&str], reads: &[&str], steps: Vec<StepConfig>) -> TaskConfig {
@@ -852,7 +874,7 @@ mod tests {
             )],
         );
         let tmp = std::env::temp_dir();
-        let out = run_ephemeral(&cfg, "", &tmp).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, "", &tmp, None).expect("ephemeral run succeeds");
         assert_eq!(out.trim(), "got: hello-from-producer");
     }
 
@@ -873,7 +895,7 @@ mod tests {
             vec![phase("p1", vec![task("t1", &[], &[], vec![step("s1", "procedural.noop", serde_json::Value::Null)])])],
         );
         let cwd = std::env::temp_dir();
-        let out = run_ephemeral(&cfg, "", &cwd).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, "", &cwd, None).expect("ephemeral run succeeds");
         // `procedural.noop` with no `output` override defaults to its own
         // step id (see `ProceduralNoopStepKind::run`) — proves the run
         // actually executed, not just that no directory appeared.
@@ -916,7 +938,7 @@ mod tests {
             )],
         );
         let tmp = std::env::temp_dir();
-        let out = run_ephemeral(&cfg, "hello world", &tmp).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, "hello world", &tmp, None).expect("ephemeral run succeeds");
         assert_eq!(out.trim(), "arg: hello world");
     }
 
@@ -943,7 +965,7 @@ mod tests {
             )],
         );
         let tmp = std::env::temp_dir();
-        let out = run_ephemeral(&cfg, "", &tmp).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, "", &tmp, None).expect("ephemeral run succeeds");
         assert_eq!(out.trim(), "arg:[]");
     }
 
@@ -989,7 +1011,7 @@ mod tests {
         // A NON-EMPTY args string — if injection had run anyway (ignoring
         // the collision), the reading task would see THIS value instead
         // of the document's own task output.
-        let out = run_ephemeral(&cfg, "this-should-be-ignored", &tmp).expect("ephemeral run succeeds, no duplicate-id bail");
+        let out = run_ephemeral(&cfg, "this-should-be-ignored", &tmp, None).expect("ephemeral run succeeds, no duplicate-id bail");
         assert_eq!(out.trim(), "got: operator-owned-value");
     }
 
@@ -1008,7 +1030,7 @@ mod tests {
             )],
         );
         let tmp = std::env::temp_dir();
-        let err = run_ephemeral(&cfg, "", &tmp).expect_err("a zero-step task must fail validate(), not run");
+        let err = run_ephemeral(&cfg, "", &tmp, None).expect_err("a zero-step task must fail validate(), not run");
         assert!(err.to_string().contains("failed validation"), "{err:#}");
     }
 
@@ -1041,6 +1063,7 @@ mod tests {
             Step {
                 id: "s1".to_string(),
                 task_id: "t1".to_string(),
+                gate: None,
                 kind: "procedural.noop".to_string(),
                 status: NodeStatus::Complete,
                 config: serde_json::Value::Null,
@@ -1055,5 +1078,86 @@ mod tests {
         let out = render_ephemeral_result(&[t], &steps, &report, &interpret_warnings).expect("renders");
         assert!(out.contains("done"), "{out}");
         assert!(out.contains("absent expand.over collection for task foo"), "{out}");
+    }
+
+    // ── (#1684 Packet 2) run_ephemeral + operator sign-off gate ────────
+
+    /// A two-step procedural config — a `gather` task feeding a gated
+    /// `executor` task — is the shape every documented gated panel verb
+    /// (`pr-merge`, `pr-approve`) actually has: a gather step assembles the
+    /// facts, the gated step is the consequential action. This test
+    /// exercises BOTH decisions through the real `run_ephemeral` path (not
+    /// just `gate::resolve_gate`'s own unit tests) and asserts the
+    /// handler's facts map is literally the gather task's output — the
+    /// dialog-body contract the #1685 spec depends on.
+    fn gather_then_gated_config() -> MissionConfig {
+        config(
+            "gather-then-gated",
+            None,
+            vec![phase(
+                "p1",
+                vec![
+                    task(
+                        "gather",
+                        &[],
+                        &[],
+                        vec![step(
+                            "gather-step",
+                            "procedural.shell",
+                            serde_json::json!({"command": "echo 42 open PRs"}),
+                        )],
+                    ),
+                    task(
+                        "executor",
+                        &["gather"],
+                        &[],
+                        vec![gated_step(
+                            "executor-step",
+                            "procedural.noop",
+                            serde_json::json!({"output": "merged"}),
+                            "operator",
+                        )],
+                    ),
+                ],
+            )],
+        )
+    }
+
+    #[test]
+    fn ephemeral_run_gate_handler_receives_the_gather_tasks_output_and_approving_runs_the_executor() {
+        let cfg = gather_then_gated_config();
+        let tmp = std::env::temp_dir();
+
+        let mut received: Option<Map<String, String>> = None;
+        let mut approve = |_s: &Step, f: &Map<String, String>| {
+            received = Some(f.clone());
+            crate::crew::gate::GateDecision::Approved
+        };
+        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut approve)).expect("ephemeral run succeeds");
+        assert_eq!(out.trim(), "merged", "an approved gate must let the executor step actually run");
+        assert_eq!(
+            received.as_ref().and_then(|f| f.get("gather")).map(|s| s.trim()),
+            Some("42 open PRs"),
+            "the gate handler must receive the gather task's output as its facts map — the \
+             dialog-body contract: {received:?}"
+        );
+    }
+
+    #[test]
+    fn ephemeral_run_gate_handler_declining_fails_the_command_without_running_the_executor() {
+        let cfg = gather_then_gated_config();
+        let tmp = std::env::temp_dir();
+
+        let mut decline = |_s: &Step, _f: &Map<String, String>| crate::crew::gate::GateDecision::Declined {
+            reason: "operator declined".to_string(),
+        };
+        // `run_ephemeral` still returns `Ok` — a declined gate is a command
+        // FAILURE (rendered as such, mirroring `render_ephemeral_result`'s
+        // existing Error-terminal handling), never a hard `Err` propagated
+        // across the ACP boundary.
+        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut decline))
+            .expect("a declined gate still renders a command-failed message, not an Err");
+        assert!(out.contains("darkmux: command failed"), "{out}");
+        assert!(out.contains("operator declined"), "{out}");
     }
 }

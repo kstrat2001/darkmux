@@ -495,6 +495,21 @@ pub struct Step {
     /// step-kind registry id, e.g. `"dispatch.internal"` |
     /// `"dispatch.single_shot"` | `"procedural.shell"` | `"procedural.noop"`.
     pub kind: String,
+    /// (#1684 Packet 2, mission-config schema 2.2) The operator sign-off
+    /// gate — mirrors [`mission_config::StepConfig::gate`](
+    /// crate::mission_config::StepConfig::gate), threaded through verbatim
+    /// by [`mission_config::interpret::interpret`](
+    /// crate::mission_config::interpret::interpret). `None` (every pre-2.2
+    /// document, and every step that doesn't opt in) means the step runs
+    /// exactly as before — `scheduler::run_step_graph` never even glances
+    /// at this field for an ungated step. `Some("operator")` (the only
+    /// recognized value today, `gate::GATE_KIND_OPERATOR`) means the
+    /// scheduler invokes the caller-supplied gate handler before running
+    /// this step; `Some(anything else)` is an unrecognized gate kind and
+    /// FAILS CLOSED (refused, never silently ungated) — see
+    /// `gate::resolve_gate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
     #[serde(default)]
     pub status: NodeStatus,
     /// Kind-specific config. `serde_json::Value::Null` (the `Default`) for

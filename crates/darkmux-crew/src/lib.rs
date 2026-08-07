@@ -27,6 +27,13 @@ pub mod dispatch;
 // uses, so its residency participates in the #1487 lease/reconcile regime.
 pub mod dispatch_as_crew_of_one;
 pub mod dispatch_internal;
+// (#1684 Packet 2) The operator sign-off gate — `gate: "operator"` on a
+// mission-config step (schema 2.2), the mechanism behind gated panel verbs
+// like `pr-merge`/`pr-approve`. `GateDecision`/`GateHandler`/`resolve_gate`
+// are the caller-supplied-seam types `scheduler::run_step_graph` takes;
+// `refusal_handler`/`tty_prompt_handler` are the non-interactive/CLI
+// production handlers. See the module doc.
+pub mod gate;
 // (#1284 Packet 2) The standard output contract every mission emits +
 // generalized finalization. `ReviewEnvelope` (darkmux-lab) maps INTO
 // `MissionEnvelope::payload` — this crate has no reverse dependency on

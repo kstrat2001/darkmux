@@ -80,6 +80,7 @@ use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseS
 use darkmux_types::style;
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -192,6 +193,38 @@ fn spec_origin_for(source: crew::mission_config::MissionConfigSource) -> crew::t
     match source {
         crew::mission_config::MissionConfigSource::User => crew::types::MissionSpecOrigin::UserConfig,
         _ => crew::types::MissionSpecOrigin::Builtin,
+    }
+}
+
+/// (#1684 Packet 2) `mission launch`'s operator sign-off gate handler — the
+/// #1685 spec's "interactive CLI → prompt; non-interactive → blocks
+/// pending sign-off". Picked ONCE per `launch` call by checking whether
+/// BOTH STDIN and STDOUT are real terminals: `darkmux mission launch
+/// pr-merge` typed by a human at a shell gets [`crew::gate::
+/// tty_prompt_handler`] (a y/N prompt); anything else — CI, a
+/// piped/redirected stdin OR stdout, an ACP-spawned `mission launch <id>`
+/// subprocess (the `RoutePlan::Launch` route in `src/acp_panel.rs` —
+/// headless by construction) — gets [`crew::gate::refusal_handler`], which
+/// fails CLOSED rather than hanging on input that will never arrive.
+///
+/// **Both streams, not just stdin (#1684 QA CONSIDER).** `darkmux mission
+/// launch pr-merge > log.txt` keeps a real tty on stdin while stdout is
+/// redirected — checking stdin alone would still pick the tty prompt, but
+/// the prompt text itself (written to stdout by `tty_prompt_handler`)
+/// would land silently in the redirected file, and the operator watching
+/// the terminal would see nothing but an apparent hang. Requiring BOTH
+/// streams to be terminals is the cheap fix: a redirected stdout falls
+/// through to the non-interactive refusal instead, which is at least
+/// LOUD about needing a real terminal.
+///
+/// Boxed because the two branches are different concrete closure types;
+/// `'static` because neither captures anything beyond owned stdio
+/// handles.
+fn cli_gate_handler() -> Box<crew::gate::GateHandler<'static>> {
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        Box::new(crew::gate::tty_prompt_handler())
+    } else {
+        Box::new(crew::gate::refusal_handler())
     }
 }
 
@@ -562,6 +595,13 @@ pub fn launch(
     // immutable borrow of the same map — both read-only, no conflict). The
     // bulk save loop right after this call stays in place as a cheap,
     // idempotent final reconcile.
+    // (#1684 Packet 2) Picked once per launch — see `cli_gate_handler`'s
+    // own doc. Only ever actually INVOKED if this graph contains a step
+    // declaring `"gate": "operator"` (`gate::resolve_gate` never calls it
+    // for an ungated step), which today means an operator-authored
+    // panel-verb config (e.g. the documented `pr-merge` example) launched
+    // directly rather than through the ACP ephemeral route.
+    let mut gate_handler = cli_gate_handler();
     let graph_result = crew::scheduler::run_step_graph(
         &mut steps,
         &tasks_by_id,
@@ -607,6 +647,7 @@ pub fn launch(
                 );
             }
         },
+        Some(gate_handler.as_mut()),
         None,
         &seed_artifacts,
     );
@@ -2443,6 +2484,7 @@ mod tests {
             crew::types::Step {
                 id: coder_step_id,
                 task_id: format!("{real_phase_id}-coder"),
+                gate: None,
                 kind: "mission.coder".to_string(),
                 status: NodeStatus::Planned,
                 config: serde_json::Value::Null,
@@ -2544,6 +2586,7 @@ mod tests {
         crew::types::Step {
             id: id.to_string(),
             task_id: format!("{id}-task"),
+            gate: None,
             kind: "mission.test".to_string(),
             status,
             config: serde_json::Value::Null,
@@ -3282,6 +3325,7 @@ mod tests {
         let step = crew::types::Step {
             id: format!("{}-s1", order[0]),
             task_id: format!("{}-t1", order[0]),
+            gate: None,
             kind: "procedural.noop".to_string(),
             status: NodeStatus::Complete,
             config: serde_json::Value::Null,
