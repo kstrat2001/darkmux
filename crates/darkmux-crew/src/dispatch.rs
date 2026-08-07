@@ -262,6 +262,22 @@ pub struct DispatchOpts {
     /// `None` for a one-off `dispatch` that isn't a graph step; such records
     /// attribute via `session_id` alone, exactly as before.
     pub step_id: Option<String>,
+    /// (#1698 Packet B2) Use this text as the system prompt VERBATIM instead
+    /// of resolving one via the role's manifest/loader —
+    /// [`dispatch_local_single_shot`]'s only caller today (the RADIO
+    /// answering seat, `src/radio_answer.rs`) needs its persona text
+    /// assembled per-call (a `{{humor}}` placeholder in the role's own
+    /// `.md` template, substituted from `radio.humor` config at assembly
+    /// time) — something the role-manifest loader has no hook for. `Some`
+    /// also SKIPS the specialist preamble
+    /// (`load_autonomous_dispatch_preamble`) `dispatch_local_single_shot`
+    /// would otherwise prepend for a `role_family: specialist` role: an
+    /// override caller is handing over the exact, complete system prompt it
+    /// wants sent, and the preamble's turn-cap/agent-loop guidance is noise
+    /// (or actively misleading) for a tool-less single-exchange dispatch.
+    /// `None` (every existing caller) preserves today's loader-resolved
+    /// behavior exactly.
+    pub system_prompt_override: Option<String>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime

@@ -70,18 +70,21 @@
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock,
-    ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionId,
-    SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    ContentChunk, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOption, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    StopReason, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Stdio as AcpStdio};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio as ProcStdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -103,9 +106,128 @@ const REVIEW_STAGES: &[(&str, &str)] = &[
     ("synthes", "synthesis"),
 ];
 
-/// Per-session state this spike tracks: just the `cwd` the client handed us
-/// in `session/new`, keyed by the session id we minted for it.
-type Sessions = Arc<Mutex<HashMap<SessionId, PathBuf>>>;
+/// Per-session state: the `cwd` the client handed us in `session/new` (or
+/// `session/load`), the session's artifact shelf (#1698 Packet B2, scope C
+/// — the answering seat's own recent-history grounding source), and the
+/// session's config-option overrides (scope F — the "radio host" / "humor"
+/// pickers). Keyed by the session id we minted (or, for a loaded session,
+/// the id the client asked to resume).
+#[derive(Clone, Default)]
+struct SessionState {
+    cwd: PathBuf,
+    shelf: crate::radio_answer::ArtifactShelf,
+    overrides: crate::radio_answer::AnswererOverrides,
+}
+
+type Sessions = Arc<Mutex<HashMap<SessionId, SessionState>>>;
+
+/// `session/set_config_option`'s `config_id` for the "radio host" picker
+/// (#1698 Packet B2, scope F) — selects the answering seat's profile.
+const RADIO_HOST_CONFIG_ID: &str = "radio-host";
+/// `session/set_config_option`'s `config_id` for the "humor" picker.
+const RADIO_HUMOR_CONFIG_ID: &str = "humor";
+/// The synthetic "use the configured default" choice on the radio-host
+/// picker — selecting it CLEARS the session override rather than pinning a
+/// literal profile named `"__default__"` (no such profile needs to exist).
+const RADIO_HOST_DEFAULT_CHOICE: &str = "__default__";
+
+/// Build the session config-option list reflecting `overrides`'s CURRENT
+/// state — the same shape `session/new`'s `NewSessionResponse.config_options`
+/// advertises and `session/set_config_option`'s response echoes back after
+/// a change (#1698 Packet B2, scope F). Read-only — no dispatch, no I/O
+/// beyond the registry read `radio_answer::available_profile_names` already
+/// does.
+fn build_session_config_options(overrides: &crate::radio_answer::AnswererOverrides) -> Vec<SessionConfigOption> {
+    let mut host_choices: Vec<SessionConfigSelectOption> =
+        vec![SessionConfigSelectOption::new(RADIO_HOST_DEFAULT_CHOICE, "Use configured default")];
+    host_choices.extend(
+        crate::radio_answer::available_profile_names()
+            .into_iter()
+            .map(|name| SessionConfigSelectOption::new(name.clone(), name)),
+    );
+    let host_current = overrides.profile_name.clone().unwrap_or_else(|| RADIO_HOST_DEFAULT_CHOICE.to_string());
+    let radio_host = SessionConfigOption::select(RADIO_HOST_CONFIG_ID, "Radio host", host_current, host_choices)
+        .description(Some(
+            "Which profile answers grounded questions in the radio channel (the panel's no-slash chat)."
+                .to_string(),
+        ))
+        .category(Some(SessionConfigOptionCategory::Model));
+
+    let humor_choices: Vec<SessionConfigSelectOption> = crate::radio_answer::HUMOR_PRESETS
+        .iter()
+        .map(|h| SessionConfigSelectOption::new(h.to_string(), format!("{h}%")))
+        .collect();
+    let humor_current = overrides
+        .humor
+        .unwrap_or_else(darkmux_types::config_access::radio_humor)
+        .to_string();
+    let humor = SessionConfigOption::select(RADIO_HUMOR_CONFIG_ID, "Radio humor", humor_current, humor_choices)
+        .description(Some("How much wit RADIO's persona spends versus plain answers.".to_string()))
+        .category(Some(SessionConfigOptionCategory::ModelConfig));
+
+    vec![radio_host, humor]
+}
+
+/// Apply one `session/set_config_option` request to `overrides` in place.
+/// Unrecognized `config_id`s and unrecognized values are no-ops (the
+/// response still echoes the CURRENT — unchanged — option list, never a
+/// protocol error, for the same "never bounce an error across the
+/// boundary for something we don't support yet" reason `session/prompt`'s
+/// unrecognized-command path already follows).
+fn apply_config_option(overrides: &mut crate::radio_answer::AnswererOverrides, config_id: &str, value: &SessionConfigOptionValue) {
+    let Some(value_id) = value.as_value_id() else { return };
+    let raw = value_id.0.as_ref();
+    match config_id {
+        RADIO_HOST_CONFIG_ID => {
+            overrides.profile_name = (raw != RADIO_HOST_DEFAULT_CHOICE).then(|| raw.to_string());
+        }
+        RADIO_HUMOR_CONFIG_ID => {
+            if let Ok(n) = raw.parse::<u8>() {
+                overrides.humor = Some(n.min(100));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// (#1698 Packet B2, scope G2) Background idle self-exit loop, spawned once
+/// per `serve()` call. Checks every 60s (a check-cadence far below any
+/// realistic idle threshold, so it never meaningfully delays the exit); on
+/// a MINUTES-scale idle threshold this coarseness is a non-issue. Exits the
+/// WHOLE PROCESS (`std::process::exit(0)`) — never returns an error, never
+/// tears down the connection gracefully first, because there is nothing
+/// left to tear down: zero sessions have done anything and zero commands
+/// are running, by construction of the check itself. `acp_idle_exit_minutes
+/// == 0` disables the loop entirely (checked once, up front — not on every
+/// tick, so a `0` config never even starts the sleep loop).
+async fn idle_self_exit_loop(last_activity_unix: Arc<AtomicU64>, in_flight: Arc<AtomicI64>) {
+    let idle_minutes = darkmux_types::config_access::acp_idle_exit_minutes();
+    if idle_minutes == 0 {
+        return;
+    }
+    let idle_seconds = idle_minutes * 60;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        if in_flight.load(Ordering::SeqCst) > 0 {
+            continue;
+        }
+        let idle_for = now_unix().saturating_sub(last_activity_unix.load(Ordering::SeqCst));
+        if idle_for >= idle_seconds {
+            eprintln!(
+                "[darkmux-acp] idle for {idle_for}s (>= {idle_seconds}s configured) with zero \
+                 commands in flight — self-exiting"
+            );
+            std::process::exit(0);
+        }
+    }
+}
 
 /// The no-slash channel's routing dispatch (#1698 Packet B), injectable so
 /// `serve()` can be driven in a test over an in-process transport with a
@@ -116,6 +238,17 @@ type Sessions = Arc<Mutex<HashMap<SessionId, PathBuf>>>;
 /// connection builder, one per `session/prompt` call, outliving `serve`'s
 /// own stack frame.
 type RouterCall = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
+
+/// The ANSWERING seat's dispatch (#1698 Packet B2), injectable for the SAME
+/// reason [`RouterCall`] is — `serve()` can be driven in a test with a
+/// CANNED answerer, so a router refusal (which now routes to this seat
+/// instead of rendering the bare reason) never touches a live model under
+/// test either. Takes the fully-assembled user message (grounding + the
+/// original text — see `radio_answer::build_answer_message`) plus the
+/// session's config-option overrides; `run()`'s production call site wires
+/// `radio_answer::dispatch_answerer_call_with` directly (its signature
+/// already matches this alias exactly).
+type AnswererCall = Arc<dyn Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync>;
 
 /// Entry point for `darkmux acp`. Builds its own tokio runtime and blocks on
 /// the ACP stdio loop until the client (Zed) closes the connection — same
@@ -128,7 +261,8 @@ pub fn run() -> Result<i32> {
         .build()
         .context("building the tokio runtime for `darkmux acp`")?;
     let router: RouterCall = Arc::new(crate::radio::dispatch_router_call);
-    rt.block_on(serve(router, AcpStdio::new()))?;
+    let answerer: AnswererCall = Arc::new(crate::radio_answer::dispatch_answerer_call_with);
+    rt.block_on(serve(router, answerer, AcpStdio::new()))?;
     Ok(0)
 }
 
@@ -140,15 +274,33 @@ pub fn run() -> Result<i32> {
 /// handler chain.
 async fn serve(
     router_call: RouterCall,
+    answerer_call: AnswererCall,
     transport: impl agent_client_protocol::ConnectTo<Agent> + 'static,
 ) -> Result<()> {
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
     let next_session_ordinal = Arc::new(AtomicU64::new(1));
 
+    // (#1698 Packet B2, scope G2 — idle self-exit) `last_activity_unix`
+    // updates on every `session/new` + `session/prompt`; `in_flight` counts
+    // commands/routes currently executing. The background loop spawned
+    // below self-exits the process once BOTH are quiet for
+    // `acp_idle_exit_minutes` — "most swaps find no process running" (the
+    // issue's session-hygiene addendum).
+    let last_activity_unix = Arc::new(AtomicU64::new(now_unix()));
+    let in_flight = Arc::new(AtomicI64::new(0));
+    tokio::spawn(idle_self_exit_loop(last_activity_unix.clone(), in_flight.clone()));
+
     let sessions_for_new = sessions.clone();
     let ordinal_for_new = next_session_ordinal.clone();
     let sessions_for_prompt = sessions.clone();
     let router_for_prompt = router_call.clone();
+    let answerer_for_prompt = answerer_call.clone();
+    let sessions_for_load = sessions.clone();
+    let sessions_for_config = sessions.clone();
+    let activity_for_new = last_activity_unix.clone();
+    let activity_for_prompt = last_activity_unix.clone();
+    let activity_for_load = last_activity_unix.clone();
+    let in_flight_for_prompt = in_flight.clone();
 
     Agent
         .builder()
@@ -169,19 +321,27 @@ async fn serve(
                 }
                 responder.respond(
                     InitializeResponse::new(initialize.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new()),
+                        .agent_capabilities(
+                            // (#1698 Packet B2, scope G1) Advertise minimal
+                            // `session/load` support — accept a resume,
+                            // restore cwd, replay nothing (see the
+                            // `LoadSessionRequest` handler below).
+                            AgentCapabilities::new().load_session(true),
+                        ),
                 )
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |request: NewSessionRequest, responder, cx: ConnectionTo<Client>| {
+                activity_for_new.store(now_unix(), Ordering::SeqCst);
                 let ordinal = ordinal_for_new.fetch_add(1, Ordering::Relaxed);
                 let session_id = SessionId::new(format!("darkmux-acp-{ordinal}"));
-                sessions_for_new
-                    .lock()
-                    .expect("darkmux acp: sessions mutex poisoned")
-                    .insert(session_id.clone(), request.cwd.clone());
+                let overrides = crate::radio_answer::AnswererOverrides::default();
+                sessions_for_new.lock().expect("darkmux acp: sessions mutex poisoned").insert(
+                    session_id.clone(),
+                    SessionState { cwd: request.cwd.clone(), shelf: Default::default(), overrides: overrides.clone() },
+                );
 
                 eprintln!(
                     "[darkmux-acp] session/new: {session_id} cwd={}",
@@ -197,7 +357,16 @@ async fn serve(
                 // enqueues synchronously, so calling it before
                 // `send_notification` guarantees the response precedes the
                 // update on the wire.
-                responder.respond(NewSessionResponse::new(session_id.clone()))?;
+                //
+                // (#1698 Packet B2, scope F) `config_options` advertises the
+                // "radio host" + "humor" pickers per the vendored v1 schema
+                // (`NewSessionResponse.config_options` / `SessionConfigOption`)
+                // — whether Zed RENDERS them is unknown; see the PR body's
+                // schema-finding section.
+                responder.respond(
+                    NewSessionResponse::new(session_id.clone())
+                        .config_options(Some(build_session_config_options(&overrides))),
+                )?;
 
                 // (#1684) Registry-driven advertising — every mission
                 // config in the merged registry (built-ins +
@@ -238,6 +407,7 @@ async fn serve(
         )
         .on_receive_request(
             async move |request: PromptRequest, responder, cx: ConnectionTo<Client>| {
+                activity_for_prompt.store(now_unix(), Ordering::SeqCst);
                 let session_id = request.session_id.clone();
                 let text = extract_text(&request.prompt);
                 let trimmed = text.trim();
@@ -332,12 +502,24 @@ async fn serve(
                     // own multi-minute subprocess run no longer blocks the
                     // loop from handling other sessions/notifications either.
                     let cx_task = cx.clone();
+                    let sessions_for_task = sessions_for_prompt.clone();
+                    let in_flight_for_task = in_flight_for_prompt.clone();
+                    let activity_for_task = activity_for_prompt.clone();
                     return cx.spawn(async move {
+                        // (#1698 Packet B2, scope G2) Incremented HERE, as
+                        // the future's own first action, not before
+                        // `cx.spawn` — a `cx.spawn` call that itself returns
+                        // `Err` (scheduling failure) never runs this body at
+                        // all, so incrementing before the call would leak a
+                        // count nothing ever decrements, disabling idle
+                        // self-exit for the rest of the process's life.
+                        in_flight_for_task.fetch_add(1, Ordering::SeqCst);
                         // Robustness rule (see the task brief): NOTHING from
                         // here down may panic or propagate a hard error across
                         // the protocol boundary. A crashed-looking agent in
                         // Zed has no explanation; a chunk of error text does.
-                        let run_result = execute_route_plan(&session_id, plan, &args, &cwd, &cx_task).await;
+                        let run_result =
+                            execute_route_plan(&session_id, plan, &args, &cwd, &cx_task, &sessions_for_task).await;
                         if let Err(err) = run_result {
                             eprintln!("[darkmux-acp] session/prompt: command failed: {err:#}");
                             let _ = cx_task.send_notification(agent_chunk(
@@ -345,6 +527,16 @@ async fn serve(
                                 format!("darkmux acp: command failed: {err:#}"),
                             ));
                         }
+                        // Stamped on COMPLETION, not just on receipt (the
+                        // top of the handler) — otherwise a long-running
+                        // command (a multi-minute `/review`) drops
+                        // `in_flight` to 0 the instant it finishes while
+                        // `last_activity_unix` still holds the RECEIPT
+                        // timestamp from minutes ago, and the very next
+                        // idle-loop tick sees a stale idle window and exits
+                        // while the operator is still reading the result.
+                        activity_for_task.store(now_unix(), Ordering::SeqCst);
+                        in_flight_for_task.fetch_sub(1, Ordering::SeqCst);
 
                         responder.respond(PromptResponse::new(StopReason::EndTurn))
                     });
@@ -362,9 +554,25 @@ async fn serve(
                 };
                 let cx_task = cx.clone();
                 let router_for_task = router_for_prompt.clone();
+                let answerer_for_task = answerer_for_prompt.clone();
+                let sessions_for_task = sessions_for_prompt.clone();
+                let in_flight_for_task = in_flight_for_prompt.clone();
+                let activity_for_task = activity_for_prompt.clone();
                 cx.spawn(async move {
-                    let run_result =
-                        run_no_slash_route(&session_id, &text, &cwd, &cx_task, router_for_task).await;
+                    // (#1698 Packet B2, scope G2) See the slash-path arm's
+                    // own comment on why this increments HERE, inside the
+                    // future, rather than before `cx.spawn`.
+                    in_flight_for_task.fetch_add(1, Ordering::SeqCst);
+                    let run_result = run_no_slash_route(
+                        &session_id,
+                        &text,
+                        &cwd,
+                        &cx_task,
+                        router_for_task,
+                        answerer_for_task,
+                        &sessions_for_task,
+                    )
+                    .await;
                     if let Err(err) = run_result {
                         eprintln!("[darkmux-acp] session/prompt: no-slash route failed: {err:#}");
                         let _ = cx_task.send_notification(agent_chunk(
@@ -372,8 +580,93 @@ async fn serve(
                             format!("darkmux acp: command failed: {err:#}"),
                         ));
                     }
+                    // Stamped on completion — see the slash-path arm's own
+                    // comment on why receipt-only stamping is wrong.
+                    activity_for_task.store(now_unix(), Ordering::SeqCst);
+                    in_flight_for_task.fetch_sub(1, Ordering::SeqCst);
                     responder.respond(PromptResponse::new(StopReason::EndTurn))
                 })
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // (#1698 Packet B2, scope G1) Minimal `session/load` — accept the
+        // resume, restore `cwd`, replay NOTHING. Commands are stateless
+        // views and the shelf's restart loss is already doctrine (#1684),
+        // so an empty-history resume is fully functional: Zed keeps the
+        // client-side visible transcript, and the FIRST prompt after resume
+        // just re-derives the current catalog/config/board state, same as
+        // any other prompt. `LoadSessionResponse::new()` (no modes, no
+        // config_options) is a fully spec-conformant minimal response per
+        // the vendored v1 schema (`Default`-derived, every field optional).
+        .on_receive_request(
+            async move |request: LoadSessionRequest, responder, _cx| {
+                activity_for_load.store(now_unix(), Ordering::SeqCst);
+                eprintln!(
+                    "[darkmux-acp] session/load: {} cwd={}",
+                    request.session_id,
+                    request.cwd.display()
+                );
+                // (#1698 Packet B2 review finding) `and_modify` + `or_insert_with`,
+                // NOT a blind `insert` — a session id this process ALREADY
+                // holds live (the "Zed reconnects to a still-running
+                // process" case, not just the "process restarted" case)
+                // must keep its shelf + config-option overrides; only `cwd`
+                // is refreshed from the request either way. A genuinely
+                // unknown id (the restart case) gets a fresh empty
+                // `SessionState` — replay nothing still holds for THAT case.
+                sessions_for_load
+                    .lock()
+                    .expect("darkmux acp: sessions mutex poisoned")
+                    .entry(request.session_id.clone())
+                    .and_modify(|s| s.cwd = request.cwd.clone())
+                    .or_insert_with(|| SessionState { cwd: request.cwd.clone(), shelf: Default::default(), overrides: Default::default() });
+                responder.respond(LoadSessionResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // (#1698 Packet B2, scope F) `session/set_config_option` — applies
+        // the "radio host" / "humor" picker change to this session's
+        // overrides and echoes the full updated option list back, per the
+        // vendored v1 schema's `SetSessionConfigOptionResponse` contract.
+        .on_receive_request(
+            async move |request: SetSessionConfigOptionRequest, responder, _cx| {
+                // (#1698 Packet B2 review finding) `get_mut`, NOT
+                // `entry(...).or_default()` — the wire-supplied session id
+                // is untrusted input; materializing a `SessionState` for an
+                // id this process never minted (via `session/new` or
+                // `session/load`) would grow the map unboundedly from the
+                // client AND leave `cwd` empty, which would later bypass
+                // `session_cwd`'s `None` guard and route a prompt against
+                // `cwd=""` instead of the clean "no working directory"
+                // chunk. An unknown id is a no-op: nothing persists, and the
+                // echoed list reflects the (unset) defaults — matching
+                // `session_shelf_push`'s own no-op-on-unknown-session
+                // convention.
+                // (#1698 Packet B2 review finding) `build_session_config_options`
+                // reads the profile REGISTRY off disk
+                // (`radio_answer::available_profile_names`) — mutate the
+                // session's overrides under the lock, clone them out, and
+                // release the lock BEFORE that disk read, same "never do
+                // I/O while holding the sessions mutex" shape `session/new`
+                // already follows for its own advertised-command read.
+                let overrides = {
+                    let mut guard = sessions_for_config.lock().expect("darkmux acp: sessions mutex poisoned");
+                    match guard.get_mut(&request.session_id) {
+                        Some(state) => {
+                            apply_config_option(&mut state.overrides, request.config_id.0.as_ref(), &request.value);
+                            state.overrides.clone()
+                        }
+                        None => {
+                            eprintln!(
+                                "[darkmux-acp] session/set_config_option: unknown session {} — ignoring",
+                                request.session_id
+                            );
+                            crate::radio_answer::AnswererOverrides::default()
+                        }
+                    }
+                };
+                let updated = build_session_config_options(&overrides);
+                responder.respond(SetSessionConfigOptionResponse::new(updated))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -397,7 +690,35 @@ fn session_cwd(sessions: &Sessions, session_id: &SessionId) -> Option<PathBuf> {
         .lock()
         .expect("darkmux acp: sessions mutex poisoned")
         .get(session_id)
-        .cloned()
+        .map(|s| s.cwd.clone())
+}
+
+/// Snapshot a session's artifact shelf + config-option overrides for one
+/// ask (#1698 Packet B2, scopes C/F) — a clone under the lock, released
+/// immediately, so the answering seat's (potentially slow) dispatch never
+/// holds the sessions mutex.
+fn session_answer_context(
+    sessions: &Sessions,
+    session_id: &SessionId,
+) -> (crate::radio_answer::ArtifactShelf, crate::radio_answer::AnswererOverrides) {
+    sessions
+        .lock()
+        .expect("darkmux acp: sessions mutex poisoned")
+        .get(session_id)
+        .map(|s| (s.shelf.clone(), s.overrides.clone()))
+        .unwrap_or_default()
+}
+
+/// Push one rendered command execution onto a session's shelf (#1698 Packet
+/// B2, scope C — "written on every command execution AND routed
+/// execution"). A session that vanished between the execution and this call
+/// (shouldn't happen — the same session id drove the execution) is a silent
+/// no-op, not a panic; the shelf write is best-effort bookkeeping, not a
+/// correctness-bearing step.
+fn session_shelf_push(sessions: &Sessions, session_id: &SessionId, entry: crate::radio_answer::ShelfEntry) {
+    if let Some(state) = sessions.lock().expect("darkmux acp: sessions mutex poisoned").get_mut(session_id) {
+        state.shelf.push(entry);
+    }
 }
 
 /// Turn a resolved [`crate::acp_panel::RoutePlan`] into an actual execution
@@ -414,6 +735,7 @@ async fn execute_route_plan(
     args: &str,
     cwd: &Path,
     cx: &ConnectionTo<Client>,
+    sessions: &Sessions,
 ) -> Result<()> {
     match plan {
         // `review` keeps its EXISTING bespoke path, byte-for-byte
@@ -423,13 +745,13 @@ async fn execute_route_plan(
         // never a hardcoded `"review"` — so a panel-advertised
         // review VARIANT launches itself, not the built-in.
         crate::acp_panel::RoutePlan::Review(config_id) => {
-            run_review(session_id, &config_id, args, cwd, cx).await
+            run_review(session_id, &config_id, args, cwd, cx, sessions).await
         }
         crate::acp_panel::RoutePlan::Ephemeral(config) => {
-            run_ephemeral_command(session_id, *config, args.to_string(), cwd.to_path_buf(), cx).await
+            run_ephemeral_command(session_id, *config, args.to_string(), cwd.to_path_buf(), cx, sessions).await
         }
         crate::acp_panel::RoutePlan::Launch(config_id) => {
-            run_launch_command(session_id, &config_id, args, cwd, cx).await
+            run_launch_command(session_id, &config_id, args, cwd, cx, sessions).await
         }
     }
 }
@@ -487,6 +809,8 @@ async fn run_no_slash_route(
     cwd: &Path,
     cx: &ConnectionTo<Client>,
     router_call: RouterCall,
+    answerer_call: AnswererCall,
+    sessions: &Sessions,
 ) -> Result<()> {
     let text_owned = text.to_string();
     let decision = tokio::task::spawn_blocking(move || {
@@ -499,13 +823,15 @@ async fn run_no_slash_route(
     .context("joining the radio routing task")?;
 
     match decision {
+        // (#1698 Packet B2, scope A) A router refusal no longer prints the
+        // bare reason + listing directly — it goes to the ANSWERING seat
+        // for a grounded, in-persona reply, with the session's real
+        // artifact shelf + config-option overrides. The bare reason +
+        // listing is now the LAST RESORT, rendered only when the
+        // answering dispatch itself fails — see `answer_no_slash_refusal`'s
+        // own doc.
         crate::radio::RouteDecision::Refuse { reason } => {
-            let advertised = crate::acp_panel::list_panel_commands();
-            cx.send_notification(agent_chunk(
-                session_id,
-                format!("{reason}\n\n{}", crate::acp_panel::not_a_command_message(&advertised)),
-            ))?;
-            Ok(())
+            answer_no_slash_refusal(session_id, text, &reason, cwd, cx, answerer_call, sessions).await
         }
         crate::radio::RouteDecision::Route { command, args } => {
             cx.send_notification(agent_chunk(
@@ -519,7 +845,55 @@ async fn run_no_slash_route(
                      registry changed between routing and execution)"
                 )
             })?;
-            execute_route_plan(session_id, plan, &args, cwd, cx).await
+            execute_route_plan(session_id, plan, &args, cwd, cx, sessions).await
+        }
+    }
+}
+
+/// (#1698 Packet B2, scope A) Route a router refusal to the ANSWERING seat.
+/// Runs on `spawn_blocking` — the answering dispatch is a synchronous,
+/// potentially slow call (same shape/reason as the routing dispatch above
+/// and `run_ephemeral`'s own doc). Falls back to the bare refusal reason +
+/// live command listing (the pre-B2 behavior) ONLY when the answering
+/// dispatch itself errors (e.g. no model loaded) — never silently drops the
+/// operator's message.
+async fn answer_no_slash_refusal(
+    session_id: &SessionId,
+    text: &str,
+    refusal_reason: &str,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+    answerer_call: AnswererCall,
+    sessions: &Sessions,
+) -> Result<()> {
+    let (shelf, overrides) = session_answer_context(sessions, session_id);
+    let text_owned = text.to_string();
+    let cwd_owned = cwd.to_path_buf();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let catalog = crate::radio::compile_catalog();
+        crate::radio_answer::answer(&text_owned, &catalog, &shelf, &cwd_owned, &mut |m: &str| {
+            (answerer_call)(m, &overrides)
+        })
+    })
+    .await
+    .context("joining the radio answering task")?;
+
+    match outcome {
+        Ok(outcome) => {
+            eprintln!(
+                "[darkmux-acp] radio answering seat replied ({} chars; {} chars rendered)",
+                outcome.text.chars().count(),
+                outcome.rendered.chars().count()
+            );
+            Ok(cx.send_notification(agent_chunk(session_id, outcome.rendered))?)
+        }
+        Err(e) => {
+            eprintln!("[darkmux-acp] radio answering seat failed: {e:#}; falling back to the plain refusal");
+            let advertised = crate::acp_panel::list_panel_commands();
+            Ok(cx.send_notification(agent_chunk(
+                session_id,
+                format!("{refusal_reason}\n\n{}", crate::acp_panel::not_a_command_message(&advertised)),
+            ))?)
         }
     }
 }
@@ -547,7 +921,14 @@ async fn run_no_slash_route(
 /// have no effect on the dispatched review — the final message says so
 /// explicitly rather than leaving the operator to infer it from the
 /// hint's "(no arguments)" text alone.
-async fn run_review(session_id: &SessionId, config_id: &str, args: &str, cwd: &Path, cx: &ConnectionTo<Client>) -> Result<()> {
+async fn run_review(
+    session_id: &SessionId,
+    config_id: &str,
+    args: &str,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+    sessions: &Sessions,
+) -> Result<()> {
     let diff = git_diff(cwd).await?;
     if diff.trim().is_empty() {
         cx.send_notification(agent_chunk(
@@ -763,6 +1144,11 @@ async fn run_review(session_id: &SessionId, config_id: &str, args: &str, cwd: &P
             args.trim()
         ));
     }
+    // (#1698 Packet B2, scope C) Shelve the rendered result BEFORE sending
+    // it — the answering seat's own dispatch (if this session later asks a
+    // question the router refuses) never races the shelf write against the
+    // notification itself.
+    session_shelf_push(sessions, session_id, crate::radio_answer::shelf_entry(config_id, args, &final_text));
     cx.send_notification(agent_chunk(session_id, final_text))?;
 
     Ok(())
@@ -789,6 +1175,7 @@ async fn run_ephemeral_command(
     args: String,
     cwd: PathBuf,
     cx: &ConnectionTo<Client>,
+    sessions: &Sessions,
 ) -> Result<()> {
     // (#1684 Packet 2) The ACP surface's operator sign-off gate handler —
     // see `acp_gate_handler`'s own doc. Built here (on the connection's
@@ -797,6 +1184,8 @@ async fn run_ephemeral_command(
     // synchronously from the blocking thread for any step in `config`'s
     // graph that declares `"gate": "operator"`.
     let mut gate = acp_gate_handler(cx.clone(), session_id.clone());
+    let config_id = config.id.clone();
+    let args_for_shelf = args.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         crate::acp_panel::run_ephemeral(&config, &args, &cwd, Some(&mut gate))
     })
@@ -805,6 +1194,9 @@ async fn run_ephemeral_command(
     // The ACP panel surface has no exit-code concept — it just displays
     // whichever text comes back, byte-identical to before `run_ephemeral`
     // gained a typed `success` field (#1698 Packet B carry-list item 5).
+    // (#1698 Packet B2, scope C) Shelved BEFORE the notification — see
+    // `run_review`'s own comment on the same ordering.
+    session_shelf_push(sessions, session_id, crate::radio_answer::shelf_entry(&config_id, &args_for_shelf, &outcome.text));
     cx.send_notification(agent_chunk(session_id, outcome.text))?;
     Ok(())
 }
@@ -1042,6 +1434,7 @@ async fn run_launch_command(
     args: &str,
     cwd: &Path,
     cx: &ConnectionTo<Client>,
+    sessions: &Sessions,
 ) -> Result<()> {
     let exe = std::env::current_exe().context("resolving darkmux's own executable path")?;
     let mut cmd = Command::new(&exe);
@@ -1077,6 +1470,9 @@ async fn run_launch_command(
         let detail = if stderr.is_empty() { &stdout } else { &stderr };
         format!("darkmux: `{config_id}` failed ({}).\n\n{detail}", output.status)
     };
+    // (#1698 Packet B2, scope C) Shelved BEFORE the notification — see
+    // `run_review`'s own comment on the same ordering.
+    session_shelf_push(sessions, session_id, crate::radio_answer::shelf_entry(config_id, args, &text));
     cx.send_notification(agent_chunk(session_id, text))?;
     Ok(())
 }
@@ -1434,17 +1830,33 @@ mod tests {
     /// the test's own end of the pipe: a raw writer + a buffered reader,
     /// driven with plain newline-delimited JSON exactly like a real ACP
     /// client would over stdio.
+    /// `answerer` is a SEPARATE canned closure from `router` (#1698 Packet
+    /// B2) — a router refusal now routes to the answering seat's OWN
+    /// dispatch, a second independent model call, so pipe-level tests that
+    /// never expect a refusal (or that assert on the router's own call
+    /// count) inject an answerer that panics if reached, while the two
+    /// refusal-path tests inject a real canned reply.
     fn spawn_test_agent(
         router: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
+        answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync + 'static,
     ) -> (DuplexStream, BufReader<DuplexStream>) {
         let (test_writer, agent_reader) = tokio::io::duplex(64 * 1024);
         let (agent_writer, test_reader) = tokio::io::duplex(64 * 1024);
         let router_call: RouterCall = Arc::new(router);
+        let answerer_call: AnswererCall = Arc::new(answerer);
         let transport = ByteStreams::new(agent_writer.compat_write(), agent_reader.compat());
         tokio::spawn(async move {
-            let _ = serve(router_call, transport).await;
+            let _ = serve(router_call, answerer_call, transport).await;
         });
         (test_writer, BufReader::new(test_reader))
+    }
+
+    /// The default answerer for tests that never expect the answering seat
+    /// to be reached — panics loudly rather than silently dispatching a
+    /// live model, same "fail loud, not quiet" contract `router`'s own
+    /// panic-on-call fixtures already use in this module.
+    fn never_answer(_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides) -> Result<String> {
+        panic!("the answering seat must not be reached by this scenario");
     }
 
     async fn send_json(writer: &mut DuplexStream, value: serde_json::Value) {
@@ -1536,7 +1948,7 @@ mod tests {
         let router = |_msg: &str| -> Result<String> {
             Ok("```json\n{\"command\": \"echo-fixture\", \"args\": \"\"}\n```".to_string())
         };
-        let (mut writer, mut reader) = spawn_test_agent(router);
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
         let cwd = std::env::temp_dir();
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
 
@@ -1567,12 +1979,15 @@ mod tests {
         );
     }
 
-    /// (#1698 Packet B) A refusal renders the (persona-bearing) reason
-    /// verbatim plus the live command listing — and still records wall 4's
-    /// flow record (as a refusal, not a route).
+    /// (#1698 Packet B2) A router refusal routes to the ANSWERING seat — a
+    /// SEPARATE canned dispatch, never the raw refusal reason rendered
+    /// directly (that's the pre-B2 behavior, now the last-resort fallback
+    /// only). Still records wall 4's flow record for the ROUTING decision
+    /// (as a refusal, not a route) — wall 4 is about the router's own
+    /// outcome, unaffected by what happens downstream at the answering seat.
     #[tokio::test]
     #[serial_test::serial]
-    async fn no_slash_refusal_renders_reason_and_listing_and_records_wall_4() {
+    async fn no_slash_refusal_routes_to_the_answering_seat_and_records_wall_4() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
         let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
         let flows_tmp = tempfile::TempDir::new().unwrap();
@@ -1582,16 +1997,21 @@ mod tests {
         let router = |_msg: &str| -> Result<String> {
             Ok("```json\n{\"refuse\": \"that's outside the scope of mission comms\"}\n```".to_string())
         };
-        let (mut writer, mut reader) = spawn_test_agent(router);
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+            Ok("RADIO: that's outside my mission comms scope too.".to_string())
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, answerer);
         let cwd = std::env::temp_dir();
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
 
         send_prompt(&mut writer, &session_id, "what's the weather like on mars?").await;
 
-        let refusal = recv_json(&mut reader).await;
-        let text = chunk_text(&refusal);
-        assert!(text.contains("that's outside the scope of mission comms"), "the reason is rendered verbatim: {text}");
-        assert!(text.contains("echo-fixture"), "the live command listing follows the reason: {text}");
+        let reply = recv_json(&mut reader).await;
+        let text = chunk_text(&reply);
+        assert!(
+            text.contains("that's outside my mission comms scope too"),
+            "the ANSWERING seat's canned reply must be what renders, not the raw router refusal reason: {text}"
+        );
 
         let final_response = recv_json(&mut reader).await;
         assert_end_turn(&final_response);
@@ -1603,7 +2023,141 @@ mod tests {
         assert!(flow_contents.contains("\"decision\":\"refuse\""), "{flow_contents}");
         assert!(
             flow_contents.contains("that's outside the scope of mission comms"),
-            "{flow_contents}"
+            "wall 4 still records the ROUTER's own refusal reason, independent of the \
+             answering seat's downstream reply: {flow_contents}"
+        );
+    }
+
+    /// A last-resort fallback specimen: when the ANSWERING seat's own
+    /// dispatch fails (e.g. no model loaded), the bare refusal reason +
+    /// live command listing render — the pre-B2 behavior, now scoped to
+    /// exactly this failure path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_slash_refusal_falls_back_to_the_plain_listing_when_the_answering_seat_errors() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+
+        let router = |_msg: &str| -> Result<String> {
+            Ok("```json\n{\"refuse\": \"that's outside the scope of mission comms\"}\n```".to_string())
+        };
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+            Err(anyhow::anyhow!("no model loaded"))
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, answerer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "what's the weather like on mars?").await;
+
+        let fallback = recv_json(&mut reader).await;
+        let text = chunk_text(&fallback);
+        assert!(text.contains("that's outside the scope of mission comms"), "{text}");
+        assert!(text.contains("echo-fixture"), "the live command listing follows the reason: {text}");
+
+        let final_response = recv_json(&mut reader).await;
+        assert_end_turn(&final_response);
+    }
+
+    /// (#1698 Packet B2, scope C — the shelf round trip) A command's
+    /// rendered output, once executed, is visible to a LATER answering-seat
+    /// dispatch in the same session — the shelf's entire reason for
+    /// existing. Routes `/echo-fixture` first (pushing its output onto the
+    /// shelf), then sends a no-slash message the canned router refuses; the
+    /// canned ANSWERER captures the assembled message it received and this
+    /// test asserts the fixture's earlier output is inside it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_prior_commands_output_reaches_the_answering_seats_grounding_via_the_shelf() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "the-shelf-marker-output");
+
+        let router = |_msg: &str| -> Result<String> {
+            Ok("```json\n{\"refuse\": \"ambiguous\"}\n```".to_string())
+        };
+        let received_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let received_message_for_answerer = received_message.clone();
+        let answerer = move |msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+            *received_message_for_answerer.lock().unwrap() = Some(msg.to_string());
+            Ok("RADIO: acknowledged.".to_string())
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, answerer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        // First: a SLASH invocation, executed directly (never touches the
+        // router or the answerer) — pushes its output onto the shelf.
+        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        let slash_output = recv_json(&mut reader).await;
+        assert_eq!(chunk_text(&slash_output), "the-shelf-marker-output");
+        let slash_final = recv_json(&mut reader).await;
+        assert_end_turn(&slash_final);
+
+        // Second: a no-slash message the canned router refuses, landing at
+        // the answering seat with the shelf now non-empty.
+        send_prompt(&mut writer, &session_id, "what did that just do?").await;
+        let answer_chunk = recv_json(&mut reader).await;
+        assert_eq!(chunk_text(&answer_chunk), "RADIO: acknowledged.");
+        let answer_final = recv_json(&mut reader).await;
+        assert_end_turn(&answer_final);
+
+        let captured = received_message.lock().unwrap().clone().expect("answerer must have been called");
+        assert!(
+            captured.contains("the-shelf-marker-output"),
+            "the shelf entry from the earlier /echo-fixture run must reach the answering \
+             seat's assembled message: {captured}"
+        );
+    }
+
+    /// (#1698 Packet B2, scope F — the overrides round trip) A
+    /// `session/set_config_option` change (the "humor" picker) actually
+    /// reaches the answering seat's dispatch on a LATER prompt in the same
+    /// session — proving the session-scoped override isn't just stored and
+    /// echoed back, but genuinely consulted at answer time.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_config_option_override_reaches_the_answering_seats_dispatch() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+
+        let router = |_msg: &str| -> Result<String> {
+            Ok("```json\n{\"refuse\": \"ambiguous\"}\n```".to_string())
+        };
+        let received_overrides: Arc<Mutex<Option<crate::radio_answer::AnswererOverrides>>> = Arc::new(Mutex::new(None));
+        let received_overrides_for_answerer = received_overrides.clone();
+        let answerer = move |_msg: &str, overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+            *received_overrides_for_answerer.lock().unwrap() = Some(overrides.clone());
+            Ok("RADIO: acknowledged.".to_string())
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, answerer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/set_config_option",
+                "params": {"sessionId": session_id, "configId": "humor", "value": "90"}
+            }),
+        )
+        .await;
+        let set_response = recv_json(&mut reader).await;
+        assert!(set_response.get("result").is_some(), "{set_response}");
+
+        send_prompt(&mut writer, &session_id, "what's the weather like on mars?").await;
+        let _answer_chunk = recv_json(&mut reader).await;
+        let final_response = recv_json(&mut reader).await;
+        assert_end_turn(&final_response);
+
+        let captured = received_overrides.lock().unwrap().clone().expect("answerer must have been called");
+        assert_eq!(
+            captured,
+            crate::radio_answer::AnswererOverrides { profile_name: None, humor: Some(90) },
+            "the session's humor override (set via session/set_config_option) must reach the \
+             answering seat's dispatch"
         );
     }
 
@@ -1622,7 +2176,7 @@ mod tests {
         let router = |_msg: &str| -> Result<String> {
             panic!("the slash-command path must NEVER invoke the router — mode bit violation");
         };
-        let (mut writer, mut reader) = spawn_test_agent(router);
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
         let cwd = std::env::temp_dir();
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
 
@@ -1657,7 +2211,15 @@ mod tests {
             call_count_for_router.fetch_add(1, AtomicOrdering::SeqCst);
             Ok("```json\n{\"refuse\": \"ambiguous — bare word, no slash\"}\n```".to_string())
         };
-        let (mut writer, mut reader) = spawn_test_agent(router);
+        // (#1698 Packet B2) A refusal now routes to the answering seat, a
+        // SEPARATE canned dispatch — the raw router refusal reason
+        // ("ambiguous...") is never rendered directly, so this scenario
+        // needs its own canned reply rather than asserting on the router's
+        // own text.
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+            Ok("RADIO: I can't tell what you meant by that.".to_string())
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, answerer);
         let cwd = std::env::temp_dir();
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
 
@@ -1668,9 +2230,9 @@ mod tests {
 
         let refusal = recv_json(&mut reader).await;
         assert!(
-            chunk_text(&refusal).contains("ambiguous"),
-            "a bare word must be classified by the router, never pattern-matched into a direct \
-             execution: {}",
+            chunk_text(&refusal).contains("I can't tell what you meant"),
+            "a bare word must be classified by the router (and answered by the answering seat), \
+             never pattern-matched into a direct execution: {}",
             chunk_text(&refusal)
         );
 
@@ -1701,7 +2263,7 @@ mod tests {
         let router = |_msg: &str| -> Result<String> {
             panic!("empty/whitespace text must never reach the router");
         };
-        let (mut writer, mut reader) = spawn_test_agent(router);
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
         let cwd = std::env::temp_dir();
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
 

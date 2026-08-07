@@ -25,15 +25,16 @@
 //! - **The ANSWERING seat** (Packet B) — reasoning-bearing grounded answers
 //!   over session artifacts. Not built here.
 //!
-//! **Deferred to Packet B (deliberately, "one schema change, not two"):**
-//! config-block staffing for the routing seat (e.g. a future
-//! `radio.router_profile` knob). Packet A's `dispatch_router_call` passes
-//! `profile_name: None`, which resolves through the SAME precedence every
-//! other role dispatch uses (the `role_profiles.<role_id>` map if an
-//! operator has set one, else `default_profile`) — "default staffing = the
-//! existing internal utility binding" from the issue means exactly this:
-//! no NEW staffing surface in Packet A, the routing seat behaves like any
-//! other utility-family role dispatch until Packet B adds a dedicated knob.
+//! **Deferred to Packet B in the original design (deliberately, "one schema
+//! change, not two"), landed in Packet B2:** config-block staffing for the
+//! routing seat. Packet A's `dispatch_router_call` passed
+//! `profile_name: None` unconditionally, resolving through the SAME
+//! precedence every other role dispatch uses (the `role_profiles.<role_id>`
+//! map if an operator has set one, else `default_profile`). Packet B2 adds
+//! `radio.router_profile` — see `dispatch_router_call`'s own doc — an EMPTY
+//! value still resolves to `None` here, so the pre-B2 fallback chain (and
+//! any interim `role_profiles.radio-router` pin) keeps working unchanged
+//! until the operator opts into the new knob.
 //!
 //! # Safety walls this module is directly responsible for (issue #1698)
 //!
@@ -484,8 +485,7 @@ fn extract_fenced_json_block(raw: &str) -> Option<String> {
 /// `timeout_seconds: 300` — a deliberately BOUNDED ceiling for a
 /// bounded-classification dispatch (well under `dispatch_compiler`'s 600s,
 /// which budgets for a much larger structured-proposal task). Not yet
-/// operator-tunable; the `radio` config block (Packet B2, not this packet)
-/// is where that knob would land.
+/// operator-tunable.
 pub fn dispatch_router_call(message: &str) -> Result<String> {
     let opts = crate::crew::dispatch::DispatchOpts {
         role_id: "radio-router".to_string(),
@@ -504,16 +504,22 @@ pub fn dispatch_router_call(message: &str) -> Result<String> {
         machine: None,
         wait: true,
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
-        // No `--profile` override — see this module's doc on deferred
-        // staffing; falls back to `role_profiles.radio-router` (if an
-        // operator has set one) then `default_profile`.
-        profile_name: None,
+        // (#1698 Packet B2) `radio.router_profile` when the operator has
+        // set one — an explicit override that takes precedence OVER
+        // `role_profiles.radio-router` (the same precedence every other
+        // `--profile`-style override uses). Unset (the common case today)
+        // resolves to `None` here, preserving the PRE-B2 behavior exactly:
+        // falls through to `role_profiles.radio-router` (the interim pin
+        // operators set per this issue's own live-dogfood notes) then
+        // `default_profile`. See `RadioConfig::router_profile`'s own doc.
+        profile_name: darkmux_types::config_access::radio_router_profile(),
         config_path: None,
         force_container: false,
         max_completion_tokens: None,
         image: None,
         model_base_url_override: None,
         step_id: None,
+        system_prompt_override: None,
     };
     // (#1698 Packet B — the container-path fix the issue's live dogfood
     // comment named: "the route rides the FULL internal-runtime container
@@ -793,6 +799,18 @@ mod tests {
                  which is authoritative: {other:?}"
             ),
         }
+    }
+
+    /// (#1698 Packet B2, scope H — the #1702 merge-gate carry item) The
+    /// BEFORE-direction specimen: a bare scratch fence PRECEDING the real
+    /// ```json block must ALSO refuse — the total-delimiter-count check
+    /// (`raw.matches("```").count() > 2`) doesn't care which side of the
+    /// real block the extra fence sits on.
+    #[test]
+    fn validate_router_output_bare_fence_before_the_json_block_refuses() {
+        let raw = "```\nscratch thoughts here\n```\n```json\n{\"command\": \"pr-list\", \"args\": \"\"}\n```";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        assert!(matches!(decision, RouteDecision::Refuse { .. }), "{decision:?}");
     }
 
     /// The inverted case (red-prove discipline): a SINGLE fenced block

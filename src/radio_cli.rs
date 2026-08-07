@@ -48,10 +48,30 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
     });
 
     match decision {
+        // (#1698 Packet B2, scope A) A refusal no longer prints the bare
+        // reason + listing directly — the text goes to the ANSWERING seat
+        // for a grounded, in-persona reply first (the CLI has no persistent
+        // session, so it always answers against a fresh, empty shelf — see
+        // `radio_answer::ArtifactShelf`'s own doc on why that's a documented
+        // limitation, not a bug). The bare reason + listing becomes the
+        // LAST RESORT, printed only when the answering dispatch itself
+        // fails (e.g. no model loaded) — never silently swallowed.
         RouteDecision::Refuse { reason } => {
-            println!("radio: {reason}");
-            println!("{}", advertised_list_message(&catalog));
-            Ok(0)
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let shelf = crate::radio_answer::ArtifactShelf::default();
+            let overrides = crate::radio_answer::AnswererOverrides::default();
+            match crate::radio_answer::answer_live(text, &catalog, &shelf, &cwd, &overrides) {
+                Ok(outcome) => {
+                    println!("radio: {}", outcome.rendered);
+                    Ok(0)
+                }
+                Err(e) => {
+                    eprintln!("radio: the answering seat failed ({e:#}); falling back to the plain refusal");
+                    println!("radio: {reason}");
+                    println!("{}", advertised_list_message(&catalog));
+                    Ok(0)
+                }
+            }
         }
         RouteDecision::Route { command, args } => {
             println!("radio: routing to /{command} — from your text");

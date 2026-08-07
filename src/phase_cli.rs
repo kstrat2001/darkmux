@@ -486,6 +486,7 @@ pub(crate) fn phase_review_output_at(
         image: None,
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
+        system_prompt_override: None,
     };
 
     // Emit dispatch flow record. This is a mid-point progress emit, not a

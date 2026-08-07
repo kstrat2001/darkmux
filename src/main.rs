@@ -72,6 +72,10 @@ mod radio;
 // (#1698 Packet A) The `darkmux radio` CLI verb — thin execution wiring
 // over `radio.rs`, reusing `acp_panel`'s ephemeral runner + routing plan.
 mod radio_cli;
+// (#1698 Packet B2) The radio interpreter's ANSWERING seat — grounding
+// assembler + artifact shelf + the answering dispatch. See its own module
+// doc.
+mod radio_answer;
 mod role_cli;
 // #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
 // flow/profiles all crates). Re-export keeps crate::serve::* resolving for
@@ -1404,6 +1408,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         // before the CLI verb). `None` on every operator-facing dispatch.
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
+        system_prompt_override: None,
     };
     // (#1509) Route the LOCAL half of `dispatch_routed`'s routing decision
     // through the engine as a crew of one (a full Mission -> Phase ->

@@ -78,6 +78,10 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     // classification over the currently advertised command catalog. See
     // `src/radio.rs`'s module doc for the two-seat receiver architecture.
     ("radio-router", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-router.json"))),
+    // (#1698 Packet B2) The radio interpreter's ANSWERING seat — dispatched
+    // only when radio-router refuses. See `src/radio_answer.rs`'s module
+    // doc.
+    ("radio-host", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-host.json"))),
     // Non-SWE engagement roles (#141): trip planning, health, athletics, legal.
     // Each is bounded — research/organize/structure only; no exec, no execution
     // of bookings or commitments. Each prompt's opening lines name what the role
@@ -138,6 +142,11 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     // (#1698 Packet A) Frozen model-facing text (contract 6) — byte-locked
     // by `radio::tests::radio_router_role_prompt_matches_frozen_golden`.
     ("radio-router", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-router.md"))),
+    // (#1698 Packet B2) Frozen model-facing PERSONA template (contract 6) —
+    // carries a `{{humor}}` placeholder substituted at assembly time
+    // (`src/radio_answer.rs`), never resolved by the loader itself. Byte-
+    // locked by `radio_answer::tests::radio_host_role_prompt_matches_frozen_golden`.
+    ("radio-host", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-host.md"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.md"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.md"))),
     ("lab-manager", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/lab-manager.md"))),

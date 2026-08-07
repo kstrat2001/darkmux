@@ -123,6 +123,7 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
         image: None,
         model_base_url_override: Some(server.base_url()),
         step_id: None,
+        system_prompt_override: None,
     };
 
     let result = dispatch_local_single_shot(opts);

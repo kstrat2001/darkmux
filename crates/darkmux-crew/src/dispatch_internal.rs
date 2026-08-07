@@ -1078,27 +1078,42 @@ fn try_resolve_remote_target(
         Some(pm) if pm.endpoint.as_ref().is_some_and(|e| e.is_remote()) => pm,
         _ => return Ok(None), // local ⇒ container path
     };
-    // (#1550 cluster item 3) `load_role_prompt_for` honors an explicit
-    // `role.prompt_path` (if the manifest set one) before falling to the
-    // conventional sibling-file/embedded search — `load_role_prompt` alone
-    // never checked it, which let `darkmux role show` display a path that
-    // dispatch then couldn't find.
-    let role_prompt = crate::loader::load_role_prompt_for(&role).ok_or_else(|| {
-        anyhow!(
-            "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
-             conventional roles dir, and the embedded table) — hosted dispatch requires one",
-            opts.role_id,
-            role.prompt_path
-        )
-    })?;
-    let system_prompt = if role.is_specialist() {
-        format!(
-            "{}\n\n{}",
-            load_autonomous_dispatch_preamble().trim_end(),
-            role_prompt
-        )
-    } else {
-        role_prompt
+    // (#1698 Packet B2) `system_prompt_override` is honored HERE too, not
+    // just in `dispatch_local_single_shot` — a caller-supplied override
+    // must be sent verbatim regardless of which underlying path a profile
+    // happens to resolve to (local single-shot vs remote endpoint). Without
+    // this, an override caller whose resolved profile targets a remote
+    // endpoint would silently get the UNSUBSTITUTED loader-resolved prompt
+    // instead (e.g. a literal `{{humor}}` placeholder) plus the specialist
+    // preamble the override caller explicitly opted out of — see that
+    // field's own doc on `DispatchOpts`.
+    let system_prompt = match &opts.system_prompt_override {
+        Some(text) => text.clone(),
+        None => {
+            // (#1550 cluster item 3) `load_role_prompt_for` honors an
+            // explicit `role.prompt_path` (if the manifest set one) before
+            // falling to the conventional sibling-file/embedded search —
+            // `load_role_prompt` alone never checked it, which let
+            // `darkmux role show` display a path that dispatch then
+            // couldn't find.
+            let role_prompt = crate::loader::load_role_prompt_for(&role).ok_or_else(|| {
+                anyhow!(
+                    "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
+                     conventional roles dir, and the embedded table) — hosted dispatch requires one",
+                    opts.role_id,
+                    role.prompt_path
+                )
+            })?;
+            if role.is_specialist() {
+                format!(
+                    "{}\n\n{}",
+                    load_autonomous_dispatch_preamble().trim_end(),
+                    role_prompt
+                )
+            } else {
+                role_prompt
+            }
+        }
     };
     Ok(Some((role, system_prompt, pm)))
 }
@@ -1831,22 +1846,31 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         return dispatch_remote(&opts, &remote_role, &system_prompt, &pm);
     }
 
-    let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
-        anyhow!(
-            "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
-             conventional roles dir, and the embedded table) — single-shot dispatch requires one",
-            opts.role_id,
-            role.prompt_path
-        )
-    })?;
-    let system_prompt = if role.is_specialist() {
-        format!(
-            "{}\n\n{}",
-            load_autonomous_dispatch_preamble().trim_end(),
-            role_prompt
-        )
-    } else {
-        role_prompt
+    // (#1698 Packet B2) `system_prompt_override` skips BOTH the loader
+    // lookup and the specialist-preamble prepend below — see the field's
+    // own doc on `DispatchOpts` for why an override caller wants the exact
+    // text it built, verbatim.
+    let system_prompt = match &opts.system_prompt_override {
+        Some(text) => text.clone(),
+        None => {
+            let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
+                anyhow!(
+                    "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
+                     conventional roles dir, and the embedded table) — single-shot dispatch requires one",
+                    opts.role_id,
+                    role.prompt_path
+                )
+            })?;
+            if role.is_specialist() {
+                format!(
+                    "{}\n\n{}",
+                    load_autonomous_dispatch_preamble().trim_end(),
+                    role_prompt
+                )
+            } else {
+                role_prompt
+            }
+        }
     };
     // (#147, fresh-review finding) Operator-identity augmentation — this
     // function's execution has ALREADY established, by reaching this line,
