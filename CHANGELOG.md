@@ -11,6 +11,10 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+### Added
+
+- **`darkmux-bundler-edge`** — the second reference `--bundler` plugin: zero-dependency Python, Edge.js template spans + differential facts (interpolations, directives, class-attribute churn) + cross-template manifests, proving the frozen `--bundler` contract (#1319) at N=2 — a second language, for a template DSL rather than a systems language (#1686).
+
 ## [2.5.0] - 2026-08-06
 
 The honesty release. Nearly every fix here is one defect wearing different
