@@ -168,6 +168,48 @@ fn build_session_config_options(overrides: &crate::radio_answer::AnswererOverrid
     vec![radio_host, humor]
 }
 
+/// Send the `AvailableCommandsUpdate` notification advertising every
+/// registry mission config that declares a `panel` block (#1684) — the
+/// SAME resolution `darkmux mission launch` / `mission status` use.
+///
+/// Shared by `session/new` and `session/load` (#1698 Packet B2 gate): a
+/// resumed session needs the menu as much as a fresh one, and one copy of
+/// this means the two can't drift. Callers MUST have already responded to
+/// the request — a `session/update` that reaches the client before the
+/// response names a session id the client doesn't know yet, and Zed drops
+/// exactly that update (observed live: "Available commands for darkmux:
+/// none").
+fn advertise_panel_commands(
+    cx: &ConnectionTo<Client>,
+    session_id: SessionId,
+    origin: &str,
+) -> Result<(), agent_client_protocol::Error> {
+    let panel_commands = crate::acp_panel::list_panel_commands();
+    eprintln!(
+        "[darkmux-acp] {origin}: advertising {} panel command(s): {}",
+        panel_commands.len(),
+        panel_commands.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
+    );
+    let commands = AvailableCommandsUpdate::new(
+        panel_commands
+            .iter()
+            .map(|c| {
+                let cmd = AvailableCommand::new(c.id.clone(), c.description.clone());
+                match &c.hint {
+                    Some(hint) => cmd.input(AvailableCommandInput::Unstructured(
+                        UnstructuredCommandInput::new(hint.clone()),
+                    )),
+                    None => cmd,
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    cx.send_notification(SessionNotification::new(
+        session_id,
+        SessionUpdate::AvailableCommandsUpdate(commands),
+    ))
+}
+
 /// Apply one `session/set_config_option` request to `overrides` in place.
 /// Unrecognized `config_id`s and unrecognized values are no-ops (the
 /// response still echoes the CURRENT — unchanged — option list, never a
@@ -250,6 +292,33 @@ type RouterCall = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
 /// already matches this alias exactly).
 type AnswererCall = Arc<dyn Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync>;
 
+/// The DATA-BOUNDARY seam (#1698 Packet B2 gate): how much of this
+/// machine's state may go into the answering seat's grounding bundle, given
+/// the session's overrides. Production wires
+/// `radio_answer::grounding_scope_for`, which resolves the seat's profile
+/// and answers `RemoteSafe` when it targets a remote endpoint.
+///
+/// Injectable for the same reason the model call is: resolving it reads the
+/// profile registry off disk, so a pipe test asserting that a shelf entry
+/// reaches the dispatch would otherwise depend on the HOST's
+/// `default_profile` — and would fail, correctly but uselessly, on a
+/// remote-only machine (the Studio has no local models). The boundary
+/// itself is unit-tested directly in `radio_answer`; this seam keeps the
+/// wire tests testing the wire.
+type ScopeCall = Arc<dyn Fn(&crate::radio_answer::AnswererOverrides) -> crate::radio_answer::GroundingScope + Send + Sync>;
+
+/// The answering seat's two injectable seams, carried together: the model
+/// call, and the data-boundary decision that governs what may be put IN
+/// that call (#1698 Packet B2 gate). One struct rather than two positional
+/// parameters because they are never meaningfully separable — a caller
+/// holding the ability to dispatch the seat must also hold the rule about
+/// what it may be handed.
+#[derive(Clone)]
+struct AnsweringSeat {
+    call: AnswererCall,
+    scope: ScopeCall,
+}
+
 /// Entry point for `darkmux acp`. Builds its own tokio runtime and blocks on
 /// the ACP stdio loop until the client (Zed) closes the connection — same
 /// "sync `main`, async subsystem builds its own runtime" pattern
@@ -262,7 +331,8 @@ pub fn run() -> Result<i32> {
         .context("building the tokio runtime for `darkmux acp`")?;
     let router: RouterCall = Arc::new(crate::radio::dispatch_router_call);
     let answerer: AnswererCall = Arc::new(crate::radio_answer::dispatch_answerer_call_with);
-    rt.block_on(serve(router, answerer, AcpStdio::new()))?;
+    let scope: ScopeCall = Arc::new(crate::radio_answer::grounding_scope_for);
+    rt.block_on(serve(router, AnsweringSeat { call: answerer, scope }, AcpStdio::new()))?;
     Ok(0)
 }
 
@@ -274,7 +344,7 @@ pub fn run() -> Result<i32> {
 /// handler chain.
 async fn serve(
     router_call: RouterCall,
-    answerer_call: AnswererCall,
+    seat: AnsweringSeat,
     transport: impl agent_client_protocol::ConnectTo<Agent> + 'static,
 ) -> Result<()> {
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -294,12 +364,13 @@ async fn serve(
     let ordinal_for_new = next_session_ordinal.clone();
     let sessions_for_prompt = sessions.clone();
     let router_for_prompt = router_call.clone();
-    let answerer_for_prompt = answerer_call.clone();
+    let seat_for_prompt = seat.clone();
     let sessions_for_load = sessions.clone();
     let sessions_for_config = sessions.clone();
     let activity_for_new = last_activity_unix.clone();
     let activity_for_prompt = last_activity_unix.clone();
     let activity_for_load = last_activity_unix.clone();
+    let activity_for_config = last_activity_unix.clone();
     let in_flight_for_prompt = in_flight.clone();
 
     Agent
@@ -378,30 +449,7 @@ async fn serve(
                 // here at all; it's advertised because the built-in
                 // `review.json` now carries a `panel` block like any other
                 // config would.
-                let panel_commands = crate::acp_panel::list_panel_commands();
-                eprintln!(
-                    "[darkmux-acp] session/new: advertising {} panel command(s): {}",
-                    panel_commands.len(),
-                    panel_commands.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
-                );
-                let commands = AvailableCommandsUpdate::new(
-                    panel_commands
-                        .iter()
-                        .map(|c| {
-                            let cmd = AvailableCommand::new(c.id.clone(), c.description.clone());
-                            match &c.hint {
-                                Some(hint) => cmd.input(AvailableCommandInput::Unstructured(
-                                    UnstructuredCommandInput::new(hint.clone()),
-                                )),
-                                None => cmd,
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                );
-                cx.send_notification(SessionNotification::new(
-                    session_id,
-                    SessionUpdate::AvailableCommandsUpdate(commands),
-                ))
+                advertise_panel_commands(&cx, session_id, "session/new")
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -554,7 +602,7 @@ async fn serve(
                 };
                 let cx_task = cx.clone();
                 let router_for_task = router_for_prompt.clone();
-                let answerer_for_task = answerer_for_prompt.clone();
+                let seat_for_task = seat_for_prompt.clone();
                 let sessions_for_task = sessions_for_prompt.clone();
                 let in_flight_for_task = in_flight_for_prompt.clone();
                 let activity_for_task = activity_for_prompt.clone();
@@ -569,7 +617,7 @@ async fn serve(
                         &cwd,
                         &cx_task,
                         router_for_task,
-                        answerer_for_task,
+                        seat_for_task,
                         &sessions_for_task,
                     )
                     .await;
@@ -599,7 +647,7 @@ async fn serve(
         // config_options) is a fully spec-conformant minimal response per
         // the vendored v1 schema (`Default`-derived, every field optional).
         .on_receive_request(
-            async move |request: LoadSessionRequest, responder, _cx| {
+            async move |request: LoadSessionRequest, responder, cx: ConnectionTo<Client>| {
                 activity_for_load.store(now_unix(), Ordering::SeqCst);
                 eprintln!(
                     "[darkmux-acp] session/load: {} cwd={}",
@@ -614,13 +662,42 @@ async fn serve(
                 // is refreshed from the request either way. A genuinely
                 // unknown id (the restart case) gets a fresh empty
                 // `SessionState` — replay nothing still holds for THAT case.
-                sessions_for_load
-                    .lock()
-                    .expect("darkmux acp: sessions mutex poisoned")
-                    .entry(request.session_id.clone())
-                    .and_modify(|s| s.cwd = request.cwd.clone())
-                    .or_insert_with(|| SessionState { cwd: request.cwd.clone(), shelf: Default::default(), overrides: Default::default() });
-                responder.respond(LoadSessionResponse::new())
+                let overrides = {
+                    let mut guard =
+                        sessions_for_load.lock().expect("darkmux acp: sessions mutex poisoned");
+                    let state = guard
+                        .entry(request.session_id.clone())
+                        .and_modify(|s| s.cwd = request.cwd.clone())
+                        .or_insert_with(|| SessionState {
+                            cwd: request.cwd.clone(),
+                            shelf: Default::default(),
+                            overrides: Default::default(),
+                        });
+                    state.overrides.clone()
+                };
+
+                // (#1698 Packet B2 gate) Respond WITH the config-option
+                // pickers, and re-advertise the command menu after — the
+                // vendored v1 schema carries `config_options` on
+                // `LoadSessionResponse` for exactly this ("initial session
+                // configuration options"), and `session/new` follows its own
+                // response with an `AvailableCommandsUpdate`. A bare
+                // `LoadSessionResponse::new()` is spec-legal but leaves a
+                // resumed thread with no pickers and possibly an empty slash
+                // menu — which defeats this scope's whole purpose, since the
+                // reason `session/load` exists here is to make binary swaps
+                // and reconnects INVISIBLE. (Typed `/pr-list` still works
+                // either way: `route_command` resolves against the registry,
+                // never against the advertised list.)
+                //
+                // Same respond-FIRST ordering as `session/new`: a
+                // notification naming a session id the client hasn't been
+                // told about yet gets dropped (observed live, #1684).
+                responder.respond(
+                    LoadSessionResponse::new()
+                        .config_options(Some(build_session_config_options(&overrides))),
+                )?;
+                advertise_panel_commands(&cx, request.session_id.clone(), "session/load")
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -630,6 +707,13 @@ async fn serve(
         // vendored v1 schema's `SetSessionConfigOptionResponse` contract.
         .on_receive_request(
             async move |request: SetSessionConfigOptionRequest, responder, _cx| {
+                // (#1698 Packet B2 gate) Picker changes are ACTIVITY. Without
+                // this, an operator reading results and adjusting the humor
+                // or radio-host picker for longer than the idle window can
+                // have the process exit under them — the one interaction
+                // that proves someone is at the keyboard would be the one
+                // interaction that doesn't count as being at the keyboard.
+                activity_for_config.store(now_unix(), Ordering::SeqCst);
                 // (#1698 Packet B2 review finding) `get_mut`, NOT
                 // `entry(...).or_default()` — the wire-supplied session id
                 // is untrusted input; materializing a `SessionState` for an
@@ -809,7 +893,7 @@ async fn run_no_slash_route(
     cwd: &Path,
     cx: &ConnectionTo<Client>,
     router_call: RouterCall,
-    answerer_call: AnswererCall,
+    seat: AnsweringSeat,
     sessions: &Sessions,
 ) -> Result<()> {
     let text_owned = text.to_string();
@@ -831,7 +915,7 @@ async fn run_no_slash_route(
         // answering dispatch itself fails — see `answer_no_slash_refusal`'s
         // own doc.
         crate::radio::RouteDecision::Refuse { reason } => {
-            answer_no_slash_refusal(session_id, text, &reason, cwd, cx, answerer_call, sessions).await
+            answer_no_slash_refusal(session_id, text, &reason, cwd, cx, seat, sessions).await
         }
         crate::radio::RouteDecision::Route { command, args } => {
             cx.send_notification(agent_chunk(
@@ -863,16 +947,27 @@ async fn answer_no_slash_refusal(
     refusal_reason: &str,
     cwd: &Path,
     cx: &ConnectionTo<Client>,
-    answerer_call: AnswererCall,
+    seat: AnsweringSeat,
     sessions: &Sessions,
 ) -> Result<()> {
     let (shelf, overrides) = session_answer_context(sessions, session_id);
+    // (#1698 Packet B2 gate) Resolve the data boundary BEFORE assembling —
+    // the dispatch only ever sees a finished message, so this is the last
+    // point at which "what may leave this machine" can still be decided.
+    let scope = (seat.scope)(&overrides);
+    if scope == crate::radio_answer::GroundingScope::RemoteSafe {
+        eprintln!(
+            "[darkmux-acp] radio answering seat resolves to a REMOTE endpoint — grounding \
+             limited to the command catalog and `--help`; this machine's config surface, \
+             mission board, and artifact shelf are withheld."
+        );
+    }
     let text_owned = text.to_string();
     let cwd_owned = cwd.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
         let catalog = crate::radio::compile_catalog();
-        crate::radio_answer::answer(&text_owned, &catalog, &shelf, &cwd_owned, &mut |m: &str| {
-            (answerer_call)(m, &overrides)
+        crate::radio_answer::answer(&text_owned, &catalog, &shelf, &cwd_owned, scope, &mut |m: &str| {
+            (seat.call)(m, &overrides)
         })
     })
     .await
@@ -1844,9 +1939,12 @@ mod tests {
         let (agent_writer, test_reader) = tokio::io::duplex(64 * 1024);
         let router_call: RouterCall = Arc::new(router);
         let answerer_call: AnswererCall = Arc::new(answerer);
+        // Pinned to `Full` (#1698 Packet B2 gate): these tests exercise the
+        // WIRE, not the data boundary — see `ScopeCall`'s own doc.
+        let scope_call: ScopeCall = Arc::new(|_| crate::radio_answer::GroundingScope::Full);
         let transport = ByteStreams::new(agent_writer.compat_write(), agent_reader.compat());
         tokio::spawn(async move {
-            let _ = serve(router_call, answerer_call, transport).await;
+            let _ = serve(router_call, AnsweringSeat { call: answerer_call, scope: scope_call }, transport).await;
         });
         (test_writer, BufReader::new(test_reader))
     }

@@ -124,8 +124,23 @@ pub fn not_a_command_message(commands: &[PanelCommand]) -> String {
                 `panel` block."
             .to_string();
     }
+    format!("darkmux acp doesn't recognize that as a command. {}", command_listing(commands))
+}
+
+/// The bare "Available commands: …" listing, WITHOUT the didn't-recognize-
+/// that preamble (#1698 Packet B2 gate). The answering seat appends a
+/// listing after an answer that names a `/command`, where the full
+/// `not_a_command_message` would contradict itself: RADIO answers the
+/// question, then the appended text tells the operator their message wasn't
+/// recognized. Same list, no refusal framing. Empty in ⇒ empty out, so a
+/// caller appending this to an answer adds nothing when there is nothing to
+/// list (the refusal path's own no-commands explanation stays above).
+pub fn command_listing(commands: &[PanelCommand]) -> String {
+    if commands.is_empty() {
+        return String::new();
+    }
     let list = commands.iter().map(|c| format!("`/{}`", c.id)).collect::<Vec<_>>().join(", ");
-    format!("darkmux acp doesn't recognize that as a command. Available commands: {list}.")
+    format!("Available commands: {list}.")
 }
 
 /// Split a raw prompt into `(command name, raw args)` — **the mode bit**

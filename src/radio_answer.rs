@@ -95,11 +95,18 @@ fn now_unix() -> u64 {
 /// construction site both `src/acp.rs` call sites (slash-routed execution
 /// and no-slash routed execution) use, so the timestamp convention can't
 /// drift between them.
+///
+/// Truncates at WRITE time, not just at assembly (#1698 Packet B2 gate):
+/// a `/review` render is unbounded, the shelf holds 3 of them per session,
+/// sessions are never evicted, and the process is long-lived — so an
+/// assembly-time-only cap would let RAM grow with everything the operator
+/// ever ran. `SHELF_ENTRY_CAP_CHARS` is exactly what assembly can read
+/// back, so nothing storable beyond it was ever reachable anyway.
 pub fn shelf_entry(command: &str, args: &str, rendered: &str) -> ShelfEntry {
     ShelfEntry {
         command: command.to_string(),
         args: args.to_string(),
-        rendered: rendered.to_string(),
+        rendered: truncate_chars(rendered, SHELF_ENTRY_CAP_CHARS),
         timestamp_unix: now_unix(),
     }
 }
@@ -352,30 +359,88 @@ fn render_mission_deep_artifact(mission_token: &str) -> Option<String> {
     Some(truncate_chars(&out, DEEP_ARTIFACT_CAP_CHARS))
 }
 
+/// How much of the machine's own state may go into one grounding bundle
+/// (#1698 Packet B2 gate — the data boundary).
+///
+/// The answering seat is the first darkmux surface that COMPOSES a payload
+/// out of local state and hands it to a model the operator picks at
+/// runtime. The "radio host" picker offers every profile in the registry,
+/// and on a remote-only machine (no local models) `default_profile` is
+/// remote — so "this bundle might leave the machine" is the ordinary path
+/// there, not an exotic misconfiguration.
+///
+/// The precedent this follows is one function away: `identity.md` is
+/// withheld from EVERY remote endpoint, approved ones included
+/// (`dispatch_internal::identity_augmentation_allowed`, #1405). A grounding
+/// bundle is strictly more sensitive than `identity.md` — after a
+/// `/review` the artifact shelf holds rendered review output over the
+/// operator's private diff, and the config block carries machine ids, urls,
+/// and directory layout.
+///
+/// So: what leaves the machine is what the machine already publishes.
+/// `RemoteSafe` keeps the command catalog (already sent to the client on
+/// every `session/new`) and the binary's own `--help` text; it drops the
+/// config surface, the mission board, the artifact shelf, and any deep
+/// artifact. "Is this darkmux?" and "what can I run here?" still answer
+/// correctly on a remote seat — only questions about THIS machine's private
+/// state lose their grounding, and the seat says so honestly rather than
+/// guessing (its persona forbids inventing facts it wasn't handed).
+///
+/// This is the conservative default, not a final ruling: an
+/// approved-endpoint allowlist (Azure yes, personal-key vendors no) is the
+/// obvious refinement if the operator wants one. Widening later costs a
+/// config field; un-sending a bundle costs nothing less than a rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroundingScope {
+    /// The resolved answering seat is served locally — every source is in
+    /// scope.
+    Full,
+    /// The resolved answering seat is a remote endpoint — public surfaces
+    /// only (catalog + help).
+    RemoteSafe,
+}
+
 /// Assemble the answering seat's grounding block for one ask — the pure(-
 /// ish; every source is a read-only local call, never a dispatch) core of
 /// scope B. `cwd` is accepted for a future cwd-scoped grounding source
 /// (none needed yet — every source today is process/registry-global); kept
 /// as an explicit parameter rather than added later as a breaking change.
-pub fn assemble_grounding(text: &str, catalog: &[CatalogEntry], shelf: &ArtifactShelf, _cwd: &Path) -> String {
+pub fn assemble_grounding(
+    text: &str,
+    catalog: &[CatalogEntry],
+    shelf: &ArtifactShelf,
+    _cwd: &Path,
+    scope: GroundingScope,
+) -> String {
+    let machine_local = scope == GroundingScope::Full;
     let mut sections = Sections {
+        // Always safe: the catalog is the advertised command surface (it is
+        // already sent to the CLIENT on every `session/new`), and `--help`
+        // is the shipped binary's own public text.
         catalog: Some(render_catalog_block(catalog)),
-        config: config_block(),
-        board: render_board_block(),
         help: Some(render_help_block()),
-        shelf: shelf
-            .entries()
-            .map(|e| {
-                truncate_chars(
-                    &format!(
-                        "command: /{} {} (t={})\noutput: {}",
-                        e.command, e.args, e.timestamp_unix, e.rendered
-                    ),
-                    SHELF_ENTRY_CAP_CHARS,
-                )
-            })
-            .collect(),
-        deep_artifact: detect_mission_mention(text).and_then(|m| render_mission_deep_artifact(&m)),
+        // Machine-local only — see `GroundingScope`.
+        config: machine_local.then(config_block).flatten(),
+        board: machine_local.then(render_board_block).flatten(),
+        shelf: if machine_local {
+            shelf
+                .entries()
+                .map(|e| {
+                    truncate_chars(
+                        &format!(
+                            "command: /{} {} (t={})\noutput: {}",
+                            e.command, e.args, e.timestamp_unix, e.rendered
+                        ),
+                        SHELF_ENTRY_CAP_CHARS,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        deep_artifact: machine_local
+            .then(|| detect_mission_mention(text).and_then(|m| render_mission_deep_artifact(&m)))
+            .flatten(),
     };
     sections.enforce_budget();
     sections.render()
@@ -435,13 +500,25 @@ pub fn build_answer_message(text: &str, grounding: &str) -> String {
 /// post-process. `call` is the injected [`AnswererCall`] — production wires
 /// [`dispatch_answerer_call_with`]; tests inject a canned closure (no live model
 /// ever runs under test).
-pub fn answer(text: &str, catalog: &[CatalogEntry], shelf: &ArtifactShelf, cwd: &Path, call: &mut AnswererCall<'_>) -> Result<AnswerOutcome> {
-    let grounding = assemble_grounding(text, catalog, shelf, cwd);
+pub fn answer(
+    text: &str,
+    catalog: &[CatalogEntry],
+    shelf: &ArtifactShelf,
+    cwd: &Path,
+    scope: GroundingScope,
+    call: &mut AnswererCall<'_>,
+) -> Result<AnswerOutcome> {
+    let grounding = assemble_grounding(text, catalog, shelf, cwd, scope);
     let message = build_answer_message(text, &grounding);
     let raw = call(&message)?;
     let reply = raw.trim().to_string();
-    let rendered = if answer_references_a_command(&reply, catalog) {
-        format!("{reply}\n\n{}", crate::acp_panel::not_a_command_message(&crate::acp_panel::list_panel_commands()))
+    // (#1698 Packet B2 gate) The bare LISTING, not `not_a_command_message`
+    // — appending "darkmux acp doesn't recognize that as a command" under
+    // an answer that just helpfully named `/pr-list` tells the operator
+    // their message failed, immediately after RADIO answered it.
+    let listing = crate::acp_panel::command_listing(&crate::acp_panel::list_panel_commands());
+    let rendered = if answer_references_a_command(&reply, catalog) && !listing.is_empty() {
+        format!("{reply}\n\n{listing}")
     } else {
         reply.clone()
     };
@@ -470,16 +547,41 @@ pub struct AnswererOverrides {
 /// router uses — via `DispatchOpts.system_prompt_override` so the
 /// substituted persona text is sent VERBATIM rather than re-resolved by the
 /// loader (see that field's own doc on `DispatchOpts`).
+/// The answering seat's explicitly-selected profile, if any: the session
+/// picker wins over `radio.answerer_profile`; `None` means "no explicit
+/// selection" and lets dispatch's own `role_profiles.radio-host` →
+/// `default_profile` precedence decide.
+///
+/// Factored so [`dispatch_answerer_call_with`] and [`grounding_scope_for`]
+/// resolve the SAME name. Two copies of this two-line precedence would be
+/// a data-boundary bug waiting to happen: the gate would be deciding about
+/// one profile while the dispatch went to another.
+fn resolved_answerer_profile(overrides: &AnswererOverrides) -> Option<String> {
+    overrides
+        .profile_name
+        .clone()
+        .or_else(darkmux_types::config_access::radio_answerer_profile)
+}
+
+/// The grounding scope this dispatch is allowed — [`GroundingScope::RemoteSafe`]
+/// when the answering seat resolves to a remote endpoint. Fails closed via
+/// `crew::dispatch::dispatch_resolves_remote`.
+pub fn grounding_scope_for(overrides: &AnswererOverrides) -> GroundingScope {
+    let profile = resolved_answerer_profile(overrides);
+    if crate::crew::dispatch::dispatch_resolves_remote("radio-host", profile.as_deref(), None) {
+        GroundingScope::RemoteSafe
+    } else {
+        GroundingScope::Full
+    }
+}
+
 pub fn dispatch_answerer_call_with(user_message: &str, overrides: &AnswererOverrides) -> Result<String> {
     let persona = crate::crew::loader::role_prompt("radio-host").ok_or_else(|| {
         anyhow::anyhow!("radio-host role has no readable .md persona template — cannot dispatch the answering seat")
     })?;
     let humor = overrides.humor.unwrap_or_else(darkmux_types::config_access::radio_humor);
     let system_prompt = persona.replace("{{humor}}", &humor.to_string());
-    let profile_name = overrides
-        .profile_name
-        .clone()
-        .or_else(darkmux_types::config_access::radio_answerer_profile);
+    let profile_name = resolved_answerer_profile(overrides);
 
     let opts = crate::crew::dispatch::DispatchOpts {
         role_id: "radio-host".to_string(),
@@ -521,8 +623,20 @@ pub fn answer_live(
     cwd: &Path,
     overrides: &AnswererOverrides,
 ) -> Result<AnswerOutcome> {
-    answer(text, catalog, shelf, cwd, &mut |m: &str| dispatch_answerer_call_with(m, overrides))
-        .context("dispatching the radio answering seat")
+    // (#1698 Packet B2 gate) The boundary is decided HERE, before assembly
+    // — not inside the dispatch, which only ever sees the finished message.
+    let scope = grounding_scope_for(overrides);
+    if scope == GroundingScope::RemoteSafe {
+        eprintln!(
+            "[darkmux-acp] radio answering seat resolves to a REMOTE endpoint — grounding limited \
+             to the command catalog and `--help`; the config surface, mission board, artifact \
+             shelf, and any deep artifact are withheld (they never leave this machine)."
+        );
+    }
+    answer(text, catalog, shelf, cwd, scope, &mut |m: &str| {
+        dispatch_answerer_call_with(m, overrides)
+    })
+    .context("dispatching the radio answering seat")
 }
 
 /// The profile names available for the "radio host" session config-option
@@ -621,6 +735,68 @@ mod tests {
         assert!(sections.deep_artifact.is_some());
     }
 
+    // ── The data boundary (#1698 Packet B2 gate) ─────────────────────────
+
+    /// A shelf entry with content distinctive enough that finding it in the
+    /// assembled bundle can't be a coincidence.
+    fn shelf_with_private_output() -> ArtifactShelf {
+        let mut shelf = ArtifactShelf::default();
+        shelf.push(shelf_entry("review", "", "SECRET-DIFF-CONTENT-e7f1a2 leaked from a /review"));
+        shelf
+    }
+
+    #[test]
+    fn remote_safe_grounding_withholds_the_shelf_config_and_board() {
+        let grounding = assemble_grounding(
+            "is this darkmux?",
+            &fixture_catalog(),
+            &shelf_with_private_output(),
+            Path::new("/tmp"),
+            GroundingScope::RemoteSafe,
+        );
+        assert!(
+            !grounding.contains("SECRET-DIFF-CONTENT-e7f1a2"),
+            "a remote-resolved answering seat must never be handed the artifact shelf — \
+             after a /review it holds rendered output over the operator's private diff. \
+             Got: {grounding}"
+        );
+        // The public surfaces still ship, or the seat couldn't answer
+        // "is this darkmux?" / "what can I run?" at all on a remote machine.
+        assert!(grounding.contains("pr-list"), "the command catalog is public and must survive: {grounding}");
+    }
+
+    /// The inverted case — without this, the assertion above would pass just
+    /// as happily if `assemble_grounding` returned the empty string, or if
+    /// the shelf were broken everywhere rather than withheld on purpose.
+    #[test]
+    fn full_grounding_does_include_the_shelf() {
+        let grounding = assemble_grounding(
+            "is this darkmux?",
+            &fixture_catalog(),
+            &shelf_with_private_output(),
+            Path::new("/tmp"),
+            GroundingScope::Full,
+        );
+        assert!(
+            grounding.contains("SECRET-DIFF-CONTENT-e7f1a2"),
+            "a LOCAL answering seat must still get the shelf — otherwise the RemoteSafe test \
+             above proves nothing about the boundary. Got: {grounding}"
+        );
+    }
+
+    #[test]
+    fn shelf_entries_are_truncated_at_write_time_not_only_at_assembly() {
+        let huge = "x".repeat(SHELF_ENTRY_CAP_CHARS * 4);
+        let entry = shelf_entry("review", "", &huge);
+        assert!(
+            entry.rendered.chars().count() <= SHELF_ENTRY_CAP_CHARS + 32,
+            "stored {} chars — an unbounded store grows process RAM with every command the \
+             operator ever runs, even though assembly can only ever read back {}",
+            entry.rendered.chars().count(),
+            SHELF_ENTRY_CAP_CHARS
+        );
+    }
+
     // ── detect_mission_mention (deep-artifact heuristic) ─────────────────
 
     #[test]
@@ -645,7 +821,7 @@ mod tests {
     fn answer_referencing_a_slash_command_gets_the_listing_appended() {
         let mut call = |_msg: &str| -> Result<String> { Ok("Try running /pr-list to see them.".to_string()) };
         let shelf = ArtifactShelf::default();
-        let outcome = answer("anything mergeable?", &fixture_catalog(), &shelf, Path::new("/tmp"), &mut call).unwrap();
+        let outcome = answer("anything mergeable?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, &mut call).unwrap();
         assert!(outcome.rendered.len() > outcome.text.len(), "the listing must be appended: {outcome:?}");
     }
 
@@ -653,7 +829,7 @@ mod tests {
     fn answer_not_referencing_a_command_stays_bare() {
         let mut call = |_msg: &str| -> Result<String> { Ok("darkmux is a local-AI orchestrator CLI.".to_string()) };
         let shelf = ArtifactShelf::default();
-        let outcome = answer("is this darkmux?", &fixture_catalog(), &shelf, Path::new("/tmp"), &mut call).unwrap();
+        let outcome = answer("is this darkmux?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, &mut call).unwrap();
         assert_eq!(outcome.text, outcome.rendered, "no command referenced — no listing appended: {outcome:?}");
     }
 
@@ -661,7 +837,7 @@ mod tests {
     fn answer_dispatch_error_propagates_as_err() {
         let mut call = |_msg: &str| -> Result<String> { Err(anyhow::anyhow!("no model loaded")) };
         let shelf = ArtifactShelf::default();
-        let result = answer("is this darkmux?", &fixture_catalog(), &shelf, Path::new("/tmp"), &mut call);
+        let result = answer("is this darkmux?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, &mut call);
         assert!(result.is_err(), "a dispatch failure must propagate, not be swallowed into a bogus answer");
     }
 

@@ -291,16 +291,19 @@ pub fn review_judge_concurrency() -> u32 {
 }
 
 // ── Radio interpreter (#1698 Packet B2) ──
-/// The ROUTING seat's explicit profile override. `None` when unset —
-/// callers pass that straight through as `DispatchOpts.profile_name: None`,
-/// which preserves the existing `role_profiles.radio-router` precedence
-/// (see `RadioConfig::router_profile`'s own doc). No env override — this is
-/// a config-only knob, like `role_profiles` itself.
+/// The ROUTING seat's explicit profile override. Resolves
+/// `env(DARKMUX_RADIO_ROUTER_PROFILE) > config.radio.router_profile >
+/// unset`, the standard tier order. `None` when unset — callers pass that
+/// straight through as `DispatchOpts.profile_name: None`, which preserves
+/// the existing `role_profiles.radio-router` precedence (see
+/// `RadioConfig::router_profile`'s own doc).
 pub fn radio_router_profile() -> Option<String> {
     pick_string("DARKMUX_RADIO_ROUTER_PROFILE", config().radio.as_ref().and_then(|r| r.router_profile.as_deref()), None)
 }
-/// The ANSWERING seat's explicit profile override. `None` when unset, same
-/// pass-through contract as [`radio_router_profile`].
+/// The ANSWERING seat's explicit profile override. Resolves
+/// `env(DARKMUX_RADIO_ANSWERER_PROFILE) > config.radio.answerer_profile >
+/// unset`. `None` when unset, same pass-through contract as
+/// [`radio_router_profile`].
 pub fn radio_answerer_profile() -> Option<String> {
     pick_string("DARKMUX_RADIO_ANSWERER_PROFILE", config().radio.as_ref().and_then(|r| r.answerer_profile.as_deref()), None)
 }

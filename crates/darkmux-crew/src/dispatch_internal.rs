@@ -1127,6 +1127,45 @@ fn identity_augmentation_allowed(remote_brained: bool) -> bool {
     !remote_brained
 }
 
+/// (#1698 Packet B2 gate) Would a dispatch with this (role, profile) resolve
+/// to a REMOTE endpoint? Answers the question a caller must ask BEFORE it
+/// assembles the payload — the identity gate above can decide late because
+/// it owns the augmentation, but a caller that composes its own message
+/// (the radio answering seat's grounding bundle) has to know the boundary
+/// while it is still choosing what to put IN that message.
+///
+/// Deliberately reuses `resolve_selected_profile_model` — the SAME
+/// resolution `try_resolve_remote_target` routes on — so the predicate
+/// cannot drift from where the dispatch actually goes. A cheap alternative
+/// (reading `radio.answerer_profile` and looking it up directly) would
+/// re-implement the role-aware/`default_profile` precedence and silently
+/// disagree with routing the first time that precedence changed.
+///
+/// **Fails CLOSED**: an unresolvable profile answers `true` (treat as
+/// remote, withhold). Uncertainty never degrades to permissiveness — the
+/// cost of a false `true` is a thinner grounding bundle; the cost of a
+/// false `false` is private data on someone else's server.
+pub fn dispatch_resolves_remote(
+    role_id: &str,
+    profile_name: Option<&str>,
+    config_path: Option<&str>,
+) -> bool {
+    let Ok(roles) = load_roles() else {
+        return true;
+    };
+    let Some(role) = roles.iter().find(|r| r.id == role_id) else {
+        return true;
+    };
+    match resolve_selected_profile_model(role, profile_name, config_path) {
+        Ok(Some(pm)) => pm.endpoint.as_ref().is_some_and(|e| e.is_remote()),
+        // No profile model resolves ⇒ the container path's local fallback.
+        Ok(None) => false,
+        // A quarantined profile (#1282) — the dispatch itself is about to
+        // hard-fail, but answer conservatively rather than assuming local.
+        Err(_) => true,
+    }
+}
+
 /// The chat-completions URL: `{base}/chat/completions` (+ `?api-version=` for
 /// Azure). The operator's `endpoint.url` is the base up to `/chat/completions`
 /// (an Azure deployment URL, or e.g. `https://api.openai.com/v1`).

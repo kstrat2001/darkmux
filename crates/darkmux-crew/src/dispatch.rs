@@ -574,6 +574,19 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     crate::dispatch_internal::dispatch_local_single_shot(opts)
 }
 
+/// (#1698 Packet B2 gate) True when a dispatch with this (role, profile)
+/// would resolve to a remote endpoint — the data-boundary question a caller
+/// that COMPOSES its own payload must answer before assembling it. Fails
+/// closed (unresolvable ⇒ `true`). See
+/// `dispatch_internal::dispatch_resolves_remote`'s own doc.
+pub fn dispatch_resolves_remote(
+    role_id: &str,
+    profile_name: Option<&str>,
+    config_path: Option<&str>,
+) -> bool {
+    crate::dispatch_internal::dispatch_resolves_remote(role_id, profile_name, config_path)
+}
+
 /// Outcome of the `dispatch()` routing-decision branch. Extracted as a
 /// pure shape so the (Some(machine), local_machine_id) matrix is
 /// unit-testable without filesystem / env-var setup. (Wave-E.7 #255)
