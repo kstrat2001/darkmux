@@ -745,10 +745,20 @@ async fn request_operator_sign_off(
     // a spec-compliant client — but this is the same class of "Zed drops
     // a message naming something it doesn't know about yet" surprise the
     // Packet-1 wire-ordering finding hit for `AvailableCommandsUpdate` (see
-    // `session/new`'s handler comment above). Verify the dialog body
-    // actually renders in a live Zed dogfood before relying on this.
+    // `session/new`'s handler comment above). Live dogfood verified the
+    // dialog renders — for the FIRST gated invocation only, which is why
+    // the id below carries a nonce:
+    //
+    // (#1684, confirmed live) A DETERMINISTIC id here collides on the
+    // second gated invocation in one session: the first dialog's tool call
+    // is already terminal under the same id, Zed renders no new dialog,
+    // and the agent blocks forever on a reply that cannot come (the
+    // operator's canonical approve-then-merge pair hit this on its first
+    // real use). A process-global counter makes every request's id unique.
+    static GATE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = GATE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tool_call = ToolCallUpdate::new(
-        ToolCallId::new(format!("darkmux-gate-{step_id}")),
+        ToolCallId::new(format!("darkmux-gate-{step_id}-{nonce}")),
         ToolCallUpdateFields::new()
             .title(format!("darkmux — operator sign-off required: `{step_id}`"))
             .kind(ToolKind::Execute)
