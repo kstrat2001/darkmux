@@ -65,6 +65,13 @@ mod mission_launch_review;
 mod notebook;
 mod pr_review;
 pub use darkmux_lab::providers;
+// (#1698 Packet A) The radio interpreter core (catalog compiler, closed-set
+// router, frozen prompt assembly) — surface-neutral engine capability. See
+// its own module doc for the surface-neutrality + two-seat receiver design.
+mod radio;
+// (#1698 Packet A) The `darkmux radio` CLI verb — thin execution wiring
+// over `radio.rs`, reusing `acp_panel`'s ephemeral runner + routing plan.
+mod radio_cli;
 mod role_cli;
 // #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
 // flow/profiles all crates). Re-export keeps crate::serve::* resolving for
@@ -185,6 +192,8 @@ fn run(cmd: Cmd) -> Result<i32> {
         }
         // SPIKE (#1388) — see src/acp.rs module docs.
         Cmd::Acp => acp::run(),
+        // (#1698 Packet A) — see src/radio.rs / src/radio_cli.rs module docs.
+        Cmd::Radio { text, dry_run } => radio_cli::run(&text, dry_run),
     }
 }
 

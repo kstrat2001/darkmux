@@ -2521,3 +2521,31 @@ fn pr_review_run_bundler_should_warn_ignored_with_from_envelope() {
         "expected an ignored-flag warning naming `bundler`: {stderr}"
     );
 }
+
+// ── `darkmux radio` (#1698 Packet A) ─────────────────────────────────────
+//
+// No assert_cmd binary-level test exists for `radio`'s live routing path,
+// for a reason worth recording: the built-in `review` mission config
+// (`templates/builtin/mission-configs/review.json`) declares a `panel`
+// block, so it is ALWAYS merged into `radio::compile_catalog`'s output
+// regardless of `DARKMUX_CREW_DIR` — built-ins are embedded at compile
+// time, independent of the user-tier crew dir an isolated TempDir can
+// override. There is therefore no environment override that produces a
+// genuinely EMPTY catalog (the fail-closed short-circuit
+// `radio::route_with_empty_catalog_refuses_without_invoking_call` covers),
+// and every non-empty-catalog path — a real route OR a real refusal —
+// requires an actual dispatch to the `radio-router` role through a live
+// LMStudio instance, which a deterministic test must never depend on
+// (verified empirically while writing these tests: a real local run here
+// dispatched successfully and routed `"review this for me"` to `/review`
+// end-to-end — reassuring, but not something a test suite can rely on
+// being true on every machine/CI run). This mirrors the codebase's
+// existing precedent: `mission propose` (`src/mission_propose.rs`), the
+// other CLI verb built on the same `crate::fleet::dispatch_routed`
+// mechanism, likewise has no assert_cmd-level test of its own live
+// dispatch — only its pure parsing/validation functions are unit tested.
+// `radio`'s full contract (catalog compilation, the frozen prompt
+// assembly, all five fail-closed validation paths, the dry-run decision
+// shape) is covered at the function level instead, with an injected
+// canned model call — see `src/radio.rs::tests` and
+// `src/radio_cli.rs::tests`.

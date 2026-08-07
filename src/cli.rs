@@ -294,6 +294,24 @@ pub(crate) enum Cmd {
     /// over stdio for editors like Zed. Not a shipped feature yet — see
     /// `src/acp.rs` module docs for what's spike-grade about it.
     Acp,
+    /// Route free text onto ONE advertised command via a bounded local
+    /// classification dispatch, then execute it — the terminal twin of the
+    /// panel's no-slash channel (#1698 Packet A; the ACP wiring itself is
+    /// Packet B). Single exchange by design: one routing call, one
+    /// execution, no loop, no REPL — precedent: `gh copilot suggest`.
+    /// Prints the resolved route ("routing to /<id> — from your text")
+    /// before executing so the choice is never silent (issue #1698's
+    /// "provenance boxes invisibility" wall); a message that doesn't
+    /// clearly map onto exactly one advertised command REFUSES instead of
+    /// guessing and lists the available commands.
+    Radio {
+        /// The free-text message to route.
+        text: String,
+        /// Print the resolved route + what WOULD be invoked, and execute
+        /// nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// One-command setup: install skills, optionally add session-start hook
     /// and CLAUDE.md integration so Claude Code knows about darkmux. Safe to
     /// re-run; refreshes the bundled skills after a darkmux upgrade (#1426 —

@@ -74,6 +74,10 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("test-designer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/test-designer.json"))),
     ("lab-manager", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/lab-manager.json"))),
     ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.json"))),
+    // (#1698 Packet A) The radio interpreter's ROUTING seat — bounded
+    // classification over the currently advertised command catalog. See
+    // `src/radio.rs`'s module doc for the two-seat receiver architecture.
+    ("radio-router", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-router.json"))),
     // Non-SWE engagement roles (#141): trip planning, health, athletics, legal.
     // Each is bounded — research/organize/structure only; no exec, no execution
     // of bookings or commitments. Each prompt's opening lines name what the role
@@ -131,6 +135,9 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     // `darkmux-lab`'s review tests (`verify_prompt_matches_frozen_golden`).
     ("review-verify", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-verify.md"))),
     ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.md"))),
+    // (#1698 Packet A) Frozen model-facing text (contract 6) — byte-locked
+    // by `radio::tests::radio_router_role_prompt_matches_frozen_golden`.
+    ("radio-router", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-router.md"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.md"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.md"))),
     ("lab-manager", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/lab-manager.md"))),
