@@ -39,7 +39,13 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    let decision = radio::route(text, &catalog, &mut |message: &str| radio::dispatch_router_call(message));
+    // (#1698 Packet B carry-list item 2 — wall 4's flow record) Through
+    // `route_and_record`, not the bare `route`, so this invocation drops
+    // the SAME shared-core flow record the ACP no-slash channel does — the
+    // record is written once regardless of which surface routed.
+    let decision = radio::route_and_record(text, &catalog, radio::RadioSurface::Cli, &mut |message: &str| {
+        radio::dispatch_router_call(message)
+    });
 
     match decision {
         RouteDecision::Refuse { reason } => {
@@ -77,6 +83,15 @@ fn advertised_list_message(catalog: &[CatalogEntry]) -> String {
 /// Re-derives the execution PLAN via `crate::acp_panel::route_command` —
 /// the SAME structural Review/Ephemeral/Launch decision the panel surface
 /// uses — rather than re-implementing that classification here.
+///
+/// `Review` and `Launch` used to share `spawn_mission_launch` — correct for
+/// `Launch` (no required inputs beyond the optional `args` hook), but wrong
+/// for `Review`: the dedicated review launcher requires `diff_file`/
+/// `worktree`/`case_id` inputs `spawn_mission_launch` never supplied, so
+/// `radio "review this"` routed correctly and then died at the launcher's
+/// own missing-inputs error (#1698 Packet B carry-list item 1, the #1701
+/// merge-gate headline finding). `spawn_review_launch` below synthesizes
+/// those inputs the same way `src/acp.rs`'s `run_review` does.
 fn execute(command: &str, args: &str) -> Result<i32> {
     let advertised = crate::acp_panel::list_panel_commands();
     let plan = crate::acp_panel::route_command(&advertised, command).ok_or_else(|| {
@@ -88,46 +103,108 @@ fn execute(command: &str, args: &str) -> Result<i32> {
 
     match plan {
         crate::acp_panel::RoutePlan::Ephemeral(config) => run_ephemeral_and_report(&config, args),
-        crate::acp_panel::RoutePlan::Review(id) | crate::acp_panel::RoutePlan::Launch(id) => {
-            spawn_mission_launch(&id, args)
-        }
+        crate::acp_panel::RoutePlan::Review(id) => spawn_review_launch(&id, args),
+        crate::acp_panel::RoutePlan::Launch(id) => spawn_mission_launch(&id, args),
     }
 }
 
-/// `run_ephemeral`'s own contract (see `acp_panel.rs`) returns `Ok(String)`
-/// for BOTH a clean success and a rendered business-logic FAILURE — there
-/// is no separate structured pass/fail signal (the ACP panel surface just
-/// displays the string either way, with no exit code concept). The CLI DOES
-/// have an exit code to honor (issue #1698: "nonzero on execution
-/// failure"), so this defers to `crate::acp_panel::ephemeral_output_is_failure`
-/// — the ONE place `render_ephemeral_result`'s two failure-prefix literals
-/// live — rather than sniffing (or re-copying) them here.
-///
-/// **Known gap, named rather than silently accepted:** a run whose
-/// TERMINAL step completes cleanly while a SIDE branch of the graph
-/// errored renders a success-shaped string with the warning merely
-/// appended (see `render_ephemeral_result`'s own doc) — `ephemeral_output_is_failure`
-/// can't distinguish that case from a genuine clean success by string
-/// alone, so this still exits 0 for it. Fixing that needs a real
-/// structured signal out of `run_ephemeral`, which is a behavior change
-/// beyond this packet's scope.
+/// `run_ephemeral` now returns a typed [`crate::acp_panel::EphemeralOutcome`]
+/// (#1698 Packet B carry-list item 5 — retires the failure-prefix string-
+/// sniffing `ephemeral_output_is_failure` used to require), so the CLI's
+/// exit code reads `outcome.success` directly instead of matching a
+/// literal prefix on the rendered text. This also picks up the "Known gap"
+/// fix for free: a run whose terminal step completes cleanly while a SIDE
+/// branch of the graph errored now reports `success: false` (see
+/// `render_ephemeral_result`'s own doc) — the string-sniffing contract
+/// could never distinguish that case from a genuine clean success, so this
+/// CLI used to silently exit 0 for a partially-failed run.
 fn run_ephemeral_and_report(config: &crate::crew::mission_config::MissionConfig, args: &str) -> Result<i32> {
     let cwd = std::env::current_dir().context("resolving current directory")?;
     let mut gate = cli_gate_handler();
     match crate::acp_panel::run_ephemeral(config, args, &cwd, Some(&mut *gate)) {
-        Ok(out) => {
-            println!("{out}");
-            if crate::acp_panel::ephemeral_output_is_failure(&out) {
-                Ok(1)
-            } else {
-                Ok(0)
-            }
+        Ok(outcome) => {
+            println!("{}", outcome.text);
+            if outcome.success { Ok(0) } else { Ok(1) }
         }
         Err(e) => {
             eprintln!("radio: command failed: {e:#}");
             Ok(1)
         }
     }
+}
+
+/// (#1698 Packet B carry-list item 1) Launch a Review-routed command with
+/// the SAME `diff_file`/`worktree`/`case_id` (+ optional `bundler`) inputs
+/// `src/acp.rs`'s `run_review` synthesizes for the ACP panel surface —
+/// reusing `crate::acp::synthesize_review_launch_params` (which itself
+/// reuses `derive_case_id`/`choose_bundler`) rather than re-deriving any of
+/// that logic here. Spawns with the SAME tty-inheriting shape
+/// `spawn_mission_launch` uses (not `run_review`'s headless
+/// stdout/stderr-piped subprocess) so `mission launch`'s own interactive
+/// sign-off gate prompt applies exactly as it would for a direct
+/// `darkmux mission launch <id>` at a shell — no new gate surface here.
+fn spawn_review_launch(config_id: &str, args: &str) -> Result<i32> {
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    let diff = git_diff_sync(&cwd)?;
+    if diff.trim().is_empty() {
+        println!("radio: no uncommitted changes to review in this working tree.");
+        return Ok(0);
+    }
+    let params = crate::acp::synthesize_review_launch_params(&cwd, &diff)?;
+
+    let exe = std::env::current_exe().context("resolving darkmux's own executable path")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args([
+        "mission",
+        "launch",
+        config_id,
+        "--param",
+        &params.diff_file_arg,
+        "--param",
+        &params.worktree_arg,
+        "--param",
+        &params.case_id_arg,
+    ]);
+    if let Some(bundler) = &params.bundler_param {
+        cmd.args(["--param", bundler]);
+    }
+    // (#1695 merge-gate finding 4, same honesty note `run_review` carries)
+    // no shipped review-family config consumes `args` today — forwarded
+    // anyway as the same forward-compatible `--param args=<raw>` hook every
+    // other launch route uses.
+    if !args.trim().is_empty() {
+        cmd.args(["--param", &format!("args={args}")]);
+    }
+    println!("radio: launching `{config_id}` …");
+    let status = cmd
+        .status()
+        .with_context(|| format!("spawning `darkmux mission launch {config_id}`"))?;
+    let _ = std::fs::remove_file(&params.diff_path);
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Synchronous `git diff HEAD` — the CLI verb has no tokio runtime (unlike
+/// `src/acp.rs`'s async `git_diff`, built for the ACP connection's own
+/// event loop), so this is a `std::process::Command` transport variant of
+/// the same one-line git invocation, not a second business-logic
+/// implementation: the actual review-input derivation this feeds
+/// (`crate::acp::synthesize_review_launch_params`) is shared, not
+/// duplicated.
+fn git_diff_sync(cwd: &std::path::Path) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("diff")
+        .arg("HEAD")
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("running `git diff HEAD` in {}", cwd.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`git diff HEAD` failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Spawn `darkmux mission launch <config_id>` as a child process INHERITING

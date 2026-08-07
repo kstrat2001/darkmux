@@ -167,6 +167,104 @@ pub fn route(text: &str, catalog: &[CatalogEntry], call: &mut ModelCall<'_>) -> 
     }
 }
 
+/// Which consumer initiated a routed invocation — issue #1698's wall 4
+/// ("provenance boxes invisibility ... drops a flow record with source
+/// text + chosen route") needs to know which surface it came from.
+/// `src/radio_cli.rs` (the `darkmux radio` verb, Packet A) and the ACP
+/// no-slash channel (`src/acp.rs`, Packet B) are the two consumers today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadioSurface {
+    Cli,
+    Panel,
+}
+
+impl RadioSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            RadioSurface::Cli => "cli",
+            RadioSurface::Panel => "panel",
+        }
+    }
+}
+
+/// How much of the raw source text wall 4's flow record carries — mirrors
+/// `dispatch.tool`'s own `args` cap (512 chars, FLOW_SCHEMA 1.16.0) so one
+/// long paste into the panel doesn't blow up a flow record. Counted in
+/// `char`s (not bytes), matching every other length-cap convention in this
+/// codebase (`crate::dispatch::capped_prompt` counts `chars().count()`
+/// too), so a multi-byte-heavy message isn't capped more aggressively than
+/// an ASCII one of the same visible length.
+const SOURCE_TEXT_RECORD_CAP: usize = 512;
+
+/// [`route`] PLUS wall 4's flow record — the ONE place both consumers of
+/// this module (`src/radio_cli.rs`'s CLI verb; `src/acp.rs`'s ACP no-slash
+/// channel) go through, so the record is written exactly once per
+/// invocation regardless of which surface it came from ("emit from the
+/// shared core, once" — issue #1698's Packet B carry-list item 2).
+///
+/// The record carries the source text (capped, see
+/// [`SOURCE_TEXT_RECORD_CAP`]), the chosen command id + args on a
+/// [`RouteDecision::Route`], or the refusal reason on a
+/// [`RouteDecision::Refuse`] — emitted AFTER the decision is known (a
+/// single record per invocation, not a start/complete bookend pair: the
+/// underlying model call already gets its own `dispatch.start`/
+/// `dispatch.complete` bookends via [`dispatch_router_call`]'s
+/// `dispatch_routed_via` call, so this is a HIGHER-LEVEL record about the
+/// routing OUTCOME, not a second liveness pair for the same call — the
+/// same "outer record wraps an inner dispatch's own bookends" shape
+/// `mission_propose.rs`'s `mission.compile.start`/`.complete` uses around
+/// its own `dispatch_routed` call).
+pub fn route_and_record(
+    text: &str,
+    catalog: &[CatalogEntry],
+    surface: RadioSurface,
+    call: &mut ModelCall<'_>,
+) -> RouteDecision {
+    let decision = route(text, catalog, call);
+    emit_route_record(text, surface, &decision);
+    decision
+}
+
+/// Build + write wall 4's flow record for one routed invocation. Best-
+/// effort — a flow-write failure (e.g. an unwritable flows dir) must never
+/// turn a successful route into a failed one, so the `Result` from
+/// `crate::flow::record` is intentionally discarded here, same posture
+/// every other flow-record emission site in this codebase takes.
+fn emit_route_record(text: &str, surface: RadioSurface, decision: &RouteDecision) {
+    let truncated: String = text.chars().take(SOURCE_TEXT_RECORD_CAP).collect();
+    let mut payload = serde_json::json!({
+        "surface": surface.as_str(),
+        "source_text": truncated,
+    });
+    match decision {
+        RouteDecision::Route { command, args } => {
+            payload["decision"] = serde_json::json!("route");
+            payload["command"] = serde_json::json!(command);
+            payload["args"] = serde_json::json!(args);
+        }
+        RouteDecision::Refuse { reason } => {
+            payload["decision"] = serde_json::json!("refuse");
+            payload["reason"] = serde_json::json!(reason);
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let synth_session_id = crate::types::session_id::session_id("radio", &nanos.to_string(), "");
+    let record = crate::crew::dispatch::build_dispatch_record_with_payload(
+        crate::flow::Level::Info,
+        "radio.route",
+        "radio-router",
+        &synth_session_id,
+        None,
+        None,
+        None,
+        Some(payload),
+    );
+    let _ = crate::flow::record(record);
+}
+
 /// Assemble the routing seat's USER message (the routing seat's SYSTEM
 /// prompt is the frozen `radio-router.md`, loaded by the dispatch
 /// machinery, not built here). Byte-locked by
@@ -311,17 +409,37 @@ fn extract_json(raw: &str) -> Option<serde_json::Value> {
 
 /// Return the content of the first ```json-tagged fenced block (falling
 /// back to the first bare ``` fence when no tagged opener exists anywhere),
-/// or `None` when no CLOSED fence is found at all. Deliberately simpler
-/// than `mission_propose.rs::extract_json_block` (no "unterminated"
-/// distinction — this module's caller only needs "did we get JSON or not,"
-/// and an unterminated block naturally fails the JSON parse in
-/// [`extract_json`]'s bare-parse fallback too).
+/// or `None` when no CLOSED fence is found at all, OR (see the strictness
+/// note below) a SECOND fence opener follows the first block's close.
+/// Deliberately simpler than `mission_propose.rs::extract_json_block` (no
+/// "unterminated" distinction — this module's caller only needs "did we
+/// get JSON or not," and an unterminated block naturally fails the JSON
+/// parse in [`extract_json`]'s bare-parse fallback too).
 ///
 /// Substring search over the whole response, not a line-by-line scan — a
 /// small model that emits the fence and its content on ONE physical line
 /// (`` ```json {"command": "x"} ``` `` with no newlines at all) still
 /// extracts correctly, since the opener and closer are found by byte
 /// position rather than by which line they're on.
+///
+/// **Fence-extraction strictness (#1698 Packet B carry-list item 4):
+/// REFUSE-ON-MULTIPLE-BLOCKS, not first-fence-wins.** If ANY further
+/// `` ``` `` sequence appears after the first block's own closing fence,
+/// this returns `None` rather than silently treating the first block as
+/// authoritative. Why refuse rather than pick the first: the router's own
+/// system prompt (`templates/builtin/roles/radio-router.md`) instructs
+/// "Emit exactly one fenced `json` block and no prose outside it" — a
+/// response carrying a second block already violated that contract, and
+/// picking one anyway is a GUESS about which the model actually meant.
+/// The router's own rules already name the correct response to any
+/// uncertainty ("When in doubt, refuse... Refusing is always the safer
+/// answer") — a response that can't even follow its own output-shape
+/// instruction is the same class of uncertainty, and wall 6 (fail closed)
+/// treats every uncertain case identically. `None` here routes through
+/// [`extract_json`]'s bare-JSON fallback, which a multi-block response
+/// (fences + surrounding text) will not satisfy either, so the net effect
+/// is a genuine "the routing seat's response wasn't valid JSON" refusal —
+/// no separate error path needed for this case.
 fn extract_fenced_json_block(raw: &str) -> Option<String> {
     let (open_idx, tag_len) = if let Some(i) = raw.find("```json") {
         (i, "```json".len())
@@ -333,6 +451,10 @@ fn extract_fenced_json_block(raw: &str) -> Option<String> {
     };
     let after_open = &raw[open_idx + tag_len..];
     let close_rel = after_open.find("```")?;
+    let after_close = &after_open[close_rel + "```".len()..];
+    if after_close.contains("```") {
+        return None;
+    }
     Some(after_open[..close_rel].to_string())
 }
 
@@ -366,15 +488,7 @@ pub fn dispatch_router_call(message: &str) -> Result<String> {
         workdir: None,
         phase_id: None,
         // A system-level utility dispatch; local-only (`machine: None`
-        // never routes to the fleet queue — #309, #1405). Whether the LOCAL
-        // dispatch itself runs through the internal Docker-bounded runtime
-        // or the lighter container-free single-shot path is decided by
-        // `dispatch_internal::container_path_required`, not by anything
-        // set here: because `radio-router`'s `tool_palette.allow` is empty
-        // (it wants no tools), a profile that resolves to a REMOTE endpoint
-        // takes the lighter `dispatch_remote` path automatically — unlike
-        // `mission-compiler`, whose non-empty `tool_palette.allow: ["read"]`
-        // always forces the container path regardless of profile.
+        // never routes to the fleet queue — #309, #1405).
         machine: None,
         wait: true,
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
@@ -389,7 +503,22 @@ pub fn dispatch_router_call(message: &str) -> Result<String> {
         model_base_url_override: None,
         step_id: None,
     };
-    let result = crate::fleet::dispatch_routed(opts)?;
+    // (#1698 Packet B — the container-path fix the issue's live dogfood
+    // comment named: "the route rides the FULL internal-runtime container
+    // dispatch ... for a tool-less single-shot — the routing seat should
+    // take a direct single-shot HTTP path.") `dispatch_routed_via` (not the
+    // plain `dispatch_routed` Packet A used) takes a caller-injected LOCAL
+    // execution primitive — the exact substitution seam #1509 built for
+    // `dispatch_as_crew_of_one` — so this swaps in
+    // `crate::crew::dispatch::dispatch_local_single_shot` (a container-free
+    // HTTP call straight to LMStudio, #1135-safe residency included) in
+    // place of the ordinary `crate::crew::dispatch::dispatch` (full
+    // internal-runtime container spin). `opts.machine` stays `None` above,
+    // so this is always the LOCAL fall-through — never a fleet-queue
+    // publish — and `dispatch_local_single_shot` itself falls back to the
+    // light REMOTE path automatically when the resolved profile targets a
+    // hosted endpoint (see its own doc), same as before this change.
+    let result = crate::fleet::dispatch_routed_via(opts, crate::crew::dispatch::dispatch_local_single_shot)?;
     Ok(result.stdout)
 }
 
@@ -441,19 +570,38 @@ mod tests {
 
     #[test]
     fn radio_router_role_prompt_matches_frozen_golden() {
-        // A LITERAL duplicate of `templates/builtin/roles/radio-router.md`,
-        // not an `include_str!` of the same file — the latter would compare
-        // the file against itself (both sides re-resolve to the identical
-        // bytes at compile time), so editing the file could never fail this
-        // test. A real byte-lock (contract 6: "'Frozen' means one hash, not
-        // one intention") needs a SECOND, independently-typed copy that a
-        // future edit to the file has to consciously update here too —
-        // mirrors `darkmux-lab`'s `verify_prompt_matches_frozen_golden`
-        // pattern (a literal `VERIFY_TAIL_INSTRUCTION` constant), not
+        // A LITERAL duplicate of `templates/builtin/roles/radio-router.md`
+        // — independently typed here so editing the file can't silently
+        // avoid failing this test (contract 6: "'Frozen' means one hash,
+        // not one intention"). Mirrors `darkmux-lab`'s
+        // `verify_prompt_matches_frozen_golden` pattern (a literal
+        // `VERIFY_TAIL_INSTRUCTION` constant), not
         // `build_router_message_matches_frozen_golden` above (which is
         // already a literal, since it's asserting THIS module's own
         // assembly function against a hand-written expected string, not
         // re-reading a file).
+        //
+        // (#1698 Packet B carry-list item 3, #1701's merge-gate finding —
+        // "observed live" against an operator's own persona override) this
+        // is compared against an `include_str!` of the SHIPPED template
+        // directly, NEVER `crate::crew::loader::role_prompt("radio-router")`.
+        // `role_prompt` resolves the SAME operator-tier-override-wins
+        // precedence every dispatch honors (`~/.darkmux/crew/roles/
+        // radio-router.md`, loader-preferred over the embedded default —
+        // see the issue's own "RADIO's persona" comment, which documents
+        // exactly this override as the delivery mechanism for the
+        // operator's TARS persona) — a golden test that resolved through
+        // that precedence would spuriously fail on any machine carrying a
+        // persona override, exactly what happened live: the override is
+        // sovereign operator config (CLAUDE.md's "operator sovereignty"),
+        // not a test failure. `include_str!` of the literal shipped path
+        // bypasses the override entirely, so this test verifies the
+        // SHIPPED artifact stays byte-locked regardless of what any given
+        // machine has layered on top of it.
+        const SHIPPED_TEMPLATE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/templates/builtin/roles/radio-router.md"
+        ));
         let expected = "# Radio Router\n\
             \n\
             You take one short message from the user and decide which of a fixed list of commands it maps onto, if any.\n\
@@ -488,12 +636,14 @@ mod tests {
             - When in doubt, refuse. A wrong refusal costs the user one extra step; a wrong route runs the wrong command. Refusing is always the safer answer.\n\
             - `args` is free text — copy the user's own words that follow the command's intent, don't paraphrase or summarize them. Use an empty string when there is nothing left to carry over.\n\
             - Choose at most ONE command. Never chain commands, never describe a sequence of steps, never answer the message yourself — you are only choosing one existing command or declining, nothing else.\n";
-        let loaded = crate::crew::loader::role_prompt("radio-router")
-            .expect("radio-router must have an embedded .md prompt");
         assert_eq!(
-            loaded, expected,
-            "radio-router.md drifted from the frozen model-facing text (contract 6) — a \
-             deliberate edit updates both this golden and the file together"
+            SHIPPED_TEMPLATE, expected,
+            "templates/builtin/roles/radio-router.md drifted from the frozen model-facing \
+             text (contract 6) — a deliberate edit updates both this golden and the file \
+             together. (Compared against the SHIPPED template directly, not through \
+             `crate::crew::loader::role_prompt`, which would resolve an operator's own \
+             persona override at `~/.darkmux/crew/roles/radio-router.md` instead — see this \
+             test's own doc.)"
         );
     }
 
@@ -608,6 +758,38 @@ mod tests {
         // (opener and closer on the same "line" never matched the
         // "everything after the opener line" loop).
         let raw = "```json {\"command\": \"pr-list\", \"args\": \"\"} ```";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        assert_eq!(decision, RouteDecision::Route { command: "pr-list".to_string(), args: String::new() });
+    }
+
+    /// (#1698 Packet B carry-list item 4 — fence extraction strictness)
+    /// REFUSE-ON-MULTIPLE-BLOCKS: a response carrying a SECOND fenced json
+    /// block after the first one closes must refuse, never silently pick
+    /// the first block as authoritative — the model's own instructions
+    /// promise exactly one block, and a response that breaks that promise
+    /// is exactly the "in doubt" case wall 6 exists to fail closed on.
+    #[test]
+    fn validate_router_output_multiple_fenced_json_blocks_refuses() {
+        let raw = "```json\n{\"command\": \"pr-list\", \"args\": \"\"}\n```\n\
+                   On second thought:\n\
+                   ```json\n{\"command\": \"review\", \"args\": \"\"}\n```";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        match decision {
+            RouteDecision::Refuse { reason } => assert!(reason.contains("valid JSON"), "{reason}"),
+            other => panic!(
+                "a response carrying more than one fenced json block must refuse, never guess \
+                 which is authoritative: {other:?}"
+            ),
+        }
+    }
+
+    /// The inverted case (red-prove discipline): a SINGLE fenced block
+    /// followed by ordinary trailing prose — no second fence anywhere —
+    /// must still extract and route normally. Proves the strictness above
+    /// fires on a genuine second BLOCK, not on any trailing text at all.
+    #[test]
+    fn validate_router_output_single_fenced_json_block_with_trailing_prose_still_routes() {
+        let raw = "```json\n{\"command\": \"pr-list\", \"args\": \"\"}\n```\nHope that helps!";
         let decision = validate_router_output(raw, &fixture_catalog());
         assert_eq!(decision, RouteDecision::Route { command: "pr-list".to_string(), args: String::new() });
     }
