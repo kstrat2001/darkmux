@@ -458,7 +458,13 @@ async fn execute_route_plan(
 /// own TARS-persona role override, when one is installed, speaks here
 /// exactly as it does on the CLI; see `radio-router.md`'s own doc on "the
 /// voice may only live where prose already lives") followed by the live
-/// command listing, mirroring `radio_cli.rs::run`'s own refusal rendering.
+/// command listing — same TWO-PART SHAPE `radio_cli.rs::run`'s own refusal
+/// rendering uses (reason, then listing), though the listing's own wording
+/// differs: this panel path reuses `acp_panel::not_a_command_message`
+/// ("darkmux acp doesn't recognize that as a command. Available commands:
+/// …"), while the CLI's `advertised_list_message` is plainer ("Available
+/// commands: …") — each surface's EXISTING listing helper, not a new
+/// third rendering invented for this channel.
 ///
 /// **Never blocks other sessions:** the routing dispatch itself
 /// (`router_call` — `crate::radio::dispatch_router_call` in production,

@@ -423,24 +423,36 @@ fn extract_json(raw: &str) -> Option<serde_json::Value> {
 /// position rather than by which line they're on.
 ///
 /// **Fence-extraction strictness (#1698 Packet B carry-list item 4):
-/// REFUSE-ON-MULTIPLE-BLOCKS, not first-fence-wins.** If ANY further
-/// `` ``` `` sequence appears after the first block's own closing fence,
-/// this returns `None` rather than silently treating the first block as
-/// authoritative. Why refuse rather than pick the first: the router's own
-/// system prompt (`templates/builtin/roles/radio-router.md`) instructs
-/// "Emit exactly one fenced `json` block and no prose outside it" — a
-/// response carrying a second block already violated that contract, and
-/// picking one anyway is a GUESS about which the model actually meant.
-/// The router's own rules already name the correct response to any
-/// uncertainty ("When in doubt, refuse... Refusing is always the safer
-/// answer") — a response that can't even follow its own output-shape
-/// instruction is the same class of uncertainty, and wall 6 (fail closed)
-/// treats every uncertain case identically. `None` here routes through
-/// [`extract_json`]'s bare-JSON fallback, which a multi-block response
-/// (fences + surrounding text) will not satisfy either, so the net effect
-/// is a genuine "the routing seat's response wasn't valid JSON" refusal —
-/// no separate error path needed for this case.
+/// REFUSE-ON-MULTIPLE-BLOCKS, not first-fence-wins.** If more than one
+/// fenced block appears ANYWHERE in the response — before OR after the
+/// block this function would otherwise extract — this returns `None`
+/// rather than silently treating one block as authoritative. Checked by
+/// TOTAL fence-delimiter count (every `` ``` `` — tagged or bare — is
+/// exactly one delimiter; a single well-formed block has exactly two:
+/// its opener and its closer), not by scanning only the text AFTER the
+/// first recognized block — an earlier version of this check only looked
+/// forward from the first ` ```json`/` ```` opener it found, which missed
+/// a block that came BEFORE it (e.g. a bare ` ``` ` scratch/reasoning
+/// fence followed by the real ` ```json ` answer) — a real gap a fresh
+/// review caught, not a hypothetical. Why refuse rather than pick one: the
+/// router's own system prompt (`templates/builtin/roles/radio-router.md`)
+/// instructs "Emit exactly one fenced `json` block and no prose outside
+/// it" — a response carrying a second block anywhere already violated
+/// that contract, and picking one anyway is a GUESS about which the model
+/// actually meant. The router's own rules already name the correct
+/// response to any uncertainty ("When in doubt, refuse... Refusing is
+/// always the safer answer") — a response that can't even follow its own
+/// output-shape instruction is the same class of uncertainty, and wall 6
+/// (fail closed) treats every uncertain case identically. `None` here
+/// routes through [`extract_json`]'s bare-JSON fallback, which a
+/// multi-block response (fences + surrounding text) will not satisfy
+/// either, so the net effect is a genuine "the routing seat's response
+/// wasn't valid JSON" refusal — no separate error path needed for this
+/// case.
 fn extract_fenced_json_block(raw: &str) -> Option<String> {
+    if raw.matches("```").count() > 2 {
+        return None;
+    }
     let (open_idx, tag_len) = if let Some(i) = raw.find("```json") {
         (i, "```json".len())
     } else if let Some(i) = raw.find("```JSON") {
@@ -451,29 +463,29 @@ fn extract_fenced_json_block(raw: &str) -> Option<String> {
     };
     let after_open = &raw[open_idx + tag_len..];
     let close_rel = after_open.find("```")?;
-    let after_close = &after_open[close_rel + "```".len()..];
-    if after_close.contains("```") {
-        return None;
-    }
     Some(after_open[..close_rel].to_string())
 }
 
 /// The production [`ModelCall`] implementation — ONE single-shot dispatch to
-/// the `radio-router` role via `crate::fleet::dispatch_routed`, the SAME
-/// mechanism `src/mission_propose.rs::dispatch_compiler` uses (no new
-/// dispatch path). `dispatch_routed` itself emits the `dispatch.start`/
+/// the `radio-router` role via `crate::fleet::dispatch_routed_via(opts,
+/// crate::crew::dispatch::dispatch_local_single_shot)` (#1698 Packet B —
+/// updated from Packet A's plain `dispatch_routed`, which rode the full
+/// internal-runtime container for a tool-less single-shot; see
+/// `dispatch_local_single_shot`'s own doc for the container-free path).
+/// The underlying primitive still emits the `dispatch.start`/
 /// `dispatch.complete` flow-record bookends (contract 2, dispatch
 /// liveness) — no additional bookend is added here, unlike
-/// `dispatch_compiler`'s extra `mission.compile.*` pair, since Packet A has
-/// no higher-level record vocabulary of its own yet (deferred to Packet B
-/// alongside the panel's provenance rendering — wall 4 in the issue's
-/// safety design).
+/// `dispatch_compiler`'s extra `mission.compile.*` pair. Wall 4's own
+/// flow record (source text + chosen route/refusal + surface) is a
+/// SEPARATE, higher-level record — see [`route_and_record`]/
+/// [`emit_route_record`] above, which now exists (Packet B landed it in
+/// this same module, not deferred any further).
 ///
 /// `timeout_seconds: 300` — a deliberately BOUNDED ceiling for a
 /// bounded-classification dispatch (well under `dispatch_compiler`'s 600s,
 /// which budgets for a much larger structured-proposal task). Not yet
-/// operator-tunable; Packet B's staffing config is where that knob would
-/// land per this module's own doc.
+/// operator-tunable; the `radio` config block (Packet B2, not this packet)
+/// is where that knob would land.
 pub fn dispatch_router_call(message: &str) -> Result<String> {
     let opts = crate::crew::dispatch::DispatchOpts {
         role_id: "radio-router".to_string(),

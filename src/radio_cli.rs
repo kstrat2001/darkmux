@@ -176,10 +176,14 @@ fn spawn_review_launch(config_id: &str, args: &str) -> Result<i32> {
         cmd.args(["--param", &format!("args={args}")]);
     }
     println!("radio: launching `{config_id}` …");
-    let status = cmd
-        .status()
-        .with_context(|| format!("spawning `darkmux mission launch {config_id}`"))?;
+    let status = cmd.status();
+    // Clean up the diff tempfile on EVERY exit path, including a failed
+    // spawn (fresh-review finding: a bare `?` before this line would have
+    // left the diff behind in `$TMPDIR` on that path — `run_review`'s own
+    // async cleanup has the same "always, not just on success" shape via
+    // its own unconditional `tokio::fs::remove_file` after `child.wait()`).
     let _ = std::fs::remove_file(&params.diff_path);
+    let status = status.with_context(|| format!("spawning `darkmux mission launch {config_id}`"))?;
     Ok(status.code().unwrap_or(1))
 }
 

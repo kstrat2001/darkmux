@@ -1790,6 +1790,18 @@ fn dispatch_remote(
 /// [`dispatch`]'s own remote branch) — a caller wanting the bench-
 /// consistent container substrate should call [`dispatch`] directly, not
 /// this container-free primitive.
+///
+/// **`opts.json` is also NOT honored (fresh-review finding, named rather
+/// than silently gapped).** [`dispatch_remote`] builds the `{"result":
+/// "stop", "final_assistant": ..., "metrics": {...}}` envelope when
+/// `opts.json` is set; this function always returns the bare completion
+/// text in `stdout`, regardless of `opts.json`. `radio-router` (this
+/// packet's own caller) sets `json: false`, so this doesn't bite in
+/// practice today — but a FUTURE caller of this general primitive that
+/// sets `json: true` would silently get plain text with no error, not the
+/// envelope it asked for. Wiring the envelope is a small, well-scoped
+/// follow-up when a real second caller needs it; left unbuilt here rather
+/// than adding speculative shape for a consumer that doesn't exist yet.
 pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
     crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
@@ -1836,6 +1848,20 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     } else {
         role_prompt
     };
+    // (#147, fresh-review finding) Operator-identity augmentation — this
+    // function's execution has ALREADY established, by reaching this line,
+    // that the resolved brain is LOCAL (a remote resolution returned above
+    // via `dispatch_remote`), so `identity_augmentation_allowed`'s own
+    // remote-vs-local gate is trivially satisfied here; called
+    // unconditionally rather than re-deriving that already-settled check.
+    // Load-bearing, not cosmetic: `radio-router` was TOOL-LESS pre-#1698
+    // Packet B too, so it already rode `dispatch()`'s CONTAINER path (every
+    // tool-less local dispatch is augmented there — `identity_augmentation_
+    // allowed` has no specialist/utility carve-out, only remote-vs-local).
+    // Wiring this LIGHTER path without it would have been a silent
+    // behavior regression for radio-router's live production dispatch, not
+    // just an omission for some hypothetical future caller.
+    let system_prompt = crate::dispatch::augment_prompt_with_identity(&system_prompt);
 
     // (#1135-safe) Resolves the profile's model AND ensures it's loaded at
     // the profile's declared n_ctx — the same path the container dispatch
