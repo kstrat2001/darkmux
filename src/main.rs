@@ -12,6 +12,9 @@ use clap::Parser;
 mod cli;
 use cli::*;
 
+// SPIKE (#1388) — `darkmux acp`. See src/acp.rs module docs.
+mod acp;
+
 // #463 workspace split — crew extracted to its own crate (the velocity-debt
 // target: touching dispatch_internal.rs now rebuilds only darkmux-crew + the
 // binary stub). Re-export keeps crate::crew::* resolving for the binary +
@@ -173,6 +176,8 @@ fn run(cmd: Cmd) -> Result<i32> {
             serve::run(port, bind, flows_dir, lab_dir)?;
             Ok(0)
         }
+        // SPIKE (#1388) — see src/acp.rs module docs.
+        Cmd::Acp => acp::run(),
     }
 }
 

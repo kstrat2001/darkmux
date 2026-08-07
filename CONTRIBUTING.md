@@ -57,7 +57,7 @@ render it. `cargo build -p darkmux-serve` + restart the daemon is the loop;
 
 ## Code style
 
-- Rust 2021 edition, MSRV 1.80
+- Rust 2021 edition, MSRV 1.88 (raised from 1.80 by `agent-client-protocol` 2.0.0 — see the root `Cargo.toml`'s `rust-version` comment)
 - `cargo fmt` before every commit
 - `cargo clippy` clean (warnings tolerated in legacy dead-code paths; new warnings in changed files must be fixed)
 - Single-purpose PRs

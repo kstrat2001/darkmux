@@ -22,7 +22,12 @@ license = "MIT"
 homepage = "https://darkmux.com"
 repository = "https://github.com/kstrat2001/darkmux"
 authors = ["Kain Osterholt"]
-rust-version = "1.80"
+# (#1388) Raised 1.80 -> 1.88 to take `agent-client-protocol` 2.0.0, which
+# requires 1.88. Left at 1.80, cargo silently resolved the dep DOWN to 1.0.1
+# instead of failing — a stale MSRV doesn't hold a line, it just quietly
+# picks older dependencies for you. This is the true minimum that builds,
+# not the newest toolchain on the dev box.
+rust-version = "1.88"
 
 [[bin]]
 name = "darkmux"
@@ -44,7 +49,12 @@ darkmux-serve = { path = "crates/darkmux-serve" }
 anyhow = "1.0"
 axum = "0.7"
 clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util"] }
+# "process" added for the `darkmux acp` SPIKE (#1388) — it shells out to a
+# `darkmux mission launch review` subprocess (tokio::process::Command)
+# rather than calling the review pipeline in-process, since ACP's wire
+# transport IS stdout and the review pipeline prints to it. See
+# src/acp.rs module docs.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util", "process"] }
 tokio-stream = "0.1"
 futures = "0.3"
 tower-http = { version = "0.5", features = ["cors"] }
@@ -77,6 +87,7 @@ blake3 = "1.5"
 # and parsed by serde_json). `default-features = false` keeps the
 # dep-set discipline this project values.
 ureq = { version = "2.10", default-features = false }
+agent-client-protocol = "2.0.0"
 
 [dev-dependencies]
 # #463 — enable flow's test-only helpers (isolate_test_env_once) for the
