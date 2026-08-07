@@ -99,6 +99,14 @@ assert_cmd = "2.0"
 tower = "0.5"
 predicates = "3.1"
 serial_test = "3.1"
+# (#1698 Packet B) dev-only: bridges `tokio::io::duplex()`'s halves (tokio
+# AsyncRead/AsyncWrite) into `futures::AsyncRead`/`AsyncWrite`, which
+# `agent_client_protocol::ByteStreams` requires — the in-process transport
+# `src/acp.rs`'s pipe-level tests use instead of a real stdio subprocess.
+# Test-only (never shipped in the release binary); avoided hand-rolling the
+# Pin/Poll forwarding shim (not a "small one-off need" — subtle to get
+# right) in favor of the well-tested official companion crate.
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [profile.release]
 opt-level = 3

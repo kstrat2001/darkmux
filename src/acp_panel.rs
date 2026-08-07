@@ -128,18 +128,38 @@ pub fn not_a_command_message(commands: &[PanelCommand]) -> String {
     format!("darkmux acp doesn't recognize that as a command. Available commands: {list}.")
 }
 
-/// Split a raw prompt into `(command name, raw args)`. Strips a leading
-/// `/` when present but tolerates the no-slash form too (matching the
-/// pre-#1684 spike's own `/review`-or-`review` leniency); the first
-/// whitespace-delimited word, LOWERCASED (mission-config ids are
-/// conventionally lowercase-kebab, and the pre-#1684 spike itself
-/// lowercased — `/Review` must still resolve), is the command name;
-/// everything after it (trimmed, case PRESERVED) is the raw args string
-/// forwarded verbatim to whichever route the command resolves to. `None`
-/// for empty/whitespace-only text.
+/// Split a raw prompt into `(command name, raw args)` — **the mode bit**
+/// (issue #1698, "the slash becomes the mode bit"). Matches ONLY when the
+/// first non-whitespace character is a literal `/`; anything else,
+/// including empty/whitespace-only text, is `None`.
+///
+/// **Bare-word invocation is RETIRED (#1698 Packet B, "retired in the same
+/// change" as the no-slash interpreted channel).** Before this change, a
+/// leading slash was optional (matching the pre-#1684 spike's own
+/// `/review`-or-`review` leniency) — harmless while unmatched no-slash text
+/// hit a plain help wall, but load-bearing-wrong the instant free text
+/// gains meaning: with the no-slash interpreted channel now live
+/// (`src/acp.rs`'s `run_no_slash_route`), a bare command name racing
+/// against sentence-shaped text would be genuinely ambiguous — is
+/// `"review this with me when you have a sec"` a slash-optional command
+/// invocation (first token `review` happens to match) or a sentence the
+/// interpreted channel should route? **Empirically confirmed live** (this
+/// packet's own investigation, piping `darkmux acp` directly): under the
+/// PRE-fix parser, that exact sentence matched `review` as a bare command
+/// and launched the full review pipeline — the ambiguity this retirement
+/// closes is not hypothetical. `/x` is now law (exact, zero
+/// interpretation); no slash is always the interpreted channel's to
+/// classify, never a pattern match.
+///
+/// The first whitespace-delimited word after the slash, LOWERCASED
+/// (mission-config ids are conventionally lowercase-kebab, and the
+/// pre-#1684 spike itself lowercased — `/Review` must still resolve), is
+/// the command name; everything after it (trimmed, case PRESERVED) is the
+/// raw args string forwarded verbatim to whichever route the command
+/// resolves to.
 pub fn parse_command(text: &str) -> Option<(String, String)> {
     let trimmed = text.trim();
-    let without_slash = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    let without_slash = trimmed.strip_prefix('/')?;
     if without_slash.is_empty() {
         return None;
     }
@@ -282,7 +302,7 @@ pub fn run_ephemeral(
     args: &str,
     cwd: &Path,
     gate: Option<&mut crate::crew::gate::GateHandler<'_>>,
-) -> Result<String> {
+) -> Result<EphemeralOutcome> {
     let mut config = config.clone();
     inject_panel_args_task_if_referenced(&mut config, args);
 
@@ -472,24 +492,33 @@ fn apply_default_cwd(steps: &mut BTreeMap<String, Step>, cwd: &Path) {
     }
 }
 
-/// The two literal prefixes [`render_ephemeral_result`] returns its
-/// business-logic FAILURE messages under — as `Ok(String)`, since
-/// `run_ephemeral`'s own contract has no separate structured pass/fail
-/// signal and the ACP panel surface just displays whichever string comes
-/// back. `pub` (#1698 Packet A) so `src/radio_cli.rs`'s CLI verb, which DOES
-/// have a real exit code to decide, can recognize the same two shapes
-/// without re-deriving or copy-pasting the literals — one place names what
-/// "the ephemeral run failed" looks like as text.
-pub const EPHEMERAL_FAILURE_PREFIX: &str = "darkmux: command failed";
-pub const EPHEMERAL_INCOMPLETE_PREFIX: &str = "darkmux: command did not reach";
-
-/// `true` iff `output` (an `Ok(String)` from [`run_ephemeral`]) is one of
-/// [`render_ephemeral_result`]'s two business-logic FAILURE renderings,
-/// rather than a genuine success. See those constants' own doc for why this
-/// exists — the small, documented coupling a caller with a real exit code
-/// (`src/radio_cli.rs`) needs, without a second copy of the literals.
-pub fn ephemeral_output_is_failure(output: &str) -> bool {
-    output.starts_with(EPHEMERAL_FAILURE_PREFIX) || output.starts_with(EPHEMERAL_INCOMPLETE_PREFIX)
+/// [`run_ephemeral`]'s result: the rendered TEXT (identical rendering to
+/// the pre-#1698-Packet-B `Ok(String)` contract — every caller that only
+/// ever displayed the string, `src/acp.rs`'s ACP panel path, keeps
+/// byte-identical output) PLUS a real typed success/failure signal.
+///
+/// **Retires the failure-prefix string-sniffing** (#1698 Packet B carry-
+/// list item 5) that used to be the only way a caller with a real exit
+/// code to decide (`src/radio_cli.rs`) could tell success from failure:
+/// `EPHEMERAL_FAILURE_PREFIX`/`EPHEMERAL_INCOMPLETE_PREFIX`/
+/// `ephemeral_output_is_failure` are gone — `success` is now computed
+/// directly from the scheduler's own typed state in
+/// [`render_ephemeral_result`], not re-derived by matching a literal
+/// prefix on rendered prose.
+///
+/// **Fixes the documented "Known gap" as a direct consequence, not a
+/// separate follow-up:** the terminal step can `Complete` cleanly while a
+/// SIDE branch elsewhere in the graph errored (`report.errored` non-empty)
+/// — the string-sniffing contract COULD NOT distinguish that case from a
+/// genuine clean success (the warning was appended to the SAME
+/// success-shaped text, no distinct prefix), so a caller with a real exit
+/// code silently exited 0 for a partially-failed run. With a real typed
+/// field, [`render_ephemeral_result`] now sets `success: false` for that
+/// case directly — see its own doc.
+#[derive(Debug)]
+pub struct EphemeralOutcome {
+    pub text: String,
+    pub success: bool,
 }
 
 /// The sink task in DOCUMENT order — a task no other task's `depends_on`
@@ -503,20 +532,25 @@ pub fn ephemeral_output_is_failure(output: &str) -> bool {
 /// pre-2.0 document — see `InterpretedGraph`'s doc) — `run_ephemeral`
 /// previously bound and dropped them; every other production caller
 /// (`mission_launch.rs`) prints them, so silently discarding them here was
-/// the one place in the codebase where they went nowhere.
+/// the one place in the codebase where they went nowhere. These are
+/// informational only (never flip `success` to `false` on their own — an
+/// absent `expand.over` collection isn't a run failure) — same for the
+/// multi-sink notice below.
 ///
-/// **A SIDE branch can fail while the terminal step still reports a
-/// success-shaped string** (see the CONSIDER-6 comment further down): a
-/// caller with a real exit code to decide (`src/radio_cli.rs`) sees the
-/// warning appended to the OUTPUT text, not a distinct prefix
-/// [`ephemeral_output_is_failure`] can key on — named here since that
-/// caller can't tell partial-failure from clean success by string alone.
+/// `success` (#1698 Packet B carry-list item 5): `false` for a terminal
+/// step that errored OR never completed, AND (the fixed "Known gap") for a
+/// terminal step that completed cleanly while `report.errored` names a
+/// SIDE branch that failed elsewhere in the graph — `report.errored` is
+/// scheduler-wide, not scoped to the chain that fed the terminal step, so
+/// a clean-looking terminal output over a partially-failed run is exactly
+/// the "silence reads as success" failure this project's own doctrine
+/// (CLAUDE.md's "no blind runs") warns against.
 fn render_ephemeral_result(
     ordered_tasks: &[Task],
     steps: &BTreeMap<String, Step>,
     report: &SchedulerReport,
     interpret_warnings: &[String],
-) -> Result<String> {
+) -> Result<EphemeralOutcome> {
     let referenced: BTreeSet<&str> = ordered_tasks
         .iter()
         .flat_map(|t| t.depends_on.iter().chain(t.reads.iter()))
@@ -543,30 +577,40 @@ fn render_ephemeral_result(
 
     let output = terminal.output.clone().unwrap_or_default();
     if terminal.status == NodeStatus::Error {
-        return Ok(format!("{EPHEMERAL_FAILURE_PREFIX}:\n\n{output}"));
+        return Ok(EphemeralOutcome {
+            text: format!("darkmux: command failed:\n\n{output}"),
+            success: false,
+        });
     }
     if terminal.status != NodeStatus::Complete {
         // The terminal task never completed — its dependency chain
         // stranded on an earlier error (`step_is_ready` never schedules a
         // task whose dependency didn't reach Complete). Name what errored
         // rather than returning an empty/misleading message.
-        return Ok(format!(
-            "{EPHEMERAL_INCOMPLETE_PREFIX} its final step (status: {:?}) — step(s) errored: {}",
-            terminal.status,
-            if report.errored.is_empty() { "(none recorded)".to_string() } else { report.errored.join(", ") }
-        ));
+        return Ok(EphemeralOutcome {
+            text: format!(
+                "darkmux: command did not reach its final step (status: {:?}) — step(s) errored: {}",
+                terminal.status,
+                if report.errored.is_empty() { "(none recorded)".to_string() } else { report.errored.join(", ") }
+            ),
+            success: false,
+        });
     }
 
-    // (#1684 QA finding — CONSIDER 6) The terminal step can `Complete`
-    // cleanly while a SIDE branch (a non-terminal sink, or any other step
-    // off the terminal's own dependency chain) errored — `report.errored`
-    // is scheduler-wide, not scoped to the chain that fed the terminal
-    // step. A clean-looking final message over a partially-failed run is
-    // exactly the "silence reads as success" failure this project's own
-    // doctrine (CLAUDE.md's "no blind runs") warns against; name it.
+    // (#1684 QA finding — CONSIDER 6, fixed by #1698 Packet B carry-list
+    // item 5) The terminal step can `Complete` cleanly while a SIDE branch
+    // (a non-terminal sink, or any other step off the terminal's own
+    // dependency chain) errored — `report.errored` is scheduler-wide, not
+    // scoped to the chain that fed the terminal step. A clean-looking
+    // final message over a partially-failed run is exactly the
+    // "silence reads as success" failure CLAUDE.md's "no blind runs"
+    // warns against; name it in the text AND flip `success` to `false` —
+    // no longer just a warning appended to a success-shaped string.
     let mut warnings: Vec<String> = interpret_warnings.to_vec();
+    let mut success = true;
     if !report.errored.is_empty() {
         warnings.push(format!("step(s) errored elsewhere in the graph: {}", report.errored.join(", ")));
+        success = false;
     }
     if sinks.len() > 1 {
         let other_ids: Vec<&str> = sinks[..sinks.len() - 1].iter().map(|t| t.id.as_str()).collect();
@@ -578,9 +622,12 @@ fn render_ephemeral_result(
         ));
     }
     if warnings.is_empty() {
-        return Ok(output);
+        return Ok(EphemeralOutcome { text: output, success });
     }
-    Ok(format!("{output}\n\n---\n⚠ {}", warnings.join("\n⚠ ")))
+    Ok(EphemeralOutcome {
+        text: format!("{output}\n\n---\n⚠ {}", warnings.join("\n⚠ ")),
+        success,
+    })
 }
 
 #[cfg(test)]
@@ -632,10 +679,30 @@ mod tests {
     #[test]
     fn parse_command_strips_slash_and_splits_name_from_args() {
         assert_eq!(parse_command("/pr-view 42"), Some(("pr-view".to_string(), "42".to_string())));
-        assert_eq!(parse_command("pr-view 42"), Some(("pr-view".to_string(), "42".to_string())));
         assert_eq!(parse_command("/review"), Some(("review".to_string(), String::new())));
         assert_eq!(parse_command("   "), None);
         assert_eq!(parse_command(""), None);
+    }
+
+    /// (#1698 Packet B — the mode bit) The retirement itself: a bare
+    /// command name with NO leading slash must never match, even when it
+    /// spells an advertised command id exactly, and even when it's the
+    /// first word of an otherwise ordinary sentence — the live-repro'd
+    /// ambiguity ("review this with me when you have a sec" routing as a
+    /// bare `review` invocation) this packet's own investigation confirmed
+    /// against the PRE-fix parser. Paired with the test above (a leading
+    /// slash still resolves) so the fix can't regress into "nothing
+    /// matches anymore" either.
+    #[test]
+    fn parse_command_retires_bare_word_invocation() {
+        assert_eq!(parse_command("pr-view 42"), None);
+        assert_eq!(parse_command("review"), None);
+        assert_eq!(
+            parse_command("review this with me when you have a sec"),
+            None,
+            "the exact sentence this retirement's own live investigation confirmed \
+             mis-fired under the pre-fix slash-optional parser"
+        );
     }
 
     // ── is_procedural_only (rule D routing test) ────────────────────────
@@ -902,7 +969,8 @@ mod tests {
         );
         let tmp = std::env::temp_dir();
         let out = run_ephemeral(&cfg, "", &tmp, None).expect("ephemeral run succeeds");
-        assert_eq!(out.trim(), "got: hello-from-producer");
+        assert_eq!(out.text.trim(), "got: hello-from-producer");
+        assert!(out.success);
     }
 
     #[test]
@@ -926,7 +994,8 @@ mod tests {
         // `procedural.noop` with no `output` override defaults to its own
         // step id (see `ProceduralNoopStepKind::run`) — proves the run
         // actually executed, not just that no directory appeared.
-        assert_eq!(out, "s1");
+        assert_eq!(out.text, "s1");
+        assert!(out.success);
 
         let missions_dir = crate::crew::loader::missions_dir();
         let entries: Vec<_> = std::fs::read_dir(&missions_dir).map(|d| d.collect()).unwrap_or_default();
@@ -966,7 +1035,7 @@ mod tests {
         );
         let tmp = std::env::temp_dir();
         let out = run_ephemeral(&cfg, "hello world", &tmp, None).expect("ephemeral run succeeds");
-        assert_eq!(out.trim(), "arg: hello world");
+        assert_eq!(out.text.trim(), "arg: hello world");
     }
 
     #[test]
@@ -993,7 +1062,7 @@ mod tests {
         );
         let tmp = std::env::temp_dir();
         let out = run_ephemeral(&cfg, "", &tmp, None).expect("ephemeral run succeeds");
-        assert_eq!(out.trim(), "arg:[]");
+        assert_eq!(out.text.trim(), "arg:[]");
     }
 
     // ── (#1695 merge-gate finding 1) reserved-id collision ──────────────
@@ -1039,7 +1108,7 @@ mod tests {
         // the collision), the reading task would see THIS value instead
         // of the document's own task output.
         let out = run_ephemeral(&cfg, "this-should-be-ignored", &tmp, None).expect("ephemeral run succeeds, no duplicate-id bail");
-        assert_eq!(out.trim(), "got: operator-owned-value");
+        assert_eq!(out.text.trim(), "got: operator-owned-value");
     }
 
     // ── (#1684 QA finding — CONSIDER 7) validate() runs before interpret ──
@@ -1103,8 +1172,65 @@ mod tests {
         let interpret_warnings = vec!["absent expand.over collection for task foo".to_string()];
 
         let out = render_ephemeral_result(&[t], &steps, &report, &interpret_warnings).expect("renders");
-        assert!(out.contains("done"), "{out}");
-        assert!(out.contains("absent expand.over collection for task foo"), "{out}");
+        assert!(out.text.contains("done"), "{}", out.text);
+        assert!(out.text.contains("absent expand.over collection for task foo"), "{}", out.text);
+        // Informational only (an absent expand.over collection isn't a run
+        // failure) — `success` stays true (#1698 Packet B carry-list item 5).
+        assert!(out.success);
+    }
+
+    /// (#1698 Packet B carry-list item 5 — the "Known gap" fix) A terminal
+    /// step that `Complete`s cleanly while `report.errored` names a SIDE
+    /// branch that failed elsewhere in the graph must report `success:
+    /// false`, not just append a warning to a success-shaped text. Before
+    /// the typed `EphemeralOutcome`, the string-sniffing contract
+    /// (`ephemeral_output_is_failure`) could not distinguish this case from
+    /// a genuine clean success — this is the direct regression test for
+    /// that fix, paired with the inverted case above (no errored steps ->
+    /// `success: true`) so a change that makes EVERY run `false` can't
+    /// silently pass either.
+    #[test]
+    fn render_ephemeral_result_flips_success_false_when_a_side_branch_errored() {
+        let t = Task {
+            id: "t1".to_string(),
+            phase_id: "p1".to_string(),
+            description: String::new(),
+            display_name: None,
+            step_ids: vec!["s1".to_string()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let mut steps = BTreeMap::new();
+        steps.insert(
+            "s1".to_string(),
+            Step {
+                id: "s1".to_string(),
+                task_id: "t1".to_string(),
+                gate: None,
+                kind: "procedural.noop".to_string(),
+                status: NodeStatus::Complete,
+                config: serde_json::Value::Null,
+                started_ts: None,
+                completed_ts: None,
+                output: Some("terminal step's own clean output".to_string()),
+            },
+        );
+        let report = SchedulerReport {
+            errored: vec!["side-branch-step".to_string()],
+            ..SchedulerReport::default()
+        };
+
+        let out = render_ephemeral_result(&[t], &steps, &report, &[]).expect("renders");
+        assert!(
+            !out.success,
+            "a Complete terminal step alongside an errored side branch must not report success"
+        );
+        assert!(out.text.contains("terminal step's own clean output"), "{}", out.text);
+        assert!(out.text.contains("side-branch-step"), "{}", out.text);
     }
 
     // ── (#1684 Packet 2) run_ephemeral + operator sign-off gate ────────
@@ -1161,7 +1287,8 @@ mod tests {
             crate::crew::gate::GateDecision::Approved
         };
         let out = run_ephemeral(&cfg, "", &tmp, Some(&mut approve)).expect("ephemeral run succeeds");
-        assert_eq!(out.trim(), "merged", "an approved gate must let the executor step actually run");
+        assert_eq!(out.text.trim(), "merged", "an approved gate must let the executor step actually run");
+        assert!(out.success);
         assert_eq!(
             received.as_ref().and_then(|f| f.get("gather")).map(|s| s.trim()),
             Some("42 open PRs"),
@@ -1184,7 +1311,8 @@ mod tests {
         // across the ACP boundary.
         let out = run_ephemeral(&cfg, "", &tmp, Some(&mut decline))
             .expect("a declined gate still renders a command-failed message, not an Err");
-        assert!(out.contains("darkmux: command failed"), "{out}");
-        assert!(out.contains("operator declined"), "{out}");
+        assert!(!out.success, "a declined gate must report success: false");
+        assert!(out.text.contains("darkmux: command failed"), "{}", out.text);
+        assert!(out.text.contains("operator declined"), "{}", out.text);
     }
 }

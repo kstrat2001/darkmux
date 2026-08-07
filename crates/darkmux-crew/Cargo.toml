@@ -27,6 +27,13 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 [dev-dependencies]
 tempfile = "3.10"
 serial_test = "3.1"
+# (#1698 Packet B) In-process HTTP mock server for
+# `tests/mock_single_shot_proof.rs` — the SAME crate + version `runtime/`'s
+# own compaction-loop tests and `tools/darkmux-mock-model` already depend
+# on, here used in its plain (non-standalone) in-process mode: no
+# subprocess, no port-polling — `MockServer::start()` returns ready
+# synchronously. Dev-dep only; never in the release binary.
+httpmock = "0.7"
 # (#811) Empty the config tier by construction in crew's TEST build so the
 # inactivity-timeout default-assertion tests assert the built-in 600, not the
 # operator's real runtime.inactivity_timeout_seconds. Dev-dep only; off in the

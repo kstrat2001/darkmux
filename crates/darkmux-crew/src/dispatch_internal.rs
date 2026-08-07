@@ -1745,6 +1745,257 @@ fn dispatch_remote(
     })
 }
 
+/// (#1698 Packet B carry-list item — the container-path fix named in the
+/// issue's live dogfood comment: "the route rides the FULL internal-runtime
+/// container dispatch (image/workspace/out-dir spin) for a tool-less
+/// single-shot — the routing seat should take a direct single-shot HTTP
+/// path.") Container-free single-shot dispatch to a LOCAL LMStudio-loaded
+/// model — a LOCAL peer of [`dispatch_remote`] above, built to replace
+/// `dispatch::dispatch` as the `local_dispatch` primitive
+/// `darkmux_fleet::routing::dispatch_routed_via` takes (the EXACT
+/// substitution seam #1509 built for `dispatch_as_crew_of_one` — see that
+/// function's own doc: "Every caller ... passes the raw `crew::dispatch::
+/// dispatch` primitive ... the CLI verb passes `dispatch_as_crew_of_one`
+/// ... which runs the SAME primitive wrapped in a ... graph"). `src/
+/// radio.rs::dispatch_router_call` is this function's first caller.
+///
+/// Mirrors [`dispatch_remote`]'s shape — bookended `dispatch start`/
+/// `dispatch complete`/`dispatch error` flow records (contract 2, dispatch
+/// liveness), one HTTP call, no agent loop — but resolves + calls a LOCAL
+/// LMStudio model via `crate::single_shot::single_shot_chat` instead of a
+/// remote endpoint's chat-completions URL. Model resolution reuses
+/// [`resolve_dispatch_model_internal`] — the SAME #1135-safe path (loads
+/// the selected model at the profile's DECLARED `n_ctx` before dispatch,
+/// then cross-checks against what's actually resident) the container path
+/// uses, so this lighter path inherits the same JIT-load-at-4096
+/// protection rather than reintroducing that regression class for a
+/// "faster" dispatch.
+///
+/// A resolved profile pointing at a REMOTE endpoint still takes the light
+/// REMOTE path ([`dispatch_remote`]) — this function does not itself speak
+/// to LMStudio unconditionally; it decides local-vs-remote the same way
+/// [`dispatch`] does, just without ever falling through to the container.
+///
+/// **Refuses (`Err`) for a role that grants any tools**
+/// (`role_wants_agentic_remote`) — this primitive has no agent loop and no
+/// container, so a tool-bearing role could never actually use its tools
+/// here; the caller should use the ordinary [`dispatch`] for those.
+/// `radio-router`'s own manifest declares an empty `tool_palette.allow`
+/// (see `src/radio.rs`'s own doc on `dispatch_router_call`), so this
+/// refusal is not expected to fire for its own caller in practice — it's a
+/// safety rail for any FUTURE caller of this primitive with a tool-bearing
+/// role, not a live code path today.
+///
+/// `opts.force_container` is deliberately NOT honored here (unlike
+/// [`dispatch`]'s own remote branch) — a caller wanting the bench-
+/// consistent container substrate should call [`dispatch`] directly, not
+/// this container-free primitive.
+///
+/// **`opts.json` is also NOT honored (fresh-review finding, named rather
+/// than silently gapped).** [`dispatch_remote`] builds the `{"result":
+/// "stop", "final_assistant": ..., "metrics": {...}}` envelope when
+/// `opts.json` is set; this function always returns the bare completion
+/// text in `stdout`, regardless of `opts.json`. `radio-router` (this
+/// packet's own caller) sets `json: false`, so this doesn't bite in
+/// practice today — but a FUTURE caller of this general primitive that
+/// sets `json: true` would silently get plain text with no error, not the
+/// envelope it asked for. Wiring the envelope is a small, well-scoped
+/// follow-up when a real second caller needs it; left unbuilt here rather
+/// than adding speculative shape for a consumer that doesn't exist yet.
+pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
+    darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
+    crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
+        .context("licensed-adjacent role dispatch requires acknowledgment")?;
+
+    let roles = load_roles().context("loading crew roles for internal dispatch")?;
+    let role = roles
+        .iter()
+        .find(|r| r.id == opts.role_id)
+        .ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
+
+    if role_wants_agentic_remote(role) {
+        bail!(
+            "darkmux dispatch: role `{}` grants tools — the container-free single-shot \
+             primitive has no agent loop and cannot serve a tool-bearing role; dispatch \
+             through the ordinary internal-runtime path instead",
+            opts.role_id
+        );
+    }
+
+    // A profile pinned to a remote endpoint still takes the light REMOTE
+    // path — never this function's own local HTTP call, and (per this
+    // function's own doc) never the container either, since the tool-less
+    // check above already ruled out the one case `dispatch()` would force
+    // through the container for a remote target.
+    if let Some((remote_role, system_prompt, pm)) = try_resolve_remote_target(&opts)? {
+        return dispatch_remote(&opts, &remote_role, &system_prompt, &pm);
+    }
+
+    let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
+        anyhow!(
+            "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
+             conventional roles dir, and the embedded table) — single-shot dispatch requires one",
+            opts.role_id,
+            role.prompt_path
+        )
+    })?;
+    let system_prompt = if role.is_specialist() {
+        format!(
+            "{}\n\n{}",
+            load_autonomous_dispatch_preamble().trim_end(),
+            role_prompt
+        )
+    } else {
+        role_prompt
+    };
+    // (#147, fresh-review finding) Operator-identity augmentation — this
+    // function's execution has ALREADY established, by reaching this line,
+    // that the resolved brain is LOCAL (a remote resolution returned above
+    // via `dispatch_remote`), so `identity_augmentation_allowed`'s own
+    // remote-vs-local gate is trivially satisfied here; called
+    // unconditionally rather than re-deriving that already-settled check.
+    // Load-bearing, not cosmetic: `radio-router` was TOOL-LESS pre-#1698
+    // Packet B too, so it already rode `dispatch()`'s CONTAINER path (every
+    // tool-less local dispatch is augmented there — `identity_augmentation_
+    // allowed` has no specialist/utility carve-out, only remote-vs-local).
+    // Wiring this LIGHTER path without it would have been a silent
+    // behavior regression for radio-router's live production dispatch, not
+    // just an omission for some hypothetical future caller.
+    let system_prompt = crate::dispatch::augment_prompt_with_identity(&system_prompt);
+
+    // (#1135-safe) Resolves the profile's model AND ensures it's loaded at
+    // the profile's declared n_ctx — the same path the container dispatch
+    // uses, so this lighter path can't reintroduce the JIT-load-at-4096
+    // regression. `skip_lmstudio_residency` mirrors `dispatch()`'s OWN call
+    // site exactly (`opts.model_base_url_override.is_some()`): an operator
+    // (or a test — see `mock_dispatch_proof.rs`'s own comment on why this
+    // flag exists) pointing this dispatch at a NON-LMStudio base URL has no
+    // real LMStudio instance to probe residency against in the first
+    // place — skipping is both what makes the mock-model harness usable
+    // here and the genuinely correct behavior (checking residency against
+    // the wrong server would be nonsensical, not just untestable).
+    let model_id = resolve_dispatch_model_internal(
+        role,
+        opts.profile_name.as_deref(),
+        opts.config_path.as_deref(),
+        opts.model_base_url_override.is_some(),
+    )?;
+
+    let session_id = opts
+        .session_id
+        .clone()
+        .unwrap_or_else(|| crate::dispatch::fresh_session_id(&opts.role_id));
+    let phase = opts.phase_id.as_deref();
+
+    let mut flow_sink = |r: darkmux_flow::FlowRecord| {
+        let _ = darkmux_flow::record(r);
+    };
+    let role_id_for_abort = opts.role_id.clone();
+    let session_id_for_abort = session_id.clone();
+    let model_for_abort = model_id.clone();
+    let phase_for_abort = phase.map(str::to_string);
+    let on_abort = move |_id: &str, _kind: &str| {
+        crate::dispatch::build_dispatch_record_with_payload(
+            darkmux_flow::Level::Error,
+            "dispatch error",
+            &role_id_for_abort,
+            &session_id_for_abort,
+            Some(&model_for_abort),
+            None,
+            phase_for_abort.as_deref(),
+            Some(serde_json::json!({
+                "runtime": "direct",
+                "result_class": "error",
+                "error": "dispatch terminated before completion (early return or panic)",
+            })),
+        )
+    };
+    let mut bookend = darkmux_flow::BookendGuard::new(&mut flow_sink, on_abort);
+
+    bookend.open(
+        "dispatch",
+        "dispatch",
+        build_remote_record(
+            &opts.role_id,
+            &session_id,
+            &model_id,
+            phase,
+            "dispatch start",
+            serde_json::json!({
+                "runtime": "direct",
+                "prompt": crate::dispatch::capped_prompt(&opts.message),
+                "prompt_chars": opts.message.chars().count(),
+            }),
+        ),
+    );
+
+    let t0 = SystemTime::now();
+    let req = crate::single_shot::SingleShotRequest {
+        base_url: opts.model_base_url_override.as_deref(),
+        model: &model_id,
+        system: &system_prompt,
+        user: &opts.message,
+        // (#1256 dialect note) local single-shot temperature — a bounded
+        // classification task benefits from a low-variance decision, same
+        // spirit as the review pipeline's own probe/judge seats (0.2).
+        temperature: 0.2,
+        max_tokens: opts.max_completion_tokens.unwrap_or(4096),
+        timeout_seconds: opts.timeout_seconds,
+    };
+    let result = crate::single_shot::single_shot_chat(&req);
+    let wall_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
+
+    let reply = match result {
+        Ok(r) => r,
+        Err(e) => {
+            bookend.close(
+                "dispatch",
+                build_remote_record(
+                    &opts.role_id,
+                    &session_id,
+                    &model_id,
+                    phase,
+                    "dispatch error",
+                    serde_json::json!({ "runtime": "direct", "wall_ms": wall_ms, "error": e.to_string() }),
+                ),
+            );
+            return Err(e);
+        }
+    };
+
+    bookend.close(
+        "dispatch",
+        build_remote_record(
+            &opts.role_id,
+            &session_id,
+            &model_id,
+            phase,
+            "dispatch complete",
+            serde_json::json!({
+                "result_class": "ok",
+                "exit_code": 0,
+                "runtime": "direct",
+                "prompt_tokens": reply.prompt_tokens,
+                "completion_tokens": reply.completion_tokens,
+                "total_tokens": reply.total_tokens,
+                "total_turns": 1,
+                "total_tools": 0,
+                "total_compactions": 0,
+                "wall_ms": wall_ms,
+                "stdout_chars": reply.content.len(),
+            }),
+        ),
+    );
+
+    Ok(DispatchResult {
+        exit_code: 0,
+        stdout: reply.content,
+        stderr: String::new(),
+        session_id,
+        out_dir: None,
+    })
+}
+
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they

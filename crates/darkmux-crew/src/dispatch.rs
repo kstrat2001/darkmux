@@ -549,6 +549,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     crate::dispatch_internal::dispatch(opts)
 }
 
+/// (#1698 Packet B) Container-free single-shot dispatch entry point — see
+/// `dispatch_internal::dispatch_local_single_shot`'s own doc for the full
+/// contract. A caller-injectable `local_dispatch` primitive for
+/// `fleet::dispatch_routed_via` (the same substitution seam #1509 built
+/// for `dispatch_as_crew_of_one`), never routed across the fleet itself.
+pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
+    crate::dispatch_internal::dispatch_local_single_shot(opts)
+}
+
 /// Outcome of the `dispatch()` routing-decision branch. Extracted as a
 /// pure shape so the (Some(machine), local_machine_id) matrix is
 /// unit-testable without filesystem / env-var setup. (Wave-E.7 #255)
