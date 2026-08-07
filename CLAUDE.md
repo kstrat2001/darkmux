@@ -214,6 +214,8 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | `DARKMUX_RUNTIME_MAX_TURNS` / `DARKMUX_RUNTIME_MAX_TOKENS` | `runtime.max_turns` / `runtime.max_tokens` |
 | `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` (#1221 — per-CALL completion cap, reasoning + content of one turn; unset = the runtime's built-in 10000, which truncates productive reasoning on thinking-family models) | `runtime.max_tokens_per_call` |
 | `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` | `remote.max_tokens_per_execution` (#1260) |
+| `DARKMUX_RADIO_ROUTER_PROFILE` / `DARKMUX_RADIO_ANSWERER_PROFILE` / `DARKMUX_RADIO_HUMOR` (#1698 — the radio interpreter's two seats + the RADIO persona's humor dial) | `radio.router_profile` / `radio.answerer_profile` / `radio.humor` |
+| `DARKMUX_ACP_IDLE_EXIT_MINUTES` (#1684 — `darkmux acp` exits after this long with nothing in flight; `0` disables) | `runtime.acp_idle_exit_minutes` |
 | `DARKMUX_STRICT_SELECTION` / `DARKMUX_CHECK_UPDATES` | `runtime.strict_selection` / `runtime.check_updates` |
 | `DARKMUX_FEEDBACK_INJECTION` | `runtime.feedback_injection` (#1548 — wired: `darkmux_types::config_access::feedback_injection()` resolves the tier host-side and the docker-spawn site in `dispatch_internal.rs` forwards it into the container as `-e DARKMUX_FEEDBACK_INJECTION=<true\|false>`. The runtime crate still can't depend on `config_access` directly — it reads the forwarded env var, same as before #1548 — but the HOST now does the tier resolution and always forwards its result, closing the gap where neither `config.json` nor a host-side `export` ever reached the container). |
 | `DARKMUX_DEFAULT_ROLE` / `DARKMUX_DAEMON_CORS_ORIGINS` | `runtime.default_role` / `runtime.daemon_cors_origins` |

@@ -92,6 +92,8 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.daemon_cors_origins", Ty::Str),
     ("runtime.daemon_auth_enabled", Ty::Bool),
     ("runtime.injected_context_fraction", Ty::Float),
+    // (#1698 Packet B2) The `darkmux acp` process's idle self-exit budget.
+    ("runtime.acp_idle_exit_minutes", Ty::Uint),
     ("fleet.mode", Ty::FleetMode),
     // (#1260) The per-execution remote token allowance for endpoint-staffed
     // crew seats (one pipeline stage = one execution). Tokens, never currency.
@@ -103,6 +105,10 @@ const KEYS: &[(&str, Ty)] = &[
     ("mission.stale_active_days", Ty::Uint),
     // (#1349) The PR-review pipeline's judge-step bounded-concurrency cap.
     ("review.judge_concurrency", Ty::Uint),
+    // (#1698 Packet B2) The radio interpreter's staffing + persona knobs.
+    ("radio.router_profile", Ty::Str),
+    ("radio.answerer_profile", Ty::Str),
+    ("radio.humor", Ty::Uint),
     ("dirs.flows", Ty::Str),
     ("dirs.audit", Ty::Str),
     ("dirs.notebook", Ty::Str),
@@ -220,7 +226,11 @@ fn get_at(path: &Path, key: &str) -> Result<String> {
 }
 
 /// Print the whole config.json (or a hint when there isn't one yet).
-fn list_at(path: &Path) -> Result<String> {
+/// `pub(crate)` (#1698 Packet B2) — the radio answering seat's grounding
+/// assembler (`src/radio_answer.rs`) reuses this AS the "live config
+/// surface" grounding source rather than re-deriving its own read of
+/// `config.json` (single derivation of "what does `config list` show").
+pub(crate) fn list_at(path: &Path) -> Result<String> {
     if !path.exists() {
         return Ok(format!(
             "(no config.json at {} — run `darkmux init` to write the full default config)",

@@ -871,6 +871,7 @@ impl StepKind for MissionCoderStepKind {
             // resolves), so without the step id its live turn+tool climb
             // was unattributable and the seat never ticked.
             step_id: Some(step.id.clone()),
+            system_prompt_override: None,
         };
         let result = crew::dispatch::dispatch(opts)?;
         eprintln!(

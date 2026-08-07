@@ -1,0 +1,18 @@
+{
+  "id": "radio-host",
+  "description": "Specialist-family ANSWERING seat for the `darkmux radio` no-slash channel and CLI verb (#1698 Packet B2). Dispatched only when the ROUTING seat (radio-router) refused a message — reads a per-ask compiled grounding bundle (the command catalog, the live config surface, a compact mission-board summary, the session's recent artifact shelf, and at most one named deep artifact) and answers in prose, in persona. Tool-less, single exchange, no agent loop (wall 5 — the answer seat has no hands): it never dispatches, never reads a file itself, never executes anything — every fact it can cite was already gathered deterministically and handed to it in the message. `role_family: specialist` because the humor A/B (#1698 issue) showed wit is spare capacity a small utility-class model doesn't have; the default staffing is the operator's normal specialist tier, not the compact utility binding.",
+  "skills": [],
+  "tool_palette": {
+    "allow": [],
+    "deny": [
+      "read",
+      "write",
+      "edit",
+      "exec",
+      "process",
+      "update_plan"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation",
+  "role_family": "specialist"
+}

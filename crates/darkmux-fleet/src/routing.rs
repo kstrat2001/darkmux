@@ -684,6 +684,7 @@ mod tests {
             image: None,
             model_base_url_override: None,
             step_id: None,
+            system_prompt_override: None,
         }
     }
 

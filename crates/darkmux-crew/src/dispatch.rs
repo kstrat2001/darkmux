@@ -262,6 +262,22 @@ pub struct DispatchOpts {
     /// `None` for a one-off `dispatch` that isn't a graph step; such records
     /// attribute via `session_id` alone, exactly as before.
     pub step_id: Option<String>,
+    /// (#1698 Packet B2) Use this text as the system prompt VERBATIM instead
+    /// of resolving one via the role's manifest/loader —
+    /// [`dispatch_local_single_shot`]'s only caller today (the RADIO
+    /// answering seat, `src/radio_answer.rs`) needs its persona text
+    /// assembled per-call (a `{{humor}}` placeholder in the role's own
+    /// `.md` template, substituted from `radio.humor` config at assembly
+    /// time) — something the role-manifest loader has no hook for. `Some`
+    /// also SKIPS the specialist preamble
+    /// (`load_autonomous_dispatch_preamble`) `dispatch_local_single_shot`
+    /// would otherwise prepend for a `role_family: specialist` role: an
+    /// override caller is handing over the exact, complete system prompt it
+    /// wants sent, and the preamble's turn-cap/agent-loop guidance is noise
+    /// (or actively misleading) for a tool-less single-exchange dispatch.
+    /// `None` (every existing caller) preserves today's loader-resolved
+    /// behavior exactly.
+    pub system_prompt_override: Option<String>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime
@@ -556,6 +572,19 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 /// for `dispatch_as_crew_of_one`), never routed across the fleet itself.
 pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
     crate::dispatch_internal::dispatch_local_single_shot(opts)
+}
+
+/// (#1698 Packet B2 gate) True when a dispatch with this (role, profile)
+/// would resolve to a remote endpoint — the data-boundary question a caller
+/// that COMPOSES its own payload must answer before assembling it. Fails
+/// closed (unresolvable ⇒ `true`). See
+/// `dispatch_internal::dispatch_resolves_remote`'s own doc.
+pub fn dispatch_resolves_remote(
+    role_id: &str,
+    profile_name: Option<&str>,
+    config_path: Option<&str>,
+) -> bool {
+    crate::dispatch_internal::dispatch_resolves_remote(role_id, profile_name, config_path)
 }
 
 /// Outcome of the `dispatch()` routing-decision branch. Extracted as a

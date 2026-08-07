@@ -290,6 +290,54 @@ pub fn review_judge_concurrency() -> u32 {
         .max(1)
 }
 
+// ── Radio interpreter (#1698 Packet B2) ──
+/// The ROUTING seat's explicit profile override. Resolves
+/// `env(DARKMUX_RADIO_ROUTER_PROFILE) > config.radio.router_profile >
+/// unset`, the standard tier order. `None` when unset — callers pass that
+/// straight through as `DispatchOpts.profile_name: None`, which preserves
+/// the existing `role_profiles.radio-router` precedence (see
+/// `RadioConfig::router_profile`'s own doc).
+pub fn radio_router_profile() -> Option<String> {
+    pick_string("DARKMUX_RADIO_ROUTER_PROFILE", config().radio.as_ref().and_then(|r| r.router_profile.as_deref()), None)
+}
+/// The ANSWERING seat's explicit profile override. Resolves
+/// `env(DARKMUX_RADIO_ANSWERER_PROFILE) > config.radio.answerer_profile >
+/// unset`. `None` when unset, same pass-through contract as
+/// [`radio_router_profile`].
+pub fn radio_answerer_profile() -> Option<String> {
+    pick_string("DARKMUX_RADIO_ANSWERER_PROFILE", config().radio.as_ref().and_then(|r| r.answerer_profile.as_deref()), None)
+}
+/// The RADIO persona's humor dial (0-100). Resolves
+/// `env(DARKMUX_RADIO_HUMOR) > config.radio.humor > 65`, clamped to
+/// `0..=100` (an out-of-range operator value is clamped rather than
+/// rejected — the persona template only ever renders the number as text,
+/// so an out-of-range value is a cosmetic surprise, not a correctness
+/// break; clamping keeps this accessor infallible like every other numeric
+/// accessor in this file).
+pub fn radio_humor() -> u8 {
+    // `RadioConfig::humor` is stored as `u64` (see that field's own doc on
+    // why — matching `config set`'s shared `Ty::Uint` parse avoids a
+    // whole-config-reset hazard on an out-of-u8-range hand-edit); clamped
+    // and narrowed to `u8` HERE, at the accessor, since every consumer of
+    // this value (the persona substitution, the humor picker's presets)
+    // only ever needs the already-validated `0..=100` range.
+    let cfg = config().radio.as_ref().and_then(|r| r.humor);
+    let n: u64 = pick_parsed("DARKMUX_RADIO_HUMOR", cfg, Some(65)).unwrap();
+    n.min(100) as u8
+}
+
+// ── ACP process lifecycle (#1698 Packet B2 / #1684 session hygiene) ──
+/// How many consecutive idle minutes `darkmux acp` waits (zero live
+/// sessions/commands) before self-exiting. Resolves
+/// `env(DARKMUX_ACP_IDLE_EXIT_MINUTES) > config.runtime.acp_idle_exit_minutes > 30`.
+/// `0` disables self-exit entirely (an explicit opt-out, mirroring
+/// `remote.max_tokens_per_execution`'s `0`-means-hard-off convention
+/// elsewhere in this file).
+pub fn acp_idle_exit_minutes() -> u64 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.acp_idle_exit_minutes);
+    pick_parsed("DARKMUX_ACP_IDLE_EXIT_MINUTES", cfg, Some(30)).unwrap()
+}
+
 // ── Role -> profile map (#1475 packet 1) ──
 /// (#1475 packet 1) Normalize a raw role->profile map: trim BOTH the role key
 /// AND the profile value, and drop any binding whose profile is blank (a

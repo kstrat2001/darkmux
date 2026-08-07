@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.6",
+  "schema_version": "1.7",
   "machine_id": "my-machine",
   "orchestrator": "",
   "lms_bin": "lms",
@@ -23,7 +23,8 @@
     "feedback_injection": true,
     "check_updates": true,
     "daemon_auth_enabled": false,
-    "injected_context_fraction": 0.15
+    "injected_context_fraction": 0.15,
+    "acp_idle_exit_minutes": 30
   },
   "fleet": {
     "mode": "standalone"
@@ -37,6 +38,11 @@
   },
   "review": {
     "judge_concurrency": 1
+  },
+  "radio": {
+    "router_profile": "",
+    "answerer_profile": "",
+    "humor": 65
   },
   "role_profiles": {}
 }

@@ -351,6 +351,7 @@ impl WorkJob {
             // `None` preserves that.
             model_base_url_override: None,
             step_id: None, // (#1483) set on the graph-step path only
+            system_prompt_override: None,
         }
     }
 }

@@ -57,7 +57,11 @@ use std::path::Path;
 // own `extras` overflow, so an older binary shunts the key there and falls to
 // its own default. First FIELD-level add under this rule (the nine sibling
 // `dirs.*` entries predate it, landing in the 1.0 scaffold).
-pub const CONFIG_SCHEMA_VERSION: &str = "1.6";
+// 1.7 (#1698 Packet B2): additive `radio{}` block (router_profile /
+// answerer_profile / humor — the radio interpreter's own staffing + persona
+// knobs) plus `runtime.acp_idle_exit_minutes` (the `darkmux acp` process's
+// idle self-exit budget). Minor bump, same lenient-read reasoning.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.7";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -98,6 +102,8 @@ pub struct DarkmuxConfig {
     pub mission: Option<MissionBoardConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio: Option<RadioConfig>,
 
     /// (#1475 packet 1) The machine-local **role → profile** map — the binding
     /// that welds an abstract role id (e.g. `judge`, `probe-high`) to a
@@ -235,6 +241,19 @@ pub struct RuntimeBehaviorConfig {
     // from one value — a large-window profile gets proportionally more room.
     // `env(DARKMUX_INJECTED_CONTEXT_FRACTION) > this > 0.15`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub injected_context_fraction: Option<f64>,
+    /// (#1698 Packet B2, #1684 session-hygiene addendum) How many CONSECUTIVE
+    /// idle minutes `darkmux acp` waits — zero sessions with any live
+    /// activity, zero commands/routes in flight — before self-exiting
+    /// (`std::process::exit(0)`). Lives under `runtime` rather than a new
+    /// `acp{}` block or the `radio{}` block: idle self-exit is a PROCESS
+    /// lifecycle behavior of the `darkmux acp` binary invocation itself, not
+    /// specific to the radio no-slash channel (a session doing nothing but
+    /// slash-command dispatches idles out identically) — the honest home is
+    /// alongside the other per-dispatch/per-process runtime budgets
+    /// (`inactivity_timeout_seconds`, `model_load_timeout_seconds`). Default
+    /// 30 (documented in the issue's session-hygiene addendum: "most swaps
+    /// find no process running").
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub acp_idle_exit_minutes: Option<u64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -341,6 +360,52 @@ pub struct ReviewConfig {
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (#1698 Packet B2) The radio interpreter's own staffing + persona knobs —
+/// separate from `role_profiles` because these are radio-specific overrides
+/// with radio-specific defaults (an EMPTY profile name falls through to the
+/// ordinary role-profile/default-profile precedence, not an error), and
+/// separate from `RuntimeBehaviorConfig` because they're specific to the
+/// `radio` interpreter (routing + answering), not general dispatch behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RadioConfig {
+    /// Explicit profile override for the ROUTING seat (`radio-router`).
+    /// **Empty/absent preserves today's behavior exactly**: `None` is passed
+    /// through to the ordinary dispatch precedence, which honors an existing
+    /// `role_profiles.radio-router` pin (the interim staffing operators set
+    /// per the issue's live-dogfood notes) ahead of `default_profile`.
+    /// Setting this field to a NAMED profile is the "proper fix" migration
+    /// path the issue names — a profile override takes precedence OVER
+    /// `role_profiles.radio-router` (the same precedence every other
+    /// `--profile`-style override uses), so operators migrating off the
+    /// interim `role_profiles` pin set this field to the same profile name;
+    /// leaving both set is harmless (this field simply wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub router_profile: Option<String>,
+    /// Explicit profile override for the ANSWERING seat (`radio-host`).
+    /// Empty/absent falls through to `role_profiles.radio-host` (if bound)
+    /// then `default_profile` — the fresh-install floor, per the issue's
+    /// "answerer_profile empty = default_profile."
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub answerer_profile: Option<String>,
+    /// The RADIO persona's humor dial (0-100), substituted into the
+    /// answering seat's `{{humor}}` template placeholder at assembly time
+    /// (`src/radio_answer.rs`). Default 65 — the value the operator's manual
+    /// TARS-persona override file carried before this config knob existed.
+    ///
+    /// **Deliberately `u64`, not `u8`** — `config set` coerces every `Uint`
+    /// key through one shared parse (`Ty::Uint`, `src/config_cmd.rs`) that
+    /// always produces a `u64` JSON number; a `u8` field here would make an
+    /// operator's `darkmux config set radio.humor 300` fail the WHOLE
+    /// config-file write with "the resulting config.json would not parse"
+    /// (`config_cmd.rs::set_at`), and — worse — a hand-edited `"humor": 300`
+    /// in config.json would silently reset the ENTIRE config to defaults on
+    /// next load (`DarkmuxConfig::load_from`'s lenient
+    /// `unwrap_or_default()`), taking every OTHER setting down with it. The
+    /// accessor (`config_access::radio_humor`) already clamps to `0..=100`
+    /// after parsing, so widening this field costs nothing and removes both
+    /// hazards.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub humor: Option<u64>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 /// A machine's declared fleet position. `Standalone` (default) = a
 /// single-machine install with no fleet; `Hub` = the always-on coordinator
 /// (and, per #936, supervises its own Redis); `Peer` = points at a hub.
@@ -439,6 +504,7 @@ impl DarkmuxConfig {
                 daemon_cors_origins: None,
                 daemon_auth_enabled: Some(false),
                 injected_context_fraction: Some(0.15),
+                acp_idle_exit_minutes: Some(30),
                 extras: Default::default(),
             }),
             fleet: Some(FleetConfig {
@@ -456,6 +522,16 @@ impl DarkmuxConfig {
             }),
             review: Some(ReviewConfig {
                 judge_concurrency: Some(1),
+                extras: Default::default(),
+            }),
+            // (#1698 Packet B2) Written visible with empty (unset) profile
+            // overrides — see `RadioConfig::router_profile`'s own doc for
+            // why an empty string, not an absent field, is the correct
+            // "preserve today's behavior" default.
+            radio: Some(RadioConfig {
+                router_profile: Some(String::new()),
+                answerer_profile: Some(String::new()),
+                humor: Some(65),
                 extras: Default::default(),
             }),
             // (#1475 packet 1) Written as a visible empty `{}` — the operator

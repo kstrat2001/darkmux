@@ -1,0 +1,179 @@
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Parsing contract (operator question surfaced it): the slash becomes the mode bit.** Today's parser first-token-matches with the slash OPTIONAL (`pr-view 42` invokes bare — spike-era convenience, test-pinned) and ignores command names mid-sentence. Harmless while unmatched text hits a help wall; ambiguous the instant free text gains meaning — "review this with me when you have a sec" must never race between launching the crew and routing intent. So when ANY interpreted layer of this issue ships: `/x` = law (exact command, zero interpretation); no slash = interpreted channel (router / grounded answers / authoring door); **bare-word invocation is retired in the same change**. Mid-sentence `/x` stays inert in both channels (the editor only intercepts leading slashes; the parser only reads the first token).
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Safety design (operator asked "what makes it safe?"): six walls, mostly inherited, not invented.**
+
+1. **Mode bit boxes input** — the operator's keystroke (slash / no-slash) selects law vs interpretation before any model sees text; bare-word invocation retires the day interpretation ships.
+2. **Selection-never-composition boxes output** — the router's answer space is the advertised registry (closed set): one command + args, or a refusal token. Structured output validated against the catalog; out-of-menu answers are unrepresentable, not caught. No chaining, no invention, no shell.
+3. **Gates box consequence** — every state-changing route terminates at the sign-off dialog with facts; misroutes to reads waste seconds, misroutes to writes end at a dialog the operator rejects. Consequence always costs a human click. (This is why the gate mechanism shipping BEFORE the interpreted channel was the right build order.)
+4. **Provenance boxes invisibility** — routed invocations say so in the render ("routed from your text") and drop a flow record with source text + chosen route. The misroute log IS the description-quality tuning loop.
+5. **The answer seat has no hands** — grounded answers read the catalog + the session artifact shelf and emit prose: no tools, no dispatches, single exchange. Wrong is possible; *doing* is not.
+6. **Fail closed** — low confidence → the help wall, never a guess; same pattern as unrecognized gate values. Uncertainty never degrades to permissiveness.
+
+The architecture note: the safety walls (gates, provenance, closed registry, fail-closed) all predate the intelligence — interpretation arrives last, into a box already built.
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Surface neutrality (operator question closed the design): the interpreter is ENGINE capability; ACP is its first consumer, the CLI its second.** The catalog compilation, closed-set router, and grounded-answer seat live in core (same single-derivation principle as the shared facts script), never in the acp module. Consequences:
+- A CLI verb exposes the same interpreter: single exchange, NO REPL (the turn-depth rule — multi-turn belongs to the frontier orchestrator; the verb's shape teaches the boundary). Precedent for terminal NL→command: `gh copilot suggest`.
+- Cross-surface gates compose for free: a routed gated verb hits the native dialog in the panel and the tty y/N prompt in the terminal (both shipped in the gate packet).
+- The authoring door already has its CLI verb — `mission propose`; the panel adds a doorway to it, not a duplicate.
+- Naming: NOT `assistant` (generic-AI vocabulary, describes no contract; `help` stays clap-static by convention). Candidates for the operator's pick: **`ask`** (semantically exact — one question, one answer = the single-exchange contract) or **`capcom`** (NASA doctrine — the capsule communicator: the one voice between operator and crew, routing and relaying, never flying the ship).
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Naming ratified: the verb is `radio`** — `darkmux radio "<text>"` in the terminal, the no-slash channel in the panel. Chosen over `ask` (falsely implies questions — directives are first-class) and `assistant` (generic-AI, contract-free). The metaphor is load-bearing: transmissions are short, protocol-bound, one exchange — radio discipline IS the single-exchange contract. `capcom` is reserved for the crew→frontier escalation channel (#1700).
+
+**Receiver architecture (operator's "broadcast to whoever is listening", taken literally):** you key the CHANNEL, never a model — **who's tuned in is config.** Two seats, per the role-family doctrine: a ROUTING seat (bounded classification, defaults to the utility binding) and an ANSWERING seat (reasoning-bearing grounded answers, defaults specialist-class), each operator-staffed by profile like every other seat — swap the answerer to the 35B or an endpoint seat and the surface never changes. Guardrail: ONE configured receiver per exchange — broadcast is addressing style, not fan-out.
+
+Build shape: **Packet A** = the interpreter core (catalog compiler + closed-set router + refusal, frozen-prompt golden tests, injectable model call) + the `radio` CLI verb (routes and EXECUTES with provenance; ephemeral rule and tty gates apply; `--dry-run` prints the invocation instead). **Packet B** = ACP wiring (no-slash channel, mode-bit enforcement, bare-word retirement, provenance renders) + the session artifact shelf + the answering seat.
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Grounding design (pinned late — the Packet A implementer correctly flagged that this was discussed but never ratified here, and improved it):** the router's catalog compiles per invocation from the advertised registry as **id + `panel.hint` + `panel.description`** — NOT the top-level `description`, whose register is engineering provenance (the built-in review's runs ~2KB) and which would be noise to a routing model. Consequence, sharpened: **`panel.description` quality = routing quality** — a misroute traces to a vague panel line, and the fix is editing your own config's one-liner. The answering seat (Packet B) may additionally draw on richer fields; the ROUTER grounds on the concise operator-intent surface only.
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Packet B carry-list (from the #1701 merge-gate CONSIDERs + prior pins):**
+1. **Review-route input synthesis on the CLI path** — `radio "review this"` must synthesize `worktree=cwd` like the panel's run_review does, instead of dying at the launcher's inputs error (the verb's most likely first utterance currently fails honestly but fails).
+2. **Wall 4's flow record** — routed invocations emit source text + chosen route (today: printed provenance + dispatch bookends only).
+3. Golden test must compare the SHIPPED template (include_str! directly), not resolve through the user-tier override (operator overrides are sovereign, not test failures).
+4. Fence-extraction: strict first-fence-wins or refuse-on-multiple-blocks before any reuse by the answering seat.
+5. Typed result from run_ephemeral (retire the failure-prefix string sniffing — also the middle-step stderr surfacing sibling already listed on #1685).
+6. Decide the refusal exit code (0 today; a distinct code is script-friendlier) — operator call.
+Plus the original Packet B scope: ACP no-slash channel, mode-bit enforcement + bare-word retirement, provenance renders, session artifact shelf, the answering seat + its config block (radio staffing keys land here, one schema change).
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Packet A live dogfood (first transmissions, 2026-08-07 evening):**
+- `darkmux radio --dry-run "anything mergeable?"` → routed `/pr-list` correctly on the first try. Real run: correct execution, truthful empty-queue answer.
+- **End-to-end: 13.3s — too slow for the hot path.** Two named costs: (1) the routing seat fell through to `default_profile` = the 35B (`deep`) — the deferred config block means the designed utility-4B staffing isn't reachable yet; interim: a `role_profiles.radio-router` pin, proper fix: Packet B's `radio` config block. (2) The route rides the FULL internal-runtime container dispatch (image/workspace/out-dir spin) for a tool-less single-shot — the routing seat should take a direct single-shot HTTP path. **Both added to the Packet B list.** Target: ~2–4s total (sub-second 4B route + the gh call's honest seconds).
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Seat pin dogfood + the radio-host picker (operator direction):**
+
+- Interim staffing landed: a minimal `radio` profile (utility 4B alone @ 16K, primary-only) + `role_profiles.radio-router = radio`. **Route latency: 13.3s → 2.4s end-to-end**, correctness held across rephrasing ("show me the open pull requests" → /pr-list). The container-path fix (this list, item from the dogfood comment) takes it lower.
+
+- **The radio-host picker** — operator: users should stay in Zed, in the thread, and try different models as their radio host. The ACP-native mechanism exists and is unused: **session config options** (`NewSessionResponse.config_options` + `session/set_config_option`, both in the v1 schema). Advertise a "radio host" option whose choices are the operator's profiles; the client renders a picker; selection re-staffs the routing/answering seats (session-scoped, or persisted via the ordinary `config set` path with its provenance). Dogfood question: does Zed render config options today? If not: fallback sentence `/radio-host <profile>`. Either way the staffing remains operator-sovereign config — the picker is just a hand on the same knob. Packet B scope alongside the `radio` config block.
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**RADIO's persona (operator direction: a NASA-leader character, TARS-inspired — creative, helpful, honest) — live tonight via a zero-engine mechanism:**
+
+- Delivery: the **operator-tier role override** (`~/.darkmux/crew/roles/radio-router.md`, loader-preferred over the shipped template). The persona is a file the operator owns; the next transmission picks it up.
+- **The law that makes personality safe: the voice may only live where prose already lives.** The router's JSON contract is untouched; the character expresses solely in the refusal-reason string (and, come Packet B, fully in the answering seat). Honesty is pinned at 100% — humor is the only variable.
+- **Hard lesson from the first attempt (contract broken, walls caught it):** the persona must WRAP the golden-tested contract text verbatim — a paraphrase of the mechanical instructions (dropping "exactly one fenced json block") broke the 4B's output format instantly. Small models hold character or improvised formatting, not both. Persona = preamble + one added rule; the shipped mechanics byte-preserved.
+- Live result: "what's the weather like on Mars?" → refusal in voice: "I can't provide weather data for Mars. That's outside the scope of mission comms and PR operations."
+- **Humor knob**: today = the literal "Humor setting: 65%" line in the override file. Packet B: template the value from a `radio.humor` config key and expose it as a session config option (or a `/radio-humor` sentence) beside the host picker — TARS ergonomics, operator-sovereign.
+- Route-quality note: "what PRs got merged recently?" refused on the "recently" qualifier even though pr-list now takes `merged` — the designed conservative bias, one notch shy; tuning surface is the description wording, as doctrine says.
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Humor-dial A/B (live):** same persona file at humor 90, same off-mission question ("can you fly this thing to the moon?") — the 4B host: "I can't fly anything to the moon. No command handles that." The 35B host: "Houston has no telemetry for lunar trajectories. I'm strictly wired for PRs and code reviews, so I'll have to leave the moonshot to someone else." **The humor knob is seat-gated: wit is spare capacity, and a 4B spending everything on correct classification has none.** Consequence for the host picker: it is a PERSONALITY dial as much as an accuracy dial — fast-and-deadpan vs slow-and-charming is an operator tradeoff, expressed as staffing config. The answering seat (specialist-class default) is where the persona pays off regardless of the routing host.
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**B2 addendum (operator design chat): the config concierge.**
+
+1. **Grounding, not prompt**: the answering seat's context gains a third compiled source beside the catalog and the artifact shelf — the LIVE config surface (`darkmux config list` output: keys, current values, provenance). The frozen persona/system message never carries schema; new config keys become known automatically at assembly time. Same mechanism as the command catalog, same reason.
+2. **Suggest-don't-execute**: RADIO answers config questions with the exact invocation as text ("run `/config set role_profiles.radio-router deep`") — wall 5 holds (no hands); execution is the operator's keystroke through the command's own gate.
+3. **The `/config` sentence** (floor, expressible pre-B2): get/set/list wrapping the CLI's `config set` — inheriting its dotted-key validation, typo suggestions, and secret refusal — gated as a state-changing verb.
+4. Dedicated knob verbs (`/radio-humor`, `/radio-host`) are SUGAR over /config for the weekly-touched settings, never a parallel mechanism.
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Concierge grounding, generalized (operator):** the grounding sources are darkmux's own READ-ONLY self-describing commands run at assembly time — `help` (clap output, always version-true to the running binary), `config list`, the command catalog, the artifact shelf. The tool describing itself, compiled fresh per ask; no hand-maintained schema anywhere. Disciplines: every grounding source is read-only and zero-model (the observer rule — a gather may never dispatch), and the source set starts small and fixed; an operator-tunable `radio.grounding` list is possible future config, not day-one machinery.
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Grounding sources extended to mission/run state (operator):** `mission status --json`, run records/envelopes, `lab run list`, doctor — same self-describing read-only species. New discipline this adds: **bounded assembly via deterministic pre-retrieval** — always-on cheap summaries (the board), deep artifacts only when the question names/implies one, and the ASSEMBLER selects sources by simple heuristics before any model runs. The answering seat keeps zero tools — no agentic retrieval, wall 5 intact at any grounding breadth.
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**B2 context budget (operator asked for numbers — the implementer inherits these, not vibes):** Router: ~1.5K in / ~30 out (frozen prompt ~700 + catalog ~600-800 + the message). Answering seat: target 4-8K per ask, HARD CAP ~10K — persona ~1K, catalog ~800, config surface ~500-800, help/board ~300-1K when relevant, shelf = last ~3 entries truncated ~1.5K each, one deep artifact ~1-2K only when the question names it. The assembler enforces the cap by dropping in reverse priority (shelf tail and help yield before a named artifact) — an over-budget ask arrives leaner, never overflows silently. Output bounded to a few hundred tokens (single exchange). Tokens only, per standing doctrine.
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Packet B mode-bit investigation + live dogfood (#1702):**
+
+Read the vendored `agent-client-protocol` v2.0.0 schema and empirically piped `darkmux acp` directly over stdin/stdout (a hand-rolled JSON-RPC driver, then the pipe-level test suite built for this packet). Finding: **the wire carries no structural marker distinguishing a menu-invoked slash command from freely typed text.** `PromptRequest.prompt: Vec<ContentBlock>`, and `ContentBlock::Text`'s `TextContent` has only `annotations`/`meta` — nothing command-shaped, in v1 or v2 of the schema. Whatever Zed's `/` menu does client-side, it must compose the command back into plain text (with the leading slash, per the existing slash-optional parser's own design intent) before sending it as an ordinary `session/prompt`.
+
+The empirical probe also reproduced the exact ambiguity this issue named, live, under the PRE-fix parser: `"review this with me when you have a sec"` first-token-matched `review` and launched the full review pipeline (confirmed via `git diff HEAD` firing against a non-git `/tmp` cwd and failing loudly rather than silently — the mechanism fired, just against the wrong target). That's not hypothetical — the packet's own investigation triggered it.
+
+Conclusion: the leading slash **in the text itself** is the only viable discriminator. Implemented per the mode-bit design — `/x` is law (leading-slash-required, bare-word invocation retired), no slash routes through the new interpreted channel.
+
+Live dogfood tonight, real ACP session over stdio, real `qwen3-4b-instruct-2507` dispatch via the `radio` profile (`role_profiles.radio-router` in `config.json`):
+
+- `"show me the open pull requests"` → provenance chunk first (`routing to /pr-list — from your text`), then the executed output — correct order on the wire. 5.93s (includes model load).
+- `"what's the weather like on mars?"` → the installed TARS-persona override speaking live: *"I can't provide weather data for Mars. That's outside the scope of mission comms and local AI operations."* + the command listing. 1.33s.
+- `/pr-list` → resolves directly, **zero "selected model" log line** — the router is never dispatched for the slash path. 1.69s.
+
+Full transcript + the rest of Packet B (no-slash channel, wall 4's flow record, and the #1701 carry-list fixes a/c/d/e/b) in #1702.
+
+--
+author:	kstrat2001
+association:	owner
+edited:	false
+status:	none
+--
+**Two more live panel specimens (operator dogfood, post-B1):** (1) "what is ACP?" → contract-correct but clumsy router refusal ("not a term in our system") — answering-seat acceptance case #2, joins "is this darkmux?". (2) "is anything mergable?" (sic) → refused wanting a PR number: the 4B mapped merge-vocabulary onto pr-view (whose description owns "merge-readiness") — a CROSS-COMMAND VOCABULARY COLLISION. Fix was the tuning loop again: pr-list's panel.description now claims broad merge-intent phrasing; the exact text (typo included) then routed to `pr-list open`. **Doctrine refinement: routing quality is the ECOLOGY of descriptions, not just each one's clarity — commands compete for words, and a miss's refusal reason names which description won.**
+--

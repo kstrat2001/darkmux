@@ -809,6 +809,7 @@ fn dispatch_via_internal(
         image: image.map(str::to_string),
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
+        system_prompt_override: None,
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     // `out_dir` is the host path where the runtime wrote its

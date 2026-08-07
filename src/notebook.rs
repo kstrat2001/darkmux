@@ -186,6 +186,7 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
         image: None,
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
+        system_prompt_override: None,
     };
     let result = crate::fleet::dispatch_routed(opts)
         .context("internal-runtime dispatch for notebook draft")?;

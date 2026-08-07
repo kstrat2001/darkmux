@@ -207,6 +207,7 @@ fn run_mock_dispatch(
         image: None,
         model_base_url_override: Some(format!("http://host.docker.internal:{port}/v1")),
         step_id: None, // (#1483) set on the graph-step path only
+        system_prompt_override: None,
     };
 
     let result = dispatch(opts);

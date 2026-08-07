@@ -405,6 +405,7 @@ impl StepKind for DispatchInternalStepKind {
             // records attribute to this seat even if `session_id` was
             // config-overridden off the `step-<id>` default the viewer maps.
             step_id: Some(step.id.clone()),
+            system_prompt_override: None,
         };
         let result =
             dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;
