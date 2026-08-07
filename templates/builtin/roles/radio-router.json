@@ -1,0 +1,18 @@
+{
+  "id": "radio-router",
+  "description": "Utility-family ROUTING seat for `darkmux radio` (#1698 Packet A). Given one short message and the currently advertised command catalog (id + description + optional hint), maps the message onto exactly one command id + trailing args, or refuses. Bounded classification, no agent loop, no tools — the model chooses AMONG a closed set it is handed every call, it never invents a command or writes free-form shell/text. `role_family: utility` because the work shape is bounded-I/O (one message in, one small JSON object out), matching mission-compiler's split of MODEL tier (resolved normally via the profile's default model) from BEHAVIOR shape (utility = no agent-loop preamble).",
+  "skills": [],
+  "tool_palette": {
+    "allow": [],
+    "deny": [
+      "read",
+      "write",
+      "edit",
+      "exec",
+      "process",
+      "update_plan"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation",
+  "role_family": "utility"
+}

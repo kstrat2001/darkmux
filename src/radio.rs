@@ -1,0 +1,796 @@
+//! The `radio` interpreter core (#1698 Packet A) — surface-neutral ENGINE
+//! capability, never ACP-specific. `src/acp_panel.rs`'s ratified doc line:
+//! "the interpreter is ENGINE capability; ACP is its first consumer, the
+//! CLI its second." Two independent consumers exist (or will): the CLI verb
+//! (`src/radio_cli.rs`, this packet) and the ACP no-slash channel
+//! (Packet B). Both call INTO this module; neither owns any piece of it.
+//! This module in turn calls INTO `crate::acp_panel` (catalog enumeration,
+//! `RoutePlan`, `run_ephemeral`) rather than duplicating that logic — the
+//! same single-derivation principle the module doc there names ("the shared
+//! facts script"): there is exactly one place that decides which mission
+//! configs are advertised, and exactly one place that decides how an
+//! advertised command actually runs.
+//!
+//! # The two-seat receiver architecture (issue #1698, "naming ratified")
+//!
+//! "You key the CHANNEL, never a model — who's tuned in is config." Two
+//! seats exist per the role-family doctrine:
+//!
+//! - **The ROUTING seat** (this module, Packet A) — bounded classification:
+//!   free text + the advertised catalog in, one command id + args (or a
+//!   refusal) out. Dispatches through the `radio-router` role
+//!   (`role_family: "utility"`), the SAME `crate::fleet::dispatch_routed`
+//!   mechanism `src/mission_propose.rs`'s `dispatch_compiler` uses — no new
+//!   dispatch path invented.
+//! - **The ANSWERING seat** (Packet B) — reasoning-bearing grounded answers
+//!   over session artifacts. Not built here.
+//!
+//! **Deferred to Packet B (deliberately, "one schema change, not two"):**
+//! config-block staffing for the routing seat (e.g. a future
+//! `radio.router_profile` knob). Packet A's `dispatch_router_call` passes
+//! `profile_name: None`, which resolves through the SAME precedence every
+//! other role dispatch uses (the `role_profiles.<role_id>` map if an
+//! operator has set one, else `default_profile`) — "default staffing = the
+//! existing internal utility binding" from the issue means exactly this:
+//! no NEW staffing surface in Packet A, the routing seat behaves like any
+//! other utility-family role dispatch until Packet B adds a dedicated knob.
+//!
+//! # Safety walls this module is directly responsible for (issue #1698)
+//!
+//! - **Wall 2 (selection-never-composition boxes output).** [`RouteDecision::
+//!   Route`] can only ever name a `command` that was already present in the
+//!   `catalog` this call was given — [`validate_router_output`] re-checks
+//!   the model's claimed id against the catalog after parsing, the model
+//!   never gets to hand back a bare string that becomes the answer
+//!   verbatim.
+//! - **Wall 6 (fail closed).** Every failure mode — empty output, JSON that
+//!   doesn't parse, JSON that parses but names a command outside the
+//!   catalog, a `call` closure that errors — becomes [`RouteDecision::
+//!   Refuse`], never a guess and never a panic. [`route`] itself never
+//!   returns `Result` for exactly this reason: there is no "routing
+//!   failed" outcome distinct from "refuse."
+//!
+//! # Frozen model-facing text (contract 6)
+//!
+//! The routing seat's SYSTEM prompt lives at
+//! `templates/builtin/roles/radio-router.md`, loaded like any other role's
+//! prompt (`crate::crew::loader::role_prompt`) — a single committed
+//! artifact, byte-locked by
+//! `tests::radio_router_role_prompt_matches_frozen_golden`. The USER
+//! message this module assembles per call ([`build_router_message`]) is
+//! likewise byte-locked, by `tests::build_router_message_matches_frozen_golden`.
+//! Both follow the AI-convention-terminology doctrine (CLAUDE.md's "Model-
+//! facing prompt construction"): "the user's message", "available
+//! commands" — no darkmux-internal jargon a clean-context model would need
+//! provenance for.
+
+use anyhow::Result;
+use serde::Deserialize;
+
+/// One entry in the model-facing command catalog — what the routing seat
+/// is allowed to choose among. Compiled fresh per call by [`compile_catalog`]
+/// (never cached across calls: the registry can change between the CLI
+/// process starting and the router dispatch actually running).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntry {
+    /// The REGISTRY-RESOLVABLE id — see `crate::acp_panel::PanelCommand::id`'s
+    /// own doc for why this is never the document body's own `id` field.
+    pub id: String,
+    /// The model-grounding text for THIS catalog — the config's TOP-LEVEL
+    /// `description` field — the SAME text `crate::acp_panel::
+    /// list_panel_commands` advertises to an editor's command palette
+    /// (`PanelConfig::description`, falling back to `MissionConfig.name`).
+    ///
+    /// **Deliberately NOT `MissionConfig.description`** (the config's
+    /// TOP-LEVEL field) — an earlier draft of this module preferred that
+    /// field on the theory that a routing model benefits from more
+    /// substantive provenance text than a two-word palette label. Reviewed
+    /// against the actual advertised registry and reverted: the built-in
+    /// `review` config's top-level `description` is ~2KB of engineering
+    /// provenance (crate paths, issue numbers, `StepKind` names) — exactly
+    /// the darkmux-internal-jargon shape `acp_panel.rs`'s own `PanelCommand`
+    /// doc already calls out as "unsuitable to render... in an editor's
+    /// slash-command list", and CLAUDE.md's "Model-facing prompt
+    /// construction" audit question ("what does this read as to a
+    /// fresh-context model with no darkmux history?") answers the same way
+    /// for a routing model. `panel.description` is short, human-written FOR
+    /// exactly this kind of at-a-glance classification, and reusing it here
+    /// keeps [`compile_catalog`] a pure single-derivation `map`.
+    pub description: String,
+    /// `panel.hint` — the same optional input hint the editor shows before
+    /// the user has typed anything after the command name.
+    pub hint: Option<String>,
+}
+
+/// Compile the model-facing catalog from the SAME merged, panel-blocked
+/// enumeration `crate::acp_panel::list_panel_commands` already produces
+/// (single derivation of "what's advertised" — see this module's own doc).
+/// A pure `map`: no second registry load, no divergent filter logic.
+/// Deterministic ordering: `list_panel_commands` sorts by id, and this
+/// function's `map` preserves that order.
+pub fn compile_catalog() -> Vec<CatalogEntry> {
+    crate::acp_panel::list_panel_commands()
+        .into_iter()
+        .map(|cmd| CatalogEntry {
+            id: cmd.id,
+            description: cmd.description,
+            hint: cmd.hint,
+        })
+        .collect()
+}
+
+/// The routing seat's decision for one exchange — see this module's doc on
+/// walls 2 and 6. There is no third variant and no `Result`: every failure
+/// mode this module can encounter collapses into `Refuse`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteDecision {
+    /// `command` is guaranteed to be one of `catalog`'s own `id` strings,
+    /// copied from the CATALOG entry (never the model's raw text) after a
+    /// case-insensitive match — see [`validate_router_output`]'s doc for
+    /// why this mirrors `crate::acp_panel::route_command`'s own rule.
+    Route { command: String, args: String },
+    /// A short, model- or validator-supplied reason. Never blank —
+    /// [`validate_router_output`] and [`route`] always supply one.
+    Refuse { reason: String },
+}
+
+/// The injectable model-call seam (issue #1698, "the model call is
+/// injectable... so every routing test runs WITHOUT a live model"). The
+/// production implementation is [`dispatch_router_call`]; every test in
+/// this module supplies a canned closure instead.
+pub type ModelCall<'a> = dyn FnMut(&str) -> Result<String> + 'a;
+
+/// Route `text` against `catalog` via ONE call through `call`. Fails closed
+/// (returns [`RouteDecision::Refuse`]) rather than invoking `call` at all
+/// when `catalog` is empty (there is nothing to route to) OR `text` is
+/// empty/whitespace-only (there is nothing to classify) — either way,
+/// dispatching a model for a decision with no real input would just be
+/// theater. `crate::acp_panel::parse_command` applies the same "nothing
+/// here" short-circuit for the slash-command channel.
+pub fn route(text: &str, catalog: &[CatalogEntry], call: &mut ModelCall<'_>) -> RouteDecision {
+    if catalog.is_empty() {
+        return RouteDecision::Refuse {
+            reason: "no commands are currently advertised — there is nothing to route to".to_string(),
+        };
+    }
+    if text.trim().is_empty() {
+        return RouteDecision::Refuse {
+            reason: "no message text was given — there is nothing to route".to_string(),
+        };
+    }
+    let message = build_router_message(text, catalog);
+    match call(&message) {
+        Ok(raw) => validate_router_output(&raw, catalog),
+        Err(e) => RouteDecision::Refuse {
+            reason: format!("the routing dispatch failed: {e:#}"),
+        },
+    }
+}
+
+/// Assemble the routing seat's USER message (the routing seat's SYSTEM
+/// prompt is the frozen `radio-router.md`, loaded by the dispatch
+/// machinery, not built here). Byte-locked by
+/// `tests::build_router_message_matches_frozen_golden` — this is the
+/// "assembly" half of contract 6, alongside the frozen `.md` prompt itself.
+///
+/// AI-convention terminology throughout (CLAUDE.md's "Model-facing prompt
+/// construction"): "the user's message", "available commands" — command
+/// ids and descriptions are self-explanatory as listed, no darkmux-jargon
+/// provenance marker needed.
+pub fn build_router_message(text: &str, catalog: &[CatalogEntry]) -> String {
+    let mut msg = String::new();
+    msg.push_str("Available commands:\n");
+    for entry in catalog {
+        msg.push_str("- ");
+        msg.push_str(&entry.id);
+        msg.push_str(": ");
+        msg.push_str(&entry.description);
+        if let Some(hint) = &entry.hint {
+            msg.push_str(" (hint: ");
+            msg.push_str(hint);
+            msg.push(')');
+        }
+        msg.push('\n');
+    }
+    msg.push_str("\nThe user's message:\n---\n");
+    msg.push_str(text.trim());
+    msg.push_str("\n---\n\n");
+    msg.push_str(
+        "Decide whether this message maps onto exactly one of the commands above, and \
+         respond with exactly one fenced ```json block per your instructions.\n",
+    );
+    msg
+}
+
+/// The two shapes the routing seat's fenced JSON block can take — see the
+/// module doc's "Output contract". `#[serde(untagged)]` tries `Route` first
+/// (requires `command`), then `Refuse` (requires `refuse`); a JSON object
+/// matching neither shape fails to deserialize as either, which
+/// [`validate_router_output`] treats as malformed (wall 6).
+///
+/// **`deny_unknown_fields` on BOTH variants is load-bearing, not
+/// decoration.** Without it, a confused response carrying BOTH keys —
+/// `{"command": "review", "refuse": "too ambiguous to route"}` — matches
+/// `Route` on the first (and only) attempt `untagged` makes (`Route`'s own
+/// fields are all present; the model's own explicit refusal in `refuse`
+/// would otherwise be silently dropped as an "unknown" field) and the
+/// result EXECUTES — exactly the fail-OPEN case wall 6 exists to prevent.
+/// With `deny_unknown_fields`, that same object fails BOTH shapes (each
+/// sees the OTHER shape's field as unrecognized) and
+/// [`validate_router_output`] correctly falls through to its generic
+/// "didn't match the route-or-refuse contract" refusal instead.
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum RawRouterOutput {
+    Route {
+        command: String,
+        #[serde(default)]
+        args: String,
+    },
+    Refuse { refuse: String },
+}
+
+/// Validate one raw model response against the fail-closed contract (wall
+/// 6). This is the piece every routing test in this module exercises
+/// directly with canned strings — no live model, per the issue's
+/// injectability requirement.
+///
+/// Failure modes, all collapsing to `Refuse`:
+/// - empty (or whitespace-only) `raw`
+/// - no parseable JSON object (fenced ```json block preferred, a bare JSON
+///   object as a forgiving fallback)
+/// - JSON that parses but matches neither `RawRouterOutput` shape
+/// - `command` that doesn't case-insensitively match any `catalog` entry
+///
+/// A well-formed `{"refuse": "..."}` is NOT a failure mode — it's the
+/// model's own explicit refusal, relayed verbatim (or a default reason if
+/// the model somehow emitted an empty string there).
+fn validate_router_output(raw: &str, catalog: &[CatalogEntry]) -> RouteDecision {
+    if raw.trim().is_empty() {
+        return RouteDecision::Refuse {
+            reason: "the routing seat returned no output".to_string(),
+        };
+    }
+    let Some(value) = extract_json(raw) else {
+        return RouteDecision::Refuse {
+            reason: "the routing seat's response wasn't valid JSON".to_string(),
+        };
+    };
+    let parsed: RawRouterOutput = match serde_json::from_value(value) {
+        Ok(p) => p,
+        Err(_) => {
+            return RouteDecision::Refuse {
+                reason: "the routing seat's response didn't match the route-or-refuse contract".to_string(),
+            };
+        }
+    };
+    match parsed {
+        RawRouterOutput::Refuse { refuse } => {
+            let reason = if refuse.trim().is_empty() {
+                "the routing seat declined to route this message".to_string()
+            } else {
+                refuse
+            };
+            RouteDecision::Refuse { reason }
+        }
+        RawRouterOutput::Route { command, args } => {
+            // (wall 2) Case-insensitive match against the CATALOG, mirroring
+            // `crate::acp_panel::route_command`'s own rule — the resolved
+            // `command` is the CATALOG entry's own (correctly-cased) id,
+            // never the model's raw text, so a model that echoes back a
+            // differently-cased id still resolves correctly while an
+            // out-of-catalog id still refuses.
+            match catalog.iter().find(|c| c.id.eq_ignore_ascii_case(&command)) {
+                Some(entry) => RouteDecision::Route {
+                    command: entry.id.clone(),
+                    args,
+                },
+                None => RouteDecision::Refuse {
+                    reason: format!("the routing seat named `{command}`, which isn't an advertised command"),
+                },
+            }
+        }
+    }
+}
+
+/// Extract a JSON value from a routing-seat response: prefer a fenced
+/// ```json block (matching `templates/builtin/roles/radio-router.md`'s own
+/// instructed output shape and `src/mission_propose.rs::extract_json_block`'s
+/// established convention in this codebase), falling back to parsing the
+/// WHOLE trimmed response as bare JSON for a model that skips the fence.
+/// `None` when neither yields valid JSON — the caller turns that into a
+/// fail-closed refusal (wall 6), never a guess at a truncated/partial parse.
+fn extract_json(raw: &str) -> Option<serde_json::Value> {
+    if let Some(block) = extract_fenced_json_block(raw) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&block) {
+            return Some(v);
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(raw.trim()).ok()
+}
+
+/// Return the content of the first ```json-tagged fenced block (falling
+/// back to the first bare ``` fence when no tagged opener exists anywhere),
+/// or `None` when no CLOSED fence is found at all. Deliberately simpler
+/// than `mission_propose.rs::extract_json_block` (no "unterminated"
+/// distinction — this module's caller only needs "did we get JSON or not,"
+/// and an unterminated block naturally fails the JSON parse in
+/// [`extract_json`]'s bare-parse fallback too).
+///
+/// Substring search over the whole response, not a line-by-line scan — a
+/// small model that emits the fence and its content on ONE physical line
+/// (`` ```json {"command": "x"} ``` `` with no newlines at all) still
+/// extracts correctly, since the opener and closer are found by byte
+/// position rather than by which line they're on.
+fn extract_fenced_json_block(raw: &str) -> Option<String> {
+    let (open_idx, tag_len) = if let Some(i) = raw.find("```json") {
+        (i, "```json".len())
+    } else if let Some(i) = raw.find("```JSON") {
+        (i, "```JSON".len())
+    } else {
+        let i = raw.find("```")?;
+        (i, "```".len())
+    };
+    let after_open = &raw[open_idx + tag_len..];
+    let close_rel = after_open.find("```")?;
+    Some(after_open[..close_rel].to_string())
+}
+
+/// The production [`ModelCall`] implementation — ONE single-shot dispatch to
+/// the `radio-router` role via `crate::fleet::dispatch_routed`, the SAME
+/// mechanism `src/mission_propose.rs::dispatch_compiler` uses (no new
+/// dispatch path). `dispatch_routed` itself emits the `dispatch.start`/
+/// `dispatch.complete` flow-record bookends (contract 2, dispatch
+/// liveness) — no additional bookend is added here, unlike
+/// `dispatch_compiler`'s extra `mission.compile.*` pair, since Packet A has
+/// no higher-level record vocabulary of its own yet (deferred to Packet B
+/// alongside the panel's provenance rendering — wall 4 in the issue's
+/// safety design).
+///
+/// `timeout_seconds: 300` — a deliberately BOUNDED ceiling for a
+/// bounded-classification dispatch (well under `dispatch_compiler`'s 600s,
+/// which budgets for a much larger structured-proposal task). Not yet
+/// operator-tunable; Packet B's staffing config is where that knob would
+/// land per this module's own doc.
+pub fn dispatch_router_call(message: &str) -> Result<String> {
+    let opts = crate::crew::dispatch::DispatchOpts {
+        role_id: "radio-router".to_string(),
+        message: message.to_string(),
+        session_id: None,
+        timeout_seconds: 300,
+        skip_preflight: false,
+        // radio-router parses its answer from the dispatch's human-readable
+        // stdout (a fenced ```json block) — no JSON envelope needed, same
+        // as mission-compiler.
+        json: false,
+        workdir: None,
+        phase_id: None,
+        // A system-level utility dispatch; local-only (`machine: None`
+        // never routes to the fleet queue — #309, #1405). Whether the LOCAL
+        // dispatch itself runs through the internal Docker-bounded runtime
+        // or the lighter container-free single-shot path is decided by
+        // `dispatch_internal::container_path_required`, not by anything
+        // set here: because `radio-router`'s `tool_palette.allow` is empty
+        // (it wants no tools), a profile that resolves to a REMOTE endpoint
+        // takes the lighter `dispatch_remote` path automatically — unlike
+        // `mission-compiler`, whose non-empty `tool_palette.allow: ["read"]`
+        // always forces the container path regardless of profile.
+        machine: None,
+        wait: true,
+        compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
+        // No `--profile` override — see this module's doc on deferred
+        // staffing; falls back to `role_profiles.radio-router` (if an
+        // operator has set one) then `default_profile`.
+        profile_name: None,
+        config_path: None,
+        force_container: false,
+        max_completion_tokens: None,
+        image: None,
+        model_base_url_override: None,
+        step_id: None,
+    };
+    let result = crate::fleet::dispatch_routed(opts)?;
+    Ok(result.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, description: &str, hint: Option<&str>) -> CatalogEntry {
+        CatalogEntry {
+            id: id.to_string(),
+            description: description.to_string(),
+            hint: hint.map(str::to_string),
+        }
+    }
+
+    fn fixture_catalog() -> Vec<CatalogEntry> {
+        vec![
+            entry("pr-list", "List open pull requests against the current repository.", None),
+            entry("review", "Run the review pipeline against the current branch's diff.", Some("optional PR number")),
+        ]
+    }
+
+    // ── build_router_message (frozen golden, contract 6) ────────────────
+
+    #[test]
+    fn build_router_message_matches_frozen_golden() {
+        let msg = build_router_message("review this when you get a sec", &fixture_catalog());
+        let expected = "Available commands:\n\
+             - pr-list: List open pull requests against the current repository.\n\
+             - review: Run the review pipeline against the current branch's diff. (hint: optional PR number)\n\
+             \n\
+             The user's message:\n\
+             ---\n\
+             review this when you get a sec\n\
+             ---\n\
+             \n\
+             Decide whether this message maps onto exactly one of the commands above, and \
+             respond with exactly one fenced ```json block per your instructions.\n";
+        assert_eq!(msg, expected, "byte-locked assembly drifted — see contract 6 in this module's doc");
+    }
+
+    #[test]
+    fn build_router_message_trims_the_users_text() {
+        let msg = build_router_message("  spaced out  \n", &fixture_catalog());
+        assert!(msg.contains("---\nspaced out\n---"), "{msg}");
+    }
+
+    // ── radio-router.md frozen golden (contract 6) ──────────────────────
+
+    #[test]
+    fn radio_router_role_prompt_matches_frozen_golden() {
+        // A LITERAL duplicate of `templates/builtin/roles/radio-router.md`,
+        // not an `include_str!` of the same file — the latter would compare
+        // the file against itself (both sides re-resolve to the identical
+        // bytes at compile time), so editing the file could never fail this
+        // test. A real byte-lock (contract 6: "'Frozen' means one hash, not
+        // one intention") needs a SECOND, independently-typed copy that a
+        // future edit to the file has to consciously update here too —
+        // mirrors `darkmux-lab`'s `verify_prompt_matches_frozen_golden`
+        // pattern (a literal `VERIFY_TAIL_INSTRUCTION` constant), not
+        // `build_router_message_matches_frozen_golden` above (which is
+        // already a literal, since it's asserting THIS module's own
+        // assembly function against a hand-written expected string, not
+        // re-reading a file).
+        let expected = "# Radio Router\n\
+            \n\
+            You take one short message from the user and decide which of a fixed list of commands it maps onto, if any.\n\
+            \n\
+            ## Your job\n\
+            \n\
+            Every call gives you:\n\
+            1. A list of available commands, each with an id and a description of what it does.\n\
+            2. The user's message.\n\
+            \n\
+            Decide whether the message clearly asks for ONE of the listed commands. If it does, name that command's id and pull out any trailing text the command should receive as its argument. If it does not clearly match any listed command — the message is ambiguous, open-ended, matches more than one command about equally well, or matches none of them — refuse instead of guessing.\n\
+            \n\
+            ## Output: exactly one JSON object, nothing else\n\
+            \n\
+            Emit exactly one fenced `json` block and no prose outside it.\n\
+            \n\
+            To route the message to a command:\n\
+            \n\
+            ```json\n\
+            {\"command\": \"<the exact command id from the list>\", \"args\": \"<any trailing text the command should receive, or an empty string>\"}\n\
+            ```\n\
+            \n\
+            To refuse:\n\
+            \n\
+            ```json\n\
+            {\"refuse\": \"<a short, one-sentence reason>\"}\n\
+            ```\n\
+            \n\
+            ## Rules\n\
+            \n\
+            - `command` MUST be copied EXACTLY from the list of available command ids you were given — never invent one, never guess at a close spelling, never combine two.\n\
+            - When in doubt, refuse. A wrong refusal costs the user one extra step; a wrong route runs the wrong command. Refusing is always the safer answer.\n\
+            - `args` is free text — copy the user's own words that follow the command's intent, don't paraphrase or summarize them. Use an empty string when there is nothing left to carry over.\n\
+            - Choose at most ONE command. Never chain commands, never describe a sequence of steps, never answer the message yourself — you are only choosing one existing command or declining, nothing else.\n";
+        let loaded = crate::crew::loader::role_prompt("radio-router")
+            .expect("radio-router must have an embedded .md prompt");
+        assert_eq!(
+            loaded, expected,
+            "radio-router.md drifted from the frozen model-facing text (contract 6) — a \
+             deliberate edit updates both this golden and the file together"
+        );
+    }
+
+    // ── validate_router_output — the five canned-output paths ───────────
+
+    #[test]
+    fn validate_router_output_valid_route() {
+        let raw = "```json\n{\"command\": \"review\", \"args\": \"123\"}\n```";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        assert_eq!(
+            decision,
+            RouteDecision::Route { command: "review".to_string(), args: "123".to_string() }
+        );
+    }
+
+    #[test]
+    fn validate_router_output_valid_route_case_insensitive_resolves_to_catalog_case() {
+        // Mirrors `crate::acp_panel::route_command`'s own case-insensitive
+        // rule — the resolved command is the CATALOG's own casing, never
+        // the model's raw text.
+        let catalog = vec![entry("Pr-View", "View a PR.", None)];
+        let raw = "```json\n{\"command\": \"pr-view\", \"args\": \"\"}\n```";
+        let decision = validate_router_output(raw, &catalog);
+        assert_eq!(decision, RouteDecision::Route { command: "Pr-View".to_string(), args: String::new() });
+    }
+
+    #[test]
+    fn validate_router_output_out_of_catalog_command_refuses() {
+        let raw = "```json\n{\"command\": \"not-advertised\", \"args\": \"\"}\n```";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        match decision {
+            RouteDecision::Refuse { reason } => assert!(reason.contains("not-advertised"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_router_output_malformed_json_refuses() {
+        let raw = "```json\n{not even json\n```";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        match decision {
+            RouteDecision::Refuse { reason } => assert!(reason.contains("valid JSON"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_router_output_no_fenced_block_and_not_bare_json_refuses() {
+        let raw = "sure, I'll route this for you: /review";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        match decision {
+            RouteDecision::Refuse { reason } => assert!(reason.contains("valid JSON"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_router_output_explicit_refusal_token_relays_the_reason() {
+        let raw = "```json\n{\"refuse\": \"this reads as a question about the codebase in general, not a command\"}\n```";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        assert_eq!(
+            decision,
+            RouteDecision::Refuse {
+                reason: "this reads as a question about the codebase in general, not a command".to_string()
+            }
+        );
+    }
+
+    /// Regression: a CONFUSED response carrying BOTH `command` AND `refuse`
+    /// must refuse, never execute the route. Without `deny_unknown_fields`
+    /// on [`RawRouterOutput`], `#[serde(untagged)]`'s first-match-wins
+    /// semantics would let this deserialize as `Route` (its own fields are
+    /// all present; the model's own `refuse` text would be silently
+    /// discarded as an unrecognized field) — the fail-OPEN case wall 6
+    /// exists to rule out. Neither shape may claim an object naming a field
+    /// it doesn't declare.
+    #[test]
+    fn validate_router_output_object_with_both_command_and_refuse_keys_refuses() {
+        let raw = "```json\n{\"command\": \"review\", \"refuse\": \"too ambiguous to route\"}\n```";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        assert!(
+            matches!(decision, RouteDecision::Refuse { .. }),
+            "a confused response naming both `command` and `refuse` must refuse, not route: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn validate_router_output_empty_refuses() {
+        let decision = validate_router_output("", &fixture_catalog());
+        match decision {
+            RouteDecision::Refuse { reason } => assert!(reason.contains("no output"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let decision = validate_router_output("   \n  ", &fixture_catalog());
+        assert!(matches!(decision, RouteDecision::Refuse { .. }));
+    }
+
+    #[test]
+    fn validate_router_output_bare_json_without_fence_still_parses() {
+        // A forgiving fallback (`extract_json`'s bare-parse branch) — some
+        // models skip the fence despite instructions.
+        let raw = "{\"command\": \"pr-list\", \"args\": \"\"}";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        assert_eq!(decision, RouteDecision::Route { command: "pr-list".to_string(), args: String::new() });
+    }
+
+    #[test]
+    fn validate_router_output_single_line_fenced_block_still_parses() {
+        // A small model that emits the fence and its content on ONE
+        // physical line (no newlines inside the fence at all) — a
+        // plausible shape the old line-by-line scanner would have missed
+        // (opener and closer on the same "line" never matched the
+        // "everything after the opener line" loop).
+        let raw = "```json {\"command\": \"pr-list\", \"args\": \"\"} ```";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        assert_eq!(decision, RouteDecision::Route { command: "pr-list".to_string(), args: String::new() });
+    }
+
+    #[test]
+    fn validate_router_output_object_matching_neither_shape_refuses() {
+        let raw = "```json\n{\"foo\": \"bar\"}\n```";
+        let decision = validate_router_output(raw, &fixture_catalog());
+        match decision {
+            RouteDecision::Refuse { reason } => assert!(reason.contains("route-or-refuse contract"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    // ── route() — the empty-catalog short-circuit + the call seam ───────
+
+    #[test]
+    fn route_with_empty_catalog_refuses_without_invoking_call() {
+        let mut called = false;
+        let mut call = |_msg: &str| -> Result<String> {
+            called = true;
+            Ok("{\"refuse\": \"should never be reached\"}".to_string())
+        };
+        let decision = route("do something", &[], &mut call);
+        assert!(matches!(decision, RouteDecision::Refuse { .. }));
+        assert!(!called, "an empty catalog must never dispatch a model call");
+    }
+
+    #[test]
+    fn route_with_empty_text_refuses_without_invoking_call() {
+        let mut called = false;
+        let mut call = |_msg: &str| -> Result<String> {
+            called = true;
+            Ok("{\"refuse\": \"should never be reached\"}".to_string())
+        };
+        let decision = route("   \n  ", &fixture_catalog(), &mut call);
+        assert!(matches!(decision, RouteDecision::Refuse { .. }));
+        assert!(!called, "empty/whitespace-only text must never dispatch a model call");
+    }
+
+    #[test]
+    fn route_relays_a_valid_canned_route_through_the_call_seam() {
+        let mut call = |_msg: &str| -> Result<String> { Ok("```json\n{\"command\": \"review\", \"args\": \"\"}\n```".to_string()) };
+        let decision = route("please review this", &fixture_catalog(), &mut call);
+        assert_eq!(decision, RouteDecision::Route { command: "review".to_string(), args: String::new() });
+    }
+
+    #[test]
+    fn route_turns_a_call_error_into_a_refusal() {
+        let mut call = |_msg: &str| -> Result<String> { Err(anyhow::anyhow!("dispatch failed: no model loaded")) };
+        let decision = route("please review this", &fixture_catalog(), &mut call);
+        match decision {
+            RouteDecision::Refuse { reason } => assert!(reason.contains("dispatch failed"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    // ── compile_catalog (registry fixture) ───────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn compile_catalog_advertises_panel_blocked_configs_sorted_with_the_panel_description() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+
+        let dir = tmp.path().join("mission-configs");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two panel-blocked configs (radio-advertised). Each carries a LONG
+        // top-level `description` (mimicking `review.json`'s real shape —
+        // engineering provenance, not routing text) to prove the catalog
+        // reads `panel.description`, never the top-level field.
+        std::fs::write(
+            dir.join("zzz-last.json"),
+            serde_json::to_string(&serde_json::json!({
+                "id": "zzz-last",
+                "name": "ZZZ Last",
+                "description": "Long top-level engineering provenance text, never read by the router.",
+                "panel": {"description": "Short palette label", "hint": "some hint"},
+                "phases": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("aaa-first.json"),
+            serde_json::to_string(&serde_json::json!({
+                "id": "aaa-first",
+                "name": "AAA First",
+                "description": "Another long top-level description, also never read by the router.",
+                "panel": {"description": "Another short label"},
+                "phases": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // ... and one WITHOUT a panel block — must not be advertised.
+        std::fs::write(
+            dir.join("not-advertised.json"),
+            serde_json::to_string(&serde_json::json!({
+                "id": "not-advertised",
+                "name": "Not Advertised",
+                "description": "This config carries no panel block.",
+                "phases": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // The built-in `review` config also declares a `panel` block (see
+        // `templates/builtin/mission-configs/review.json`), so it's ALWAYS
+        // merged in alongside the two user-tier fixtures above — this test
+        // asserts the fixtures' own ordering/content/exclusion rather than
+        // the full catalog contents, so it doesn't drift if a future
+        // built-in also opts into the panel.
+        let catalog = compile_catalog();
+        assert!(
+            !catalog.iter().any(|c| c.id == "not-advertised"),
+            "a config without a `panel` block must never be advertised: {catalog:?}"
+        );
+        let ids: Vec<&str> = catalog.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.is_sorted(), "catalog must be id-sorted: {ids:?}");
+        let aaa = catalog.iter().find(|c| c.id == "aaa-first").expect("aaa-first must be advertised");
+        assert_eq!(aaa.description, "Another short label", "must read panel.description, not the top-level field");
+        assert_eq!(aaa.hint, None);
+        let zzz = catalog.iter().find(|c| c.id == "zzz-last").expect("zzz-last must be advertised");
+        assert_eq!(zzz.description, "Short palette label", "must read panel.description, not the top-level field");
+        assert_eq!(zzz.hint.as_deref(), Some("some hint"));
+        // `aaa-first` sorts before `zzz-last` (both are also confirmed
+        // present above); the built-in `review` sorts between them.
+        let aaa_pos = ids.iter().position(|id| *id == "aaa-first").unwrap();
+        let zzz_pos = ids.iter().position(|id| *id == "zzz-last").unwrap();
+        assert!(aaa_pos < zzz_pos, "aaa-first must sort before zzz-last: {ids:?}");
+
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compile_catalog_falls_back_to_the_configs_name_when_panel_description_is_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+
+        let dir = tmp.path().join("mission-configs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("no-panel-desc.json"),
+            serde_json::to_string(&serde_json::json!({
+                "id": "no-panel-desc",
+                "name": "No Panel Desc",
+                "description": "A long top-level description that must NOT be read here either.",
+                "panel": {},
+                "phases": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // The built-in `review` config is also always merged in (see the
+        // sibling test's comment) — find this fixture's own entry rather
+        // than asserting the catalog's total length. `PanelConfig::
+        // description` absent falls back to `MissionConfig.name`
+        // (`crate::acp_panel::list_panel_commands`'s own rule) — never to
+        // the top-level `description`.
+        let catalog = compile_catalog();
+        let found = catalog.iter().find(|c| c.id == "no-panel-desc").expect("no-panel-desc must be advertised");
+        assert_eq!(found.description, "No Panel Desc");
+
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+}

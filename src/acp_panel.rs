@@ -472,6 +472,26 @@ fn apply_default_cwd(steps: &mut BTreeMap<String, Step>, cwd: &Path) {
     }
 }
 
+/// The two literal prefixes [`render_ephemeral_result`] returns its
+/// business-logic FAILURE messages under — as `Ok(String)`, since
+/// `run_ephemeral`'s own contract has no separate structured pass/fail
+/// signal and the ACP panel surface just displays whichever string comes
+/// back. `pub` (#1698 Packet A) so `src/radio_cli.rs`'s CLI verb, which DOES
+/// have a real exit code to decide, can recognize the same two shapes
+/// without re-deriving or copy-pasting the literals — one place names what
+/// "the ephemeral run failed" looks like as text.
+pub const EPHEMERAL_FAILURE_PREFIX: &str = "darkmux: command failed";
+pub const EPHEMERAL_INCOMPLETE_PREFIX: &str = "darkmux: command did not reach";
+
+/// `true` iff `output` (an `Ok(String)` from [`run_ephemeral`]) is one of
+/// [`render_ephemeral_result`]'s two business-logic FAILURE renderings,
+/// rather than a genuine success. See those constants' own doc for why this
+/// exists — the small, documented coupling a caller with a real exit code
+/// (`src/radio_cli.rs`) needs, without a second copy of the literals.
+pub fn ephemeral_output_is_failure(output: &str) -> bool {
+    output.starts_with(EPHEMERAL_FAILURE_PREFIX) || output.starts_with(EPHEMERAL_INCOMPLETE_PREFIX)
+}
+
 /// The sink task in DOCUMENT order — a task no other task's `depends_on`
 /// OR `reads` names — and its last step's output, rendered as the final
 /// panel message. `ordered_tasks` MUST be the original `Vec<Task>`
@@ -484,6 +504,13 @@ fn apply_default_cwd(steps: &mut BTreeMap<String, Step>, cwd: &Path) {
 /// previously bound and dropped them; every other production caller
 /// (`mission_launch.rs`) prints them, so silently discarding them here was
 /// the one place in the codebase where they went nowhere.
+///
+/// **A SIDE branch can fail while the terminal step still reports a
+/// success-shaped string** (see the CONSIDER-6 comment further down): a
+/// caller with a real exit code to decide (`src/radio_cli.rs`) sees the
+/// warning appended to the OUTPUT text, not a distinct prefix
+/// [`ephemeral_output_is_failure`] can key on — named here since that
+/// caller can't tell partial-failure from clean success by string alone.
 fn render_ephemeral_result(
     ordered_tasks: &[Task],
     steps: &BTreeMap<String, Step>,
@@ -516,7 +543,7 @@ fn render_ephemeral_result(
 
     let output = terminal.output.clone().unwrap_or_default();
     if terminal.status == NodeStatus::Error {
-        return Ok(format!("darkmux: command failed:\n\n{output}"));
+        return Ok(format!("{EPHEMERAL_FAILURE_PREFIX}:\n\n{output}"));
     }
     if terminal.status != NodeStatus::Complete {
         // The terminal task never completed — its dependency chain
@@ -524,7 +551,7 @@ fn render_ephemeral_result(
         // task whose dependency didn't reach Complete). Name what errored
         // rather than returning an empty/misleading message.
         return Ok(format!(
-            "darkmux: command did not reach its final step (status: {:?}) — step(s) errored: {}",
+            "{EPHEMERAL_INCOMPLETE_PREFIX} its final step (status: {:?}) — step(s) errored: {}",
             terminal.status,
             if report.errored.is_empty() { "(none recorded)".to_string() } else { report.errored.join(", ") }
         ));

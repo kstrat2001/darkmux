@@ -474,7 +474,7 @@
         let _guard = TestCrewRoot::new();
         let roles = load_roles().expect("load_roles must succeed against embedded defaults");
         let utility: std::collections::BTreeSet<&str> =
-            ["mission-compiler", "scribe"].into_iter().collect();
+            ["mission-compiler", "scribe", "radio-router"].into_iter().collect();
         for r in &roles {
             assert!(
                 r.role_family.is_some(),
