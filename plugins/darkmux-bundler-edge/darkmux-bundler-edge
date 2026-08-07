@@ -97,10 +97,10 @@ def facts_for(hunks):
     new = [e for e in interp_added if e not in interp_removed]
     if new:
         vals, extra = uniq_capped(new)
-        facts.append("interpolation(s) added: " + ", ".join("{{ %s }}" % v for v in vals) + (f" (+{extra} more)" if extra else ""))
+        facts.append("interpolation(s) added: " + ", ".join("{{ " + v + " }}" for v in vals) + (f" (+{extra} more)" if extra else ""))
     if gone:
         vals, extra = uniq_capped(gone)
-        facts.append("interpolation(s) removed: " + ", ".join("{{ %s }}" % v for v in vals) + (f" (+{extra} more)" if extra else ""))
+        facts.append("interpolation(s) removed: " + ", ".join("{{ " + v + " }}" for v in vals) + (f" (+{extra} more)" if extra else ""))
 
     dir_added = [l.strip() for l in added if DIRECTIVE_RE.match(l)]
     dir_removed = [l.strip() for l in removed if DIRECTIVE_RE.match(l)]
