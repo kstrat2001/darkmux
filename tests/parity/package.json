@@ -11,7 +11,8 @@
     "redprove": "playwright test redprove.spec.ts",
     "determinism": "bun run determinism.mjs",
     "tripwire": "bun run tripwire.mjs",
-    "check": "bun run verify && bun run redprove && bun run determinism && bun run tripwire"
+    "check": "bun run verify && bun run redprove && bun run determinism && bun run tripwire",
+    "next-parity": "playwright test --config next-parity.playwright.config.js"
   },
   "devDependencies": {
     "@playwright/test": "1.60.0"

@@ -116,3 +116,65 @@ export interface MachineResources {
   warnings: string[];
   cache_ttl_ms: number;
 }
+
+/** `GET /fleet/sessions/live` — `axum::Json(Vec<LiveSessionBeat>)`, the
+ * session-presence twin of `PresenceBeat` above (same crate, same hand-write
+ * rationale — see that type's doc comment). Only `session_id` is consumed by
+ * the machine lens's `liveSessionSet()` port (`lib/flow.ts`); the daemon
+ * sends more fields (see `tests/parity/corpus/fleet-sessions-live.json`,
+ * empty in the recorded corpus — no session was live at record time), widen
+ * this interface if a future lens needs them.
+ * Source: `crates/darkmux-flow/src/presence.rs`. */
+export interface LiveSessionBeat {
+  session_id: string;
+}
+
+/** A raw flow record — the JSONL shape every `/flow/<date>` entry and SSE
+ * tail message carries (`darkmux_flow::FlowRecord`, `crates/darkmux-flow`).
+ * Hand-written for the same reason as `PresenceBeat`: bridging it with ts-rs
+ * would add ts-rs to a production-consumed lib crate, not just
+ * `darkmux-serve`'s test-only surface. Only the fields the machine lens's
+ * runs-list/health-region port (`lib/flow.ts`, ported from `viewer.html`'s
+ * `flowToRenderModel`/`recentRow`/`dispatch*` functions) actually reads are
+ * typed here — a flow record carries more (see any `tests/parity/corpus/
+ * flow-*.json` fixture for the full shape); widen as a future lens needs
+ * more of it. `payload` is intentionally loose (`Record<string, unknown>`)
+ * — its shape varies per `action`, same as the legacy JS's untyped access. */
+export interface FlowRecord {
+  ts: string;
+  level?: string;
+  category?: string;
+  tier?: string;
+  stage?: string;
+  action?: string;
+  handle?: string;
+  session_id?: string;
+  source?: string;
+  model?: string;
+  mission_id?: string;
+  phase_id?: string;
+  machine_id?: string;
+  machine_uid?: string;
+  orchestrator?: string;
+  payload?: Record<string, unknown>;
+  /** Present only on the schema-header line every flow file leads with —
+   * `flowToRenderModel`'s `!r._type` filter drops it before it reaches the
+   * render model (see `lib/flow.ts::buildFlowWindow`). */
+  _type?: string;
+}
+
+/** The subset of `dispatch.complete`/`dispatch.error`'s `payload` the
+ * runs-list row (`recentRow()` in `viewer.html`) reads for its collapsed
+ * summary line — the only state the `<details>` element's closed-by-default
+ * `innerText` ever exposes (its `.rrdetail` expansion is hidden markup, out
+ * of the parity harness's extraction target; see `tests/parity/README.md`). */
+export interface DispatchCompletePayload {
+  total_turns?: number;
+  total_tools?: number;
+  total_tokens?: number;
+  total_compactions?: number;
+  result_class?: string;
+  exit_code?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+}

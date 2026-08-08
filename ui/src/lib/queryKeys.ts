@@ -47,4 +47,10 @@ export const queryKeys = {
   machineResources: () => ["machine", "resources"] as const,
   panel: (id: string) => ["panel", id] as const,
   flowTail: (date: string) => ["flow", date, "tail"] as const,
+  /** `GET /flow/<date>` — the full day's records (distinct from `flowTail`'s
+   * SSE stream key above). Consumed by `useFlowWindow` (`hooks/
+   * useFlowWindow.ts`), which fetches yesterday+today per `loadLiveWindow()`
+   * (viewer.html:3497) — see `lib/flow.ts`'s module doc for the fetch-order
+   * subtlety that makes the two-day merge order load-bearing. */
+  flowDate: (date: string) => ["flow", date] as const,
 };

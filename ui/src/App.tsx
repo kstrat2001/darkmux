@@ -1,23 +1,87 @@
+import { useMemo } from "react";
 import { useHashRoute } from "./lib/useHashRoute";
 import { FleetStrip } from "./components/FleetStrip";
 import { LensPlaceholder } from "./components/LensPlaceholder";
+import { MachineLens } from "./lenses/machine/MachineLens";
+import { useFlowWindow } from "./hooks/useFlowWindow";
+import { useLiveMachines } from "./hooks/useLiveMachines";
+import { computeMetaLines } from "./lib/metaLine";
+import { localMachineUid, nameOf } from "./lib/flow";
+import { useQuery } from "@tanstack/react-query";
+import { fetchJson } from "./lib/fetcher";
+import { queryKeys } from "./lib/queryKeys";
+import type { MachineSpecs } from "./types/handwritten";
 import type { Route } from "./lib/route";
 
 /**
  * The app shell. A `switch` over the parsed [[Route]] (see `lib/route.ts` for
- * the hash-grammar port) — `fleet` is this packet's ONE real region
- * (`FleetStrip`, driven by `useQuery`); every other lens renders
- * [[LensPlaceholder]] naming what still needs to be built, per the
- * render-sanity contract (never a blank page).
+ * the hash-grammar port) drives `#stage`; `fleet` (`FleetStrip`) and
+ * `machine` (`MachineLens`) are this build's two real regions, every other
+ * lens renders [[LensPlaceholder]] naming what still needs to be built, per
+ * the render-sanity contract (never a blank page).
+ *
+ * `#crumb` and `#logscope` are LENS-SPECIFIC (legacy: `renderCrumb()`'s
+ * `$("crumb").innerHTML=...` per `state.level`, and each `render*()`
+ * function's own `$("logscope").textContent=...`) — computed here per
+ * route rather than inside each lens component, since the target DOM
+ * elements are App-level siblings of `#stage`, not descendants of it.
+ * `#meta` is GLOBAL (legacy's `renderMeta()` runs on every render()
+ * regardless of `state.level` — confirmed: `goldens/fleet.txt` and
+ * `goldens/machine.txt` carry byte-identical `=== meta ===` sections), so
+ * it's computed here unconditionally rather than per-route. The underlying
+ * `useFlowWindow`/`useLiveMachines`/`machineSpecs` queries are ALSO used
+ * inside `MachineLens` — TanStack Query dedupes by queryKey, so this is
+ * cache reuse, not a second network round trip.
  */
 export function App() {
   const route = useHashRoute();
+  const nowMs = Date.now();
+
+  const flowWindow = useFlowWindow(nowMs);
+  const liveMachines = useLiveMachines();
+  const specsQuery = useQuery({
+    queryKey: queryKeys.machineSpecs(),
+    queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
+  });
+  const specs = specsQuery.data?.ok ? specsQuery.data.data : null;
+
+  const localUid = useMemo(
+    () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null),
+    [flowWindow.data, liveMachines, specs],
+  );
+  const localName = localUid != null ? nameOf(flowWindow.data, liveMachines, localUid) : null;
+
+  const metaLines = useMemo(() => computeMetaLines(flowWindow.data, liveMachines, nowMs), [flowWindow.data, liveMachines, nowMs]);
+
+  const { crumb, logscope } = routeChrome(route, localName);
 
   return (
     <div className="app-shell">
       <header className="app-shell__crumb" id="crumb">
-        darkmux {routeLabel(route)}
+        {crumb}
       </header>
+      <div className="app-shell__meta" id="meta">
+        {/* `whiteSpace: "pre"` — the idle headline's literal double space
+            before "· last run" (see `metaLine.ts`'s module doc) is an
+            artifact of legacy's icon SPAN breaking the whitespace-collapse
+            run; default `white-space: normal` would collapse it back to
+            one space here, since there's no element in the way. Preserving
+            it verbatim is simpler and more robust than reproducing the
+            icon-boundary quirk with a real (empty) element. */}
+        {metaLines.map((line, i) => (
+          <div key={i} style={{ whiteSpace: "pre" }}>
+            {line}
+          </div>
+        ))}
+      </div>
+      {/* Visible (never `display:none`) — `innerText`, which the parity
+          harness extracts, returns "" for a hidden element; see
+          `tests/parity/lib/extract-lens.js`'s `regionText`. Legacy's own
+          `#logscope` lives inside a visible sidebar heading, not hidden
+          either. */}
+      <span className="app-shell__logscope" id="logscope">
+        {logscope}
+      </span>
       <main className="app-shell__stage" id="stage">
         {renderRoute(route)}
       </main>
@@ -25,23 +89,20 @@ export function App() {
   );
 }
 
-function routeLabel(route: Route): string {
-  switch (route.kind) {
-    case "fleet":
-      return "· fleet";
-    case "runs":
-      return `· runs (${route.runsKind})`;
-    case "machine":
-      return "· machine";
-    case "console":
-      return `· console${route.panelId ? ` · ${route.panelId}` : ""}`;
-    case "session":
-      return `· session ${route.sessionId}`;
-    case "mission-redirect":
-      return `· mission ${route.missionId}`;
-    case "unknown":
-      return "· unrecognized route";
+/** `renderCrumb()` (viewer.html:2476-2568) + each lens's own
+ * `$("logscope").textContent=` assignment, folded into one lookup keyed on
+ * [[Route]]. Only `machine` has a real (non-empty) mapping ported so far —
+ * every other route's crumb/logscope stays empty, matching legacy's actual
+ * default for most levels (see e.g. `goldens/fleet.txt`'s `(empty)` crumb)
+ * rather than a placeholder string invented for scaffold navigability. */
+function routeChrome(route: Route, localMachineName: string | null): { crumb: string; logscope: string } {
+  if (route.kind === "machine") {
+    // `$("crumb").innerHTML = state.machine!=null ? escN(state.machine) :
+    // "this machine"` (viewer.html:2537); `$("logscope").textContent =
+    // m!=null?nameOf(m):"machine"` (viewer.html:1799).
+    return { crumb: localMachineName ?? "this machine", logscope: localMachineName ?? "machine" };
   }
+  return { crumb: "", logscope: "" };
 }
 
 function renderRoute(route: Route) {
@@ -51,7 +112,7 @@ function renderRoute(route: Route) {
     case "runs":
       return <LensPlaceholder label={`runs (kind=${route.runsKind})`} />;
     case "machine":
-      return <LensPlaceholder label="machine" />;
+      return <MachineLens />;
     case "console":
       return <LensPlaceholder label={`console panel "${route.panelId || "mission-status"}"`} />;
     case "session":

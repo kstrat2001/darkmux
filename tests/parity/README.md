@@ -156,7 +156,7 @@ one's vocabulary.
 | fleet (default) | `#` (no hash) | `fleet.txt` |
 | console | `#lens=console` (`&panel=<id>`) | `console.txt` (default panel: `mission-status`) |
 | runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-lab.txt` (kind=lab — a genuinely different render, the series/knob-diff view) |
-| machine | `#lens=machine` | `machine.txt` |
+| machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
 | session drill-in | `#session=<id>` | `session-task-list.txt` |
 
 **Out of scope for this packet: `#mission=<id>`.** On a live daemon (exactly
@@ -243,10 +243,11 @@ scope:
 - **The `◧ series` sub-view within kind=lab** (`state.runsSeries===true`) —
   see the `/lab/runs` correction above; this is the one thing that endpoint
   actually feeds, and it's recorded but not rendered into any golden.
-- **Deep-link boot paths other than `#session=<id>`** — `#lens=console&panel=<id>`,
+- **Deep-link boot paths other than `#session=<id>` and `#lens=machine`
+  (closed by Packet 2 — `machine-deeplink.txt`)** — `#lens=console&panel=<id>`,
   a bare `#<date>` hash (playback-by-date, daemon-only), and `#mission=<id>`
-  (out of scope entirely — see the lens inventory above) are none of them
-  golden-tested.
+  (out of scope entirely — see the lens inventory above) are still
+  golden-untested.
 - **`fleet-sessions-live.json` was recorded empty** (`[]`) — no session was
   live on the operator's daemon at record time, so this corpus fixture has
   never actually exercised the viewer's non-empty rendering path for that
