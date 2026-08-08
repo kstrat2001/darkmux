@@ -26,7 +26,7 @@
 // match.
 
 import { test, expect } from "@playwright/test";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { GOLDENS_DIR } from "./lib/paths.js";
 import { loadMeta, installCorpusRoutes, installBlankRoutes } from "./lib/mock-routes.js";
@@ -36,9 +36,24 @@ import { extractLensText, waitSettled, installFrozenClock, regionText } from "./
 // requirement): zero pageerror, `#stage` visible with real height, no
 // horizontal document scroll at phone width. Gallery PNGs land here for the
 // operator's morning review (not committed — binary bloat, see the runbook).
-const GALLERY_DIR =
-  process.env.DARKMUX_GALLERY_DIR ||
-  "/private/tmp/claude-501/-Users-kain-de-projects-darkmux-public/652b2a6d-51b7-4543-9ddf-8ef250dd2a4d/scratchpad/ui-port-gallery/2-machine";
+//
+// Gitignored, repo-relative by default (`tests/parity/.gallery/2-machine/`)
+// — NOT an operator machine path (QA must-fix, 2026-08-09: a committed
+// absolute path bakes one machine's home-directory layout, and worse a
+// session-scoped scratch UUID, into a PUBLIC repo — no gate catches it,
+// `tripwire.mjs` only scans `corpus/`+`goldens/`). Every lens packet that
+// appends `test()` blocks to this shared file inherits this default, so the
+// path propagates correctly by construction rather than by each packet
+// remembering to get it right. Override with `DARKMUX_GALLERY_DIR` for a
+// real run (e.g. the operator's own scratchpad). `mkdirSync` itself lives
+// in the top-level `test.beforeAll` below (fires only when this suite
+// actually RUNS, never at import/collection time), matching the sibling
+// `next-parity-runs.spec.ts`'s pattern.
+const GALLERY_DIR = process.env.DARKMUX_GALLERY_DIR || path.join(__dirname, ".gallery", "2-machine");
+
+test.beforeAll(() => {
+  mkdirSync(GALLERY_DIR, { recursive: true });
+});
 
 function screenshotPath(name) {
   return path.join(GALLERY_DIR, name);
@@ -48,7 +63,12 @@ function readGolden(label) {
   return readFileSync(`${GOLDENS_DIR}/${label}.txt`, "utf8");
 }
 
-test.describe.configure({ mode: "serial" });
+// NOTE: deliberately NOT `test.describe.configure({ mode: "serial" })` (QA
+// take, mutation-proved 2026-08-09) — serial mode meant one lens's failure
+// suppressed every OTHER lens's result in this shared file (observed:
+// 1 failed / 5 did not run, vs the correct 2 failed / 4 passed once
+// removed). Every test here reads its own goldens and writes its own
+// distinct screenshot; nothing needs cross-test ordering.
 
 test("next: click-navigation into #lens=machine matches goldens/machine.txt", async ({ page }) => {
   const meta = loadMeta();

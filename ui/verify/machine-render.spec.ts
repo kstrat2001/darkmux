@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { mkdirSync } from "node:fs";
 import path from "node:path";
 
 // Packet 2's live render proof — the machine lens's twin of Packet 1's
@@ -10,9 +11,20 @@ import path from "node:path";
 // same "observer must not join the observed" posture the lens itself is
 // built on), not an inference call, so it doesn't touch the no-unattended-
 // LMStudio-dispatch boundary.
-const GALLERY_DIR =
-  process.env.DARKMUX_GALLERY_DIR ||
-  "/private/tmp/claude-501/-Users-kain-de-projects-darkmux-public/652b2a6d-51b7-4543-9ddf-8ef250dd2a4d/scratchpad/ui-port-gallery/2-machine";
+//
+// Gitignored, repo-relative by default (`ui/verify/.gallery/2-machine/`) —
+// NOT an operator machine path (QA must-fix, 2026-08-09 — see the parallel
+// fix in `tests/parity/next-parity.spec.ts` for the full rationale: a
+// committed absolute path bakes one machine's home-directory layout, and a
+// session-scoped scratch UUID, into a PUBLIC repo). Override with
+// `DARKMUX_GALLERY_DIR` for a real run. `mkdirSync` lives in `beforeAll`,
+// not module scope, so importing/collecting this file has zero filesystem
+// side effects.
+const GALLERY_DIR = process.env.DARKMUX_GALLERY_DIR || path.join(__dirname, ".gallery", "2-machine");
+
+test.beforeAll(() => {
+  mkdirSync(GALLERY_DIR, { recursive: true });
+});
 
 function screenshotPath(name: string): string {
   return path.join(GALLERY_DIR, name);
