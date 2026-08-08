@@ -938,7 +938,13 @@ fn board_order(a: &MissionView, b: &MissionView) -> std::cmp::Ordering {
 /// mission can be paused after being started, or finalized without ever having
 /// started. Nothing is subtracted, so a mission with only `created_ts` still
 /// sorts by that.
-fn last_activity(m: &Mission) -> u64 {
+/// `pub(crate)` since #1713: `radio_answer`'s grounding block orders the
+/// missions it names by the SAME rule, and its verification criterion is
+/// literally "matches the CLI board's top row". Two copies of this would
+/// drift the first time a new terminal stamp lands (an `aborted_ts`, say):
+/// whoever updated one would have no reason to find the other, and radio
+/// would quietly start disagreeing with the board.
+pub(crate) fn last_activity(m: &Mission) -> u64 {
     m.created_ts
         .max(m.started_ts.unwrap_or(0))
         .max(m.paused_ts.unwrap_or(0))
