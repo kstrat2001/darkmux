@@ -1,0 +1,52 @@
+=== crumb ===
+(empty)
+
+=== meta ===
+● ready · 2  · last run 2h ago
+952 records · last 24h
+
+=== logscope ===
+console
+
+=== stage ===
+mission status
+all missions
+machine
+flow
+roles
+config
+fixtures
+doctor
+$ darkmux flow status
+captured 20:54:23
+· 216ms
+re-run
+darkmux flow status — ⚠ warn
+  schema:       1.18.0
+  composition:  Tee([LocalFile, Redis])
+
+Redis
+  url:          redis://100.158.129.76:6379
+  stream:       darkmux:flow
+  max_len:      10000
+  reachable:    true
+  xlen:         10002
+  oldest_id:    1785723302248-0
+  newest_id:    1786199280948-0
+  probe_ms:     177
+  ⚠ stream is ≥95% of max_len — older records will be trimmed soon
+
+Disk
+  flows_dir:    /Users/kain/.darkmux/flows
+  exists:       true
+  day_files:    80
+  total_bytes:  78531486
+
+Schema
+  writer:       1.18.0
+  observed:     1.1.0, 1.11.0, 1.12.0, 1.13.0, 1.14.0, 1.15.0, 1.16.0, 1.17.0, 1.18.0, 1.2.0, 1.3.0, 1.5.0, 1.7.0, 1.8.0, 1.9.0
+  skew:         false
+
+Warnings:
+  - redis_stream_near_maxlen
+

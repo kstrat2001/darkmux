@@ -30,11 +30,38 @@
 export const RUNS_KINDS = ["all", "mission", "dispatch", "lab"] as const;
 export type RunsKind = (typeof RUNS_KINDS)[number];
 
+/** The console lens's panel allowlist — a straight port of `viewer.html`'s
+ * `PANELS` id list (`crates/darkmux-serve/src/panel.rs::PANEL_IDS` is the
+ * server-side twin). Kept here, next to `RUNS_KINDS`, because both exist for
+ * the SAME reason: `parseRoute` needs a closed set to validate a hash param
+ * against before trusting it. Console-lens-only concerns (tab labels, which
+ * panels are manual-only) stay in `lenses/console/panels.ts` — this list is
+ * the routing-grammar's business, not the lens's. */
+export const PANEL_IDS = [
+  "mission-status",
+  "mission-status-all",
+  "machine-status",
+  "flow-status",
+  "role-list",
+  "config-list",
+  "lab-fixture-list",
+  "doctor",
+] as const;
+export type PanelId = (typeof PANEL_IDS)[number];
+
 export type Route =
   | { kind: "fleet" }
   | { kind: "runs"; runsKind: RunsKind; run: string | null }
   | { kind: "machine" }
-  | { kind: "console"; panelId: string }
+  /** `panelId` is `""` for "no explicit panel requested" AND for "an
+   * unrecognized id" — both fall back to the console lens's own default
+   * (`mission-status`), matching legacy's `consoleQuery()`:
+   * `PANELS.some(x=>x.id===id) ? id : ""`. The router does the same
+   * allowlist check `consoleQuery` does; the lens component owns applying
+   * the "" -> default fallback (mirroring `state.panelId` starting at
+   * `"mission-status"` and `boot()`'s `if(nq) state.panelId=nq` — a falsy
+   * `nq` leaves the existing default untouched rather than overwriting it). */
+  | { kind: "console"; panelId: PanelId | "" }
   | { kind: "session"; sessionId: string }
   /** `#mission=<id>` is a FULL NAVIGATION in the legacy viewer
    * (`location.href = "/mission/<id>/graph"`) — a separate asset with its own
@@ -85,7 +112,9 @@ export function parseRoute(): Route {
   }
 
   if (lens === "console") {
-    return { kind: "console", panelId: get("panel") };
+    const rawPanel = get("panel");
+    const panelId = (PANEL_IDS as readonly string[]).includes(rawPanel) ? (rawPanel as PanelId) : "";
+    return { kind: "console", panelId };
   }
 
   const mission = get("mission");

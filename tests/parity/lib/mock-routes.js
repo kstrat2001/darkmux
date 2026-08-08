@@ -82,6 +82,13 @@ function installCorpusRoutes(page, meta) {
     if (p.startsWith("/flow-mission/")) return jsonInline({ records: [], count: 0, truncated: false, generated_at_ms: meta.frozen_clock_ms });
 
     if (p === "/panel/mission-status") return json("panel-mission-status.json");
+    if (p === "/panel/mission-status-all") return json("panel-mission-status-all.json");
+    if (p === "/panel/machine-status") return json("panel-machine-status.json");
+    if (p === "/panel/flow-status") return json("panel-flow-status.json");
+    if (p === "/panel/role-list") return json("panel-role-list.json");
+    if (p === "/panel/config-list") return json("panel-config-list.json");
+    if (p === "/panel/lab-fixture-list") return json("panel-lab-fixture-list.json");
+    if (p === "/panel/doctor") return json("panel-doctor.json");
     if (p.startsWith("/panel/")) return notFound('unknown panel "' + p.slice("/panel/".length) + '" — panels are a fixed allowlist, not arbitrary commands\n');
 
     if (p.startsWith("/lab/run/")) return notFound("lab-run drill-down not recorded in this corpus\n");

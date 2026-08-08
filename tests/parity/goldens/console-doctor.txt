@@ -1,0 +1,50 @@
+=== crumb ===
+(empty)
+
+=== meta ===
+● ready · 2  · last run 2h ago
+952 records · last 24h
+
+=== logscope ===
+console
+
+=== stage ===
+mission status
+all missions
+machine
+flow
+roles
+config
+fixtures
+doctor
+$ darkmux doctor
+captured 20:54:25
+· manual-run only
+· 1923ms
+re-run
+darkmux doctor — 38 checks
+
+● needs attention — binary vs source: the darkmux you are running was built from 557e1b94, but this source tree's HEAD is 899cf7be — your latest code is NOT in the binary under test
+
+  ✓ build                  darkmux 2.5.0 (557e1b94) · flow schema 1.18.0
+  ✓ daemon reachable       reachable · viewer http://100.141.193.1:8765/ · phone http://macbook-pro.taild82cbb.ts.net/
+  ✓ 31 more checks passed — `-v` for detail
+  ⚠ binary vs source       the darkmux you are running was built from 557e1b94, but this source tree's HEAD is 899cf7be — your latest code is NOT in the binary under test
+        → rebuild + install it: `cargo install --path .`
+  ⚠ flow sink health       Tee([LocalFile, Redis]) · warnings: redis_stream_near_maxlen
+        → Run `darkmux flow status` for full detail. Common fixes: start Redis (`brew services start redis`) if `redis_unreachable`; raise `DARKMUX_REDIS_MAXLEN` if `redis_stream_near_maxlen`; upgrade the lagging writer in the fleet if `schema_skew_detected`.
+  ⚠ redis config           config Redis enabled → 100.158.129.76, but no password (Keychain item `darkmux-redis` absent, no DARKMUX_REDIS_URL) — connecting password-less
+        → If your Redis requires auth, store the password: `security add-generic-password -a $USER -s darkmux-redis -w` (URL-safe). Password-less is fine for a local/Tailnet-trusted Redis.
+  ⚠ beat-33 crew/ layout   operator state still under /Users/kain/.darkmux/crew/ (found: missions, roles); flattening is recommended
+        → darkmux still reads the legacy layout via the loader's dual-read fallback — no rush. When you're ready to flatten, copy-paste this (uses `mv -n` so existing canonical files are never overwritten):
+        →
+        → mv -n /Users/kain/.darkmux/crew/missions /Users/kain/.darkmux/missions
+        → mv -n /Users/kain/.darkmux/crew/roles /Users/kain/.darkmux/roles
+        → rmdir /Users/kain/.darkmux/crew 2>/dev/null || true
+        →
+        → Note: if you set DARKMUX_CREW_DIR explicitly, this check assumes the env var points at the post-flatten root (e.g. `~/.darkmux/`). If you instead set it at the legacy `crew/` dir (`~/.darkmux/crew/`), the dual-read keeps working but this script's paths are computed from the env var value as-given.
+  ⚠ legacy compaction extras profile `bakeoff-a10b` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, customInstructions, mode; profile `bakeoff-codernext` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, customInstructions, mode; profile `balanced` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, customInstructions, mode; profile `deep` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, customInstructions, mode; profile `diff-review` has fields not consumed by the internal runtime: mode; profile `fast` has fields not consumed by the internal runtime: mode; profile `gpt-oss-harmony` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, customInstructions, mode; profile `probe-27b` has fields not consumed by the internal runtime: mode; profile `probe-4b` has fields not consumed by the internal runtime: mode; profile `probe-gptoss` has fields not consumed by the internal runtime: mode; profile `scribe` has fields not consumed by the internal runtime: mode; profile `sweep-35b-noTQ` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, mode; profile `sweep-35b-oq6` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, mode; profile `sweep-qwen3-122b` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, mode; profile `sweep-qwen3-27b` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, mode; profile `sweep-qwen3-coder` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, mode; profile `v15-5` has fields not consumed by the internal runtime: maxHistoryShare, recentTurnsPreserve, customInstructions, mode
+        → Migrate `customInstructions` to typed `custom_instructions` field; remove `mode` / `maxHistoryShare` / `recentTurnsPreserve` (darkmux's typed schema doesn't expose these — see DESIGN.md Schema isolation).
+
+33 pass, 5 warn — workable but worth a look
+

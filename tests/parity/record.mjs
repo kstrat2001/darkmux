@@ -150,6 +150,29 @@ async function main() {
     file: "panel-mission-status.json",
     headers: { "x-darkmux-panel": "1" },
   });
+  // The remaining seven panels in the daemon's allowlist (Packet 6 growth —
+  // see crates/darkmux-serve/src/panel.rs::PANEL_IDS for the source of
+  // truth). `doctor` is manual-run-only server-side (auto_refresh:false,
+  // rate-floored at 30s between runs, ~2s to gather) — recording it here is
+  // still safe: this script runs at most once per `bun run record`
+  // invocation, an operator-initiated action, never a poll.
+  const PANEL_IDS_EXCEPT_MISSION_STATUS = [
+    "mission-status-all",
+    "machine-status",
+    "flow-status",
+    "role-list",
+    "config-list",
+    "lab-fixture-list",
+    "doctor",
+  ];
+  for (const id of PANEL_IDS_EXCEPT_MISSION_STATUS) {
+    await rec({
+      name: `panel-${id}`,
+      urlPath: `/panel/${id}`,
+      file: `panel-${id}.json`,
+      headers: { "x-darkmux-panel": "1" },
+    });
+  }
   // Extensions beyond the plan's literal list — see module doc.
   await rec({ name: "lab-runs", urlPath: "/lab/runs", file: "lab-runs.json", extra: { reason: "runs lens fetches this alongside /runs on every entry" } });
   await rec({

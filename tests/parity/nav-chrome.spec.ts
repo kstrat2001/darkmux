@@ -80,9 +80,24 @@ function shot(name) {
 // actually rendered (never just "something changed") — same discipline
 // `extract-lens.js`'s own module doc requires of every navigation in this
 // harness.
+// `console`'s settle selector was `[data-state="not-ported"]` (the
+// `LensPlaceholder` this tab rendered when this file was authored) — QA
+// found it stale post-merge (2026-08-09): Packet 6 landed a REAL
+// `ConsolePanel` for `#lens=console` in the meantime, which never carries
+// that data-state, so the click-navigation test hung waiting for a marker
+// that can no longer appear (a twin-drift instance, same class this file's
+// own module doc already names for the frozen-clock interaction). `.panelchrome`
+// is `ConsolePanel`'s own chrome wrapper, rendered UNCONDITIONALLY on mount
+// regardless of loading/error/loaded/manual-not-yet-run state (see that
+// component's own doc) and unique to it — nothing else in this app uses the
+// class — so waiting on it proves the RIGHT lens mounted, matching this
+// test's actual assertions (hash + `.on` class), without needing the
+// content to be FULLY loaded (this test never calls `waitSettled` with a
+// `previousText` check here, so it doesn't need a load-complete marker like
+// `next-parity-console.spec.ts`'s own `re-run`-button marker does).
 const TABS = [
   { act: "fleet", hash: "", settle: '[data-state]:not([data-state="pending"])' },
-  { act: "console", hash: "#lens=console", settle: '[data-state="not-ported"]' },
+  { act: "console", hash: "#lens=console", settle: ".panelchrome" },
   { act: "runs", hash: "#lens=runs", settle: '[data-state="data"], [data-state="pending"]' },
   { act: "machine", hash: "#lens=machine", settle: '.machine-lens__health[data-state="loaded"]' },
 ];

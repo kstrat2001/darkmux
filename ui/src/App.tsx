@@ -6,6 +6,7 @@ import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
 import { MachineLens } from "./lenses/machine/MachineLens";
 import { RunsBoard } from "./lenses/runs/RunsBoard";
+import { ConsolePanel } from "./lenses/console/ConsolePanel";
 import { CatalogPanel } from "./lenses/catalog/CatalogPanel";
 import { MissionReplay } from "./lenses/catalog/MissionReplay";
 import { SessionReplay } from "./lenses/catalog/SessionReplay";
@@ -163,7 +164,7 @@ function renderRoute(route: Route) {
     case "machine":
       return <MachineLens />;
     case "console":
-      return <LensPlaceholder label={`console panel "${route.panelId || "mission-status"}"`} />;
+      return <ConsolePanel initialPanelId={route.panelId} />;
     case "session":
       // Packet 4: a real fetch to /flow-session/<id> — see SessionReplay's
       // own doc for why the RENDER (not the fetch) is still a not-ported

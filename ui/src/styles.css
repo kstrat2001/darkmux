@@ -434,6 +434,155 @@ body {
   padding: 10px 0;
 }
 
+/* ── Console lens (Packet 6) — ported from viewer.html's own <style> block
+   (search that file for `.panelwrap`/`.panelchrome`/`.panelout`). Same
+   load-bearing-CSS caveat as the runs lens block above: `.panelchrome` is
+   `display:flex;flex-wrap:wrap` so each chrome span (`$ darkmux …`,
+   `captured …`, the optional stale/manual badges, `· <n>ms`, the button)
+   lands on its OWN innerText line, matching the goldens exactly — collapsing
+   it to inline would merge them onto one line and break parity. `.panelout`
+   is rendered on a real `<pre>` element (not a styled `<div>`), so
+   `white-space:pre` here is belt-and-suspenders with the tag's own UA
+   default, not the only thing providing it — don't swap the tag for a `div`
+   without re-adding the rule's effect. Colors are approximated against this
+   port's own root palette (`--accent`/`--error`/`--dim`/`--border`) rather
+   than reproducing legacy's separate `--bg2`/`--panel`/`--line`/`--muted`/
+   `--good`/`--warn`/`--bad`/`--run`/`--accent-dim` tokens verbatim — `
+   innerText()` (what parity actually checks) never reads color, so this is a
+   deliberate simplification, not a parity risk. */
+.panelwrap {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #131826;
+  margin-top: 10px;
+  overflow: hidden;
+}
+.panelchrome {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: #1c1c22;
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+.panelchrome .pc-cmd {
+  color: var(--fg);
+  font-weight: 600;
+}
+.panelchrome .pc-spacer {
+  flex: 1 1 auto;
+}
+.panelchrome .pc-stale {
+  color: #ffb86b;
+}
+.panelchrome .pc-manual {
+  color: #2a8a96;
+}
+.pcbtn {
+  font: 600 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  background: #131826;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+.pcbtn:hover {
+  color: var(--accent);
+  border-color: #2a8a96;
+}
+.pcbtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.pcbtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.panelout {
+  margin: 0;
+  padding: 12px;
+  overflow-x: auto;
+  white-space: pre;
+  font:
+    12px/1.5 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace,
+    "Apple Color Emoji";
+  color: var(--fg);
+}
+.panelerr {
+  padding: 12px;
+  font: 12px/1.5 "JetBrains Mono", monospace;
+  color: var(--error);
+  white-space: pre-wrap;
+}
+/* ANSI SGR -> palette. Only what darkmux's own output emits is mapped with
+   intent; the rest fall back to sane terminal-ish values — same scope as
+   `ANSI_SGR_CLASS` in `lib/ansi.ts`. */
+.panelout .a-bold {
+  font-weight: 700;
+}
+.panelout .a-dim {
+  opacity: 0.62;
+}
+.panelout .a-ital {
+  font-style: italic;
+}
+.panelout .a-underline {
+  text-decoration: underline;
+}
+.panelout .a-fg1,
+.panelout .a-fg9 {
+  color: var(--error);
+}
+.panelout .a-fg2,
+.panelout .a-fg10 {
+  color: #5af0a3;
+}
+.panelout .a-fg3,
+.panelout .a-fg11 {
+  color: #ffd166;
+}
+.panelout .a-fg4,
+.panelout .a-fg12 {
+  color: #7aa2f7;
+}
+.panelout .a-fg5,
+.panelout .a-fg13 {
+  color: #c39cf7;
+}
+.panelout .a-fg6,
+.panelout .a-fg14 {
+  color: var(--accent);
+}
+.panelout .a-fg0,
+.panelout .a-fg8 {
+  color: var(--dim);
+}
+.panelout .a-fg7,
+.panelout .a-fg15 {
+  color: var(--fg);
+}
+.panelout .a-link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: #2a8a96;
+  padding: 2px 0;
+}
+@media (max-width: 700px) {
+  .panelout {
+    font-size: 11px;
+    padding: 10px;
+  }
+  .panelchrome {
+    font-size: 10px;
+    padding: 7px 10px;
+  }
+}
+
 /* ── Catalog picker (Packet 4) — ported from viewer.html's own <style>
    block (search that file for `.catpanel`/`.catrow`/`.cathdr`/`.catempty`).
    `.catrow`'s explicit `display:block` (overriding <button>'s UA-stylesheet

@@ -1,0 +1,52 @@
+=== crumb ===
+(empty)
+
+=== meta ===
+● ready · 2  · last run 2h ago
+952 records · last 24h
+
+=== logscope ===
+console
+
+=== stage ===
+mission status
+all missions
+machine
+flow
+roles
+config
+fixtures
+doctor
+$ darkmux role list
+captured 20:54:23
+· 5ms
+re-run
+id                     description                                                     skills       escalation
+analyst                Data/system analyst who reads run outputs, logs, metrics,…      1            bail-with-explanation
+code-reviewer          Senior reviewer who reads PR diffs, identifies issues, le…      1            bail-with-explanation
+coder                  Implements features described by the user. Reads existing…      2            bail-with-explanation
+design-reviewer        A senior reviewer who evaluates design proposals (UX, arc…      2            bail-with-explanation
+dialectic-defender     Defense seat of the adversarial (dialectic) PR review (#1…      1            bail-with-explanation
+dialectic-judge        Judge seat of the adversarial (dialectic) PR review (#122…      1            bail-with-explanation
+dialectic-prosecutor   Prosecution seat of the adversarial (dialectic) PR review…      1            bail-with-explanation
+fitness-coach          Fitness-planning thinking partner. Structures training ro…      2            bail-with-explanation
+health-research        Health-research thinking partner. Reads symptoms/research…      2            bail-with-explanation
+lab-manager            Manages darkmux lab dispatches end-to-end: runs them, cap…      2            bail-with-explanation
+legal-research         Legal-research thinking partner. Reads contracts, surface…      2            bail-with-explanation
+logistics-coordinator  Organizes trip logistics — booking deadlines, document ti…      2            bail-with-explanation
+mission-compiler       Utility-family role that takes unstructured intent and em…      1            bail-with-explanation
+pr-reviewer            Tool-less PR code reviewer for CI: reads a unified diff p…      1            bail-with-explanation
+pr-reviewer-agentic    PR reviewer with the repository checked out: reads the di…      1            bail-with-explanation
+pr-reviewer-freeform   Tool-less PR code reviewer, aggressive stance: reads a un…      1            bail-with-explanation
+review-judge           Judge seat of the review pipeline (#1222 Phase B): invest…      1            bail-with-explanation
+review-probe           Probe seat of the review pipeline (#1222 Phase B): given …      1            bail-with-explanation
+review-probe-high      High-tier probe seat of the review pipeline (#1475 packet…      1            bail-with-explanation
+review-probe-low       Low-tier probe seat of the review pipeline (#1475 packet …      1            bail-with-explanation
+review-probe-mid       Mid-tier probe seat of the review pipeline (#1475 packet …      1            bail-with-explanation
+review-verify          Verify (adjudication) seat of the review pipeline (#1260/…      1            bail-with-explanation
+scribe                 Drafts lab notebook entries and prose from run data + use…      1            bail-with-explanation
+test-designer          Plans test strategies, selects edge cases, and writes tes…      2            bail-with-explanation
+tool-bench             Harness role for the tool-call bench (#1196): retrieves r…      1            bail-with-explanation
+trip-researcher        Researches destinations, restaurants, transit options, an…      2            bail-with-explanation
+voice-editor           A senior editor who reads existing drafts and suggests re…      2            bail-with-explanation
+

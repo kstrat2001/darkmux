@@ -144,6 +144,27 @@ export interface LabRunsResponse {
   runs: LabRun[];
 }
 
+/** `GET /panel/:id` — an allowlisted CLI command's own rendered output,
+ * metadata AROUND the text, never extraction FROM it. Source:
+ * `crates/darkmux-serve/src/panel.rs::panel_handler`'s `serde_json::json!`
+ * body — see that module's own doc for the full field-by-field rationale
+ * (`gather_ms` stamps the observer's own cost; `cache_ttl_ms`/`age_ms` make
+ * staleness verifiable; `auto_refresh:false` is `doctor`'s manual-run-only
+ * marker, honored client-side AND enforced server-side). */
+export interface PanelResponse {
+  panel: string;
+  argv: string[];
+  captured_ts_ms: number;
+  gather_ms: number;
+  exit_code: number | null;
+  ansi_text: string;
+  stderr_tail: string;
+  cols: number;
+  cache_ttl_ms: number;
+  age_ms: number;
+  auto_refresh: boolean;
+}
+
 /** `GET /flow-days` — one row per `YYYY-MM-DD.jsonl` day file on disk,
  * newest-first (the server sorts). Source:
  * `crates/darkmux-serve/src/lib.rs::scan_flow_days`. */

@@ -44,6 +44,11 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "console", panelId: "" });
   });
 
+  it("falls back to the default panel for an unrecognized panel id (matching legacy consoleQuery, not a blank page)", () => {
+    setHash("#lens=console&panel=rm-rf-everything");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "" });
+  });
+
   it("parses #session=<id>", () => {
     setHash("#session=abc-123");
     expect(parseRoute()).toEqual({ kind: "session", sessionId: "abc-123" });

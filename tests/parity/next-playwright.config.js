@@ -31,15 +31,20 @@ const PORT = 47920;
 module.exports = defineConfig({
   testDir: __dirname,
   // Dedicated to the runs lens (Packet 3) — `next-parity-runs` in
-  // package.json. Packet 4's catalog suite got its OWN config +
-  // script (`next-parity-catalog.playwright.config.js` /
-  // `next-parity-catalog`, port 47922) after the back-merge with Packet 2's
-  // machine lens, which introduced its own dedicated
-  // `next-parity.playwright.config.js` / `next-parity` (port 47921) —
-  // riding this file's testMatch post-merge would have made the
-  // `next-parity-runs` script name lie about what it runs. Each lens suite
-  // is individually invokable now; a future packet may fold all three into
-  // one shared harness (a rename, not a rewrite) if that turns out cleaner.
+  // package.json. Packet 4's catalog suite got its OWN config + script
+  // (`next-parity-catalog.playwright.config.js` / `next-parity-catalog`,
+  // port 47922) after the back-merge with Packet 2's machine lens, which
+  // introduced its own dedicated `next-parity.playwright.config.js` /
+  // `next-parity` (port 47921) — riding this file's testMatch post-merge
+  // would have made the `next-parity-runs` script name lie about what it
+  // runs. Packet 6's console suite followed the same precedent (QA
+  // post-merge review, 2026-08-09) and moved OUT to its own
+  // `next-parity-console.playwright.config.js` / `next-parity-console`
+  // (port 47923) rather than riding this array — it briefly lived here
+  // (`testMatch: [..., "next-parity-console.spec.ts"]`) before that split.
+  // Each lens suite is individually invokable now; a future packet may fold
+  // all of them into one shared harness (a rename, not a rewrite) if that
+  // turns out cleaner.
   testMatch: ["next-parity-runs.spec.ts"],
   forbidOnly: !!process.env.CI,
   retries: 0,

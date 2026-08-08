@@ -32,15 +32,81 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText(/no machines currently present/i)).toBeInTheDocument());
   });
 
-  it("renders a named placeholder for a lens this packet doesn't implement", () => {
+  it("renders the real console lens (not a placeholder) for #lens=console", async () => {
     window.location.hash = "#lens=console";
+    // App-level `useFlowWindow`/`useLiveMachines`/`machineSpecs` (Packet 2's
+    // GLOBAL `#meta` chrome, wired into every route, not just `#lens=machine`)
+    // fire alongside the console lens's own `/panel/*` fetch — a mock that
+    // ONLY answers `/panel/*` throws inside `useLiveMachines` (`query.data.data
+    // is not iterable`) the instant this route mounts. Route on URL: the panel
+    // endpoint gets real content, everything else gets an empty-but-valid `[]`
+    // (same blanket default the sibling "machine lens" test below uses).
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (typeof url === "string" && url.startsWith("/panel/")) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                panel: "mission-status",
+                argv: ["mission", "status"],
+                captured_ts_ms: Date.now(),
+                gather_ms: 1,
+                exit_code: 0,
+                ansi_text: "no missions",
+                stderr_tail: "",
+                cols: 100,
+                cache_ttl_ms: 3000,
+                age_ms: 0,
+                auto_refresh: true,
+              }),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={queryClient}>
         <App />
       </QueryClientProvider>,
     );
-    expect(screen.getByText(/lens not ported yet: console/i)).toBeInTheDocument();
+    expect(screen.queryByText(/lens not ported yet/i)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("no missions")).toBeInTheDocument());
+  });
+
+  it("renders a named placeholder once SessionReplay's real fetch resolves populated (Packet 4 completed the fetch wiring, not the render)", async () => {
+    // `#lens=console` was this test's original target before Packet 6 ported
+    // the console lens for real, then briefly `#session=<id>` (Packet 4
+    // still rendered a bare `LensPlaceholder` there at the time) before
+    // Packet 4 landed `SessionReplay` — a REAL fetch to `/flow-session/<id>`
+    // that only falls through to `LensPlaceholder` once the fetch resolves
+    // with a non-empty count (see that component's own doc). Mock the
+    // session endpoint with a populated response so the assertion still
+    // exercises the placeholder-mechanism end state, not SessionReplay's own
+    // loading/error branches (which is Packet 4's concern to test, not this
+    // file's App-routing regression guard).
+    window.location.hash = "#session=abc-123";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (typeof url === "string" && url.startsWith("/flow-session/")) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ records: [{}], count: 1, truncated: false, generated_at_ms: Date.now() }), { status: 200 }),
+          );
+        }
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByText(/lens not ported yet: session drill-in abc-123/i)).toBeInTheDocument());
   });
 
   it("renders the machine lens (Packet 2) instead of a placeholder", async () => {
