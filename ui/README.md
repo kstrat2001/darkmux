@@ -1,0 +1,68 @@
+# darkmux viewer — `/next` (UI port Packet 1: the scaffold)
+
+React + TanStack Query workspace that builds to ONE committed, self-contained
+`crates/darkmux-serve/assets/next.html`, served at `GET /next` alongside the
+legacy `viewer.html` (still at `GET /`). See the root plan
+(`UI_PORT_PLAN.md`, private scratch) for the full port arc; this package is
+Packet 1 only — the scaffold, not any lens.
+
+## The stack, and why
+
+- **bun** — package manager + script runner. Fast, text lockfile (`bun.lock`
+  is diffable, unlike a binary one).
+- **Vite + `vite-plugin-singlefile`** — bundler. Singlefile inlines every JS
+  chunk and the stylesheet into ONE `index.html`, which is what lets the
+  Rust side `include_str!` a single committed artifact instead of shipping a
+  whole `dist/` tree — the release binary stays self-contained and node-free
+  (`cargo build` never touches `ui/`).
+- **React 18 + TypeScript strict** — the spine the port was ratified against.
+- **@tanstack/react-query** — data layer. Every fetch goes through ONE typed
+  wrapper (`src/lib/fetcher.ts`) returning a discriminated `FetchResult`, so
+  a lens component renders its error state from real detail (status +
+  message), not Query's bare `isError` boolean.
+- **ts-rs** (Rust dev-dependency, `#[cfg(test)]`-gated in
+  `crates/darkmux-serve/src/runs.rs`) — generates `src/types/generated/*.ts`
+  straight from the `/runs` view-model structs. Endpoints that build ad-hoc
+  `serde_json::json!({...})` (no typed Rust struct to derive from) are typed
+  by hand in `src/types/handwritten.ts`, which names its Rust source per
+  field group — see that file's own doc for which endpoints and why.
+- **vitest + @testing-library/react** — unit/component tests.
+- **@playwright/test** (`ui/verify/`, NOT wired into `test`/`build`) — the
+  one-shot LIVE render-proof harness against a throwaway daemon. Not a
+  runtime or CI dependency; see that directory's own doc comment.
+
+## Scripts
+
+| Script | What |
+|---|---|
+| `bun run dev` | Vite dev server (not used by the daemon; local iteration only). |
+| `bun run build` | typecheck → `vite build` → copies `dist/index.html` to `../crates/darkmux-serve/assets/next.html`. **Run this and commit the result** — the artifact is committed, not built by `cargo build`. |
+| `bun run test` | vitest, `src/**/*.test.{ts,tsx}` only (`verify/` is excluded — see `vitest.config.ts`). |
+| `bun run typecheck` | `tsc --noEmit`. |
+| `bun run types:regen` | Regenerates `src/types/generated/*.ts` from the live Rust structs (`cargo test -p darkmux-serve export_bindings --lib`). |
+| `bun run types:check` | Regenerates, then `git diff --exit-code` on the generated dir — the drift guard. Wire this into CI in a follow-up packet; it's a local check today. |
+
+## The `#lens=` compatibility promise
+
+The hash grammar (`src/lib/route.ts`) is a byte-for-byte port of
+`viewer.html`'s own `catalogQuery`/`labQuery`/`consoleQuery`/`machineQuery`
+functions, precedence order included — every CLI-printed deep link and
+phone-bookmark against the legacy viewer must keep resolving once a lens
+moves here. An unrecognized route renders a named placeholder
+(`LensPlaceholder`), never a blank page.
+
+## What's deliberately deferred to lens packets
+
+- Every lens except the fleet-machines strip (`FleetStrip`) is a
+  `LensPlaceholder` naming what still needs porting.
+- `PresenceBeat` (fleet/machines/live's real Rust type, in `darkmux-flow`)
+  is hand-written, not ts-rs-derived — bridging it would mean adding ts-rs
+  as a dependency of a crate consumed by production code, not just
+  `darkmux-serve`'s test-only surface; ledgered rather than chased (see the
+  overnight runbook's FOLLOW-UPS section).
+- `types:check` is a local script, not a CI job yet.
+- The SSE spike (`src/lib/sse.ts`) is unit-tested against a mock
+  `EventSource` only — the live proof against a real `/flow/:date/stream`
+  is Packet 5's job.
+- The three-state **contract** (empty-is-never-silent, enforced everywhere)
+  is a later arc; this packet only proves the PATTERN on one region.

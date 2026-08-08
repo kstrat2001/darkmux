@@ -50,3 +50,14 @@ tests/parity/.verify-snapshot/
 tests/parity/corpus.tmp-*/
 tests/parity/test-results/
 tests/parity/playwright-report/
+
+# UI port scaffold (Packet 1) — local artifacts. `ui/dist/index.html` is
+# copied to the COMMITTED `crates/darkmux-serve/assets/next.html` by
+# `bun run build`'s `copy-artifact` step; `dist/` itself is scratch.
+# `src/types/generated/` IS committed (ts-rs output; see ui/README.md).
+ui/node_modules/
+ui/dist/
+ui/test-results/
+ui/playwright-report/
+ui/verify/test-results/
+ui/verify/playwright-report/

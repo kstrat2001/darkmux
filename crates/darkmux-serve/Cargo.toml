@@ -35,6 +35,12 @@ redis = { version = "0.27", default-features = false, features = ["streams"] }
 tempfile = "3.10"
 serial_test = "3.1"
 tower = "0.5"
+# (UI port Packet 1) TS-bridge generator for the /runs view-model — dev-only,
+# derive gated `#[cfg(test)]` in runs.rs so it never touches the release
+# binary. Regenerate: `cargo test -p darkmux-serve --test ts_export` (or the
+# ui/ package.json's `types:check` script, which runs the same command and
+# diffs the result).
+ts-rs = "10"
 # (#811) Enable darkmux-types' test-support in serve's TEST build only so the
 # config tier is empty by construction — the flow-endpoint tests never
 # aggregate from the operator's real config.json Redis. Feature-unifies with

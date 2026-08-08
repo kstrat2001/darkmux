@@ -1,0 +1,132 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0e14;
+  --fg: #e6e8ee;
+  --dim: #8b93a7;
+  --accent: #4fd1c5;
+  --error: #f56565;
+  --border: #232838;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  /* No horizontal document scroll at any width, including 390px phone
+     viewports — the overnight runbook's render-sanity contract. */
+  overflow-x: hidden;
+  max-width: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  width: 100%;
+}
+
+.app-shell__crumb {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+  color: var(--dim);
+}
+
+.app-shell__stage {
+  flex: 1;
+  padding: 16px;
+  min-height: 200px;
+}
+
+/* Fleet strip — three visibly distinct data states. */
+.fleet-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.fleet-strip--pending .fleet-skeleton {
+  width: 220px;
+  height: 64px;
+  border-radius: 8px;
+  background: linear-gradient(90deg, #1a1f2e 25%, #232941 37%, #1a1f2e 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.4s ease infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+.fleet-strip--error {
+  border: 1px solid var(--error);
+  background: rgba(245, 101, 101, 0.08);
+  border-radius: 8px;
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--error);
+}
+
+.fleet-strip--empty {
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  color: var(--dim);
+}
+
+.fleet-strip--data .fleet-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  min-width: 200px;
+  background: #131826;
+}
+
+.fleet-card__name {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.fleet-card__specs,
+.fleet-card__models {
+  font-size: 12px;
+  color: var(--dim);
+  margin-top: 4px;
+}
+
+.lens-placeholder {
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  color: var(--dim);
+}
+
+.lens-placeholder__title {
+  font-size: 16px;
+  color: var(--fg);
+  margin: 0 0 8px;
+}
+
+.lens-placeholder__hash,
+.lens-placeholder__note {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 13px;
+  margin: 4px 0;
+}
