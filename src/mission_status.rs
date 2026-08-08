@@ -441,7 +441,7 @@ fn unreachable_phase_drifts(m: &Mission, phases: &[&Phase]) -> Vec<Drift> {
 /// system derived (#44). `--json` is never paginated: a machine reader wants
 /// the whole board, and trimming it would make the structured output lie about
 /// what exists (#1569).
-pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
+pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> Result<i32> {
     let unlimited = all || limit == Some(0);
     let missions = crew::loader::load_missions()?;
     let phases = crew::loader::load_phases()?;
@@ -495,11 +495,24 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    // (#1562) Named-first default: machine-minted run instances collapse
-    // into a footer summary instead of a full row, so the missions the
-    // operator actually named aren't drowned by pipeline/dispatch noise.
-    // `--all` restores every mission — the pre-#1562 everything-shown board.
-    let (visible, hidden) = partition_visibility(&views, all);
+    // (#1709) RECENT-FIRST default, filter on request — the inversion of
+    // #1562's named-first rule.
+    //
+    // #1562 was solving a real problem (minted runs outnumber named missions
+    // and drown them), but it solved it by answering the wrong question. The
+    // board's default now includes run instances, because "what's recent" is
+    // the question an operator actually brings to a status board; "which
+    // missions did I name" is a FILTER they ask for when they want it
+    // (`--missions`), the other tab of the same view.
+    //
+    // Lived failure that forced the flip: with zero open missions, the
+    // FINALIZED section — documented in `default_limit` as "recent-history
+    // context, not the question the board answers" — WAS the entire board,
+    // and its top row was frozen on the last named mission finalized 8 days
+    // earlier. Meanwhile a full day of reviews and panel commands showed up
+    // as a single grey "+61 run instances" footer. The board was accurate and
+    // useless at the same time.
+    let (visible, hidden) = partition_visibility(&views, !missions_only);
 
     println!(
         "{}",
@@ -692,6 +705,16 @@ pub fn run(json: bool, limit: Option<usize>, all: bool) -> Result<i32> {
             println!("{}", style::dim(&l));
         }
     }
+    // (#1709) The other half of the tab. A filter nobody can find is a
+    // filter that doesn't exist — and the default board now MIXES named
+    // missions with minted runs, which is exactly when someone wants the
+    // named-only list. Printed only when there is something to filter, so a
+    // board of purely named work never advertises a no-op.
+    if !missions_only && visible.iter().any(|v| is_minted_run(v.m)) {
+        for l in wrap_indented("→ `--missions` for named missions only", 0, width) {
+            println!("{}", style::dim(&l));
+        }
+    }
     // A hidden run needing attention is exactly the same "some are hidden"
     // situation a per-section `--limit` already warns about below — folded
     // into the same flag rather than a second, competing qualifier.
@@ -738,15 +761,19 @@ fn hidden_run_summary(hidden_len: usize, hidden_attention: usize) -> Option<Stri
         return None;
     }
     let plural = if hidden_len == 1 { "" } else { "s" };
+    // (#1709) This line now only ever prints under `--missions` — the
+    // operator ASKED to filter these out, so the advice names the way back
+    // rather than `--all` (which would also un-paginate).
     if hidden_attention == 0 {
         return Some(format!(
-            "+{hidden_len} run instance{plural} — `--all` for every mission, or the runs lens"
+            "+{hidden_len} run instance{plural} filtered out — drop `--missions` to include them, \
+             or see the runs lens"
         ));
     }
     let verb = if hidden_attention == 1 { "needs" } else { "need" };
     Some(format!(
-        "+{hidden_len} run instance{plural}, {hidden_attention} {verb} attention — `--all` for every \
-         mission, or the runs lens"
+        "+{hidden_len} run instance{plural} filtered out, {hidden_attention} {verb} attention — \
+         drop `--missions` to include them, or see the runs lens"
     ))
 }
 
@@ -892,9 +919,14 @@ fn last_activity(m: &Mission) -> u64 {
 /// outranks a derived one).
 fn default_limit(group: MissionStatus) -> usize {
     match group {
-        // (#1627) Aborted is closed history like Finalized — recent context,
-        // not the question the board answers.
-        MissionStatus::Finalized | MissionStatus::Aborted => 3,
+        // (#1709) Raised 3 → 8. The old budget was tuned when the default
+        // board FILTERED run instances out, which made FINALIZED a small
+        // recent-history footnote beneath the operator's named work. With
+        // the recent-first default, closed work is where nearly everything
+        // lands — and when nothing is open it is the whole board, so a
+        // 3-row budget answered "what's recent" with one day's tail.
+        // Still well under ACTIVE/PAUSED's 10: open work outranks closed.
+        MissionStatus::Finalized | MissionStatus::Aborted => 8,
         MissionStatus::Active | MissionStatus::Paused => 10,
     }
 }
@@ -2208,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_visibility_keeps_named_and_collapses_minted_by_default() {
+    fn partition_visibility_keeps_named_and_collapses_minted_when_filtering() {
         let named = mission("doom-loop-m4", MissionStatus::Active);
         let mut minted = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Active);
         minted.spec = Some(minted_spec());
@@ -2234,6 +2266,33 @@ mod tests {
         assert!(hidden.is_empty(), "`--all` must hide nothing");
     }
 
+    /// (#1709) The DEFAULT board passes `true` here (`!missions_only`), so a
+    /// minted run instance is on the board unless the operator filters it
+    /// out. This pins the inversion itself: before #1709 the default passed
+    /// `all` (false), which is what buried a day of real work under an
+    /// 8-day-old finished mission.
+    #[test]
+    fn the_default_board_includes_minted_run_instances() {
+        let named = mission("doom-loop-m4", MissionStatus::Finalized);
+        let mut minted = mission("review-1786150410-209398", MissionStatus::Finalized);
+        minted.spec = Some(minted_spec());
+        let views = [view(&named, 1, 0), view(&minted, 1, 0)];
+
+        // What `run()` passes when `--missions` was NOT given.
+        let missions_only = false;
+        let (visible, hidden) = partition_visibility(&views, !missions_only);
+        assert!(
+            visible.iter().any(|v| v.m.id == "review-1786150410-209398"),
+            "today's run instance must be ON the default board, not in a footer"
+        );
+        assert!(hidden.is_empty(), "nothing is filtered out unless --missions asks for it");
+
+        // …and the filter still works when asked for.
+        let (visible, hidden) = partition_visibility(&views, !true);
+        assert_eq!(visible.iter().map(|v| v.m.id.as_str()).collect::<Vec<_>>(), vec!["doom-loop-m4"]);
+        assert_eq!(hidden.len(), 1, "--missions filters the minted run out");
+    }
+
     #[test]
     fn hidden_run_summary_is_none_when_nothing_is_hidden() {
         assert_eq!(hidden_run_summary(0, 0), None);
@@ -2243,11 +2302,11 @@ mod tests {
     fn hidden_run_summary_names_the_count_and_pluralizes() {
         assert_eq!(
             hidden_run_summary(1, 0).unwrap(),
-            "+1 run instance — `--all` for every mission, or the runs lens"
+            "+1 run instance filtered out — drop `--missions` to include them, or see the runs lens"
         );
         assert_eq!(
             hidden_run_summary(32, 0).unwrap(),
-            "+32 run instances — `--all` for every mission, or the runs lens"
+            "+32 run instances filtered out — drop `--missions` to include them, or see the runs lens"
         );
     }
 
@@ -2258,11 +2317,13 @@ mod tests {
         // collapsed out of the section it would have rendered in.
         assert_eq!(
             hidden_run_summary(32, 2).unwrap(),
-            "+32 run instances, 2 need attention — `--all` for every mission, or the runs lens"
+            "+32 run instances filtered out, 2 need attention — drop `--missions` to include them, \
+             or see the runs lens"
         );
         assert_eq!(
             hidden_run_summary(3, 1).unwrap(),
-            "+3 run instances, 1 needs attention — `--all` for every mission, or the runs lens"
+            "+3 run instances filtered out, 1 needs attention — drop `--missions` to include them, \
+             or see the runs lens"
         );
     }
 

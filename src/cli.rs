@@ -381,6 +381,18 @@ pub(crate) enum MissionCmd {
         /// Show every mission in every section, ignoring `--limit`.
         #[arg(long)]
         all: bool,
+        /// Show only the missions you NAMED — hide machine-minted run
+        /// instances (a `review` launch, a `dispatch <role>` crew-of-one).
+        ///
+        /// The board's default answers "what's recent" across everything,
+        /// because that is the question an operator brings to it. This flag
+        /// is the other tab: the named-mission list, for when the run
+        /// instances are noise rather than the news. (Before #1709 the
+        /// filtered view WAS the default, which meant a day of real work
+        /// collapsed into a one-line footer while an 8-day-old finished
+        /// mission held the top of the board.)
+        #[arg(long)]
+        missions: bool,
     },
     /// Debrief a mission (#1000) — the post-mission review ceremony's raw
     /// material in one place: the loop pathologies darkmux's detectors flagged
