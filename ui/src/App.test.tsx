@@ -77,20 +77,36 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("no missions")).toBeInTheDocument());
   });
 
-  it("renders a named placeholder for a lens this packet doesn't implement (session drill-in)", () => {
+  it("renders a named placeholder once SessionReplay's real fetch resolves populated (Packet 4 completed the fetch wiring, not the render)", async () => {
     // `#lens=console` was this test's original target before Packet 6 ported
-    // the console lens for real — kept AS a placeholder-mechanism check, but
-    // re-pointed at a route that's still genuinely unported (`#session=<id>`,
-    // see `renderRoute`'s `LensPlaceholder` branch) rather than asserting
-    // stale behavior against a route that no longer matches it.
+    // the console lens for real, then briefly `#session=<id>` (Packet 4
+    // still rendered a bare `LensPlaceholder` there at the time) before
+    // Packet 4 landed `SessionReplay` — a REAL fetch to `/flow-session/<id>`
+    // that only falls through to `LensPlaceholder` once the fetch resolves
+    // with a non-empty count (see that component's own doc). Mock the
+    // session endpoint with a populated response so the assertion still
+    // exercises the placeholder-mechanism end state, not SessionReplay's own
+    // loading/error branches (which is Packet 4's concern to test, not this
+    // file's App-routing regression guard).
     window.location.hash = "#session=abc-123";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (typeof url === "string" && url.startsWith("/flow-session/")) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ records: [{}], count: 1, truncated: false, generated_at_ms: Date.now() }), { status: 200 }),
+          );
+        }
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={queryClient}>
         <App />
       </QueryClientProvider>,
     );
-    expect(screen.getByText(/lens not ported yet: session drill-in abc-123/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/lens not ported yet: session drill-in abc-123/i)).toBeInTheDocument());
   });
 
   it("renders the machine lens (Packet 2) instead of a placeholder", async () => {
