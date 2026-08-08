@@ -54,4 +54,9 @@ export const queryKeys = {
    * (viewer.html:3497) — see `lib/flow.ts`'s module doc for the fetch-order
    * subtlety that makes the two-day merge order load-bearing. */
   flowDate: (date: string) => ["flow", date] as const,
+  // (Packet 4) The playback catalog (`#691`) — day/mission history browser.
+  flowDays: () => ["flow", "days"] as const,
+  flowMissions: () => ["flow", "missions"] as const,
+  flowMission: (id: string) => ["flow", "mission", id] as const,
+  flowSession: (id: string) => ["flow", "session", id] as const,
 };

@@ -165,6 +165,58 @@ export interface PanelResponse {
   auto_refresh: boolean;
 }
 
+/** `GET /flow-days` — one row per `YYYY-MM-DD.jsonl` day file on disk,
+ * newest-first (the server sorts). Source:
+ * `crates/darkmux-serve/src/lib.rs::scan_flow_days`. */
+export interface FlowDay {
+  date: string;
+  records: number;
+  missions: string[];
+  dispatches: number;
+}
+
+/** `GET /flow-days` itself. Source:
+ * `crates/darkmux-serve/src/lib.rs::flow_days_handler`. */
+export interface FlowDaysResponse {
+  days: FlowDay[];
+  generated_at_ms: number;
+}
+
+/** One row of `GET /flow-missions` — a cross-day rollup per `mission_id`,
+ * newest-activity-first (the server sorts by `last_ts`). Source:
+ * `crates/darkmux-serve/src/lib.rs::scan_flow_missions`. */
+export interface FlowMissionSummary {
+  mission_id: string;
+  records: number;
+  dispatches: number;
+  machines: string[];
+  first_ts: string;
+  last_ts: string;
+  first_date: string;
+  last_date: string;
+}
+
+/** `GET /flow-missions` itself. Source:
+ * `crates/darkmux-serve/src/lib.rs::flow_missions_handler`. */
+export interface FlowMissionsResponse {
+  missions: FlowMissionSummary[];
+  generated_at_ms: number;
+}
+
+/** `GET /flow-mission/:id` and `GET /flow-session/:id` — the "replay this
+ * mission/dispatch" payload, both built by the same handler. `records` is
+ * the raw flow-record shape (opaque here — the catalog/replay lenses this
+ * packet ports only need `count`/`truncated` to decide what to render; a
+ * future lens that actually renders the records widens this, per this
+ * file's own convention). Source:
+ * `crates/darkmux-serve/src/lib.rs::catalog_records_response`. */
+export interface FlowRecordsResponse {
+  records: Record<string, unknown>[];
+  count: number;
+  truncated: boolean;
+  generated_at_ms: number;
+}
+
 export interface MachineResources {
   schema_version: string;
   generated_at_ms: number;

@@ -98,6 +98,11 @@ export function canonicalHash(route: Route): string | null {
     case "mission-redirect":
     case "unknown":
       return null;
+    case "playback":
+      // (merge of packets 1.5 + 4) A bare `#<date>` hash IS its canonical
+      // form — legacy's syncLabHash never rewrites the date view, and
+      // canonicalizing it here would erase the date from the address bar.
+      return null;
   }
 }
 

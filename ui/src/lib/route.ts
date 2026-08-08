@@ -9,11 +9,22 @@
  *
  * Precedence when the hash carries multiple intents (same order `boot()`
  * checks them in): `lens=runs`/`lens=lab` > `lens=machine` > `lens=console` >
- * `mission=`/`session=` > default fleet. A `lens` value this build doesn't
- * recognize (not `runs`/`lab`/`machine`/`console`, and no bare
- * `mission=`/`session=` present either) falls through to `unknown` — a
- * visible "lens not ported yet" placeholder naming the raw hash, never a
- * blank page (the overnight runbook's render-sanity contract).
+ * `mission=`/`session=` > a bare `#<date>` (or `?date=`) playback pin >
+ * default fleet. A `lens` value this build doesn't recognize (not
+ * `runs`/`lab`/`machine`/`console`, and no bare `mission=`/`session=`/date
+ * present either) falls through to `unknown` — a visible "lens not ported
+ * yet" placeholder naming the raw hash, never a blank page (the overnight
+ * runbook's render-sanity contract).
+ *
+ * (Packet 4) The bare-date form is `targetDate()`'s convenience in
+ * `viewer.html` (type/bookmark `#2026-08-07` directly) — a DIFFERENT
+ * mechanism from the catalog panel's own day-row click, which does a full
+ * navigation to `/play/<date>` (a separate server route this app doesn't own
+ * and doesn't try to). This was `unknown` through Packet 1–3 (out of scope
+ * until a lens packet owned the catalog); this packet is that lens packet,
+ * so it's recognized as its own `playback` route now — see
+ * `lenses/catalog/PlaybackLens.tsx` for what it renders (not the full
+ * historical-playback view yet, a follow-up; see that file's doc).
  */
 
 export const RUNS_KINDS = ["all", "mission", "dispatch", "lab"] as const;
@@ -59,7 +70,17 @@ export type Route =
    * hash shape and reports it distinctly from `unknown` so a lens packet can
    * wire the redirect without re-deriving the grammar. */
   | { kind: "mission-redirect"; missionId: string }
+  /** A bare `#<date>` hash (or `?date=<date>`, its query-string form) —
+   * `viewer.html`'s `targetDate()` fallback. Distinct from `fleet`: legacy's
+   * `boot()` computes `live = date===todayUTC()`, which is false for any
+   * OTHER date, forcing the playback fetch branch instead of the live
+   * window — a genuinely different render, not just a different label on
+   * the same one. See `route.ts`'s own module doc for the precedence this
+   * sits at (lowest, below every `lens=`/`mission=`/`session=` form). */
+  | { kind: "playback"; date: string }
   | { kind: "unknown"; hash: string };
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function hashParams(): URLSearchParams {
   return new URLSearchParams((location.hash || "").replace(/^#/, ""));
@@ -114,13 +135,25 @@ export function parseRoute(): Route {
     return { kind: "unknown", hash: raw };
   }
   if (!raw) {
+    // (Packet 4) `?date=<date>` — the query-string form of the same
+    // `targetDate()` fallback the bare hash below reads, checked here only
+    // when the hash itself is empty (matching legacy's own precedence: an
+    // in-hash date wins when both are present, since the hash check below
+    // runs first when `raw` is non-empty).
+    const qDate = search.get("date");
+    if (qDate && DATE_RE.test(qDate)) {
+      return { kind: "playback", date: qDate };
+    }
     return { kind: "fleet" };
   }
-  // A bare hash that parses as neither a recognized `lens=` nor a bare-date
-  // playback pin (out of scope for `/next` — playback lives at `/play/:date`,
-  // not a hash on this route) is unrecognized too.
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return { kind: "unknown", hash: raw };
+  // (Packet 4) A bare `#<date>` hash — `targetDate()`'s convenience form
+  // (type/bookmark a date directly). A garbage non-date, non-`lens=` hash
+  // falls through to the final `fleet` below, matching legacy's own silent
+  // fallback verbatim (targetDate() defaults to today for anything it can't
+  // parse, which is the same live view as no hash at all) — only a
+  // genuinely date-shaped hash gets its own route.
+  if (DATE_RE.test(raw)) {
+    return { kind: "playback", date: raw };
   }
   return { kind: "fleet" };
 }

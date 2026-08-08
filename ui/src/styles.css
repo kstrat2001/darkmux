@@ -582,3 +582,99 @@ body {
     padding: 7px 10px;
   }
 }
+
+/* ── Catalog picker (Packet 4) — ported from viewer.html's own <style>
+   block (search that file for `.catpanel`/`.catrow`/`.cathdr`/`.catempty`).
+   `.catrow`'s explicit `display:block` (overriding <button>'s UA-stylesheet
+   `inline-block` default) is load-bearing for `next-parity-catalog.spec.ts`'s
+   byte-comparison against goldens/catalog-open.txt — same load-bearing-CSS
+   note as the runs lens above, don't "clean up" it without re-running that
+   spec. Colors/fonts below use THIS file's own custom-property names
+   (--dim/--fg/--accent/--border), not viewer.html's (--muted/--text/--line)
+   — only the box-generation properties need to match, not the palette.
+
+   `.catalog-anchor` is the positioning context for `.catpanel` (QA
+   must-fix): the panel used to sit at a page-level `top:48px;left:16px`,
+   which overlapped the toggle BUTTON once `#meta` landed above it (QA
+   measured `elementFromPoint` at the button's center returning the panel,
+   and a real click timing out — the toggle was structurally unclickable
+   while open, so the panel couldn't be closed that way). Anchoring the
+   panel to the toggle's OWN wrapper — `top: calc(100% + 6px)`, directly
+   below it — means the panel can never cover the button again, regardless
+   of what other App-level chrome sits above this component. */
+.catalog-anchor {
+  position: relative;
+  /* `.app-shell` is `display:flex; flex-direction:column` (default
+     `align-items:stretch`) — without this, the anchor (and the button
+     inside it) stretches to the shell's full cross-axis width instead of
+     sizing to its own content, the same way legacy's `#srcbadge` is a
+     small corner badge, not a full-width bar. */
+  align-self: flex-start;
+  margin: 12px 0 0 16px;
+}
+.catalog-toggle {
+  font: 600 11px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--bg);
+  background: var(--accent);
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.catalog-toggle:hover {
+  box-shadow: 0 0 0 2px rgba(79, 209, 197, 0.35);
+}
+.catpanel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 60;
+  background: #131826;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px;
+  min-width: 300px;
+  max-width: min(420px, 92vw);
+  max-height: 60vh;
+  overflow: auto;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+.catpanel .cathdr {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  padding: 7px 8px 4px;
+}
+.catrow {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: var(--fg);
+  padding: 7px 9px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.catrow:hover {
+  background: rgba(79, 209, 197, 0.12);
+}
+.catrow .cd {
+  font: 600 13px/1.2 -apple-system, sans-serif;
+}
+.catrow .cs {
+  color: var(--dim);
+  font: 11px/1.3 -apple-system, sans-serif;
+  margin-top: 2px;
+}
+.catrow.live .cd {
+  color: var(--accent);
+}
+.catempty {
+  color: var(--dim);
+  font: 12px/1.4 -apple-system, sans-serif;
+  padding: 8px 9px;
+}

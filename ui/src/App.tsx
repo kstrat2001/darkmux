@@ -7,6 +7,10 @@ import { NavChrome } from "./components/NavChrome";
 import { MachineLens } from "./lenses/machine/MachineLens";
 import { RunsBoard } from "./lenses/runs/RunsBoard";
 import { ConsolePanel } from "./lenses/console/ConsolePanel";
+import { CatalogPanel } from "./lenses/catalog/CatalogPanel";
+import { MissionReplay } from "./lenses/catalog/MissionReplay";
+import { SessionReplay } from "./lenses/catalog/SessionReplay";
+import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { computeMetaLines } from "./lib/metaLine";
@@ -21,7 +25,9 @@ import type { Route } from "./lib/route";
  * The app shell. A `switch` over the parsed [[Route]] (see `lib/route.ts` for
  * the hash-grammar port) drives `#stage`; `fleet` (`FleetStrip`), `runs`
  * (`RunsBoard`, Packet 3), and `machine` (`MachineLens`, Packet 2) are real
- * regions driven by `useQuery`; every other lens renders [[LensPlaceholder]]
+ * regions driven by `useQuery`; `session`/`mission-redirect`/`playback`
+ * (Packet 4) do REAL fetches/navigation wiring per the catalog+replay
+ * lens's own doc comments; every other lens renders [[LensPlaceholder]]
  * naming what still needs to be built, per the render-sanity contract
  * (never a blank page).
  *
@@ -37,6 +43,11 @@ import type { Route } from "./lib/route";
  * `useFlowWindow`/`useLiveMachines`/`machineSpecs` queries are ALSO used
  * inside `MachineLens` — TanStack Query dedupes by queryKey, so this is
  * cache reuse, not a second network round trip.
+ *
+ * `CatalogPanel` (Packet 4) mounts here rather than inside any one lens's
+ * stage — it's global chrome (`viewer.html`'s `#catpanel`, a body-level
+ * sibling of `#stage`, reachable from every lens), not a routed destination
+ * itself.
  *
  * Packet 1.5 additions (nav chrome + hash write-back — the scaffold gap
  * both the machine and runs lens packets independently flagged as a hard
@@ -108,6 +119,7 @@ export function App() {
           ))}
         </div>
       </div>
+      <CatalogPanel />
       {/* Visible (never `display:none`) — `innerText`, which the parity
           harness extracts, returns "" for a hidden element; see
           `tests/parity/lib/extract-lens.js`'s `regionText`. Legacy's own
@@ -128,7 +140,11 @@ export function App() {
  * [[Route]]. Only `machine` has a real (non-empty) mapping ported so far —
  * every other route's crumb/logscope stays empty, matching legacy's actual
  * default for most levels (see e.g. `goldens/fleet.txt`'s `(empty)` crumb)
- * rather than a placeholder string invented for scaffold navigability. */
+ * rather than a placeholder string invented for scaffold navigability.
+ * `session`/`mission-redirect`/`playback` (Packet 4) fall through to the
+ * same empty default — none of them are byte-parity targets for `#crumb`
+ * (see each component's own doc for why), so inventing crumb text for them
+ * would be UX decoration, not a port. */
 function routeChrome(route: Route, localMachineName: string | null): { crumb: string; logscope: string } {
   if (route.kind === "machine") {
     // `$("crumb").innerHTML = state.machine!=null ? escN(state.machine) :
@@ -150,13 +166,21 @@ function renderRoute(route: Route) {
     case "console":
       return <ConsolePanel initialPanelId={route.panelId} />;
     case "session":
-      return <LensPlaceholder label={`session drill-in ${route.sessionId}`} />;
+      // Packet 4: a real fetch to /flow-session/<id> — see SessionReplay's
+      // own doc for why the RENDER (not the fetch) is still a not-ported
+      // notice.
+      return <SessionReplay sessionId={route.sessionId} />;
     case "mission-redirect":
-      // The legacy viewer does a FULL NAVIGATION here (`location.href =
-      // "/mission/<id>/graph"`) — out of scope for this packet (see
-      // tests/parity/README.md's lens inventory). A future packet wires the
-      // same redirect; until then this is a named placeholder, not silence.
-      return <LensPlaceholder label={`mission graph redirect for ${route.missionId} (out of scope — see /mission/:id/graph)`} />;
+      // Packet 4: a real fetch to /flow-mission/<id>, conditionally
+      // navigating to /mission/<id>/graph exactly like legacy's boot() does
+      // — see MissionReplay's own doc for why this completes Packet 1's
+      // deferred placeholder rather than staying inert.
+      return <MissionReplay missionId={route.missionId} />;
+    case "playback":
+      // Packet 4: a bare #<date> hash — see PlaybackLens's own doc for why
+      // this is a named not-ported notice rather than a full historical
+      // render.
+      return <PlaybackLens date={route.date} />;
     case "unknown":
       return <LensPlaceholder label="unrecognized" hash={route.hash} />;
   }
