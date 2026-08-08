@@ -1,6 +1,13 @@
 import { test, expect } from "@playwright/test";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// `ui/` is an ESM package ("type": "module" in package.json) — `__dirname`
+// isn't defined here the way it is in `tests/parity`'s CJS-transpiled specs
+// (see `next-parity.spec.ts`'s identical constant for the CJS-side
+// equivalent). Derived from `import.meta.url` instead.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Packet 2's live render proof — the machine lens's twin of Packet 1's
 // `live-render.spec.ts`, against a THROWAWAY daemon on 127.0.0.1:8793

@@ -1,6 +1,12 @@
 import { test, expect } from "@playwright/test";
 import { execSync } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// `ui/` is an ESM package ("type": "module" in package.json) — `__dirname`
+// isn't defined here the way it is in `tests/parity`'s CJS-transpiled specs.
+// Derived from `import.meta.url` instead.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Packet 1's live render proof (see `ui/verify/playwright.config.ts`'s own
 // doc). Talks to a THROWAWAY daemon on 127.0.0.1:8790 — never port 8765.
