@@ -156,7 +156,7 @@ one's vocabulary.
 | fleet (default) | `#` (no hash) | `fleet.txt` |
 | console | `#lens=console` (`&panel=<id>`) | `console.txt` (default panel: `mission-status`) |
 | runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-kind-lab.txt` (all four filter chips, Packet 3), `runs-series.txt` (kind=lab + the `◧ series` toggle — the ONE thing `/lab/runs` actually feeds, see the correction below; Packet 3), `runs-lens-boot.txt` (a FRESH `#lens=runs` boot, exercising `boot()`'s own `lq` deep-link branch rather than a click-through — content is byte-identical to `runs.txt` by design, since both land on kind=all over the same corpus; the golden's value is proving the boot mechanism independently, Packet 3) |
-| machine | `#lens=machine` | `machine.txt` |
+| machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
 | session drill-in | `#session=<id>` | `session-task-list.txt` |
 
 **Out of scope for this packet: `#mission=<id>`.** On a live daemon (exactly
@@ -251,13 +251,15 @@ scope:
   exercised. `mission-status-all`, `role-list`, `machine-status`,
   `config-list`, `flow-status`, `lab-fixture-list`, and `doctor` are
   reachable via `data-act="setpanel"` clicks but none are golden-tested.
-- **Deep-link boot paths other than `#session=<id>` and `#lens=runs`** —
-  `#lens=console&panel=<id>`, a bare `#<date>` hash (playback-by-date,
-  daemon-only), `#lens=runs&kind=<mission|dispatch|lab>` specifically as a
-  BOOT (only the plain `#lens=runs` boot is golden-tested; the kind-filtered
-  goldens are all reached by click, per the lens inventory table above), and
-  `#mission=<id>` (out of scope entirely — see the lens inventory above) are
-  none of them golden-tested.
+- **Deep-link boot paths other than `#session=<id>`, `#lens=runs`, and
+  `#lens=machine` (the latter two closed by Packets 3 and 2 —
+  `runs-lens-boot.txt` / `machine-deeplink.txt`)** — `#lens=console&panel=<id>`,
+  a bare `#<date>` hash (playback-by-date, daemon-only),
+  `#lens=runs&kind=<mission|dispatch|lab>` specifically as a BOOT (only the
+  plain `#lens=runs` boot is golden-tested; the kind-filtered goldens are all
+  reached by click, per the lens inventory table above), and `#mission=<id>`
+  (out of scope entirely — see the lens inventory above) are still
+  golden-untested.
 - **`fleet-sessions-live.json` was recorded empty** (`[]`) — no session was
   live on the operator's daemon at record time, so this corpus fixture has
   never actually exercised the viewer's non-empty rendering path for that

@@ -1,6 +1,12 @@
 import { test, expect } from "@playwright/test";
 import { execSync } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// `ui/` is an ESM package ("type": "module" in package.json) — `__dirname`
+// isn't defined here the way it is in `tests/parity`'s CJS-transpiled specs.
+// Derived from `import.meta.url` instead.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Packet 1's live render proof (see `ui/verify/playwright.config.ts`'s own
 // doc). Talks to a THROWAWAY daemon on 127.0.0.1:8790 — never port 8765.
@@ -13,9 +19,13 @@ const PID_FILE = process.env.DARKMUX_THROWAWAY_PID_FILE || "/tmp/darkmux-throwaw
 // Matched against `ps -p <pid> -o command=` before the error-state test kills
 // anything — see that test's own comment for why.
 const THROWAWAY_PORT = "8790";
-const GALLERY_DIR =
-  process.env.DARKMUX_GALLERY_DIR ||
-  "/private/tmp/claude-501/-Users-kain-de-projects-darkmux-public/652b2a6d-51b7-4543-9ddf-8ef250dd2a4d/scratchpad/ui-port-gallery/1-scaffold";
+// Gitignored, repo-relative by default (`ui/verify/.gallery/1-scaffold/`) —
+// NOT an operator machine path (QA must-fix, 2026-08-09, inherited into
+// Packet 2's back-merge — see `machine-render.spec.ts`'s identical fix for
+// the full rationale: a committed absolute path bakes one machine's
+// home-directory layout, and a session-scoped scratch UUID, into a PUBLIC
+// repo). Override with `DARKMUX_GALLERY_DIR` for a real run.
+const GALLERY_DIR = process.env.DARKMUX_GALLERY_DIR || path.join(__dirname, ".gallery", "1-scaffold");
 
 function screenshotPath(name: string): string {
   return path.join(GALLERY_DIR, name);

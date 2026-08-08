@@ -33,14 +33,30 @@ describe("App", () => {
   });
 
   it("renders a named placeholder for a lens this packet doesn't implement", () => {
-    window.location.hash = "#lens=machine";
+    window.location.hash = "#lens=console";
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={queryClient}>
         <App />
       </QueryClientProvider>,
     );
-    expect(screen.getByText(/lens not ported yet: machine/i)).toBeInTheDocument();
+    expect(screen.getByText(/lens not ported yet: console/i)).toBeInTheDocument();
+  });
+
+  it("renders the machine lens (Packet 2) instead of a placeholder", async () => {
+    window.location.hash = "#lens=machine";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByText(/lens not ported yet/i)).not.toBeInTheDocument();
+    // The stagehdr line renders immediately (synchronous, no fetch needed
+    // for its fallback text) even before the specs/flow-window queries
+    // settle — see `MachineLens`'s `label` fallback ("this machine").
+    await waitFor(() => expect(screen.getByText(/fleet › machine/)).toBeInTheDocument());
   });
 
   it("renders a named placeholder (with the raw hash) for an unrecognized route, never a blank page", () => {

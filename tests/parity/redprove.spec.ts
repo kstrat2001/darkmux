@@ -140,6 +140,22 @@ test("blank page fails the #lens=runs deep-link boot golden comparison", async (
   assertRed("runs-lens-boot", await extractLensText(page));
 });
 
+test("blank page fails the #lens=machine deep-link golden comparison", async ({ page }) => {
+  await installFrozenClock(page, Date.UTC(2026, 0, 1));
+  installBlankRoutes(page);
+
+  // Same settled-marker reasoning as the fleet/machine case above: the blank
+  // page's `/machine/resources` 404s, so `renderMachine()` lands in the
+  // "daemon not reachable" `.none` branch — never `.memcard`.
+  const machineSettled = page
+    .locator("#stage .memcard")
+    .or(page.locator("#stage .none", { hasText: /not reachable/i }));
+  await page.goto("/index.html#lens=machine");
+  await waitSettled(page, expect, machineSettled);
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+  assertRed("machine-deeplink", await extractLensText(page));
+});
+
 test("blank page fails the #session=task-list golden comparison", async ({ page }) => {
   await installFrozenClock(page, Date.UTC(2026, 0, 1));
   installBlankRoutes(page);
