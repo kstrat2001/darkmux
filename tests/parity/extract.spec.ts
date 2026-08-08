@@ -61,14 +61,28 @@ test("boot + four lens tabs (fleet, console, runs, machine)", async ({ page }) =
   // on `.panelout`/`.panelerr`, and only the loaded branch's `.panelout`
   // carries the real `$ darkmux mission status` output — the loading branch
   // ALSO emits `.panelout` (with literal "running…" text), so the selector
-  // alone isn't sufficient here; pair it with the previousText check, which
-  // catches "still showing the placeholder" because that placeholder text
-  // differs from the fleet lens's leftover text too, but more importantly a
-  // POLL against the placeholder's own STABLE text would otherwise pass
-  // immediately — see the redprove/latency-injection proof in the report for
-  // why this combination (not either check alone) is what closes the gap.
+  // alone isn't sufficient here.
+  //
+  // MUST-FIX (QA, post-Packet-6 review): this FIRST console capture used to
+  // pair that selector with a `previousText` check — comparing against
+  // `fleetStageText` (a completely different lens's leftover text) — on the
+  // theory that "any change from a totally different render" was enough to
+  // prove settlement. It is NOT: QA red-proved it with 300ms of injected
+  // latency on `/panel/mission-status` and the OLD pattern committed a
+  // 109-byte "running…" placeholder instead of the real ~1.2KB content,
+  // reproduced byte-for-byte here (transcript in the packet report) — the
+  // exact same race class as the 2b loop below, just never caught here
+  // because the mocked corpus route normally resolves fast enough that the
+  // placeholder is never actually observed. Same fix as 2b: wait on
+  // `RERUN_BUTTON`, the genuinely exclusive "re-run" marker (only the
+  // `if(st.body)` chrome branch renders it; the `else` branch's button
+  // always says "run"), defined once here and reused by every console
+  // settle-wait below. Red-proved BOTH ways under the same injected latency:
+  // the OLD selector fails (captures the placeholder), `RERUN_BUTTON`
+  // passes (captures the real content) — see the packet report.
+  const RERUN_BUTTON = '.panelchrome button:text-is("re-run")';
   await page.click("#lens-console");
-  await waitSettled(page, expect, "#stage .panelout, #stage .panelerr", { previousText: fleetStageText });
+  await waitSettled(page, expect, RERUN_BUTTON, { previousText: fleetStageText });
   await extractAndWrite(page, "console");
   let panelStageText = await regionText(page, "stage");
 
@@ -77,28 +91,30 @@ test("boot + four lens tabs (fleet, console, runs, machine)", async ({ page }) =
   // click re-fetches through `loadPanel()`/`setPanel()`, which paints TWO
   // synchronous intermediate renders before the (mocked, near-instant) fetch
   // resolves — "not yet run" then "running…" — both still `!st.body`. A
-  // `previousText`-only settle check (as used for the very first console
-  // click above, landing from a completely different lens) is provably racy
-  // here: switching panel-to-panel, either intermediate render ALREADY
-  // differs from the prior panel's real content, so `waitSettled` can report
-  // "settled" on the transient placeholder — caught empirically by
-  // `bun run determinism` flagging a genuine two-run mismatch on
-  // `console-lab-fixture-list.txt` (618B loaded vs 249B placeholder).
+  // `previousText`-only settle check is provably racy here: switching
+  // panel-to-panel, either intermediate render ALREADY differs from the
+  // prior panel's real content, so `waitSettled` can report "settled" on the
+  // transient placeholder — caught empirically by `bun run determinism`
+  // flagging a genuine two-run mismatch on `console-lab-fixture-list.txt`
+  // (618B loaded vs 249B placeholder).
   //
   // FIRST attempt at a fix used `#stage .pc-cmd` as the "loaded" marker and
   // was WRONG — re-reading `renderConsole()` shows `.pc-cmd` is emitted in
   // BOTH chrome branches (`if(st.body){...<span class="pc-cmd">...} else
-  // {...<span class="pc-cmd">...}`), with IDENTICAL text for these panel ids
-  // besides (`argv.join(" ")` and `id.replace(/-/g," ")` produce the same
-  // string for every id here) — so waiting on it never actually gated
-  // anything beyond the pre-existing `previousText` check, and the race was
-  // still latent. The ACTUALLY exclusive marker is the "re-run" BUTTON TEXT:
-  // only the `if(st.body)` branch's button says "re-run" (the `else`
-  // branch's button always says "run", loading or not) — a genuine
-  // discriminator with no shared-text trap. Re-verified: `bun run
-  // determinism` run 5x back-to-back, byte-identical every time (see the
-  // packet report for the transcript).
-  const RERUN_BUTTON = '.panelchrome button:text-is("re-run")';
+  // {...<span class="pc-cmd">...}`). QA's own diff (post-review, comparing
+  // `argv.join(" ")` against `id.replace(/-/g," ")` for every panel in
+  // `panel.rs`'s allowlist) found the text is identical for 7 of the 8 panel
+  // ids — `mission-status-all` is the ONE exception (`argv` is `["mission",
+  // "status", "--all"]` → `"mission status --all"`, but the id-based guess
+  // is `"mission status all"` — the `--all` flag doesn't round-trip through
+  // dash-splitting) — so `.pc-cmd` never reliably gated anything beyond the
+  // pre-existing `previousText` check, and the race was still latent for the
+  // other 7. The ACTUALLY exclusive marker is the "re-run" BUTTON TEXT: only
+  // the `if(st.body)` branch's button says "re-run" (the `else` branch's
+  // button always says "run", loading or not) — a genuine discriminator
+  // with no shared-text trap, for every panel including the exception.
+  // Re-verified: `bun run determinism` run 5x back-to-back, byte-identical
+  // every time (see the packet report for the transcript).
   for (const panelId of ["mission-status-all", "machine-status", "flow-status", "role-list", "config-list", "lab-fixture-list"]) {
     await page.click(`[data-act="setpanel"][data-arg="${panelId}"]`);
     await waitSettled(page, expect, RERUN_BUTTON, { previousText: panelStageText });
@@ -200,6 +216,26 @@ test("#lens=runs deep-link boot (boot()'s lq path, not a click-through)", async 
   await waitSettled(page, expect, "#stage .lablist");
   await expect(page.locator("body")).not.toHaveClass(/booting/);
   await extractAndWrite(page, "runs-lens-boot");
+});
+
+test("#lens=machine deep link (fresh boot straight into the machine lens — Packet 2)", async ({ page }) => {
+  // A FRESH boot with the hash already set, unlike the click-navigation path
+  // above (`#lens-machine` click from an already-booted fleet lens). This is
+  // a genuinely different code path: `boot()`'s `machineQuery()` branch
+  // (viewer.html:3791-3796) fires BEFORE the fleet lens ever renders, so the
+  // page never passes through `renderFleet()` at all — a bug in that
+  // precedence check (e.g. the fleet lens winning the race) would only show
+  // up on this path, not the click path. See tests/parity/README.md's
+  // "Deep-link boot paths" coverage-gap note — this closes the `#lens=
+  // machine` gap named there for Packet 2.
+  const meta = loadMeta();
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  installCorpusRoutes(page, meta);
+
+  await page.goto("/index.html#lens=machine");
+  await waitSettled(page, expect, "#stage .memcard");
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+  await extractAndWrite(page, "machine-deeplink");
 });
 
 test("#session=task-list deep link (drill-in rendered inside viewer.html)", async ({ page }) => {

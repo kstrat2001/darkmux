@@ -34,28 +34,38 @@ describe("App", () => {
 
   it("renders the real console lens (not a placeholder) for #lens=console", async () => {
     window.location.hash = "#lens=console";
+    // App-level `useFlowWindow`/`useLiveMachines`/`machineSpecs` (Packet 2's
+    // GLOBAL `#meta` chrome, wired into every route, not just `#lens=machine`)
+    // fire alongside the console lens's own `/panel/*` fetch — a mock that
+    // ONLY answers `/panel/*` throws inside `useLiveMachines` (`query.data.data
+    // is not iterable`) the instant this route mounts. Route on URL: the panel
+    // endpoint gets real content, everything else gets an empty-but-valid `[]`
+    // (same blanket default the sibling "machine lens" test below uses).
     vi.stubGlobal(
       "fetch",
-      vi.fn(() =>
-        Promise.resolve(
-          new Response(
-            JSON.stringify({
-              panel: "mission-status",
-              argv: ["mission", "status"],
-              captured_ts_ms: Date.now(),
-              gather_ms: 1,
-              exit_code: 0,
-              ansi_text: "no missions",
-              stderr_tail: "",
-              cols: 100,
-              cache_ttl_ms: 3000,
-              age_ms: 0,
-              auto_refresh: true,
-            }),
-            { status: 200 },
-          ),
-        ),
-      ),
+      vi.fn((url: string) => {
+        if (typeof url === "string" && url.startsWith("/panel/")) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                panel: "mission-status",
+                argv: ["mission", "status"],
+                captured_ts_ms: Date.now(),
+                gather_ms: 1,
+                exit_code: 0,
+                ansi_text: "no missions",
+                stderr_tail: "",
+                cols: 100,
+                cache_ttl_ms: 3000,
+                age_ms: 0,
+                auto_refresh: true,
+              }),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
     );
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
@@ -67,15 +77,36 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("no missions")).toBeInTheDocument());
   });
 
-  it("renders a named placeholder for a lens this packet doesn't implement", () => {
-    window.location.hash = "#lens=machine";
+  it("renders a named placeholder for a lens this packet doesn't implement (session drill-in)", () => {
+    // `#lens=console` was this test's original target before Packet 6 ported
+    // the console lens for real — kept AS a placeholder-mechanism check, but
+    // re-pointed at a route that's still genuinely unported (`#session=<id>`,
+    // see `renderRoute`'s `LensPlaceholder` branch) rather than asserting
+    // stale behavior against a route that no longer matches it.
+    window.location.hash = "#session=abc-123";
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={queryClient}>
         <App />
       </QueryClientProvider>,
     );
-    expect(screen.getByText(/lens not ported yet: machine/i)).toBeInTheDocument();
+    expect(screen.getByText(/lens not ported yet: session drill-in abc-123/i)).toBeInTheDocument();
+  });
+
+  it("renders the machine lens (Packet 2) instead of a placeholder", async () => {
+    window.location.hash = "#lens=machine";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByText(/lens not ported yet/i)).not.toBeInTheDocument();
+    // The stagehdr line renders immediately (synchronous, no fetch needed
+    // for its fallback text) even before the specs/flow-window queries
+    // settle — see `MachineLens`'s `label` fallback ("this machine").
+    await waitFor(() => expect(screen.getByText(/fleet › machine/)).toBeInTheDocument());
   });
 
   it("renders a named placeholder (with the raw hash) for an unrecognized route, never a blank page", () => {

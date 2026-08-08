@@ -156,7 +156,7 @@ one's vocabulary.
 | fleet (default) | `#` (no hash) | `fleet.txt` |
 | console | `#lens=console` (`&panel=<id>`) | `console.txt` (default panel: `mission-status`, Packet 0a), plus one golden per remaining allowlisted panel (Packet 6): `console-mission-status-all.txt`, `console-machine-status.txt`, `console-flow-status.txt`, `console-role-list.txt`, `console-config-list.txt`, `console-lab-fixture-list.txt`, `console-doctor-not-run.txt` (the manual-only "not yet run" placeholder — selecting the tab must never auto-fetch, #1286) and `console-doctor.txt` (after clicking "run") |
 | runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-kind-lab.txt` (all four filter chips, Packet 3), `runs-series.txt` (kind=lab + the `◧ series` toggle — the ONE thing `/lab/runs` actually feeds, see the correction below; Packet 3), `runs-lens-boot.txt` (a FRESH `#lens=runs` boot, exercising `boot()`'s own `lq` deep-link branch rather than a click-through — content is byte-identical to `runs.txt` by design, since both land on kind=all over the same corpus; the golden's value is proving the boot mechanism independently, Packet 3) |
-| machine | `#lens=machine` | `machine.txt` |
+| machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
 | session drill-in | `#session=<id>` | `session-task-list.txt` |
 
 **Out of scope for this packet: `#mission=<id>`.** On a live daemon (exactly
@@ -264,12 +264,15 @@ scope:
   see the lens inventory table above. `doctor` specifically has TWO
   (`console-doctor-not-run.txt`, `console-doctor.txt`) since it's the one
   manual-only panel and both states are real, distinct, reachable behavior.
-- **Deep-link boot paths other than `#session=<id>` and `#lens=runs`** —
-  `#lens=console&panel=<id>` AS A FRESH BOOT is still not exercised on the
-  LEGACY side specifically (`extract.spec.ts`/`redprove.spec.ts` only reach
-  every console panel via a CLICK sequence starting from the fleet default,
-  same shape as every OTHER lens's click-through — see the file's own
-  comments). Precedent (`runs-lens-boot.txt` vs `runs.txt`, Packet 3) is that
+- **Deep-link boot paths other than `#session=<id>`, `#lens=runs`, and
+  `#lens=machine` (the latter two closed by Packets 3 and 2 —
+  `runs-lens-boot.txt` / `machine-deeplink.txt`)** — `#lens=console&panel=<id>`
+  AS A FRESH BOOT is still not exercised on the LEGACY side specifically
+  (`extract.spec.ts`/`redprove.spec.ts` only reach every console panel via a
+  CLICK sequence starting from the fleet default, same shape every OTHER
+  lens's click-through used before its own deep-link-boot golden landed —
+  see the file's own comments). Precedent (`runs-lens-boot.txt` vs `runs.txt`,
+  Packet 3; `machine-deeplink.txt` vs `machine.txt`, Packet 2) is that
   `#stage` content is identical whichever way a lens is reached, so this is
   believed-safe rather than a real content gap — a future packet wanting to
   CLOSE it on the legacy side would add one more `page.goto("#lens=console

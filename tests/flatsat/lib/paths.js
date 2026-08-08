@@ -19,8 +19,23 @@ const PEER_STATE_DIR = path.join(STATE_DIR, "peer");
 const PARITY_DIR = path.join(REPO_ROOT, "tests", "parity");
 const PARITY_CORPUS_DIR = path.join(PARITY_DIR, "corpus");
 
-const GALLERY_DIR =
-  "/private/tmp/claude-501/-Users-kain-de-projects-darkmux-public/652b2a6d-51b7-4543-9ddf-8ef250dd2a4d/scratchpad/ui-port-gallery/0b-flatsat";
+// Gitignored, repo-relative by default (`tests/flatsat/.gallery/`) — NOT an
+// operator machine path. Fixed inherited defect (Packet 6 QA, 2026-08-09):
+// this constant previously hardcoded the operator's absolute scratchpad
+// path, INCLUDING a session-scoped UUID, straight into committed source —
+// the same class of leak packets 2 and 3 already fixed in
+// `tests/parity/next-parity-*.spec.ts` (see those files' own comments for
+// the full "why this must never be an operator absolute path" rationale). A
+// public repo committing one machine's home-directory layout (worse, a
+// session UUID that will never resolve on any other machine) is the defect;
+// `screenshot()`'s own `mkdirSync` already runs lazily inside the function
+// body (never at module scope), so switching the default here to a
+// repo-relative path carries no new "silently creates a directory on
+// import" risk. Override with `DARKMUX_GALLERY_DIR` for a real run (e.g.
+// the operator's own scratchpad) — same env var name `next-parity-runs.spec
+// .ts`/`next-parity-console.spec.ts` already use, so one override works
+// across every UI-port gallery.
+const GALLERY_DIR = process.env.DARKMUX_GALLERY_DIR || path.join(FLATSAT_DIR, ".gallery", "0b-flatsat");
 
 const HUB_URL = "http://127.0.0.1:18765";
 const PEER_URL = "http://127.0.0.1:18766";

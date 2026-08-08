@@ -65,6 +65,7 @@ tests/flatsat/node_modules/
 tests/flatsat/.state/
 tests/flatsat/test-results/
 tests/flatsat/playwright-report/
+tests/flatsat/.gallery/
 
 # UI port scaffold (Packet 1) — local artifacts. `ui/dist/index.html` is
 # copied to the COMMITTED `crates/darkmux-serve/assets/next.html` by
@@ -76,3 +77,4 @@ ui/test-results/
 ui/playwright-report/
 ui/verify/test-results/
 ui/verify/playwright-report/
+ui/verify/.gallery/
