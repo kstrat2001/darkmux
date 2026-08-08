@@ -283,13 +283,64 @@ fn render_help_block() -> String {
     truncate_chars(&help, HELP_CAP_CHARS)
 }
 
+/// How many recent missions the board block names (#1713). Small on
+/// purpose: this is grounding for one answer, not a listing — the operator
+/// asking "what's recent" needs the top of the list, and `darkmux mission
+/// status` is the surface that shows the rest.
+const RECENT_MISSIONS_IN_BOARD_BLOCK: usize = 5;
+
+/// Per-id cap in the recent-missions rows (#1714 gate C-4). `truncate_chars`
+/// cuts the WHOLE block at a char count, which can slice an id in half and
+/// leave `review-17860` looking like a complete mission id a model can
+/// confidently cite. Capping each id first means an over-long name is
+/// visibly elided (`…`) instead of silently forged. Comfortably above real
+/// ids: the longest observed are ~40 chars.
+const BOARD_ID_CAP_CHARS: usize = 56;
+
+/// The lowercase status word for a mission, for the grounding block. Kept
+/// local rather than borrowed from `mission_status` — that module's copy is
+/// board-rendering detail, and a model-facing string should not silently
+/// change when a board's presentation does. The exhaustive `match` means a
+/// new `MissionStatus` variant breaks the build rather than drifting quietly.
+fn status_word(s: crate::crew::types::MissionStatus) -> &'static str {
+    use crate::crew::types::MissionStatus as M;
+    match s {
+        M::Active => "active",
+        M::Paused => "paused",
+        M::Finalized => "finalized",
+        M::Aborted => "aborted",
+    }
+}
+
 /// Compact mission-board summary — always-on, cheap (issue #1698: "always-on
 /// cheap summaries (the board), deep artifacts only when the question names
-/// one"). Counts by status plus up to 5 non-terminal (Active/Paused)
-/// mission ids, never the full board render `mission status` itself
-/// produces (that's an operator-facing table, not grounding text).
+/// one"). Never the full board render `mission status` itself produces
+/// (that's an operator-facing table, not grounding text).
+///
+/// Emits counts by status, the open (Active/Paused) mission ids when there
+/// are any, and — since #1713 — the most RECENT missions whatever their
+/// status. The last line is the one that matters most in practice: the
+/// questions an operator asks a console are disproportionately about what
+/// just happened, and before #1713 this block filtered exactly that out,
+/// leaving a machine with nothing open unable to name a single mission.
+///
+/// The loader half only; [`render_board_block_from`] is the pure core.
 fn render_board_block() -> Option<String> {
     let missions = crate::crew::loader::load_missions().ok()?;
+    render_board_block_from(&missions)
+}
+
+/// The pure core of [`render_board_block`] (#1714 gate MF-2).
+///
+/// Split out so the ordering, the cap, and the status-inclusion rule are
+/// reachable by a test. They were not: the only entry point read
+/// `~/.darkmux` off disk, so on CI (no crew dir) `load_missions` returned
+/// empty and every line below the early return NEVER EXECUTED under test,
+/// while on a developer machine the same tests silently read the real board.
+/// That is the setup `mission_status::board_order`'s doc records as how an
+/// INVERTED comparator once shipped — reachable only through a printing
+/// function, so no unit test could pin it.
+fn render_board_block_from(missions: &[crate::crew::types::Mission]) -> Option<String> {
     if missions.is_empty() {
         return Some("no missions yet.".to_string());
     }
@@ -303,10 +354,10 @@ fn render_board_block() -> Option<String> {
         count(MissionStatus::Finalized),
         count(MissionStatus::Aborted)
     );
-    let live: Vec<&str> = missions
+    let live: Vec<String> = missions
         .iter()
         .filter(|m| matches!(m.status, MissionStatus::Active | MissionStatus::Paused))
-        .map(|m| m.id.as_str())
+        .map(|m| elide(&m.id, BOARD_ID_CAP_CHARS))
         .take(5)
         .collect();
     if !live.is_empty() {
@@ -314,7 +365,44 @@ fn render_board_block() -> Option<String> {
         out.push_str(&live.join(", "));
         out.push('\n');
     }
+
+    // (#1713) The MOST RECENT missions, whatever their status.
+    //
+    // This block used to name only the active/paused ones, on the assumption
+    // that open work is the interesting work. That is the same assumption
+    // #1709 removed from the CLI board, and it failed the same way: an
+    // operator with nothing open (every mission finalized — the ordinary
+    // state on a machine whose recent work is all run instances) got a
+    // grounding bundle containing zero mission NAMES, and the answering seat
+    // correctly declined a question the machine could trivially answer.
+    //
+    // Ordered by `mission_status::last_activity` — the SAME rule the board
+    // sorts by, shared rather than copied (#1714 gate C-1) so radio's answer
+    // and the board's top row cannot drift apart.
+    let mut recent: Vec<&crate::crew::types::Mission> = missions.iter().collect();
+    recent.sort_by_key(|m| std::cmp::Reverse(crate::mission_status::last_activity(m)));
+    out.push_str("Most recent (newest first): ");
+    let rows: Vec<String> = recent
+        .iter()
+        .take(RECENT_MISSIONS_IN_BOARD_BLOCK)
+        .map(|m| format!("{} ({})", elide(&m.id, BOARD_ID_CAP_CHARS), status_word(m.status)))
+        .collect();
+    out.push_str(&rows.join(", "));
+    out.push('\n');
+
     Some(truncate_chars(&out, BOARD_CAP_CHARS))
+}
+
+/// Shorten `s` to `max_chars` with a trailing `…` when it doesn't fit —
+/// unlike [`truncate_chars`], which is for whole blocks and whose verbose
+/// marker would be absurd per-id.
+fn elide(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// Deterministic pre-retrieval heuristic (issue #1698): a case-insensitive
@@ -376,6 +464,15 @@ fn render_mission_deep_artifact(mission_token: &str) -> Option<String> {
 /// `/review` the artifact shelf holds rendered review output over the
 /// operator's private diff, and the config block carries machine ids, urls,
 /// and directory layout.
+///
+/// (#1714 gate C-3) The board block belongs in that list too, and since
+/// #1713 it always carries mission ids — which encode repository names and
+/// commit SHAs (`zed-finsys-client-<sha>`, `review-<epoch>-<hash>`) and
+/// ticket-shaped operator names. When the approved-endpoint allowlist
+/// mentioned below gets written, the board must stay withheld (or its ids
+/// redacted) even for an approved endpoint: an allowlist decides WHOSE
+/// server may see a bundle, not whether repo names stop being work-derived
+/// identifiers.
 ///
 /// So: what leaves the machine is what the machine already publishes.
 /// `RemoteSafe` keeps the command catalog (already sent to the client on
@@ -733,6 +830,133 @@ mod tests {
         assert!(sections.help.is_some());
         assert_eq!(sections.shelf.len(), 1);
         assert!(sections.deep_artifact.is_some());
+    }
+
+    // ── The board block (#1713 / #1714 gate MF-2) ────────────────────────
+    //
+    // Against the PURE core, so these actually execute on CI. Before the
+    // extraction the only entry point read `~/.darkmux` off disk: CI has no
+    // crew dir, so `load_missions` returned empty, the early return fired,
+    // and every line below it went untested — while locally the same tests
+    // silently read the developer's real board.
+
+    fn board_mission(
+        id: &str,
+        status: crate::crew::types::MissionStatus,
+        created: u64,
+        finalized: Option<u64>,
+    ) -> crate::crew::types::Mission {
+        crate::crew::types::Mission {
+            id: id.into(),
+            description: id.into(),
+            status,
+            phase_ids: vec![],
+            created_ts: created,
+            started_ts: None,
+            finalized_ts: finalized,
+            paused_ts: None,
+            source_input: None,
+            ticket: None,
+            spec: None,
+        }
+    }
+
+    /// THE #1713 regression. Every mission finalized — the ordinary state on
+    /// a machine whose recent work is all run instances — must still put
+    /// mission NAMES in the bundle. Before the fix this block named only
+    /// active/paused missions, so the answering seat was handed counts and
+    /// nothing else, and correctly refused to say which was most recent.
+    #[test]
+    fn the_board_block_names_recent_missions_even_when_nothing_is_open() {
+        use crate::crew::types::MissionStatus as M;
+        let missions = vec![
+            board_mission("review-old", M::Finalized, 100, Some(200)),
+            board_mission("review-newest", M::Finalized, 100, Some(9_000)),
+        ];
+        let block = render_board_block_from(&missions).expect("block renders");
+        assert!(
+            block.contains("review-newest"),
+            "a finalized mission must still be nameable — this is #1713: {block}"
+        );
+        let recent_line = block.lines().find(|l| l.starts_with("Most recent")).expect("line");
+        // …and it must be FIRST, not merely present.
+        let newest = recent_line.find("review-newest").unwrap();
+        let older = recent_line.find("review-old").unwrap();
+        assert!(newest < older, "newest-first ordering: {recent_line}");
+    }
+
+    /// The sort is `Reverse(last_activity)`, and `last_activity` is a max over
+    /// whichever stamps are present — which field is newest depends on the
+    /// mission's path through the state machine. A mission finalized long
+    /// after creation must outrank one merely created later.
+    #[test]
+    fn board_block_orders_by_last_touched_not_by_creation() {
+        use crate::crew::types::MissionStatus as M;
+        let missions = vec![
+            board_mission("created-later-never-finished", M::Active, 5_000, None),
+            board_mission("created-early-finalized-late", M::Finalized, 10, Some(8_000)),
+        ];
+        let block = render_board_block_from(&missions).expect("block renders");
+        // Scoped to the recent LINE on purpose: an open mission also appears
+        // on the `Active/paused:` line above it, so a whole-block `find`
+        // measures which line comes first, not the ordering under test.
+        let recent_line = block.lines().find(|l| l.starts_with("Most recent")).expect("line");
+        let finalized_at = recent_line.find("created-early-finalized-late").unwrap();
+        let created_at = recent_line.find("created-later-never-finished").unwrap();
+        assert!(
+            finalized_at < created_at,
+            "a mission finalized at 8000 was touched more recently than one created at 5000: {recent_line}"
+        );
+    }
+
+    #[test]
+    fn board_block_caps_the_recent_list() {
+        use crate::crew::types::MissionStatus as M;
+        let missions: Vec<_> = (0..12)
+            .map(|i| board_mission(&format!("m-{i}"), M::Finalized, 100, Some(1_000 + i as u64)))
+            .collect();
+        let block = render_board_block_from(&missions).expect("block renders");
+        let recent_line = block.lines().find(|l| l.starts_with("Most recent")).expect("line");
+        let named = (0..12).filter(|i| recent_line.contains(&format!("m-{i} ("))).count();
+        assert_eq!(
+            named, RECENT_MISSIONS_IN_BOARD_BLOCK,
+            "the recent list is capped, not the whole board: {recent_line}"
+        );
+        // The cap keeps the NEWEST, which is the whole point.
+        assert!(recent_line.contains("m-11"), "{recent_line}");
+        assert!(!recent_line.contains("m-0 ("), "{recent_line}");
+    }
+
+    #[test]
+    fn board_block_counts_every_status_not_just_the_open_ones() {
+        use crate::crew::types::MissionStatus as M;
+        let missions = vec![
+            board_mission("a", M::Active, 1, None),
+            board_mission("f", M::Finalized, 1, Some(2)),
+            board_mission("x", M::Aborted, 1, None),
+        ];
+        let block = render_board_block_from(&missions).expect("block renders");
+        assert!(block.contains("1 active"), "{block}");
+        assert!(block.contains("1 finalized"), "{block}");
+        assert!(block.contains("1 aborted"), "{block}");
+    }
+
+    #[test]
+    fn board_block_is_the_no_missions_line_when_there_are_none() {
+        assert_eq!(render_board_block_from(&[]).unwrap(), "no missions yet.");
+    }
+
+    /// An elided id must not read as a whole one — a model that cites
+    /// `review-17860` as a mission id has been handed a forgery by the
+    /// harness, which is exactly what this seat's honesty rests on not
+    /// happening.
+    #[test]
+    fn elide_marks_what_it_cut_and_leaves_short_ids_alone() {
+        assert_eq!(elide("review-1786081556-0eea32", BOARD_ID_CAP_CHARS), "review-1786081556-0eea32");
+        let long = "x".repeat(BOARD_ID_CAP_CHARS + 20);
+        let cut = elide(&long, BOARD_ID_CAP_CHARS);
+        assert!(cut.ends_with('…'), "an elided id must be visibly partial: {cut}");
+        assert_eq!(cut.chars().count(), BOARD_ID_CAP_CHARS);
     }
 
     // ── The data boundary (#1698 Packet B2 gate) ─────────────────────────
