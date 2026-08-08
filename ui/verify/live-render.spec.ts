@@ -10,6 +10,9 @@ import path from "node:path";
 // `/tmp/darkmux-throwaway-8790.pid`) so this spec can kill it mid-test for
 // the error-state proof without hardcoding a PID that changes every run.
 const PID_FILE = process.env.DARKMUX_THROWAWAY_PID_FILE || "/tmp/darkmux-throwaway-8790.pid";
+// Matched against `ps -p <pid> -o command=` before the error-state test kills
+// anything — see that test's own comment for why.
+const THROWAWAY_PORT = "8790";
 const GALLERY_DIR =
   process.env.DARKMUX_GALLERY_DIR ||
   "/private/tmp/claude-501/-Users-kain-de-projects-darkmux-public/652b2a6d-51b7-4543-9ddf-8ef250dd2a4d/scratchpad/ui-port-gallery/1-scaffold";
@@ -36,7 +39,14 @@ test("the /next shell renders clean: zero pageerrors, no horizontal scroll at 39
   expect(stageBox, "the #stage region must have a real bounding box").not.toBeNull();
   expect(stageBox!.height).toBeGreaterThan(20);
 
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
+  // Probe `document.body.scrollWidth`, NOT `document.documentElement.scrollWidth`.
+  // `styles.css` sets `overflow-x: hidden` on both html AND body — that CLAMPS
+  // `documentElement.scrollWidth` to the viewport width, so a genuinely
+  // overflowing child would silently pass this assertion (QA red-proved this:
+  // a 3000px-wide injected child did NOT fire it). `body`'s own scrollWidth is
+  // unaffected by `html`'s overflow clip, so it still reports the true content
+  // width. Do not "simplify" this back to `documentElement` — that's the bug.
+  const overflow = await page.evaluate(() => document.body.scrollWidth > document.documentElement.clientWidth);
   expect(overflow, "no horizontal document scroll at 390px").toBe(false);
 
   expect(pageErrors, `pageerror events: ${pageErrors.join("; ")}`).toHaveLength(0);
@@ -102,9 +112,26 @@ test("error state: killing the throwaway daemon mid-session renders a visible er
   await expect(page.locator('[data-state="error"]')).toHaveCount(0);
 
   // Kill the THROWAWAY daemon (port 8790 only — never the operator's real
-  // daemon on 8765). The already-loaded page's JS bundle stays in memory;
-  // only its next fetch (the 5s refetchInterval) now fails.
+  // daemon on 8765). Guarded: a stale PID file (leftover from a previous
+  // run, or a recycled PID reused by an unrelated process) must never `kill`
+  // whatever happens to hold that number now — worst case, the operator's
+  // real 8765 daemon, which Hard Boundary #2 protects absolutely. Verify the
+  // PID is actually a `darkmux serve` process bound to THIS throwaway port
+  // before sending anything to it; skip loudly otherwise rather than guess.
   const pid = execSync(`cat ${PID_FILE}`).toString().trim();
+  let command = "";
+  try {
+    command = execSync(`ps -p ${pid} -o command=`).toString();
+  } catch {
+    // `ps -p` exits non-zero when the pid doesn't exist at all.
+    command = "";
+  }
+  test.skip(
+    !(command.includes("serve") && command.includes(THROWAWAY_PORT)),
+    `refusing to kill pid ${pid}: \`ps -p ${pid} -o command=\` was "${command.trim()}", which does not ` +
+      `look like this test's own throwaway daemon (expected "serve" and port ${THROWAWAY_PORT}) — stale or ` +
+      `recycled PID file, skipping rather than risking an unrelated process`,
+  );
   execSync(`kill ${pid}`);
 
   await expect(page.locator('[data-state="error"]')).toBeVisible({ timeout: 15_000 });

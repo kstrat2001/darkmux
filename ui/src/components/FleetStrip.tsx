@@ -52,8 +52,8 @@ export function FleetStrip() {
     return (
       <div className="fleet-strip fleet-strip--empty" data-state="empty">
         No machines currently present. A machine shows up here once its
-        darkmux daemon is running and heartbeating (needs
-        <code> DARKMUX_REDIS_URL</code> configured fleet-wide).
+        darkmux daemon is running and heartbeating (needs{" "}
+        <code>DARKMUX_REDIS_URL</code> configured fleet-wide).
       </div>
     );
   }
