@@ -40,6 +40,25 @@ async function extractStageOnlyText(page) {
   return `=== stage ===\n${normalize(stage || "(empty)")}\n`;
 }
 
+/** (Packet 4) The catalog-panel analog of `extractStageOnlyText` above —
+ * `#catpanel` is global chrome mounted as a SIBLING of `#stage` in BOTH apps
+ * (see `CatalogPanel.tsx`'s own module doc), not something `#stage`-only
+ * scoping would ever see, so it gets its own extractor + its own golden
+ * section rather than being folded into the stage comparison. */
+async function extractCatalogOnlyText(page) {
+  const catalog = await regionText(page, "catpanel");
+  return `=== catalog ===\n${normalize(catalog || "(empty)")}\n`;
+}
+
+/** Slice the `=== catalog ===` section out of a full legacy golden — the
+ * `extractCatalogOnlyText` counterpart to `stageSectionOf` below. */
+function catalogSectionOf(fullGoldenText) {
+  const marker = "=== catalog ===\n";
+  const idx = fullGoldenText.indexOf(marker);
+  if (idx === -1) throw new Error(`catalogSectionOf: no "${marker.trim()}" marker found in golden text`);
+  return fullGoldenText.slice(idx);
+}
+
 /** Slice just the `=== stage ===` section out of a FULL legacy golden (the
  * four-region file `extractLensText` writes) — so this harness compares
  * against the SAME committed golden file the legacy extractor produces,
@@ -55,6 +74,8 @@ function stageSectionOf(fullGoldenText) {
 module.exports = {
   extractStageOnlyText,
   stageSectionOf,
+  extractCatalogOnlyText,
+  catalogSectionOf,
   waitSettled,
   installFrozenClock,
   installCorpusRoutes,

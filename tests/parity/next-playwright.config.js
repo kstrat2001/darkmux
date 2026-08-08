@@ -30,7 +30,11 @@ const PORT = 47920;
 
 module.exports = defineConfig({
   testDir: __dirname,
-  testMatch: ["next-parity-runs.spec.ts"],
+  // ADDITIVE: each lens packet appends its own spec file here rather than
+  // fighting over one shared file (a packet-2-era shared `next-parity.spec.ts`
+  // may fold these together later — see next-parity-runs.spec.ts's own doc —
+  // that's a rename, not a rewrite, when it happens).
+  testMatch: ["next-parity-runs.spec.ts", "next-parity-catalog.spec.ts"],
   forbidOnly: !!process.env.CI,
   retries: 0,
   fullyParallel: false,
