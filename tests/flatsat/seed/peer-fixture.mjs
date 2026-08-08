@@ -17,7 +17,13 @@ export function buildPeerFixture(nowMs) {
     {
       id: "peer-demo-refactor",
       description: "Peer-machine demo mission: a small finalized refactor phase, seeded for the flatsat's fleet-visible scenario.",
-      status: "Finalized",
+      // Lowercase — MissionStatus/PhaseStatus are `#[serde(rename_all =
+      // "lowercase")]` in crates/darkmux-crew/src/types.rs. QA finding
+      // (M1): the PascalCase values previously here parsed-failed on
+      // every one of these 4 files, so the peer daemon silently served
+      // {"missions":[]} while this script printed "peer: 2 missions" —
+      // the harness was reporting state that didn't exist.
+      status: "finalized",
       phase_ids: ["peer-demo-refactor-phase"],
       created_ts: t(-3),
       started_ts: t(-3),
@@ -26,7 +32,7 @@ export function buildPeerFixture(nowMs) {
     {
       id: "peer-demo-docs",
       description: "Peer-machine demo mission: an in-progress docs pass, seeded so the peer board shows both a finished and a running row.",
-      status: "Active",
+      status: "active",
       phase_ids: ["peer-demo-docs-phase"],
       created_ts: t(-1),
       started_ts: t(-1),
@@ -38,7 +44,7 @@ export function buildPeerFixture(nowMs) {
       id: "peer-demo-refactor-phase",
       mission_id: "peer-demo-refactor",
       description: "Rename a helper module and update its call sites.",
-      status: "Complete",
+      status: "complete",
       created_ts: t(-3),
       started_ts: t(-3),
       completed_ts: t(-2),
@@ -48,7 +54,7 @@ export function buildPeerFixture(nowMs) {
       id: "peer-demo-docs-phase",
       mission_id: "peer-demo-docs",
       description: "Write the peer machine's onboarding notes.",
-      status: "Running",
+      status: "running",
       created_ts: t(-1),
       started_ts: t(-1),
       task_ids: [],

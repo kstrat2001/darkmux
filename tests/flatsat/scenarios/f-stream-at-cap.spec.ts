@@ -13,11 +13,29 @@
 import { test, expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { collectPageErrors, assertRenderSanity, screenshot } from "../lib/render-sanity.js";
-import { GALLERY_DIR } from "../lib/paths.js";
+import { GALLERY_DIR, REDIS_MAXLEN } from "../lib/paths.js";
 
 test("the fleet view stays sane once the shared flow stream rides its MAXLEN cap", async ({ page }) => {
   test.setTimeout(120_000);
   execFileSync("bash", ["../inject.sh", "flood-stream", "10500"], { cwd: __dirname, stdio: "inherit" });
+
+  // QA finding (TAKE 1): assert the scenario's own precondition — without
+  // this, a broken/no-op flood step would silently leave the stream small
+  // and every assertion below would still pass for the wrong reason (there
+  // would be nothing to actually saturate). `~` MAXLEN trim is approximate
+  // (it may leave the stream a little ABOVE the cap between trims), so this
+  // checks "at or past the cap", not an exact count.
+  //
+  // `docker exec redis-cli` rather than lib/redis.mjs's Bun.RedisClient
+  // wrapper — Playwright's own test workers run under Node (verified live:
+  // `bunx playwright test` still executes spec files in a Node worker
+  // process), where the `Bun` global doesn't exist. lib/redis.mjs stays
+  // Bun-only for the scripts that ARE run via `bun run` (seed.mjs,
+  // flood-stream.mjs); this is the one call site that needs a
+  // runtime-agnostic path, matching inject.sh's own docker-exec pattern.
+  const xlenOut = execFileSync("docker", ["exec", "flatsat-redis", "redis-cli", "XLEN", "darkmux:flow"], { encoding: "utf8" });
+  const streamLen = parseInt(xlenOut.trim(), 10);
+  expect(streamLen, `stream should have reached its MAXLEN ~ ${REDIS_MAXLEN} cap after flooding`).toBeGreaterThanOrEqual(REDIS_MAXLEN);
 
   const pageErrors = collectPageErrors(page);
   const start = Date.now();

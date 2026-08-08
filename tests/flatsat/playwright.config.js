@@ -19,7 +19,6 @@ module.exports = defineConfig({
   use: {
     baseURL: `http://127.0.0.1:${HUB_PORT}`,
     trace: 'retain-on-failure',
-    viewport: { width: 390, height: 844 }, // phone width — the chrome-order horizontal-scroll precedent
     // (finding, see lib/paths.js's SERVE_TOKEN comment) Docker's port
     // forwarding doesn't preserve loopback identity, so darkmux serve's
     // #881 auth gate treats every request here as remote and requires
@@ -27,5 +26,26 @@ module.exports = defineConfig({
     // navigation and every fetch() the loaded viewer.html issues itself.
     extraHTTPHeaders: { Authorization: `Bearer ${SERVE_TOKEN}` },
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  // QA finding (M2): a top-level `use.viewport` is NOT the last word —
+  // `devices['Desktop Chrome']` carries its OWN `viewport: {1280,720}`,
+  // and a project's `use` object REPLACES the top-level one key-for-key
+  // (it doesn't merge underneath it), so spreading the device here silently
+  // overrode the phone-width viewport for every scenario: every
+  // render-sanity "no horizontal scroll at phone width" claim was actually
+  // measured at 1280px, and the gallery PNGs came out 1280 wide instead of
+  // 390. tests/parity's playwright.config.js has this same
+  // `projects: [{ use: { ...devices[...] } }]` shape and is NOT affected —
+  // it makes no phone-width claim, so there's nothing for the device's
+  // viewport to silently clobber there. The trap is specifically "a device
+  // spread AFTER a viewport override" — the fix is naming the viewport
+  // AFTER the spread, in the SAME object, so it's the last key to apply.
+  projects: [
+    {
+      name: 'chromium',
+      use: {
+        ...devices['Desktop Chrome'],
+        viewport: { width: 390, height: 844 }, // phone width — the chrome-order horizontal-scroll precedent
+      },
+    },
+  ],
 });

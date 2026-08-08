@@ -19,21 +19,19 @@
 // ledger for the concrete fix shape (a non-macOS machine_uid fallback,
 // e.g. `/etc/machine-id`, so presence has something to key on off-Mac).
 //
-// What this test verifies instead, honestly: the flow-record-derived
-// liveness surface (the fleet dashboard's activity attribution, which does
-// NOT depend on presence) correctly reflects that the peer stops producing
-// NEW activity once paused — the closest true-to-architecture proxy this
-// environment can exercise. The stronger presence-TTL claim itself is
-// `test.fixme` below with this same reasoning.
+// What this test verifies instead, honestly (QA finding TAKE 2 — an
+// earlier version here claimed a flow-record-derived "peer stops producing
+// NEW activity" proxy, but that assertion was VACUOUS: nothing in the test
+// produces new activity whether or not the peer is actually paused, so it
+// passed identically with the pause step deleted): the peer's own daemon
+// becomes genuinely unreachable while frozen (not just quiet — connections
+// hang, confirmed live), and the hub keeps rendering sanely throughout.
+// Real, verified properties; not a liveness proxy. The stronger
+// presence-TTL claim itself is `test.fixme` below with the reasoning
+// above.
 import { test, expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { collectPageErrors, assertRenderSanity } from "../lib/render-sanity.js";
-import { SERVE_TOKEN } from "../lib/paths.js";
-
-// Node-context fetch()es (unlike page.goto/page navigation, which inherits
-// playwright.config.js's context-wide extraHTTPHeaders) don't carry the
-// bearer token automatically — see lib/paths.js's SERVE_TOKEN comment.
-const authed = { headers: { Authorization: `Bearer ${SERVE_TOKEN}` } };
 
 test.afterEach(async () => {
   // Idempotent cleanup: the declarative fixme test never actually pauses
@@ -66,13 +64,17 @@ test.fixme(
   }
 );
 
-test("pausing the peer stops it registering fresh flow activity via the shared stream", async ({ page }) => {
+// QA finding (TAKE 2): the title + closing assertion below previously
+// claimed to prove the peer "stops registering fresh flow activity via
+// the shared stream" — but nothing in this test ever produces NEW
+// activity in the first place (paused or not), so that before/after
+// mission-id-set equality passed identically with the `pause-peer` call
+// deleted entirely. It was vacuous, not evidence. Renamed to what this
+// test actually demonstrates — the two properties it DOES verify, for
+// real, with teeth: the peer becomes genuinely unreachable while frozen
+// (not just quiet), and the hub keeps rendering sanely throughout.
+test("pausing the peer makes it unreachable while the hub keeps rendering sanely", async ({ page }) => {
   const pageErrors = collectPageErrors(page);
-  const beforeRes = await fetch("http://127.0.0.1:18765/flow-missions", authed);
-  const before = await beforeRes.json();
-  const beforePeerMissions = new Set(
-    (before.missions || []).filter((m: any) => (m.machines || []).includes("flatsat-peer")).map((m: any) => m.mission_id)
-  );
 
   execFileSync("bash", ["../inject.sh", "pause-peer"], { cwd: __dirname, stdio: "inherit" });
 
@@ -93,14 +95,4 @@ test("pausing the peer stops it registering fresh flow activity via the shared s
     const res = await fetch("http://127.0.0.1:18766/health");
     expect(res.ok).toBe(true);
   }).toPass({ timeout: 15000 });
-
-  // No NEW mission_ids attributed to the peer should have appeared while
-  // it was frozen (it's a static snapshot; a genuinely-live peer producing
-  // work would grow this set — a real, if presence-blind, liveness proxy).
-  const afterRes = await fetch("http://127.0.0.1:18765/flow-missions", authed);
-  const after = await afterRes.json();
-  const afterPeerMissions = new Set(
-    (after.missions || []).filter((m: any) => (m.machines || []).includes("flatsat-peer")).map((m: any) => m.mission_id)
-  );
-  expect([...afterPeerMissions]).toEqual([...beforePeerMissions]);
 });
