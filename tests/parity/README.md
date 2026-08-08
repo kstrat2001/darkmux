@@ -156,7 +156,7 @@ one's vocabulary.
 | fleet (default) | `#` (no hash) | `fleet.txt` |
 | console | `#lens=console` (`&panel=<id>`) | `console.txt` (default panel: `mission-status`) |
 | runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-kind-lab.txt` (all four filter chips, Packet 3), `runs-series.txt` (kind=lab + the `◧ series` toggle — the ONE thing `/lab/runs` actually feeds, see the correction below; Packet 3), `runs-lens-boot.txt` (a FRESH `#lens=runs` boot, exercising `boot()`'s own `lq` deep-link branch rather than a click-through — content is byte-identical to `runs.txt` by design, since both land on kind=all over the same corpus; the golden's value is proving the boot mechanism independently, Packet 3) |
-| machine | `#lens=machine` | `machine.txt` |
+| machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
 | session drill-in | `#session=<id>` | `session-task-list.txt` |
 | catalog picker | `#catpanel` (toggled via `#srcbadge`, not a hash route — global chrome, Packet 4) | `catalog-open.txt` (five regions: crumb/meta/logscope/stage + the new `=== catalog ===` section — see "Extraction target" below) |
 | mission replay-by-query | `#mission=<id>` (Packet 4) | `mission-replay.txt` (the unknown-id in-page path only — see the note below) |
@@ -270,8 +270,10 @@ scope:
   exercised. `mission-status-all`, `role-list`, `machine-status`,
   `config-list`, `flow-status`, `lab-fixture-list`, and `doctor` are
   reachable via `data-act="setpanel"` clicks but none are golden-tested.
-- **Deep-link boot paths other than `#session=<id>`, `#lens=runs`, `#mission=<id>`,
-  and a bare `#<date>`** — `#lens=console&panel=<id>` and
+- **Deep-link boot paths other than `#session=<id>`, `#lens=runs`,
+  `#lens=machine`, `#mission=<id>`, and a bare `#<date>`** (`#lens=runs`
+  and `#lens=machine` closed by Packets 3 and 2 — `runs-lens-boot.txt` /
+  `machine-deeplink.txt`) — `#lens=console&panel=<id>` and
   `#lens=runs&kind=<mission|dispatch|lab>` specifically as a BOOT (only the
   plain `#lens=runs` boot is golden-tested; the kind-filtered goldens are all
   reached by click, per the lens inventory table above) remain untested.

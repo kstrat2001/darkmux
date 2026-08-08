@@ -76,3 +76,4 @@ ui/test-results/
 ui/playwright-report/
 ui/verify/test-results/
 ui/verify/playwright-report/
+ui/verify/.gallery/

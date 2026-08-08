@@ -12,15 +12,12 @@ const SERVED_DIR = path.join(PARITY_DIR, ".served");
 const REPO_ROOT = path.dirname(path.dirname(PARITY_DIR));
 const VIEWER_HTML = path.join(REPO_ROOT, "crates", "darkmux-serve", "assets", "viewer.html");
 const META_JSON = path.join(CORPUS_DIR, "meta.json");
-
-// The `/next` port's committed, self-contained build artifact (see
-// `ui/README.md` — `bun run build` copies `ui/dist/index.html` here). Used by
-// `next-parity-*.spec.ts` the same way `VIEWER_HTML` is used by
-// `extract.spec.ts`/`redprove.spec.ts`: read as-is and served statically —
-// no meta-injection needed here (unlike `viewer.html`'s `darkmux-mode`
-// trick), because the React app has no daemon-less/static-playback mode to
-// route around; it always fetches its real endpoints, which `page.route()`
-// intercepts exactly like the legacy harness does.
+// The committed BUILT artifact (`ui/`'s `bun run build` output) — see
+// `next-parity.spec.ts`'s / `next-parity-runs.spec.ts`'s module docs.
+// Distinct from `VIEWER_HTML`: this is the React port under test, not the
+// legacy reference. Shared by both next-parity harnesses (Packet 2's and
+// Packet 3's) — each config copies it into its OWN `.served-next`-style
+// staging dir before serving, so the two never race on a shared file.
 const NEXT_HTML = path.join(REPO_ROOT, "crates", "darkmux-serve", "assets", "next.html");
 const SERVED_NEXT_DIR = path.join(PARITY_DIR, ".served-next");
 

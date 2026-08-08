@@ -156,6 +156,26 @@ test("#lens=runs deep-link boot (boot()'s lq path, not a click-through)", async 
   await extractAndWrite(page, "runs-lens-boot");
 });
 
+test("#lens=machine deep link (fresh boot straight into the machine lens — Packet 2)", async ({ page }) => {
+  // A FRESH boot with the hash already set, unlike the click-navigation path
+  // above (`#lens-machine` click from an already-booted fleet lens). This is
+  // a genuinely different code path: `boot()`'s `machineQuery()` branch
+  // (viewer.html:3791-3796) fires BEFORE the fleet lens ever renders, so the
+  // page never passes through `renderFleet()` at all — a bug in that
+  // precedence check (e.g. the fleet lens winning the race) would only show
+  // up on this path, not the click path. See tests/parity/README.md's
+  // "Deep-link boot paths" coverage-gap note — this closes the `#lens=
+  // machine` gap named there for Packet 2.
+  const meta = loadMeta();
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  installCorpusRoutes(page, meta);
+
+  await page.goto("/index.html#lens=machine");
+  await waitSettled(page, expect, "#stage .memcard");
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+  await extractAndWrite(page, "machine-deeplink");
+});
+
 test("#session=task-list deep link (drill-in rendered inside viewer.html)", async ({ page }) => {
   // A FRESH boot, because the session catalog query only resolves at boot
   // time (catalogQuery() -> the cq branch in boot()) — see viewer.html's own
