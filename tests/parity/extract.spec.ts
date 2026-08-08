@@ -26,12 +26,18 @@ import { test, expect } from "@playwright/test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { GOLDENS_DIR } from "./lib/paths.js";
 import { loadMeta, installCorpusRoutes } from "./lib/mock-routes.js";
-import { extractLensText, waitSettled, installFrozenClock, regionText } from "./lib/extract-lens.js";
+import { extractLensText, extractLensTextWithCatalog, waitSettled, installFrozenClock, regionText } from "./lib/extract-lens.js";
 
 mkdirSync(GOLDENS_DIR, { recursive: true });
 
 async function extractAndWrite(page, label) {
   const golden = await extractLensText(page);
+  writeFileSync(`${GOLDENS_DIR}/${label}.txt`, golden, "utf8");
+  return golden;
+}
+
+async function extractAndWriteWithCatalog(page, label) {
+  const golden = await extractLensTextWithCatalog(page);
   writeFileSync(`${GOLDENS_DIR}/${label}.txt`, golden, "utf8");
   return golden;
 }
@@ -168,4 +174,97 @@ test("#session=task-list deep link (drill-in rendered inside viewer.html)", asyn
   await waitSettled(page, expect, "#stage .sub");
   await expect(page.locator("body")).not.toHaveClass(/booting/);
   await extractAndWrite(page, "session-task-list");
+});
+
+test("catalog picker (#catpanel): live row + capped missions + all days from the corpus (Packet 4)", async ({ page }) => {
+  // The catalog panel is global chrome (#691's day/mission history browser),
+  // reachable from any lens once boot() wires `data-act=catalog` onto
+  // `#srcbadge` (see viewer.html's boot(): `if(!flowSrc && mode!=="no-daemon")
+  // {...sb.dataset.act="catalog";...}`) — a fresh boot straight to the
+  // default fleet lens is how an operator actually reaches it ("browse
+  // history" from wherever they land), matching the README's own KNOWN
+  // COVERAGE GAPS note this test closes: "the extractor doesn't capture it
+  // at all; it's a modal overlay, not part of #stage".
+  const meta = loadMeta();
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  installCorpusRoutes(page, meta);
+
+  await page.goto("/index.html");
+  await waitSettled(page, expect, "#stage .fleet");
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+
+  // toggleCatalog() paints a synchronous "loading…" placeholder (a single
+  // `.cathdr`, no `.catrow`) before its two fetches (flow-days +
+  // flow-missions, Promise.allSettled) resolve — `.catrow` never appears in
+  // that placeholder, only once real rows render (the "● live · today" row
+  // is unconditional, so it alone is a safe post-fetch marker even on a
+  // corpus with zero days/missions).
+  await page.click("#srcbadge");
+  await waitSettled(page, expect, "#catpanel .catrow");
+  // This corpus has 155 missions (> CATALOG_MISSION_CAP=50) and 80 days —
+  // the golden below is what exercises the "newest 50 of 155" cap-disclosure
+  // header (#1569 sweep) for real, not a fabricated small fixture.
+  await extractAndWriteWithCatalog(page, "catalog-open");
+});
+
+test("#mission=<known-corpus-mission> deep link (Packet 4 — the unknown-id in-page path)", async ({ page }) => {
+  // A FRESH boot, same reasoning as the #session=task-list test above:
+  // catalogQuery() only resolves at boot time.
+  //
+  // missionGraphReachable() is TRUE in this harness (darkmux-mode=live, no
+  // darkmux-flow-src — see playwright.config.js's own comment), so a
+  // POPULATED /flow-mission/<id> response would navigate boot() straight to
+  // /mission/<id>/graph (viewer.html's boot(): `if(cq&&cq.kind==="mission"&&
+  // RAW.length){location.href=...;return;}`) — a separate document this
+  // harness's static file server can't serve and the README's lens inventory
+  // already named as out of scope for this suite. `lib/mock-routes.js`
+  // answers EVERY `/flow-mission/:id` path with an honest 200+empty payload
+  // (`{records:[],count:0,...}` — matching what the REAL endpoint returns
+  // for an unmatched id; see that file's own comment for why this was
+  // changed from Packet 0a's original 404-everything mock, and confirmed via
+  // `bun run check` that the change is byte-invisible to every legacy
+  // golden), regardless of which id is named — so RAW stays empty, the
+  // navigation guard's `RAW.length` check is false, and boot() falls through
+  // to its normal `render()` call instead. This records what legacy
+  // ACTUALLY does on THIS corpus: an empty in-page fleet render, not the
+  // graph page — the brief's own "record what legacy actually does,
+  // honestly" instruction, not a stand-in for the populated/navigates-away
+  // case (which needs real per-mission record fixtures this corpus doesn't
+  // have — see README).
+  const meta = loadMeta();
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  installCorpusRoutes(page, meta);
+
+  await page.goto("/index.html#mission=acp-ephemeral-pr-ship-1786152707367180000-5");
+  await waitSettled(page, expect, "#stage .fleet");
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+  // Confirm boot() really did NOT navigate away — the page is still on
+  // index.html, not `/mission/<id>/graph` (which this harness's static file
+  // server would 404 on, a different failure mode than what this test means
+  // to prove).
+  expect(new URL(page.url()).pathname).toBe("/index.html");
+  await extractAndWrite(page, "mission-replay");
+});
+
+test("bare #<date> hash — playback for a non-today day (Packet 4 — flips `live` false)", async ({ page }) => {
+  // A FRESH boot at a bare date hash — targetDate()'s fallback convenience
+  // (type/bookmark a date directly), distinct from the catalog panel's OWN
+  // day-row click (`location.href="/play/"+date`, a full navigation to a
+  // SEPARATE server route this harness doesn't serve). This is the
+  // README's other named KNOWN COVERAGE GAP: "a bare #<date> hash
+  // (playback-by-date, daemon-only)". The corpus's OWN previous-day date
+  // (meta.captured_prev_date, backed by the real flow-yesterday.json fixture
+  // — 1993 records) is used so the render has genuine content, not an empty
+  // shell — and, being genuinely NOT today, `boot()`'s `live = !wantsPlayback
+  // && date===todayUTC()` check is false, landing on the playback fetch
+  // branch (`/flow/<date>`) instead of the live-window branch — a real,
+  // distinct render path from the default `fleet.txt` golden.
+  const meta = loadMeta();
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  installCorpusRoutes(page, meta);
+
+  await page.goto(`/index.html#${meta.captured_prev_date}`);
+  await waitSettled(page, expect, "#stage .fleet");
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+  await extractAndWrite(page, "playback-date");
 });

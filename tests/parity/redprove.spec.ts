@@ -25,7 +25,7 @@ import { test, expect } from "@playwright/test";
 import { readFileSync, existsSync } from "node:fs";
 import { GOLDENS_DIR } from "./lib/paths.js";
 import { installBlankRoutes } from "./lib/mock-routes.js";
-import { extractLensText, waitSettled, installFrozenClock, regionText } from "./lib/extract-lens.js";
+import { extractLensText, extractLensTextWithCatalog, waitSettled, installFrozenClock, regionText } from "./lib/extract-lens.js";
 
 function existingGolden(label) {
   const p = `${GOLDENS_DIR}/${label}.txt`;
@@ -150,4 +150,56 @@ test("blank page fails the #session=task-list golden comparison", async ({ page 
   await waitSettled(page, expect, "#stage .sub");
   await expect(page.locator("body")).not.toHaveClass(/booting/);
   assertRed("session-task-list", await extractLensText(page));
+});
+
+test("blank page fails the catalog-open golden comparison (Packet 4)", async ({ page }) => {
+  await installFrozenClock(page, Date.UTC(2026, 0, 1));
+  installBlankRoutes(page);
+
+  await page.goto("/index.html");
+  await waitSettled(page, expect, "#stage .fleet");
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+
+  // /flow-days and /flow-missions both 404 here — toggleCatalog()'s
+  // Promise.allSettled swallows both failures to empty arrays, so the panel
+  // still renders (the "● live · today" row is unconditional — see
+  // extract.spec.ts's own comment) but with NEITHER a missions section nor
+  // any day rows, just the `.catempty` "no recorded days yet" fallback —
+  // structurally nothing like the real corpus's 155-mission/80-day golden.
+  await page.click("#srcbadge");
+  await waitSettled(page, expect, "#catpanel .catrow");
+  assertRed("catalog-open", await extractLensTextWithCatalog(page));
+});
+
+test("blank page fails the #mission=<id> golden comparison (Packet 4)", async ({ page }) => {
+  await installFrozenClock(page, Date.UTC(2026, 0, 1));
+  installBlankRoutes(page);
+
+  await page.goto("/index.html#mission=acp-ephemeral-pr-ship-1786152707367180000-5");
+  await waitSettled(page, expect, "#stage .fleet");
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+  // Both the flow window (RAW=[]) AND /missions+/phases 404 here — unlike
+  // the real corpus's `mission-replay` golden, where /missions+/phases
+  // return real content (155KB+ of real mission/phase data) even though the
+  // flow-mission fetch itself ALSO lands on empty RAW on both harnesses (the
+  // real corpus answers 200+empty, installBlankRoutes 404s — either way
+  // `RAW.length` is 0, see mock-routes.js's own comment on the
+  // installCorpusRoutes side). That /missions+/phases difference
+  // (savingsHero()'s mission-aware rendering) is what keeps this golden from
+  // being a vacuous "both sides are empty" comparison.
+  assertRed("mission-replay", await extractLensText(page));
+});
+
+test("blank page fails the bare #<date> playback golden comparison (Packet 4)", async ({ page }) => {
+  await installFrozenClock(page, Date.UTC(2026, 0, 1));
+  installBlankRoutes(page);
+
+  // Any date string works here (installBlankRoutes 404s every /flow/<date>
+  // path uniformly) — the real golden pins the corpus's own previous-day
+  // date, but red-prove only needs A bare-date hash to exercise the same
+  // code path with everything 404ing.
+  await page.goto("/index.html#2026-08-07");
+  await waitSettled(page, expect, "#stage .fleet");
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+  assertRed("playback-date", await extractLensText(page));
 });

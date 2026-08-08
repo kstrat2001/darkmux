@@ -45,6 +45,34 @@ async function extractLensText(page) {
   );
 }
 
+/**
+ * Packet 4 addition (ADDITIVE ONLY — `extractLensText`'s signature and
+ * output are untouched above, so every existing golden this function's
+ * sibling produces stays byte-identical; see the module doc's opening
+ * paragraph). `#catpanel` (the playback-catalog day/mission picker, #691) is
+ * a MODAL OVERLAY — a body-level sibling of `#stage`, not part of it — so
+ * the four-region `extractLensText` structurally cannot see it (the README's
+ * own "KNOWN COVERAGE GAPS" named this explicitly: "the extractor doesn't
+ * capture it at all; it's a modal overlay, not part of #stage"). This closes
+ * that gap as a FIFTH, OPTIONAL region rather than widening the four-region
+ * function, so callers that don't need it (every existing test) are
+ * unaffected.
+ */
+async function extractCatalogText(page) {
+  const catalog = await regionText(page, "catpanel");
+  return `=== catalog ===\n${normalize(catalog || "(empty)")}\n`;
+}
+
+/** `extractLensText` (unchanged) + the catalog region appended — for the ONE
+ * golden that needs both (the catalog panel opened over a lens's normal
+ * render). Composing rather than modifying `extractLensText` itself is what
+ * keeps this additive. */
+async function extractLensTextWithCatalog(page) {
+  const base = await extractLensText(page);
+  const catalog = await extractCatalogText(page);
+  return base + catalog;
+}
+
 // QA finding (post-0a review): the original `waitSettled` relied on
 // `page.waitForLoadState('networkidle')`, which samples network state at the
 // moment it's called — for a fetch a CLICK just kicked off asynchronously
@@ -102,4 +130,12 @@ async function installFrozenClock(page, ms) {
   await page.clock.pauseAt(ms);
 }
 
-module.exports = { normalize, regionText, extractLensText, waitSettled, installFrozenClock };
+module.exports = {
+  normalize,
+  regionText,
+  extractLensText,
+  extractCatalogText,
+  extractLensTextWithCatalog,
+  waitSettled,
+  installFrozenClock,
+};

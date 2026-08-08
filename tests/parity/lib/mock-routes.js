@@ -26,6 +26,7 @@ function installCorpusRoutes(page, meta) {
     const p = url.pathname;
 
     const json = (file) => route.fulfill({ status: 200, contentType: "application/json", body: fixture(file) });
+    const jsonInline = (body) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
     const notFound = (msg) => route.fulfill({ status: 404, contentType: "text/plain", body: msg || "not recorded in this corpus\n" });
 
     if (p === "/missions") return json("missions.json");
@@ -58,7 +59,25 @@ function installCorpusRoutes(page, meta) {
 
     if (p === "/flow-session/task-list") return json("flow-session-task-list.json");
     if (p.startsWith("/flow-session/")) return notFound("no recorded fixture for this session id\n");
-    if (p.startsWith("/flow-mission/")) return notFound("mission-graph deep links are out of scope for this packet — see README\n");
+    // (Packet 4) The REAL `/flow-mission/:id` handler (catalog_records_response
+    // in crates/darkmux-serve/src/lib.rs) never 404s for an unmatched id — it
+    // always answers 200 with `{records:[],count:0,...}` (a 404 is reserved
+    // for an actually MALFORMED id shape, is_valid_catalog_id). Packet 0a's
+    // original 404-everything mock predates this packet (its own comment says
+    // "out of scope for this packet" — mission-graph deep links, i.e. this
+    // whole endpoint, were literally out of scope back then) and doesn't
+    // match that contract. This corpus never recorded the per-mission record
+    // bodies (only the flow-missions.json ROLLUP), so `records:[]`/`count:0`
+    // here is the honest answer given what's actually on disk — not a claim
+    // that the mission has zero real records, just that this fixture set
+    // can't answer with more. Verified this doesn't change ANY legacy golden
+    // (viewer.html's boot() folds both a non-ok response AND a
+    // ok-with-empty-array response into the same `RAW=[]`, so `bun run check`
+    // stays green byte-for-byte either way) — it only changes which BRANCH
+    // `/next`'s MissionReplay takes (its real "empty" state instead of an
+    // artificial "couldn't reach" error, which the real endpoint would never
+    // actually produce for this case).
+    if (p.startsWith("/flow-mission/")) return jsonInline({ records: [], count: 0, truncated: false, generated_at_ms: meta.frozen_clock_ms });
 
     if (p === "/panel/mission-status") return json("panel-mission-status.json");
     if (p.startsWith("/panel/")) return notFound('unknown panel "' + p.slice("/panel/".length) + '" — panels are a fixed allowlist, not arbitrary commands\n');
