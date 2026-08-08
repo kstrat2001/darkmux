@@ -93,6 +93,8 @@ use std::path::{Path as StdPath, PathBuf};
 /// `build_graph` always produces — read as `Dispatch`; anything else reads
 /// as `Mission`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RunKind {
     Mission,
@@ -104,6 +106,8 @@ pub(crate) enum RunKind {
 /// [`mission_run_status`] (missions/dispatches), [`lab_run_status`] (lab
 /// runs), [`ghost_runs`] (untracked flow-only sessions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RunStatus {
     Planned,
@@ -118,25 +122,40 @@ pub(crate) enum RunStatus {
 /// persisted, so there's no schema-version discipline to carry; a future
 /// consumer (the step-4 Runs lens) just reads whatever's present.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub(crate) struct Run {
     pub(crate) id: String,
     pub(crate) kind: RunKind,
     pub(crate) status: RunStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) machine: Option<String>,
     /// Endpoint label (e.g. `"azure:host/gpt-4o"`) when any of the run's
     /// dispatches used a hosted endpoint; `None` = local LMStudio (or no
     /// flow session found at all). See the module doc's join-key section
     /// for how this is resolved per `kind`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) route: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) model: Option<String>,
+    // (UI port Packet 1) `#[ts(type = "number")]` overrides ts-rs's default
+    // u64 -> bigint mapping. The wire format is plain `JSON.parse` (never
+    // serde_json's stringify-large-ints convention), so the browser always
+    // sees a JS `number` here, not a `bigint` — these are Unix EPOCH SECONDS,
+    // safe within `Number.MAX_SAFE_INTEGER` for millennia. Leaving the
+    // default `bigint` mapping would type-check against a value `JSON.parse`
+    // never actually produces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "number"))]
     pub(crate) started_ts: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "number"))]
     pub(crate) completed_ts: Option<u64>,
     /// (#1584) **When this run was last active** — the one field the runs
     /// lens can always order by, across all three sources.
@@ -153,6 +172,7 @@ pub(crate) struct Run {
     /// "newest first" is a total order rather than one with a large
     /// arbitrarily-ordered tail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "number"))]
     pub(crate) updated_ts: Option<u64>,
     /// `false` = a flow-only ghost with no durable record backing it (see
     /// the module doc's "untracked" synthesis). `true` for every mission
