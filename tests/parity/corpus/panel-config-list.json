@@ -1,0 +1,16 @@
+{
+  "panel": "config-list",
+  "argv": [
+    "config",
+    "list"
+  ],
+  "captured_ts_ms": 1786222463566,
+  "gather_ms": 3,
+  "exit_code": 0,
+  "ansi_text": "{\n  \"audit\": {\n    \"dir\": \"~/.darkmux/audit\",\n    \"enabled\": false\n  },\n  \"dirs\": {\n    \"notebook\": \"/Users/kain/Documents/de-data/darkmux-notebook\"\n  },\n  \"lms_bin\": \"lms\",\n  \"lmstudio_url\": \"http://localhost:1234\",\n  \"machine_id\": \"MacBook-Pro\",\n  \"orchestrator\": \"claude-code\",\n  \"redis\": {\n    \"enabled\": true,\n    \"host\": \"100.158.129.76\",\n    \"maxlen\": 10000,\n    \"port\": 6379,\n    \"stream\": \"darkmux:flow\"\n  },\n  \"role_profiles\": {\n    \"review-judge\": \"deep\",\n    \"review-probe-high\": \"probe-gptoss\",\n    \"review-probe-low\": \"probe-4b\",\n    \"review-probe-mid\": \"diff-review\",\n    \"review-verify\": \"deep\",\n    \"radio-router\": \"radio\"\n  },\n  \"runtime\": {\n    \"check_updates\": true,\n    \"feedback_injection\": true,\n    \"inactivity_timeout_seconds\": 600,\n    \"strict_selection\": false\n  },\n  \"schema_version\": \"1.0\"\n}\n",
+  "stderr_tail": "",
+  "cols": 100,
+  "cache_ttl_ms": 3000,
+  "age_ms": 0,
+  "auto_refresh": true
+}

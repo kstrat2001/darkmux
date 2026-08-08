@@ -1,0 +1,16 @@
+{
+  "panel": "machine-status",
+  "argv": [
+    "machine",
+    "status"
+  ],
+  "captured_ts_ms": 1786222463338,
+  "gather_ms": 144,
+  "exit_code": 0,
+  "ansi_text": "registry: /Users/kain/.darkmux/profiles.json\n\n\u001b[1;36mdarkmux-managed (2):\u001b[0m\n  \u001b[36mdarkmux:qwen3.6-35b-a3b-turboquant-mlx        \u001b[0m ctx=262144   18.45 GB   \u001b[2midle\u001b[0m\n  \u001b[36mdarkmux:qwen3-4b-instruct-2507                \u001b[0m ctx=16000    2.15 GB    \u001b[2midle\u001b[0m\n\n\u001b[1;36muser state (0):\u001b[0m\n  (none — LMStudio is exclusively darkmux's right now)\n\nmatches no registered profile\n",
+  "stderr_tail": "",
+  "cols": 100,
+  "cache_ttl_ms": 3000,
+  "age_ms": 0,
+  "auto_refresh": true
+}

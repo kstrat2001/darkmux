@@ -1,0 +1,16 @@
+{
+  "panel": "flow-status",
+  "argv": [
+    "flow",
+    "status"
+  ],
+  "captured_ts_ms": 1786222463554,
+  "gather_ms": 216,
+  "exit_code": 0,
+  "ansi_text": "darkmux flow status — ⚠ warn\n  schema:       1.18.0\n  composition:  Tee([LocalFile, Redis])\n\nRedis\n  url:          redis://100.158.129.76:6379\n  stream:       darkmux:flow\n  max_len:      10000\n  reachable:    true\n  xlen:         10002\n  oldest_id:    1785723302248-0\n  newest_id:    1786199280948-0\n  probe_ms:     177\n  ⚠ stream is ≥95% of max_len — older records will be trimmed soon\n\nDisk\n  flows_dir:    /Users/kain/.darkmux/flows\n  exists:       true\n  day_files:    80\n  total_bytes:  78531486\n\nSchema\n  writer:       1.18.0\n  observed:     1.1.0, 1.11.0, 1.12.0, 1.13.0, 1.14.0, 1.15.0, 1.16.0, 1.17.0, 1.18.0, 1.2.0, 1.3.0, 1.5.0, 1.7.0, 1.8.0, 1.9.0\n  skew:         false\n\nWarnings:\n  - redis_stream_near_maxlen\n",
+  "stderr_tail": "laborum est aute elit quis tempor adipiscing et quis cupidatat ipsum adipiscing consequat incididunt off\ncia sit est exercitation voluptate et occaecat proident culpa eiusmod ex adipiscing aliqua proident sunt consectetur ex id fugiat sed esse aliquip esse ame\n amet aliqua labore sunt dolore pariatur sint fugiat deserunt consequat elit sed irure dolor enim nostrud officia occaec",
+  "cols": 100,
+  "cache_ttl_ms": 3000,
+  "age_ms": 0,
+  "auto_refresh": true
+}

@@ -65,6 +65,42 @@ test("blank page fails every golden comparison (fleet/console/runs/machine)", as
   await waitSettled(page, expect, "#stage .panelout, #stage .panelerr", { previousText: fleetStageText });
   const consoleText = await extractLensText(page);
   assertRed("console", consoleText);
+  let panelStageText = await regionText(page, "stage");
+
+  // The other six auto-refreshable panels (Packet 6 growth): every
+  // `/panel/*` path 404s under installBlankRoutes regardless of id, landing
+  // renderConsole()'s error branch (`.panelerr`) every time — there is no
+  // "loaded" state reachable here at all, so (unlike extract.spec.ts's
+  // `.pc-cmd`-gated wait, needed there specifically to skip past a real
+  // async fetch) the simple combined selector + previousText is exact: the
+  // chrome's `$ darkmux <id>` line already differs per-id on the very first
+  // synchronous render, before the 404 even lands.
+  for (const panelId of ["mission-status-all", "machine-status", "flow-status", "role-list", "config-list", "lab-fixture-list"]) {
+    await page.click(`[data-act="setpanel"][data-arg="${panelId}"]`);
+    await waitSettled(page, expect, "#stage .panelout, #stage .panelerr", { previousText: panelStageText });
+    assertRed(`console-${panelId}`, await extractLensText(page));
+    panelStageText = await regionText(page, "stage");
+  }
+
+  // doctor — MANUAL-ONLY: selecting the tab renders "not yet run" from pure
+  // client state (no fetch at all — `setPanel`'s MANUAL_PANELS guard returns
+  // before `loadPanel` is ever called), so `#stage` alone is IDENTICAL
+  // between a real daemon and a blank one for this one golden. What still
+  // makes this a valid red-prove is `#meta`: boot's own live-window fetch
+  // 404s under blank routes, so the badge line differs from the real
+  // corpus's boot — `assertRed` compares the FULL four-region text
+  // (`extractLensText`), not `#stage` alone, so the comparison is still
+  // meaningful even though the stage half is deliberately unchanged.
+  await page.click('[data-act="setpanel"][data-arg="doctor"]');
+  await waitSettled(page, expect, "#stage .panelout, #stage .panelerr", { previousText: panelStageText });
+  assertRed("console-doctor-not-run", await extractLensText(page));
+  const doctorNotRunStageText = await regionText(page, "stage");
+
+  // Clicking "run" DOES hit the network (404 under blank routes) — same
+  // `.panelerr` landing as every other panel above.
+  await page.click('[data-act="refreshpanel"]');
+  await waitSettled(page, expect, "#stage .panelout, #stage .panelerr", { previousText: doctorNotRunStageText });
+  assertRed("console-doctor", await extractLensText(page));
   const consoleStageText = await regionText(page, "stage");
 
   // Runs: /runs and /lab/runs both 404, but loadRuns()/loadLabRuns()'s catch

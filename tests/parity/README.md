@@ -154,7 +154,7 @@ one's vocabulary.
 | Lens | Hash route | Golden(s) |
 |---|---|---|
 | fleet (default) | `#` (no hash) | `fleet.txt` |
-| console | `#lens=console` (`&panel=<id>`) | `console.txt` (default panel: `mission-status`) |
+| console | `#lens=console` (`&panel=<id>`) | `console.txt` (default panel: `mission-status`, Packet 0a), plus one golden per remaining allowlisted panel (Packet 6): `console-mission-status-all.txt`, `console-machine-status.txt`, `console-flow-status.txt`, `console-role-list.txt`, `console-config-list.txt`, `console-lab-fixture-list.txt`, `console-doctor-not-run.txt` (the manual-only "not yet run" placeholder — selecting the tab must never auto-fetch, #1286) and `console-doctor.txt` (after clicking "run") |
 | runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-kind-lab.txt` (all four filter chips, Packet 3), `runs-series.txt` (kind=lab + the `◧ series` toggle — the ONE thing `/lab/runs` actually feeds, see the correction below; Packet 3), `runs-lens-boot.txt` (a FRESH `#lens=runs` boot, exercising `boot()`'s own `lq` deep-link branch rather than a click-through — content is byte-identical to `runs.txt` by design, since both land on kind=all over the same corpus; the golden's value is proving the boot mechanism independently, Packet 3) |
 | machine | `#lens=machine` | `machine.txt` |
 | session drill-in | `#session=<id>` | `session-task-list.txt` |
@@ -206,6 +206,18 @@ required to reach it honestly:
   golden. `task-list` was chosen specifically because it carries no client
   identifiers, avoiding URL-encoding a sanitized compound id in route
   matching.
+- `/panel/mission-status-all`, `/panel/machine-status`, `/panel/flow-status`,
+  `/panel/role-list`, `/panel/config-list`, `/panel/lab-fixture-list`,
+  `/panel/doctor` (Packet 6) — the seven console panels 0a didn't record
+  (only `/panel/mission-status`, the default tab, was recorded there). Each
+  is a real `x-darkmux-panel: 1` GET against the live daemon, sanitized
+  through the same `lib/sanitize.mjs` field policy as every other fixture.
+  `doctor` was recorded exactly ONCE (its `auto_refresh: false`/manual-run-
+  only semantics mean an operator, not a poll, decided when it ran — see
+  `panel.rs`'s own module doc for the #1286 rationale); it takes ~2s to
+  gather (it probes the machine) but that's a one-time recording cost, not a
+  test-suite cost — the extraction/parity specs replay the RECORDED body,
+  they never re-invoke the real command.
 
 ## Extraction target
 
@@ -247,17 +259,30 @@ scope:
 - **The catalog day-picker** (`#catpanel`, the history browser reached by
   clicking the source/date badge) — the extractor doesn't capture it at all;
   it's a modal overlay, not part of `#stage`.
-- **7 of the 8 console panels** — only the default `mission-status` panel is
-  exercised. `mission-status-all`, `role-list`, `machine-status`,
-  `config-list`, `flow-status`, `lab-fixture-list`, and `doctor` are
-  reachable via `data-act="setpanel"` clicks but none are golden-tested.
+- ~~7 of the 8 console panels~~ **CLOSED (Packet 6).** All eight allowlisted
+  panels (`crates/darkmux-serve/src/panel.rs::PANEL_IDS`) now have a golden —
+  see the lens inventory table above. `doctor` specifically has TWO
+  (`console-doctor-not-run.txt`, `console-doctor.txt`) since it's the one
+  manual-only panel and both states are real, distinct, reachable behavior.
 - **Deep-link boot paths other than `#session=<id>` and `#lens=runs`** —
-  `#lens=console&panel=<id>`, a bare `#<date>` hash (playback-by-date,
-  daemon-only), `#lens=runs&kind=<mission|dispatch|lab>` specifically as a
-  BOOT (only the plain `#lens=runs` boot is golden-tested; the kind-filtered
-  goldens are all reached by click, per the lens inventory table above), and
-  `#mission=<id>` (out of scope entirely — see the lens inventory above) are
-  none of them golden-tested.
+  `#lens=console&panel=<id>` AS A FRESH BOOT is still not exercised on the
+  LEGACY side specifically (`extract.spec.ts`/`redprove.spec.ts` only reach
+  every console panel via a CLICK sequence starting from the fleet default,
+  same shape as every OTHER lens's click-through — see the file's own
+  comments). Precedent (`runs-lens-boot.txt` vs `runs.txt`, Packet 3) is that
+  `#stage` content is identical whichever way a lens is reached, so this is
+  believed-safe rather than a real content gap — a future packet wanting to
+  CLOSE it on the legacy side would add one more `page.goto("#lens=console
+  &panel=<id>")` + `extractAndWrite` per panel and diff the result against
+  the click-reached golden byte-for-byte. `/next`'s OWN parity spec
+  (`next-parity-console.spec.ts`) DOES boot every panel via a fresh deep-link
+  (that's its whole point — the CLI emits these links, see
+  `panel_deep_link`), so the PORT'S deep-link mechanism is proven even though
+  the legacy reference-golden's provenance is click-based. Also still open: a
+  bare `#<date>` hash (playback-by-date, daemon-only), `#lens=runs&kind=<mission|
+  dispatch|lab>` specifically as a boot (only plain `#lens=runs` is
+  golden-tested as a boot), and `#mission=<id>` (out of scope entirely — see
+  the lens inventory above).
 - **`fleet-sessions-live.json` was recorded empty** (`[]`) — no session was
   live on the operator's daemon at record time, so this corpus fixture has
   never actually exercised the viewer's non-empty rendering path for that

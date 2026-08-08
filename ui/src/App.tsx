@@ -2,6 +2,7 @@ import { useHashRoute } from "./lib/useHashRoute";
 import { FleetStrip } from "./components/FleetStrip";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { RunsBoard } from "./lenses/runs/RunsBoard";
+import { ConsolePanel } from "./lenses/console/ConsolePanel";
 import type { Route } from "./lib/route";
 
 /**
@@ -54,7 +55,7 @@ function renderRoute(route: Route) {
     case "machine":
       return <LensPlaceholder label="machine" />;
     case "console":
-      return <LensPlaceholder label={`console panel "${route.panelId || "mission-status"}"`} />;
+      return <ConsolePanel initialPanelId={route.panelId} />;
     case "session":
       return <LensPlaceholder label={`session drill-in ${route.sessionId}`} />;
     case "mission-redirect":

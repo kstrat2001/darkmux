@@ -70,6 +70,58 @@ test("boot + four lens tabs (fleet, console, runs, machine)", async ({ page }) =
   await page.click("#lens-console");
   await waitSettled(page, expect, "#stage .panelout, #stage .panelerr", { previousText: fleetStageText });
   await extractAndWrite(page, "console");
+  let panelStageText = await regionText(page, "stage");
+
+  // 2b. The other six auto-refreshable console panels (Packet 6 growth —
+  // only `mission-status`, the default, had a golden before this). Each tab
+  // click re-fetches through `loadPanel()`/`setPanel()`, which paints TWO
+  // synchronous intermediate renders before the (mocked, near-instant) fetch
+  // resolves — "not yet run" then "running…" — both still `!st.body`. A
+  // `previousText`-only settle check (as used for the very first console
+  // click above, landing from a completely different lens) is provably racy
+  // here: switching panel-to-panel, either intermediate render ALREADY
+  // differs from the prior panel's real content, so `waitSettled` can report
+  // "settled" on the transient placeholder — caught empirically by
+  // `bun run determinism` flagging a genuine two-run mismatch on
+  // `console-lab-fixture-list.txt` (618B loaded vs 249B placeholder).
+  //
+  // FIRST attempt at a fix used `#stage .pc-cmd` as the "loaded" marker and
+  // was WRONG — re-reading `renderConsole()` shows `.pc-cmd` is emitted in
+  // BOTH chrome branches (`if(st.body){...<span class="pc-cmd">...} else
+  // {...<span class="pc-cmd">...}`), with IDENTICAL text for these panel ids
+  // besides (`argv.join(" ")` and `id.replace(/-/g," ")` produce the same
+  // string for every id here) — so waiting on it never actually gated
+  // anything beyond the pre-existing `previousText` check, and the race was
+  // still latent. The ACTUALLY exclusive marker is the "re-run" BUTTON TEXT:
+  // only the `if(st.body)` branch's button says "re-run" (the `else`
+  // branch's button always says "run", loading or not) — a genuine
+  // discriminator with no shared-text trap. Re-verified: `bun run
+  // determinism` run 5x back-to-back, byte-identical every time (see the
+  // packet report for the transcript).
+  const RERUN_BUTTON = '.panelchrome button:text-is("re-run")';
+  for (const panelId of ["mission-status-all", "machine-status", "flow-status", "role-list", "config-list", "lab-fixture-list"]) {
+    await page.click(`[data-act="setpanel"][data-arg="${panelId}"]`);
+    await waitSettled(page, expect, RERUN_BUTTON, { previousText: panelStageText });
+    await extractAndWrite(page, `console-${panelId}`);
+    panelStageText = await regionText(page, "stage");
+  }
+
+  // 2c. doctor — MANUAL-ONLY (#1286): selecting the tab must NOT auto-fetch.
+  // Capture the "not yet run" placeholder state first (this IS the real,
+  // permanent behavior on tab-select — `setPanel`'s MANUAL_PANELS guard
+  // returns before ever calling `loadPanel`, so there is no async race to
+  // settle here at all, `.panelout`+previousText is exact), then click the
+  // panel's own "run" button (`data-act="refreshpanel"`, the same affordance
+  // an operator would use) to capture the real probed content — same
+  // `RERUN_BUTTON` marker as the loop above, for the same reason.
+  await page.click('[data-act="setpanel"][data-arg="doctor"]');
+  await waitSettled(page, expect, "#stage .panelout, #stage .panelerr", { previousText: panelStageText });
+  await extractAndWrite(page, "console-doctor-not-run");
+  const doctorNotRunStageText = await regionText(page, "stage");
+
+  await page.click('[data-act="refreshpanel"]');
+  await waitSettled(page, expect, RERUN_BUTTON, { previousText: doctorNotRunStageText });
+  await extractAndWrite(page, "console-doctor");
   const consoleStageText = await regionText(page, "stage");
 
   // 3. runs — the consolidated kind-tagged run list, default kind=all.

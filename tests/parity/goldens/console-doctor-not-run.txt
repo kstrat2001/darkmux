@@ -1,0 +1,23 @@
+=== crumb ===
+(empty)
+
+=== meta ===
+● ready · 2  · last run 2h ago
+952 records · last 24h
+
+=== logscope ===
+console
+
+=== stage ===
+mission status
+all missions
+machine
+flow
+roles
+config
+fixtures
+doctor
+$ darkmux doctor
+run
+not run yet — this panel probes the machine, so it runs only when you ask.
+

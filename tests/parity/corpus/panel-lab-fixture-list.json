@@ -1,0 +1,17 @@
+{
+  "panel": "lab-fixture-list",
+  "argv": [
+    "lab",
+    "fixture",
+    "list"
+  ],
+  "captured_ts_ms": 1786222463570,
+  "gather_ms": 3,
+  "exit_code": 0,
+  "ansi_text": "Lab registry: /Users/kain/.darkmux/lab-registry.json (1 fixture)\n\n  pepper-grinder\n    path:       /Users/kain/de-projects/darkmux-lab-fixtures/pepper-grinder\n    version:    1.0\n    satisfies:  node-refresh-token-rotation@1.0\n    hash:       blake3:6f31a20b6a9a6e130afd7b0de438399d8157428f26a50b014de736884a989a1e\n    hashed_at:  2026-06-02T14:11:19Z\n\n",
+  "stderr_tail": "",
+  "cols": 100,
+  "cache_ttl_ms": 3000,
+  "age_ms": 0,
+  "auto_refresh": true
+}

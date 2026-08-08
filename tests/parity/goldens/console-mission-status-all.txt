@@ -1,0 +1,123 @@
+=== crumb ===
+(empty)
+
+=== meta ===
+● ready · 2  · last run 2h ago
+952 records · last 24h
+
+=== logscope ===
+console
+
+=== stage ===
+mission status
+all missions
+machine
+flow
+roles
+config
+fixtures
+doctor
+$ darkmux mission status --all
+captured 20:54:23
+· 10ms
+re-run
+mission status — 93 missions
+
+FINALIZED (93)
+  ◆ PR review — kstrat2001/darkmux@8cf07d1c…ep+diff-review+probe-4b+probe-gptoss`)   1d    3/3  ▓▓▓▓
+  ◆ PR review — nbd-sfymfx-bfkdxl-71ns8216 …ep+diff-review+probe-4b+probe-gptoss`)   1d    3/3  ▓▓▓▓
+  ◆ PR review — nbd-sfymfx-bfkdxl-71ns8216 …ep+diff-review+probe-4b+probe-gptoss`)   1d    3/3  ▓▓▓▓
+  ◆ PR review — nbd-sfymfx-bfkdxl-71ns8216 …ep+diff-review+probe-4b+probe-gptoss`)   1d    3/3  ▓▓▓▓
+  • pr-reviewer                                                                      2d    1/1  ▓▓▓▓
+  ◆ PR review — dogfood-2.5.0-pr1671 (crew …ep+diff-review+probe-4b+probe-gptoss`)   2d    3/3  ▓▓▓▓
+  ◆ PR review — kstrat2001/darkmux@42f63390…ep+diff-review+probe-4b+probe-gptoss`)   5d    0/3  ░░░░
+  ◆ PR review — kstrat2001/darkmux@e700d21c…ep+diff-review+probe-4b+probe-gptoss`)   5d    0/3  ░░░░
+  ◆ PR review — kstrat2001/darkmux@e700d21c…ep+diff-review+probe-4b+probe-gptoss`)   5d    0/3  ░░░░
+  • code-reviewer                                                                    7d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    7d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  ◆ M4 doom-loop arc — finish the engagemen…maining enhancements + the validation.   9d    3/4  ▓▓▓░
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  ◆ PR review — kstrat2001/darkmux@38031a5a…ep+diff-review+probe-4b+probe-gptoss`)   9d    3/3  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                    9d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   10d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   10d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   10d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   10d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   10d    1/1  ▓▓▓▓
+  ◆ PR review — tag-2.3.0-smoke (crew `diff-review+funnel-judge-35b+probe-4b`)      11d    3/3  ▓▓▓▓
+  ◆ PR review — dogfood-splitfix (crew `funnel-judge-35b+probe-4b`)                 11d    3/3  ▓▓▓▓
+  ◆ PR review — dogfood-mixed (crew `deep+diff-review+probe-4b+probe-gptoss`)       11d    3/3  ▓▓▓▓
+  ◆ PR review — dogfood-deep (crew `diff-re…+funnel-judge-35b+probe-27b+probe-4b`)  11d    3/3  ▓▓▓▓
+  ◆ PR review — dogfood-standard (crew `funnel-judge-35b+probe-4b`)                 11d    3/3  ▓▓▓▓
+  ◆ PR review — dogfood-lean (crew `funnel-judge-35b+probe-4b`)                     11d    3/3  ▓▓▓▓
+  ◆ PR review — dogfood-lean (crew `funnel-judge-35b+probe-4b`)                     11d    0/3  ░░░░
+  ◆ PR review — dogfood-lean (crew `funnel-judge-35b+probe-4b`)                     11d    0/3  ░░░░
+  ◆ PR review — dogfood-2.2.0 (crew `deep+probe-4b`)                                14d    0/3  ░░░░
+  • code-reviewer                                                                   15d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   16d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   16d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   16d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   16d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   17d    1/1  ▓▓▓▓
+  • Sanity: step-kind swap                                                          17d    1/1  ▓▓▓▓
+  ◆ Sanity: review-shaped 1-probe/1-judge                                           17d    3/3  ▓▓▓▓
+  • Sanity: parallel fan-out + fan-in                                               17d    1/1  ▓▓▓▓
+  • code-reviewer                                                                   18d    1/1  ▓▓▓▓
+  • health-research                                                                 18d    1/1  ▓▓▓▓
+  • health-research                                                                 18d    1/1  ▓▓▓▓
+  • health-research                                                                 18d    1/1  ▓▓▓▓
+  ◆ PR review — zawmpk-352-vejagb-crdoil (c…ep+diff-review+probe-4b+probe-gptoss`)  21d    3/3  ▓▓▓▓
+  ◆ PR review — kstrat2001/darkmux@5ad35641…ep+diff-review+probe-4b+probe-gptoss`)  21d    0/3  ░░░░
+  ◆ PR review — kstrat2001/darkmux@f8dda892…ep+diff-review+probe-4b+probe-gptoss`)  21d    3/3  ▓▓▓▓
+  ◆ PR review — local-565-rolecrew (crew `deep+diff-review+probe-27b+probe-4b`)     21d    3/3  ▓▓▓▓
+  ◆ PR review — local-565-1784338758 (crew `diff-review`)                           21d    3/3  ▓▓▓▓
+  ◆ PR review — ts-smoke-1784296156 (crew `diff-review`)                            22d    3/3  ▓▓▓▓
+  ◆ PR review — smoke2-1784295856 (crew `diff-review`)                              22d    0/3  ░░░░
+  ◆ PR review — kstrat2001/darkmux@90c3cc85…51358fa89358d2c78 (crew `review-deep`)  22d    0/3  ░░░░
+  ◆ PR review — ship2b-validate (crew `diff-review`)                                22d    3/3  ▓▓▓▓
+  ◆ PR review — live-smoke-1442c (crew `diff-review`)                               22d    3/3  ▓▓▓▓
+  ◆ PR review — live-smoke-1442b (crew `diff-review`)                               22d    0/3  ░░░░
+  ◆ PR review — live-smoke-1442 (crew `diff-review`)                                22d    0/3  ░░░░
+  ◆ PR review — kstrat2001/darkmux@8dd4f40d…c51f78c65179587a2 (crew `review-deep`)  23d    0/3  ░░░░
+  • PR review: /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/.tmprEsz7c/wt       23d    0/1  ░░░░
+  ◆ PR review — kstrat2001/darkmux@2aff11d3…101881c7a1773b635 (crew `review-deep`)  23d    0/3  ░░░░
+  • PR review: /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/.tmplOI9d2/wt       23d    0/1  ░░░░
+  • PR review: /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/.tmpp0a2hW/wt       23d    0/1  ░░░░
+  • PR review: /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/.tmpN1SPAI/wt       23d    0/1  ░░░░
+  • PR review: /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/.tmpUVGIbJ/wt       23d    0/1  ░░░░
+  • PR review: /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/.tmpMobsRe/wt       23d    0/1  ░░░░
+  • Registry-arc P5 release-gate dispatch (…sk through mission launch coder-phase.  23d    0/1  ░░░░
+  • Registry-arc P5 release-gate dispatch (…sk through mission launch coder-phase.  23d    0/1  ░░░░
+  ◆ PR review — p5-gate-review-1384-bundled (crew `review-gate`)                    23d    3/3  ▓▓▓▓
+  ◆ PR review — p5-gate-review-1383-wt (crew `review-gate`)                         23d    0/3  ░░░░
+  ◆ PR review — p5-gate-review-1384-wt (crew `review-gate`)                         23d    0/3  ░░░░
+  ◆ PR review — p5-gate-review-1384 (crew `review-gate`)                            23d    0/3  ░░░░
+  ◆ PR review — kstrat2001/darkmux@5f8c703d…af397df9d887dae54 (crew `review-deep`)  26d    3/3  ▓▓▓▓
+  ◆ PR review — kstrat2001/darkmux@a13fa20e…2bc6089b63e455ada (crew `review-deep`)  26d    3/3  ▓▓▓▓
+  ◆ PR review — kstrat2001/darkmux@94d604d4…0e7f57d155b5fc601 (crew `review-deep`)  26d    3/3  ▓▓▓▓
+  ◆ Apply darkmux CLI styling foundation (s…le output remains byte-for-byte clean.   7w    4/4  ▓▓▓▓
+  ◆ Land the pre-1.0 compat-freeze sweep (#…t:slim with the in-sandbox inner loop.   7w    2/2  ▓▓▓▓
+  ◆ Harden the queue→container dispatch bou…eue-validation tests that were absent.   7w    3/3  ▓▓▓▓
+  • Follow-up for PR2 of submissions retire…ad-policy guard to prevent 500 errors.   8w    1/1  ▓▓▓▓
+  • Revoke client-side form authoring capab…while preserving read and apply flows.   8w    1/1  ▓▓▓▓
+  • Fix misleading APIM subscription copy i…rs on Subscriptions Create/Edit pages.   8w    1/1  ▓▓▓▓
+  • Live diff view for an active dispatch (…form' differentiation feature for 1.0.   8w    1/1  ▓▓▓▓
+  ◆ Build the shared inline Rust styling mo… never corrupted by ANSI escape codes.   8w    3/3  ▓▓▓▓
+→ `--missions` for named missions only
+
+✓ board is clean — every mission's phases are reconciled
+

@@ -30,7 +30,7 @@ const PORT = 47920;
 
 module.exports = defineConfig({
   testDir: __dirname,
-  testMatch: ["next-parity-runs.spec.ts"],
+  testMatch: ["next-parity-runs.spec.ts", "next-parity-console.spec.ts"],
   forbidOnly: !!process.env.CI,
   retries: 0,
   fullyParallel: false,

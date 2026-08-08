@@ -32,6 +32,41 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText(/no machines currently present/i)).toBeInTheDocument());
   });
 
+  it("renders the real console lens (not a placeholder) for #lens=console", async () => {
+    window.location.hash = "#lens=console";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              panel: "mission-status",
+              argv: ["mission", "status"],
+              captured_ts_ms: Date.now(),
+              gather_ms: 1,
+              exit_code: 0,
+              ansi_text: "no missions",
+              stderr_tail: "",
+              cols: 100,
+              cache_ttl_ms: 3000,
+              age_ms: 0,
+              auto_refresh: true,
+            }),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByText(/lens not ported yet/i)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("no missions")).toBeInTheDocument());
+  });
+
   it("renders a named placeholder for a lens this packet doesn't implement", () => {
     window.location.hash = "#lens=machine";
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
