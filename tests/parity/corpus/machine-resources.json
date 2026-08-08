@@ -1,0 +1,53 @@
+{
+  "schema_version": "1.0",
+  "generated_at_ms": 1786207256843,
+  "gather_ms": 441,
+  "limit_bytes": 137438953472,
+  "limit_source": "physical_pool",
+  "pool": {
+    "capacity_bytes": 137438953472,
+    "available_bytes": 14452359168
+  },
+  "pressure": {
+    "swap_used_bytes": 8308129792,
+    "compressor_bytes": 1121665024,
+    "memory_free_percent": 94,
+    "red": false
+  },
+  "models": [
+    {
+      "identifier": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "model_key": "qwen3.6-35b-a3b-turboquant-mlx",
+      "owner": "darkmux",
+      "loaded_ctx": 262144,
+      "weights_bytes": 18446676063,
+      "kv_per_token_bytes": 20480,
+      "kv_bytes_at_ctx": 5368709120,
+      "potential_bytes": 24565385183,
+      "current_bytes": 19351355392,
+      "state": "green"
+    },
+    {
+      "identifier": "darkmux:qwen3-4b-instruct-2507",
+      "model_key": "qwen3-4b-instruct-2507",
+      "owner": "darkmux",
+      "loaded_ctx": 16000,
+      "weights_bytes": 2153225524,
+      "kv_per_token_bytes": 147456,
+      "kv_bytes_at_ctx": 2359296000,
+      "potential_bytes": 5262521524,
+      "current_bytes": 2856615936,
+      "state": "green"
+    }
+  ],
+  "machine": {
+    "potential_bytes": 29827906707,
+    "unpriced_models": 0,
+    "current_bytes": 22207971328,
+    "state": "green"
+  },
+  "attribution": "per_process",
+  "attribution_note": "nostrud anim pariatur do nostrud cillum cupidatat duis fugiat nostrud ullamco anim pariatur amet amet quis voluptate proid",
+  "warnings": [],
+  "cache_ttl_ms": 2000
+}

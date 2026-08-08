@@ -1,0 +1,14 @@
+[
+  {
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "display_name": "MacBook-Pro",
+    "schema_version": "1.18.0",
+    "beat_ts_ms": 1786207252010
+  },
+  {
+    "machine_uid": "E3F5FE8A-1460-E6FF-663F-760A6D75B9C9",
+    "display_name": "m1-max-32gb-studio",
+    "schema_version": "1.18.0",
+    "beat_ts_ms": 1786207251383
+  }
+]

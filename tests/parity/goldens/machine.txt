@@ -1,0 +1,122 @@
+=== crumb ===
+MacBook-Pro
+
+=== meta ===
+● ready · 2  · last run 2h ago
+952 records · last 24h
+
+=== logscope ===
+MacBook-Pro
+
+=== stage ===
+fleet › machine · MacBook-Pro — Apple M5 Max · 128 GB
+darkmux/utility
+utility tier · darkmux:qwen3-4b-instruct-2507
+compaction · mission-compile · estimate · scribe
+resident
+machine total
+GREEN
+Σ potential 29.83 GB · Σ current 22.21 GB · limit 137.44 GB (physical pool (no budget configured)) · pool 137.44 GB / free 14.45 GB
+darkmux:qwen3.6-35b-a3b-turboquant-mlx
+DARKMUX
+GREEN
+ctx 262144 · weights 18.45 GB · kv@ctx 5.37 GB · potential 24.57 GB · current 19.35 GB
+darkmux:qwen3-4b-instruct-2507
+DARKMUX
+GREEN
+ctx 16000 · weights 2.15 GB · kv@ctx 2.36 GB · potential 5.26 GB · current 2.86 GB
+pressure
+swap used
+8.31 GB
+compressor
+1.12 GB
+memory free
+94%
+attribution: nostrud anim pariatur do nostrud cillum cupidatat duis fugiat nostrud ullamco anim pariatur amet amet quis voluptate proid
+gather 441 ms (zero model dispatches) · server cache 2000 ms · polled every 5s
+RUNS ON MACBOOK-PRO
+#30
+complete
+radio-router · qwen3-4b-instruct-2507
+1t 0⚙ 982tok 0⚡
+14:28:00 · just now · 0:00
+#29
+no start
+radio-router · ?
+#28
+complete
+radio-host · qwen3.6-35b-a3b-turboquant-mlx
+1t 0⚙ 2ktok 0⚡
+11:31:56 · 2h ago · 0:04
+#27
+complete
+radio-router · qwen3-4b-instruct-2507
+1t 0⚙ 978tok 0⚡
+11:31:52 · 2h ago · 0:01
+#26
+no start
+radio-router · ?
+#25
+complete
+radio-host · qwen3.6-35b-a3b-turboquant-mlx
+1t 0⚙ 2ktok 0⚡
+09:57:23 · 4h ago · 0:03
+#24
+complete
+radio-router · qwen3-4b-instruct-2507
+1t 0⚙ 980tok 0⚡
+09:57:20 · 4h ago · 0:01
+#23
+no start
+radio-router · ?
+#22
+complete
+radio-host · qwen3.6-35b-a3b-turboquant-mlx
+1t 0⚙ 4ktok 0⚡
+09:47:31 · 4h ago · 0:16
+#21
+complete
+radio-router · qwen3-4b-instruct-2507
+1t 0⚙ 978tok 0⚡
+09:47:15 · 4h ago · 0:01
+#20
+no start
+radio-router · ?
+#19
+no start
+merge-step · ? · acp-ephemeral-pr-ship-1786152707367180000-5
+#18
+no start
+gather-merge-step · ? · acp-ephemeral-pr-ship-1786152707367180000-5
+#17
+no start
+approve-step · ? · acp-ephemeral-pr-ship-1786152707367180000-5
+#16
+no start
+gather-approve-step · ? · acp-ephemeral-pr-ship-1786152707367180000-5
+#15
+complete
+radio-router · qwen3-4b-instruct-2507
+1t 0⚙ 984tok 0⚡
+01:16:43 · 13h ago · 0:01
+#14
+no start
+radio-router · ?
+#13
+no start
+view-step · ? · acp-ephemeral-pr-view-1786150088844151000-2
+#12
+complete
+radio-router · qwen3-4b-instruct-2507
+1t 0⚙ 965tok 0⚡
+16:44:34 · 21h ago · 0:01
+#11
+no start
+radio-router · ?
+show all 30 →
+UNSCOPED RECORDS · 10 TODAY
+unscoped records
+10 records without a session
+flow notes, ambient telemetry, etc.
+loose
+

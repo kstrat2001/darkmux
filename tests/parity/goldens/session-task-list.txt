@@ -1,0 +1,35 @@
+=== crumb ===
+◆ acp-ephemeral-pr-list-1786088208704943000-0››task-list
+
+=== meta ===
+◆ acp-ephemeral-pr-list-1786088208704943000-0, acp-ephemeral-pr-list-1786089430627298000-0 +22 more · flow · 2026-08-08 · 8/7/2026 07:36:48–01:28:42
+48 records · 1 machines
+
+=== logscope ===
+TASK-LIST
+
+=== stage ===
+RUNNING RUN · FETCH-RENDER (task-list on )
+run
+route
+LMStudio · local · this machine
+timing
+07:36:48 · running
+—
+TURNS
+—
+TOKENS IN
+—
+TOKENS OUT
+—
+CONTEXT
+0
+COMPACTIONS
+1071:54 so far
+WALL CLOCK
+model (lms)
+no telemetry yet
+detections
+✓ clean
+no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)
+

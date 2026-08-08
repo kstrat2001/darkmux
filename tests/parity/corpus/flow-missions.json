@@ -1,0 +1,1861 @@
+{
+  "missions": [
+    {
+      "mission_id": "acp-ephemeral-pr-ship-1786152707367180000-5",
+      "records": 10,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-08T01:31:47Z",
+      "last_ts": "2026-08-08T01:32:29Z",
+      "first_date": "2026-08-08",
+      "last_date": "2026-08-08"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-comments-list-1786152519941013000-4",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-08T01:28:39Z",
+      "last_ts": "2026-08-08T01:28:42Z",
+      "first_date": "2026-08-08",
+      "last_date": "2026-08-08"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786152504805583000-3",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-08T01:28:24Z",
+      "last_ts": "2026-08-08T01:28:26Z",
+      "first_date": "2026-08-08",
+      "last_date": "2026-08-08"
+    },
+    {
+      "mission_id": "review-1786150410-209398",
+      "records": 868,
+      "dispatches": 3,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-08T00:53:30Z",
+      "last_ts": "2026-08-08T01:18:32Z",
+      "first_date": "2026-08-08",
+      "last_date": "2026-08-08"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-view-1786150088844151000-2",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-08T00:48:08Z",
+      "last_ts": "2026-08-08T00:48:13Z",
+      "first_date": "2026-08-08",
+      "last_date": "2026-08-08"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786150055695736000-1",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-08T00:47:35Z",
+      "last_ts": "2026-08-08T00:47:37Z",
+      "first_date": "2026-08-08",
+      "last_date": "2026-08-08"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786121191309511000-1",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T16:46:31Z",
+      "last_ts": "2026-08-07T16:46:35Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786121158195620000-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T16:45:58Z",
+      "last_ts": "2026-08-07T16:45:59Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786121058517076000-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T16:44:18Z",
+      "last_ts": "2026-08-07T16:44:20Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786118526256603000-1",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T16:02:06Z",
+      "last_ts": "2026-08-07T16:02:07Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786118523229280000-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T16:02:03Z",
+      "last_ts": "2026-08-07T16:02:04Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786114632381137000-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T14:57:12Z",
+      "last_ts": "2026-08-07T14:57:15Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786112866553668000-0",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T14:27:46Z",
+      "last_ts": "2026-08-07T14:27:47Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786112149864218000-0",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T14:15:49Z",
+      "last_ts": "2026-08-07T14:15:51Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786111634440410000-3",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T14:07:14Z",
+      "last_ts": "2026-08-07T14:07:16Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-merge-1786111093969402000-2",
+      "records": 6,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T13:58:13Z",
+      "last_ts": "2026-08-07T13:58:23Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-approve-1786110758707741000-1",
+      "records": 6,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T13:52:38Z",
+      "last_ts": "2026-08-07T13:53:01Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786110732765195000-0",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T13:52:12Z",
+      "last_ts": "2026-08-07T13:52:14Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786096374062061000-12",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:52:54Z",
+      "last_ts": "2026-08-07T09:52:55Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-merge-1786096346020539000-11",
+      "records": 6,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:52:26Z",
+      "last_ts": "2026-08-07T09:52:39Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786096335940154000-10",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:52:15Z",
+      "last_ts": "2026-08-07T09:52:17Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-merge-1786096304195656000-9",
+      "records": 5,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:51:44Z",
+      "last_ts": "2026-08-07T09:52:04Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-approve-1786096233364710000-8",
+      "records": 6,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:50:33Z",
+      "last_ts": "2026-08-07T09:51:28Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-comments-list-1786096216607360000-7",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:50:16Z",
+      "last_ts": "2026-08-07T09:50:20Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-view-1786096184556928000-6",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:49:44Z",
+      "last_ts": "2026-08-07T09:49:48Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786096163987015000-5",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:49:23Z",
+      "last_ts": "2026-08-07T09:49:25Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-approve-1786095848295749000-4",
+      "records": 5,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:44:08Z",
+      "last_ts": "2026-08-07T09:49:12Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786095828927395000-3",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:43:48Z",
+      "last_ts": "2026-08-07T09:43:50Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-approve-1786095190336606000-2",
+      "records": 6,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:33:10Z",
+      "last_ts": "2026-08-07T09:33:46Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-merge-1786095174518836000-1",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:32:54Z",
+      "last_ts": "2026-08-07T09:32:58Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786095161284735000-0",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T09:32:41Z",
+      "last_ts": "2026-08-07T09:32:42Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786091297730112000-2",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T08:28:17Z",
+      "last_ts": "2026-08-07T08:28:19Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-comments-list-1786091178187633000-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T08:26:18Z",
+      "last_ts": "2026-08-07T08:26:20Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786091112370460000-0",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T08:25:12Z",
+      "last_ts": "2026-08-07T08:25:13Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-view-1786089463406811000-1",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T07:57:43Z",
+      "last_ts": "2026-08-07T07:57:45Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786089430627298000-0",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T07:57:10Z",
+      "last_ts": "2026-08-07T07:57:12Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "acp-ephemeral-pr-list-1786088208704943000-0",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T07:36:48Z",
+      "last_ts": "2026-08-07T07:36:50Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "review-1786081556-0eea32",
+      "records": 1183,
+      "dispatches": 5,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T05:45:56Z",
+      "last_ts": "2026-08-07T06:38:16Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "review-1786071434-f6d2f5",
+      "records": 232,
+      "dispatches": 5,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T02:57:14Z",
+      "last_ts": "2026-08-07T03:04:38Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "review-1786070274-89d50b",
+      "records": 226,
+      "dispatches": 5,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T02:37:54Z",
+      "last_ts": "2026-08-07T02:45:08Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "review-1786068582-93f404",
+      "records": 49,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-07T02:09:42Z",
+      "last_ts": "2026-08-07T02:09:47Z",
+      "first_date": "2026-08-07",
+      "last_date": "2026-08-07"
+    },
+    {
+      "mission_id": "dispatch-pr-reviewer-1785977775-901a-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-06T00:56:15Z",
+      "last_ts": "2026-08-06T00:56:47Z",
+      "first_date": "2026-08-06",
+      "last_date": "2026-08-06"
+    },
+    {
+      "mission_id": "review-1785977466-1d3e70",
+      "records": 101,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-06T00:51:06Z",
+      "last_ts": "2026-08-06T00:53:43Z",
+      "first_date": "2026-08-06",
+      "last_date": "2026-08-06"
+    },
+    {
+      "mission_id": "review-1785946022-8d2715",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-05T16:07:02Z",
+      "last_ts": "2026-08-05T16:14:26Z",
+      "first_date": "2026-08-05",
+      "last_date": "2026-08-05"
+    },
+    {
+      "mission_id": "review-1785942965-0eaca3",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-05T15:16:05Z",
+      "last_ts": "2026-08-05T15:16:24Z",
+      "first_date": "2026-08-05",
+      "last_date": "2026-08-05"
+    },
+    {
+      "mission_id": "review-1785885677-5ec5e0",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-04T23:21:17Z",
+      "last_ts": "2026-08-04T23:21:18Z",
+      "first_date": "2026-08-04",
+      "last_date": "2026-08-04"
+    },
+    {
+      "mission_id": "review-1785851756-6042a4",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-04T13:55:56Z",
+      "last_ts": "2026-08-04T13:59:56Z",
+      "first_date": "2026-08-04",
+      "last_date": "2026-08-04"
+    },
+    {
+      "mission_id": "review-1785847613-b140c0",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-04T12:46:53Z",
+      "last_ts": "2026-08-04T12:50:38Z",
+      "first_date": "2026-08-04",
+      "last_date": "2026-08-04"
+    },
+    {
+      "mission_id": "review-1785843516-483ebb",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-04T11:38:36Z",
+      "last_ts": "2026-08-04T11:44:00Z",
+      "first_date": "2026-08-04",
+      "last_date": "2026-08-04"
+    },
+    {
+      "mission_id": "review-1785771277-054756",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-03T15:34:37Z",
+      "last_ts": "2026-08-03T15:40:07Z",
+      "first_date": "2026-08-03",
+      "last_date": "2026-08-03"
+    },
+    {
+      "mission_id": "review-1785753634-47ed19",
+      "records": 11,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-03T10:40:34Z",
+      "last_ts": "2026-08-03T15:30:23Z",
+      "first_date": "2026-08-03",
+      "last_date": "2026-08-03"
+    },
+    {
+      "mission_id": "review-1785759617-f38841",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-03T12:20:17Z",
+      "last_ts": "2026-08-03T15:30:23Z",
+      "first_date": "2026-08-03",
+      "last_date": "2026-08-03"
+    },
+    {
+      "mission_id": "review-1785760749-4f1703",
+      "records": 11,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-03T12:39:09Z",
+      "last_ts": "2026-08-03T15:30:22Z",
+      "first_date": "2026-08-03",
+      "last_date": "2026-08-03"
+    },
+    {
+      "mission_id": "review-1785770519-f814e0",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-03T15:21:59Z",
+      "last_ts": "2026-08-03T15:25:21Z",
+      "first_date": "2026-08-03",
+      "last_date": "2026-08-03"
+    },
+    {
+      "mission_id": "review-1785768532-cbd22b",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-03T14:48:52Z",
+      "last_ts": "2026-08-03T14:49:10Z",
+      "first_date": "2026-08-03",
+      "last_date": "2026-08-03"
+    },
+    {
+      "mission_id": "review-1785766753-218e27",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-03T14:19:13Z",
+      "last_ts": "2026-08-03T14:19:31Z",
+      "first_date": "2026-08-03",
+      "last_date": "2026-08-03"
+    },
+    {
+      "mission_id": "review-1785725244-690658",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-03T02:47:24Z",
+      "last_ts": "2026-08-03T02:57:51Z",
+      "first_date": "2026-08-03",
+      "last_date": "2026-08-03"
+    },
+    {
+      "mission_id": "review-1785723266-7f7326",
+      "records": 7,
+      "dispatches": 0,
+      "machines": [
+        "m1-max-32gb-studio"
+      ],
+      "first_ts": "2026-08-03T02:16:14Z",
+      "last_ts": "2026-08-03T02:16:49Z",
+      "first_date": "2026-08-03",
+      "last_date": "2026-08-03"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785589698-5d6a-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-01T13:08:18Z",
+      "last_ts": "2026-08-01T13:08:47Z",
+      "first_date": "2026-08-01",
+      "last_date": "2026-08-01"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785570518-17301-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-08-01T07:48:38Z",
+      "last_ts": "2026-08-01T07:50:17Z",
+      "first_date": "2026-08-01",
+      "last_date": "2026-08-01"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785424933-9ab8-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T15:22:13Z",
+      "last_ts": "2026-07-30T15:22:46Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785421719-2d8d-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T14:28:39Z",
+      "last_ts": "2026-07-30T14:29:00Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785412993-ba6b-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T12:03:13Z",
+      "last_ts": "2026-07-30T12:03:45Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785411609-73ee-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T11:40:09Z",
+      "last_ts": "2026-07-30T11:40:42Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785407851-178e9-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T10:37:31Z",
+      "last_ts": "2026-07-30T10:38:14Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "review-1785400940-136e76",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T08:42:20Z",
+      "last_ts": "2026-07-30T09:59:16Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785402561-b25d-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T09:09:21Z",
+      "last_ts": "2026-07-30T09:11:55Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785401912-4445-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T08:58:32Z",
+      "last_ts": "2026-07-30T09:00:13Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785392290-12eb6-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T06:18:10Z",
+      "last_ts": "2026-07-30T06:19:33Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785392221-129c0-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T06:17:01Z",
+      "last_ts": "2026-07-30T06:18:16Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785387728-a0d2-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T05:02:08Z",
+      "last_ts": "2026-07-30T05:02:38Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785387671-972c-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T05:01:11Z",
+      "last_ts": "2026-07-30T05:02:11Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785386551-4b71-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T04:42:32Z",
+      "last_ts": "2026-07-30T04:43:01Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785384819-157-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T04:13:39Z",
+      "last_ts": "2026-07-30T04:13:58Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785380025-c60c-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T02:53:46Z",
+      "last_ts": "2026-07-30T02:57:40Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785379738-ad36-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T02:48:58Z",
+      "last_ts": "2026-07-30T02:51:17Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785371423-bb1f-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-30T00:30:23Z",
+      "last_ts": "2026-07-30T00:32:34Z",
+      "first_date": "2026-07-30",
+      "last_date": "2026-07-30"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785343684-1c01-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-29T16:48:05Z",
+      "last_ts": "2026-07-29T16:50:20Z",
+      "first_date": "2026-07-29",
+      "last_date": "2026-07-29"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785343334-348-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-29T16:42:15Z",
+      "last_ts": "2026-07-29T16:42:49Z",
+      "first_date": "2026-07-29",
+      "last_date": "2026-07-29"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785340728-7167-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-29T15:58:48Z",
+      "last_ts": "2026-07-29T15:59:40Z",
+      "first_date": "2026-07-29",
+      "last_date": "2026-07-29"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785339733-16dff-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-29T15:42:14Z",
+      "last_ts": "2026-07-29T15:42:34Z",
+      "first_date": "2026-07-29",
+      "last_date": "2026-07-29"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1785337256-5b72-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-29T15:00:56Z",
+      "last_ts": "2026-07-29T15:08:06Z",
+      "first_date": "2026-07-29",
+      "last_date": "2026-07-29"
+    },
+    {
+      "mission_id": "review-1785224975-ee40dc",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-28T07:49:35Z",
+      "last_ts": "2026-07-28T07:52:15Z",
+      "first_date": "2026-07-28",
+      "last_date": "2026-07-28"
+    },
+    {
+      "mission_id": "review-1785213958-daa5ba",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-28T04:45:58Z",
+      "last_ts": "2026-07-28T04:47:40Z",
+      "first_date": "2026-07-28",
+      "last_date": "2026-07-28"
+    },
+    {
+      "mission_id": "review-1785209203-975bfe",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-28T03:26:43Z",
+      "last_ts": "2026-07-28T03:33:33Z",
+      "first_date": "2026-07-28",
+      "last_date": "2026-07-28"
+    },
+    {
+      "mission_id": "review-1785207867-6a1432",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-28T03:04:27Z",
+      "last_ts": "2026-07-28T03:20:40Z",
+      "first_date": "2026-07-28",
+      "last_date": "2026-07-28"
+    },
+    {
+      "mission_id": "review-1785207646-45d532",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-28T03:00:46Z",
+      "last_ts": "2026-07-28T03:04:05Z",
+      "first_date": "2026-07-28",
+      "last_date": "2026-07-28"
+    },
+    {
+      "mission_id": "review-1785207492-f044bc",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-28T02:58:12Z",
+      "last_ts": "2026-07-28T02:59:56Z",
+      "first_date": "2026-07-28",
+      "last_date": "2026-07-28"
+    },
+    {
+      "mission_id": "review-1785207257-ec8779",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-28T02:54:17Z",
+      "last_ts": "2026-07-28T02:56:15Z",
+      "first_date": "2026-07-28",
+      "last_date": "2026-07-28"
+    },
+    {
+      "mission_id": "review-1785207179-e6071c",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-28T02:52:59Z",
+      "last_ts": "2026-07-28T02:53:03Z",
+      "first_date": "2026-07-28",
+      "last_date": "2026-07-28"
+    },
+    {
+      "mission_id": "review-1784949740-727afc",
+      "records": 10,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-25T03:22:20Z",
+      "last_ts": "2026-07-25T03:22:24Z",
+      "first_date": "2026-07-25",
+      "last_date": "2026-07-25"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1784864820-f2c9-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-24T03:47:00Z",
+      "last_ts": "2026-07-24T03:48:02Z",
+      "first_date": "2026-07-24",
+      "last_date": "2026-07-24"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1784809996-31f2-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-23T12:33:16Z",
+      "last_ts": "2026-07-23T12:33:56Z",
+      "first_date": "2026-07-23",
+      "last_date": "2026-07-23"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1784808704-1588e-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-23T12:11:44Z",
+      "last_ts": "2026-07-23T12:12:10Z",
+      "first_date": "2026-07-23",
+      "last_date": "2026-07-23"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1784808083-12e7b-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-23T12:01:23Z",
+      "last_ts": "2026-07-23T12:02:17Z",
+      "first_date": "2026-07-23",
+      "last_date": "2026-07-23"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1784808029-12b28-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-23T12:00:29Z",
+      "last_ts": "2026-07-23T12:00:47Z",
+      "first_date": "2026-07-23",
+      "last_date": "2026-07-23"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1784705852-930b-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-22T07:37:32Z",
+      "last_ts": "2026-07-22T07:37:44Z",
+      "first_date": "2026-07-22",
+      "last_date": "2026-07-22"
+    },
+    {
+      "mission_id": "sanity-swap-1784702803-8fd6ca",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-22T06:46:43Z",
+      "last_ts": "2026-07-22T06:46:49Z",
+      "first_date": "2026-07-22",
+      "last_date": "2026-07-22"
+    },
+    {
+      "mission_id": "sanity-review-shape-1784702742-76e0c1",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-22T06:45:42Z",
+      "last_ts": "2026-07-22T06:45:49Z",
+      "first_date": "2026-07-22",
+      "last_date": "2026-07-22"
+    },
+    {
+      "mission_id": "sanity-parallel-1784699884-009600",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-22T05:58:04Z",
+      "last_ts": "2026-07-22T05:58:11Z",
+      "first_date": "2026-07-22",
+      "last_date": "2026-07-22"
+    },
+    {
+      "mission_id": "dispatch-code-reviewer-1784655359-10f41-0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-21T17:36:00Z",
+      "last_ts": "2026-07-21T17:36:11Z",
+      "first_date": "2026-07-21",
+      "last_date": "2026-07-21"
+    },
+    {
+      "mission_id": "review-b31cfcb86b",
+      "records": 22,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-18T08:26:28Z",
+      "last_ts": "2026-07-18T17:10:08Z",
+      "first_date": "2026-07-18",
+      "last_date": "2026-07-18"
+    },
+    {
+      "mission_id": "smoke-test",
+      "records": 2,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-18T13:02:07Z",
+      "last_ts": "2026-07-18T13:02:07Z",
+      "first_date": "2026-07-18",
+      "last_date": "2026-07-18"
+    },
+    {
+      "mission_id": "review-96b3c8a3e4",
+      "records": 7,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-18T11:40:22Z",
+      "last_ts": "2026-07-18T11:46:55Z",
+      "first_date": "2026-07-18",
+      "last_date": "2026-07-18"
+    },
+    {
+      "mission_id": "review-1e47c34023",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-18T10:39:28Z",
+      "last_ts": "2026-07-18T11:35:36Z",
+      "first_date": "2026-07-18",
+      "last_date": "2026-07-18"
+    },
+    {
+      "mission_id": "review-3049b0d2ec",
+      "records": 10,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-18T08:22:17Z",
+      "last_ts": "2026-07-18T08:24:38Z",
+      "first_date": "2026-07-18",
+      "last_date": "2026-07-18"
+    },
+    {
+      "mission_id": "review-e027c8c9d8",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-18T06:29:35Z",
+      "last_ts": "2026-07-18T07:59:39Z",
+      "first_date": "2026-07-18",
+      "last_date": "2026-07-18"
+    },
+    {
+      "mission_id": "review-9a61067955",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-18T01:39:19Z",
+      "last_ts": "2026-07-18T01:56:51Z",
+      "first_date": "2026-07-18",
+      "last_date": "2026-07-18"
+    },
+    {
+      "mission_id": "review-2b657bf5e8",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-17T13:49:16Z",
+      "last_ts": "2026-07-17T13:51:30Z",
+      "first_date": "2026-07-17",
+      "last_date": "2026-07-17"
+    },
+    {
+      "mission_id": "review-e67df631ca",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-17T13:46:56Z",
+      "last_ts": "2026-07-17T13:47:00Z",
+      "first_date": "2026-07-17",
+      "last_date": "2026-07-17"
+    },
+    {
+      "mission_id": "review-6b4f936487",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T08:13:38Z",
+      "last_ts": "2026-07-17T11:27:24Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-17"
+    },
+    {
+      "mission_id": "review-34b6ae1d4f",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-17T11:20:47Z",
+      "last_ts": "2026-07-17T11:22:44Z",
+      "first_date": "2026-07-17",
+      "last_date": "2026-07-17"
+    },
+    {
+      "mission_id": "review-90abbf2b7f",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-17T08:58:22Z",
+      "last_ts": "2026-07-17T09:00:08Z",
+      "first_date": "2026-07-17",
+      "last_date": "2026-07-17"
+    },
+    {
+      "mission_id": "review-d4359dd341",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-17T08:56:37Z",
+      "last_ts": "2026-07-17T08:56:40Z",
+      "first_date": "2026-07-17",
+      "last_date": "2026-07-17"
+    },
+    {
+      "mission_id": "review-ab724725cd",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-17T08:55:08Z",
+      "last_ts": "2026-07-17T08:55:11Z",
+      "first_date": "2026-07-17",
+      "last_date": "2026-07-17"
+    },
+    {
+      "mission_id": "pr-review-kstrat2001-darkmux-ae2a3e8b4ea83be8249ce5ec9990e00e11d1aeea",
+      "records": 5,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T07:35:47Z",
+      "last_ts": "2026-07-16T07:35:47Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmprEsz7c-wt-1783880359",
+      "records": 3,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T07:35:45Z",
+      "last_ts": "2026-07-16T07:35:46Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "pr-review-kstrat2001-darkmux-98ec3688075937e18053e4f31fe274ed9be00e16",
+      "records": 5,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T07:35:46Z",
+      "last_ts": "2026-07-16T07:35:46Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpp0a2hW-wt-1783897982",
+      "records": 3,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T07:35:45Z",
+      "last_ts": "2026-07-16T07:35:45Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmplOI9d2-wt-1783880051",
+      "records": 3,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T07:35:45Z",
+      "last_ts": "2026-07-16T07:35:45Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpMobsRe-wt-1783880106",
+      "records": 3,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T07:35:43Z",
+      "last_ts": "2026-07-16T07:35:44Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpUVGIbJ-wt-1783880766",
+      "records": 3,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T07:35:44Z",
+      "last_ts": "2026-07-16T07:35:44Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpN1SPAI-wt-1783880130",
+      "records": 3,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T07:35:44Z",
+      "last_ts": "2026-07-16T07:35:44Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "p5-gate-coder-bc2206a259",
+      "records": 110,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T00:39:03Z",
+      "last_ts": "2026-07-16T07:35:04Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "p5-gate-coder-72deee644b",
+      "records": 5,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T00:38:27Z",
+      "last_ts": "2026-07-16T07:35:04Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "review-63ce440d2c",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T00:50:19Z",
+      "last_ts": "2026-07-16T01:07:28Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "review-5ddc545b04",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T00:48:24Z",
+      "last_ts": "2026-07-16T00:48:29Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "review-89f4276eba",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T00:47:33Z",
+      "last_ts": "2026-07-16T00:47:38Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "review-e7d4e5d8ec",
+      "records": 8,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-16T00:45:48Z",
+      "last_ts": "2026-07-16T00:45:53Z",
+      "first_date": "2026-07-16",
+      "last_date": "2026-07-16"
+    },
+    {
+      "mission_id": "future-kind",
+      "records": 1,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-07-15T05:20:08Z",
+      "last_ts": "2026-07-15T05:20:08Z",
+      "first_date": "2026-07-15",
+      "last_date": "2026-07-15"
+    },
+    {
+      "mission_id": "japan-trip-2026-05",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-07-15T05:19:55Z",
+      "last_ts": "2026-07-15T05:19:55Z",
+      "first_date": "2026-07-15",
+      "last_date": "2026-07-15"
+    },
+    {
+      "mission_id": "hydra",
+      "records": 1,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-07-15T05:19:55Z",
+      "last_ts": "2026-07-15T05:19:55Z",
+      "first_date": "2026-07-15",
+      "last_date": "2026-07-15"
+    },
+    {
+      "mission_id": "hydra-53f17099f2",
+      "records": 1,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-07-15T05:19:55Z",
+      "last_ts": "2026-07-15T05:19:55Z",
+      "first_date": "2026-07-15",
+      "last_date": "2026-07-15"
+    },
+    {
+      "mission_id": "draft-blog-post",
+      "records": 5,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-07-15T05:19:36Z",
+      "last_ts": "2026-07-15T05:19:37Z",
+      "first_date": "2026-07-15",
+      "last_date": "2026-07-15"
+    },
+    {
+      "mission_id": "unknown-kind-6e46dd10de",
+      "records": 1,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-07-15T04:51:53Z",
+      "last_ts": "2026-07-15T04:51:53Z",
+      "first_date": "2026-07-15",
+      "last_date": "2026-07-15"
+    },
+    {
+      "mission_id": "japan-6e46dd10de",
+      "records": 1,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-07-15T04:50:56Z",
+      "last_ts": "2026-07-15T04:50:56Z",
+      "first_date": "2026-07-15",
+      "last_date": "2026-07-15"
+    },
+    {
+      "mission_id": "draft-blog-post-6e46dd10de",
+      "records": 1,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-07-15T04:50:35Z",
+      "last_ts": "2026-07-15T04:50:35Z",
+      "first_date": "2026-07-15",
+      "last_date": "2026-07-15"
+    },
+    {
+      "mission_id": "smoke-test-6e46dd10de",
+      "records": 1,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-07-15T04:40:46Z",
+      "last_ts": "2026-07-15T04:40:46Z",
+      "first_date": "2026-07-15",
+      "last_date": "2026-07-15"
+    },
+    {
+      "mission_id": "pr-review-kstrat2001-darkmux-f91d72cf962da36597b24759851416fe6955867a",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-13T13:24:09Z",
+      "last_ts": "2026-07-13T13:24:10Z",
+      "first_date": "2026-07-13",
+      "last_date": "2026-07-13"
+    },
+    {
+      "mission_id": "pr-review-kstrat2001-darkmux-0a50ae80342fe2fa681ce293e58038d703caa1c0",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-13T11:21:24Z",
+      "last_ts": "2026-07-13T11:21:24Z",
+      "first_date": "2026-07-13",
+      "last_date": "2026-07-13"
+    },
+    {
+      "mission_id": "pr-review-kstrat2001-darkmux-8ae41076d84b24c5ef27e06a93a4ac5f1b82f9f8",
+      "records": 4,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-07-13T07:31:52Z",
+      "last_ts": "2026-07-13T07:31:52Z",
+      "first_date": "2026-07-13",
+      "last_date": "2026-07-13"
+    },
+    {
+      "mission_id": "doom-loop-m4",
+      "records": 1361,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-06-22T15:25:37Z",
+      "last_ts": "2026-06-22T17:27:24Z",
+      "first_date": "2026-06-22",
+      "last_date": "2026-06-22"
+    },
+    {
+      "mission_id": "cli-styling-rollout",
+      "records": 1719,
+      "dispatches": 6,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-06-11T06:01:43Z",
+      "last_ts": "2026-06-14T15:02:13Z",
+      "first_date": "2026-06-11",
+      "last_date": "2026-06-14"
+    },
+    {
+      "mission_id": "pre-1.0-compat-sweep",
+      "records": 294,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-06-07T07:10:35Z",
+      "last_ts": "2026-06-14T14:21:47Z",
+      "first_date": "2026-06-07",
+      "last_date": "2026-06-14"
+    },
+    {
+      "mission_id": "dispatch-boundary-hardening",
+      "records": 1705,
+      "dispatches": 3,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-06-14T05:01:48Z",
+      "last_ts": "2026-06-14T06:57:32Z",
+      "first_date": "2026-06-14",
+      "last_date": "2026-06-14"
+    },
+    {
+      "mission_id": "knk-1631-unified-permissions-catalog",
+      "records": 884,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-06-14T03:12:53Z",
+      "last_ts": "2026-06-14T03:32:34Z",
+      "first_date": "2026-06-14",
+      "last_date": "2026-06-14"
+    },
+    {
+      "mission_id": "cli-styling-foundation",
+      "records": 198,
+      "dispatches": 2,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-06-11T05:19:58Z",
+      "last_ts": "2026-06-14T02:16:19Z",
+      "first_date": "2026-06-11",
+      "last_date": "2026-06-14"
+    },
+    {
+      "mission_id": "vzi-5545-revoke-client-form-authoring",
+      "records": 205,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-06-12T15:46:47Z",
+      "last_ts": "2026-06-14T02:03:22Z",
+      "first_date": "2026-06-12",
+      "last_date": "2026-06-14"
+    },
+    {
+      "mission_id": "fix-apim-subscription-copy",
+      "records": 64,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-06-12T15:08:20Z",
+      "last_ts": "2026-06-14T02:03:22Z",
+      "first_date": "2026-06-12",
+      "last_date": "2026-06-14"
+    },
+    {
+      "mission_id": "kko-1576-submissions-retirement",
+      "records": 231,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-06-13T01:40:48Z",
+      "last_ts": "2026-06-14T02:03:22Z",
+      "first_date": "2026-06-13",
+      "last_date": "2026-06-14"
+    },
+    {
+      "mission_id": "756-live-diff",
+      "records": 818,
+      "dispatches": 1,
+      "machines": [
+        "MacBook-Pro"
+      ],
+      "first_ts": "2026-06-12T11:17:26Z",
+      "last_ts": "2026-06-12T11:46:29Z",
+      "first_date": "2026-06-12",
+      "last_date": "2026-06-12"
+    },
+    {
+      "mission_id": "darkmux-independence-runtime",
+      "records": 12,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-05-26T02:53:22Z",
+      "last_ts": "2026-05-26T04:38:49Z",
+      "first_date": "2026-05-26",
+      "last_date": "2026-05-26"
+    },
+    {
+      "mission_id": "cbdfvh-qg-lyrrqq-4320-10",
+      "records": 5,
+      "dispatches": 0,
+      "machines": [],
+      "first_ts": "2026-05-19T02:05:02Z",
+      "last_ts": "2026-05-19T02:23:55Z",
+      "first_date": "2026-05-19",
+      "last_date": "2026-05-19"
+    },
+    {
+      "mission_id": "test-mission",
+      "records": 1,
+      "dispatches": 0,
+      "machines": [
+        "MacBook-Pro.local"
+      ],
+      "first_ts": "2026-05-17T01:17:28Z",
+      "last_ts": "2026-05-17T01:17:28Z",
+      "first_date": "2026-05-17",
+      "last_date": "2026-05-17"
+    },
+    {
+      "mission_id": "smoke-mission",
+      "records": 1,
+      "dispatches": 0,
+      "machines": [],
+      "first_ts": "2026-05-16T15:40:31Z",
+      "last_ts": "2026-05-16T15:40:31Z",
+      "first_date": "2026-05-16",
+      "last_date": "2026-05-16"
+    }
+  ],
+  "generated_at_ms": 1786207255303
+}

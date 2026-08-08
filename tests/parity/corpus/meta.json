@@ -1,0 +1,305 @@
+{
+  "recorded_at_ms": 1786207254337,
+  "recorded_at_iso": "2026-08-08T16:40:54.337Z",
+  "daemon_url": "http://127.0.0.1:8765",
+  "daemon_health": {
+    "darkmux_version": "2.5.0",
+    "build": "2.5.0 (557e1b94)",
+    "binary_mtime": 1786189046,
+    "flow_schema_version": "1.18.0"
+  },
+  "captured_date": "2026-08-08",
+  "captured_prev_date": "2026-08-07",
+  "freeze_offset_ms": 5000,
+  "frozen_clock_ms": 1786207259337,
+  "endpoints": [
+    {
+      "name": "missions",
+      "path": "/missions",
+      "file": "missions.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": null,
+      "bytes": 47364,
+      "sanitized": {
+        "identifiers": 0,
+        "tickets": 4,
+        "shas": 20,
+        "ips": 0,
+        "prose": 94,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "phases",
+      "path": "/phases",
+      "file": "phases.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": null,
+      "bytes": 92420,
+      "sanitized": {
+        "identifiers": 0,
+        "tickets": 4,
+        "shas": 30,
+        "ips": 0,
+        "prose": 184,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "runs",
+      "path": "/runs",
+      "file": "runs.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": null,
+      "bytes": 80513,
+      "sanitized": {
+        "identifiers": 10,
+        "tickets": 2,
+        "shas": 5,
+        "ips": 0,
+        "prose": 0,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "flow-days",
+      "path": "/flow-days",
+      "file": "flow-days.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": null,
+      "bytes": 15839,
+      "sanitized": {
+        "identifiers": 1,
+        "tickets": 6,
+        "shas": 5,
+        "ips": 0,
+        "prose": 0,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "flow-missions",
+      "path": "/flow-missions",
+      "file": "flow-missions.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": null,
+      "bytes": 48971,
+      "sanitized": {
+        "identifiers": 1,
+        "tickets": 3,
+        "shas": 5,
+        "ips": 0,
+        "prose": 0,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "flow-today",
+      "path": "/flow/2026-08-08",
+      "file": "flow-today.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": {
+        "date": "2026-08-08"
+      },
+      "bytes": 582927,
+      "sanitized": {
+        "identifiers": 668,
+        "tickets": 0,
+        "shas": 0,
+        "ips": 0,
+        "prose": 20,
+        "paths": 74,
+        "uuids": 924,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "flow-yesterday",
+      "path": "/flow/2026-08-07",
+      "file": "flow-yesterday.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": {
+        "date": "2026-08-07"
+      },
+      "bytes": 1158191,
+      "sanitized": {
+        "identifiers": 341,
+        "tickets": 0,
+        "shas": 997,
+        "ips": 0,
+        "prose": 51,
+        "paths": 102,
+        "uuids": 1993,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "fleet-machines-live",
+      "path": "/fleet/machines/live",
+      "file": "fleet-machines-live.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": null,
+      "bytes": 344,
+      "sanitized": {
+        "identifiers": 0,
+        "tickets": 0,
+        "shas": 0,
+        "ips": 0,
+        "prose": 0,
+        "paths": 0,
+        "uuids": 2,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "fleet-sessions-live",
+      "path": "/fleet/sessions/live",
+      "file": "fleet-sessions-live.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": null,
+      "bytes": 3,
+      "sanitized": {
+        "identifiers": 0,
+        "tickets": 0,
+        "shas": 0,
+        "ips": 0,
+        "prose": 0,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "machine-resources",
+      "path": "/machine/resources",
+      "file": "machine-resources.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": null,
+      "bytes": 1512,
+      "sanitized": {
+        "identifiers": 0,
+        "tickets": 0,
+        "shas": 0,
+        "ips": 0,
+        "prose": 1,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "machine-specs",
+      "path": "/machine/specs",
+      "file": "machine-specs.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": null,
+      "bytes": 841,
+      "sanitized": {
+        "identifiers": 0,
+        "tickets": 0,
+        "shas": 0,
+        "ips": 1,
+        "prose": 0,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "panel-mission-status",
+      "path": "/panel/mission-status",
+      "file": "panel-mission-status.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": null,
+      "bytes": 2495,
+      "sanitized": {
+        "identifiers": 3,
+        "tickets": 0,
+        "shas": 0,
+        "ips": 1,
+        "prose": 1,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "lab-runs",
+      "path": "/lab/runs",
+      "file": "lab-runs.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": {
+        "reason": "runs lens fetches this alongside /runs on every entry"
+      },
+      "bytes": 56925,
+      "sanitized": {
+        "identifiers": 229,
+        "tickets": 0,
+        "shas": 0,
+        "ips": 0,
+        "prose": 5,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "flow-session-task-list",
+      "path": "/flow-session/task-list",
+      "file": "flow-session-task-list.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": {
+        "reason": "#session=<id> deep-link golden target; task-list chosen because it carries no client identifiers, sidestepping URL-encoding of a sanitized compound id"
+      },
+      "bytes": 22025,
+      "sanitized": {
+        "identifiers": 0,
+        "tickets": 0,
+        "shas": 0,
+        "ips": 0,
+        "prose": 0,
+        "paths": 0,
+        "uuids": 48,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    }
+  ]
+}
