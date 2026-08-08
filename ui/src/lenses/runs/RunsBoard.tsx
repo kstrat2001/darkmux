@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
+import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import type { RunsResponse, LabRunsResponse, LabRun } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
@@ -53,6 +54,16 @@ import {
  * visible one-line `.labnotice` naming the gap and pointing at the classic
  * viewer, per the operator-authored posture (a stuck feature gets a visible
  * placeholder, not just a code comment nobody but a future dev will read).
+ *
+ * Hash write-back (Packet 1.5): a kind-chip click changes no `Route` (no
+ * `hashchange` fires — this is purely local state), so `App`'s route-keyed
+ * `useSyncHash` effect (`lib/hashSync.ts`) would never see it. `selectKind`
+ * therefore calls `writeHash`/`canonicalHash` DIRECTLY, at the moment of the
+ * click, constructing the same `{kind:"runs", runsKind:k}` shape the route
+ * parser would have produced had the operator arrived via a `kind=`
+ * deep-link — so the address bar always names the filter actually on
+ * screen, matching legacy's `setRunsKind`'s own `render()` (which calls
+ * `syncLabHash` every time, chip clicks included).
  */
 const NOT_PORTED_NOTICE = "run detail isn't in /next yet — open it in the classic viewer at /";
 
@@ -105,6 +116,7 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
     setShowAll(false);
     setRowClickNotice(null);
     if (k !== "lab") setSeries(false);
+    writeHash(canonicalHash({ kind: "runs", runsKind: k, run: null }));
   }
 
   // viewer.html: `labSourceNotice()`.
