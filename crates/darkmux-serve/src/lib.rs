@@ -1491,8 +1491,13 @@ async fn missions_handler() -> axum::Json<serde_json::Value> {
 async fn runs_handler(State(state): State<AppState>) -> axum::Json<serde_json::Value> {
     let flows_dir = state.flows_dir.clone();
     let lab_dir = state.lab_dir.clone();
-    let result = tokio::task::spawn_blocking(move || runs::build_runs(&flows_dir, lab_dir.as_deref()))
-        .await;
+    // (#1705) One blocking task: read the fleet stream, then build every
+    // row against local + fleet together.
+    let result = tokio::task::spawn_blocking(move || {
+        let fleet = fleet_flow_records();
+        runs::build_runs(&flows_dir, lab_dir.as_deref(), &fleet)
+    })
+    .await;
     let runs = result.unwrap_or_default();
     axum::Json(serde_json::json!({
         "runs": runs,
@@ -2782,16 +2787,38 @@ pub(crate) fn for_each_flow_record_across_days(
 /// "replay the mission" instead of hunting through days (#691). Disk-backed.
 async fn flow_missions_handler(State(state): State<AppState>) -> impl IntoResponse {
     let dir = state.flows_dir.clone();
-    let missions = tokio::task::spawn_blocking(move || scan_flow_missions(&dir))
-        .await
-        .unwrap_or_default();
+    // (#1705) The fleet read happens INSIDE the same blocking task as the
+    // day-file walk — one `spawn_blocking`, not two round trips.
+    let missions = tokio::task::spawn_blocking(move || {
+        let fleet = fleet_flow_records();
+        scan_flow_missions(&dir, &fleet)
+    })
+    .await
+    .unwrap_or_default();
     axum::Json(serde_json::json!({
         "missions": missions,
         "generated_at_ms": current_millis(),
     }))
 }
 
-fn scan_flow_missions(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
+/// Roll every flow record up per `mission_id`, across the local day-files
+/// AND the fleet stream (#1705).
+///
+/// Before #1705 this walked only `flows_dir` — which by construction holds
+/// nothing but THIS machine's work, so every mission executing anywhere
+/// else in the fleet was absent from the missions lens while its records
+/// sat in the daemon's own reach. `fleet` supplies the peers' half; the
+/// local walk stays authoritative for this machine and for history older
+/// than the stream's `MAXLEN` cap.
+///
+/// `fleet` is applied FIRST and its records win the de-dup, matching
+/// `union_flow_records`' precedence — this machine's own records land in
+/// both sinks, so without the shared [`flow_record_identity`] key every
+/// local dispatch would be counted twice.
+fn scan_flow_missions(
+    flows_dir: &std::path::Path,
+    fleet: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
     use std::collections::{BTreeSet, HashMap};
     struct Agg {
         records: u64,
@@ -2803,12 +2830,14 @@ fn scan_flow_missions(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
         last_date: String,
     }
     let mut by_mission: HashMap<String, Agg> = HashMap::new();
-    for_each_flow_record_across_days(flows_dir, |date, v| {
+
+    // The per-record fold, shared by both sources so they cannot drift.
+    let fold = |by_mission: &mut HashMap<String, Agg>, date: &str, v: &serde_json::Value| {
         let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) else {
-            return std::ops::ControlFlow::Continue(());
+            return;
         };
         if mid.is_empty() {
-            return std::ops::ControlFlow::Continue(());
+            return;
         }
         let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
         let e = by_mission.entry(mid.to_string()).or_insert_with(|| Agg {
@@ -2846,8 +2875,32 @@ fn scan_flow_missions(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
                 e.machines.insert(mach.to_string());
             }
         }
+    };
+
+    // Fleet first — its records win the de-dup (see this function's doc).
+    let mut fleet_seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(fleet.len());
+    for v in fleet {
+        // A fleet record carries no day-file to name it, so its date comes
+        // from its own `ts` (`YYYY-MM-DD` prefix of an ISO-8601 UTC stamp).
+        let date = v
+            .get("ts")
+            .and_then(|t| t.as_str())
+            .map(|t| t.chars().take(10).collect::<String>())
+            .unwrap_or_default();
+        fleet_seen.insert(flow_record_identity(v));
+        fold(&mut by_mission, &date, v);
+    }
+    // Then the local day-files, skipping anything the fleet already
+    // supplied — this machine's own records are written to BOTH sinks.
+    for_each_flow_record_across_days(flows_dir, |date, v| {
+        if !fleet_seen.is_empty() && fleet_seen.contains(&flow_record_identity(v)) {
+            return std::ops::ControlFlow::Continue(());
+        }
+        fold(&mut by_mission, date, v);
         std::ops::ControlFlow::Continue(())
     });
+
     let mut out: Vec<serde_json::Value> = by_mission
         .into_iter()
         .map(|(mid, a)| {
@@ -2978,7 +3031,7 @@ async fn aggregate_flow_records_for_date(
     let date_owned = date.to_string();
     let url_owned = url.clone();
     let redis_task = tokio::task::spawn_blocking(move || {
-        read_flow_records_from_redis(url_owned.expose_for_probe(), &date_owned)
+        read_flow_records_from_redis(url_owned.expose_for_probe(), Some(&date_owned))
     });
     let (redis_result, local_records) = tokio::join!(redis_task, read_flow_records_from_file(date, flows_dir));
 
@@ -3026,25 +3079,97 @@ fn union_flow_records(
     redis_records: Vec<serde_json::Value>,
     local_records: Vec<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
-    fn key(r: &serde_json::Value) -> String {
-        let f = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        [
-            f("ts"),
-            f("machine_uid"),
-            f("session_id"),
-            f("action"),
-            f("source"),
-            f("handle"),
-            f("level"),
-            f("stage"),
-            r.get("payload").map(|p| p.to_string()).unwrap_or_default(),
-        ]
-        .join("\u{1f}")
-    }
-    let seen: std::collections::HashSet<String> = redis_records.iter().map(key).collect();
+    let seen: std::collections::HashSet<String> =
+        redis_records.iter().map(flow_record_identity).collect();
     let mut out = redis_records;
-    out.extend(local_records.into_iter().filter(|r| !seen.contains(&key(r))));
+    out.extend(local_records.into_iter().filter(|r| !seen.contains(&flow_record_identity(r))));
     out
+}
+
+/// The de-duplication key for one flow record, used wherever the fleet
+/// stream and the local day-files are merged.
+///
+/// `pub(crate)` since #1705: the fleet-wide aggregations (`/flow-missions`,
+/// `runs::build_runs`) merge the same two sources `union_flow_records`
+/// does, but stream the local side from disk instead of materializing it,
+/// so they need the KEY without the Vec-shaped union. One definition —
+/// two sources disagreeing about what "the same record" means would
+/// double-count this machine's own work, which lands in BOTH sinks.
+pub(crate) fn flow_record_identity(r: &serde_json::Value) -> String {
+    let f = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    [
+        f("ts"),
+        f("machine_uid"),
+        f("session_id"),
+        f("action"),
+        f("source"),
+        f("handle"),
+        f("level"),
+        f("stage"),
+        r.get("payload").map(|p| p.to_string()).unwrap_or_default(),
+    ]
+    .join("\u{1f}")
+}
+
+/// Every record the FLEET stream currently holds (#1705) — the peers' work
+/// this machine can see but never wrote to its own `flows/` directory.
+///
+/// Blocking (sync `redis::Client`, same as the per-date read); every caller
+/// is already inside `spawn_blocking`. Returns EMPTY — never an error — when
+/// Redis is unconfigured, unreachable, or malformed: a degraded fleet view
+/// must degrade to local-only, exactly as `aggregate_flow_records_for_date`
+/// already does for `GET /flow/:date`. Bounded by the same `XREVRANGE …
+/// COUNT 10000` cap as every other read of this stream.
+/// The cached fleet snapshot: when it was read, and what it held.
+type FleetCache = Option<(std::time::Instant, Vec<serde_json::Value>)>;
+
+pub(crate) fn fleet_flow_records() -> Vec<serde_json::Value> {
+    // (#1705) Short-TTL shared cache. The read costs ~344ms over a tailnet
+    // (measured: `XREVRANGE … COUNT 10000` against the hub), and the viewer
+    // polls `/runs` and `/flow-missions` on a timer — so without this the
+    // fleet half would tax every poll of every lens separately. #1570 made
+    // exactly this argument for `GET /flow/:date` and solved it by
+    // concurrency; these two aggregations fold the fleet records BEFORE
+    // walking the local day-files (the de-dup needs them first), so they
+    // amortize instead.
+    //
+    // The TTL is a NAMED CONSTANT, not an adaptive guess — a sampling
+    // cadence that tunes itself silently is unauditable (the observability
+    // doctrine's "cadence is a recorded knob"). 2s is well under any
+    // human-perceptible staleness in a lens that renders whole missions,
+    // and well over the poll interval it is protecting.
+    const FLEET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+    static FLEET_CACHE: std::sync::OnceLock<std::sync::Mutex<FleetCache>> =
+        std::sync::OnceLock::new();
+    let cache = FLEET_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((at, records)) = guard.as_ref() {
+            if at.elapsed() < FLEET_CACHE_TTL {
+                return records.clone();
+            }
+        }
+    }
+
+    let Some(url) = darkmux_flow::redis_url() else {
+        return Vec::new();
+    };
+    match read_flow_records_from_redis(url.expose_for_probe(), None) {
+        Ok(records) => {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = Some((std::time::Instant::now(), records.clone()));
+            }
+            records
+        }
+        Err(e) => {
+            // Never interpolate the url (#661 Slice 5) — it can carry an
+            // inline password.
+            eprintln!(
+                "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
+                 serving this machine's records only"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// (#1570) Apply the per-command response deadline to a freshly obtained
@@ -3063,19 +3188,23 @@ fn bound_redis_response(conn: &redis::Connection) {
 
 fn read_flow_records_from_redis(
     url: &str,
-    date: &str,
+    date: Option<&str>,
 ) -> Result<Vec<serde_json::Value>, anyhow::Error> {
     use anyhow::Context;
+    // `None` = the WHOLE capped stream, no date filter (#1705): the
+    // fleet-wide aggregations (`/flow-missions`, `/runs`) are not
+    // day-scoped, so they cannot use the per-date read.
+    let date_label = date.unwrap_or("all");
     // NOTE: never interpolate `url` into a log/error — it may carry an inline
     // password (the env-URL tier). Use the non-secret `{date}` for context.
     // (#661 Slice 5 — sealing a pre-existing raw-URL log the audit flagged.)
     let client = redis::Client::open(url)
-        .with_context(|| format!("opening Redis client for /flow aggregation (date {date})"))?;
+        .with_context(|| format!("opening Redis client for /flow aggregation (date {date_label})"))?;
     // Bounded by REDIS_CONNECT_TIMEOUT (#278) — Studio-offline scenarios
     // must not wedge the HTTP handler thread for the OS default 75s.
     let mut conn = client
         .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
-        .with_context(|| format!("connecting to Redis for /flow aggregation (date {date})"))?;
+        .with_context(|| format!("connecting to Redis for /flow aggregation (date {date_label})"))?;
     // (#1570) The connect above is bounded; the XREVRANGE below was not. This
     // is the exact read that took 30s and 408'd the viewer.
     bound_redis_response(&conn);
@@ -3117,8 +3246,10 @@ fn read_flow_records_from_redis(
             _ => continue,
         };
         let Some(json) = extract_record_field(fields) else { continue };
-        if !record_ts_matches_date(json, date) {
-            continue;
+        if let Some(date) = date {
+            if !record_ts_matches_date(json, date) {
+                continue;
+            }
         }
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
             continue;

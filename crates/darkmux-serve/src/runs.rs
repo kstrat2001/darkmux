@@ -165,8 +165,18 @@ pub(crate) struct Run {
 /// source: `load_missions`/`load_phases` degrade to empty via
 /// `unwrap_or_default` (matching `missions_handler`'s own posture), and
 /// `crate::scan_lab_runs` is already resilient (best-effort scan, #1247).
-pub(crate) fn build_runs(flows_dir: &StdPath, lab_dir: Option<&StdPath>) -> Vec<Run> {
-    let flow_index = build_flow_session_index(flows_dir);
+pub(crate) fn build_runs(
+    flows_dir: &StdPath,
+    lab_dir: Option<&StdPath>,
+    fleet: &[serde_json::Value],
+) -> Vec<Run> {
+    let flow_index = build_flow_session_index(flows_dir, fleet);
+    // (#1705) Mission-level rollup over the SAME merged record set. A
+    // mission owned by another machine has no durable record here — its
+    // `Mission` JSON lives on the machine that ran it — so without this it
+    // could only ever appear as a scatter of per-session ghosts. One
+    // review = one row, wherever it ran.
+    let flow_missions = build_flow_mission_index(flows_dir, fleet);
     // (#1523 gate CONSIDER 2) Pre-group flow sessions by `mission_id` ONCE
     // — an O(sessions) pass — rather than filtering the whole `flow_index`
     // per mission (O(missions × sessions), the shape a Studio-scale flow
@@ -231,9 +241,158 @@ pub(crate) fn build_runs(flows_dir: &StdPath, lab_dir: Option<&StdPath>) -> Vec<
         }
     }
 
-    runs.extend(ghost_runs(&flow_index, &known_mission_ids, &known_session_ids, now_ms));
+    // (#1705) Missions seen only in the record stream — i.e. executing on a
+    // peer. Emitted BEFORE ghosts so their sessions are claimed and don't
+    // also surface as loose dispatch rows.
+    let mut remote_mission_ids: HashSet<String> = HashSet::new();
+    for (mission_id, agg) in &flow_missions {
+        if known_mission_ids.contains(mission_id) {
+            continue;
+        }
+        remote_mission_ids.insert(mission_id.clone());
+        runs.push(flow_mission_to_run(mission_id, agg, &flow_index, now_ms));
+    }
+
+    runs.extend(ghost_runs(
+        &flow_index,
+        &known_mission_ids,
+        &known_session_ids,
+        &remote_mission_ids,
+        now_ms,
+    ));
 
     runs
+}
+
+/// Per-`mission_id` rollup over the merged record stream (#1705) — the
+/// substrate for missions this daemon can SEE but does not OWN.
+///
+/// A mission's durable `Mission`/`Phase`/`Task`/`Step` JSON lives on the
+/// machine that ran it, so a peer's mission is invisible to
+/// `load_missions()` here no matter how much of its work crosses the flow
+/// stream. This index is deliberately thin: identity, machine, span, and
+/// whether a terminal mission-lifecycle record was seen. Everything richer
+/// (the task graph, per-step config) genuinely is not available off-machine,
+/// and inventing it would be worse than omitting it.
+#[derive(Debug, Default, Clone)]
+struct FlowMissionAgg {
+    machine: Option<String>,
+    first_ts: Option<String>,
+    last_ts: Option<String>,
+    /// A `mission close` / `mission finalize` lifecycle record was seen —
+    /// the only honest completion signal for work this machine did not run.
+    closed_ts: Option<String>,
+    /// Session ids observed under this mission, used to borrow role/model/
+    /// endpoint for the row without a second pass.
+    session_ids: Vec<String>,
+}
+
+fn build_flow_mission_index(
+    flows_dir: &StdPath,
+    fleet: &[serde_json::Value],
+) -> HashMap<String, FlowMissionAgg> {
+    let mut idx: HashMap<String, FlowMissionAgg> = HashMap::new();
+    let fleet_seen: std::collections::HashSet<String> =
+        fleet.iter().map(crate::flow_record_identity).collect();
+
+    let fold = |idx: &mut HashMap<String, FlowMissionAgg>, v: &serde_json::Value| {
+        let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) else {
+            return;
+        };
+        if mid.is_empty() {
+            return;
+        }
+        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+        let agg = idx.entry(mid.to_string()).or_default();
+        if agg.machine.is_none() {
+            if let Some(m) = v.get("machine_id").and_then(|m| m.as_str()) {
+                if !m.is_empty() {
+                    agg.machine = Some(m.to_string());
+                }
+            }
+        }
+        if !ts.is_empty() {
+            if agg.first_ts.as_deref().map(|cur| ts < cur).unwrap_or(true) {
+                agg.first_ts = Some(ts.to_string());
+            }
+            if agg.last_ts.as_deref().map(|cur| ts > cur).unwrap_or(true) {
+                agg.last_ts = Some(ts.to_string());
+            }
+        }
+        let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        if matches!(action, "mission close" | "mission finalize" | "mission abort") && agg.closed_ts.is_none() {
+            agg.closed_ts = Some(ts.to_string());
+        }
+        if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+            if !sid.is_empty() && !agg.session_ids.iter().any(|s| s == sid) {
+                agg.session_ids.push(sid.to_string());
+            }
+        }
+    };
+
+    for v in fleet {
+        fold(&mut idx, v);
+    }
+    for_each_recent_flow_record(flows_dir, |v| {
+        if !fleet_seen.is_empty() && fleet_seen.contains(&crate::flow_record_identity(v)) {
+            return std::ops::ControlFlow::Continue(());
+        }
+        fold(&mut idx, v);
+        std::ops::ControlFlow::Continue(())
+    });
+    idx
+}
+
+/// One [`Run`] for a mission this daemon observed but does not own (#1705).
+///
+/// `tracked: false` is the honest flag: there is no durable run record on
+/// THIS machine backing it. That is the same claim ghost rows make, and it
+/// is what lets the viewer distinguish "I have the mission" from "I can see
+/// the mission."
+///
+/// Status is deliberately conservative. A terminal mission-lifecycle record
+/// means Complete. Otherwise the row is Running only while its sessions
+/// still look live by the SAME `session_is_live` staleness rule every other
+/// row obeys — a peer that goes to sleep mid-mission must not leave a row
+/// claiming to be running forever.
+fn flow_mission_to_run(
+    mission_id: &str,
+    agg: &FlowMissionAgg,
+    flow_index: &HashMap<String, SessionAgg>,
+    now_ms: u64,
+) -> Run {
+    let sessions: Vec<&SessionAgg> =
+        agg.session_ids.iter().filter_map(|s| flow_index.get(s)).collect();
+    let any_live = sessions.iter().any(|s| session_is_live(s, now_ms));
+    let status = if agg.closed_ts.is_some() {
+        RunStatus::Complete
+    } else if any_live {
+        RunStatus::Running
+    } else {
+        RunStatus::Abandoned
+    };
+    // Borrow route/model from whichever session first resolved one — a
+    // mission-level row has no endpoint of its own, and showing the seat's
+    // is more informative than showing nothing.
+    let route = sessions.iter().find_map(|s| s.endpoint.clone());
+    let model = sessions.iter().find_map(|s| s.model.clone());
+    Run {
+        id: mission_id.to_string(),
+        kind: RunKind::Mission,
+        status,
+        machine: agg.machine.clone(),
+        route,
+        role: None,
+        model,
+        started_ts: agg.first_ts.as_deref().and_then(parse_flow_ts),
+        completed_ts: agg.closed_ts.as_deref().and_then(parse_flow_ts),
+        updated_ts: agg
+            .closed_ts
+            .as_deref()
+            .or(agg.last_ts.as_deref())
+            .and_then(parse_flow_ts),
+        tracked: false,
+    }
 }
 
 // ─── Mission / dispatch normalization ──────────────────────────────────────
@@ -721,14 +880,24 @@ struct SessionAgg {
 
 /// One pass over every flow record within [`RUNS_FLOW_SCAN_WINDOW_DAYS`],
 /// building a per-`session_id` rollup.
-fn build_flow_session_index(flows_dir: &StdPath) -> HashMap<String, SessionAgg> {
+fn build_flow_session_index(
+    flows_dir: &StdPath,
+    fleet: &[serde_json::Value],
+) -> HashMap<String, SessionAgg> {
     let mut idx: HashMap<String, SessionAgg> = HashMap::new();
-    for_each_recent_flow_record(flows_dir, |v| {
+
+    // (#1705) Fleet first, then the local day-files minus anything the
+    // fleet already supplied — this machine's records land in BOTH sinks,
+    // so the shared identity key is what keeps one dispatch from being
+    // folded twice. Same precedence as `union_flow_records`.
+    let fleet_seen: std::collections::HashSet<String> =
+        fleet.iter().map(crate::flow_record_identity).collect();
+    let fold = |idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Value| {
         let Some(session_id) = v.get("session_id").and_then(|s| s.as_str()) else {
-            return std::ops::ControlFlow::Continue(());
+            return;
         };
         if session_id.is_empty() {
-            return std::ops::ControlFlow::Continue(());
+            return;
         }
         let agg = idx.entry(session_id.to_string()).or_default();
 
@@ -808,7 +977,16 @@ fn build_flow_session_index(flows_dir: &StdPath) -> HashMap<String, SessionAgg> 
                 agg.terminal_ts = Some(ts.to_string());
             }
         }
+    };
 
+    for v in fleet {
+        fold(&mut idx, v);
+    }
+    for_each_recent_flow_record(flows_dir, |v| {
+        if !fleet_seen.is_empty() && fleet_seen.contains(&crate::flow_record_identity(v)) {
+            return std::ops::ControlFlow::Continue(());
+        }
+        fold(&mut idx, v);
         std::ops::ControlFlow::Continue(())
     });
     idx
@@ -877,6 +1055,7 @@ fn ghost_runs(
     flow_index: &HashMap<String, SessionAgg>,
     known_mission_ids: &HashSet<String>,
     known_session_ids: &HashSet<String>,
+    remote_mission_ids: &HashSet<String>,
     now_ms: u64,
 ) -> Vec<Run> {
     let mut out = Vec::new();
@@ -889,6 +1068,10 @@ fn ghost_runs(
         }
         if let Some(mid) = &agg.mission_id {
             if known_mission_ids.contains(mid) {
+                continue;
+            }
+            // (#1705) Already represented by its own remote-mission row.
+            if remote_mission_ids.contains(mid) {
                 continue;
             }
         }
@@ -1672,7 +1855,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path());
+        let idx = build_flow_session_index(tmp.path(), &[]);
         let agg = idx.get("sess-1").expect("session indexed");
         assert_eq!(agg.endpoint.as_deref(), Some("azure:host/gpt-4o"));
         assert_eq!(agg.terminal_status, Some(RunStatus::Complete));
@@ -1699,7 +1882,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path());
+        let idx = build_flow_session_index(tmp.path(), &[]);
         assert_eq!(idx["sess-2"].terminal_status, Some(RunStatus::Abandoned));
     }
 
@@ -1719,7 +1902,7 @@ mod tests {
                 "handle": "coder",
             })],
         );
-        let idx = build_flow_session_index(tmp.path());
+        let idx = build_flow_session_index(tmp.path(), &[]);
         assert!(
             !idx.contains_key("ancient-orphan-sess"),
             "a session older than the scan window must never be indexed at all"
@@ -1752,7 +1935,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path());
+        let idx = build_flow_session_index(tmp.path(), &[]);
         let agg = idx.get("ticking-sess").expect("session indexed");
         assert_eq!(
             agg.last_activity_ts.as_deref(),
@@ -1797,7 +1980,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path());
+        let idx = build_flow_session_index(tmp.path(), &[]);
         let agg = idx.get("outoforder-sess").expect("session indexed");
         assert_eq!(
             agg.last_activity_ts.as_deref(),
@@ -1867,7 +2050,7 @@ mod tests {
         );
         let mut known_missions = HashSet::new();
         known_missions.insert("real-mission-1".to_string());
-        let ghosts = ghost_runs(&idx, &known_missions, &HashSet::new(), now_unix() * 1_000);
+        let ghosts = ghost_runs(&idx, &known_missions, &HashSet::new(), &HashSet::new(), now_unix() * 1_000);
         assert!(ghosts.is_empty(), "a session covered by a loaded mission must not double-list");
     }
 
@@ -1883,7 +2066,7 @@ mod tests {
         );
         let mut known_sessions = HashSet::new();
         known_sessions.insert("crew-dispatch-coder-abc".to_string());
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &known_sessions, now_unix() * 1_000);
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &known_sessions, &HashSet::new(), now_unix() * 1_000);
         assert!(ghosts.is_empty());
     }
 
@@ -1905,7 +2088,7 @@ mod tests {
         // Judged at exactly the session's own activity instant — idle 0,
         // unambiguously live.
         let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), now_ms);
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
         assert_eq!(ghosts.len(), 1);
         let g = &ghosts[0];
         assert_eq!(g.id, "orphan-sess");
@@ -1922,7 +2105,7 @@ mod tests {
             "no-start-sess".to_string(),
             SessionAgg { has_start: false, ..Default::default() },
         );
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), now_unix() * 1_000);
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_unix() * 1_000);
         assert!(ghosts.is_empty());
     }
 
@@ -1945,13 +2128,13 @@ mod tests {
 
         // Just inside the budget: still live.
         let inside_ms = base_ms + stale_after_ms() - 1_000;
-        let fresh = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), inside_ms);
+        let fresh = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), inside_ms);
         assert_eq!(fresh[0].status, RunStatus::Running, "no terminal + recent activity must read live");
 
         // Past the budget: the trail stops, and that is evidence of
         // abandonment — the #1642/#1633 defect this test guards.
         let outside_ms = base_ms + stale_after_ms() + 1_000;
-        let stale = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), outside_ms);
+        let stale = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), outside_ms);
         assert_eq!(
             stale[0].status,
             RunStatus::Abandoned,
@@ -1974,7 +2157,7 @@ mod tests {
             },
         );
         let far_future_ms = (now_unix() + 999_999_999) * 1_000;
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), far_future_ms);
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), far_future_ms);
         assert_eq!(ghosts[0].status, RunStatus::Complete, "a terminal verdict must never decay into Abandoned");
     }
 
@@ -2022,7 +2205,7 @@ mod tests {
         ] {
             assert_eq!(lab_run_status(&lab_summary, now_ms), want, "lab disagreed {label}");
             assert_eq!(mission_run_status(&mission, &[&session], now_ms), want, "mission disagreed {label}");
-            let ghosts = ghost_runs(&ghost_idx, &HashSet::new(), &HashSet::new(), now_ms);
+            let ghosts = ghost_runs(&ghost_idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
             assert_eq!(ghosts[0].status, want, "ghost disagreed {label}");
         }
     }
@@ -2091,7 +2274,7 @@ mod tests {
             ],
         );
 
-        let runs = build_runs(flows.path(), None);
+        let runs = build_runs(flows.path(), None, &[]);
         assert_eq!(runs.len(), 1, "exactly one Run — the tracked mission, no ghost duplicate: {runs:?}");
         assert_eq!(runs[0].id, "dispatch-coder-1");
         assert_eq!(runs[0].kind, RunKind::Dispatch);
@@ -2149,7 +2332,7 @@ mod tests {
             ],
         );
 
-        let runs = build_runs(flows.path(), None);
+        let runs = build_runs(flows.path(), None, &[]);
         assert_eq!(runs.len(), 1, "exactly one Run for the generic-config mission, no per-step ghost: {runs:?}");
         assert_eq!(runs[0].id, "generic-config-1");
         assert_eq!(runs[0].kind, RunKind::Mission);
@@ -2203,7 +2386,7 @@ mod tests {
             ],
         );
 
-        let runs = build_runs(flows.path(), None);
+        let runs = build_runs(flows.path(), None, &[]);
         assert_eq!(
             runs.len(),
             1,
@@ -2259,7 +2442,7 @@ mod tests {
             ],
         );
 
-        let runs = build_runs(flows.path(), None);
+        let runs = build_runs(flows.path(), None, &[]);
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].status, RunStatus::Abandoned, "a crashed session must not read as eternal Running");
     }
@@ -2309,7 +2492,7 @@ mod tests {
             ],
         );
 
-        let runs = build_runs(flows.path(), None);
+        let runs = build_runs(flows.path(), None, &[]);
         assert_eq!(runs.len(), 2, "{runs:?}");
         let tracked = runs.iter().find(|r| r.id == "dispatch-coder-2").expect("tracked run present");
         assert!(tracked.tracked);
@@ -2319,5 +2502,115 @@ mod tests {
             .expect("ghost run present");
         assert!(!ghost.tracked);
         assert_eq!(ghost.status, RunStatus::Running);
+    }
+
+    // ── #1705: the fleet half — records this machine never wrote ─────────
+
+    /// A record shaped like one a PEER emitted: it exists only in the fleet
+    /// stream, never in this machine's day-files.
+    fn peer_record(action: &str, ts: &str) -> serde_json::Value {
+        serde_json::json!({
+            "ts": ts,
+            "level": "info",
+            "category": "work",
+            "stage": "dispatch",
+            "action": action,
+            "handle": "azure-review",
+            "session_id": "peer-session-1",
+            "source": "review",
+            "model": "gpt-4o",
+            "mission_id": "review-on-the-hub",
+            "machine_id": "m1-max-32gb-studio",
+            "machine_uid": "PEER-UID-1",
+        })
+    }
+
+    #[test]
+    fn a_peers_mission_becomes_one_run_row_from_the_fleet_stream() {
+        let flows = TempDir::new().unwrap(); // deliberately EMPTY: the peer's
+        // records were never written to this machine's flows dir.
+        let fleet = vec![
+            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch complete", &darkmux_flow::ts_utc_now()),
+        ];
+        let runs = build_runs(flows.path(), None, &fleet);
+        let row = runs
+            .iter()
+            .find(|r| r.id == "review-on-the-hub")
+            .expect("a mission seen only in the fleet stream must still produce a run row");
+        assert_eq!(row.kind, RunKind::Mission, "one row per mission, not one per session");
+        assert!(!row.tracked, "this machine has no durable record of a peer's mission");
+        assert_eq!(row.machine.as_deref(), Some("m1-max-32gb-studio"));
+        assert_eq!(row.model.as_deref(), Some("gpt-4o"), "route/model borrowed from its sessions");
+        // and NOT also a loose per-session ghost for the same work
+        assert!(
+            !runs.iter().any(|r| r.id == "peer-session-1"),
+            "the peer's session is represented by its mission row, not duplicated as a ghost"
+        );
+    }
+
+    /// The inverted case. Without it, the test above would pass just as
+    /// happily if `build_runs` fabricated rows from somewhere other than the
+    /// fleet input — the assertion would be measuring nothing.
+    #[test]
+    fn with_no_fleet_records_there_is_no_peer_row() {
+        let flows = TempDir::new().unwrap();
+        let runs = build_runs(flows.path(), None, &[]);
+        assert!(
+            !runs.iter().any(|r| r.id == "review-on-the-hub"),
+            "the peer row must come from the fleet stream, not from thin air"
+        );
+    }
+
+    #[test]
+    fn a_closed_peer_mission_reads_complete_not_running() {
+        let flows = TempDir::new().unwrap();
+        let fleet = vec![
+            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
+            serde_json::json!({
+                "ts": darkmux_flow::ts_utc_now(),
+                "action": "mission close",
+                "source": "mission_lifecycle",
+                "session_id": "mission-review-on-the-hub",
+                "mission_id": "review-on-the-hub",
+                "machine_id": "m1-max-32gb-studio",
+            }),
+        ];
+        let runs = build_runs(flows.path(), None, &fleet);
+        let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert_eq!(row.status, RunStatus::Complete);
+        assert!(row.completed_ts.is_some(), "a closed mission carries its completion stamp");
+    }
+
+    /// A peer that fell asleep mid-mission must not leave a row claiming to
+    /// be running forever — the same staleness rule every other row obeys.
+    #[test]
+    fn a_stale_unclosed_peer_mission_is_abandoned_not_running() {
+        let flows = TempDir::new().unwrap();
+        let fleet = vec![peer_record("dispatch start", "2020-01-01T00:00:00Z")];
+        let runs = build_runs(flows.path(), None, &fleet);
+        let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert_eq!(row.status, RunStatus::Abandoned);
+    }
+
+    #[test]
+    fn a_record_present_in_both_sinks_is_counted_once() {
+        let flows = TempDir::new().unwrap();
+        // The SAME record in the local day-file and in the fleet stream —
+        // exactly what happens for this machine's own work, which is
+        // written to both.
+        let rec = peer_record("dispatch start", &darkmux_flow::ts_utc_now());
+        write_day_file(flows.path(), &today(), std::slice::from_ref(&rec));
+        let idx = build_flow_session_index(flows.path(), std::slice::from_ref(&rec));
+        let agg = idx.get("peer-session-1").expect("session present");
+        assert!(agg.has_start);
+        // The dedup is what this asserts: two sources, one session, and the
+        // mission row must still be singular.
+        let runs = build_runs(flows.path(), None, std::slice::from_ref(&rec));
+        assert_eq!(
+            runs.iter().filter(|r| r.id == "review-on-the-hub").count(),
+            1,
+            "a record in both sinks must not produce two runs"
+        );
     }
 }

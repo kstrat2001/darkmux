@@ -2235,7 +2235,7 @@
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
-                let r = super::read_flow_records_from_redis("redis://127.0.0.1:1", "2026-08-15");
+                let r = super::read_flow_records_from_redis("redis://127.0.0.1:1", Some("2026-08-15"));
                 let _ = tx.send((r.is_err(), started.elapsed()));
             });
 
