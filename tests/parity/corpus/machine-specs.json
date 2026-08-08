@@ -1,0 +1,32 @@
+{
+  "darkmux_version": "2.5.0",
+  "flow_schema_version": "1.18.0",
+  "machine_id": "MacBook-Pro",
+  "os": "macos aarch64",
+  "ram_total_bytes": 137438953472,
+  "ram_free_for_ai_bytes": 71511205478,
+  "cpu_brand": "Apple M5 Max",
+  "loaded_models": [
+    {
+      "identifier": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "status": "idle",
+      "size": "18.45 GB",
+      "context": 262144
+    },
+    {
+      "identifier": "darkmux:qwen3-4b-instruct-2507",
+      "model": "qwen3-4b-instruct-2507",
+      "status": "idle",
+      "size": "2.15 GB",
+      "context": 16000
+    }
+  ],
+  "lms_unreachable": false,
+  "utility_model": {
+    "id": "darkmux:qwen3-4b-instruct-2507",
+    "loaded": true
+  },
+  "redis_url_redacted": "redis://100.158.129.76:6379",
+  "generated_at_ms": 1786207257111
+}

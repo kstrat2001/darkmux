@@ -1,0 +1,2959 @@
+{
+  "runs": [
+    {
+      "id": "756-live-diff",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1781263010,
+      "completed_ts": 1781264789,
+      "updated_ts": 1781264789,
+      "tracked": true
+    },
+    {
+      "id": "cli-styling-foundation",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1781155198,
+      "completed_ts": 1781156606,
+      "updated_ts": 1781156606,
+      "tracked": true
+    },
+    {
+      "id": "cli-styling-rollout",
+      "kind": "mission",
+      "status": "complete",
+      "completed_ts": 1781449333,
+      "updated_ts": 1781449333,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-boundary-hardening",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1781413099,
+      "completed_ts": 1781420252,
+      "updated_ts": 1781420252,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1784655359-10f41-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "role": "code-reviewer",
+      "started_ts": 1784655359,
+      "completed_ts": 1784655371,
+      "updated_ts": 1784655371,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1784705852-930b-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "role": "code-reviewer",
+      "started_ts": 1784705852,
+      "completed_ts": 1784705864,
+      "updated_ts": 1784705864,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1784808029-12b28-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "role": "code-reviewer",
+      "started_ts": 1784808029,
+      "completed_ts": 1784808047,
+      "updated_ts": 1784808047,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1784808083-12e7b-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "role": "code-reviewer",
+      "started_ts": 1784808083,
+      "completed_ts": 1784808137,
+      "updated_ts": 1784808137,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1784808704-1588e-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "role": "code-reviewer",
+      "started_ts": 1784808704,
+      "completed_ts": 1784808730,
+      "updated_ts": 1784808730,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1784809996-31f2-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "role": "code-reviewer",
+      "started_ts": 1784809996,
+      "completed_ts": 1784810036,
+      "updated_ts": 1784810036,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1784864820-f2c9-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "role": "code-reviewer",
+      "started_ts": 1784864820,
+      "completed_ts": 1784864882,
+      "updated_ts": 1784864882,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785337256-5b72-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785337256,
+      "completed_ts": 1785337686,
+      "updated_ts": 1785337686,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785339733-16dff-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785339733,
+      "completed_ts": 1785339754,
+      "updated_ts": 1785339754,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785340728-7167-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785340728,
+      "completed_ts": 1785340780,
+      "updated_ts": 1785340780,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785343334-348-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785343335,
+      "completed_ts": 1785343369,
+      "updated_ts": 1785343369,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785343684-1c01-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785343685,
+      "completed_ts": 1785343820,
+      "updated_ts": 1785343820,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785371423-bb1f-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785371423,
+      "completed_ts": 1785371554,
+      "updated_ts": 1785371554,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785379738-ad36-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785379738,
+      "completed_ts": 1785379877,
+      "updated_ts": 1785379877,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785380025-c60c-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785380026,
+      "completed_ts": 1785380260,
+      "updated_ts": 1785380260,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785384819-157-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785384819,
+      "completed_ts": 1785384838,
+      "updated_ts": 1785384838,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785386551-4b71-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785386552,
+      "completed_ts": 1785386581,
+      "updated_ts": 1785386581,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785387671-972c-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785387671,
+      "completed_ts": 1785387731,
+      "updated_ts": 1785387731,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785387728-a0d2-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785387728,
+      "completed_ts": 1785387758,
+      "updated_ts": 1785387758,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785392221-129c0-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785392221,
+      "completed_ts": 1785392296,
+      "updated_ts": 1785392296,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785392290-12eb6-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785392290,
+      "completed_ts": 1785392373,
+      "updated_ts": 1785392373,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785401912-4445-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785401912,
+      "completed_ts": 1785402011,
+      "updated_ts": 1785402011,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785402561-b25d-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785402561,
+      "completed_ts": 1785402715,
+      "updated_ts": 1785402715,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785407851-178e9-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785407851,
+      "completed_ts": 1785407894,
+      "updated_ts": 1785407894,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785411609-73ee-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785411609,
+      "completed_ts": 1785411642,
+      "updated_ts": 1785411642,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785412993-ba6b-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785412993,
+      "completed_ts": 1785413025,
+      "updated_ts": 1785413025,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785421719-2d8d-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785421719,
+      "completed_ts": 1785421740,
+      "updated_ts": 1785421740,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785424933-9ab8-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785424933,
+      "completed_ts": 1785424966,
+      "updated_ts": 1785424966,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785570518-17301-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785570518,
+      "completed_ts": 1785570617,
+      "updated_ts": 1785570617,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-code-reviewer-1785589698-5d6a-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "code-reviewer",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785589698,
+      "completed_ts": 1785589727,
+      "updated_ts": 1785589727,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-health-research-1784652812-1818c0",
+      "kind": "dispatch",
+      "status": "complete",
+      "role": "health-research",
+      "started_ts": 1784652812,
+      "completed_ts": 1784652813,
+      "updated_ts": 1784652813,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-health-research-1784652812-1818f0",
+      "kind": "dispatch",
+      "status": "complete",
+      "role": "health-research",
+      "started_ts": 1784652812,
+      "completed_ts": 1784652813,
+      "updated_ts": 1784652813,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-health-research-1784652812-181920",
+      "kind": "dispatch",
+      "status": "complete",
+      "role": "health-research",
+      "started_ts": 1784652812,
+      "completed_ts": 1784652819,
+      "updated_ts": 1784652819,
+      "tracked": true
+    },
+    {
+      "id": "dispatch-pr-reviewer-1785977775-901a-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "pr-reviewer",
+      "model": "mistralai/devstral-small-2-2512",
+      "started_ts": 1785977775,
+      "completed_ts": 1785977807,
+      "updated_ts": 1785977807,
+      "tracked": true
+    },
+    {
+      "id": "doom-loop-m4",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1782141824,
+      "completed_ts": 1785411166,
+      "updated_ts": 1785411166,
+      "tracked": true
+    },
+    {
+      "id": "fix-apim-subscription-copy",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1781276900,
+      "completed_ts": 1781279069,
+      "updated_ts": 1781279069,
+      "tracked": true
+    },
+    {
+      "id": "p5-gate-coder-72deee644b",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784162307,
+      "completed_ts": 1784187304,
+      "updated_ts": 1784187304,
+      "tracked": true
+    },
+    {
+      "id": "p5-gate-coder-bc2206a259",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784162343,
+      "completed_ts": 1784187304,
+      "updated_ts": 1784187304,
+      "tracked": true
+    },
+    {
+      "id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpMobsRe-wt-1783880106",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783880106,
+      "completed_ts": 1784187343,
+      "updated_ts": 1784187343,
+      "tracked": true
+    },
+    {
+      "id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpN1SPAI-wt-1783880130",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783880130,
+      "completed_ts": 1784187344,
+      "updated_ts": 1784187344,
+      "tracked": true
+    },
+    {
+      "id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpUVGIbJ-wt-1783880766",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783880766,
+      "completed_ts": 1784187344,
+      "updated_ts": 1784187344,
+      "tracked": true
+    },
+    {
+      "id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmplOI9d2-wt-1783880051",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783880051,
+      "completed_ts": 1784187345,
+      "updated_ts": 1784187345,
+      "tracked": true
+    },
+    {
+      "id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpp0a2hW-wt-1783897982",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783897982,
+      "completed_ts": 1784187345,
+      "updated_ts": 1784187345,
+      "tracked": true
+    },
+    {
+      "id": "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmprEsz7c-wt-1783880359",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783880359,
+      "completed_ts": 1784187346,
+      "updated_ts": 1784187346,
+      "tracked": true
+    },
+    {
+      "id": "pr-review-kstrat2001-darkmux-98ec3688075937e18053e4f31fe274ed9be00e16",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783952556,
+      "completed_ts": 1784187346,
+      "updated_ts": 1784187346,
+      "tracked": true
+    },
+    {
+      "id": "pr-review-kstrat2001-darkmux-f91d72cf962da36597b24759851416fe6955867a",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783945692,
+      "completed_ts": 1783949050,
+      "updated_ts": 1783949050,
+      "tracked": true
+    },
+    {
+      "id": "pr-review-kstrat2001-darkmux-ae2a3e8b4ea83be8249ce5ec9990e00e11d1aeea",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783952943,
+      "completed_ts": 1784187347,
+      "updated_ts": 1784187347,
+      "tracked": true
+    },
+    {
+      "id": "pr-review-kstrat2001-darkmux-8ae41076d84b24c5ef27e06a93a4ac5f1b82f9f8",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783923671,
+      "completed_ts": 1783927912,
+      "updated_ts": 1783927912,
+      "tracked": true
+    },
+    {
+      "id": "pr-review-kstrat2001-darkmux-0a50ae80342fe2fa681ce293e58038d703caa1c0",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1783938815,
+      "completed_ts": 1783941684,
+      "updated_ts": 1783941684,
+      "tracked": true
+    },
+    {
+      "id": "pre-1.0-compat-sweep",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1780810668,
+      "completed_ts": 1781446907,
+      "updated_ts": 1781446907,
+      "tracked": true
+    },
+    {
+      "id": "review-1784949740-727afc",
+      "kind": "mission",
+      "status": "error",
+      "machine": "MacBook-Pro",
+      "role": "deep+probe-4b",
+      "model": "darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1784949740,
+      "completed_ts": 1784949744,
+      "updated_ts": 1784949744,
+      "tracked": true
+    },
+    {
+      "id": "review-1785207179-e6071c",
+      "kind": "mission",
+      "status": "error",
+      "machine": "MacBook-Pro",
+      "role": "funnel-judge-35b+probe-4b",
+      "model": "darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785207179,
+      "completed_ts": 1785207183,
+      "updated_ts": 1785207183,
+      "tracked": true
+    },
+    {
+      "id": "review-1785207257-ec8779",
+      "kind": "mission",
+      "status": "error",
+      "machine": "MacBook-Pro",
+      "role": "review-1785207257-ec8779",
+      "started_ts": 1785207257,
+      "completed_ts": 1785207375,
+      "updated_ts": 1785207375,
+      "tracked": true
+    },
+    {
+      "id": "review-1785207492-f044bc",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "review-1785207492-f044bc",
+      "started_ts": 1785207492,
+      "completed_ts": 1785207596,
+      "updated_ts": 1785207596,
+      "tracked": true
+    },
+    {
+      "id": "review-1785207646-45d532",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "funnel-judge-35b+probe-4b",
+      "model": "darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785207646,
+      "completed_ts": 1785207845,
+      "updated_ts": 1785207845,
+      "tracked": true
+    },
+    {
+      "id": "review-1785207867-6a1432",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "diff-review+funnel-judge-35b+probe-27b+probe-4b",
+      "model": "darkmux:mistralai/devstral-small-2-2512, darkmux:qwen/qwen3.6-27b, darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785207867,
+      "completed_ts": 1785208840,
+      "updated_ts": 1785208840,
+      "tracked": true
+    },
+    {
+      "id": "review-1785209203-975bfe",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "deep+diff-review+probe-4b+probe-gptoss",
+      "model": "darkmux:gpt-oss-120b, darkmux:mistralai/devstral-small-2-2512, darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785209203,
+      "completed_ts": 1785209613,
+      "updated_ts": 1785209613,
+      "tracked": true
+    },
+    {
+      "id": "review-1785213958-daa5ba",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "funnel-judge-35b+probe-4b",
+      "model": "darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785213958,
+      "completed_ts": 1785214060,
+      "updated_ts": 1785214060,
+      "tracked": true
+    },
+    {
+      "id": "review-1785224975-ee40dc",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "diff-review+funnel-judge-35b+probe-4b",
+      "model": "darkmux:mistralai/devstral-small-2-2512, darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785224975,
+      "completed_ts": 1785225135,
+      "updated_ts": 1785225135,
+      "tracked": true
+    },
+    {
+      "id": "review-1785400940-136e76",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "deep+diff-review+probe-4b+probe-gptoss",
+      "model": "darkmux:gpt-oss-120b, darkmux:mistralai/devstral-small-2-2512, darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785400940,
+      "completed_ts": 1785405556,
+      "updated_ts": 1785405556,
+      "tracked": true
+    },
+    {
+      "id": "review-1785753634-47ed19",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "deep+diff-review+probe-4b+probe-gptoss",
+      "model": "darkmux:gpt-oss-120b, darkmux:mistralai/devstral-small-2-2512, darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785753634,
+      "completed_ts": 1785771023,
+      "updated_ts": 1785771023,
+      "tracked": true
+    },
+    {
+      "id": "review-1785759617-f38841",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "deep+diff-review+probe-4b+probe-gptoss",
+      "model": "darkmux:gpt-oss-120b, darkmux:mistralai/devstral-small-2-2512, darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785759617,
+      "completed_ts": 1785771023,
+      "updated_ts": 1785771023,
+      "tracked": true
+    },
+    {
+      "id": "review-1785760749-4f1703",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "mission-run",
+      "started_ts": 1785760749,
+      "completed_ts": 1785771022,
+      "updated_ts": 1785771022,
+      "tracked": true
+    },
+    {
+      "id": "review-1785977466-1d3e70",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "route": "azure:urrznykcri.nmbzwqlmuyjfbbxlp.gsibm.urr/zny-7j",
+      "role": "review-probe-high-step",
+      "model": "darkmux:gpt-oss-120b",
+      "started_ts": 1785977466,
+      "completed_ts": 1785977623,
+      "updated_ts": 1785977623,
+      "tracked": true
+    },
+    {
+      "id": "review-1786068582-93f404",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "deep+diff-review+probe-4b+probe-gptoss",
+      "model": "darkmux:gpt-oss-120b, darkmux:mistralai/devstral-small-2-2512, darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1786068582,
+      "completed_ts": 1786068587,
+      "updated_ts": 1786068587,
+      "tracked": true
+    },
+    {
+      "id": "review-1786070274-89d50b",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "review-1786070274-89d50b",
+      "started_ts": 1786070274,
+      "completed_ts": 1786070708,
+      "updated_ts": 1786070708,
+      "tracked": true
+    },
+    {
+      "id": "review-1786071434-f6d2f5",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "review-1786071434-f6d2f5",
+      "started_ts": 1786071434,
+      "completed_ts": 1786071878,
+      "updated_ts": 1786071878,
+      "tracked": true
+    },
+    {
+      "id": "review-1786081556-0eea32",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "deep+diff-review+probe-4b+probe-gptoss",
+      "model": "darkmux:gpt-oss-120b, darkmux:mistralai/devstral-small-2-2512, darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1786081556,
+      "completed_ts": 1786084696,
+      "updated_ts": 1786084696,
+      "tracked": true
+    },
+    {
+      "id": "review-1e47c34023",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784371168,
+      "completed_ts": 1784374535,
+      "updated_ts": 1784374535,
+      "tracked": true
+    },
+    {
+      "id": "review-2b657bf5e8",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784296156,
+      "completed_ts": 1784296290,
+      "updated_ts": 1784296290,
+      "tracked": true
+    },
+    {
+      "id": "review-34b6ae1d4f",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784287247,
+      "completed_ts": 1784287364,
+      "updated_ts": 1784287364,
+      "tracked": true
+    },
+    {
+      "id": "review-5ddc545b04",
+      "kind": "mission",
+      "status": "error",
+      "started_ts": 1784162904,
+      "completed_ts": 1784162909,
+      "updated_ts": 1784162909,
+      "tracked": true
+    },
+    {
+      "id": "review-63ce440d2c",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784163019,
+      "completed_ts": 1784164048,
+      "updated_ts": 1784164048,
+      "tracked": true
+    },
+    {
+      "id": "review-6b4f936487",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784189618,
+      "completed_ts": 1784287644,
+      "updated_ts": 1784287644,
+      "tracked": true
+    },
+    {
+      "id": "review-89f4276eba",
+      "kind": "mission",
+      "status": "error",
+      "started_ts": 1784162853,
+      "completed_ts": 1784162858,
+      "updated_ts": 1784162858,
+      "tracked": true
+    },
+    {
+      "id": "review-90abbf2b7f",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784278702,
+      "completed_ts": 1784278808,
+      "updated_ts": 1784278808,
+      "tracked": true
+    },
+    {
+      "id": "review-96b3c8a3e4",
+      "kind": "mission",
+      "status": "error",
+      "started_ts": 1784374822,
+      "completed_ts": 1784375215,
+      "updated_ts": 1784375215,
+      "tracked": true
+    },
+    {
+      "id": "review-9a61067955",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784338759,
+      "completed_ts": 1784339811,
+      "updated_ts": 1784339811,
+      "tracked": true
+    },
+    {
+      "id": "review-ab724725cd",
+      "kind": "mission",
+      "status": "error",
+      "started_ts": 1784278508,
+      "completed_ts": 1784278511,
+      "updated_ts": 1784278511,
+      "tracked": true
+    },
+    {
+      "id": "review-b31cfcb86b",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784364224,
+      "completed_ts": 1784394608,
+      "updated_ts": 1784394608,
+      "tracked": true
+    },
+    {
+      "id": "review-d4359dd341",
+      "kind": "mission",
+      "status": "error",
+      "started_ts": 1784278597,
+      "completed_ts": 1784278600,
+      "updated_ts": 1784278600,
+      "tracked": true
+    },
+    {
+      "id": "review-e027c8c9d8",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784356175,
+      "completed_ts": 1784361579,
+      "updated_ts": 1784361579,
+      "tracked": true
+    },
+    {
+      "id": "review-e67df631ca",
+      "kind": "mission",
+      "status": "error",
+      "started_ts": 1784296016,
+      "completed_ts": 1784296020,
+      "updated_ts": 1784296020,
+      "tracked": true
+    },
+    {
+      "id": "review-e7d4e5d8ec",
+      "kind": "mission",
+      "status": "error",
+      "started_ts": 1784162748,
+      "completed_ts": 1784162753,
+      "updated_ts": 1784162753,
+      "tracked": true
+    },
+    {
+      "id": "sanity-parallel-1784699884-009600",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784699884,
+      "completed_ts": 1784699891,
+      "updated_ts": 1784699891,
+      "tracked": true
+    },
+    {
+      "id": "sanity-review-shape-1784702742-76e0c1",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784702742,
+      "completed_ts": 1784702749,
+      "updated_ts": 1784702749,
+      "tracked": true
+    },
+    {
+      "id": "sanity-swap-1784702803-8fd6ca",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1784702803,
+      "completed_ts": 1784702809,
+      "updated_ts": 1784702809,
+      "tracked": true
+    },
+    {
+      "id": "vzi-5545-revoke-client-form-authoring",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1781279207,
+      "completed_ts": 1781312089,
+      "updated_ts": 1781312089,
+      "tracked": true
+    },
+    {
+      "id": "kko-1576-submissions-retirement",
+      "kind": "mission",
+      "status": "complete",
+      "started_ts": 1781314848,
+      "completed_ts": 1781365166,
+      "updated_ts": 1781365166,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786125001194",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786125001,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786123759517",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786123759,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786123489502",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786123490,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786123090473",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786123091,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786118605041",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786118605,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786118187734",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786118187,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786117888861",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786117889,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786117072744",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786117073,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786116627286",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786116628,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786115911662",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786115912,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786110214781",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786110215,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786089527475",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786089528,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786089220048",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786089220,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1786083717750",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1786083718,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785909328136",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785909328,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785891997494",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785891997,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785891900851",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785891901,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785889938692",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785889938,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785889819932",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785889820,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785889479667",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785889480,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785889146683",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785889147,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785888837866",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785888838,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785855798988",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785855799,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785854895467",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785854896,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785847806208",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785847806,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785845912207",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785845912,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785843095940",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785843096,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785829099142",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785829099,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785829042909",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785829043,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785828992066",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785828995,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785828989644",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785828994,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785828976426",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785828977,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785828975358",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785828977,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785828937253",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785828937,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785828863062",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785828863,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785828817299",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785828817,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785828770783",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785828771,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785828723491",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785828723,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785828484475",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785828485,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785760383401",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785760521,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785757770716",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785757771,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785754477443",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785754478,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785751969523",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785751970,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785750535792",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785750536,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785734872887",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785734873,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785731848999",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785731849,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785729468430",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785729469,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785400101406",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785400102,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785394740969",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785394741,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785391669461",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785391676,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785380611017",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785380611,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785341594502",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785341595,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785339707451",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785339708,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785339220926",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785339221,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785295386377",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785295387,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785294669764",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785294670,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785291804515",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785291805,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785223451368",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785223451,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785223249303",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785223250,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785215713842",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785215714,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785213224816",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785213225,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785213161589",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785213162,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785212305266",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785212305,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785199961612",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785199962,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785198828165",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785198828,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785197737436",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785197738,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785164564415",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785164564,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785163836082",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785163836,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785163768454",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785163769,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785159400968",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785159401,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785157701168",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785157701,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785066271792",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785066272,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785064324379",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785064325,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785063732561",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785063733,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785061219165",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785061219,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785060751429",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785060752,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785057255200",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785057255,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785056926880",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785056927,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785056676380",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785056677,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785055285518",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785055286,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785054162104",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785054162,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785053931849",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785053932,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785052605275",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785052605,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785051507411",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785051507,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785051230684",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785051231,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785048829389",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785048830,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785032500794",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785032501,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785032480445",
+      "kind": "lab",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "updated_ts": 1785032480,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1785032401234",
+      "kind": "lab",
+      "status": "error",
+      "machine": "MacBook-Pro",
+      "role": "review-judge",
+      "model": "darkmux:model-a",
+      "completed_ts": 1785032402,
+      "updated_ts": 1785032402,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1784246826653",
+      "kind": "lab",
+      "status": "error",
+      "machine": "MacBook-Pro",
+      "model": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+      "completed_ts": 1784246827,
+      "updated_ts": 1784246827,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1783704790922",
+      "kind": "lab",
+      "status": "error",
+      "machine": "MacBook-Pro",
+      "route": "example.azure.com",
+      "model": "gpt-remote",
+      "completed_ts": 1783704791,
+      "updated_ts": 1783704791,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1783449190917",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783449191,
+      "updated_ts": 1783449191,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-1783437770528",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783437770,
+      "updated_ts": 1783437770,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-agentic-uncapped-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783317041,
+      "updated_ts": 1783317041,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-agentic-typed-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783310725,
+      "updated_ts": 1783310725,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gemini31pro-agentic-v5-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783302146,
+      "updated_ts": 1783302146,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gemini31pro-agentic-v5-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783302017,
+      "updated_ts": 1783302017,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gemini31pro-agentic-v3-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783299385,
+      "updated_ts": 1783299385,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gemini31pro-agentic-v3-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783299289,
+      "updated_ts": 1783299289,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-agentic-r3",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783269861,
+      "updated_ts": 1783269861,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-agentic-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783268460,
+      "updated_ts": 1783268460,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-agentic-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783267012,
+      "updated_ts": 1783267012,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-grok43-freeform-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783264373,
+      "updated_ts": 1783264373,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-grok43-freeform-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783264316,
+      "updated_ts": 1783264316,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-grok43-strict-r3",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783264266,
+      "updated_ts": 1783264266,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-grok43-strict-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783264225,
+      "updated_ts": 1783264225,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-grok43-strict-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783264184,
+      "updated_ts": 1783264184,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gemini-freeform-final-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783263767,
+      "updated_ts": 1783263767,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gemini-strict-r3",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783261195,
+      "updated_ts": 1783261195,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gemini-strict-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783261094,
+      "updated_ts": 1783261094,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gemini-strict-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783261006,
+      "updated_ts": 1783261006,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-agentic-r3",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783259318,
+      "updated_ts": 1783259318,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-agentic-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783259202,
+      "updated_ts": 1783259202,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-agentic-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783259059,
+      "updated_ts": 1783259059,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-agentic-probe",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783258869,
+      "updated_ts": 1783258869,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-freeform-med-r3",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783258238,
+      "updated_ts": 1783258238,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-freeform-med-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783257579,
+      "updated_ts": 1783257579,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-freeform-med-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783256864,
+      "updated_ts": 1783256864,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-freeform-r3",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783255577,
+      "updated_ts": 1783255577,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-freeform-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783255075,
+      "updated_ts": 1783255075,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-freeform-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783254509,
+      "updated_ts": 1783254509,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-freeform-r3",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783254082,
+      "updated_ts": 1783254082,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-freeform-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783253885,
+      "updated_ts": 1783253885,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-freeform-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783253688,
+      "updated_ts": 1783253688,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-anchor-r3",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783252334,
+      "updated_ts": 1783252334,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-anchor-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783252315,
+      "updated_ts": 1783252315,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-gpt51-anchor-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783252295,
+      "updated_ts": 1783252295,
+      "tracked": true
+    },
+    {
+      "id": "tool-bench-anchor-remote-azure-review-1783252054-1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783252237,
+      "updated_ts": 1783252237,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-anchor-r3",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783250644,
+      "updated_ts": 1783250644,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-anchor-r2",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783250583,
+      "updated_ts": 1783250583,
+      "tracked": true
+    },
+    {
+      "id": "review-bench-qwen36-anchor-r1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783250543,
+      "updated_ts": 1783250543,
+      "tracked": true
+    },
+    {
+      "id": "tool-bench-k3-deep-1783250143-1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783250288,
+      "updated_ts": 1783250288,
+      "tracked": true
+    },
+    {
+      "id": "tool-bench-deep-1783249302-1",
+      "kind": "lab",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "completed_ts": 1783249349,
+      "updated_ts": 1783249349,
+      "tracked": true
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786091297730112000-2",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786091297,
+      "updated_ts": 1786091299,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786095828927395000-3",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786095828,
+      "updated_ts": 1786095830,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786152504805583000-3",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786152504,
+      "updated_ts": 1786152506,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786089430627298000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786089430,
+      "updated_ts": 1786089432,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-comments-list-1786091178187633000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786091178,
+      "updated_ts": 1786091180,
+      "tracked": false
+    },
+    {
+      "id": "review-1785851756-6042a4",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "route": "azure:urrznykcri.nmbzwqlmuyjfbbxlp.gsibm.urr/zny-7j",
+      "model": "gpt-4o",
+      "started_ts": 1785851756,
+      "completed_ts": 1785851996,
+      "updated_ts": 1785851996,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786118523229280000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786118523,
+      "updated_ts": 1786118524,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786096335940154000-10",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786096335,
+      "updated_ts": 1786096337,
+      "tracked": false
+    },
+    {
+      "id": "review-1786150410-209398",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "route": "azure:urrznykcri.nmbzwqlmuyjfbbxlp.gsibm.urr/zny-7j",
+      "model": "gpt-4o",
+      "started_ts": 1786150410,
+      "completed_ts": 1786151912,
+      "updated_ts": 1786151912,
+      "tracked": false
+    },
+    {
+      "id": "review-1785946022-8d2715",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "route": "azure:urrznykcri.nmbzwqlmuyjfbbxlp.gsibm.urr/zny-7j",
+      "model": "gpt-4o",
+      "started_ts": 1785946022,
+      "completed_ts": 1785946466,
+      "updated_ts": 1785946466,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786118526256603000-1",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786118526,
+      "updated_ts": 1786118527,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786150055695736000-1",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786150055,
+      "updated_ts": 1786150057,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786095161284735000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786095161,
+      "updated_ts": 1786095162,
+      "tracked": false
+    },
+    {
+      "id": "review-1785723266-7f7326",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "route": "azure:urrznykcri.nmbzwqlmuyjfbbxlp.gsibm.urr/zny-7j",
+      "model": "gpt-4o",
+      "started_ts": 1785723374,
+      "completed_ts": 1785723409,
+      "updated_ts": 1785723409,
+      "tracked": false
+    },
+    {
+      "id": "review-1785843516-483ebb",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "route": "azure:urrznykcri.nmbzwqlmuyjfbbxlp.gsibm.urr/zny-7j",
+      "model": "gpt-4o",
+      "started_ts": 1785843516,
+      "completed_ts": 1785843840,
+      "updated_ts": 1785843840,
+      "tracked": false
+    },
+    {
+      "id": "review-1785847613-b140c0",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "route": "azure:urrznykcri.nmbzwqlmuyjfbbxlp.gsibm.urr/zny-7j",
+      "model": "gpt-4o",
+      "started_ts": 1785847613,
+      "completed_ts": 1785847838,
+      "updated_ts": 1785847838,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-approve-1786095848295749000-4",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786095848,
+      "updated_ts": 1786096152,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786088208704943000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786088208,
+      "updated_ts": 1786088210,
+      "tracked": false
+    },
+    {
+      "id": "review-1785771277-054756",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "route": "azure:urrznykcri.nmbzwqlmuyjfbbxlp.gsibm.urr/zny-7j",
+      "model": "gpt-4o",
+      "started_ts": 1785771277,
+      "completed_ts": 1785771607,
+      "updated_ts": 1785771607,
+      "tracked": false
+    },
+    {
+      "id": "review-1785768532-cbd22b",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "model": "gpt-4o",
+      "started_ts": 1785768532,
+      "completed_ts": 1785768550,
+      "updated_ts": 1785768550,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786096163987015000-5",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786096163,
+      "updated_ts": 1786096165,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786091112370460000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786091112,
+      "updated_ts": 1786091113,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-view-1786089463406811000-1",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786089463,
+      "updated_ts": 1786089465,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786112149864218000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786112149,
+      "updated_ts": 1786112151,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-merge-1786095174518836000-1",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786095174,
+      "updated_ts": 1786095178,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-approve-1786096233364710000-8",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786096233,
+      "updated_ts": 1786096288,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-merge-1786096346020539000-11",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786096346,
+      "updated_ts": 1786096359,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-view-1786150088844151000-2",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786150088,
+      "updated_ts": 1786150093,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786110732765195000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786110732,
+      "updated_ts": 1786110734,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786111634440410000-3",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786111634,
+      "updated_ts": 1786111636,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-comments-list-1786152519941013000-4",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786152519,
+      "updated_ts": 1786152522,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-view-1786096184556928000-6",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786096184,
+      "updated_ts": 1786096188,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-merge-1786111093969402000-2",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786111093,
+      "updated_ts": 1786111103,
+      "tracked": false
+    },
+    {
+      "id": "review-1785766753-218e27",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "model": "gpt-4o",
+      "started_ts": 1785766753,
+      "completed_ts": 1785766771,
+      "updated_ts": 1785766771,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-comments-list-1786096216607360000-7",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786096216,
+      "updated_ts": 1786096220,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786121058517076000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786121058,
+      "updated_ts": 1786121060,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-approve-1786095190336606000-2",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786095190,
+      "updated_ts": 1786095226,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-merge-1786096304195656000-9",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786096304,
+      "updated_ts": 1786096324,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-approve-1786110758707741000-1",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786110758,
+      "updated_ts": 1786110781,
+      "tracked": false
+    },
+    {
+      "id": "review-1785885677-5ec5e0",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "model": "gpt-4o",
+      "started_ts": 1785885677,
+      "completed_ts": 1785885678,
+      "updated_ts": 1785885678,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786096374062061000-12",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786096374,
+      "updated_ts": 1786096375,
+      "tracked": false
+    },
+    {
+      "id": "review-1785770519-f814e0",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "route": "azure:urrznykcri.nmbzwqlmuyjfbbxlp.gsibm.urr/zny-7j",
+      "model": "gpt-4o",
+      "started_ts": 1785770519,
+      "completed_ts": 1785770721,
+      "updated_ts": 1785770721,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786121191309511000-1",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786121191,
+      "updated_ts": 1786121195,
+      "tracked": false
+    },
+    {
+      "id": "review-1785942965-0eaca3",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "model": "gpt-4o",
+      "started_ts": 1785942965,
+      "completed_ts": 1785942984,
+      "updated_ts": 1785942984,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786121158195620000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786121158,
+      "updated_ts": 1786121159,
+      "tracked": false
+    },
+    {
+      "id": "review-1785725244-690658",
+      "kind": "mission",
+      "status": "complete",
+      "machine": "m1-max-32gb-studio",
+      "route": "azure:urrznykcri.nmbzwqlmuyjfbbxlp.gsibm.urr/zny-7j",
+      "model": "gpt-4o",
+      "started_ts": 1785725244,
+      "completed_ts": 1785725871,
+      "updated_ts": 1785725871,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786114632381137000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786114632,
+      "updated_ts": 1786114635,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-ship-1786152707367180000-5",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786152707,
+      "updated_ts": 1786152749,
+      "tracked": false
+    },
+    {
+      "id": "acp-ephemeral-pr-list-1786112866553668000-0",
+      "kind": "mission",
+      "status": "abandoned",
+      "machine": "MacBook-Pro",
+      "started_ts": 1786112866,
+      "updated_ts": 1786112867,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-host-1786182435865961-1",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-host",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1786182435,
+      "completed_ts": 1786182451,
+      "updated_ts": 1786182451,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786113250032083-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786113250,
+      "completed_ts": 1786113252,
+      "updated_ts": 1786113252,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786151802570362-4",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786151802,
+      "completed_ts": 1786151803,
+      "updated_ts": 1786151803,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786118522430002-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786118522,
+      "completed_ts": 1786118522,
+      "updated_ts": 1786118522,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786183039911693-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786183039,
+      "completed_ts": 1786183040,
+      "updated_ts": 1786183040,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786120974520838-2",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786120974,
+      "completed_ts": 1786120974,
+      "updated_ts": 1786120974,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786182434869757-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786182434,
+      "completed_ts": 1786182435,
+      "updated_ts": 1786182435,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786113252709212-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786113252,
+      "completed_ts": 1786113254,
+      "updated_ts": 1786113254,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786120947145183-1",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786120947,
+      "completed_ts": 1786120947,
+      "updated_ts": 1786120947,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786121073895143-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786121073,
+      "completed_ts": 1786121074,
+      "updated_ts": 1786121074,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786112876311662-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786112876,
+      "completed_ts": 1786112878,
+      "updated_ts": 1786112878,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786113374154365-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786113374,
+      "completed_ts": 1786113376,
+      "updated_ts": 1786113376,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-host-1786188712657282-1",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-host",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1786188712,
+      "completed_ts": 1786188716,
+      "updated_ts": 1786188716,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786112834578924-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786112834,
+      "completed_ts": 1786112836,
+      "updated_ts": 1786112836,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786113209481777-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786113209,
+      "completed_ts": 1786113211,
+      "updated_ts": 1786113211,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786112850834624-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786112850,
+      "completed_ts": 1786112852,
+      "updated_ts": 1786112852,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786113098090185-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786113098,
+      "completed_ts": 1786113100,
+      "updated_ts": 1786113100,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786112776411655-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786112776,
+      "completed_ts": 1786112778,
+      "updated_ts": 1786112778,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786112101918549-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1786112101,
+      "completed_ts": 1786112106,
+      "updated_ts": 1786112106,
+      "tracked": false
+    },
+    {
+      "id": "darkmux-coding-long-agentic-1785734324766",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "coder",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785734325,
+      "completed_ts": 1785735739,
+      "updated_ts": 1785735739,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-host-1786183040782553-1",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-host",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1786183040,
+      "completed_ts": 1786183043,
+      "updated_ts": 1786183043,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786112138533263-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1786112138,
+      "completed_ts": 1786112149,
+      "updated_ts": 1786112149,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786120921622136-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786120921,
+      "completed_ts": 1786120922,
+      "updated_ts": 1786120922,
+      "tracked": false
+    },
+    {
+      "id": "darkmux-coding-long-agentic-1785767351605",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "coder",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785767351,
+      "completed_ts": 1785768150,
+      "updated_ts": 1785768150,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786114630363736-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786114630,
+      "completed_ts": 1786114632,
+      "updated_ts": 1786114632,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786112864789912-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786112864,
+      "completed_ts": 1786112866,
+      "updated_ts": 1786112866,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786120995643038-3",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786120995,
+      "completed_ts": 1786120996,
+      "updated_ts": 1786120996,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786113399788068-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1786113399,
+      "completed_ts": 1786113408,
+      "updated_ts": 1786113408,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786118525220381-1",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786118525,
+      "completed_ts": 1786118525,
+      "updated_ts": 1786118525,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786188711607472-0",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786188711,
+      "completed_ts": 1786188712,
+      "updated_ts": 1786188712,
+      "tracked": false
+    },
+    {
+      "id": "darkmux-coding-long-agentic-1785977118027",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "coder",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "started_ts": 1785977118,
+      "completed_ts": 1785977360,
+      "updated_ts": 1785977360,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786199280181417-5",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786199280,
+      "completed_ts": 1786199280,
+      "updated_ts": 1786199280,
+      "tracked": false
+    },
+    {
+      "id": "crew-dispatch-radio-router-1786113206865215-internal",
+      "kind": "dispatch",
+      "status": "complete",
+      "machine": "MacBook-Pro",
+      "role": "radio-router",
+      "model": "qwen3-4b-instruct-2507",
+      "started_ts": 1786113206,
+      "completed_ts": 1786113208,
+      "updated_ts": 1786113208,
+      "tracked": false
+    }
+  ],
+  "generated_at_ms": 1786207254901
+}

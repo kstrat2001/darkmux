@@ -39,3 +39,14 @@ tests/e2e/.served/
 tests/e2e/test-results/
 tests/e2e/playwright-report/
 target-review/
+
+# Viewer parity harness (Packet 0a) — local artifacts. corpus/ and goldens/
+# ARE committed (they're the recorded spec the React port is graded
+# against); only the build/run scratch below is ignored.
+tests/parity/node_modules/
+tests/parity/.served/
+tests/parity/.determinism-run1/
+tests/parity/.verify-snapshot/
+tests/parity/corpus.tmp-*/
+tests/parity/test-results/
+tests/parity/playwright-report/

@@ -1,0 +1,46 @@
+=== crumb ===
+(empty)
+
+=== meta ===
+● ready · 2  · last run 2h ago
+952 records · last 24h
+
+=== logscope ===
+FLEET
+
+=== stage ===
+BY YOUR FLEET · LAST 24H
+0
+LOCAL TOKENS
+396,926
+CLOUD TOKENS
+89k
+GENERATED
+0
+FRESH INPUT
+0
+RE-READ
+308k
+UNCLASSIFIED
+3
+DISPATCHES
+Orchestrator note: 3 dispatches via cloud — the right brain for the job. keep it up.
+MacBook-Pro
+Apple M5 Max · 128 GB
+idle
+0 running
+m1-max-32gb-studio
+hardware not reported
+idle
+0 running
+RECENT ACTIVITY · AUG 7 16:40:59–AUG 8 16:40:59
+10M
+1H
+4H
+24H
+MacBook-Pro
+m1-max-32gb-studio
+16:40
+04:40
+16:40
+

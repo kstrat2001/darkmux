@@ -1,0 +1,16 @@
+{
+  "panel": "mission-status",
+  "argv": [
+    "mission",
+    "status"
+  ],
+  "captured_ts_ms": 1786207257120,
+  "gather_ms": 8,
+  "exit_code": 0,
+  "ansi_text": "\u001b[1;36mmission status — 93 missions\u001b[0m\n\n\u001b[2mFINALIZED (93)\u001b[0m\n  ◆ \u001b]8;;http://100.141.193.1:8765/mission/review-1786081556-0eea32/graph\u001b\\PR review — kstrat2001/darkmux@8cf07d1c…ep+diff-review+probe-4b+probe-gptoss`)\u001b]8;;\u001b\\   \u001b[2m1d\u001b[0m    3/3  ▓▓▓▓\n  ◆ \u001b]8;;http://100.141.193.1:8765/mission/review-1786071434-f6d2f5/graph\u001b\\PR review — nbd-sfymfx-bfkdxl-71ns8216 …ep+diff-review+probe-4b+probe-gptoss`)\u001b]8;;\u001b\\   \u001b[2m1d\u001b[0m    3/3  ▓▓▓▓\n  ◆ \u001b]8;;http://100.141.193.1:8765/mission/review-1786070274-89d50b/graph\u001b\\PR review — nbd-sfymfx-bfkdxl-71ns8216 …ep+diff-review+probe-4b+probe-gptoss`)\u001b]8;;\u001b\\   \u001b[2m1d\u001b[0m    3/3  ▓▓▓▓\n  ◆ \u001b]8;;http://100.141.193.1:8765/mission/review-1786068582-93f404/graph\u001b\\PR review — nbd-sfymfx-bfkdxl-71ns8216 …ep+diff-review+probe-4b+probe-gptoss`)\u001b]8;;\u001b\\   \u001b[2m1d\u001b[0m    3/3  ▓▓▓▓\n  • \u001b]8;;http://100.141.193.1:8765/mission/dispatch-pr-reviewer-1785977775-901a-0/graph\u001b\\pr-reviewer\u001b]8;;\u001b\\                                                                      \u001b[2m2d\u001b[0m    1/1  ▓▓▓▓\n  ◆ \u001b]8;;http://100.141.193.1:8765/mission/review-1785977466-1d3e70/graph\u001b\\PR review — dogfood-2.5.0-pr1671 (crew …ep+diff-review+probe-4b+probe-gptoss`)\u001b]8;;\u001b\\   \u001b[2m2d\u001b[0m    3/3  ▓▓▓▓\n  ◆ \u001b]8;;http://100.141.193.1:8765/mission/review-1785753634-47ed19/graph\u001b\\PR review — kstrat2001/darkmux@42f63390…ep+diff-review+probe-4b+probe-gptoss`)\u001b]8;;\u001b\\   \u001b[2m5d\u001b[0m    0/3  ░░░░\n  ◆ \u001b]8;;http://100.141.193.1:8765/mission/review-1785759617-f38841/graph\u001b\\PR review — kstrat2001/darkmux@e700d21c…ep+diff-review+probe-4b+probe-gptoss`)\u001b]8;;\u001b\\   \u001b[2m5d\u001b[0m    0/3  ░░░░\n\u001b[2m  … 85 more (8 of 93 shown)\u001b[0m\n  \u001b]8;;http://100.141.193.1:8765/#lens=console&panel=mission-status-all\u001b\\→ show every mission\u001b]8;;\u001b\\\n\n\u001b[32m✓ board is clean — every mission's phases are reconciled\u001b[0m\n",
+  "stderr_tail": "",
+  "cols": 100,
+  "cache_ttl_ms": 3000,
+  "age_ms": 0,
+  "auto_refresh": true
+}

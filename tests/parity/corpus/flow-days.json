@@ -1,0 +1,663 @@
+{
+  "days": [
+    {
+      "date": "2026-08-08",
+      "records": 54,
+      "missions": [
+        "acp-ephemeral-pr-comments-list-1786152519941013000-4",
+        "acp-ephemeral-pr-list-1786150055695736000-1",
+        "acp-ephemeral-pr-list-1786152504805583000-3",
+        "acp-ephemeral-pr-ship-1786152707367180000-5",
+        "acp-ephemeral-pr-view-1786150088844151000-2"
+      ],
+      "dispatches": 8
+    },
+    {
+      "date": "2026-08-07",
+      "records": 1993,
+      "missions": [
+        "acp-ephemeral-pr-approve-1786095190336606000-2",
+        "acp-ephemeral-pr-approve-1786095848295749000-4",
+        "acp-ephemeral-pr-approve-1786096233364710000-8",
+        "acp-ephemeral-pr-approve-1786110758707741000-1",
+        "acp-ephemeral-pr-comments-list-1786091178187633000-0",
+        "acp-ephemeral-pr-comments-list-1786096216607360000-7",
+        "acp-ephemeral-pr-list-1786088208704943000-0",
+        "acp-ephemeral-pr-list-1786089430627298000-0",
+        "acp-ephemeral-pr-list-1786091112370460000-0",
+        "acp-ephemeral-pr-list-1786091297730112000-2",
+        "acp-ephemeral-pr-list-1786095161284735000-0",
+        "acp-ephemeral-pr-list-1786095828927395000-3",
+        "acp-ephemeral-pr-list-1786096163987015000-5",
+        "acp-ephemeral-pr-list-1786096335940154000-10",
+        "acp-ephemeral-pr-list-1786096374062061000-12",
+        "acp-ephemeral-pr-list-1786110732765195000-0",
+        "acp-ephemeral-pr-list-1786111634440410000-3",
+        "acp-ephemeral-pr-list-1786112149864218000-0",
+        "acp-ephemeral-pr-list-1786112866553668000-0",
+        "acp-ephemeral-pr-list-1786114632381137000-0",
+        "acp-ephemeral-pr-list-1786118523229280000-0",
+        "acp-ephemeral-pr-list-1786118526256603000-1",
+        "acp-ephemeral-pr-list-1786121058517076000-0",
+        "acp-ephemeral-pr-list-1786121158195620000-0",
+        "acp-ephemeral-pr-list-1786121191309511000-1",
+        "acp-ephemeral-pr-merge-1786095174518836000-1",
+        "acp-ephemeral-pr-merge-1786096304195656000-9",
+        "acp-ephemeral-pr-merge-1786096346020539000-11",
+        "acp-ephemeral-pr-merge-1786111093969402000-2",
+        "acp-ephemeral-pr-view-1786089463406811000-1",
+        "acp-ephemeral-pr-view-1786096184556928000-6",
+        "review-1786068582-93f404",
+        "review-1786070274-89d50b",
+        "review-1786071434-f6d2f5",
+        "review-1786081556-0eea32"
+      ],
+      "dispatches": 28
+    },
+    {
+      "date": "2026-08-06",
+      "records": 354,
+      "missions": [
+        "dispatch-pr-reviewer-1785977775-901a-0",
+        "review-1785977466-1d3e70"
+      ],
+      "dispatches": 3
+    },
+    {
+      "date": "2026-08-04",
+      "records": 1,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-08-03",
+      "records": 5033,
+      "missions": [
+        "review-1785753634-47ed19",
+        "review-1785759617-f38841",
+        "review-1785760749-4f1703"
+      ],
+      "dispatches": 4
+    },
+    {
+      "date": "2026-08-02",
+      "records": 27,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-08-01",
+      "records": 154,
+      "missions": [
+        "dispatch-code-reviewer-1785570518-17301-0",
+        "dispatch-code-reviewer-1785589698-5d6a-0"
+      ],
+      "dispatches": 2
+    },
+    {
+      "date": "2026-07-31",
+      "records": 2,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-07-30",
+      "records": 2927,
+      "missions": [
+        "dispatch-code-reviewer-1785371423-bb1f-0",
+        "dispatch-code-reviewer-1785379738-ad36-0",
+        "dispatch-code-reviewer-1785380025-c60c-0",
+        "dispatch-code-reviewer-1785384819-157-0",
+        "dispatch-code-reviewer-1785386551-4b71-0",
+        "dispatch-code-reviewer-1785387671-972c-0",
+        "dispatch-code-reviewer-1785387728-a0d2-0",
+        "dispatch-code-reviewer-1785392221-129c0-0",
+        "dispatch-code-reviewer-1785392290-12eb6-0",
+        "dispatch-code-reviewer-1785401912-4445-0",
+        "dispatch-code-reviewer-1785402561-b25d-0",
+        "dispatch-code-reviewer-1785407851-178e9-0",
+        "dispatch-code-reviewer-1785411609-73ee-0",
+        "dispatch-code-reviewer-1785412993-ba6b-0",
+        "dispatch-code-reviewer-1785421719-2d8d-0",
+        "dispatch-code-reviewer-1785424933-9ab8-0",
+        "review-1785400940-136e76"
+      ],
+      "dispatches": 17
+    },
+    {
+      "date": "2026-07-29",
+      "records": 583,
+      "missions": [
+        "dispatch-code-reviewer-1785337256-5b72-0",
+        "dispatch-code-reviewer-1785339733-16dff-0",
+        "dispatch-code-reviewer-1785340728-7167-0",
+        "dispatch-code-reviewer-1785343334-348-0",
+        "dispatch-code-reviewer-1785343684-1c01-0"
+      ],
+      "dispatches": 5
+    },
+    {
+      "date": "2026-07-28",
+      "records": 1079,
+      "missions": [
+        "review-1785207179-e6071c",
+        "review-1785207257-ec8779",
+        "review-1785207492-f044bc",
+        "review-1785207646-45d532",
+        "review-1785207867-6a1432",
+        "review-1785209203-975bfe",
+        "review-1785213958-daa5ba",
+        "review-1785224975-ee40dc"
+      ],
+      "dispatches": 6
+    },
+    {
+      "date": "2026-07-26",
+      "records": 2,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-07-25",
+      "records": 33,
+      "missions": [
+        "review-1784949740-727afc"
+      ],
+      "dispatches": 1
+    },
+    {
+      "date": "2026-07-24",
+      "records": 67,
+      "missions": [
+        "dispatch-code-reviewer-1784864820-f2c9-0"
+      ],
+      "dispatches": 1
+    },
+    {
+      "date": "2026-07-23",
+      "records": 173,
+      "missions": [
+        "dispatch-code-reviewer-1784808029-12b28-0",
+        "dispatch-code-reviewer-1784808083-12e7b-0",
+        "dispatch-code-reviewer-1784808704-1588e-0",
+        "dispatch-code-reviewer-1784809996-31f2-0"
+      ],
+      "dispatches": 4
+    },
+    {
+      "date": "2026-07-22",
+      "records": 66,
+      "missions": [
+        "dispatch-code-reviewer-1784705852-930b-0",
+        "sanity-parallel-1784699884-009600",
+        "sanity-review-shape-1784702742-76e0c1",
+        "sanity-swap-1784702803-8fd6ca"
+      ],
+      "dispatches": 1
+    },
+    {
+      "date": "2026-07-21",
+      "records": 24,
+      "missions": [
+        "dispatch-code-reviewer-1784655359-10f41-0"
+      ],
+      "dispatches": 1
+    },
+    {
+      "date": "2026-07-20",
+      "records": 6,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-07-19",
+      "records": 1,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-07-18",
+      "records": 6039,
+      "missions": [
+        "review-1e47c34023",
+        "review-3049b0d2ec",
+        "review-96b3c8a3e4",
+        "review-9a61067955",
+        "review-b31cfcb86b",
+        "review-e027c8c9d8",
+        "smoke-test"
+      ],
+      "dispatches": 7
+    },
+    {
+      "date": "2026-07-17",
+      "records": 437,
+      "missions": [
+        "review-2b657bf5e8",
+        "review-34b6ae1d4f",
+        "review-6b4f936487",
+        "review-90abbf2b7f",
+        "review-ab724725cd",
+        "review-d4359dd341",
+        "review-e67df631ca"
+      ],
+      "dispatches": 6
+    },
+    {
+      "date": "2026-07-16",
+      "records": 2034,
+      "missions": [
+        "p5-gate-coder-72deee644b",
+        "p5-gate-coder-bc2206a259",
+        "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpMobsRe-wt-1783880106",
+        "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpN1SPAI-wt-1783880130",
+        "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpUVGIbJ-wt-1783880766",
+        "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmplOI9d2-wt-1783880051",
+        "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpp0a2hW-wt-1783897982",
+        "pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmprEsz7c-wt-1783880359",
+        "pr-review-kstrat2001-darkmux-98ec3688075937e18053e4f31fe274ed9be00e16",
+        "pr-review-kstrat2001-darkmux-ae2a3e8b4ea83be8249ce5ec9990e00e11d1aeea",
+        "review-5ddc545b04",
+        "review-63ce440d2c",
+        "review-6b4f936487",
+        "review-89f4276eba",
+        "review-e7d4e5d8ec"
+      ],
+      "dispatches": 7
+    },
+    {
+      "date": "2026-07-15",
+      "records": 19,
+      "missions": [
+        "draft-blog-post",
+        "draft-blog-post-6e46dd10de",
+        "future-kind",
+        "hydra",
+        "hydra-53f17099f2",
+        "japan-6e46dd10de",
+        "japan-trip-2026-05",
+        "smoke-test-6e46dd10de",
+        "unknown-kind-6e46dd10de"
+      ],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-07-13",
+      "records": 2714,
+      "missions": [
+        "pr-review-kstrat2001-darkmux-f91d72cf962da36597b24759851416fe6955867a",
+        "pr-review-kstrat2001-darkmux-8ae41076d84b24c5ef27e06a93a4ac5f1b82f9f8",
+        "pr-review-kstrat2001-darkmux-0a50ae80342fe2fa681ce293e58038d703caa1c0"
+      ],
+      "dispatches": 6
+    },
+    {
+      "date": "2026-07-12",
+      "records": 329,
+      "missions": [],
+      "dispatches": 6
+    },
+    {
+      "date": "2026-07-11",
+      "records": 86,
+      "missions": [],
+      "dispatches": 1
+    },
+    {
+      "date": "2026-07-10",
+      "records": 137,
+      "missions": [],
+      "dispatches": 2
+    },
+    {
+      "date": "2026-07-09",
+      "records": 122,
+      "missions": [],
+      "dispatches": 6
+    },
+    {
+      "date": "2026-07-08",
+      "records": 5919,
+      "missions": [],
+      "dispatches": 13
+    },
+    {
+      "date": "2026-07-07",
+      "records": 8969,
+      "missions": [],
+      "dispatches": 29
+    },
+    {
+      "date": "2026-07-06",
+      "records": 6580,
+      "missions": [],
+      "dispatches": 66
+    },
+    {
+      "date": "2026-07-05",
+      "records": 8652,
+      "missions": [],
+      "dispatches": 297
+    },
+    {
+      "date": "2026-07-04",
+      "records": 1983,
+      "missions": [],
+      "dispatches": 45
+    },
+    {
+      "date": "2026-07-03",
+      "records": 4975,
+      "missions": [],
+      "dispatches": 56
+    },
+    {
+      "date": "2026-07-02",
+      "records": 2413,
+      "missions": [],
+      "dispatches": 137
+    },
+    {
+      "date": "2026-07-01",
+      "records": 3349,
+      "missions": [],
+      "dispatches": 12
+    },
+    {
+      "date": "2026-06-30",
+      "records": 18,
+      "missions": [],
+      "dispatches": 2
+    },
+    {
+      "date": "2026-06-29",
+      "records": 2525,
+      "missions": [],
+      "dispatches": 32
+    },
+    {
+      "date": "2026-06-28",
+      "records": 2237,
+      "missions": [],
+      "dispatches": 38
+    },
+    {
+      "date": "2026-06-27",
+      "records": 512,
+      "missions": [],
+      "dispatches": 42
+    },
+    {
+      "date": "2026-06-26",
+      "records": 711,
+      "missions": [],
+      "dispatches": 67
+    },
+    {
+      "date": "2026-06-23",
+      "records": 139,
+      "missions": [],
+      "dispatches": 5
+    },
+    {
+      "date": "2026-06-22",
+      "records": 1561,
+      "missions": [
+        "doom-loop-m4"
+      ],
+      "dispatches": 3
+    },
+    {
+      "date": "2026-06-21",
+      "records": 532,
+      "missions": [],
+      "dispatches": 11
+    },
+    {
+      "date": "2026-06-19",
+      "records": 54,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-06-18",
+      "records": 23,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-06-17",
+      "records": 28,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-06-15",
+      "records": 21,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-06-14",
+      "records": 8064,
+      "missions": [
+        "cli-styling-foundation",
+        "cli-styling-rollout",
+        "dispatch-boundary-hardening",
+        "fix-apim-subscription-copy",
+        "pre-1.0-compat-sweep",
+        "vzi-5545-revoke-client-form-authoring",
+        "kko-1576-submissions-retirement",
+        "knk-1631-unified-permissions-catalog"
+      ],
+      "dispatches": 27
+    },
+    {
+      "date": "2026-06-13",
+      "records": 629,
+      "missions": [
+        "vzi-5545-revoke-client-form-authoring",
+        "kko-1576-submissions-retirement"
+      ],
+      "dispatches": 4
+    },
+    {
+      "date": "2026-06-12",
+      "records": 3292,
+      "missions": [
+        "756-live-diff",
+        "fix-apim-subscription-copy",
+        "vzi-5545-revoke-client-form-authoring"
+      ],
+      "dispatches": 22
+    },
+    {
+      "date": "2026-06-11",
+      "records": 1749,
+      "missions": [
+        "cli-styling-foundation",
+        "cli-styling-rollout"
+      ],
+      "dispatches": 23
+    },
+    {
+      "date": "2026-06-10",
+      "records": 272,
+      "missions": [],
+      "dispatches": 7
+    },
+    {
+      "date": "2026-06-09",
+      "records": 1537,
+      "missions": [],
+      "dispatches": 8
+    },
+    {
+      "date": "2026-06-08",
+      "records": 533,
+      "missions": [],
+      "dispatches": 4
+    },
+    {
+      "date": "2026-06-07",
+      "records": 773,
+      "missions": [
+        "pre-1.0-compat-sweep"
+      ],
+      "dispatches": 9
+    },
+    {
+      "date": "2026-06-06",
+      "records": 399,
+      "missions": [],
+      "dispatches": 6
+    },
+    {
+      "date": "2026-06-05",
+      "records": 307,
+      "missions": [],
+      "dispatches": 3
+    },
+    {
+      "date": "2026-06-04",
+      "records": 86,
+      "missions": [],
+      "dispatches": 1
+    },
+    {
+      "date": "2026-06-03",
+      "records": 304,
+      "missions": [],
+      "dispatches": 8
+    },
+    {
+      "date": "2026-06-02",
+      "records": 1540,
+      "missions": [],
+      "dispatches": 3
+    },
+    {
+      "date": "2026-06-01",
+      "records": 307,
+      "missions": [],
+      "dispatches": 1
+    },
+    {
+      "date": "2026-05-31",
+      "records": 82,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-05-30",
+      "records": 640,
+      "missions": [],
+      "dispatches": 4
+    },
+    {
+      "date": "2026-05-29",
+      "records": 90,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-05-28",
+      "records": 3635,
+      "missions": [],
+      "dispatches": 27
+    },
+    {
+      "date": "2026-05-27",
+      "records": 4583,
+      "missions": [],
+      "dispatches": 25
+    },
+    {
+      "date": "2026-05-26",
+      "records": 5633,
+      "missions": [
+        "darkmux-independence-runtime"
+      ],
+      "dispatches": 32
+    },
+    {
+      "date": "2026-05-25",
+      "records": 7929,
+      "missions": [],
+      "dispatches": 31
+    },
+    {
+      "date": "2026-05-24",
+      "records": 185,
+      "missions": [],
+      "dispatches": 9
+    },
+    {
+      "date": "2026-05-23",
+      "records": 133,
+      "missions": [],
+      "dispatches": 2
+    },
+    {
+      "date": "2026-05-22",
+      "records": 14,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-05-21",
+      "records": 78,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-05-20",
+      "records": 58,
+      "missions": [],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-05-19",
+      "records": 17,
+      "missions": [
+        "cbdfvh-qg-lyrrqq-4320-10"
+      ],
+      "dispatches": 2
+    },
+    {
+      "date": "2026-05-17",
+      "records": 1,
+      "missions": [
+        "test-mission"
+      ],
+      "dispatches": 0
+    },
+    {
+      "date": "2026-05-16",
+      "records": 35,
+      "missions": [
+        "smoke-mission"
+      ],
+      "dispatches": 15
+    },
+    {
+      "date": "2026-05-15",
+      "records": 18,
+      "missions": [],
+      "dispatches": 8
+    },
+    {
+      "date": "2026-05-14",
+      "records": 41,
+      "missions": [],
+      "dispatches": 6
+    },
+    {
+      "date": "2026-05-13",
+      "records": 41,
+      "missions": [],
+      "dispatches": 7
+    }
+  ],
+  "generated_at_ms": 1786207255061
+}
