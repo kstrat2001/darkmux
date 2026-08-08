@@ -441,6 +441,13 @@ fn unreachable_phase_drifts(m: &Mission, phases: &[&Phase]) -> Vec<Drift> {
 /// system derived (#44). `--json` is never paginated: a machine reader wants
 /// the whole board, and trimming it would make the structured output lie about
 /// what exists (#1569).
+///
+/// `missions_only` (#1709) is MEMBERSHIP, not pagination: it filters
+/// machine-minted run instances out, leaving the missions the operator
+/// named. The default is `false` — the board answers "what's recent" across
+/// everything, and the named-only list is the other tab. `all` and
+/// `missions_only` are orthogonal: `--missions --all` means every named
+/// mission, unpaginated. Like `limit`, it does not touch `--json`.
 pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> Result<i32> {
     let unlimited = all || limit == Some(0);
     let missions = crew::loader::load_missions()?;
@@ -471,9 +478,9 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         .collect();
     views.sort_by(board_order);
 
-    // (#1562) `--json` is deliberately NEVER filtered by the named-first
-    // default below, regardless of `--all` — this branch returns before
-    // `partition_visibility` even runs, so a machine reader always gets the
+    // (#1562, restated for #1709) `--json` is deliberately NEVER filtered —
+    // not by `--missions`, not by anything — because this branch returns
+    // before `board_partition` even runs. A machine reader always gets the
     // whole board (`record exhaustively, display selectively`: the filter is
     // display-only). `--limit`/pagination already followed this same rule.
     if json {
@@ -512,7 +519,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // earlier. Meanwhile a full day of reviews and panel commands showed up
     // as a single grey "+61 run instances" footer. The board was accurate and
     // useless at the same time.
-    let (visible, hidden) = partition_visibility(&views, !missions_only);
+    let (visible, hidden) = board_partition(&views, missions_only);
 
     println!(
         "{}",
@@ -710,7 +717,12 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // missions with minted runs, which is exactly when someone wants the
     // named-only list. Printed only when there is something to filter, so a
     // board of purely named work never advertises a no-op.
-    if !missions_only && visible.iter().any(|v| is_minted_run(v.m)) {
+    // `all_link.is_none()` — the panel surface has no prompt to type a flag
+    // at, and this file already learned that the hard way: see
+    // `panel_deep_link`'s doc ("the ADVICE has to match the surface … a dead
+    // end in a panel"), which is why the `--all` advice above is suppressed
+    // the same way. A hint the operator cannot act on is worse than none.
+    if !missions_only && all_link.is_none() && visible.iter().any(|v| is_minted_run(v.m)) {
         for l in wrap_indented("→ `--missions` for named missions only", 0, width) {
             println!("{}", style::dim(&l));
         }
@@ -734,17 +746,39 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     Ok(0)
 }
 
-/// (#1562) Split `views` into (visible, hidden) for the named-first default
-/// vs `--all`. `all == true` returns every mission visible and nothing
-/// hidden — the pre-#1562 everything-shown board. `all == false` hides
-/// machine-minted run instances (`is_minted_run`) so the missions an
-/// operator actually named aren't drowned by pipeline/dispatch noise. Pure
-/// and borrowing, so it's unit-testable without any disk I/O.
+/// Split `views` into (visible, hidden). `include_minted == true` returns
+/// every mission visible and nothing hidden; `false` hides machine-minted
+/// run instances (`is_minted_run`).
+///
+/// (#1709) The parameter is no longer "`--all`": the DEFAULT board passes
+/// `true` here and `--missions` passes `false` — see [`board_partition`],
+/// which owns that mapping. `--all` now only controls pagination.
+///
+/// Pure and borrowing, so it's unit-testable without any disk I/O.
+/// (#1709 gate MF-3) The flag → partition mapping, as a NAMED function the
+/// tests can actually reach.
+///
+/// The mapping itself is one `!`, which is exactly why it needs to live
+/// here: `run()` is a printing function no unit test calls, so a mapping
+/// written inline is unpinnable, and reverting it to the pre-#1709
+/// `partition_visibility(&views, all)` would leave the whole suite green
+/// while the default silently re-flipped. This file has already paid for
+/// that lesson once — see `board_order`'s doc on shipping an INVERTED
+/// comparator because it "lived inside `run()` … so no unit test could
+/// reach it".
+fn board_partition<'a>(
+    views: &'a [MissionView<'a>],
+    missions_only: bool,
+) -> (Vec<&'a MissionView<'a>>, Vec<&'a MissionView<'a>>) {
+    // `--missions` FILTERS minted runs out; the default includes them.
+    partition_visibility(views, !missions_only)
+}
+
 fn partition_visibility<'a>(
     views: &'a [MissionView<'a>],
-    all: bool,
+    include_minted: bool,
 ) -> (Vec<&'a MissionView<'a>>, Vec<&'a MissionView<'a>>) {
-    if all {
+    if include_minted {
         return (views.iter().collect(), Vec::new());
     }
     views.iter().partition(|v| !is_minted_run(v.m))
@@ -798,17 +832,21 @@ fn attention_rollup(
         return (true, "✓ board is clean — every mission's phases are reconciled".to_string());
     }
     if visible_attention == 0 {
-        // Nothing printed above needs action, but a collapsed run does —
-        // point at `--all` rather than "commands above", since there are
-        // none above to run.
+        // Nothing printed above needs action, but a filtered-out run does.
+        // (#1709) This branch is now reachable ONLY under `--missions` —
+        // that is the only way anything lands in `hidden` — so the remedy is
+        // to DROP the filter, matching `hidden_run_summary`'s advice one line
+        // above. Suggesting `--all` here would sit under a footer offering a
+        // different cure for the same set, and an operator who ADDED `--all`
+        // to their current `--missions` invocation would see nothing new.
         let plural = if hidden_attention == 1 { "" } else { "s" };
         let verb = if hidden_attention == 1 { "needs" } else { "need" };
         let it = if hidden_attention == 1 { "it" } else { "them" };
         return (
             false,
             format!(
-                "{hidden_attention} hidden run instance{plural} {verb} attention — run `darkmux mission \
-                 status --all` to see {it} and {its} reconcile command{plural}",
+                "{hidden_attention} filtered-out run instance{plural} {verb} attention — drop \
+                 `--missions` to see {it} and {its} reconcile command{plural}",
                 its = if hidden_attention == 1 { "its" } else { "their" },
             ),
         );
@@ -2278,9 +2316,10 @@ mod tests {
         minted.spec = Some(minted_spec());
         let views = [view(&named, 1, 0), view(&minted, 1, 0)];
 
-        // What `run()` passes when `--missions` was NOT given.
-        let missions_only = false;
-        let (visible, hidden) = partition_visibility(&views, !missions_only);
+        // `board_partition` is the function `run()` itself calls (#1709 gate
+        // MF-3) — testing `partition_visibility` directly would pass even if
+        // the call site reverted to the pre-#1709 `!`-less mapping.
+        let (visible, hidden) = board_partition(&views, false);
         assert!(
             visible.iter().any(|v| v.m.id == "review-1786150410-209398"),
             "today's run instance must be ON the default board, not in a footer"
@@ -2288,7 +2327,7 @@ mod tests {
         assert!(hidden.is_empty(), "nothing is filtered out unless --missions asks for it");
 
         // …and the filter still works when asked for.
-        let (visible, hidden) = partition_visibility(&views, !true);
+        let (visible, hidden) = board_partition(&views, true);
         assert_eq!(visible.iter().map(|v| v.m.id.as_str()).collect::<Vec<_>>(), vec!["doom-loop-m4"]);
         assert_eq!(hidden.len(), 1, "--missions filters the minted run out");
     }
@@ -2336,17 +2375,19 @@ mod tests {
 
     #[test]
     fn attention_rollup_names_a_hidden_only_attention_item() {
-        // Nothing printed above needs action, but a collapsed run does — the
-        // board must not read as clean, and must point at `--all` since
-        // there are no commands above it to run.
+        // Nothing printed above needs action, but a filtered-out run does —
+        // the board must not read as clean, and (#1709) must point at
+        // DROPPING `--missions`, the only thing that could have hidden it,
+        // matching the footer's advice rather than competing with it.
         let (clean, msg) = attention_rollup(0, 1, true, false);
         assert!(!clean, "a hidden actionable run must never look like a clean board");
-        assert!(msg.contains("1 hidden run instance needs attention"), "{msg}");
-        assert!(msg.contains("--all"), "{msg}");
+        assert!(msg.contains("1 filtered-out run instance needs attention"), "{msg}");
+        assert!(msg.contains("--missions"), "{msg}");
 
         let (clean, msg) = attention_rollup(0, 2, true, false);
         assert!(!clean);
-        assert!(msg.contains("2 hidden run instances need attention"), "{msg}");
+        assert!(msg.contains("2 filtered-out run instances need attention"), "{msg}");
+        assert!(msg.contains("--missions"), "{msg}");
     }
 
     #[test]
