@@ -1,0 +1,16 @@
+{
+  "name": "darkmux-flatsat",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Packet 0b of the viewer -> React port. The FLATSAT: a docker-compose two-machine darkmux fleet (hub+peer+redis) so the viewer can be tested against LIVE daemons, real Redis, and injected failures, instead of only the static parity corpus. Seeds from tests/parity's sanitized corpus. Self-contained; does not touch tests/parity or tests/e2e.",
+  "scripts": {
+    "up": "bash up.sh",
+    "down": "bash down.sh",
+    "seed": "bun run seed/seed.mjs",
+    "scenarios": "playwright test",
+    "check": "bash check.sh"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0"
+  }
+}

@@ -1,0 +1,168 @@
+=== crumb ===
+(empty)
+
+=== meta ===
+● ready · 2  · last run 2h ago
+952 records · last 24h
+
+=== logscope ===
+runs
+
+=== stage ===
+runs · dispatch · newest 25 of 67
+all 308
+mission 108
+dispatch 67
+lab 133
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786199280181417-5
+2h ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-host-1786188712657282-1
+5h ago
+untracked
+radio-host · qwen3.6-35b-a3b-turboquant-mlx · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786188711607472-0
+5h ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-host-1786183040782553-1
+6h ago
+untracked
+radio-host · qwen3.6-35b-a3b-turboquant-mlx · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786183039911693-0
+6h ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-host-1786182435865961-1
+6h ago
+untracked
+radio-host · qwen3.6-35b-a3b-turboquant-mlx · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786182434869757-0
+6h ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786151802570362-4
+15h ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786121073895143-0
+23h ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786120995643038-3
+23h ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786120974520838-2
+23h ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786120947145183-1
+23h ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786120921622136-0
+23h ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786118525220381-1
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786118522430002-0
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786114630363736-internal
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786113399788068-internal
+1d ago
+untracked
+radio-router · qwen3.6-35b-a3b-turboquant-mlx · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786113374154365-internal
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786113252709212-internal
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786113250032083-internal
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786113209481777-internal
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786113206865215-internal
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786113098090185-internal
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786112876311662-internal
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786112864789912-internal
+1d ago
+untracked
+radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
+show all 67 — 42 more
+

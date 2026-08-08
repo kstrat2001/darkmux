@@ -91,6 +91,59 @@ export interface MachineResourcesModel {
   state: "green" | "yellow" | "red" | string;
 }
 
+/** `GET /lab/runs`'s per-seat staffing snapshot — only the fields the runs
+ * lens's series/knob-diff view actually reads (`labKnobSummary`/
+ * `labKnobDiff` in the legacy viewer). `SeatStaffingSnapshot` carries more
+ * (`role_id`, `remote`, `endpoint`, `passes`, `selector`, `provenance`) —
+ * widen this as a lens actually consumes more of it, per this file's own
+ * convention. Source: `crates/darkmux-lab/src/lab/review.rs::SeatStaffingSnapshot`. */
+export interface SeatStaffing {
+  name: string;
+  model: string;
+  k: number;
+  n_ctx?: number;
+  max_tokens?: number;
+}
+
+/** Source: `crates/darkmux-lab/src/lab/review.rs::StaffingSnapshot` (the
+ * `verify`/`request_changes` fields exist on the real struct but are unread
+ * by the runs lens's series view — same widen-when-consumed note as above). */
+export interface StaffingSnapshot {
+  probes: SeatStaffing[];
+  judge?: SeatStaffing;
+}
+
+/** One row of `GET /lab/runs`'s `runs` array — the SAME on-disk scan `/runs`
+ * folds lab-bench runs from (see `Run`'s own doc), but carrying the lab-only
+ * extras (`staffing` snapshot, bundle/flag counts) the flat `Run` shape
+ * doesn't. Source: `crates/darkmux-serve/src/lib.rs::LabRunSummary`. */
+export interface LabRun {
+  dir: string;
+  mtime_ms: number;
+  case_ids: string[];
+  crew?: string;
+  exec_mode?: string;
+  staffing?: StaffingSnapshot;
+  bundles: number;
+  raw_flags: number;
+  deduped_flags: number;
+  confirmed: number;
+  needs_check: number;
+  archived: number;
+  degenerate: boolean;
+  finished: boolean;
+}
+
+/** `GET /lab/runs` itself. `configured: false` (with an empty `runs`) means
+ * the daemon has no lab-dir source wired — never a 404/500. Source:
+ * `crates/darkmux-serve/src/lib.rs::lab_runs_handler`. */
+export interface LabRunsResponse {
+  configured: boolean;
+  dir: string | null;
+  exists: boolean | null;
+  runs: LabRun[];
+}
+
 export interface MachineResources {
   schema_version: string;
   generated_at_ms: number;

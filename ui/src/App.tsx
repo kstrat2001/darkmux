@@ -3,6 +3,7 @@ import { useHashRoute } from "./lib/useHashRoute";
 import { FleetStrip } from "./components/FleetStrip";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { MachineLens } from "./lenses/machine/MachineLens";
+import { RunsBoard } from "./lenses/runs/RunsBoard";
 import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { computeMetaLines } from "./lib/metaLine";
@@ -15,10 +16,11 @@ import type { Route } from "./lib/route";
 
 /**
  * The app shell. A `switch` over the parsed [[Route]] (see `lib/route.ts` for
- * the hash-grammar port) drives `#stage`; `fleet` (`FleetStrip`) and
- * `machine` (`MachineLens`) are this build's two real regions, every other
- * lens renders [[LensPlaceholder]] naming what still needs to be built, per
- * the render-sanity contract (never a blank page).
+ * the hash-grammar port) drives `#stage`; `fleet` (`FleetStrip`), `runs`
+ * (`RunsBoard`, Packet 3), and `machine` (`MachineLens`, Packet 2) are real
+ * regions driven by `useQuery`; every other lens renders [[LensPlaceholder]]
+ * naming what still needs to be built, per the render-sanity contract
+ * (never a blank page).
  *
  * `#crumb` and `#logscope` are LENS-SPECIFIC (legacy: `renderCrumb()`'s
  * `$("crumb").innerHTML=...` per `state.level`, and each `render*()`
@@ -110,7 +112,7 @@ function renderRoute(route: Route) {
     case "fleet":
       return <FleetStrip />;
     case "runs":
-      return <LensPlaceholder label={`runs (kind=${route.runsKind})`} />;
+      return <RunsBoard initialKind={route.runsKind} />;
     case "machine":
       return <MachineLens />;
     case "console":

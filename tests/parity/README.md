@@ -155,7 +155,7 @@ one's vocabulary.
 |---|---|---|
 | fleet (default) | `#` (no hash) | `fleet.txt` |
 | console | `#lens=console` (`&panel=<id>`) | `console.txt` (default panel: `mission-status`) |
-| runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-lab.txt` (kind=lab — a genuinely different render, the series/knob-diff view) |
+| runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-kind-lab.txt` (all four filter chips, Packet 3), `runs-series.txt` (kind=lab + the `◧ series` toggle — the ONE thing `/lab/runs` actually feeds, see the correction below; Packet 3), `runs-lens-boot.txt` (a FRESH `#lens=runs` boot, exercising `boot()`'s own `lq` deep-link branch rather than a click-through — content is byte-identical to `runs.txt` by design, since both land on kind=all over the same corpus; the golden's value is proving the boot mechanism independently, Packet 3) |
 | machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
 | session drill-in | `#session=<id>` | `session-task-list.txt` |
 
@@ -227,10 +227,23 @@ scope:
 
 - **Lab-run detail level** (`state.level==="lab-run"`, reached by clicking
   a `kind=lab` run row — either the flat list's or the `◧ series` view's) —
-  not exercised.
+  **still not exercised (Packet 3 checked and deliberately did not chase
+  this).** It needs `/lab/run/detail?dir=<dir>` and `/lab/run/events?dir=<dir>`
+  fixtures, and NEITHER is in the corpus — `lib/mock-routes.js` explicitly
+  404s both (`"lab-run drill-down not recorded in this corpus"`). Recording
+  them for real needs a daemon with a resolvable lab-run dir at `record.mjs`
+  time; fabricating them would violate the "never fabricate a fixture"
+  discipline (`record.mjs`'s own doc: "Refuses to write anything if the
+  daemon is unreachable... no fabricated fixtures"). Clicking a lab row
+  against today's corpus doesn't hang or crash — `LAB_DETAIL` stays `null`,
+  and `drillLabRun` falls back to the run list with a one-line notice — but
+  that fallback state is not the same thing as the real detail render, so it
+  isn't captured as a stand-in golden either. Follow-up: re-record with
+  `/lab/run/detail` + `/lab/run/events` for one real `dir` included.
 - **The `loose` level** (`drillLoose()` — a machine's session-less/unscoped
   records, reached by clicking a link inside the machine lens, not a
-  documented hash route) — not exercised.
+  documented hash route) — not exercised (machine-lens territory, not
+  runs-lens; left for the machine-lens packet).
 - **The catalog day-picker** (`#catpanel`, the history browser reached by
   clicking the source/date badge) — the extractor doesn't capture it at all;
   it's a modal overlay, not part of `#stage`.
@@ -238,14 +251,13 @@ scope:
   exercised. `mission-status-all`, `role-list`, `machine-status`,
   `config-list`, `flow-status`, `lab-fixture-list`, and `doctor` are
   reachable via `data-act="setpanel"` clicks but none are golden-tested.
-- **Runs lens kinds `mission` and `dispatch`** — only `kind=all` and
-  `kind=lab` are golden-tested; the other two filter chips are unexercised.
-- **The `◧ series` sub-view within kind=lab** (`state.runsSeries===true`) —
-  see the `/lab/runs` correction above; this is the one thing that endpoint
-  actually feeds, and it's recorded but not rendered into any golden.
-- **Deep-link boot paths other than `#session=<id>` and `#lens=machine`
-  (closed by Packet 2 — `machine-deeplink.txt`)** — `#lens=console&panel=<id>`,
-  a bare `#<date>` hash (playback-by-date, daemon-only), and `#mission=<id>`
+- **Deep-link boot paths other than `#session=<id>`, `#lens=runs`, and
+  `#lens=machine` (the latter two closed by Packets 3 and 2 —
+  `runs-lens-boot.txt` / `machine-deeplink.txt`)** — `#lens=console&panel=<id>`,
+  a bare `#<date>` hash (playback-by-date, daemon-only),
+  `#lens=runs&kind=<mission|dispatch|lab>` specifically as a BOOT (only the
+  plain `#lens=runs` boot is golden-tested; the kind-filtered goldens are all
+  reached by click, per the lens inventory table above), and `#mission=<id>`
   (out of scope entirely — see the lens inventory above) are still
   golden-untested.
 - **`fleet-sessions-live.json` was recorded empty** (`[]`) — no session was

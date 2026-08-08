@@ -15,7 +15,4 @@ const META_JSON = path.join(CORPUS_DIR, "meta.json");
 // The committed BUILT artifact (`ui/`'s `bun run build` output) — see
 // `next-parity.spec.ts`'s module doc. Distinct from `VIEWER_HTML`: this is
 // the React port under test, not the legacy reference.
-const NEXT_HTML = path.join(REPO_ROOT, "crates", "darkmux-serve", "assets", "next.html");
-const SERVED_NEXT_DIR = path.join(PARITY_DIR, ".served-next");
-
 module.exports = { PARITY_DIR, CORPUS_DIR, GOLDENS_DIR, SERVED_DIR, REPO_ROOT, VIEWER_HTML, META_JSON, NEXT_HTML, SERVED_NEXT_DIR };
