@@ -48,4 +48,9 @@ export const queryKeys = {
   machineResources: () => ["machine", "resources"] as const,
   panel: (id: string) => ["panel", id] as const,
   flowTail: (date: string) => ["flow", date, "tail"] as const,
+  // (Packet 4) The playback catalog (`#691`) — day/mission history browser.
+  flowDays: () => ["flow", "days"] as const,
+  flowMissions: () => ["flow", "missions"] as const,
+  flowMission: (id: string) => ["flow", "mission", id] as const,
+  flowSession: (id: string) => ["flow", "session", id] as const,
 };
