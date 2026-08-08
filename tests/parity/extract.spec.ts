@@ -91,12 +91,63 @@ test("boot + four lens tabs (fleet, console, runs, machine)", async ({ page }) =
   await extractAndWrite(page, "runs-kind-lab");
   const runsLabStageText = await regionText(page, "stage");
 
+  // 3c. runs, kind=mission — the other two filter chips (Packet 3 growth:
+  // only kind=all/kind=lab were golden-tested before this). Same re-filter,
+  // no new fetch — `.lablist` + the chip's `.on` state is the same settle
+  // pattern as 3b.
+  await page.click('[data-act="runskind"][data-arg="mission"]');
+  await waitSettled(page, expect, '#stage .lablist, [data-act="runskind"][data-arg="mission"].on', { previousText: runsLabStageText });
+  await extractAndWrite(page, "runs-kind-mission");
+  const runsMissionStageText = await regionText(page, "stage");
+
+  // 3d. runs, kind=dispatch — the last uncovered chip.
+  await page.click('[data-act="runskind"][data-arg="dispatch"]');
+  await waitSettled(page, expect, '#stage .lablist, [data-act="runskind"][data-arg="dispatch"].on', { previousText: runsMissionStageText });
+  await extractAndWrite(page, "runs-kind-dispatch");
+  const runsDispatchStageText = await regionText(page, "stage");
+
+  // 3e. runs, kind=lab, ◧ series — the series/knob-diff sub-view
+  // (`state.runsSeries===true`), reached only from under the lab filter. It
+  // is the ONE thing `/lab/runs` actually feeds (see README's correction);
+  // this golden is what makes that fixture live rather than recorded-but-
+  // inert. `.labtaskcard` is `renderLabTaskCard`'s wrapper — present only in
+  // the series view, never in the flat `.labrunrow` list — so it alone
+  // proves the toggle actually rendered the grouped view, not just flipped a
+  // CSS class on the same rows.
+  await page.click('[data-act="runskind"][data-arg="lab"]');
+  await waitSettled(page, expect, '#stage .lablist, [data-act="runskind"][data-arg="lab"].on', { previousText: runsDispatchStageText });
+  const runsLabAgainStageText = await regionText(page, "stage");
+  await page.click('[data-act="runsseries"]');
+  await waitSettled(page, expect, '#stage .lablist, [data-act="runsseries"].on', { previousText: runsLabAgainStageText });
+  await extractAndWrite(page, "runs-series");
+  const runsSeriesStageText = await regionText(page, "stage");
+
   // 4. machine — the unified local-machine page (#lens=machine). `.memcard`
   // is the loaded-content marker for the residency/RAM section — absent
   // during goMachine()'s `!b` ("loading…") branch in renderMachine().
   await page.click("#lens-machine");
-  await waitSettled(page, expect, "#stage .memcard", { previousText: runsLabStageText });
+  await waitSettled(page, expect, "#stage .memcard", { previousText: runsSeriesStageText });
   await extractAndWrite(page, "machine");
+});
+
+test("#lens=runs deep-link boot (boot()'s lq path, not a click-through)", async ({ page }) => {
+  // A FRESH boot straight at `#lens=runs` (default kind=all) — exercises
+  // `boot()`'s own `lq` deep-link branch (`state.runsKind=lq.kind||"all";
+  // goRuns()`, called BEFORE the first `render()` ever paints fleet — see
+  // viewer.html's boot()), which is a genuinely different code path than
+  // clicking the runs tab after landing on fleet (that path goes through
+  // `window.setRunsKind`/the `data-act="runs"` delegate, never through
+  // `lq`). Content is expected to match `runs.txt` byte-for-byte (same
+  // corpus, same default kind=all) — the golden's value is proving the BOOT
+  // MECHANISM independently, not a different render.
+  const meta = loadMeta();
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  installCorpusRoutes(page, meta);
+
+  await page.goto("/index.html#lens=runs");
+  await waitSettled(page, expect, "#stage .lablist");
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+  await extractAndWrite(page, "runs-lens-boot");
 });
 
 test("#session=task-list deep link (drill-in rendered inside viewer.html)", async ({ page }) => {
