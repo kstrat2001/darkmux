@@ -9,6 +9,7 @@
     "rebaseline": "bun run extract",
     "verify": "bun run verify-goldens.mjs",
     "redprove": "playwright test redprove.spec.ts",
+    "next-parity": "playwright test --config next-playwright.config.js",
     "determinism": "bun run determinism.mjs",
     "tripwire": "bun run tripwire.mjs",
     "check": "bun run verify && bun run redprove && bun run determinism && bun run tripwire"

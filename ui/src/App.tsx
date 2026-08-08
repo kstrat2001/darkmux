@@ -1,12 +1,13 @@
 import { useHashRoute } from "./lib/useHashRoute";
 import { FleetStrip } from "./components/FleetStrip";
 import { LensPlaceholder } from "./components/LensPlaceholder";
+import { RunsBoard } from "./lenses/runs/RunsBoard";
 import type { Route } from "./lib/route";
 
 /**
  * The app shell. A `switch` over the parsed [[Route]] (see `lib/route.ts` for
- * the hash-grammar port) — `fleet` is this packet's ONE real region
- * (`FleetStrip`, driven by `useQuery`); every other lens renders
+ * the hash-grammar port) — `fleet` (`FleetStrip`) and `runs` (`RunsBoard`,
+ * Packet 3) are real regions driven by `useQuery`; every other lens renders
  * [[LensPlaceholder]] naming what still needs to be built, per the
  * render-sanity contract (never a blank page).
  */
@@ -49,7 +50,7 @@ function renderRoute(route: Route) {
     case "fleet":
       return <FleetStrip />;
     case "runs":
-      return <LensPlaceholder label={`runs (kind=${route.runsKind})`} />;
+      return <RunsBoard initialKind={route.runsKind} />;
     case "machine":
       return <LensPlaceholder label="machine" />;
     case "console":
