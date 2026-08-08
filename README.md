@@ -18,7 +18,7 @@ darkmux init      # config + profiles + agent skills (never overwrites)
 darkmux doctor    # pre-flight: LMStudio, models, Docker, runtime, RAM
 ```
 
-You need [LMStudio](https://lmstudio.ai/) with at least one model downloaded, and [Docker](https://www.docker.com/products/docker-desktop) for the dispatch path: the runtime image pulls from GHCR on first use. Building from source, hub setup, updating, configuration: [docs/OPERATIONS.md](docs/OPERATIONS.md) · [full guide](https://darkmux.com/guide/).
+Local seats run on [LMStudio](https://lmstudio.ai/) (one downloaded model minimum). Any seat can instead be staffed by a hosted OpenAI-compatible endpoint: a machine with zero local models still runs full reviews. [Docker](https://www.docker.com/products/docker-desktop) hosts the dispatch runtime; the image pulls from GHCR on first use. Building from source, hub setup, updating, configuration: [docs/OPERATIONS.md](docs/OPERATIONS.md) · [full guide](https://darkmux.com/guide/).
 
 ## Your first mission
 
@@ -64,7 +64,7 @@ darkmux exists because the [Genesis series](https://darklyenergized.substack.com
 
 ## Honest limits
 
-- **Backend: LMStudio, today.** The abstraction for a second backend is deliberately unbuilt until a real one has a real user ([#316](https://github.com/kstrat2001/darkmux/issues/316)).
+- **Local model server: LMStudio, today.** A second local backend (Ollama, llama.cpp) is deliberately unbuilt until a real one has a real user ([#316](https://github.com/kstrat2001/darkmux/issues/316)). Hosted endpoints are not the gap: any seat can run on an OpenAI-compatible cloud endpoint today.
 - **Developed and dogfooded on Apple Silicon.** Linux compiles and passes CI's fleet tests, but nobody dogfoods it yet; Intel Mac is untested.
 - **Built to be driven by a frontier orchestrator** (Claude Code or equivalent). Standalone CLI use works for scripting; orchestrator-driven is the design.
 - **One operator, their own machines.** Not team tooling, not multi-tenant: a few Macs on a tailnet you trust. That's a focus, not a fence.
