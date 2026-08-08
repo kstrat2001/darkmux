@@ -11,7 +11,6 @@ import {
   runsMultiMachine,
   runsAgo,
   runSubtitle,
-  shortModel,
   groupLabRunsByTask,
   labKnobSummary,
   labKnobDiff,
@@ -294,7 +293,3 @@ function LabTaskCard({ group }: { group: LabTaskGroup }) {
     </div>
   );
 }
-
-// Referenced only for the `shortModel` re-export used by tests that exercise
-// this module's formatting surface via the component's own import graph.
-export { shortModel };
