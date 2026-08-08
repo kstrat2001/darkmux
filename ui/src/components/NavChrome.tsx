@@ -54,6 +54,11 @@ function isActive(route: Route, tab: TabAct): boolean {
       return tab === "console";
     case "unknown":
       return false;
+    case "playback":
+      // (merge of packets 1.5 + 4) A bare-date playback view is a
+      // time-scoped FLEET rendering in legacy (`live=false`, same hero) —
+      // fleet is the honest tab.
+      return tab === "fleet";
   }
 }
 

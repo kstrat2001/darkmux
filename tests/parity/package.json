@@ -14,6 +14,7 @@
     "tripwire": "bun run tripwire.mjs",
     "check": "bun run verify && bun run redprove && bun run determinism && bun run tripwire",
     "next-parity": "playwright test --config next-parity.playwright.config.js",
+    "next-parity-catalog": "playwright test --config next-parity-catalog.playwright.config.js",
     "next-parity-chrome": "playwright test --config nav-chrome.playwright.config.js"
   },
   "devDependencies": {
