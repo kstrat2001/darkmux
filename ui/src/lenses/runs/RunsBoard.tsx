@@ -78,7 +78,32 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
   // mounted (route.runsKind changes without the runs lens itself
   // unmounting) re-syncs local filter state — mirrors `window.goRuns`
   // resetting `state.runsAll=false` on every fresh entry into the lens.
+  //
+  // QA must-fix (2026-08-09): `if (initialKind === kind) return;` guards
+  // against the WRITE-BACK ECHO Packet 1.5 armed. `selectKind`'s own
+  // `writeHash` call fires `history.replaceState`, which — same as legacy's
+  // `syncLabHash` — never dispatches `hashchange`. `useHashRoute`'s
+  // module-level `cachedHref` therefore goes stale; the NEXT App re-render
+  // for ANY unrelated reason (the presence poll, a query refetch — anything
+  // that touches `location.href` freshly) recomputes a `Route` whose
+  // `runsKind` now matches what the operator already clicked, and without
+  // this guard `initialKind` would look like a FRESH deep-link into a
+  // different kind, silently resetting `series`/`showAll`/the row-click
+  // notice out from under an operator who touched nothing. The guard is
+  // exactly "only a GENUINE kind change resets" — `initialKind !== kind`
+  // is true both for a real deep-link (arriving on a different `kind=`)
+  // and for the FIRST render after mount (`kind` seeded from `initialKind`,
+  // so they're already equal and this effect no-ops on mount too, matching
+  // its prior behavior there). Two alternatives that look right and
+  // aren't (ruled out during QA): pinning `useHashRoute`'s cache would
+  // leave THIS board stale after a later nav-tab click away and back;
+  // switching `selectKind`'s write to `location.hash = ...` would fire
+  // `hashchange` (fixing this symptom) but ALSO push a new history entry
+  // per chip click, breaking legacy's "lens hops must not spam history"
+  // contract (`syncLabHash`'s own comment) — `replaceState` is the whole
+  // reason legacy's mechanism exists.
   useEffect(() => {
+    if (initialKind === kind) return;
     setKind(initialKind);
     setSeries(false);
     setShowAll(false);

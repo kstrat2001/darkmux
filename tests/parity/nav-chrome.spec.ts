@@ -16,27 +16,48 @@
 // Deliberately DOES NOT install the frozen clock the byte-parity specs use
 // (`installFrozenClock`, from the same module). This spec asserts hash/DOM
 // mechanics, never relative-time TEXT, so it doesn't need the determinism a
-// frozen clock buys — and installing it actively BREAKS this spec: root-caused
-// by hand (temporarily removed, re-added, `debug-chrome.spec.ts` scratch file
-// deleted after) to `MachineLens`'s `resourcesQuery` (`refetchInterval:
-// MACHINE_MEM_POLL_MS`) — under Playwright's `page.clock.install()` (which
-// fakes `requestAnimationFrame` among other timers), a REAL `page.click()`
-// through the nav tab left `/machine/resources`'s 200 response sitting in
-// TanStack Query's cache while the component stayed rendered at
-// `data-state="loading"` indefinitely; the SAME navigation via
-// `page.evaluate(() => location.hash = ...)` (what `next-parity.spec.ts` uses)
-// was unaffected. A real click's actionability wait (browser-side stability
-// checks) interacting with a faked `requestAnimationFrame` is the suspected
-// mechanism; a harness quirk, not a product bug — `next-parity.spec.ts`'s own
+// frozen clock buys — and installing it actively BREAKS this spec.
+//
+// THE HARNESS RULE (sharpened per QA, 2026-08-09 — durable, not packet-local):
+// `installFrozenClock` does `page.clock.install({time}); page.clock.pauseAt(time)`
+// — that second call is load-bearing: `install()` alone sets an origin but
+// lets timers keep firing in real wall-clock time from there (the SAME gotcha
+// `lib/extract-lens.js`'s own doc names for the extraction side); `pauseAt()`
+// is what makes the clock FULLY PAUSED — no `setTimeout`/`requestAnimationFrame`
+// fires at all until something explicitly advances it. The failure mode is
+// precisely: a REAL `page.click()` OBSERVED THROUGH a TanStack Query carrying
+// a `refetchInterval` (`MachineLens`'s `resourcesQuery`,
+// `refetchInterval: MACHINE_MEM_POLL_MS`) — under a fully paused clock, the
+// fetch's own 200 response lands in cache but the component never re-renders
+// past `data-state="loading"`; the same navigation via
+// `page.evaluate(() => location.hash = ...)` (what `next-parity.spec.ts`
+// uses) is unaffected, and a real click against LOCAL REACT STATE (no query,
+// no `refetchInterval`) is ALSO unaffected — proof: `next-parity-runs.spec.ts`'s
+// own "kind=lab + ◧ series toggle" test does a genuine `page.click()` on the
+// series toggle UNDER a frozen clock and passes cleanly every run, because
+// that toggle is `useState`, not a polled query. The bug needs BOTH a real
+// click AND a refetchInterval-bearing query sitting downstream of it.
+//
+// Root-caused by hand (frozen clock temporarily removed, re-added, a
+// `debug-chrome.spec.ts` scratch repro file used then deleted). Three-line
+// repro, for the next person who hits this shape:
+//   await page.clock.install({ time }); await page.clock.pauseAt(time);
+//   await page.goto("/index.html");
+//   await page.click('[data-act="machine"]'); // stuck at data-state="loading" forever
+//
+// A harness quirk, not a product bug — `next-parity.spec.ts`'s own
 // machine-lens goldens (which DO use the frozen clock, via `location.hash =`
 // assignment, never a real click) are unaffected and remain the byte-parity
-// source of truth for that lens's rendered content.
+// source of truth for that lens's rendered content. This spec simply drops
+// the frozen clock rather than working around the interaction, since it has
+// no need for frozen relative-time text in the first place.
 
 import { test, expect } from "@playwright/test";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { loadMeta, installCorpusRoutes } from "./lib/mock-routes.js";
 import { waitSettled } from "./lib/extract-lens.js";
+import { CORPUS_DIR } from "./lib/paths.js";
 
 // Gitignored, repo-relative by default (`tests/parity/.gallery/1.5-chrome/`)
 // — NOT an operator machine path (the QA must-fix pattern every earlier
@@ -159,5 +180,72 @@ test.describe("nav chrome (Packet 1.5)", () => {
     }).toPass({ timeout: 5000 });
     await expect(page.locator("#lens-runs")).toHaveClass(/\bon\b/);
     await page.screenshot({ path: shot("chrome-runs-kind-chip.png"), fullPage: true });
+  });
+
+  // QA regression test (2026-08-09) for the write-back echo MUST-FIX:
+  // `writeHash`'s `replaceState` fires ZERO `hashchange` events, so
+  // `useHashRoute`'s module-level `cachedHref` goes stale the instant a
+  // kind chip is clicked. The NEXT App re-render for ANY unrelated reason
+  // (App's own `useLiveMachines()` polls `/fleet/machines/live` every
+  // `PRESENCE_POLL_MS` — 5s) then recomputes a fresh `Route` whose
+  // `runsKind` matches what the operator already selected, which
+  // `RunsBoard`'s `useEffect([initialKind])` used to treat as a BRAND NEW
+  // deep-link and reset `series`/`showAll`/the row-click notice out from
+  // under the operator. Fixed by a `if (initialKind === kind) return;`
+  // guard in that effect (see `RunsBoard.tsx`).
+  //
+  // QA's own diagnosis of why the OTHER tests in this file (and every
+  // corpus-backed next-parity spec) never caught it: the corpus is a
+  // STATIC fixture, so every `/fleet/machines/live` poll returns
+  // byte-identical content — TanStack Query's structural sharing collapses
+  // that into a no-op query-state change, App never actually re-renders,
+  // and the echo path is never exercised. This test defeats structural
+  // sharing on purpose: `page.route` handlers are LIFO (the LAST
+  // registered one wins for a matching URL), so registering a SECOND
+  // `/fleet/machines/live` handler AFTER `installCorpusRoutes` overrides
+  // the corpus fixture with a response that bumps `beat_ts_ms` on every
+  // single call — a genuinely NEW value each poll, which forces a real
+  // re-render.
+  test("a runs-lens kind-chip selection survives an unrelated App re-render (regression: the write-back echo must not reset the board)", async ({
+    page,
+  }) => {
+    const meta = loadMeta();
+    installCorpusRoutes(page, meta);
+
+    const liveMachinesFixture = JSON.parse(readFileSync(path.join(CORPUS_DIR, "fleet-machines-live.json"), "utf8"));
+    let pollCount = 0;
+    // Registered AFTER installCorpusRoutes -> Playwright routes LIFO -> this
+    // one wins. See the module-level comment above for why the bumped
+    // `beat_ts_ms` (not just "any handler") is the load-bearing part.
+    await page.route("**/fleet/machines/live", (route) => {
+      pollCount++;
+      const fresh = liveMachinesFixture.map((m) => ({ ...m, beat_ts_ms: Date.now() }));
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fresh) });
+    });
+
+    await page.goto("/index.html#lens=runs");
+    await waitSettled(page, expect, '[data-state="data"], [data-state="pending"]');
+
+    // Operator action: select kind=lab, then toggle the series view — the
+    // exact sequence QA's live-browser repro used.
+    await page.click('[data-arg="lab"]');
+    await expect(page.locator('[data-arg="lab"].on')).toBeAttached();
+    await page.click('[data-arg="series"]');
+    await expect(page.locator('[data-arg="series"].on')).toBeAttached();
+
+    const headerBefore = await page.locator(".stagehdr").innerText();
+    expect(headerBefore, "the series view's own header must actually say 'series' before we can prove it survives").toMatch(/series/);
+
+    // Touch nothing. Wait long enough for the 5s presence poll to fire at
+    // least once (and for React to process whatever re-render it triggers).
+    await page.waitForTimeout(8_000);
+
+    expect(pollCount, "the presence-poll override must have actually fired at least once, or this test proves nothing").toBeGreaterThan(0);
+
+    const headerAfter = await page.locator(".stagehdr").innerText();
+    expect(
+      headerAfter,
+      `the runs board must NOT revert out of series view just because an unrelated poll re-rendered the app (got: "${headerAfter}")`,
+    ).toMatch(/series/);
   });
 });

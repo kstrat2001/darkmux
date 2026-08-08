@@ -23,8 +23,12 @@ describe("NavChrome", () => {
     // Legacy: `state.level==="subsystem"` (a session drill-in) leaves the
     // fleet tab lit — see `NavChrome.tsx`'s own `isActive` doc.
     [{ kind: "session", sessionId: "abc-123" }, "lens-fleet"],
-    // Legacy: `inMission` also lights the console tab.
-    [{ kind: "mission-redirect", missionId: "m1" }, "lens-console"],
+    // QA correction (2026-08-09): mission-redirect lights fleet, not
+    // console — `inMission`'s console-lighting is only reachable via
+    // legacy's daemon-less static fallback, never the live-daemon
+    // `#mission=` redirect this app actually exercises. See
+    // `NavChrome.tsx`'s own `isActive` doc for the full measurement.
+    [{ kind: "mission-redirect", missionId: "m1" }, "lens-fleet"],
   ])("highlights exactly the tab matching %o -> %s", (route, expectedOnId) => {
     render(<NavChrome route={route} />);
     const tabs = screen.getAllByRole("link");

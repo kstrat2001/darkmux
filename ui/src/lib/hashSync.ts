@@ -37,14 +37,35 @@ import type { Route } from "./route";
  * Scope: only the params THIS packet's lenses actually drive
  * (`lens`/`kind`/`panel`/`session`) are written. `run` (the lab-run-detail
  * deep link) and `mission` (the mission-graph full-navigation) are both
- * genuinely out of scope this packet — see `route.ts`'s own module doc —
- * so neither is ever written here; a route carrying one (parsed from an
- * incoming deep link) is left untouched by design. `mission-redirect` and
- * `unknown` routes are likewise never canonicalized: legacy does a full
- * navigation away for the former (nothing left to write back to), and
- * rewriting an `unknown` hash would silently "fix" what should stay a
- * visible, debuggable broken bookmark (`LensPlaceholder` names the raw
- * hash for exactly this reason — see that component's doc).
+ * genuinely out of scope this packet — see `route.ts`'s own module doc.
+ *
+ * QA correction (2026-08-09): an earlier version of this doc claimed a
+ * `run` param survives untouched. It does NOT — `canonicalHash`'s `"runs"`
+ * branch never reads `route.run`, so booting on `#lens=runs&run=/x/y`
+ * gets REWRITTEN to the bare `#lens=runs` the moment `useSyncHash`'s
+ * effect fires (which includes the very first render, mount included) —
+ * the `run` param is silently dropped, not preserved. QA measured that
+ * this is actually the FAITHFUL analog of legacy's own behavior, not a
+ * deviation from it: legacy's `syncLabHash` only WRITES `run` when
+ * `state.level==="lab-run"` — i.e. when `drillLabRun` actually resolved
+ * the dir and the operator is genuinely looking at a lab-run detail pane;
+ * for an unresolvable `run` (the dir doesn't match anything, or — as
+ * here — the drill-down code path doesn't exist at all) legacy's `else`
+ * branch deletes the param too. Since this port never implements
+ * `state.level==="lab-run"` at all (lab-run detail is out of scope — see
+ * `route.ts`'s module doc), EVERY `run=` this port receives is
+ * structurally in legacy's "unresolvable" bucket, so always dropping it
+ * reproduces legacy's actual behavior for the only case this port can
+ * ever hit — it isn't an omission, it's the faithful mapping. Revisit
+ * this comment (and add `run` to `canonicalHash`'s `"runs"` branch) the
+ * day a lab-run-detail packet lands.
+ *
+ * `mission-redirect` and `unknown` routes are likewise never
+ * canonicalized: legacy does a full navigation away for the former
+ * (nothing left to write back to), and rewriting an `unknown` hash would
+ * silently "fix" what should stay a visible, debuggable broken bookmark
+ * (`LensPlaceholder` names the raw hash for exactly this reason — see
+ * that component's doc).
  */
 export function canonicalHash(route: Route): string | null {
   switch (route.kind) {

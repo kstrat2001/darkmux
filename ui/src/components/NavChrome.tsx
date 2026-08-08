@@ -15,10 +15,26 @@ type TabAct = (typeof TABS)[number]["act"];
  * `(inMission||inRuns||inMachine||inConsole)?"":" on"`) — which includes
  * the `session` drill-in (legacy's `state.level==="subsystem"` state also
  * leaves fleet lit, since a session drills IN from fleet, not from a lens
- * tab). `mission-redirect` mirrors legacy's `inMission` lighting the
- * console tab (`(inConsole||inMission)?" on":""`) — the mission-graph
- * click is reached FROM the console lens's board in legacy, so the same
- * tab stays highlighted through the (out-of-scope, see route.ts) redirect.
+ * tab) AND `mission-redirect`.
+ *
+ * QA correction (2026-08-09): an earlier version of this comment mapped
+ * `mission-redirect` to the CONSOLE tab, reasoning from `inMission` in the
+ * `.on`-class assignment above. QA MEASURED live against the real corpus
+ * that this is wrong for the path our port actually exercises: `inMission`
+ * (`state.level==="mission"`) is only ever reached through
+ * `renderMissionStatic()`, legacy's DAEMON-LESS static-build fallback for
+ * `#mission=<id>` — a code path this app never runs (see `route.ts`'s own
+ * module doc: this app always has a daemon). On a live daemon (this
+ * harness's setup, and every real `/next` deployment), `#mission=<id>`
+ * does a FULL NAVIGATION (`location.href = "/mission/<id>/graph"`) before
+ * `inMission` is ever computed — nothing about `.lenstabs` is observable
+ * mid-redirect, and the `#mission=` hash is typically reached FROM the
+ * fleet hero (a mission card), not the console board. `fleet` is the
+ * faithful placeholder-state mapping for the live-daemon path; if a future
+ * packet reaches `#mission=<id>` some other way (e.g. from within the
+ * console board), revisit this mapping against how THAT click actually
+ * arrives.
+ *
  * `unknown` lights no tab — there's no legacy analog (an unrecognized
  * `lens=` silently falls back to fleet there; this port renders it as a
  * visibly distinct placeholder instead, a documented deviation — see
@@ -28,13 +44,13 @@ function isActive(route: Route, tab: TabAct): boolean {
   switch (route.kind) {
     case "fleet":
     case "session":
+    case "mission-redirect":
       return tab === "fleet";
     case "runs":
       return tab === "runs";
     case "machine":
       return tab === "machine";
     case "console":
-    case "mission-redirect":
       return tab === "console";
     case "unknown":
       return false;
