@@ -288,6 +288,26 @@ fn render_help_block() -> String {
 /// one"). Counts by status plus up to 5 non-terminal (Active/Paused)
 /// mission ids, never the full board render `mission status` itself
 /// produces (that's an operator-facing table, not grounding text).
+/// How many recent missions the board block names (#1713). Small on
+/// purpose: this is grounding for one answer, not a listing — the operator
+/// asking "what's recent" needs the top of the list, and `darkmux mission
+/// status` is the surface that shows the rest.
+const RECENT_MISSIONS_IN_BOARD_BLOCK: usize = 5;
+
+/// The lowercase status word for a mission, for the grounding block. Kept
+/// local rather than borrowed from `mission_status` — that module's copy is
+/// board-rendering detail, and a model-facing string should not silently
+/// change when a board's presentation does.
+fn status_word(s: crate::crew::types::MissionStatus) -> &'static str {
+    use crate::crew::types::MissionStatus as M;
+    match s {
+        M::Active => "active",
+        M::Paused => "paused",
+        M::Finalized => "finalized",
+        M::Aborted => "aborted",
+    }
+}
+
 fn render_board_block() -> Option<String> {
     let missions = crate::crew::loader::load_missions().ok()?;
     if missions.is_empty() {
@@ -312,6 +332,40 @@ fn render_board_block() -> Option<String> {
     if !live.is_empty() {
         out.push_str("Active/paused: ");
         out.push_str(&live.join(", "));
+        out.push('\n');
+    }
+
+    // (#1713) The MOST RECENT missions, whatever their status.
+    //
+    // This block used to name only the active/paused ones, on the assumption
+    // that open work is the interesting work. That is the same assumption
+    // #1709 just removed from the CLI board, and it fails the same way: an
+    // operator with nothing open (every mission finalized — the ordinary
+    // state on a machine whose recent work is all run instances) got a
+    // grounding bundle containing zero mission NAMES. Asked "what's the most
+    // recent mission?", the answering seat correctly declined, because the
+    // harness had handed it counts and nothing else.
+    //
+    // Ordered by the same "last touched" rule the board uses (a max over the
+    // present transition stamps — which field is newest depends on the
+    // mission's path through the state machine).
+    let mut recent: Vec<&crate::crew::types::Mission> = missions.iter().collect();
+    recent.sort_by_key(|m| {
+        std::cmp::Reverse(
+            m.created_ts
+                .max(m.started_ts.unwrap_or(0))
+                .max(m.paused_ts.unwrap_or(0))
+                .max(m.finalized_ts.unwrap_or(0)),
+        )
+    });
+    if !recent.is_empty() {
+        out.push_str("Most recent (newest first): ");
+        let rows: Vec<String> = recent
+            .iter()
+            .take(RECENT_MISSIONS_IN_BOARD_BLOCK)
+            .map(|m| format!("{} ({})", m.id, status_word(m.status)))
+            .collect();
+        out.push_str(&rows.join(", "));
         out.push('\n');
     }
     Some(truncate_chars(&out, BOARD_CAP_CHARS))
