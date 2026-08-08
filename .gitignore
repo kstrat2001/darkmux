@@ -50,3 +50,11 @@ tests/parity/.verify-snapshot/
 tests/parity/corpus.tmp-*/
 tests/parity/test-results/
 tests/parity/playwright-report/
+
+# Flatsat (Packet 0b) — local artifacts. .state/ is the seeded/bind-mounted
+# DARKMUX_HOME for each container (regenerated every `up` by seed.mjs from
+# the parity corpus + a hand-authored peer fixture); never committed.
+tests/flatsat/node_modules/
+tests/flatsat/.state/
+tests/flatsat/test-results/
+tests/flatsat/playwright-report/
