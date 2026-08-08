@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
+import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import type { RunsResponse, LabRunsResponse, LabRun } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
@@ -53,6 +54,16 @@ import {
  * visible one-line `.labnotice` naming the gap and pointing at the classic
  * viewer, per the operator-authored posture (a stuck feature gets a visible
  * placeholder, not just a code comment nobody but a future dev will read).
+ *
+ * Hash write-back (Packet 1.5): a kind-chip click changes no `Route` (no
+ * `hashchange` fires — this is purely local state), so `App`'s route-keyed
+ * `useSyncHash` effect (`lib/hashSync.ts`) would never see it. `selectKind`
+ * therefore calls `writeHash`/`canonicalHash` DIRECTLY, at the moment of the
+ * click, constructing the same `{kind:"runs", runsKind:k}` shape the route
+ * parser would have produced had the operator arrived via a `kind=`
+ * deep-link — so the address bar always names the filter actually on
+ * screen, matching legacy's `setRunsKind`'s own `render()` (which calls
+ * `syncLabHash` every time, chip clicks included).
  */
 const NOT_PORTED_NOTICE = "run detail isn't in /next yet — open it in the classic viewer at /";
 
@@ -67,7 +78,32 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
   // mounted (route.runsKind changes without the runs lens itself
   // unmounting) re-syncs local filter state — mirrors `window.goRuns`
   // resetting `state.runsAll=false` on every fresh entry into the lens.
+  //
+  // QA must-fix (2026-08-09): `if (initialKind === kind) return;` guards
+  // against the WRITE-BACK ECHO Packet 1.5 armed. `selectKind`'s own
+  // `writeHash` call fires `history.replaceState`, which — same as legacy's
+  // `syncLabHash` — never dispatches `hashchange`. `useHashRoute`'s
+  // module-level `cachedHref` therefore goes stale; the NEXT App re-render
+  // for ANY unrelated reason (the presence poll, a query refetch — anything
+  // that touches `location.href` freshly) recomputes a `Route` whose
+  // `runsKind` now matches what the operator already clicked, and without
+  // this guard `initialKind` would look like a FRESH deep-link into a
+  // different kind, silently resetting `series`/`showAll`/the row-click
+  // notice out from under an operator who touched nothing. The guard is
+  // exactly "only a GENUINE kind change resets" — `initialKind !== kind`
+  // is true both for a real deep-link (arriving on a different `kind=`)
+  // and for the FIRST render after mount (`kind` seeded from `initialKind`,
+  // so they're already equal and this effect no-ops on mount too, matching
+  // its prior behavior there). Two alternatives that look right and
+  // aren't (ruled out during QA): pinning `useHashRoute`'s cache would
+  // leave THIS board stale after a later nav-tab click away and back;
+  // switching `selectKind`'s write to `location.hash = ...` would fire
+  // `hashchange` (fixing this symptom) but ALSO push a new history entry
+  // per chip click, breaking legacy's "lens hops must not spam history"
+  // contract (`syncLabHash`'s own comment) — `replaceState` is the whole
+  // reason legacy's mechanism exists.
   useEffect(() => {
+    if (initialKind === kind) return;
     setKind(initialKind);
     setSeries(false);
     setShowAll(false);
@@ -105,6 +141,7 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
     setShowAll(false);
     setRowClickNotice(null);
     if (k !== "lab") setSeries(false);
+    writeHash(canonicalHash({ kind: "runs", runsKind: k, run: null }));
   }
 
   // viewer.html: `labSourceNotice()`.

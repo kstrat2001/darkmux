@@ -1,7 +1,9 @@
 import { useMemo } from "react";
 import { useHashRoute } from "./lib/useHashRoute";
+import { useSyncHash } from "./lib/hashSync";
 import { FleetStrip } from "./components/FleetStrip";
 import { LensPlaceholder } from "./components/LensPlaceholder";
+import { NavChrome } from "./components/NavChrome";
 import { MachineLens } from "./lenses/machine/MachineLens";
 import { RunsBoard } from "./lenses/runs/RunsBoard";
 import { useFlowWindow } from "./hooks/useFlowWindow";
@@ -34,6 +36,30 @@ import type { Route } from "./lib/route";
  * `useFlowWindow`/`useLiveMachines`/`machineSpecs` queries are ALSO used
  * inside `MachineLens` — TanStack Query dedupes by queryKey, so this is
  * cache reuse, not a second network round trip.
+ *
+ * Packet 1.5 additions (nav chrome + hash write-back — the scaffold gap
+ * both the machine and runs lens packets independently flagged as a hard
+ * blocker for the eventual `/next` → `/` flip):
+ *
+ * - `<NavChrome>` (see that component's own doc) is a new sibling INSIDE a
+ *   `.app-shell__crumbbar` wrapper alongside `#crumb`/`#meta` — a pure DOM
+ *   restructuring, not a content change: the parity extractor
+ *   (`tests/parity/lib/extract-lens.js`) selects `#crumb`/`#meta` BY ID
+ *   regardless of parent, so moving their container doesn't touch
+ *   byte-parity. `#logscope`/`#stage` are untouched siblings, same as
+ *   before.
+ * - `useSyncHash` (see `lib/hashSync.ts`) is the `/next` port of legacy's
+ *   `syncLabHash()` — reflects the current `Route` back into `location.hash`
+ *   via `replaceState` on every route change, so every view is bookmarkable
+ *   (matches legacy's own reasoning: the phone dashboard is the first-class
+ *   consumer). This is also what performs the legacy `#lens=lab` →
+ *   `#lens=runs&kind=lab` upgrade, since arriving on the alias parses to
+ *   the canonical `Route` already and the write-back just names it.
+ *   `RunsBoard`'s kind chips are the one piece of lens state that changes
+ *   WITHOUT a route change (no `hashchange` fires) — that write goes
+ *   straight from `RunsBoard.tsx`'s `selectKind` to `hashSync.ts`'s
+ *   `writeHash`, not through this route-keyed effect (see that file's own
+ *   doc for why).
  */
 export function App() {
   const route = useHashRoute();
@@ -57,24 +83,29 @@ export function App() {
 
   const { crumb, logscope } = routeChrome(route, localName);
 
+  useSyncHash(route);
+
   return (
     <div className="app-shell">
-      <header className="app-shell__crumb" id="crumb">
-        {crumb}
-      </header>
-      <div className="app-shell__meta" id="meta">
-        {/* `whiteSpace: "pre"` — the idle headline's literal double space
-            before "· last run" (see `metaLine.ts`'s module doc) is an
-            artifact of legacy's icon SPAN breaking the whitespace-collapse
-            run; default `white-space: normal` would collapse it back to
-            one space here, since there's no element in the way. Preserving
-            it verbatim is simpler and more robust than reproducing the
-            icon-boundary quirk with a real (empty) element. */}
-        {metaLines.map((line, i) => (
-          <div key={i} style={{ whiteSpace: "pre" }}>
-            {line}
-          </div>
-        ))}
+      <div className="app-shell__crumbbar">
+        <NavChrome route={route} />
+        <header className="app-shell__crumb" id="crumb">
+          {crumb}
+        </header>
+        <div className="app-shell__meta" id="meta">
+          {/* `whiteSpace: "pre"` — the idle headline's literal double space
+              before "· last run" (see `metaLine.ts`'s module doc) is an
+              artifact of legacy's icon SPAN breaking the whitespace-collapse
+              run; default `white-space: normal` would collapse it back to
+              one space here, since there's no element in the way. Preserving
+              it verbatim is simpler and more robust than reproducing the
+              icon-boundary quirk with a real (empty) element. */}
+          {metaLines.map((line, i) => (
+            <div key={i} style={{ whiteSpace: "pre" }}>
+              {line}
+            </div>
+          ))}
+        </div>
       </div>
       {/* Visible (never `display:none`) — `innerText`, which the parity
           harness extracts, returns "" for a hidden element; see
