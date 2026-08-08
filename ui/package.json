@@ -1,0 +1,35 @@
+{
+  "name": "darkmux-viewer-next",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Packet 1 of the viewer -> React port: the scaffold. React + TanStack Query + ts-rs types over the existing daemon JSON endpoints, built to one committed self-contained artifact (crates/darkmux-serve/assets/next.html) served at GET /next.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "bun run typecheck && vite build && bun run copy-artifact",
+    "copy-artifact": "cp dist/index.html ../crates/darkmux-serve/assets/next.html",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "types:regen": "(cd .. && cargo test -p darkmux-serve export_bindings --lib)",
+    "types:check": "bun run types:regen && git diff --exit-code -- src/types/generated"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.101.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^6.0.5",
+    "jsdom": "^30.0.1",
+    "typescript": "^5.6.3",
+    "vite": "^8.2.1",
+    "vite-plugin-singlefile": "^2.3.3",
+    "vitest": "^4.1.10"
+  }
+}
