@@ -1,0 +1,820 @@
+=== crumb ===
+(empty)
+
+=== meta ===
+● ready · 2  · last run 2h ago
+952 records · last 24h
+
+=== logscope ===
+runs
+
+=== stage ===
+runs · lab series · 133 runs · 4 tasks
+all 308
+mission 108
+dispatch 67
+lab 133
+◧ series
+(case pending)
+91 RUNS
+● LIVE
+(crew unknown)
+review-bench-1786125001194
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786123759517
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786123489502
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786123090473
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786118605041
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786118187734
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786117888861
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786117072744
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786116627286
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786115911662
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786110214781
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786089527475
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786089220048
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1786083717750
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785909328136
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785891997494
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785891900851
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785889938692
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785889819932
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785889479667
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785889146683
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785888837866
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785855798988
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785854895467
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785847806208
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785845912207
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785843095940
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785829099142
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785829042909
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785828992066
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785828989644
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785828976426
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785828975358
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785828937253
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785828863062
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785828817299
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785828770783
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785828723491
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785828484475
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785760383401
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785757770716
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785754477443
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785751969523
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785750535792
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785734872887
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785731848999
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785729468430
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785400101406
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785394740969
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785391669461
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785380611017
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785341594502
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785339707451
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785339220926
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785295386377
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785294669764
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785291804515
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785223451368
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785223249303
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785215713842
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785213224816
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785213161589
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785212305266
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785199961612
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785198828165
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785197737436
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785164564415
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785163836082
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785163768454
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785159400968
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785157701168
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785066271792
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785064324379
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785063732561
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785061219165
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785060751429
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785057255200
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785056926880
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785056676380
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785055285518
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785054162104
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785053931849
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785052605275
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785051507411
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785051230684
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785048829389
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785032500794
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+● LIVE
+(crew unknown)
+review-bench-1785032480445
+staffing pending — first case hasn't completed yet
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+tool-bench-anchor-remote-azure-review-1783252054-1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+tool-bench-k3-deep-1783250143-1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+tool-bench-deep-1783249302-1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+c1
+3 RUNS
+FINISHED
+review-funnel
+review-bench-1785032401234
+3 probes (k=1,1,1) · judge model-a k=1 · 32K ctx
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0 · ⚠ degenerate
+⚠ multi-variable change: crew deep→review-funnel · exec_mode auto→sequential · -probe deep · +probe review-funnel (model-a) · judge.model qwen3.6-35b-a3b-turboquant-mlx→model-a · judge.n_ctx 262144→32000
+FINISHED
+deep
+review-bench-1784246826653
+1 probe (k=3) · judge qwen3.6-35b-a3b-turboquant-mlx k=1 · 262K ctx
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0 · ⚠ degenerate
+⚠ multi-variable change: crew remote-crew→deep · exec_mode parallel→auto · -probe cloud · +probe deep (qwen3.6-35b-a3b-turboquant-mlx) · judge.model gpt-remote→qwen3.6-35b-a3b-turboquant-mlx · judge.k 3→1 · judge.n_ctx 100000→262144
+FINISHED
+remote-crew
+review-bench-1783704790922
+1 probe (k=2) · judge gpt-remote k=3 · 100K ctx
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0 · ⚠ degenerate
+asgcbk-841, dbjcgg-207, hoipmx-434, mrypfh-120, nlasqp-550, ofgtkv-849
+38 RUNS
+FINISHED
+(crew unknown)
+review-bench-1783449190917
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-1783437770528
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-agentic-uncapped-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-agentic-typed-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gemini31pro-agentic-v5-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gemini31pro-agentic-v5-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gemini31pro-agentic-v3-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gemini31pro-agentic-v3-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-agentic-r3
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-agentic-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-agentic-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-grok43-freeform-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-grok43-freeform-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-grok43-strict-r3
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-grok43-strict-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-grok43-strict-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gemini-freeform-final-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gemini-strict-r3
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gemini-strict-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gemini-strict-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-agentic-r3
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-agentic-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-agentic-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-freeform-med-r3
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-freeform-med-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-freeform-med-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-freeform-r3
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-freeform-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-freeform-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-freeform-r3
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-freeform-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-freeform-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-anchor-r3
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-anchor-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-gpt51-anchor-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-anchor-r3
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-anchor-r2
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+no knob change vs previous run
+FINISHED
+(crew unknown)
+review-bench-qwen36-anchor-r1
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+ofgtkv-849
+1 RUN
+FINISHED
+(crew unknown)
+review-bench-gpt51-agentic-probe
+staffing not recorded (older artifact)
+bundles 0 · flags 0→0 · confirmed 0 · needs_check 0 · archived 0
+

@@ -43,6 +43,7 @@ export const queryKeys = {
   fleetMachinesLive: () => ["fleet", "machines", "live"] as const,
   fleetSessionsLive: () => ["fleet", "sessions", "live"] as const,
   runs: () => ["runs"] as const,
+  labRuns: () => ["lab", "runs"] as const,
   machineSpecs: () => ["machine", "specs"] as const,
   machineResources: () => ["machine", "resources"] as const,
   panel: (id: string) => ["panel", id] as const,

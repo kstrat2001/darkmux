@@ -130,3 +130,218 @@ body {
   font-size: 13px;
   margin: 4px 0;
 }
+
+/* ── Runs lens (Packet 3) — ported nearly verbatim from viewer.html's own
+   <style> block (search that file for `.lablist`/`.runchip`/`.labrunmain`)
+   so the SAME class names produce the SAME DOM/CSS shape, which is what
+   makes `next-parity-runs.spec.ts`'s stage-text byte-comparison possible at
+   all: Chromium's `innerText()` treats each direct child of a `display:flex`
+   container as its own line, REGARDLESS of visual wrapping (verified
+   empirically — see the packet's own report) — so `.labrunmain`/`.runsbar`/
+   `.labtaskhdr` being `display:flex` (not just visually similar) is
+   load-bearing for parity, not a styling nicety. Likewise `text-transform:
+   uppercase` on `.labbadge`/`.runkind`/`.labtaskcount` is what turns the
+   wire's lowercase `status`/`kind` strings into the goldens' UPPERCASE
+   text — innerText reflects CSS text-transform. Don't "clean up" either
+   property without re-running the parity spec. */
+.lablist {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 10px;
+}
+.stagehdr {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  margin-bottom: 14px;
+}
+.labnotice {
+  font: 12px/1.5 "JetBrains Mono", monospace;
+  color: #ffb86b;
+  border: 1px solid #ffb86b;
+  border-radius: 6px;
+  padding: 9px 12px;
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+.runsbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 4px;
+}
+.runchip {
+  font: 600 11px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.04em;
+  padding: 6px 10px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: #131826;
+  color: var(--dim);
+  cursor: pointer;
+}
+.runchip:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.runchip.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: #1c1c22;
+}
+.runchipn {
+  opacity: 0.7;
+  font-weight: 400;
+}
+.runkind {
+  display: inline-block;
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  flex: 0 0 auto;
+}
+.runkind.mission {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.runkind.dispatch {
+  color: var(--fg);
+}
+.runkind.lab {
+  color: #5af0a3;
+  border-color: #5af0a3;
+}
+.labrunrow {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #131826;
+  cursor: pointer;
+  margin-bottom: 6px;
+}
+.labrunrow:last-child {
+  margin-bottom: 0;
+}
+.labrunrow.flat {
+  cursor: default;
+}
+.labrunmain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.labruncrew {
+  font: 600 12px "JetBrains Mono", monospace;
+  color: var(--fg);
+}
+.labrundir {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.labrunmeta {
+  font: 11px/1.4 "JetBrains Mono", monospace;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.labrunmeta.dim {
+  color: var(--dim);
+}
+.labdegenerate {
+  color: var(--error);
+  font-weight: 600;
+}
+.labdiffline {
+  font: 11px/1.4 "JetBrains Mono", monospace;
+  color: #5af0a3;
+  padding: 2px 0 8px 6px;
+  border-left: 2px solid #5af0a3;
+  margin: -2px 0 6px 4px;
+  overflow-wrap: anywhere;
+}
+.labdiffline.warn {
+  color: #ffb86b;
+  border-left-color: #ffb86b;
+}
+.labdiffline.dim {
+  color: var(--dim);
+  border-left-color: var(--border);
+}
+.labbadge {
+  display: inline-block;
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.labbadge.finished,
+.labbadge.complete {
+  color: #5af0a3;
+  border-color: #5af0a3;
+}
+.labbadge.live,
+.labbadge.running {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.labbadge.error {
+  color: var(--error);
+  border-color: var(--error);
+}
+.labbadge.planned,
+.labbadge.abandoned {
+  color: var(--dim);
+}
+.rununtracked {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  color: var(--dim);
+  letter-spacing: 0.04em;
+}
+.runmore {
+  font: 12px "JetBrains Mono", monospace;
+  color: var(--dim);
+  margin-top: 10px;
+  cursor: pointer;
+  text-align: center;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+}
+.labtaskcard {
+  background: #1c1c22;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.labtaskhdr {
+  font: 600 13px "JetBrains Mono", monospace;
+  color: var(--accent);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.labtaskcount {
+  font: 600 10px "JetBrains Mono", monospace;
+  color: var(--dim);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.none {
+  color: var(--dim);
+  font: 11px "JetBrains Mono", monospace;
+  padding: 10px 0;
+}

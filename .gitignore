@@ -5,7 +5,12 @@ Cargo.lock.bak
 
 # darkmux runtime state (project-local + defense-in-depth)
 .darkmux/
-runs/
+# Root-scoped only (not `runs/`, unqualified) — an unqualified pattern here
+# matched ANY directory literally named `runs` anywhere in the tree, which
+# silently swallowed `ui/src/lenses/runs/` (the Packet 3 runs-lens source)
+# from `git status`/`git add` with zero error output. Found live: `git
+# status` showed every other new file in this packet except that directory.
+/runs/
 sandboxes/
 *.trajectory.jsonl
 qa-reply.json
@@ -45,6 +50,8 @@ target-review/
 # against); only the build/run scratch below is ignored.
 tests/parity/node_modules/
 tests/parity/.served/
+tests/parity/.served-next/
+tests/parity/.gallery/
 tests/parity/.determinism-run1/
 tests/parity/.verify-snapshot/
 tests/parity/corpus.tmp-*/

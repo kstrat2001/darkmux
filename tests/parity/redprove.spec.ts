@@ -83,6 +83,37 @@ test("blank page fails every golden comparison (fleet/console/runs/machine)", as
   assertRed("runs-kind-lab", runsLabText);
   const runsLabStageText = await regionText(page, "stage");
 
+  // Packet 3 growth: kind=mission / kind=dispatch — /runs 404s, so both
+  // filters land on `runsFiltered()`'s empty branch ("no mission/dispatch
+  // runs recorded yet."), which still differs from the real (non-empty)
+  // golden. Same `.lablist` + chip `.on` settle pattern as kind=lab above.
+  await page.click('[data-act="runskind"][data-arg="mission"]');
+  await waitSettled(page, expect, '#stage .lablist, [data-act="runskind"][data-arg="mission"].on', { previousText: runsLabStageText });
+  const runsMissionText = await extractLensText(page);
+  assertRed("runs-kind-mission", runsMissionText);
+  const runsMissionStageText = await regionText(page, "stage");
+
+  await page.click('[data-act="runskind"][data-arg="dispatch"]');
+  await waitSettled(page, expect, '#stage .lablist, [data-act="runskind"][data-arg="dispatch"].on', { previousText: runsMissionStageText });
+  const runsDispatchText = await extractLensText(page);
+  assertRed("runs-kind-dispatch", runsDispatchText);
+  const runsDispatchStageText = await regionText(page, "stage");
+
+  // ◧ series: /lab/runs 404s too, so `groupLabRunsByTask([])` yields zero
+  // groups — `renderLabRunsList()`'s series branch still emits `.lablist`
+  // (wrapping the "no lab runs with a recorded corpus yet" empty state, NOT
+  // `.labtaskcard` — that class only appears for a real, non-empty group),
+  // so the settle marker here is `.lablist` + the toggle's own `.on` state,
+  // not `.labtaskcard` (which the blank page can never produce).
+  await page.click('[data-act="runskind"][data-arg="lab"]');
+  await waitSettled(page, expect, '#stage .lablist, [data-act="runskind"][data-arg="lab"].on', { previousText: runsDispatchStageText });
+  const runsLabAgainStageText = await regionText(page, "stage");
+  await page.click('[data-act="runsseries"]');
+  await waitSettled(page, expect, '#stage .lablist, [data-act="runsseries"].on', { previousText: runsLabAgainStageText });
+  const runsSeriesText = await extractLensText(page);
+  assertRed("runs-series", runsSeriesText);
+  const runsSeriesStageText = await regionText(page, "stage");
+
   // Machine: /machine/resources 404s, so MACHINE_MEM never populates —
   // renderMachine() permanently lands in `MACHINE_MEM_ERR && !b` branch
   // ("daemon not reachable…"), which ALSO uses class="none" (the same class
@@ -94,9 +125,19 @@ test("blank page fails every golden comparison (fleet/console/runs/machine)", as
     .locator("#stage .memcard")
     .or(page.locator("#stage .none", { hasText: /not reachable/i }));
   await page.click("#lens-machine");
-  await waitSettled(page, expect, machineSettled, { previousText: runsLabStageText });
+  await waitSettled(page, expect, machineSettled, { previousText: runsSeriesStageText });
   const machineText = await extractLensText(page);
   assertRed("machine", machineText);
+});
+
+test("blank page fails the #lens=runs deep-link boot golden comparison", async ({ page }) => {
+  await installFrozenClock(page, Date.UTC(2026, 0, 1));
+  installBlankRoutes(page);
+
+  await page.goto("/index.html#lens=runs");
+  await waitSettled(page, expect, "#stage .lablist");
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+  assertRed("runs-lens-boot", await extractLensText(page));
 });
 
 test("blank page fails the #session=task-list golden comparison", async ({ page }) => {
