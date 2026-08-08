@@ -279,9 +279,17 @@ struct FlowMissionAgg {
     machine: Option<String>,
     first_ts: Option<String>,
     last_ts: Option<String>,
-    /// A `mission close` / `mission finalize` lifecycle record was seen —
-    /// the only honest completion signal for work this machine did not run.
-    closed_ts: Option<String>,
+    /// The terminal mission-lifecycle record, if one was seen: its stamp and
+    /// whether it was an ABORT.
+    ///
+    /// The distinction is load-bearing, not cosmetic (#1627, mirrored from
+    /// the tracked path's `MissionStatus::Aborted => RunStatus::Abandoned`):
+    /// a torn-down mission is not a completed one, and collapsing the two
+    /// would let a killed run inherit a success verdict it never earned —
+    /// on every peer's viewer, while the owning machine correctly showed it
+    /// Abandoned.
+    terminal_ts: Option<String>,
+    terminal_was_abort: bool,
     /// Session ids observed under this mission, used to borrow role/model/
     /// endpoint for the row without a second pass.
     session_ids: Vec<String>,
@@ -292,8 +300,28 @@ fn build_flow_mission_index(
     fleet: &[serde_json::Value],
 ) -> HashMap<String, FlowMissionAgg> {
     let mut idx: HashMap<String, FlowMissionAgg> = HashMap::new();
+    // (#1707 gate MUST FIX 2) The fleet half obeys the SAME
+    // `RUNS_FLOW_SCAN_WINDOW_DAYS` bound the local walk does. Without this
+    // the two sources disagree about how far back `/runs` reaches, and the
+    // stream is the WORSE offender: `XADD MAXLEN ~` trims lazily, only on
+    // write, so a fleet that has gone quiet still holds month-old records —
+    // which would resurface dead missions and un-terminated sessions as
+    // Abandoned rows that never age out. This bites the single-machine
+    // redis-enabled operator too, not just a fleet.
+    let fleet_cutoff = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS);
+    let within_window = |v: &serde_json::Value| -> bool {
+        match v.get("ts").and_then(|t| t.as_str()) {
+            // Lexical compare on the `YYYY-MM-DD` prefix — the same trick
+            // `for_each_recent_flow_record` uses on day-file names.
+            Some(ts) if ts.len() >= 10 => ts[..10] >= fleet_cutoff[..],
+            // No parseable ts: keep it. Dropping an unattributable record
+            // would silently narrow the view, which is this issue's own bug.
+            _ => true,
+        }
+    };
+
     let fleet_seen: std::collections::HashSet<String> =
-        fleet.iter().map(crate::flow_record_identity).collect();
+        fleet.iter().filter(|v| within_window(v)).map(crate::flow_record_identity).collect();
 
     let fold = |idx: &mut HashMap<String, FlowMissionAgg>, v: &serde_json::Value| {
         let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) else {
@@ -319,9 +347,15 @@ fn build_flow_mission_index(
                 agg.last_ts = Some(ts.to_string());
             }
         }
+        // The only terminal mission-lifecycle actions the emitter actually
+        // writes are `mission close` and `mission abort`
+        // (`darkmux_crew::lifecycle`); `mission start` is the opening
+        // bookend. Matching vocabulary that is never emitted would read as
+        // real coverage to the next person who greps for it.
         let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
-        if matches!(action, "mission close" | "mission finalize" | "mission abort") && agg.closed_ts.is_none() {
-            agg.closed_ts = Some(ts.to_string());
+        if matches!(action, "mission close" | "mission abort") && agg.terminal_ts.is_none() {
+            agg.terminal_ts = Some(ts.to_string());
+            agg.terminal_was_abort = action == "mission abort";
         }
         if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
             if !sid.is_empty() && !agg.session_ids.iter().any(|s| s == sid) {
@@ -330,7 +364,7 @@ fn build_flow_mission_index(
         }
     };
 
-    for v in fleet {
+    for v in fleet.iter().filter(|v| within_window(v)) {
         fold(&mut idx, v);
     }
     for_each_recent_flow_record(flows_dir, |v| {
@@ -364,12 +398,12 @@ fn flow_mission_to_run(
     let sessions: Vec<&SessionAgg> =
         agg.session_ids.iter().filter_map(|s| flow_index.get(s)).collect();
     let any_live = sessions.iter().any(|s| session_is_live(s, now_ms));
-    let status = if agg.closed_ts.is_some() {
-        RunStatus::Complete
-    } else if any_live {
-        RunStatus::Running
-    } else {
-        RunStatus::Abandoned
+    let status = match (&agg.terminal_ts, agg.terminal_was_abort) {
+        // #1627 again: abort is teardown, not success.
+        (Some(_), true) => RunStatus::Abandoned,
+        (Some(_), false) => RunStatus::Complete,
+        (None, _) if any_live => RunStatus::Running,
+        (None, _) => RunStatus::Abandoned,
     };
     // Borrow route/model from whichever session first resolved one — a
     // mission-level row has no endpoint of its own, and showing the seat's
@@ -385,9 +419,15 @@ fn flow_mission_to_run(
         role: None,
         model,
         started_ts: agg.first_ts.as_deref().and_then(parse_flow_ts),
-        completed_ts: agg.closed_ts.as_deref().and_then(parse_flow_ts),
+        // An aborted mission has a terminal stamp but no COMPLETION — the
+        // tracked path makes the same distinction.
+        completed_ts: if agg.terminal_was_abort {
+            None
+        } else {
+            agg.terminal_ts.as_deref().and_then(parse_flow_ts)
+        },
         updated_ts: agg
-            .closed_ts
+            .terminal_ts
             .as_deref()
             .or(agg.last_ts.as_deref())
             .and_then(parse_flow_ts),
@@ -878,8 +918,10 @@ struct SessionAgg {
     last_activity_ts: Option<String>,
 }
 
-/// One pass over every flow record within [`RUNS_FLOW_SCAN_WINDOW_DAYS`],
-/// building a per-`session_id` rollup.
+/// One pass over every flow record within [`RUNS_FLOW_SCAN_WINDOW_DAYS`] —
+/// from the local day-files AND the fleet stream (#1705), both bounded by
+/// that same window so the two sources cannot disagree about how far back
+/// `/runs` reaches.
 fn build_flow_session_index(
     flows_dir: &StdPath,
     fleet: &[serde_json::Value],
@@ -890,8 +932,28 @@ fn build_flow_session_index(
     // fleet already supplied — this machine's records land in BOTH sinks,
     // so the shared identity key is what keeps one dispatch from being
     // folded twice. Same precedence as `union_flow_records`.
+    // (#1707 gate MUST FIX 2) The fleet half obeys the SAME
+    // `RUNS_FLOW_SCAN_WINDOW_DAYS` bound the local walk does. Without this
+    // the two sources disagree about how far back `/runs` reaches, and the
+    // stream is the WORSE offender: `XADD MAXLEN ~` trims lazily, only on
+    // write, so a fleet that has gone quiet still holds month-old records —
+    // which would resurface dead missions and un-terminated sessions as
+    // Abandoned rows that never age out. This bites the single-machine
+    // redis-enabled operator too, not just a fleet.
+    let fleet_cutoff = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS);
+    let within_window = |v: &serde_json::Value| -> bool {
+        match v.get("ts").and_then(|t| t.as_str()) {
+            // Lexical compare on the `YYYY-MM-DD` prefix — the same trick
+            // `for_each_recent_flow_record` uses on day-file names.
+            Some(ts) if ts.len() >= 10 => ts[..10] >= fleet_cutoff[..],
+            // No parseable ts: keep it. Dropping an unattributable record
+            // would silently narrow the view, which is this issue's own bug.
+            _ => true,
+        }
+    };
+
     let fleet_seen: std::collections::HashSet<String> =
-        fleet.iter().map(crate::flow_record_identity).collect();
+        fleet.iter().filter(|v| within_window(v)).map(crate::flow_record_identity).collect();
     let fold = |idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Value| {
         let Some(session_id) = v.get("session_id").and_then(|s| s.as_str()) else {
             return;
@@ -979,7 +1041,7 @@ fn build_flow_session_index(
         }
     };
 
-    for v in fleet {
+    for v in fleet.iter().filter(|v| within_window(v)) {
         fold(&mut idx, v);
     }
     for_each_recent_flow_record(flows_dir, |v| {
@@ -2587,10 +2649,63 @@ mod tests {
     #[test]
     fn a_stale_unclosed_peer_mission_is_abandoned_not_running() {
         let flows = TempDir::new().unwrap();
-        let fleet = vec![peer_record("dispatch start", "2020-01-01T00:00:00Z")];
+        // Yesterday: comfortably INSIDE the 14-day scan window, comfortably
+        // OUTSIDE the liveness budget. The two bounds answer different
+        // questions and this test pins the second one — `cutoff_date_string(1)`
+        // is the same date arithmetic the window itself uses.
+        let stale_ts = format!("{}T00:00:00Z", cutoff_date_string(1));
+        let fleet = vec![peer_record("dispatch start", &stale_ts)];
         let runs = build_runs(flows.path(), None, &fleet);
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert_eq!(row.status, RunStatus::Abandoned);
+    }
+
+    /// #1627, applied to a mission this machine did not run: a torn-down
+    /// mission is not a completed one. Before the #1707 gate caught it, an
+    /// aborted peer mission read `complete` on every OTHER machine while the
+    /// owning machine correctly read `abandoned` — a killed run inheriting a
+    /// success verdict it never earned.
+    #[test]
+    fn an_aborted_peer_mission_reads_abandoned_not_complete() {
+        let flows = TempDir::new().unwrap();
+        let fleet = vec![
+            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
+            serde_json::json!({
+                "ts": darkmux_flow::ts_utc_now(),
+                "action": "mission abort",
+                "source": "mission_lifecycle",
+                "session_id": "mission-review-on-the-hub",
+                "mission_id": "review-on-the-hub",
+                "machine_id": "m1-max-32gb-studio",
+            }),
+        ];
+        let runs = build_runs(flows.path(), None, &fleet);
+        let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert_eq!(
+            row.status,
+            RunStatus::Abandoned,
+            "an abort is teardown, not success — this is what the tracked path does \
+             (MissionStatus::Aborted => RunStatus::Abandoned)"
+        );
+        assert!(
+            row.completed_ts.is_none(),
+            "a torn-down mission never completed, so it carries no completion stamp"
+        );
+    }
+
+    /// The fleet half must obey the same 14-day bound the local walk does.
+    /// `XADD MAXLEN ~` trims lazily — only on write — so a quiet fleet keeps
+    /// month-old records that would otherwise resurface as rows that never
+    /// age out.
+    #[test]
+    fn a_fleet_record_older_than_the_scan_window_never_enters_runs() {
+        let flows = TempDir::new().unwrap();
+        let fleet = vec![peer_record("dispatch start", "2020-01-01T00:00:00Z")];
+        let runs = build_runs(flows.path(), None, &fleet);
+        assert!(
+            !runs.iter().any(|r| r.id == "review-on-the-hub"),
+            "a fleet record far outside RUNS_FLOW_SCAN_WINDOW_DAYS must not build a row"
+        );
     }
 
     #[test]

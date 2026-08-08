@@ -2956,10 +2956,16 @@ async fn catalog_records_response(
             .into_response();
     }
     let dir = state.flows_dir.clone();
-    let (records, truncated) =
-        tokio::task::spawn_blocking(move || collect_records_by_field(&dir, field, &id))
-            .await
-            .unwrap_or_else(|_| (Vec::new(), false));
+    let (records, truncated) = tokio::task::spawn_blocking(move || {
+        // (#1707 gate CONSIDER 5) The fleet half too — otherwise the
+        // missions lens now LISTS a peer's mission (#1705) and clicking
+        // through to replay it returns zero records: a dead end created by
+        // making the mission visible in the first place.
+        let fleet = fleet_flow_records();
+        collect_records_by_field(&dir, &fleet, field, &id)
+    })
+    .await
+    .unwrap_or_else(|_| (Vec::new(), false));
     axum::Json(serde_json::json!({
         "records": records,
         "count": records.len(),
@@ -2969,26 +2975,56 @@ async fn catalog_records_response(
     .into_response()
 }
 
-/// Collect every record whose top-level string `field` equals `id`, across all
-/// day files in chronological order, bounded at MAX_CATALOG_RECORDS. Returns the
-/// records + whether the cap truncated the result. Stops scanning once the cap is
-/// hit (ControlFlow::Break) rather than reading the rest of history.
+/// Collect every record whose top-level string `field` equals `id`, from the
+/// local day files AND the fleet stream (#1705), in chronological order,
+/// bounded at MAX_CATALOG_RECORDS. Returns the records + whether the cap
+/// truncated the result. Stops scanning the local side once the cap is hit
+/// (ControlFlow::Break) rather than reading the rest of history.
+///
+/// Same fleet-first de-dup as every other merged read: this machine's own
+/// records land in both sinks.
 fn collect_records_by_field(
     flows_dir: &std::path::Path,
+    fleet: &[serde_json::Value],
     field: &str,
     id: &str,
 ) -> (Vec<serde_json::Value>, bool) {
     let mut records: Vec<serde_json::Value> = Vec::new();
     let mut truncated = false;
-    for_each_flow_record_across_days(flows_dir, |_date, v| {
-        if v.get(field).and_then(|f| f.as_str()) == Some(id) {
-            if records.len() >= MAX_CATALOG_RECORDS {
-                truncated = true;
-                return std::ops::ControlFlow::Break(());
-            }
-            records.push(v.clone());
+    let mut fleet_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for v in fleet {
+        if v.get(field).and_then(|f| f.as_str()) != Some(id) {
+            continue;
         }
-        std::ops::ControlFlow::Continue(())
+        if records.len() >= MAX_CATALOG_RECORDS {
+            truncated = true;
+            break;
+        }
+        fleet_seen.insert(flow_record_identity(v));
+        records.push(v.clone());
+    }
+    if !truncated {
+        for_each_flow_record_across_days(flows_dir, |_date, v| {
+            if v.get(field).and_then(|f| f.as_str()) == Some(id) {
+                if records.len() >= MAX_CATALOG_RECORDS {
+                    truncated = true;
+                    return std::ops::ControlFlow::Break(());
+                }
+                if fleet_seen.is_empty() || !fleet_seen.contains(&flow_record_identity(v)) {
+                    records.push(v.clone());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+    }
+    // Two sources, one timeline: the local walk is chronological on its own
+    // and so is the fleet slice, but concatenated they interleave. The
+    // endpoint's contract (and its test) is chronological order.
+    records.sort_by(|a, b| {
+        let ts = |r: &serde_json::Value| {
+            r.get("ts").and_then(|t| t.as_str()).unwrap_or_default().to_string()
+        };
+        ts(a).cmp(&ts(b))
     });
     (records, truncated)
 }
@@ -3142,6 +3178,8 @@ pub(crate) fn fleet_flow_records() -> Vec<serde_json::Value> {
     static FLEET_CACHE: std::sync::OnceLock<std::sync::Mutex<FleetCache>> =
         std::sync::OnceLock::new();
     let cache = FLEET_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    // A stale entry is deliberately RETAINED rather than cleared: the
+    // failure path below serves it if the refresh fails.
     if let Ok(guard) = cache.lock() {
         if let Some((at, records)) = guard.as_ref() {
             if at.elapsed() < FLEET_CACHE_TTL {
@@ -3161,13 +3199,39 @@ pub(crate) fn fleet_flow_records() -> Vec<serde_json::Value> {
             records
         }
         Err(e) => {
+            // (#1707 gate) Serve the LAST-KNOWN-GOOD snapshot rather than
+            // nothing. Returning empty would make a live remote mission
+            // VANISH from the lenses for the duration of a blip — which is
+            // precisely the "empty lens indistinguishable from an idle
+            // fleet" silence #1705 exists to kill, reintroduced for outage
+            // windows. A row that is a few seconds stale, next to a
+            // `/fleet/machines/live` heartbeat that tells the truth, beats a
+            // row that disappears.
+            //
             // Never interpolate the url (#661 Slice 5) — it can carry an
             // inline password.
-            eprintln!(
-                "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
-                 serving this machine's records only"
-            );
-            Vec::new()
+            let stale = cache
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|(_, records)| records.clone()));
+            match stale {
+                Some(records) => {
+                    eprintln!(
+                        "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
+                         serving the last-known-good fleet snapshot ({} records) plus this \
+                         machine's own",
+                        records.len()
+                    );
+                    records
+                }
+                None => {
+                    eprintln!(
+                        "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
+                         no previous snapshot — serving this machine's records only"
+                    );
+                    Vec::new()
+                }
+            }
         }
     }
 }
