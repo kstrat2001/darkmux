@@ -122,4 +122,63 @@ describe("RunsBoard", () => {
     renderBoard();
     await waitFor(() => expect(screen.getByText(/no runs recorded yet/i)).toBeInTheDocument());
   });
+
+  it("clicking a still-interactive row surfaces a visible 'not ported yet' notice, not a silent no-op", async () => {
+    mockFetch();
+    renderBoard();
+    // "m1" (mission, tracked:true) is interactive — a real `data-act` target
+    // in legacy (`gomission`). Its detail page doesn't exist in `/next` yet.
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    expect(screen.queryByText(/isn't in \/next yet/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("m1").closest(".labrunrow")!);
+
+    const notice = screen.getByText(/isn't in \/next yet/i);
+    expect(notice).toBeInTheDocument();
+    expect(notice).toHaveAttribute("role", "status");
+    expect(notice.textContent).toMatch(/open it in the classic viewer at \//i);
+  });
+
+  it("the not-ported notice also fires from a keyboard Enter activation", async () => {
+    mockFetch();
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    fireEvent.keyDown(screen.getByText("m1").closest(".labrunrow")!, { key: "Enter" });
+    expect(screen.getByText(/isn't in \/next yet/i)).toBeInTheDocument();
+  });
+
+  it("an untracked ghost row has no click affordance and never shows the notice", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url === "/runs") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                runs: [{ id: "ghost2", kind: "dispatch", status: "abandoned", tracked: false, updated_ts: 1 }],
+                generated_at_ms: 1,
+              }),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response(JSON.stringify({ configured: true, dir: null, exists: null, runs: [] }), { status: 200 }));
+      }),
+    );
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("ghost2")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("ghost2").closest(".labrunrow")!);
+    expect(screen.queryByText(/isn't in \/next yet/i)).not.toBeInTheDocument();
+  });
+
+  it("switching kind chips clears a lingering not-ported notice", async () => {
+    mockFetch();
+    const { container } = renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("m1").closest(".labrunrow")!);
+    expect(screen.getByText(/isn't in \/next yet/i)).toBeInTheDocument();
+
+    fireEvent.click(container.querySelector('[data-arg="dispatch"]')!);
+    expect(screen.queryByText(/isn't in \/next yet/i)).not.toBeInTheDocument();
+  });
 });

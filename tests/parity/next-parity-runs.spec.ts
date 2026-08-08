@@ -30,10 +30,17 @@ import {
   loadMeta,
 } from "./lib/extract-next-lens.js";
 
-const GALLERY_DIR =
-  process.env.DARKMUX_GALLERY_DIR ||
-  "/private/tmp/claude-501/-Users-kain-de-projects-darkmux-public/652b2a6d-51b7-4543-9ddf-8ef250dd2a4d/scratchpad/ui-port-gallery/3-runs";
-mkdirSync(GALLERY_DIR, { recursive: true });
+// Gitignored, repo-relative by default (`tests/parity/.gallery/3-runs/`) —
+// NOT an operator machine path. A committed absolute path here would bake
+// one machine's layout (and, worse, a session-scoped scratch UUID) into a
+// public repo, and `mkdirSync` at MODULE scope would run for anyone whose
+// Playwright collection merely IMPORTS this file, on any machine. Override
+// with `DARKMUX_GALLERY_DIR` for a real run (e.g. the operator's own
+// scratchpad); the `mkdirSync` call itself moves into a `test.beforeAll`
+// hook below (fires only when this suite actually RUNS, not when Playwright
+// merely COLLECTS/imports the file), so importing this file has zero
+// filesystem side effects.
+const GALLERY_DIR = process.env.DARKMUX_GALLERY_DIR || path.join(__dirname, ".gallery", "3-runs");
 function shot(name: string) {
   return path.join(GALLERY_DIR, name);
 }
@@ -50,6 +57,10 @@ function goldenStageText(label: string): string {
 const SETTLED = '[data-state="data"]';
 
 test.describe("next-parity: runs board (Packet 3)", () => {
+  test.beforeAll(() => {
+    mkdirSync(GALLERY_DIR, { recursive: true });
+  });
+
   test("kind=all deep-link boot matches runs.txt's #stage", async ({ page }) => {
     const meta = loadMeta();
     await installFrozenClock(page, meta.frozen_clock_ms);

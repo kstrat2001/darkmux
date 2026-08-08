@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
@@ -46,11 +46,22 @@ import {
  * (pure port, including its silences) governs here; the three-state
  * empty-is-never-silent contract is a later, separate arc (see the root
  * plan). Ledgered as a improvement candidate for that arc, not taken now.
+ *
+ * Row-click destinations (lab-run detail, the mission-graph page — both
+ * genuinely out of scope this packet, see `RunRow`'s own doc) are NOT silent
+ * no-ops: clicking a still-interactive row surfaces `NOT_PORTED_NOTICE`, a
+ * visible one-line `.labnotice` naming the gap and pointing at the classic
+ * viewer, per the operator-authored posture (a stuck feature gets a visible
+ * placeholder, not just a code comment nobody but a future dev will read).
  */
+const NOT_PORTED_NOTICE = "run detail isn't in /next yet — open it in the classic viewer at /";
+
 export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
   const [kind, setKind] = useState<RunsKind>(initialKind);
   const [series, setSeries] = useState(false);
   const [showAll, setShowAll] = useState(false);
+  const [rowClickNotice, setRowClickNotice] = useState<string | null>(null);
+  const onRowActivate = () => setRowClickNotice(NOT_PORTED_NOTICE);
 
   // A fresh deep-link into a DIFFERENT kind while this component is already
   // mounted (route.runsKind changes without the runs lens itself
@@ -60,6 +71,7 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
     setKind(initialKind);
     setSeries(false);
     setShowAll(false);
+    setRowClickNotice(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialKind]);
 
@@ -91,6 +103,7 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
   function selectKind(k: RunsKind) {
     setKind(k);
     setShowAll(false);
+    setRowClickNotice(null);
     if (k !== "lab") setSeries(false);
   }
 
@@ -119,10 +132,15 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
           runs · lab series · {labRuns.length} run{labRuns.length === 1 ? "" : "s"} · {groups.length} task{groups.length === 1 ? "" : "s"}
         </div>
         {bar}
+        {rowClickNotice && (
+          <div className="labnotice" role="status">
+            {rowClickNotice}
+          </div>
+        )}
         {notice && <div className="labnotice">{notice}</div>}
         <div className="lablist">
           {groups.length ? (
-            groups.map((g) => <LabTaskCard key={g.key} group={g} />)
+            groups.map((g) => <LabTaskCard key={g.key} group={g} onRowActivate={onRowActivate} />)
           ) : (
             <div className="none">
               no lab runs with a recorded corpus yet — run <code>darkmux lab eval --funnel …</code> to produce one.
@@ -145,12 +163,17 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
         runs{scope} · {count}
       </div>
       {bar}
+      {rowClickNotice && (
+        <div className="labnotice" role="status">
+          {rowClickNotice}
+        </div>
+      )}
       {notice && <div className="labnotice">{notice}</div>}
       <div className="lablist">
         {shown.length ? (
           <>
             {shown.map((r) => (
-              <RunRow key={r.id} run={r} showMachine={showMachine} />
+              <RunRow key={r.id} run={r} showMachine={showMachine} onActivate={onRowActivate} />
             ))}
             {more > 0 && (
               <div className="runmore" role="button" tabIndex={0} onClick={() => setShowAll(true)}>
@@ -212,21 +235,38 @@ function RunsBar({
   );
 }
 
+/** Enter/Space activates a `role="button"` `<div>` the same way a native
+ * `<button>` would — needed because none of these rows ARE a real `button`
+ * element (matching legacy's own non-semantic `data-act` div pattern), so
+ * the browser grants no built-in keyboard activation. */
+function onActivateKeyDown(onActivate: () => void) {
+  return (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onActivate();
+    }
+  };
+}
+
 /** viewer.html: `function runStatusBadge(r)` + `function renderRunRow(r,
  * showMachine)`. The `data-act="labrun"/"gomission"` click destinations
  * (lab-run detail, the mission-graph page) are BOTH out of scope for this
  * packet (see `tests/parity/README.md`'s KNOWN COVERAGE GAPS and lens
  * inventory) — the row keeps its `role="button"`/`tabIndex` affordance for
- * tracked rows (DOM-shape parity) but the click is a documented no-op until
- * those destinations exist in `/next`. */
-function RunRow({ run, showMachine }: { run: Run; showMachine: boolean }) {
+ * tracked rows (DOM-shape parity), and activating it (click or Enter/Space)
+ * surfaces `NOT_PORTED_NOTICE` via `onActivate` rather than silently doing
+ * nothing (operator-authored posture: a stuck feature gets a VISIBLE
+ * placeholder, not a code comment). */
+function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
   const interactive = run.kind === "lab" || run.tracked;
   const ago = runsAgo(run);
   const subtitle = runSubtitle(run, showMachine);
   return (
     <div
       className={`labrunrow${interactive ? "" : " flat"}`}
-      {...(interactive ? { role: "button" as const, tabIndex: 0 } : {})}
+      {...(interactive
+        ? { role: "button" as const, tabIndex: 0, onClick: onActivate, onKeyDown: onActivateKeyDown(onActivate) }
+        : {})}
     >
       <div className="labrunmain">
         <span className={`labbadge ${run.status}`}>{run.status}</span>
@@ -247,10 +287,12 @@ function LabBadge({ finished }: { finished: boolean }) {
 }
 
 /** viewer.html: `function renderLabRunRow(run)` (the series-view row, reading
- * `LabRun`'s own richer fields — NOT `renderRunRow`/`Run` above). */
-function LabRunRow({ run }: { run: LabRun }) {
+ * `LabRun`'s own richer fields — NOT `renderRunRow`/`Run` above). Every
+ * series row is interactive in legacy (it always opens the lab-run detail
+ * pane) — same not-ported-yet notice on activation as `RunRow`. */
+function LabRunRow({ run, onActivate }: { run: LabRun; onActivate: () => void }) {
   return (
-    <div className="labrunrow" role="button" tabIndex={0}>
+    <div className="labrunrow" role="button" tabIndex={0} onClick={onActivate} onKeyDown={onActivateKeyDown(onActivate)}>
       <div className="labrunmain">
         <LabBadge finished={run.finished} />
         <span className="labruncrew">{run.crew || "(crew unknown)"}</span>
@@ -266,7 +308,7 @@ function LabRunRow({ run }: { run: LabRun }) {
 }
 
 /** viewer.html: `function renderLabTaskCard(group)`. */
-function LabTaskCard({ group }: { group: LabTaskGroup }) {
+function LabTaskCard({ group, onRowActivate }: { group: LabTaskGroup; onRowActivate: () => void }) {
   return (
     <div className="labtaskcard">
       <div className="labtaskhdr">
@@ -277,7 +319,7 @@ function LabTaskCard({ group }: { group: LabTaskGroup }) {
         const diff = prev ? labKnobDiff(prev, r) : null;
         return (
           <Fragment key={r.dir}>
-            <LabRunRow run={r} />
+            <LabRunRow run={r} onActivate={onRowActivate} />
             {prev &&
               (diff && diff.length ? (
                 <div className={`labdiffline${diff.length > 1 ? " warn" : ""}`}>
