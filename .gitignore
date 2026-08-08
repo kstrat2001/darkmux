@@ -51,6 +51,14 @@ tests/parity/corpus.tmp-*/
 tests/parity/test-results/
 tests/parity/playwright-report/
 
+# Flatsat (Packet 0b) — local artifacts. .state/ is the seeded/bind-mounted
+# DARKMUX_HOME for each container (regenerated every `up` by seed.mjs from
+# the parity corpus + a hand-authored peer fixture); never committed.
+tests/flatsat/node_modules/
+tests/flatsat/.state/
+tests/flatsat/test-results/
+tests/flatsat/playwright-report/
+
 # UI port scaffold (Packet 1) — local artifacts. `ui/dist/index.html` is
 # copied to the COMMITTED `crates/darkmux-serve/assets/next.html` by
 # `bun run build`'s `copy-artifact` step; `dist/` itself is scratch.
