@@ -1,0 +1,65 @@
+import { describe, it, expect, afterEach } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
+import { NavChrome } from "./NavChrome";
+import type { Route } from "../lib/route";
+
+afterEach(() => {
+  window.location.hash = "";
+});
+
+describe("NavChrome", () => {
+  it("renders all four tabs in legacy DOM order (viewer.html:816: fleet, console, runs, machine)", () => {
+    render(<NavChrome route={{ kind: "fleet" }} />);
+    const tabs = screen.getAllByRole("link");
+    expect(tabs.map((t) => t.textContent)).toEqual(["fleet", "console", "runs", "machine"]);
+    expect(tabs.map((t) => t.id)).toEqual(["lens-fleet", "lens-console", "lens-runs", "lens-machine"]);
+  });
+
+  it.each<[Route, string]>([
+    [{ kind: "fleet" }, "lens-fleet"],
+    [{ kind: "runs", runsKind: "all", run: null }, "lens-runs"],
+    [{ kind: "machine" }, "lens-machine"],
+    [{ kind: "console", panelId: "" }, "lens-console"],
+    // Legacy: `state.level==="subsystem"` (a session drill-in) leaves the
+    // fleet tab lit — see `NavChrome.tsx`'s own `isActive` doc.
+    [{ kind: "session", sessionId: "abc-123" }, "lens-fleet"],
+    // QA correction (2026-08-09): mission-redirect lights fleet, not
+    // console — `inMission`'s console-lighting is only reachable via
+    // legacy's daemon-less static fallback, never the live-daemon
+    // `#mission=` redirect this app actually exercises. See
+    // `NavChrome.tsx`'s own `isActive` doc for the full measurement.
+    [{ kind: "mission-redirect", missionId: "m1" }, "lens-fleet"],
+  ])("highlights exactly the tab matching %o -> %s", (route, expectedOnId) => {
+    render(<NavChrome route={route} />);
+    const tabs = screen.getAllByRole("link");
+    for (const tab of tabs) {
+      if (tab.id === expectedOnId) {
+        expect(tab.className).toMatch(/\bon\b/);
+        expect(tab.getAttribute("aria-current")).toBe("page");
+      } else {
+        expect(tab.className).not.toMatch(/\bon\b/);
+        expect(tab.getAttribute("aria-current")).toBeNull();
+      }
+    }
+  });
+
+  it("an unrecognized route lights no tab at all", () => {
+    render(<NavChrome route={{ kind: "unknown", hash: "lens=bogus" }} />);
+    for (const tab of screen.getAllByRole("link")) {
+      expect(tab.className).not.toMatch(/\bon\b/);
+    }
+  });
+
+  it("clicking a tab writes the corresponding hash and prevents the default navigation", () => {
+    render(<NavChrome route={{ kind: "fleet" }} />);
+    fireEvent.click(screen.getByRole("link", { name: "machine" }));
+    expect(window.location.hash).toBe("#lens=machine");
+  });
+
+  it("clicking the fleet tab from elsewhere clears the hash", () => {
+    window.location.hash = "#lens=machine";
+    render(<NavChrome route={{ kind: "machine" }} />);
+    fireEvent.click(screen.getByRole("link", { name: "fleet" }));
+    expect(window.location.hash).toBe("");
+  });
+});
