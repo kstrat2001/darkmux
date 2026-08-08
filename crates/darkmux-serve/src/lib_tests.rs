@@ -1028,6 +1028,60 @@
         assert_eq!(missions[0]["mission_id"], "m2");
     }
 
+    /// #1705: a mission that ran on a PEER reaches the missions lens even
+    /// though nothing about it was ever written to this machine's flows dir.
+    #[test]
+    fn scan_flow_missions_includes_a_mission_seen_only_in_the_fleet_stream() {
+        let tmp = TempDir::new().unwrap(); // deliberately empty
+        let fleet = vec![serde_json::json!({
+            "action": "dispatch start",
+            "session_id": "S-peer",
+            "mission_id": "m-on-the-hub",
+            "machine_id": "m1-max-32gb-studio",
+            "machine_uid": "PEER-UID",
+            "ts": "2026-05-14T09:00:00Z",
+        })];
+        let missions = super::scan_flow_missions(tmp.path(), &fleet);
+        let m = missions
+            .iter()
+            .find(|m| m["mission_id"] == "m-on-the-hub")
+            .expect("a peer's mission must appear in the missions lens");
+        assert_eq!(m["records"], 1);
+        assert_eq!(m["machines"], serde_json::json!(["m1-max-32gb-studio"]));
+        assert_eq!(m["first_date"], "2026-05-14", "the date comes from the record's own ts");
+    }
+
+    /// The de-dup, tested where it is actually OBSERVABLE. This machine's
+    /// records are written to BOTH sinks, and the per-mission `records`
+    /// counter is the one field a double-fold inflates — the aggregate folds
+    /// are otherwise idempotent, so a run-row count would pass either way.
+    #[test]
+    fn scan_flow_missions_counts_a_record_in_both_sinks_exactly_once() {
+        let tmp = TempDir::new().unwrap();
+        let record = serde_json::json!({
+            "action": "dispatch start",
+            "session_id": "S-mine",
+            "mission_id": "m-mine",
+            "machine_id": "MacBook-Pro",
+            "machine_uid": "MY-UID",
+            "ts": "2026-05-14T09:00:00Z",
+        });
+        // The SAME record on disk and in the stream — exactly what a Tee sink
+        // produces for local work.
+        fs::write(
+            tmp.path().join("2026-05-14.jsonl"),
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+        let missions = super::scan_flow_missions(tmp.path(), std::slice::from_ref(&record));
+        let m = missions.iter().find(|m| m["mission_id"] == "m-mine").expect("mission present");
+        assert_eq!(
+            m["records"], 1,
+            "a record present in both sinks must be counted once — without the shared \
+             identity de-dup this reads 2, and every local dispatch is double-counted"
+        );
+    }
+
     #[tokio::test]
     async fn flow_mission_returns_records_across_days_chronologically() {
         let tmp = TempDir::new().unwrap();
@@ -2235,7 +2289,7 @@
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
-                let r = super::read_flow_records_from_redis("redis://127.0.0.1:1", "2026-08-15");
+                let r = super::read_flow_records_from_redis("redis://127.0.0.1:1", Some("2026-08-15"));
                 let _ = tx.send((r.is_err(), started.elapsed()));
             });
 
