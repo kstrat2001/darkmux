@@ -372,15 +372,32 @@ pub(crate) enum MissionCmd {
         json: bool,
         /// Max missions shown PER SECTION (0 = no cap), applied uniformly to
         /// every section. Omit it for the tuned defaults: 10 for ACTIVE and
-        /// PAUSED, 3 for FINALIZED (closed work is recent-history context, not
-        /// the question the board answers). Each section always reports its
-        /// true total, and drifted missions are ordered first so a cap hides
-        /// only rows needing no attention.
+        /// PAUSED, 8 for FINALIZED and ABORTED (open work outranks closed,
+        /// but closed work is where nearly everything lands). Each section
+        /// always reports its true total, and drifted missions are ordered
+        /// first so a cap hides only rows needing no attention.
         #[arg(long)]
         limit: Option<usize>,
-        /// Show every mission in every section, ignoring `--limit`.
+        /// Show every mission in every section, ignoring `--limit`. Combined
+        /// with `--missions`, that means every NAMED mission — the filter
+        /// still applies; `--all` controls pagination, not membership.
         #[arg(long)]
         all: bool,
+        /// Show only the missions you NAMED — hide machine-minted run
+        /// instances (a `review` launch, a `dispatch <role>` crew-of-one).
+        ///
+        /// The board's default answers "what's recent" across everything,
+        /// because that is the question an operator brings to it. This flag
+        /// is the other tab: the named-mission list, for when the run
+        /// instances are noise rather than the news. (Before #1709 the
+        /// filtered view WAS the default, which meant a day of real work
+        /// collapsed into a one-line footer while an 8-day-old finished
+        /// mission held the top of the board.)
+        ///
+        /// Ignored under `--json`, which always emits the whole board — a
+        /// machine reader filters for itself.
+        #[arg(long)]
+        missions: bool,
     },
     /// Debrief a mission (#1000) — the post-mission review ceremony's raw
     /// material in one place: the loop pathologies darkmux's detectors flagged

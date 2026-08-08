@@ -822,7 +822,7 @@ fn cmd_role(sub: RoleCmd) -> Result<i32> {
 
 fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
-        MissionCmd::Status { json, limit, all } => mission_status::run(json, limit, all),
+        MissionCmd::Status { json, limit, all, missions } => mission_status::run(json, limit, all, missions),
         MissionCmd::Debrief { id, json } => coder_phase::debrief(&id, json),
         MissionCmd::Start { id, reasoning } => {
             let m = crew::lifecycle::mission_start_with_reasoning(&id, reasoning.as_deref())?;
