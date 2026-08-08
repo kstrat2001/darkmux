@@ -87,6 +87,67 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     await page.screenshot({ path: shot("catalog-open.png"), fullPage: true });
   });
 
+  // QA must-fix (post-first-review): legacy has THREE ways to close
+  // `#catpanel`, this component originally had zero — dropped both
+  // dismissal handlers AND had a geometry bug (`.catpanel` at a page-level
+  // `top:48px` overlapped the toggle button itself once `#meta` landed
+  // above it) that made even the toggle structurally unclickable while
+  // open. `CatalogPanel.test.tsx` (vitest/jsdom) covers the handler LOGIC;
+  // these three tests are the real-browser regression proof — in
+  // particular the geometry fix, which jsdom can't catch at all (jsdom has
+  // no layout engine, so `page.click()`'s real actionability check —
+  // "is this element visible AND not covered by another element at its
+  // center point" — is exactly the mechanism QA used to catch the original
+  // bug, and exactly what a mocked/jsdom click can't reproduce).
+  test.describe("dismissal (real browser)", () => {
+    test("Escape closes the panel", async ({ page }) => {
+      const meta = loadMeta();
+      await installFrozenClock(page, meta.frozen_clock_ms);
+      installCorpusRoutes(page, meta);
+
+      await page.goto("/index.html");
+      await page.click(".catalog-toggle");
+      await expect(page.locator(CATALOG_SETTLED).first()).toBeAttached({ timeout: 15000 });
+
+      await page.keyboard.press("Escape");
+      await expect(page.locator("#catpanel")).toHaveCount(0);
+    });
+
+    test("a click outside the panel closes it", async ({ page }) => {
+      const meta = loadMeta();
+      await installFrozenClock(page, meta.frozen_clock_ms);
+      installCorpusRoutes(page, meta);
+
+      await page.goto("/index.html");
+      await page.click(".catalog-toggle");
+      await expect(page.locator(CATALOG_SETTLED).first()).toBeAttached({ timeout: 15000 });
+
+      // #stage is real page content outside both the toggle and the panel.
+      await page.click("#stage", { position: { x: 5, y: 5 } });
+      await expect(page.locator("#catpanel")).toHaveCount(0);
+    });
+
+    test("the toggle stays clickable while the panel is open — the geometry regression test", async ({ page }) => {
+      const meta = loadMeta();
+      await installFrozenClock(page, meta.frozen_clock_ms);
+      installCorpusRoutes(page, meta);
+
+      await page.goto("/index.html");
+      await page.click(".catalog-toggle");
+      await expect(page.locator(CATALOG_SETTLED).first()).toBeAttached({ timeout: 15000 });
+
+      // This is the exact reproduction of QA's original finding: Playwright's
+      // `click()` performs a real actionability check (element is visible,
+      // stable, and NOT obscured by another element at its center point)
+      // before clicking — it would TIME OUT here if the panel still
+      // overlapped the toggle, the same way QA's `elementFromPoint` probe
+      // caught it. A short timeout is deliberate: this must succeed FAST if
+      // the geometry is right, not eventually.
+      await page.click(".catalog-toggle", { timeout: 3000 });
+      await expect(page.locator("#catpanel")).toHaveCount(0);
+    });
+  });
+
   test("#mission=<known-corpus-mission>: real fetch, honest empty render (this corpus has no /flow-mission fixture)", async ({
     page,
   }) => {

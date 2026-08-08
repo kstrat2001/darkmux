@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CatalogPanel } from "./CatalogPanel";
 import { todayUTC } from "./format";
@@ -145,5 +145,84 @@ describe("CatalogPanel", () => {
     await waitFor(() => expect(screen.getByText(/no recorded days yet/i)).toBeInTheDocument());
     // The live row still renders — a failed days fetch doesn't blank the whole panel.
     expect(screen.getByText("● live · today")).toBeInTheDocument();
+  });
+
+  // QA must-fix: legacy has THREE ways to close #catpanel
+  // (viewer.html:3002-3008 click-outside, viewer.html:3020-3023 Escape); the
+  // panel originally dropped all of them. These three tests cover each
+  // dismissal path independently, including the toggle-reclick case QA
+  // named as the zero-coverage path.
+  describe("dismissal", () => {
+    it("Escape closes the panel", async () => {
+      stubFetch({});
+      renderPanel();
+      screen.getByRole("button", { name: /browse history/i }).click();
+      await waitFor(() => expect(document.getElementById("catpanel")).toBeTruthy());
+
+      fireEvent.keyDown(document, { key: "Escape" });
+      await waitFor(() => expect(document.getElementById("catpanel")).toBeNull());
+    });
+
+    it("a click outside the panel (and outside the toggle) closes it", async () => {
+      stubFetch({});
+      renderPanel();
+      screen.getByRole("button", { name: /browse history/i }).click();
+      await waitFor(() => expect(document.getElementById("catpanel")).toBeTruthy());
+
+      // document.body is neither the toggle nor a descendant of the
+      // `.catalog-anchor` wrapper — a real "outside" click, matching
+      // legacy's `!e.target.closest("#catpanel")` check (and implicitly
+      // excluding the toggle itself, since the toggle isn't `#catpanel`
+      // either — see CatalogPanel.tsx's own doc for why one containment
+      // check on the shared anchor covers both exclusions).
+      fireEvent.click(document.body);
+      await waitFor(() => expect(document.getElementById("catpanel")).toBeNull());
+    });
+
+    it("re-clicking the toggle while open closes it (zero-coverage path QA named)", async () => {
+      stubFetch({});
+      renderPanel();
+      const toggle = screen.getByRole("button", { name: /browse history/i });
+      fireEvent.click(toggle);
+      await waitFor(() => expect(document.getElementById("catpanel")).toBeTruthy());
+
+      // The SAME click both flips `open` via the toggle's own onClick AND
+      // bubbles to the document-level outside-click listener — verifying
+      // this doesn't double-toggle (re-open immediately) or throw is the
+      // point: the click lands INSIDE `.catalog-anchor`, so the outside-click
+      // listener no-ops and only the toggle's own handler closes it.
+      fireEvent.click(toggle);
+      await waitFor(() => expect(document.getElementById("catpanel")).toBeNull());
+    });
+
+    it("a click on a row INSIDE the panel does not trigger the outside-click closer redundantly", async () => {
+      stubFetch({});
+      renderPanel();
+      fireEvent.click(screen.getByRole("button", { name: /browse history/i }));
+      await waitFor(() => expect(screen.getByText("● live · today")).toBeInTheDocument());
+
+      // The live row's own onClick already closes the panel (asserted
+      // elsewhere) — this test's point is narrower: clicking INSIDE the
+      // panel must not throw or misbehave now that a document-level click
+      // listener is also active.
+      const liveRow = screen.getByText("● live · today").closest("button")!;
+      expect(() => fireEvent.click(liveRow)).not.toThrow();
+      await waitFor(() => expect(document.getElementById("catpanel")).toBeNull());
+    });
+
+    it("Escape and outside-click listeners are removed once the panel closes (no stale global listeners)", async () => {
+      stubFetch({});
+      const removeSpy = vi.spyOn(document, "removeEventListener");
+      renderPanel();
+      screen.getByRole("button", { name: /browse history/i }).click();
+      await waitFor(() => expect(document.getElementById("catpanel")).toBeTruthy());
+
+      fireEvent.keyDown(document, { key: "Escape" });
+      await waitFor(() => expect(document.getElementById("catpanel")).toBeNull());
+
+      expect(removeSpy).toHaveBeenCalledWith("keydown", expect.any(Function));
+      expect(removeSpy).toHaveBeenCalledWith("click", expect.any(Function));
+      removeSpy.mockRestore();
+    });
   });
 });

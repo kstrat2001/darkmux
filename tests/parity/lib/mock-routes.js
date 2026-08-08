@@ -61,8 +61,10 @@ function installCorpusRoutes(page, meta) {
     if (p.startsWith("/flow-session/")) return notFound("no recorded fixture for this session id\n");
     // (Packet 4) The REAL `/flow-mission/:id` handler (catalog_records_response
     // in crates/darkmux-serve/src/lib.rs) never 404s for an unmatched id — it
-    // always answers 200 with `{records:[],count:0,...}` (a 404 is reserved
-    // for an actually MALFORMED id shape, is_valid_catalog_id). Packet 0a's
+    // always answers 200 with `{records:[],count:0,...}` (an actually
+    // MALFORMED id shape gets 400 BAD_REQUEST instead — the
+    // is_valid_catalog_id check at lib.rs:2975-2981 — never 404 either).
+    // Packet 0a's
     // original 404-everything mock predates this packet (its own comment says
     // "out of scope for this packet" — mission-graph deep links, i.e. this
     // whole endpoint, were literally out of scope back then) and doesn't
