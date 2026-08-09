@@ -1,3 +1,12 @@
+=== topbar ===
+darkmux · observability
+FLOW · 2026-08-07
+▣ PLAYBACK
+home
+guide
+articles
+github
+
 === crumb ===
 ◆ review-1786068582-93f404
 

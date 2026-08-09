@@ -113,6 +113,14 @@ body {
   font-weight: 600;
   letter-spacing: 0.02em;
   color: var(--dim);
+  /* (Chrome packet) Matches legacy's `.pb{text-transform:uppercase}`
+     (viewer.html:747) — a real visual rule, not just a parity trick: the
+     underlying text nodes STAY lowercase ("● live"/"◌ reconnecting", see
+     `LiveStatusBadge.tsx`), so `next-parity-live.spec.ts`'s case-sensitive
+     `toContainText("live")`/`toContainText("reconnecting")` (which read
+     `textContent`, unaffected by CSS) keep passing — verified with a
+     throwaway Playwright probe before relying on it. */
+  text-transform: uppercase;
 }
 
 #modebadge.pb.live {
@@ -155,6 +163,395 @@ body {
   flex: 1;
   padding: 16px;
   min-height: 200px;
+  min-width: 0;
+}
+
+/* ── Masthead (Chrome packet) — port of legacy's `.top` (viewer.html:802-816).
+   Precedes `.app-shell__crumbbar`, matching legacy's DOM order. */
+.masthead {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.masthead__brand {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.masthead__brand a {
+  color: inherit;
+  text-decoration: none;
+}
+.masthead__brand b {
+  color: var(--accent);
+}
+.masthead__brand a:hover b {
+  text-decoration: underline;
+}
+/* `#verbadge` — the build-identifier chip. Empty (zero width, no border) when
+   no `darkmux-version` meta was injected (every test harness in this repo —
+   see `Masthead.tsx`'s own doc); a real daemon populates it with volatile
+   version/build-hash text the parity extractor normalizes before it ever
+   reaches a golden (`tests/parity/lib/extract-lens.js`'s
+   `extractTopbarText`). */
+.masthead__ver {
+  font: 11px/1 ui-monospace, SFMono-Regular, monospace;
+  color: var(--dim);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.masthead__refresh {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  border-radius: 4px;
+  cursor: pointer;
+  font: 13px ui-monospace, SFMono-Regular, monospace;
+  padding: 2px 7px;
+  line-height: 1.4;
+}
+.masthead__refresh:hover {
+  color: var(--fg);
+}
+.masthead__refresh.spin {
+  animation: masthead-refresh-spin 0.8s linear infinite;
+}
+@keyframes masthead-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .masthead__refresh.spin {
+    animation: none;
+    opacity: 0.5;
+  }
+}
+.masthead__nav {
+  margin-left: auto;
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.masthead__nav a {
+  color: var(--dim);
+  text-decoration: none;
+  font: 600 12px ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 0.04em;
+}
+.masthead__nav a:hover {
+  color: var(--accent);
+}
+/* The catalog toggle (`<CatalogPanel>`, now mounted inside the masthead —
+   see that component's own doc) sits between the ver chip and the live
+   badge, same relative order as legacy's `#srcbadge` before `#modebadge`. */
+.masthead .catalog-anchor {
+  position: relative;
+}
+
+@media (max-width: 768px) {
+  .masthead {
+    gap: 8px 10px;
+    padding: 8px 12px;
+  }
+  .masthead__nav {
+    order: 1;
+    flex: 1 1 100%;
+    margin-left: 0;
+    gap: 12px;
+  }
+}
+
+/* ── Content row (Chrome packet) — `#stage` beside the event-log column,
+   the port of legacy's `.wrap` (viewer.html:822-847: `.stage` then `.log`,
+   siblings). Stacks on phone width, matching legacy's own mobile-first
+   `.wrap{display:block}` rule (viewer.html:672-680). */
+.app-shell__content {
+  display: flex;
+  align-items: flex-start;
+  flex: 1;
+  min-width: 0;
+}
+
+@media (max-width: 768px) {
+  .app-shell__content {
+    display: block;
+  }
+}
+
+/* ── Event-log column (Chrome packet) — port of legacy's `.log`
+   (viewer.html:321) + `.detail`/`.split`/`.loglist`/`.loghead`/`.logsearch`/
+   `#logbody`/`.rec` (viewer.html:321-372). Only mounted (never just
+   CSS-hidden) when `lib/route.ts`'s `showsEventLog(route)` is true — see
+   that function's own doc for the verified visibility rule. A fixed height
+   (not the viewport-locked `calc()` legacy uses — this port doesn't lock
+   the document height at all, see `styles.css`'s own `html,body` rule) so
+   the column has a sane, internally-scrolling presence regardless of how
+   tall `#stage`'s own content happens to be. */
+.eventlog {
+  width: 380px;
+  flex: none;
+  height: 70vh;
+  min-height: 320px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: #10141f;
+}
+@media (max-width: 768px) {
+  .eventlog {
+    width: 100%;
+    height: 60vh;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+}
+/* `runs`/`console`/`machine` — port of legacy's `body.runs-mode .log,
+   body.machine-mode .log{display:none}` (viewer.html:106/258), applied here
+   as a class on the column itself (this app conditionally SETS the class
+   per route in `App.tsx` rather than toggling a body class) instead of
+   unmounting it — see `EventLogColumn.tsx`'s own `visible` doc for why
+   unmounting was tried first and is wrong (it drops `#logscope`'s real
+   text, which `next-parity.spec.ts`'s byte-parity goldens for the machine
+   lens actually need present, just not painted). */
+.eventlog--hidden {
+  display: none;
+}
+.eventlog__detail {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 60px;
+  padding: 10px 12px 0;
+  overflow: hidden;
+}
+.eventlog__detailhead {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+  flex: none;
+}
+.eventlog__detailtitle {
+  font: 600 11px ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.eventlog__detailbody {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+  padding-bottom: 10px;
+}
+.eventlog__none {
+  color: var(--dim);
+  font: 11px ui-monospace, SFMono-Regular, monospace;
+  padding: 8px 0;
+}
+.eventlog__detailcard {
+  font: 11px/1.5 ui-monospace, SFMono-Regular, monospace;
+}
+.eventlog__detailsummary {
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+.eventlog__detailpre {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.5 ui-monospace, SFMono-Regular, monospace;
+}
+.eventlog__split {
+  height: 7px;
+  flex: none;
+  background: var(--border);
+  cursor: row-resize;
+  touch-action: none;
+}
+.eventlog__split:hover {
+  background: var(--accent);
+  opacity: 0.6;
+}
+@media (max-width: 768px) {
+  /* the row-resize handle isn't useful when stacked, matching legacy's own
+     `.split{display:none}` mobile rule (viewer.html:679). */
+  .eventlog__split {
+    display: none;
+  }
+}
+.eventlog__list {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.eventlog__head {
+  flex: none;
+  padding: 8px 12px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.eventlog__head h3 {
+  margin: 0;
+  font: 600 11px/1 ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dim);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.eventlog__headbtns {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.eventlog__follow,
+.eventlog__fbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  background: none;
+  font-size: 12px;
+  line-height: 1;
+}
+.eventlog__follow:hover,
+.eventlog__fbtn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.eventlog__follow.on,
+.eventlog__fbtn.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.eventlog__search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.eventlog__searchbox {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.eventlog__sicon {
+  position: absolute;
+  left: 8px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--dim);
+  pointer-events: none;
+}
+.eventlog__searchbox input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  /* 16px, not 12px — iOS Safari zooms the whole page on focus of a text
+     input under 16px; same rationale as legacy's own `.searchbox input`
+     rule (viewer.html:341-347). */
+  padding: 6px 26px;
+  font: 16px ui-monospace, SFMono-Regular, monospace;
+}
+.eventlog__searchbox input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+}
+.eventlog__searchbox input::placeholder {
+  color: var(--dim);
+  font-style: italic;
+}
+.eventlog__sclear {
+  position: absolute;
+  right: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--dim);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.eventlog__sclear:hover {
+  color: var(--fg);
+}
+.eventlog__qcount {
+  flex: none;
+  font: 600 10px/1 ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+  white-space: nowrap;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  opacity: 0;
+}
+.eventlog__qcount.show {
+  opacity: 1;
+}
+.eventlog__qcount.zero {
+  color: var(--error);
+  border-color: var(--error);
+}
+.eventlog__body {
+  flex: 1;
+  overflow: auto;
+  padding: 6px 12px 8px;
+}
+.eventlog__rec {
+  font: 11px/1.5 ui-monospace, SFMono-Regular, monospace;
+  color: var(--dim);
+  padding: 5px 6px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+.eventlog__rec:hover {
+  background: #161b28;
+}
+.eventlog__rec.sel {
+  background: #1a2030;
+  border-left: 2px solid var(--accent);
+  color: var(--fg);
+}
+.eventlog__rectime {
+  color: var(--accent);
+}
+.eventlog__ractivity {
+  color: var(--fg);
+}
+.eventlog__empty {
+  color: var(--dim);
+  font: 11px ui-monospace, SFMono-Regular, monospace;
+  padding: 10px 2px;
 }
 
 /* Fleet strip — three visibly distinct data states. */
@@ -698,6 +1095,38 @@ body {
   color: var(--dim);
   font: 12px/1.4 -apple-system, sans-serif;
   padding: 8px 9px;
+}
+
+/* (Chrome packet) `.catalog-anchor`'s desktop positioning assumed the
+   toggle sits near the LEFT edge of its containing block (true when this
+   component was a body-level sibling at `margin-left:16px`; the QA
+   `next-parity-catalog.spec.ts`'s render-sanity check for 390px + panel
+   open PASSED under that layout). Moving the toggle INTO `<Masthead>`'s
+   flex row (this packet) puts it wherever the brand/ver text pushes it —
+   often past 390px minus `.catpanel`'s own `min-width:300px`, so
+   `left:0` (anchor-relative) overflows the viewport. Caught by that exact
+   spec going red after the move; fixed by pinning the panel to the
+   VIEWPORT (not the anchor) at phone width — `top: 56px` clears the
+   masthead's own height at this breakpoint (`padding:8px 12px` + ~20px
+   line height), a fixed value rather than `calc(100% + 6px)` because
+   `position:fixed` escapes the anchor's containing block entirely, so
+   that formula's "% of the anchor" has nothing to resolve against. */
+/* (QA gate) 480px was chosen as "phone width", but the actual trigger is
+   `anchor-x + 300px min-width > viewport`, which starts failing around
+   560px. Worse, `html,body{overflow-x:hidden}` CLIPS the overflow with no
+   scrollbar and no `scrollWidth` signal — so at ~520px every mission row
+   was silently truncated at the right edge and the overflow probes still
+   passed. A bug you cannot see and cannot measure is the worst kind this
+   viewer ships; the breakpoint now covers the whole failing band. */
+@media (max-width: 560px) {
+  .catpanel {
+    position: fixed;
+    top: 56px;
+    left: 8px;
+    right: 8px;
+    width: auto;
+    max-width: none;
+  }
 }
 
 /* ── Fleet lens (Packet 8) — the savings hero + machine cards + recent-

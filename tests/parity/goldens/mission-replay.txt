@@ -1,3 +1,12 @@
+=== topbar ===
+darkmux · observability
+NO RECORDS · 2026-08-08
+▣ PLAYBACK
+home
+guide
+articles
+github
+
 === crumb ===
 (empty)
 

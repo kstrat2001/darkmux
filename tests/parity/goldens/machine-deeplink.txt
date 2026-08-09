@@ -1,3 +1,13 @@
+=== topbar ===
+darkmux · observability
+TODAY
+◌ RECONNECTING
+⟳
+home
+guide
+articles
+github
+
 === crumb ===
 MacBook-Pro
 

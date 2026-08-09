@@ -94,6 +94,41 @@ export function isLiveRoute(route: Route): boolean {
   return route.kind !== "playback" && route.kind !== "session" && route.kind !== "mission-redirect";
 }
 
+/** Should the event-log column (`components/EventLogColumn.tsx` — the
+ * per-record stream + its search/filter/follow chrome and the `#detail`
+ * selected-event panel) render for this route?
+ *
+ * QA CORRECTION (2026-08-09, this packet): the packet brief this function
+ * was written against claimed the column "shows on fleet, console, and the
+ * catalog/replay overlay; hidden on runs and machine" — that is WRONG,
+ * verified two ways against the actual legacy source:
+ *
+ * 1. Reading `renderCrumb()` (viewer.html:2521): `document.body.classList
+ *    .toggle("runs-mode", inRuns||inConsole)` — CONSOLE sets `runs-mode`
+ *    too, not just runs. `machine-mode` is its own separate toggle
+ *    (line 2523). The CSS (viewer.html:106/258) hides `.log`/`.split`/
+ *    `.scrub` on BOTH `body.runs-mode` and `body.machine-mode`.
+ * 2. A throwaway Playwright probe against the recorded corpus
+ *    (`getComputedStyle('.log').display` per lens, via the harness's own
+ *    `installCorpusRoutes`/`waitSettled`) measured it directly rather than
+ *    trusting the read: `fleet` → `flex` (visible); `console` → `none`;
+ *    `runs` → `none`; `machine` → `none`; back to `fleet` → `flex` again.
+ *
+ * So the real rule is the INVERSE of the brief for `console`: the column is
+ * hidden on `runs`, `console`, AND `machine` (every `state.level` legacy
+ * sets `runs-mode`/`machine-mode` for), and shown everywhere else — `fleet`,
+ * a session drill-in (`state.level==="subsystem"`), a bare-date playback
+ * (stays at the `fleet` level, per `targetDate()`'s boot path never
+ * reassigning `state.level`), and the daemon-less static mission summary
+ * (`state.level==="mission"`, reached here as `mission-redirect` — moot in
+ * practice since a real daemon always navigates away before render, but
+ * named for completeness). `unknown` has no legacy analog; defaults to
+ * shown (the fleet-like default) rather than inventing a hide rule with no
+ * source to verify it against. */
+export function showsEventLog(route: Route): boolean {
+  return route.kind !== "runs" && route.kind !== "console" && route.kind !== "machine";
+}
+
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function hashParams(): URLSearchParams {
