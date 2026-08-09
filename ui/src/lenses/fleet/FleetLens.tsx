@@ -7,6 +7,7 @@ import { useFleetCoverage, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS } from "../../lib/flow";
 import { fmtN, fmtC } from "../../lib/format";
+import { MachineIcon } from "../../components/MachineIcon";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { buildFleetCard } from "./cards";
@@ -19,15 +20,6 @@ import type { MachineSpecs } from "../../types/handwritten";
  * machines render with no icon until /machine/specs/<id> wiring lands"). No
  * text content — contributes nothing to the parity extractor's `innerText`,
  * same as legacy's inline SVG. */
-function MachineIcon() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-      <rect x="7" y="7" width="10" height="10" rx="1.5" />
-      <path d="M10 7V4.5M14 7V4.5M10 19.5V17M14 19.5V17M7 10H4.5M7 14H4.5M19.5 10H17M19.5 14H17" />
-    </svg>
-  );
-}
-
 /** `sc()` — viewer.html:1633. One token-class chip (value over label). */
 function Chip({ value, label, cls }: { value: string | number; label: string; cls?: string }) {
   return (

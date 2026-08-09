@@ -15,7 +15,8 @@ import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
-import { computeMetaLines } from "./lib/metaLine";
+import { computeMetaLines, readyParts } from "./lib/metaLine";
+import { ReadyHeadline } from "./components/ReadyHeadline";
 import { localMachineUid, nameOf } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
@@ -115,6 +116,7 @@ export function App() {
   );
   const localName = localUid != null ? nameOf(flowWindow.data, liveMachines, localUid) : null;
 
+  const ready = useMemo(() => readyParts(flowWindow.data, liveMachines, nowMs), [flowWindow.data, liveMachines, nowMs]);
   const metaLines = useMemo(() => computeMetaLines(flowWindow.data, liveMachines, nowMs), [flowWindow.data, liveMachines, nowMs]);
 
   const { crumb, logscope } = routeChrome(route, localName);
@@ -144,11 +146,12 @@ export function App() {
               one space here, since there's no element in the way. Preserving
               it verbatim is simpler and more robust than reproducing the
               icon-boundary quirk with a real (empty) element. */}
-          {metaLines.map((line, i) => (
-            <div key={i} style={{ whiteSpace: "pre" }}>
-              {line}
-            </div>
-          ))}
+          {ready ? (
+            <div><ReadyHeadline n={ready.n} ago={ready.ago} /></div>
+          ) : (
+            <div style={{ whiteSpace: "pre" }}>{metaLines[0]}</div>
+          )}
+          <div style={{ whiteSpace: "pre" }}>{metaLines[1]}</div>
         </div>
       </div>
       {/* (Chrome packet) `.wrap` — `#stage` beside the event-log column,

@@ -1708,3 +1708,12 @@ body {
 }
 .rv__toggle:hover, .rv__more:hover { text-decoration: underline; }
 .rv__rawtoggle { display: block; margin-top: 4px; }
+
+/* `#meta`'s ready headline — ported from viewer.html (`.rdot`, `.mco`). All
+   four rules were MISSING from this port: the dot rendered uncoloured and the
+   machine icon was absent entirely, invisible to the goldens because neither
+   a class nor an SVG contributes text. See ReadyHeadline.tsx. */
+.rdot { font-weight: 700; }
+.rdot.ok { color: var(--good, #4ade80); }
+.mco { white-space: nowrap; }
+.mco svg { width: 13px; height: 13px; vertical-align: -2px; margin-left: 2px; color: var(--accent-dim, var(--accent)); }

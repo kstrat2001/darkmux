@@ -13,7 +13,6 @@ MacBook-Pro
 
 === meta ===
 ● ready · 2  · last run 2h ago
-952 records · last 24h
 
 === logscope ===
 MacBook-Pro

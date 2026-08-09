@@ -17,7 +17,7 @@
  * not per-lens.
  */
 
-import { T, LIVE_WINDOW_MS } from "./flow";
+import { T} from "./flow";
 import { relAgoFrom } from "./format";
 import type { FlowRecord, PresenceBeat } from "../types/handwritten";
 
@@ -38,8 +38,25 @@ function idleHeadline(data: FlowRecord[], liveMachines: Map<string, PresenceBeat
   return `● ready · ${n} ` + (ago ? ` · last run ${ago}` : "");
 }
 
+/** The ready headline as PARTS, so the caller can render legacy's real
+ *  elements — `<span class="rdot ok">` (green) and `<span class="mco">` with
+ *  the machine icon — instead of a flat string. Flattening them lost the
+ *  dot's colour AND the icon while keeping the text identical, which is
+ *  exactly why the goldens never noticed. */
+export interface ReadyParts { kind: "ready"; n: number; ago: string }
+export function readyParts(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): ReadyParts | null {
+  const n = liveMachines.size;
+  if (!n) return null;
+  const closes = data.filter((r) => r.action === "dispatch.complete" || r.action === "dispatch.error");
+  const last = closes.length ? Math.max(...closes.map((r) => T(r.ts))) : null;
+  const known = last != null && nowMs - last >= 0;
+  return { kind: "ready", n, ago: known ? relAgoFrom(nowMs, last as number) : "" };
+}
+
 /** The two `#meta` lines (joined by `<br>` in legacy — two lines here). */
 export function computeMetaLines(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): string[] {
-  const hours = Math.round(LIVE_WINDOW_MS / 3600000);
-  return [idleHeadline(data, liveMachines, nowMs), `${data.length} records · last ${hours}h`];
+  // (operator) One line. The record count lives in the event pane now, next
+  // to the records — stating it here too cost the status bar a second line
+  // for something the pane already says. See EventLogColumn's counter chip.
+  return [idleHeadline(data, liveMachines, nowMs)];
 }

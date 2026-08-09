@@ -1305,8 +1305,12 @@ function renderMeta(){
   // machine presence is on the headline — so records stand alone here. Playback is
   // a specific day: its date + span are meaningful when scrubbing, so keep them.
   if(document.body.classList.contains('live-mode')){
-    const hrs=Math.round(LIVE_WINDOW_MS/3600000);
-    $("meta").innerHTML=`${head}<br>${DATA.length} records · last ${hrs}h`;
+    // (operator) The record count moved INTO the event pane, beside the
+    // records it counts. It was stated twice — here and on the log's own
+    // counter chip — and the duplicate cost the status a whole second line
+    // for information the pane already carries. Playback (the else branch)
+    // keeps its own line: a specific day's span IS the context there.
+    $("meta").innerHTML=head;
   } else {
     $("meta").innerHTML=`${head} · <b>${esc(DATA_SOURCE)}</b> · ${lday(tMin)} `+
       `${clk(tMin)}–${clk(tMax)}<br>${DATA.length} records · ${machines().length} machines`;

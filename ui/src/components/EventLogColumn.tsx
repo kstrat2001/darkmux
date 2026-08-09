@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import type { FlowRecord } from "../types/handwritten";
 import { recKey } from "../lib/flow";
+import { LIVE_WINDOW_MS } from "../lib/flow";
 import { clk } from "../lib/format";
 import { RecordView } from "./RecordView";
 
@@ -34,6 +35,10 @@ const MODEL_ACTIVITIES = new Set(["reasoning", "tool call", "turn"]);
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
  * newest 50, newest-first. */
 const LOG_CAP = 50;
+
+/** The live window the counter reports, in hours — the status bar used to
+ *  state this and no longer does (it belongs beside the records). */
+const WINDOW_HOURS = Math.round(LIVE_WINDOW_MS / 3600000);
 
 const MIN_DETAIL_PCT = 15;
 const MAX_DETAIL_PCT = 70;
@@ -187,11 +192,18 @@ export function EventLogColumn({
   const q = query.length > 0;
   const qcountText = q
     ? filtered.length
-      ? `${filtered.length} match${filtered.length === 1 ? "" : "es"}${capped ? " · newest 50" : ""}`
+      ? `${filtered.length} match${filtered.length === 1 ? "" : "es"}${capped ? ` · ${LOG_CAP} shown` : ""}`
       : "no match"
+    // (operator) "newest 50 of 734" -> "50 of 734". The word carried no
+    // information the newest-first ordering does not already show, and this
+    // chip sits beside a live stream where every extra word is noise.
+    //
+    // The CAP itself is legacy's (`all.slice(-50)`, viewer.html:2443) — what
+    // this port adds is SAYING so. Legacy hides 684 records in silence; the
+    // label is the honest half and worth keeping.
     : capped
-      ? `newest 50 of ${filtered.length}`
-      : "";
+      ? `${LOG_CAP} of ${filtered.length} · last ${WINDOW_HOURS}h`
+      : `${filtered.length} · last ${WINDOW_HOURS}h`;
 
   return (
     <div className={`eventlog${visible ? "" : " eventlog--hidden"}`} ref={columnRef}>
