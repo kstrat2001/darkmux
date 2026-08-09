@@ -206,3 +206,104 @@ test("next: render-sanity screenshot of the deep-link boot path", async ({ page 
   await waitSettled(page, expect, '.machine-lens__health[data-state="loaded"]');
   await page.screenshot({ path: screenshotPath("machine-deeplink-390px.png"), fullPage: true });
 });
+
+// ── Packet 8 — the fleet default view (the savings hero + machine cards +
+// activity timeline), superseding the scaffold's original `FleetStrip`
+// presence-only proof region. `#lens=fleet` doesn't exist as a hash value
+// in the legacy grammar — the fleet lens is what a BARE `/index.html` (no
+// hash at all) resolves to (`parseRoute()`'s final fallback) — so unlike
+// the machine lens above there is only ONE boot path to test, not a
+// click-navigation/deep-link pair: every fresh load of the app lands here.
+const FLEET_GALLERY_DIR = process.env.DARKMUX_GALLERY_DIR || path.join(__dirname, ".gallery", "8-fleet");
+function fleetShot(name) {
+  return path.join(FLEET_GALLERY_DIR, name);
+}
+test.beforeAll(() => {
+  mkdirSync(FLEET_GALLERY_DIR, { recursive: true });
+});
+
+// The fleet lens's own post-fetch content marker (mirrors the machine
+// lens's `.machine-lens__health[data-state="loaded"]` above): `FleetLens`
+// renders its FULL structure (hero + cards + timeline) immediately, even
+// before `useFlowWindow` settles — the hero always-renders-even-at-zero by
+// design (see `SavingsHero`'s own doc) — so `.fleet-lens` itself attaches
+// to the DOM on first paint, well before real data has arrived. Waiting on
+// bare `.fleet-lens` (or even legacy's own `#stage .fleet` marker, which
+// this port's `.fleet` cards div ALSO satisfies unconditionally) would race
+// the fetch exactly the way `extract-lens.js`'s module doc warns against.
+// `data-state="loaded"` is stamped only once BOTH day-fetches
+// (`useFlowWindow`'s `settled`) have resolved — the same two-fetch gate the
+// numbers/cards/timeline all actually depend on.
+const FLEET_LOADED = '.fleet-lens[data-state="loaded"]';
+
+test("next: fresh boot (no hash) into the fleet lens matches goldens/fleet.txt", async ({ page }) => {
+  const meta = loadMeta();
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  installCorpusRoutes(page, meta);
+
+  await page.goto("/index.html");
+  await waitSettled(page, expect, FLEET_LOADED);
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+
+  const got = await extractLensText(page);
+  expect(got).toBe(readGolden("fleet"));
+});
+
+// Red-prove — same self-test discipline as the machine lens's own redprove
+// test above: a blank/unreachable daemon must NOT produce text matching the
+// real golden. `flowWindow.settled` still flips true on a blank harness
+// (both day-fetches resolve to a non-ok `FetchResult`, which is still a
+// SETTLED query state, not a pending one) — so `FLEET_LOADED` appears here
+// too, just fronting all-zero/empty content instead of the real corpus.
+test("next: blank daemon fails the fleet-lens golden comparison", async ({ page }) => {
+  await installFrozenClock(page, Date.UTC(2026, 0, 1));
+  installBlankRoutes(page);
+
+  await page.goto("/index.html");
+  await waitSettled(page, expect, FLEET_LOADED);
+
+  const got = await extractLensText(page);
+  expect(got, "redprove FAILED: a blank/unreachable daemon must not match the real fleet golden").not.toBe(readGolden("fleet"));
+});
+
+test("next: fleet lens render-sanity — zero pageerror, no horizontal scroll at 390px, real stage height", async ({ page }) => {
+  const pageErrors = [];
+  const consoleErrors = [];
+  page.on("pageerror", (err) => pageErrors.push(String(err)));
+  page.on("console", (msg) => {
+    if (msg.type() === "error") consoleErrors.push(msg.text());
+  });
+
+  const meta = loadMeta();
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  installCorpusRoutes(page, meta);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/index.html");
+  await waitSettled(page, expect, FLEET_LOADED);
+
+  const stageBox = await page.locator("#stage").boundingBox();
+  expect(stageBox, "the #stage region must have a real bounding box").not.toBeNull();
+  expect(stageBox.height).toBeGreaterThan(20);
+
+  // `document.body.scrollWidth`, NOT `document.documentElement.scrollWidth`
+  // — see the machine lens's identical render-sanity test above for why.
+  const overflow = await page.evaluate(() => document.body.scrollWidth > document.documentElement.clientWidth);
+  expect(overflow, "no horizontal document scroll at 390px").toBe(false);
+
+  expect(pageErrors, `pageerror events: ${pageErrors.join("; ")}`).toHaveLength(0);
+  expect(consoleErrors, `console.error events: ${consoleErrors.join("; ")}`).toHaveLength(0);
+
+  await page.screenshot({ path: fleetShot("fleet-390px.png"), fullPage: true });
+});
+
+test("next: fleet lens render-sanity screenshot at desktop width (populated, for review)", async ({ page }) => {
+  const meta = loadMeta();
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  installCorpusRoutes(page, meta);
+
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/index.html");
+  await waitSettled(page, expect, FLEET_LOADED);
+  await page.screenshot({ path: fleetShot("fleet-1280px.png"), fullPage: true });
+});

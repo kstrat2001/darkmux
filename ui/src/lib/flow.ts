@@ -341,3 +341,17 @@ export function buildMachineRuns(
 export function looseRecords(data: FlowRecord[], m: string): FlowRecord[] {
   return data.filter((r) => uidOf(r) === m && !r.session_id);
 }
+
+/** `lastTs()` — viewer.html:1187. A session's last recorded activity —
+ * where an orphan's timeline bar ends when it aged out of presence with no
+ * close-edge (so the bar stops at its last sign of life, not at "now"). */
+export function lastTs(data: FlowRecord[], sid: string): number {
+  let m = 0;
+  for (const r of data) {
+    if (r.session_id === sid) {
+      const t = T(r.ts);
+      if (t > m) m = t;
+    }
+  }
+  return m;
+}

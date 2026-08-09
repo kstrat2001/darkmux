@@ -38,7 +38,14 @@ describe("App", () => {
       </QueryClientProvider>,
     );
     expect(document.getElementById("stage")).toBeTruthy();
-    await waitFor(() => expect(screen.getByText(/no machines currently present/i)).toBeInTheDocument());
+    // Packet 8: the default route is `FleetLens` (the savings hero +
+    // machine cards + activity timeline), superseding the scaffold's
+    // original `FleetStrip` presence-only region — see that component's
+    // own doc. With every endpoint answering a blank `[]`, the hero still
+    // renders (always-render-even-at-zero, per its own doc) and the
+    // timeline falls to its empty-fleet branch.
+    await waitFor(() => expect(screen.getByText(/by your fleet/i)).toBeInTheDocument());
+    expect(screen.getByText(/waiting for the first flow record/i)).toBeInTheDocument();
   });
 
   it("renders the real console lens (not a placeholder) for #lens=console", async () => {

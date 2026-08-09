@@ -26,6 +26,27 @@ export function clk(t: number): string {
   return new Date(t).toLocaleTimeString([], { hour12: false });
 }
 
+/** `clkhm()` — viewer.html:976. `HH:MM` local, no seconds — the fleet
+ * activity-timeline axis labels. */
+export function clkhm(t: number): string {
+  return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+/** `sameDay()` — viewer.html:982. */
+function sameDay(a: number, b: number): boolean {
+  return new Date(a).toDateString() === new Date(b).toDateString();
+}
+
+/** `clkrange()` — viewer.html:983-987 (#1530 dogfood). A time-only formatter
+ * can't distinguish two instants exactly 24h apart, so a same-day range
+ * stays bare `HH:MM:SS–HH:MM:SS`; a window straddling a day boundary
+ * prefixes each end with its short date ("Aug 7 16:40:59–Aug 8 16:40:59"). */
+export function clkrange(a: number, b: number): string {
+  if (sameDay(a, b)) return `${clk(a)}–${clk(b)}`;
+  const d = (t: number) => new Date(t).toLocaleDateString([], { month: "short", day: "numeric" });
+  return `${d(a)} ${clk(a)}–${d(b)} ${clk(b)}`;
+}
+
 /** `relAgoFrom()` — viewer.html:987-989. Coarse past-only relative time.
  * `<5s` reads as "just now"; note this is NOT the same threshold as
  * `<60s` — 5-59s renders as "Ns ago", a real bucket the machine lens's own
