@@ -1,1 +1,11 @@
-[]
+{
+  "sessions": [],
+  "meta": {
+    "sources": {
+      "fleet": {
+        "state": "ok"
+      }
+    },
+    "complete": true
+  }
+}
