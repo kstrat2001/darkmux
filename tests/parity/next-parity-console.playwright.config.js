@@ -1,6 +1,7 @@
 const { defineConfig, devices } = require("@playwright/test");
 const fs = require("fs");
 const path = require("path");
+const { stageNextBundle } = require('./lib/stage-next-bundle.js');
 
 // The console (CLI-panel) lens's OWN acceptance-gate harness (Packet 6).
 // Same structure as its siblings — `next-playwright.config.js` (Packet 3,
@@ -34,15 +35,9 @@ const NEXT_HTML = path.join(REPO_ROOT, "crates", "darkmux-serve", "assets", "nex
 const SERVED = path.join(__dirname, ".served-next-console");
 const PORT = 47923;
 
-(function stageArtifact() {
-  if (!fs.existsSync(NEXT_HTML)) {
-    throw new Error(
-      `next-parity-console.playwright.config: ${NEXT_HTML} does not exist — run \`cd ui && bun run build\` first (the artifact is committed, not built by this config).`,
-    );
-  }
-  fs.mkdirSync(SERVED, { recursive: true });
-  fs.copyFileSync(NEXT_HTML, path.join(SERVED, "index.html"));
-})();
+// (#1737) Staging goes through the shared helper, which REFUSES a stale
+// bundle instead of silently serving one. See lib/stage-next-bundle.js.
+stageNextBundle(SERVED, 'next-parity-console.playwright.config');
 
 module.exports = defineConfig({
   testDir: __dirname,
