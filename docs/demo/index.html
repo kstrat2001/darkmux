@@ -1277,8 +1277,23 @@ function idleStatus(){
   // (#1105) No "fleet" wording — it reads wrong for a solo local machine
   // ("fleet (1)"). Waiting = no machine has checked in yet.
   if(!n) return '<span class="rdot">○</span> waiting for a machine';
-  const closes=DATA.filter(r=>r.action==="dispatch.complete"||r.action==="dispatch.error");
-  const last=closes.length?Math.max(...closes.map(r=>T(r.ts))):null;
+  // (operator) LAST EVENT, not last run. Two reasons it changed: "last run"
+  // could not say WHICH machine it belonged to, and it sat above an event log
+  // it was not actually describing. The newest record in the window is a
+  // property of the STREAM — unambiguous by definition, no attribution
+  // needed — and reads as "when did anything last happen", which is exactly
+  // the question you ask before opening the log beneath it.
+  // LAST DISPATCH, measured at its START.
+  //
+  // Three iterations to get here, each wrong for a different reason.
+  // "last run" used dispatch COMPLETION — so a dispatch still running was
+  // invisible, and the line aged while work was actively happening.
+  // "last event" used the newest record of any kind — useless, because
+  // heartbeats stream continuously and it would read "just now" forever.
+  // A dispatch START is the honest activity signal: it says when work last
+  // BEGAN, counts in-flight work, and cannot be kept warm by telemetry.
+  const starts=DATA.filter(r=>r.action==="dispatch.start");
+  const last=starts.length?Math.max(...starts.map(r=>T(r.ts))):null;
   // (#1103) "last run" measured from real wall-clock now, NOT state.t (=tMax, the
   // newest record): an idle machine's playhead sits on its last record, so the old
   // reference made every idle headline read "just now". The count is PRESENCE
@@ -1290,7 +1305,11 @@ function idleStatus(){
   const now=Date.now();
   const known=last!=null&&(now-last)>=0;
   const ago=known?relAgoFrom(now,last):'';
-  return `<span class="rdot ok">●</span> ready · <span class="mco" title="${n} machine${n===1?'':'s'} online">${n} ${ICON.machine}</span>${ago?` · last run ${ago}`:''}`;
+  // No `● ready`: the machine CARDS below state health per machine, and a
+  // single green dot cannot represent two machines in different states. It
+  // also collided with the `● live` badge a few pixels away — two green dots
+  // asserting different things with nothing to tell them apart.
+  return `<span class="mco" title="${n} machine${n===1?'':'s'} online">${n} ${ICON.machine}</span>${ago?` · last dispatch ${ago}`:''}`;
 }
 function renderMeta(){
   // (#789) Activity-driven headline. Running → the live subject (mission-scoped

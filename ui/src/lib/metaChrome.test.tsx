@@ -15,11 +15,11 @@ import { ReadyHeadline } from "../components/ReadyHeadline";
 // element present, class applied — because text extraction is blind to it.
 
 describe("ReadyHeadline", () => {
-  it("renders the status dot with the class that colours it green", () => {
+  it("renders NO status dot — the cards state health, and one dot cannot speak for two machines", () => {
+    // Cut deliberately: it also collided with the `● live` badge inches
+    // away, leaving two green dots asserting different things.
     const { container } = render(<ReadyHeadline n={2} ago="10h ago" />);
-    const dot = container.querySelector(".rdot");
-    expect(dot).toBeTruthy();
-    expect(dot!.className).toContain("ok");
+    expect(container.querySelector(".rdot")).toBeNull();
   });
 
   it("renders the machine ICON beside the count, not just the number", () => {
@@ -41,11 +41,11 @@ describe("ReadyHeadline", () => {
 
   it("reproduces legacy's exact TEXT, so the parity goldens stay honest", () => {
     const { container } = render(<ReadyHeadline n={2} ago="10h ago" />);
-    expect(container.textContent).toBe("● ready · 2  · last run 10h ago");
+    expect(container.textContent).toBe("2  · last dispatch 10h ago");
   });
 
-  it("omits the last-run clause when no run is known", () => {
+  it("omits the last-dispatch clause when the window holds nothing", () => {
     const { container } = render(<ReadyHeadline n={2} ago="" />);
-    expect(container.textContent).toBe("● ready · 2 ");
+    expect(container.textContent).toBe("2 ");
   });
 });

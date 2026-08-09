@@ -25,8 +25,8 @@ import type { FlowRecord, PresenceBeat } from "../types/handwritten";
 function idleHeadline(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): string {
   const n = liveMachines.size;
   if (!n) return "○ waiting for a machine";
-  const closes = data.filter((r) => r.action === "dispatch.complete" || r.action === "dispatch.error");
-  const last = closes.length ? Math.max(...closes.map((r) => T(r.ts))) : null;
+  const starts = data.filter((r) => r.action === "dispatch.start");
+  const last = starts.length ? Math.max(...starts.map((r) => T(r.ts))) : null;
   const known = last != null && nowMs - last >= 0;
   const ago = known ? relAgoFrom(nowMs, last as number) : "";
   // Trailing space after `n` and the leading space on the `ago` suffix are
@@ -35,7 +35,7 @@ function idleHeadline(data: FlowRecord[], liveMachines: Map<string, PresenceBeat
   // producing a double space before "· last run" when ago is present. See
   // `format.ts`'s module doc for why this is baked into the string rather
   // than reproduced via CSS/DOM structure.
-  return `● ready · ${n} ` + (ago ? ` · last run ${ago}` : "");
+  return `${n} ` + (ago ? ` · last dispatch ${ago}` : "");
 }
 
 /** The ready headline as PARTS, so the caller can render legacy's real
@@ -47,8 +47,17 @@ export interface ReadyParts { kind: "ready"; n: number; ago: string }
 export function readyParts(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): ReadyParts | null {
   const n = liveMachines.size;
   if (!n) return null;
-  const closes = data.filter((r) => r.action === "dispatch.complete" || r.action === "dispatch.error");
-  const last = closes.length ? Math.max(...closes.map((r) => T(r.ts))) : null;
+  // LAST DISPATCH, measured at its START.
+  //
+  // Three iterations to get here, each wrong for a different reason.
+  // "last run" used dispatch COMPLETION — so a dispatch still running was
+  // invisible, and the line aged while work was actively happening.
+  // "last event" used the newest record of any kind — useless, because
+  // heartbeats stream continuously and it would read "just now" forever.
+  // A dispatch START is the honest activity signal: it says when work last
+  // BEGAN, counts in-flight work, and cannot be kept warm by telemetry.
+  const starts = data.filter((r) => r.action === "dispatch.start");
+  const last = starts.length ? Math.max(...starts.map((r) => T(r.ts))) : null;
   const known = last != null && nowMs - last >= 0;
   return { kind: "ready", n, ago: known ? relAgoFrom(nowMs, last as number) : "" };
 }

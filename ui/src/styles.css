@@ -96,8 +96,23 @@ body {
   .nav-tab {
     display: inline-flex;
     align-items: center;
-    min-height: 44px;
+    /* NOT `min-height` on a PAINTED control: a filled 44px slab around 11px
+       text reads as a big empty block (operator, on the phone). The box keeps
+       its natural size; `::after` extends only the invisible TAP region to
+       Apple's 44pt minimum. Hit area and visual weight are different things
+       and were wrongly fused here. */
+    position: relative;
   }
+  .nav-tab::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 44px;
+    transform: translateY(-50%);
+  }
+
 }
 
 .app-shell__crumb {
@@ -319,8 +334,23 @@ body {
   .catalog-toggle {
     display: inline-flex;
     align-items: center;
-    min-height: 44px;
+    /* NOT `min-height` on a PAINTED control: a filled 44px slab around 11px
+       text reads as a big empty block (operator, on the phone). The box keeps
+       its natural size; `::after` extends only the invisible TAP region to
+       Apple's 44pt minimum. Hit area and visual weight are different things
+       and were wrongly fused here. */
+    position: relative;
   }
+  .catalog-toggle::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 44px;
+    transform: translateY(-50%);
+  }
+
   .masthead__nav a {
     display: inline-flex;
     align-items: center;
@@ -1600,8 +1630,23 @@ body {
     align-items: center;
     justify-content: center;
     min-width: 44px;
-    min-height: 44px;
+    /* NOT `min-height` on a PAINTED control: a filled 44px slab around 11px
+       text reads as a big empty block (operator, on the phone). The box keeps
+       its natural size; `::after` extends only the invisible TAP region to
+       Apple's 44pt minimum. Hit area and visual weight are different things
+       and were wrongly fused here. */
+    position: relative;
   }
+  .twinb::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 44px;
+    transform: translateY(-50%);
+  }
+
 }
 /* (operator) The machine name is a CAPTION ABOVE its track, not a gutter
    beside it. Legacy reserved `--lname-w` (150px default) as a fixed

@@ -27,11 +27,15 @@ import { MachineIcon } from "./MachineIcon";
 export function ReadyHeadline({ n, ago }: { n: number; ago: string }) {
   return (
     <>
-      <span className="rdot ok">●</span> ready ·{" "}
+      {/* No `● ready`: the machine CARDS below state health per machine, and
+          one green dot cannot represent two machines in different states. It
+          also collided with the `● live` badge inches away — two green dots
+          asserting different things, with nothing telling you which to
+          believe. The count and the icon carry what is left. */}
       <span className="mco" title={`${n} machine${n === 1 ? "" : "s"} online`}>
         {n} <MachineIcon />
       </span>
-      {ago ? ` · last run ${ago}` : null}
+      {ago ? ` · last dispatch ${ago}` : null}
     </>
   );
 }

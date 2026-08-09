@@ -12,7 +12,7 @@ github
 MacBook-Pro
 
 === meta ===
-● ready · 2  · last run 2h ago
+2  · last dispatch 2h ago
 
 === logscope ===
 MacBook-Pro
