@@ -118,16 +118,30 @@ async function waitSettled(page, expect, contentSelector, opts = {}) {
   }
 }
 
-// QA finding (post-0a review): `page.clock.install({ time })` sets an
-// INITIAL time but leaves timers running in real wall-clock time from that
-// point — QA measured a 1506ms delta after a 1500ms wait, i.e. the clock
-// was never actually frozen. `pauseAt()` is what freezes it (no timer fires
-// until `runFor`/`fastForward`/`resume` is explicitly called). Installing
-// and immediately pausing at the SAME instant, before navigation, means the
-// page never observes real time passing at all.
+// What the goldens actually need is a fixed `Date.now()` — so a rendered
+// "3m ago" or an absolute timestamp is the same on every run. They do NOT
+// need timers stopped, and stopping them is actively harmful.
+//
+// History, because this was gotten wrong twice in opposite directions:
+//
+//  1. `page.clock.install({ time })` alone sets an INITIAL time but lets
+//     timers keep running in real wall-clock time (QA measured a 1506ms
+//     delta after a 1500ms wait) — so the clock was never frozen and the
+//     goldens were only accidentally stable.
+//  2. Adding `pauseAt()` did freeze it, and froze the TIMERS with it. React
+//     18 schedules non-urgent updates through the timer queue, so a state
+//     update that lands after the pause is never flushed: the fetch
+//     resolves, the data is in the cache, and the component renders
+//     `loading…` forever. This passed locally (the update won the race on a
+//     fast machine, ~1.6s for the whole suite) and failed on CI's slower
+//     Linux runner, where the same suite took 1.1m and four machine-lens
+//     assertions timed out. The traces showed all seven endpoint requests
+//     returning 200 — the data arrived; only the render never happened.
+//
+// `setFixedTime` is the option that matches the actual requirement: pin what
+// the page READS as now, leave the event loop alone.
 async function installFrozenClock(page, ms) {
-  await page.clock.install({ time: ms });
-  await page.clock.pauseAt(ms);
+  await page.clock.setFixedTime(ms);
 }
 
 module.exports = {
