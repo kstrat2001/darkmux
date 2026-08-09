@@ -398,6 +398,26 @@ body {
   border-left: 1px solid var(--border);
   background: #10141f;
 }
+/* (operator, on the phone) The detail panel's height is an INLINE
+   `flex-basis` driven by the split-resizer's state — 38% by default. On
+   desktop that is legacy's draggable split and the operator can change it.
+   On mobile the resizer is hidden, so 38% becomes a permanent RESERVATION:
+   a short selected event leaves most of it blank, and the log list — the
+   thing you opened the panel to read — gets pushed below a screenful of
+   nothing. Measured at 402x844: a 192px detail holding 163px of body, with
+   the list starting 1279px down the page.
+
+   `flex-basis: auto` makes it size to CONTENT instead, capped so a large
+   event can still not swallow the column. `!important` is deliberate and is
+   the correct tool here: it exists to override an inline style, which is
+   exactly what this is doing. */
+@media (max-width: 768px) {
+  .eventlog__detail {
+    flex-basis: auto !important;
+    max-height: 45vh;
+  }
+}
+
 @media (max-width: 768px) {
   .eventlog {
     width: 100%;
@@ -1472,6 +1492,25 @@ body {
   border-top: 1px solid var(--border);
   padding-top: 18px;
 }
+/* (operator) The preset control goes LEFT, the range label RIGHT.
+   `clkrange` returns `HH:MM–HH:MM` when both ends fall on the same day and
+   `Aug 8 18:45–Aug 9 18:45` when they do not — so ONLY the 24h preset spans
+   two days and renders the long form. With the label first, switching away
+   from 24h collapsed it and the buttons JUMPED LEFT out from under the
+   pointer mid-click. Controls must not move when neighbouring text changes
+   width.
+
+   Done with `order`, not by reordering the JSX: `innerText` follows DOM
+   order, so the parity goldens are untouched by a purely visual swap. (Run
+   the suites after touching this — that assumption is the whole reason this
+   is safe, and it is worth re-proving rather than trusting.) */
+.tlhdr > :first-child {
+  order: 2;
+}
+.tlhdr .twin {
+  order: 1;
+}
+
 .tlhdr {
   font: 600 11px/1 "JetBrains Mono", monospace;
   letter-spacing: 0.14em;
