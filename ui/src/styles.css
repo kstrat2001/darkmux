@@ -103,6 +103,27 @@ body {
   text-align: right;
 }
 
+/* `#modebadge` (Packet 5) — viewer.html:406 (`#modebadge.stale{opacity:.65}`)
+   + the `.live` accent legacy's `setBadges()` toggles. Global chrome, a
+   sibling of `#meta`, not a lens region — see `LiveStatusBadge.tsx`'s own
+   doc. */
+#modebadge.pb {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--dim);
+}
+
+#modebadge.pb.live {
+  color: var(--accent);
+}
+
+#modebadge.pb.stale {
+  color: var(--error);
+  opacity: 0.85;
+}
+
 /* (#1613/#1614 precedent, `tests/e2e/chrome-order.spec.js`) At phone width
    the crumbbar reads BROADEST-SCOPE-FIRST: global status (`#meta`) above
    the tab selector above the per-tab crumb — `order`, not just wrapping,

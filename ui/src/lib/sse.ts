@@ -12,10 +12,36 @@ import type { QueryClient, QueryKey } from "@tanstack/react-query";
  * Deliberately NOT a React hook — a hook wrapper is a lens-packet concern
  * once a real flow-tail component exists to own the effect's lifecycle. This
  * module is the reusable primitive underneath one.
+ *
+ * (Packet 5) EXTENDED, not rewritten, per the packet brief: `startFlowTail`
+ * gained an optional `handlers` param (`FlowTailHandlers`, below) so
+ * `hooks/useLiveTail.ts` can drive the live/reconnecting mode-badge honesty
+ * legacy's `LIVE_ES.onopen`/`.onerror` implement, plus the #1480 self-heal
+ * reconcile-on-reconnect — without either duplicating this module's
+ * EventSource lifecycle management or reaching into its private `source`
+ * variable. The append/reconnect-on-visibility behavior this spike already
+ * proved is UNCHANGED; every existing call site (including `sse.test.ts`)
+ * sees no behavior difference from the new, optional 5th parameter.
  */
 
 export interface FlowTailHandle {
   close: () => void;
+}
+
+/** (Packet 5) Connection-state callbacks — the primitive's own twin of
+ * `EventSource.onopen`/`.onerror`, threaded through so a caller can drive
+ * the legacy `#modebadge` live/reconnecting honesty (viewer.html's
+ * `LIVE_ES.onopen`/`.onerror`, 3609-3625) without reaching into the
+ * `EventSource` itself — `useLiveTail` is the one caller today. Both are
+ * OPTIONAL and purely additive: a caller that doesn't pass `handlers` (every
+ * existing call site, including `sse.test.ts`) sees no behavior change. */
+export interface FlowTailHandlers {
+  /** Fires on every successful (re)connect, including the FIRST one — a
+   * caller that wants the "self-heal on RECONNECT only, not the initial
+   * connect" distinction (#1480 part 1) tracks that itself, the same way
+   * `LIVE_ES.onopen`'s own `everOpened` flag does. */
+  onOpen?: () => void;
+  onError?: () => void;
 }
 
 /**
@@ -32,6 +58,7 @@ export function startFlowTail(
   queryKey: QueryKey,
   date: string,
   eventSourceFactory: (url: string) => EventSource = (url) => new EventSource(url),
+  handlers?: FlowTailHandlers,
 ): FlowTailHandle {
   let source: EventSource | null = null;
 
@@ -51,6 +78,8 @@ export function startFlowTail(
     source?.close();
     source = eventSourceFactory(`/flow/${date}/stream`);
     source.onmessage = (event: MessageEvent<string>) => appendRecord(event.data);
+    source.onopen = () => handlers?.onOpen?.();
+    source.onerror = () => handlers?.onError?.();
   };
 
   const onVisibilityChange = () => {

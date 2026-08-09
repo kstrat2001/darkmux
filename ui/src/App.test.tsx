@@ -228,4 +228,36 @@ describe("App", () => {
     // is still the active lens, just re-filtered client-side).
     expect(document.getElementById("lens-runs")!.className).toMatch(/\bon\b/);
   });
+
+  // (QA, packet 5) The live badge must not speak for a view that has no tail.
+  // `useLiveTail(false)` returns its INITIAL "live" untouched, so rendering
+  // the badge unconditionally made a replay route claim `● live` with no
+  // stream, no reconcile, and no liveness of any kind — #1480's dishonesty
+  // pointed the other way.
+  it("shows no live badge on a replay route, where no tail is running", async () => {
+    window.location.hash = "#session=abc-123";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container } = render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(container.querySelector(".crumbbar, #stage")).toBeTruthy());
+    expect(container.querySelector("#modebadge")).toBeNull();
+  });
+
+  it("DOES show the live badge on a live route — the inverted case", async () => {
+    // Guards the gate from over-firing: the default fleet view is live, and
+    // silently dropping its badge would be its own dishonesty.
+    window.location.hash = "";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container } = render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(container.querySelector("#modebadge")).toBeTruthy());
+  });
 });

@@ -60,3 +60,8 @@ export const queryKeys = {
   flowMission: (id: string) => ["flow", "mission", id] as const,
   flowSession: (id: string) => ["flow", "session", id] as const,
 };
+
+/** How often a live view re-checks whether the UTC day has rolled over.
+ *  Same 5s cadence legacy's live poll used for the same check — a named
+ *  constant rather than a literal, per the recorded-knob doctrine. */
+export const DATE_ROLLOVER_CHECK_MS = 5000;

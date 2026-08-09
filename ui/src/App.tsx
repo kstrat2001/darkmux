@@ -4,6 +4,7 @@ import { useSyncHash } from "./lib/hashSync";
 import { FleetStrip } from "./components/FleetStrip";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
+import { LiveStatusBadge } from "./components/LiveStatusBadge";
 import { MachineLens } from "./lenses/machine/MachineLens";
 import { RunsBoard } from "./lenses/runs/RunsBoard";
 import { ConsolePanel } from "./lenses/console/ConsolePanel";
@@ -13,8 +14,10 @@ import { SessionReplay } from "./lenses/catalog/SessionReplay";
 import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useLiveMachines } from "./hooks/useLiveMachines";
+import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines } from "./lib/metaLine";
 import { localMachineUid, nameOf } from "./lib/flow";
+import { isLiveRoute } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
 import { queryKeys } from "./lib/queryKeys";
@@ -77,6 +80,14 @@ export function App() {
   const route = useHashRoute();
   const nowMs = Date.now();
 
+  // (Packet 5) The SSE tail + reconcile backstop + date-rollover handler —
+  // gated by `isLiveRoute` (see that function's own doc) so a genuinely
+  // historical route (`playback`/`session`/`mission-redirect`) doesn't run
+  // a live tail behind it, matching legacy's own `wantsPlayback` gate on
+  // `startLiveTail`. Feeds `flowWindow` below via the Query cache
+  // (`useFlowWindow`'s own doc), not a direct return-value dependency here.
+  const liveStatus = useLiveTail(isLiveRoute(route));
+
   const flowWindow = useFlowWindow(nowMs);
   const liveMachines = useLiveMachines();
   const specsQuery = useQuery({
@@ -118,6 +129,12 @@ export function App() {
             </div>
           ))}
         </div>
+        {/* (QA, packet 5) Only where a tail actually runs. `useLiveTail(false)`
+            returns its initial "live" untouched, so rendering this
+            unconditionally made a session-replay route claim `● live` with no
+            stream, no reconcile, and no liveness of any kind — #1480's
+            dishonesty in mirror image. */}
+        {isLiveRoute(route) ? <LiveStatusBadge status={liveStatus} /> : null}
       </div>
       <CatalogPanel />
       {/* Visible (never `display:none`) — `innerText`, which the parity
