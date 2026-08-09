@@ -251,6 +251,21 @@ body {
    badge, same relative order as legacy's `#srcbadge` before `#modebadge`. */
 .masthead .catalog-anchor {
   position: relative;
+  /* The base `.catalog-anchor` sets `align-self: flex-start`, which is right
+     inside `.app-shell` (a VERTICAL flex column, where it stops the anchor
+     stretching full width) and wrong here, inside the masthead's HORIZONTAL
+     row, where it overrides the row's `align-items: center`. Measured: every
+     other masthead child centered at y=27, this one at y=33 — six pixels low,
+     which is exactly the sort of thing that reads as "off" long before anyone
+     can say why.
+
+     `align-self: center` alone does NOT fix it: the base rule also carries
+     `margin: 12px 0 0 16px` from its old placement, and centering centers the
+     MARGIN BOX — so a 12px top margin displaces the visible content by
+     exactly the 6px measured. The margin has to go too, and the masthead's
+     own `gap` already provides the horizontal spacing. */
+  align-self: center;
+  margin: 0;
 }
 
 @media (max-width: 768px) {
@@ -272,7 +287,10 @@ body {
    `.wrap{display:block}` rule (viewer.html:672-680). */
 .app-shell__content {
   display: flex;
-  align-items: flex-start;
+  /* `stretch`, not `flex-start`: the event-log column fills the row's height
+     (see `.eventlog`). `flex-start` left it at its own intrinsic height with
+     dead space beneath. */
+  align-items: stretch;
   flex: 1;
   min-width: 0;
 }
@@ -287,15 +305,21 @@ body {
    (viewer.html:321) + `.detail`/`.split`/`.loglist`/`.loghead`/`.logsearch`/
    `#logbody`/`.rec` (viewer.html:321-372). Only mounted (never just
    CSS-hidden) when `lib/route.ts`'s `showsEventLog(route)` is true — see
-   that function's own doc for the verified visibility rule. A fixed height
-   (not the viewport-locked `calc()` legacy uses — this port doesn't lock
-   the document height at all, see `styles.css`'s own `html,body` rule) so
-   the column has a sane, internally-scrolling presence regardless of how
-   tall `#stage`'s own content happens to be. */
+   that function's own doc for the verified visibility rule.
+
+   HEIGHT: stretches to fill the content row, rather than the fixed `70vh`
+   this first shipped with. That fixed height was measured leaving 236px of
+   dead space below the column on a 1143px viewport AND clipping the event
+   list mid-row — the stream visibly "cut off" partway down the page with
+   empty space beneath it, which is what the operator saw. Legacy fills the
+   available height too (`.wrap`'s `calc()` + `.log` as a flex child); the
+   difference is that this port lets the ROW own the height and the column
+   stretch into it, so there is no viewport arithmetic to keep in sync.
+   The inner `.loglist` still scrolls. */
 .eventlog {
   width: 380px;
   flex: none;
-  height: 70vh;
+  align-self: stretch;
   min-height: 320px;
   display: flex;
   flex-direction: column;
