@@ -234,7 +234,14 @@ test.describe("nav chrome (Packet 1.5)", () => {
     // `beat_ts_ms` (not just "any handler") is the load-bearing part.
     await page.route("**/fleet/machines/live", (route) => {
       pollCount++;
-      const fresh = liveMachinesFixture.map((m) => ({ ...m, beat_ts_ms: Date.now() }));
+      // (#1729) The endpoint is an envelope — `{machines, meta}` — so the
+      // bumped beats have to be rebuilt INSIDE it. Serving a bare array here
+      // would make the app read zero machines and the regression this test
+      // guards would go quiet for the wrong reason.
+      const fresh = {
+        ...liveMachinesFixture,
+        machines: (liveMachinesFixture.machines ?? []).map((m) => ({ ...m, beat_ts_ms: Date.now() })),
+      };
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fresh) });
     });
 

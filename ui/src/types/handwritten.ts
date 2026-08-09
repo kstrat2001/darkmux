@@ -21,6 +21,47 @@ export interface RunsResponse {
   generated_at_ms: number;
 }
 
+/**
+ * How completely one underlying source answered for a response (#1729).
+ * Source: `crates/darkmux-serve/src/source_state.rs::SourceState`.
+ *
+ * Four states, and the pair that matters is `off` vs `unavailable`: a
+ * standalone machine with no fleet is CORRECT and must never be warned at,
+ * while a configured fleet that could not be read is an incomplete answer
+ * wearing a complete answer's clothes. Rendering them the same is the whole
+ * defect the marker exists to remove.
+ */
+export type SourceState =
+  | { state: "ok" }
+  | { state: "stale"; age_ms: number; detail: string }
+  | { state: "unavailable"; detail: string }
+  | { state: "off" };
+
+/**
+ * The `meta` every coverage-bearing endpoint carries (#1729).
+ *
+ * `sources` holds ONLY sources whose state is genuinely tracked — an absent
+ * key means "not tracked", never "fine". `complete` is the derived
+ * "is this the whole truth?", so a renderer can decide whether to warn
+ * without re-deriving the meaning of each state at every call site.
+ */
+export interface CoverageMeta {
+  sources: { fleet?: SourceState };
+  complete: boolean;
+}
+
+/** `GET /fleet/machines/live` (#1729) — the beats plus their coverage. */
+export interface FleetMachinesLiveResponse {
+  machines: PresenceBeat[];
+  meta: CoverageMeta;
+}
+
+/** `GET /fleet/sessions/live` (#1729) — the beats plus their coverage. */
+export interface FleetSessionsLiveResponse {
+  sessions: LiveSessionBeat[];
+  meta: CoverageMeta;
+}
+
 /** `GET /fleet/machines/live` — `axum::Json(Vec<PresenceBeat>)`, a REAL typed
  * struct, but one that lives in `darkmux-flow` rather than `darkmux-serve`.
  * Bridging it with ts-rs would mean adding `ts-rs` as a dependency of
