@@ -1,5 +1,5 @@
 === topbar ===
-darkmux · observability
+darkmux
 FLOW · 2026-08-07
 ▣ PLAYBACK
 home
@@ -15,10 +15,10 @@ github
 2008 records · 1 machines
 
 === logscope ===
-FLEET
+fleet
 
 === stage ===
-BY YOUR FLEET
+TOKENS
 577,442
 LOCAL TOKENS
 0

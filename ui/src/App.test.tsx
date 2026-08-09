@@ -44,7 +44,7 @@ describe("App", () => {
     // own doc. With every endpoint answering a blank `[]`, the hero still
     // renders (always-render-even-at-zero, per its own doc) and the
     // timeline falls to its empty-fleet branch.
-    await waitFor(() => expect(screen.getByText(/by your fleet/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());
     expect(screen.getByText(/waiting for the first flow record/i)).toBeInTheDocument();
   });
 
@@ -278,7 +278,7 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(screen.getByText(/observability/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("darkmux")).toBeInTheDocument());
   });
 
   // (Chrome packet) `showsEventLog` is a pure-function unit-tested directly
@@ -292,7 +292,7 @@ describe("App", () => {
   // "FLEET" bug — that bug was about a `#logscope` rendered in the WRONG
   // PLACE (loose, above the stage) with the WRONG SCOPE (always "FLEET"
   // regardless of lens), not about existing at all.
-  it("mounts the event-log column visibly (not eventlog--hidden), with #logscope=FLEET, on the default fleet route", async () => {
+  it("mounts the event-log column visibly (not eventlog--hidden) on the default fleet route", async () => {
     vi.stubGlobal("fetch", mockFleetLikeFetch());
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
@@ -301,11 +301,11 @@ describe("App", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(document.getElementById("logbody")).toBeTruthy());
-    expect(document.getElementById("logscope")?.textContent).toBe("FLEET");
+    expect(document.getElementById("logscope")?.hasAttribute("hidden")).toBe(true);
     expect(document.querySelector(".eventlog")?.className).not.toMatch(/eventlog--hidden/);
   });
 
-  it("mounts the event-log column but HIDDEN (eventlog--hidden) on the machine lens, with #logscope still present", async () => {
+  it("mounts the event-log column but HIDDEN (eventlog--hidden) on the machine lens", async () => {
     window.location.hash = "#lens=machine";
     vi.stubGlobal("fetch", mockFleetLikeFetch());
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -316,10 +316,12 @@ describe("App", () => {
     );
     await waitFor(() => expect(screen.getByText(/fleet › machine/)).toBeInTheDocument());
     expect(document.getElementById("logbody")).toBeTruthy();
-    // `#logscope` still has real text (matching legacy — see the component's
-    // own doc for why unmounting it was tried first and is wrong), just not
-    // painted (a real DOM/CSS state, not a text-existence contract).
-    expect(document.getElementById("logscope")?.textContent).toBeTruthy();
+    // `#logscope` stays PRESENT (so this port's parity extraction matches
+    // legacy's) but is now EMPTY everywhere: the outer UI owns context. What
+    // this test still guards is the real DOM/CSS state — the column is
+    // mounted and merely unpainted, not unmounted.
+    expect(document.getElementById("logscope")).toBeTruthy();
+    expect(document.getElementById("logscope")?.hasAttribute("hidden")).toBe(true);
     expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
   });
 

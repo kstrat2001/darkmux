@@ -1,7 +1,9 @@
 import { useMemo, useRef, useState } from "react";
 import type { FlowRecord } from "../types/handwritten";
 import { recKey } from "../lib/flow";
+import { LIVE_WINDOW_MS } from "../lib/flow";
 import { clk } from "../lib/format";
+import { RecordView } from "./RecordView";
 
 /** `activityOf()` — viewer.html:1014-1038, the subset this column's "model
  * only" quick filter and row tags need (reasoning/tool-call/turn/dispatch
@@ -33,6 +35,10 @@ const MODEL_ACTIVITIES = new Set(["reasoning", "tool call", "turn"]);
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
  * newest 50, newest-first. */
 const LOG_CAP = 50;
+
+/** The live window the counter reports, in hours — the status bar used to
+ *  state this and no longer does (it belongs beside the records). */
+const WINDOW_HOURS = Math.round(LIVE_WINDOW_MS / 3600000);
 
 const MIN_DETAIL_PCT = 15;
 const MAX_DETAIL_PCT = 70;
@@ -115,12 +121,14 @@ const DEFAULT_DETAIL_PCT = 38;
  */
 export function EventLogColumn({
   records,
-  scopeLabel,
   visible,
+  scopeLabel,
 }: {
   records: FlowRecord[];
-  scopeLabel: string;
   visible: boolean;
+  /** Not shown — written into a hidden span purely so this port's parity
+   *  extraction matches legacy's. See App's `routeChrome` note. */
+  scopeLabel: string;
 }) {
   const [query, setQuery] = useState("");
   const [modelOnly, setModelOnly] = useState(false);
@@ -186,18 +194,30 @@ export function EventLogColumn({
   const q = query.length > 0;
   const qcountText = q
     ? filtered.length
-      ? `${filtered.length} match${filtered.length === 1 ? "" : "es"}${capped ? " · newest 50" : ""}`
+      ? `${filtered.length} match${filtered.length === 1 ? "" : "es"}${capped ? ` · ${LOG_CAP} shown` : ""}`
       : "no match"
+    // (operator) "newest 50 of 734" -> "50 of 734". The word carried no
+    // information the newest-first ordering does not already show, and this
+    // chip sits beside a live stream where every extra word is noise.
+    //
+    // The CAP itself is legacy's (`all.slice(-50)`, viewer.html:2443) — what
+    // this port adds is SAYING so. Legacy hides 684 records in silence; the
+    // label is the honest half and worth keeping.
     : capped
-      ? `newest 50 of ${filtered.length}`
-      : "";
+      ? `${LOG_CAP} of ${filtered.length} events`
+      : `${filtered.length} events`;
 
   return (
     <div className={`eventlog${visible ? "" : " eventlog--hidden"}`} ref={columnRef}>
       <div className="eventlog__detail" id="detail" style={{ flexBasis: `${detailPct}%` }}>
-        <div className="eventlog__detailhead">
-          <span className="eventlog__detailtitle">selected event</span>
-        </div>
+        {/* (operator) No "selected event" title. It was static chrome
+            competing with the record's own headline — `RecordView` already
+            leads with the action in accent colour, so the label was a second
+            heading fighting the real one, and one more thing to read before
+            reaching the content. The empty-state line below still explains
+            the panel when nothing is selected, which is the only moment a
+            title would have earned its place. Free to remove: this panel sits
+            outside every extracted golden region. */}
         <div id="detailbody" className="eventlog__detailbody">
           {selected ? <EventDetail record={selected} /> : <div className="eventlog__none">select an event from the log to inspect it</div>}
         </div>
@@ -213,8 +233,15 @@ export function EventLogColumn({
       <div className="eventlog__list">
         <div className="eventlog__head">
           <h3>
+            {/* (operator) The header names the WINDOW; the outer UI owns
+                context. `#logscope` repeated what the active tab or the crumb
+                had already established in six of its eight states — and in
+                two of those it was VAGUER than the crumb beside it ("mission"
+                against `◆ <mission id>"). Kept in the DOM, empty and hidden,
+                so legacy's extraction and this port's agree; the element
+                itself is legacy's and dies with it at the flip. */}
             <span>
-              event log · <span id="logscope">{scopeLabel}</span>
+              events last {WINDOW_HOURS}h<span id="logscope" hidden>{scopeLabel}</span>
             </span>
             <span className="eventlog__headbtns">
               <button
@@ -311,11 +338,7 @@ export function EventLogColumn({
 function EventDetail({ record }: { record: FlowRecord }) {
   return (
     <div className="eventlog__detailcard">
-      <div className="eventlog__detailsummary">
-        {activityOf(record)} · {clk(Date.parse(record.ts))}
-        {record.machine_id ? ` · ${record.machine_id}` : ""}
-      </div>
-      <pre className="eventlog__detailpre">{JSON.stringify(record, null, 2)}</pre>
+      <RecordView record={record as unknown as Record<string, unknown>} />
     </div>
   );
 }

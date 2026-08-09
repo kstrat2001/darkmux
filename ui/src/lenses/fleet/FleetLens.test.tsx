@@ -59,7 +59,7 @@ describe("FleetLens", () => {
   it("always renders the hero, even at zero — never hides it while there's no data yet", async () => {
     mockFleetFetch();
     renderFleetLens();
-    await waitFor(() => expect(screen.getByText(/by your fleet/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());
     // Two "0" values (local + cloud tokens) render rather than the card
     // disappearing — the "hides late, pops in" defect this port guards
     // against (see `SavingsHero`'s own doc).

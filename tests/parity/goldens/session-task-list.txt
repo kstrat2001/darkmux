@@ -1,5 +1,5 @@
 === topbar ===
-darkmux · observability
+darkmux
 FLOW · 2026-08-08
 ▣ PLAYBACK
 home
@@ -15,7 +15,7 @@ github
 48 records · 1 machines
 
 === logscope ===
-TASK-LIST
+task-list
 
 === stage ===
 RUNNING RUN · FETCH-RENDER (task-list on )

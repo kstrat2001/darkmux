@@ -73,8 +73,16 @@ function nextDateUTC(d) {
   return dt.toISOString().slice(0, 10);
 }
 
-function recordCountFrom(metaText) {
-  const m = metaText.match(/(\d+)\s+records/);
+// The live record count MOVED out of `#meta` and into the event pane's own
+// counter chip — the status bar stated it and so did the pane, and the
+// duplicate cost the status a whole second line. The assertion is unchanged
+// (an SSE-delivered record raises the count by exactly one); only where it
+// reads the number moved. Chip reads `50 of 734 · last 24h`, or
+// `734 · last 24h` when under the cap.
+async function liveRecordCount(page) {
+  const t = await page.locator(".eventlog__qcount, .qcount").first().textContent().catch(() => null);
+  if (!t) return null;
+  const m = t.match(/of\s+(\d+)/) || t.match(/^\s*(\d+)\b/);
   return m ? Number(m[1]) : null;
 }
 
@@ -92,7 +100,7 @@ function recordCountFrom(metaText) {
 async function waitForStableRecordCount(page, { attempts = 30, intervalMs = 200 } = {}) {
   let last = null;
   for (let i = 0; i < attempts; i++) {
-    const now = recordCountFrom(await regionText(page, "meta"));
+    const now = await liveRecordCount(page);
     if (now !== null && now === last) return now;
     last = now;
     // eslint-disable-next-line no-await-in-loop -- deliberately sequential: each sample must see the PREVIOUS one's result.
@@ -150,7 +158,7 @@ test.describe("next-parity: live/SSE lens (Packet 5)", () => {
     });
 
     await page.goto("/index.html");
-    await expect(page.locator("#meta")).toContainText(/records/, { timeout: 15000 });
+    await expect(page.locator(".eventlog__qcount, .qcount").first()).toContainText(/\d/, { timeout: 15000 });
     const before = await waitForStableRecordCount(page);
     expect(before, "the corpus's own /flow fixtures must produce a real baseline count").toBeGreaterThan(0);
 
@@ -160,7 +168,7 @@ test.describe("next-parity: live/SSE lens (Packet 5)", () => {
     deliverRecord = true;
 
     await expect(async () => {
-      const nowCount = recordCountFrom(await regionText(page, "meta"));
+      const nowCount = await liveRecordCount(page);
       expect(nowCount).toBe(before + 1);
     }).toPass({ timeout: 8000, intervals: [100] });
 

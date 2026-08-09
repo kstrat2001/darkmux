@@ -120,10 +120,14 @@ export function Masthead({ route, liveStatus }: { route: Route; liveStatus: Live
     // own BEM-style styling hook, unrelated to the extractor.
     <header className="masthead top">
       <span className="masthead__brand">
+        {/* (operator) Just the name. "· observability" labelled the category
+            of the thing you are already looking at — decoration in a view
+            whose stated goal is less noise. Changed in the LEGACY viewer too,
+            so the parity goldens rebaseline from a source that genuinely
+            changed rather than being edited to match the port. */}
         <a href="https://darkmux.com/" target="_blank" rel="noopener">
           <b>darkmux</b>
-        </a>{" "}
-        · observability
+        </a>
       </span>
       {verText ? (
         <span className="masthead__ver" id="verbadge" title={verTitle}>
@@ -134,7 +138,15 @@ export function Masthead({ route, liveStatus }: { route: Route; liveStatus: Live
       )}
       <CatalogPanel label={srcbadgeText(route)} />
       {live ? <LiveStatusBadge status={liveStatus} /> : null}
-      {live ? (
+      {/* (operator: "a reload button next to 'live' is absurd") — and it is:
+          a refresh control beside a badge reading `● LIVE` contradicts
+          itself. If the view is live there is nothing to refresh; if you
+          need to refresh, it is not live. The one state where a manual retry
+          genuinely helps is `◌ RECONNECTING`, so the button and the badge
+          are now mutually exclusive by MEANING rather than by screen width
+          (the earlier mobile-only hide was the same instinct, argued from
+          the wrong premise). */}
+      {live && liveStatus !== "live" ? (
         <button
           type="button"
           className={`masthead__refresh${spinning ? " spin" : ""}`}
