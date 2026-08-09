@@ -23,21 +23,85 @@ async function regionText(page, id) {
   return el.innerText();
 }
 
+// The masthead's build-identifier chip (`#verbadge`, viewer.html:3824-3828)
+// carries the running darkmux VERSION (a semver that changes every release)
+// and a short git BUILD HASH (that changes on literally every commit) —
+// `"v"+version+(schema?" · schema "+schema:"")+"  ⓘ"`. Capturing that raw
+// into a committed golden would make it fail on the very next release; this
+// is the deliberate fix (chosen over the alternative of just EXCLUDING the
+// region — see extractTopbarText's own doc for why): normalize the whole
+// populated chip to one fixed, stable placeholder BEFORE it's joined into
+// the extracted text, the same "normalize the volatile substring, don't
+// pretend it isn't there" discipline `normalize()` above already applies to
+// whitespace. Matches ANY version string (not just today's scheme) and any
+// schema value, so a future version-string format change doesn't silently
+// stop matching and re-introduce the flake.
+const VERBADGE_RE = /v\S+(?: \([^)]*\))?(?: · schema \S+)?  ⓘ/g;
+// NOTE (QA gate): this normalization is UNREACHABLE in the current harness,
+// and the honest reason is worth recording rather than leaving the reader to
+// discover it. Goldens are extracted from a statically-served page whose
+// `buildHarness()` injects only `darkmux-mode` — never `darkmux-version` — so
+// the version chip renders EMPTY in every golden and this regex never matches
+// anything. Mutating it to an identity function leaves `verify` and every
+// next-parity suite green, which was verified.
+//
+// It stays because the moment a harness DOES inject version metas, the raw
+// chip would make the golden fail on the next release. But do not read it as
+// an active guard today: it is future-proofing, not coverage.
+function normalizeVerbadge(text) {
+  return text.replace(VERBADGE_RE, "v<version>  ⓘ");
+}
+
 /**
- * The "main content region" for a lens: the crumb (breadcrumb/level label),
+ * The masthead (`.top`, viewer.html:802-816) — brand, the build-identifier
+ * chip, the playback-catalog trigger (`#srcbadge`), the live/mode badge
+ * (`#modebadge`), the manual-refetch control, and the topnav links. Global
+ * chrome, a body-level sibling of `#stage` — structurally invisible to the
+ * four-region `extractLensText` below, same class of gap `extractCatalogText`
+ * (Packet 4) closed for `#catpanel`. This is what caught the operator-visible
+ * bug this packet fixes: a region entirely outside the four captured ones is
+ * NOT just "untested", it's LITERALLY UNOBSERVABLE by this harness — the
+ * masthead could go missing (or grow a stray element) and every existing
+ * golden would stay byte-identical.
+ *
+ * Unlike `extractCatalogText`, this is folded directly INTO
+ * `extractLensText` below (not left as an opt-in fifth region) — the
+ * masthead renders identically on every lens (verified: `.top`'s content
+ * doesn't depend on `state.level`), so every existing golden gains this
+ * section on rebaseline rather than one dedicated golden growing it. See
+ * `normalizeVerbadge` above for how the one volatile piece (`#verbadge`) is
+ * handled — normalized in place, not excluded, so a real regression INSIDE
+ * the volatile chip (e.g. the `ⓘ` affordance silently disappearing) still
+ * shows up as a golden diff instead of being invisible twice over.
+ */
+async function extractTopbarText(page) {
+  const el = page.locator(".top");
+  if ((await el.count()) === 0) return `=== topbar ===\n(empty)\n\n`;
+  const raw = await el.innerText();
+  return `=== topbar ===\n${normalize(normalizeVerbadge(raw) || "(empty)")}\n`;
+}
+
+/**
+ * The "main content region" for a lens: the topbar (masthead — see
+ * `extractTopbarText`'s own doc for why this joined in directly rather than
+ * staying a separate opt-in region), the crumb (breadcrumb/level label),
  * the meta line, the event-log scope label, and the stage (every render*()
  * function's actual output target — see viewer.html, every renderX() writes
- * `$("stage").innerHTML=...`). See README.md for why these four and not the
- * full scrolling event log.
+ * `$("stage").innerHTML=...`). See README.md for why these regions and not
+ * the full scrolling event log. `=== stage ===` STAYS LAST — `stageSectionOf`
+ * (`lib/extract-next-lens.js`) slices a golden from that marker to end-of-
+ * string, so any section added here must go BEFORE it, never after.
  */
 async function extractLensText(page) {
-  const [crumb, meta, logscope, stage] = await Promise.all([
+  const [topbar, crumb, meta, logscope, stage] = await Promise.all([
+    extractTopbarText(page),
     regionText(page, "crumb"),
     regionText(page, "meta"),
     regionText(page, "logscope"),
     regionText(page, "stage"),
   ]);
   return (
+    topbar +
     `=== crumb ===\n${normalize(crumb || "(empty)")}\n` +
     `=== meta ===\n${normalize(meta || "(empty)")}\n` +
     `=== logscope ===\n${normalize(logscope || "(empty)")}\n` +

@@ -158,7 +158,7 @@ one's vocabulary.
 | runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-kind-lab.txt` (all four filter chips, Packet 3), `runs-series.txt` (kind=lab + the `◧ series` toggle — the ONE thing `/lab/runs` actually feeds, see the correction below; Packet 3), `runs-lens-boot.txt` (a FRESH `#lens=runs` boot, exercising `boot()`'s own `lq` deep-link branch rather than a click-through — content is byte-identical to `runs.txt` by design, since both land on kind=all over the same corpus; the golden's value is proving the boot mechanism independently, Packet 3) |
 | machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
 | session drill-in | `#session=<id>` | `session-task-list.txt` |
-| catalog picker | `#catpanel` (toggled via `#srcbadge`, not a hash route — global chrome, Packet 4) | `catalog-open.txt` (five regions: crumb/meta/logscope/stage + the new `=== catalog ===` section — see "Extraction target" below) |
+| catalog picker | `#catpanel` (toggled via `#srcbadge`, not a hash route — global chrome, Packet 4) | `catalog-open.txt` (six regions: topbar/crumb/meta/logscope/stage + the `=== catalog ===` section — see "Extraction target" below) |
 | mission replay-by-query | `#mission=<id>` (Packet 4) | `mission-replay.txt` (the unknown-id in-page path only — see the note below) |
 | bare-date playback | `#<date>` (Packet 4) | `playback-date.txt` |
 
@@ -230,25 +230,41 @@ required to reach it honestly:
 
 ## Extraction target
 
-Each golden is four labeled regions, joined: `#crumb` (breadcrumb), `#meta`
-(the badge line), `#logscope` (event-log scope label), and `#stage` — the
-actual output target of every `render*()` function in viewer.html. The full
-scrolling event log (`#logbody`, inside the `.loglist` wrapper) is
-deliberately NOT captured: it's a per-record stream, not lens-specific
-content, and would make goldens huge and timestamp-heavy for little parity
-value beyond what `#stage` already covers. Text is whitespace-normalized
-(trailing space stripped per line, runs of 3+ blank lines collapsed to one)
-for stability, not screenshots.
+Each golden is five labeled regions, joined: `=== topbar ===` (the
+masthead — `.top`, brand/build-chip/catalog-trigger/live-badge/refresh/
+topnav), `#crumb` (breadcrumb), `#meta` (the badge line), `#logscope`
+(event-log scope label), and `#stage` — the actual output target of every
+`render*()` function in viewer.html. The full scrolling event log
+(`#logbody`, inside the `.loglist` wrapper) is deliberately NOT captured:
+it's a per-record stream, not lens-specific content, and would make goldens
+huge and timestamp-heavy for little parity value beyond what `#stage`
+already covers. Text is whitespace-normalized (trailing space stripped per
+line, runs of 3+ blank lines collapsed to one) for stability, not
+screenshots.
 
-**Packet 4 addition: a FIFTH, optional `=== catalog ===` region** (see
+**Chrome packet addition: `=== topbar ===`, folded directly into the base
+extraction (not a sixth opt-in region like catalog below).** `.top` is
+global chrome — a body-level sibling of `#stage` — that the original
+four-region extractor structurally could not see AT ALL: the masthead could
+go missing, or grow a stray element, and every golden would stay
+byte-identical. That gap is exactly how a stray unscoped `#logscope`
+("FLEET" floating above the hero on `/next`) shipped invisibly — see
+`lib/extract-lens.js`'s `extractTopbarText` for the full story and
+`normalizeVerbadge` for how the one genuinely volatile piece (the
+`#verbadge` build-identifier chip — a version + git SHA that changes on
+every release) is handled: normalized to a fixed placeholder, not excluded,
+so a real regression inside the chip still shows up as a diff. Folded in
+(not opt-in) because `.top`'s content doesn't depend on `state.level` — it
+renders identically on every lens — so every existing golden gained this
+section on rebaseline rather than one dedicated golden growing it, unlike
+catalog below.
+
+**Packet 4 addition: an optional `=== catalog ===` region** (see
 `lib/extract-lens.js`'s `extractCatalogText`/`extractLensTextWithCatalog`).
 `#catpanel` (the playback-catalog day/mission picker) is a modal overlay —
-a body-level sibling of `#stage`, never part of it — so the original
-four-region function structurally can't see it. This is composed on TOP of
-the unchanged four-region extraction, not folded into it: every existing
-golden's extraction call is byte-identical to before this packet (verified —
-`bun run check` reproduced all 10 pre-Packet-4 goldens unchanged), and only
-`catalog-open.txt` carries the fifth section.
+a body-level sibling of `#stage`, never part of it — so the base extraction
+structurally can't see it. This is composed on TOP of the base extraction,
+not folded into it: only `catalog-open.txt` carries this section.
 
 ## KNOWN COVERAGE GAPS
 

@@ -267,4 +267,110 @@ describe("App", () => {
     );
     await waitFor(() => expect(container.querySelector("#modebadge")).toBeTruthy());
   });
+
+  // (Chrome packet) The masthead is now App-level chrome, mounted
+  // unconditionally above the crumbbar.
+  it("renders the masthead brand on the default route (machine/fleet routes are covered byte-for-byte by next-parity)", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByText(/observability/)).toBeInTheDocument());
+  });
+
+  // (Chrome packet) `showsEventLog` is a pure-function unit-tested directly
+  // in `lib/route.test.ts`; these assert the WIRING — that `App.tsx` mounts
+  // `EventLogColumn` on EVERY route (never conditionally, per that
+  // component's own `visible` doc — legacy's real `#logscope` stays present
+  // even when its ancestor is CSS-hidden), and that the `eventlog--hidden`
+  // class (not a missing DOM node) is what actually hides it on
+  // `runs`/`console`/`machine`. `#logscope`'s continued PRESENCE, with a
+  // real value, on every route is itself the fix for the stray-uppercase-
+  // "FLEET" bug — that bug was about a `#logscope` rendered in the WRONG
+  // PLACE (loose, above the stage) with the WRONG SCOPE (always "FLEET"
+  // regardless of lens), not about existing at all.
+  it("mounts the event-log column visibly (not eventlog--hidden), with #logscope=FLEET, on the default fleet route", async () => {
+    vi.stubGlobal("fetch", mockFleetLikeFetch());
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.getElementById("logbody")).toBeTruthy());
+    expect(document.getElementById("logscope")?.textContent).toBe("FLEET");
+    expect(document.querySelector(".eventlog")?.className).not.toMatch(/eventlog--hidden/);
+  });
+
+  it("mounts the event-log column but HIDDEN (eventlog--hidden) on the machine lens, with #logscope still present", async () => {
+    window.location.hash = "#lens=machine";
+    vi.stubGlobal("fetch", mockFleetLikeFetch());
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByText(/fleet › machine/)).toBeInTheDocument());
+    expect(document.getElementById("logbody")).toBeTruthy();
+    // `#logscope` still has real text (matching legacy — see the component's
+    // own doc for why unmounting it was tried first and is wrong), just not
+    // painted (a real DOM/CSS state, not a text-existence contract).
+    expect(document.getElementById("logscope")?.textContent).toBeTruthy();
+    expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
+  });
+
+  it("hides the event-log column (eventlog--hidden) on the console lens (QA correction — the packet brief wrongly claimed console keeps it)", async () => {
+    window.location.hash = "#lens=console";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (typeof url === "string" && url.startsWith("/panel/")) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                panel: "mission-status",
+                argv: ["mission", "status"],
+                captured_ts_ms: Date.now(),
+                gather_ms: 1,
+                exit_code: 0,
+                ansi_text: "no missions",
+                stderr_tail: "",
+                cols: 100,
+                cache_ttl_ms: 3000,
+                age_ms: 0,
+                auto_refresh: true,
+              }),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByText("no missions")).toBeInTheDocument());
+    expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
+  });
+
+  it("hides the event-log column (eventlog--hidden) on the runs lens", async () => {
+    window.location.hash = "#lens=runs";
+    vi.stubGlobal("fetch", mockFleetLikeFetch());
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(window.location.hash).toBe("#lens=runs"));
+    expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
+  });
 });

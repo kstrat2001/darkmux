@@ -75,8 +75,17 @@ import { CATALOG_MISSION_CAP, daySummary, missionSummary, missionsHeader, todayU
  * THAT anchor — the panel now always renders directly below the toggle's
  * own box, so it can never cover it, regardless of what other App-level
  * chrome (like `#meta`) sits above.
+ *
+ * `label` (Chrome packet, optional): overrides the toggle button's VISIBLE
+ * text — defaults to "browse history" (this component's original,
+ * self-contained behavior, unchanged for every existing caller/test). The
+ * button's ACCESSIBLE NAME is always "browse history" regardless (see the
+ * button's own `aria-label` comment) — only `<Masthead>` passes this, to
+ * make the toggle's on-page text match legacy's `#srcbadge` byte-for-byte
+ * while every other consumer (and this component's own test suite) is
+ * completely unaffected.
  */
-export function CatalogPanel() {
+export function CatalogPanel({ label }: { label?: string } = {}) {
   const [open, setOpen] = useState(false);
   const anchorRef = useRef<HTMLDivElement>(null);
 
@@ -140,8 +149,24 @@ export function CatalogPanel() {
         aria-expanded={open}
         aria-controls="catpanel"
         title="browse history"
+        // (Chrome packet) `aria-label` is a CONSTANT "browse history"
+        // regardless of `label` below — legacy's own `#srcbadge` does
+        // exactly this split (visible text "today"/a date, `title`="browse
+        // history" — viewer.html:3909) when `<Masthead>` renders this
+        // component in the source/date-badge slot: it passes `label="TODAY"`
+        // (etc.) so the VISIBLE text matches legacy's masthead byte-for-byte
+        // (`tests/parity/goldens/fleet.txt`'s `=== topbar ===` section), while
+        // the ACCESSIBLE NAME stays "browse history" so this button is still
+        // found the same way everywhere — standalone (this component's own
+        // `CatalogPanel.test.tsx`, which renders `<CatalogPanel />` with no
+        // `label` and never sees this change) AND embedded (`Masthead.test.tsx`).
+        // `aria-label` wins the accessible-name computation over text content,
+        // so this is a real (not just cosmetic) decoupling: a screen reader
+        // always announces "browse history", a sighted user reading the
+        // masthead sees "TODAY".
+        aria-label="browse history"
       >
-        browse history
+        {label ?? "browse history"}
       </button>
       {open && (
         <div className="catpanel" id="catpanel">

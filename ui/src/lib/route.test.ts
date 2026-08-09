@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { parseRoute } from "./route";
+import { parseRoute, showsEventLog, type Route } from "./route";
 
 function setHash(hash: string) {
   window.location.hash = hash;
@@ -109,5 +109,24 @@ describe("parseRoute", () => {
     window.history.replaceState(null, "", url.toString());
     expect(parseRoute()).toEqual({ kind: "mission-redirect", missionId: "my-mission" });
     window.history.replaceState(null, "", "/");
+  });
+});
+
+// (Chrome packet) `showsEventLog` — verified against the real legacy source
+// + a live computed-style probe (see the function's own doc for the
+// evidence trail); this is the RED-PROVABLE guard that the verified rule,
+// not the packet brief's wrong claim, is what shipped. Break the function
+// (e.g. revert to `route.kind !== "runs" && route.kind !== "machine"`,
+// dropping the console exclusion) and this test for "console" goes red.
+describe("showsEventLog", () => {
+  const hidden: Route["kind"][] = ["runs", "console", "machine"];
+  const shown: Route["kind"][] = ["fleet", "session", "playback", "mission-redirect", "unknown"];
+
+  it.each(hidden)("hides the event log on %s", (kind) => {
+    expect(showsEventLog({ kind } as Route)).toBe(false);
+  });
+
+  it.each(shown)("shows the event log on %s", (kind) => {
+    expect(showsEventLog({ kind } as Route)).toBe(true);
   });
 });

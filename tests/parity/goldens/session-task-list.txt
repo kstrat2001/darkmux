@@ -1,3 +1,12 @@
+=== topbar ===
+darkmux · observability
+FLOW · 2026-08-08
+▣ PLAYBACK
+home
+guide
+articles
+github
+
 === crumb ===
 ◆ acp-ephemeral-pr-list-1786088208704943000-0››task-list
 
