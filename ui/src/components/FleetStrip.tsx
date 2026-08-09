@@ -55,6 +55,12 @@ export function FleetStrip() {
   // machines are missing from the answer, not absent from the world. This is
   // the distinction the whole marker exists for; rendering both as the
   // reassuring "no machines present" copy below is the original defect.
+  //
+  // `stale` is unreachable from THIS endpoint today (the presence handlers
+  // emit only ok/unavailable/off; only the fleet-flow cache in #1707 can go
+  // stale). It is handled because the type says it can arrive, not because
+  // it does — so the copy describes what this component would actually show
+  // rather than promising a last-known set it does not render here.
   if (coverage && (coverage.state === "unavailable" || coverage.state === "stale")) {
     const stale = coverage.state === "stale";
     return (
@@ -62,10 +68,10 @@ export function FleetStrip() {
         <span className="fleet-strip__icon">⚠</span>
         <span>
           {stale
-            ? `Fleet presence is stale — showing the last known set${
+            ? `Fleet presence is stale${
                 "age_ms" in coverage ? ` (${Math.round(coverage.age_ms / 1000)}s old)` : ""
-              }. Machines may have come or gone since.`
-            : "Fleet presence could not be read, so this shows THIS MACHINE only — other machines are missing from the answer, not absent."}
+              } — machines may have come or gone since.`
+            : "Fleet presence could not be read — other machines are missing from the answer, not absent."}
         </span>
         {machines.length > 0 ? <span className="fleet-strip__count">{machines.length} last known</span> : null}
       </div>

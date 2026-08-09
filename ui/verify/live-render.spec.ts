@@ -65,8 +65,10 @@ test("the /next shell renders clean: zero pageerrors, no horizontal scroll at 39
   await page.screenshot({ path: screenshotPath("shell-390px.png") });
 
   // Real empty state: the throwaway daemon has no DARKMUX_REDIS_URL, so
-  // /fleet/machines/live genuinely returns [] — this is the REAL daemon's
-  // real answer, not a mock.
+  // /fleet/machines/live genuinely answers `{machines: [], meta: {... fleet:
+  // {state: "off"}, complete: true}}` (#1729) — the REAL daemon's real
+  // answer, not a mock. `off` is a correct standalone machine, so this must
+  // land on the plain empty state and NOT the degraded one.
   const emptyState = page.locator('[data-state="empty"]');
   await expect(emptyState).toBeVisible();
   await page.screenshot({ path: screenshotPath("2-fleet-empty-real.png") });
@@ -77,7 +79,12 @@ test("data state: a non-empty fleet renders one card per machine", async ({ page
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify([
+      body: JSON.stringify({
+        // (#1729) The endpoint is an envelope. A bare array here would make
+        // the strip read zero machines and render `empty`, so the assertion
+        // below would fail for a reason that has nothing to do with the app.
+        meta: { sources: { fleet: { state: "ok" } }, complete: true },
+        machines: [
         {
           machine_uid: "ABFCA777-9F06-A6BF-52CB-589A5D164929",
           display_name: "MacBook-Pro",
@@ -92,7 +99,8 @@ test("data state: a non-empty fleet renders one card per machine", async ({ page
           schema_version: "1.18.0",
           beat_ts_ms: Date.now(),
         },
-      ]),
+        ],
+      }),
     }),
   );
   await page.setViewportSize({ width: 1280, height: 800 });
@@ -106,7 +114,7 @@ test("data state: a non-empty fleet renders one card per machine", async ({ page
 test("pending state: the skeleton renders before the fetch resolves", async ({ page }) => {
   await page.route("**/fleet/machines/live", async (route) => {
     await new Promise((resolve) => setTimeout(resolve, 5_000));
-    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }) });
   });
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/next");

@@ -62,7 +62,8 @@ export interface FleetSessionsLiveResponse {
   meta: CoverageMeta;
 }
 
-/** `GET /fleet/machines/live` — `axum::Json(Vec<PresenceBeat>)`, a REAL typed
+/** One presence beat. (The endpoint wraps these in `FleetMachinesLiveResponse`
+ * since #1729; this is the element type.) A REAL typed
  * struct, but one that lives in `darkmux-flow` rather than `darkmux-serve`.
  * Bridging it with ts-rs would mean adding `ts-rs` as a dependency of
  * `darkmux-flow` itself (a lib crate consumed by production code, not just
