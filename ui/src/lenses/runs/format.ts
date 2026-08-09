@@ -11,24 +11,39 @@
  * repeated here) — this is a port, not a redesign. `RUNS_KINDS`/`RunsKind`
  * live in `../../lib/route.ts` already (the scaffold's hash-grammar port);
  * imported from there rather than redeclared.
+ *
+ * The lab-series six (`shortModel`/`labFieldVal`/`labTaskKey`/
+ * `groupLabRunsByTask`/`labKnobSummary`/`labKnobDiff`) used to be
+ * hand-duplicated here — this file predates `../lab/labSeries.ts`, the lab
+ * lens's own dedicated pure-logic module, extracted+differentially-tested
+ * against the legacy viewer later. The two copies had already drifted:
+ * this file's `labFieldVal` stringified every non-`darkmux:`-prefixed value
+ * (`String(v)`), where legacy (and `labSeries.ts`) pass a number straight
+ * through unchanged — invisible in the rendered DOM (template-literal
+ * interpolation stringifies either way) but a real behavioral difference a
+ * caller comparing the return value directly would see. Re-exported from
+ * `labSeries.ts` below instead of maintained twice; only `labCounts` (not
+ * one of the "six" — no `labSeries.ts` counterpart) stays defined here.
  */
 
 import type { Run } from "../../types/generated/Run";
 import type { LabRun } from "../../types/handwritten";
+import {
+  shortModel,
+  labFieldVal,
+  labTaskKey,
+  groupLabRunsByTask,
+  labKnobSummary,
+  labKnobDiff,
+} from "../lab/labSeries";
+import type { LabSeries } from "../lab/types";
+
+export { shortModel, labFieldVal, labTaskKey, groupLabRunsByTask, labKnobSummary, labKnobDiff };
+/** Same shape as `../lab/labSeries.ts`'s `LabSeries` — kept under this
+ * file's pre-existing name so `RunsBoard.tsx`'s import site doesn't churn. */
+export type LabTaskGroup = LabSeries;
 
 export const RUNS_CAP = 25; // viewer.html: `const RUNS_CAP=25`
-
-/** viewer.html: `function shortModel(m)`. Strips the darkmux LMStudio
- * load-namespace prefix (see the root CLAUDE.md's "Namespace convention")
- * so the operator never sees the internal `darkmux:` marker in a run row. */
-export function shortModel(m: string | null | undefined): string {
-  return String(m || "").replace(/^darkmux:/, "");
-}
-
-/** viewer.html: `function labFieldVal(v)`. */
-export function labFieldVal(v: unknown): string {
-  return v == null ? "—" : typeof v === "string" && v.startsWith("darkmux:") ? shortModel(v) : String(v);
-}
 
 /** viewer.html: `function runActivity(r)`. STRICTLY newest-activity-first
  * ordering — see that function's own comment for why `running` rows are
@@ -74,95 +89,6 @@ export function runsFiltered(runs: Run[], kind: string): Run[] {
   const rows = kind === "all" ? runs.slice() : runs.filter((r) => r.kind === kind);
   rows.sort((a, b) => runActivity(b) - runActivity(a));
   return rows;
-}
-
-/** viewer.html: `function labTaskKey(run)`. */
-export function labTaskKey(run: LabRun): string {
-  return run.case_ids && run.case_ids.length ? run.case_ids.slice().sort().join(", ") : "(case pending)";
-}
-
-export interface LabTaskGroup {
-  key: string;
-  runs: LabRun[];
-}
-
-/** viewer.html: `function groupLabRunsByTask(runs)`. */
-export function groupLabRunsByTask(runs: LabRun[]): LabTaskGroup[] {
-  const byKey = new Map<string, LabRun[]>();
-  runs.forEach((r) => {
-    const k = labTaskKey(r);
-    if (!byKey.has(k)) byKey.set(k, []);
-    byKey.get(k)!.push(r);
-  });
-  const groups = [...byKey.entries()].map(([key, rs]) => ({
-    key,
-    runs: rs.slice().sort((a, b) => b.mtime_ms - a.mtime_ms),
-  }));
-  groups.sort((a, b) => b.runs[0].mtime_ms - a.runs[0].mtime_ms);
-  return groups;
-}
-
-/** viewer.html: `function labKnobSummary(run)`. */
-export function labKnobSummary(run: LabRun): string {
-  const st = run.staffing;
-  if (!st) return run.finished ? "staffing not recorded (older artifact)" : "staffing pending — first case hasn't completed yet";
-  const probes = st.probes || [];
-  const pbit = probes.length
-    ? `${probes.length} probe${probes.length === 1 ? "" : "s"} (k=${probes.map((p) => p.k).join(",")})`
-    : "no probes";
-  const j = st.judge;
-  const jbit = j ? `judge ${shortModel(j.model)} k=${j.k} · ${Math.round((j.n_ctx || 0) / 1000)}K ctx` : "";
-  return [pbit, jbit].filter(Boolean).join(" · ");
-}
-
-/** viewer.html: `function labKnobDiff(prev, curr)`. */
-export function labKnobDiff(prev: LabRun | undefined, curr: LabRun | undefined): string[] | null {
-  if (!prev || !curr) return null;
-  const changes: string[] = [];
-  if ((prev.crew || null) !== (curr.crew || null)) changes.push(`crew ${labFieldVal(prev.crew)}→${labFieldVal(curr.crew)}`);
-  if ((prev.exec_mode || null) !== (curr.exec_mode || null))
-    changes.push(`exec_mode ${labFieldVal(prev.exec_mode)}→${labFieldVal(curr.exec_mode)}`);
-  const ps = prev.staffing,
-    cs = curr.staffing;
-  if (ps && cs) {
-    const byName = (arr?: { name: string }[]) => {
-      const m: Record<string, { name: string; model: string; k: number; max_tokens?: number; n_ctx?: number }> = {};
-      (arr || []).forEach((p: any) => {
-        m[p.name] = p;
-      });
-      return m;
-    };
-    const pn = byName(ps.probes),
-      cn = byName(cs.probes);
-    const names = [...new Set([...Object.keys(pn), ...Object.keys(cn)])].sort();
-    names.forEach((n) => {
-      const a = pn[n],
-        b = cn[n];
-      if (a && b) {
-        (["model", "k", "max_tokens", "n_ctx"] as const).forEach((f) => {
-          if (a[f] !== b[f]) changes.push(`${n}.${f} ${labFieldVal(a[f])}→${labFieldVal(b[f])}`);
-        });
-      } else if (!a && b) {
-        changes.push(`+probe ${n} (${shortModel(b.model)})`);
-      } else if (a && !b) {
-        changes.push(`-probe ${n}`);
-      }
-    });
-    const aj = ps.judge,
-      bj = cs.judge;
-    if (aj && bj) {
-      (["model", "k", "max_tokens", "n_ctx"] as const).forEach((f) => {
-        if (aj[f] !== bj[f]) changes.push(`judge.${f} ${labFieldVal(aj[f])}→${labFieldVal(bj[f])}`);
-      });
-    } else if (!aj && bj) {
-      changes.push(`+judge (${shortModel(bj.model)})`);
-    } else if (aj && !bj) {
-      changes.push("-judge");
-    }
-  } else if (ps !== cs) {
-    changes.push("staffing snapshot became available");
-  }
-  return changes;
 }
 
 /** viewer.html: `function labCounts(run)` — text only (no HTML), the

@@ -1,46 +1,23 @@
 // Shapes served by `GET /lab/runs` (see `crates/darkmux-serve/src/lib.rs`'s
 // lab handlers and `tests/parity/corpus/lab-runs.json`).
 //
-// Hand-written rather than ts-rs-generated: the lab payload has no ts-rs
-// derives yet, and adding them is a separate change (it needs a cargo pass
-// and a drift-guard entry). Typed by hand here so the lab lens is not
-// blocked on that; replace with generated types when they land.
+// These used to be hand-rolled again here, duplicating `LabRun`/
+// `StaffingSnapshot`/`SeatStaffing` already defined in
+// `src/types/handwritten.ts` (the project's one home for hand-written wire
+// types — see that file's own doc). Reconciled onto the existing types
+// instead of maintaining two copies of the same wire shape: `handwritten.ts`
+// widened `SeatStaffing.model`/`.k` to optional and `LabRun.crew`/
+// `.exec_mode`/`.staffing` to accept an explicit `null` (both needed by the
+// pure logic in `./labSeries.ts` and its differential-tested spec), plus
+// grew `has_funnels`/`has_events` (present on every real `/lab/runs` row —
+// see the corpus fixture — but missing from the pre-existing type).
+//
+// `LabSeries` stays here rather than moving to `handwritten.ts`: it's
+// lens-DERIVED data (`groupLabRunsByTask`'s grouped-by-corpus output), not a
+// shape `/lab/runs` itself ever sends over the wire.
+import type { LabRun } from "../../types/handwritten";
 
-/** One seat's recorded staffing knobs, as snapshotted into the envelope. */
-export interface LabSeat {
-  name: string;
-  model?: string | null;
-  k?: number | null;
-  max_tokens?: number | null;
-  n_ctx?: number | null;
-}
-
-/** The `staffing` snapshot (#1247): what the run was actually configured as. */
-export interface LabStaffing {
-  probes?: LabSeat[] | null;
-  judge?: LabSeat | null;
-}
-
-/** One lab run directory as `/lab/runs` reports it. */
-export interface LabRun {
-  dir: string;
-  mtime_ms: number;
-  case_ids: string[];
-  bundles: number;
-  raw_flags: number;
-  deduped_flags: number;
-  confirmed: number;
-  needs_check: number;
-  archived: number;
-  degenerate: boolean;
-  finished: boolean;
-  has_funnels: boolean;
-  has_events: boolean;
-  /** Absent on older artifacts AND on runs whose first case hasn't finished. */
-  staffing?: LabStaffing | null;
-  crew?: string | null;
-  exec_mode?: string | null;
-}
+export type { LabRun, StaffingSnapshot as LabStaffing, SeatStaffing as LabSeat } from "../../types/handwritten";
 
 /** Runs over the same corpus, newest-first, keyed by their sorted case ids. */
 export interface LabSeries {

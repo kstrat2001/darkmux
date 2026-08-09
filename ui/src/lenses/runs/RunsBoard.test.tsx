@@ -18,21 +18,26 @@ const RUNS = [
   { id: "l1", kind: "lab", status: "abandoned", tracked: true, updated_ts: 100, machine: "MacBook-Pro" },
 ];
 
-function mockFetch(runsOk = true, labRunsOk = true) {
+/** The board's own fixture carries a lab row, and the lab-source notice
+ *  only renders when there are NO lab runs — so a three-state test must
+ *  start from a runs set without one, or it silently asserts nothing. */
+const NO_LAB_RUNS = RUNS.filter((r) => r.kind !== "lab");
+
+function mockFetch(runsOk = true, labRunsOk = true, labSource: Record<string, unknown> = {}, runs: unknown[] = RUNS) {
   vi.stubGlobal(
     "fetch",
     vi.fn((url: string) => {
       if (url === "/runs") {
         return Promise.resolve(
           runsOk
-            ? new Response(JSON.stringify({ runs: RUNS, generated_at_ms: 1 }), { status: 200 })
+            ? new Response(JSON.stringify({ runs, generated_at_ms: 1 }), { status: 200 })
             : new Response("boom", { status: 500 }),
         );
       }
       if (url === "/lab/runs") {
         return Promise.resolve(
           labRunsOk
-            ? new Response(JSON.stringify({ configured: true, dir: "/lab", exists: true, runs: [] }), { status: 200 })
+            ? new Response(JSON.stringify({ configured: true, dir: "/lab", exists: true, runs: [], ...labSource }), { status: 200 })
             : new Response("boom", { status: 500 }),
         );
       }
@@ -180,5 +185,41 @@ describe("RunsBoard", () => {
 
     fireEvent.click(container.querySelector('[data-arg="dispatch"]')!);
     expect(screen.queryByText(/isn't in \/next yet/i)).not.toBeInTheDocument();
+  });
+
+  // (#1585's bug class) `/lab/runs` distinguishes THREE reasons the lab tab
+  // can be empty, and the operator acts differently on each. They were
+  // rendered correctly but pinned by nothing — no unit mock set
+  // `configured:false` or `exists:false`, and the recorded corpus is
+  // `configured:true, exists:true` with 133 runs. A regression collapsing
+  // them into one reassuring "no runs" line would have shipped green, which
+  // is exactly how 247 real runs once read as an empty tab.
+  it("no lab source wired reads as UNWIRED, not as an empty lab", async () => {
+    mockFetch(true, true, { configured: false, dir: null, exists: null }, NO_LAB_RUNS);
+    const { container } = renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    fireEvent.click(container.querySelector('[data-arg="lab"]')!);
+    await waitFor(() => expect(screen.getByText(/no lab-run source wired/i)).toBeInTheDocument());
+    expect(screen.queryByText(/no lab runs found/i)).toBeNull();
+  });
+
+  it("a configured-but-missing lab dir names the dir, rather than claiming no runs", async () => {
+    mockFetch(true, true, { configured: true, dir: "/nope", exists: false }, NO_LAB_RUNS);
+    const { container } = renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    fireEvent.click(container.querySelector('[data-arg="lab"]')!);
+    await waitFor(() => expect(screen.getByText(/does not exist yet \(\/nope\)/i)).toBeInTheDocument());
+    expect(screen.queryByText(/no lab runs found/i)).toBeNull();
+  });
+
+  it("a healthy but empty lab dir DOES read as no runs — the inverted case", async () => {
+    // Guards the fix from over-firing: a wired, existing, genuinely empty
+    // lab must not be reported as a configuration problem.
+    mockFetch(true, true, { configured: true, dir: "/lab", exists: true }, NO_LAB_RUNS);
+    const { container } = renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    fireEvent.click(container.querySelector('[data-arg="lab"]')!);
+    await waitFor(() => expect(screen.getByText(/no lab runs found under the configured lab dir/i)).toBeInTheDocument());
+    expect(screen.queryByText(/no lab-run source wired/i)).toBeNull();
   });
 });
