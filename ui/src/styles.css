@@ -65,8 +65,10 @@ body {
   text-transform: uppercase;
   color: var(--dim);
   /* Taller than legacy's 5px/11px (a mouse-first desktop app) — phone tap
-     targets need real height; ~36px total (8px*2 + line-height) clears the
-     commonly-cited ~40px minimum comfortably enough at this font size. */
+     targets need real height. Measured (QA, phone-fix pass): 33px actual,
+     short of Apple's real 44pt minimum this rule's own comment used to
+     misstate as "~40px" — see the mobile-only override below for the
+     correction. */
   padding: 11px 13px;
   cursor: pointer;
   text-decoration: none;
@@ -85,6 +87,17 @@ body {
 .nav-tab.on {
   background: var(--accent);
   color: var(--bg);
+}
+
+/* (Mobile fix pass) Measured 63-79px wide (already >=44) but only 33px
+   tall — short of the 44x44 minimum. Mobile-only: desktop's mouse-first
+   33px is left alone (1280px render-sanity unaffected). */
+@media (max-width: 768px) {
+  .nav-tab {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
 }
 
 .app-shell__crumb {
@@ -279,6 +292,65 @@ body {
     margin-left: 0;
     gap: 12px;
   }
+  /* Touch targets (mobile-only — desktop keeps its compact chrome). Every
+     interactive masthead control grows to >=44x44 via padding/min-height,
+     never font-size, so the rendered TEXT (parity-checked for `.top`'s
+     brand string) stays byte-identical — only the box around it grows. */
+  .masthead__brand a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  .catalog-toggle {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  .masthead__nav a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 4px 8px;
+  }
+}
+
+/* (Mobile fix pass) Below ~560px the masthead's non-negotiable content
+   (brand + the catalog/live status group) plus the topnav no longer fit in
+   4 rows worth of wrapping — measured at 402px CSS width: brand alone /
+   ver+TODAY+LIVE / refresh alone / nav, 119px tall. Two controls drop here:
+
+   - `.masthead__refresh` (operator-approved): the view already polls every
+     5s, the SSE tail pushes live changes, and iOS Safari provides
+     pull-to-refresh natively — the button has no job on a phone. Desktop
+     (>560px) is untouched; the `live` conditional in Masthead.tsx still
+     mounts it there.
+   - `.masthead__ver` (an addition beyond the operator's explicit list,
+     named here rather than done quietly): the build-identifier chip
+     (`v<semver> (<sha>) · schema <n>  ⓘ`) measures 200-225px wide on a
+     real daemon — wider than the brand text itself, and ALONE it already
+     exceeds the ~354px content budget left after the brand + TODAY badge +
+     live badge share a row. It is the single blocker standing between 3
+     rows and the 2-row target: with it gone, brand + TODAY + live-badge
+     fit on one line and nav owns the other. It is informational only
+     (never interactive, no touch-target concern) and untested by every
+     parity golden today (`Masthead.tsx`'s own doc: no harness in this repo
+     injects `darkmux-version`, so `#verbadge` renders empty in every
+     recorded golden) — hiding it here changes zero committed text. A build
+     check on the phone is a real, if occasional, want; a tap-to-reveal (or
+     folding it into an about surface) is the natural follow-up if the
+     operator wants it back, not reproduced here. */
+@media (max-width: 560px) {
+  .masthead__refresh {
+    display: none;
+  }
+  .masthead__ver {
+    display: none;
+  }
+  .masthead {
+    gap: 8px 6px;
+  }
 }
 
 /* ── Content row (Chrome packet) — `#stage` beside the event-log column,
@@ -465,6 +537,19 @@ body {
   color: var(--accent);
   border-color: var(--accent);
 }
+/* (Mobile fix pass) Measured 23x22 each — mobile-only growth to 44x44.
+   `.eventlog__fbtn` also carries a wider visible "MODEL" label now (see
+   `EventLogColumn.tsx`'s doc for why) which already pushes its width past
+   44 unaided; `min-width` here is belt-and-suspenders for narrower labels
+   a future edit might introduce. */
+@media (max-width: 768px) {
+  .eventlog__follow,
+  .eventlog__fbtn {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 4px 10px;
+  }
+}
 .eventlog__search {
   display: flex;
   align-items: center;
@@ -498,6 +583,14 @@ body {
      rule (viewer.html:341-347). */
   padding: 6px 26px;
   font: 16px ui-monospace, SFMono-Regular, monospace;
+}
+/* (Mobile fix pass) Measured 354x32 — width already clears 44, height
+   didn't. Mobile-only padding bump; the 16px font (iOS zoom-avoidance
+   rule above) stays untouched. */
+@media (max-width: 768px) {
+  .eventlog__searchbox input {
+    padding: 13px 26px;
+  }
 }
 .eventlog__searchbox input::-webkit-search-cancel-button {
   -webkit-appearance: none;
@@ -1220,6 +1313,25 @@ body {
   justify-content: flex-end;
   flex: 1 1 auto;
 }
+/* (Mobile fix pass) At 402px the 4 chips (generated/fresh input/re-read/
+   dispatches) wrapped 3-then-1, stranding "1 DISPATCH" alone under
+   "RE-READ". Forcing exactly 2-per-row via `flex-basis` — NOT switching to
+   `display:grid` — is deliberate: this block's own module doc documents
+   that Chromium's `innerText()` puts each DIRECT CHILD of a `display:flex`
+   container on its own line REGARDLESS of visual wrapping, which is what
+   the fleet golden's chip-per-line shape depends on. That rule is also why
+   this fix is parity-safe in the first place: innerText already treated
+   each `.savc` as its own line under the OLD 3-then-1 wrap, so changing
+   which chips share a visual row changes nothing byte-parity checks. */
+@media (max-width: 480px) {
+  .savclasses {
+    justify-content: flex-start;
+    gap: 12px 16px;
+  }
+  .savc {
+    flex: 0 0 calc(50% - 8px);
+  }
+}
 .savc .scv {
   font: 600 23px/1.1 "JetBrains Mono", monospace;
   color: var(--fg);
@@ -1276,11 +1388,16 @@ body {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 16px;
-  cursor: pointer;
+  /* NO `cursor: pointer` and no hover affordance until the machine drill-in
+     is ported. Legacy's `.mach` navigates (`drillMachine`); this port has no
+     click handler behind it, so a pointer cursor + hover highlight is a TRAP
+     CONTROL — it advertises an interaction that silently does nothing, on the
+     card an operator is most likely to try first. Same call as the
+     `history →` link. Restore both when the drill-in lands. */
   transition: border-color 0.15s;
 }
 .mach:hover {
-  border-color: var(--accent);
+  /* intentionally inert — see `.mach` */
 }
 .mach.active {
   border-color: var(--accent);
@@ -1337,6 +1454,19 @@ body {
   box-shadow: none;
 }
 
+/* (Mobile fix pass) `.mach`'s fixed 248px width left 122px of dead space to
+   its right inside a 370px `.fleet` row at 402px viewport (a single card
+   can never reach `.fleet`'s own `flex-wrap` — there's nothing to wrap
+   against). Sizing-only change (`.fleet` stays `display:flex`, `.mach`
+   stays a direct child) — the same "don't touch display type, only size"
+   discipline the `.savc` fix above uses, so the flex-line innerText
+   invariant this block's own module doc warns about is untouched. */
+@media (max-width: 560px) {
+  .mach {
+    width: 100%;
+  }
+}
+
 .fleettl {
   margin-top: 30px;
   border-top: 1px solid var(--border);
@@ -1378,6 +1508,19 @@ body {
 .twinb.on {
   background: var(--accent);
   color: var(--bg);
+}
+/* (Mobile fix pass) Measured 30-37px wide, 18px tall — worst of the
+   touch-target sweep along with TODAY's 58x21. Mobile-only. `.twin`'s own
+   `overflow:hidden` + shared border still frame the group the same way at
+   the larger size. */
+@media (max-width: 768px) {
+  .twinb {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+  }
 }
 .lane {
   display: flex;

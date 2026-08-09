@@ -92,6 +92,26 @@ const DEFAULT_DETAIL_PCT = 38;
  * always-available quick action ("model only"); the full category/tier/
  * source/activity checkbox grid is a real follow-up (`.fbtn` here toggles
  * the quick filter directly instead of opening a modal with checkboxes).
+ *
+ * **(Mobile fix pass) `#fbtn` no longer renders legacy's funnel glyph.**
+ * Legacy's `ICON.filter` is a real funnel SVG, and its own `title`/
+ * `aria-label` literally say "filters" — an honest name for a control that
+ * opens the full modal. This button does something narrower (a one-shot
+ * "model activity only" toggle), and the `title`/`aria-label` text already
+ * said so — but `title` is a HOVER affordance, invisible on a phone with no
+ * mouse. The operator tapped it expecting the modal anyway: the glyph was
+ * the only thing a touch user actually sees before tapping, and an
+ * ambiguous icon in the funnel's old visual slot still reads as "open
+ * filters" regardless of what the hidden title says. Fixed by replacing the
+ * glyph with a real VISIBLE label ("MODEL") — no hover required to know
+ * what tapping it does — rather than reproducing the funnel shape (which
+ * would keep implying the modal) or any other icon that still needs a
+ * tooltip to explain itself. `title`/`aria-label` are unchanged and still
+ * carry the fuller sentence for pointer/screen-reader users. Untested by
+ * every parity golden (`extractLensText` only reads `#topbar`/`#crumb`/
+ * `#meta`/`#logscope`/`#stage` — `.eventlog__head`'s buttons are outside
+ * all five regions), so this is a zero-golden-risk change; verified no
+ * golden references either the old glyph or "MODEL".
  */
 export function EventLogColumn({
   records,
@@ -216,7 +236,7 @@ export function EventLogColumn({
                 aria-pressed={modelOnly}
                 onClick={() => setModelOnly((v) => !v)}
               >
-                ⏚
+                MODEL
               </button>
             </span>
           </h3>
