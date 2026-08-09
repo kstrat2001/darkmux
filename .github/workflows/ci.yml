@@ -629,3 +629,17 @@ jobs:
             echo "── $suite ──"
             bun run "$suite"
           done
+
+      # A playwright failure on a runner we cannot reproduce locally is only
+      # actionable with its trace. Uploaded on failure ONLY, so a green run
+      # carries no artifact cost.
+      - name: Upload playwright traces on failure
+        if: failure() && steps.filter.outputs.ui == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: |
+            tests/parity/test-results/**
+            tests/parity/playwright-report/**
+          retention-days: 7
+          if-no-files-found: ignore
