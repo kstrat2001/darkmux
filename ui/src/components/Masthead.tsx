@@ -120,10 +120,14 @@ export function Masthead({ route, liveStatus }: { route: Route; liveStatus: Live
     // own BEM-style styling hook, unrelated to the extractor.
     <header className="masthead top">
       <span className="masthead__brand">
+        {/* (operator) Just the name. "· observability" labelled the category
+            of the thing you are already looking at — decoration in a view
+            whose stated goal is less noise. Changed in the LEGACY viewer too,
+            so the parity goldens rebaseline from a source that genuinely
+            changed rather than being edited to match the port. */}
         <a href="https://darkmux.com/" target="_blank" rel="noopener">
           <b>darkmux</b>
-        </a>{" "}
-        · observability
+        </a>
       </span>
       {verText ? (
         <span className="masthead__ver" id="verbadge" title={verTitle}>

@@ -407,7 +407,18 @@ body {
   position: sticky;
   top: var(--chrome-h, 97px);
   align-self: flex-start;
-  max-height: calc(100vh - var(--chrome-h, 97px));
+  /* DEFINITE height, not `max-height`. This is the third time this property
+     has been wrong, and the reason is subtle enough to be worth writing down:
+     the detail panel sizes itself with a percentage `flex-basis` (the split
+     resizer's state). A percentage resolves against the CONTAINER'S height —
+     and `max-height` alone leaves that height INDEFINITE, so the percentage
+     silently falls back to content size. Two symptoms, one cause: the detail
+     panel grew and shrank with whichever event you clicked (and could run
+     off the bottom of the screen on a large one), and the drag handle did
+     nothing visible because the percentage it was updating no longer
+     resolved against anything. A definite height fixes both and bounds the
+     column to the viewport at the same time. */
+  height: calc(100vh - var(--chrome-h, 97px));
   min-height: 320px;
   display: flex;
   flex-direction: column;

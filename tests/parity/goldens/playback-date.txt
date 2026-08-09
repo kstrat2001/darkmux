@@ -1,5 +1,5 @@
 === topbar ===
-darkmux · observability
+darkmux
 FLOW · 2026-08-07
 ▣ PLAYBACK
 home
