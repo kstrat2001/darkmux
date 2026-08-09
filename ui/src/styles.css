@@ -1,0 +1,1793 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0e14;
+  --fg: #e6e8ee;
+  --dim: #8b93a7;
+  --accent: #4fd1c5;
+  --error: #f56565;
+  --border: #232838;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  /* No horizontal document scroll at any width, including 390px phone
+     viewports — the overnight runbook's render-sanity contract. */
+  overflow-x: hidden;
+  max-width: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  width: 100%;
+}
+
+/* ── Nav chrome (Packet 1.5) — port of legacy's `.crumbbar` (viewer.html:89,
+   816): the lens-tab bar (`.lenstabs`/`.lens`) plus `#crumb`/`#meta` sharing
+   one row. `#crumb`/`#meta` keep their OWN element/id (unchanged from
+   Packets 1-3 — only their PARENT moved), so this is pure layout, not a
+   content change; the parity extractor selects by id regardless of DOM
+   nesting. */
+.app-shell__crumbbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.app-shell__navtabs {
+  display: inline-flex;
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.nav-tab {
+  display: inline-block;
+  font: 600 11px/1 ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  /* Taller than legacy's 5px/11px (a mouse-first desktop app) — phone tap
+     targets need real height. Measured (QA, phone-fix pass): 33px actual,
+     short of Apple's real 44pt minimum this rule's own comment used to
+     misstate as "~40px" — see the mobile-only override below for the
+     correction. */
+  padding: 11px 13px;
+  cursor: pointer;
+  text-decoration: none;
+  background: none;
+  border: none;
+}
+
+.nav-tab + .nav-tab {
+  border-left: 1px solid var(--border);
+}
+
+.nav-tab:hover {
+  color: var(--fg);
+}
+
+.nav-tab.on {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+/* (Mobile fix pass) Measured 63-79px wide (already >=44) but only 33px
+   tall — short of the 44x44 minimum. Mobile-only: desktop's mouse-first
+   33px is left alone (1280px render-sanity unaffected). */
+@media (max-width: 768px) {
+  .nav-tab {
+    display: inline-flex;
+    align-items: center;
+    /* NOT `min-height` on a PAINTED control: a filled 44px slab around 11px
+       text reads as a big empty block (operator, on the phone). The box keeps
+       its natural size; `::after` extends only the invisible TAP region to
+       Apple's 44pt minimum. Hit area and visual weight are different things
+       and were wrongly fused here. */
+    position: relative;
+  }
+  .nav-tab::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 44px;
+    transform: translateY(-50%);
+  }
+
+}
+
+.app-shell__crumb {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  border-bottom: none;
+  font-size: 14px;
+  color: var(--dim);
+}
+
+.app-shell__meta {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--dim);
+  text-align: right;
+}
+
+/* `#modebadge` (Packet 5) — viewer.html:406 (`#modebadge.stale{opacity:.65}`)
+   + the `.live` accent legacy's `setBadges()` toggles. Global chrome, a
+   sibling of `#meta`, not a lens region — see `LiveStatusBadge.tsx`'s own
+   doc. */
+#modebadge.pb {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--dim);
+  /* (Chrome packet) Matches legacy's `.pb{text-transform:uppercase}`
+     (viewer.html:747) — a real visual rule, not just a parity trick: the
+     underlying text nodes STAY lowercase ("● live"/"◌ reconnecting", see
+     `LiveStatusBadge.tsx`), so `next-parity-live.spec.ts`'s case-sensitive
+     `toContainText("live")`/`toContainText("reconnecting")` (which read
+     `textContent`, unaffected by CSS) keep passing — verified with a
+     throwaway Playwright probe before relying on it. */
+  text-transform: uppercase;
+}
+
+/* (operator: "should live be pulsing like it did before?") — it should, and
+   it was MISSING: legacy has `@keyframes lpulse` + `.pb.live{animation:…}`
+   and this port had neither. Another purely visual element the text goldens
+   could not see, alongside the machine icon and the status dot's colour.
+
+   Worth knowing what it does and does not mean: the pulse is a fixed 1.6s
+   loop gated only on the badge being live. It does NOT track record arrival
+   or connection health — so it says "live" a second time rather than adding
+   information. An arrival-driven pulse would genuinely signal a stream going
+   quiet; that is new behaviour, not a port, and is left as its own call. */
+@keyframes lpulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+#modebadge.pb.live {
+  color: var(--accent);
+}
+
+#modebadge.pb.stale {
+  color: var(--error);
+  opacity: 0.85;
+}
+
+/* (#1613/#1614 precedent, `tests/e2e/chrome-order.spec.js`) At phone width
+   the crumbbar reads BROADEST-SCOPE-FIRST: global status (`#meta`) above
+   the tab selector above the per-tab crumb — `order`, not just wrapping,
+   since a document-order assertion can't catch a CSS-only regression here
+   (see that spec's own comment). Tab ORDER within `.app-shell__navtabs`
+   itself is untouched — only these three outer regions reflow. */
+@media (max-width: 768px) {
+  .app-shell__crumbbar {
+    gap: 6px 8px;
+  }
+  .app-shell__meta {
+    order: -1;
+    flex: 1 1 100%;
+    margin-left: 0;
+    text-align: left;
+  }
+  .app-shell__navtabs {
+    order: 0;
+  }
+  .app-shell__crumb {
+    order: 1;
+    flex: 1 1 auto;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+}
+
+.app-shell__stage {
+  flex: 1;
+  padding: 16px;
+  min-height: 200px;
+  min-width: 0;
+}
+
+/* ── Masthead (Chrome packet) — port of legacy's `.top` (viewer.html:802-816).
+   Precedes `.app-shell__crumbbar`, matching legacy's DOM order. */
+.masthead {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.masthead__brand {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.masthead__brand a {
+  color: inherit;
+  text-decoration: none;
+}
+.masthead__brand b {
+  color: var(--accent);
+}
+.masthead__brand a:hover b {
+  text-decoration: underline;
+}
+/* `#verbadge` — the build-identifier chip. Empty (zero width, no border) when
+   no `darkmux-version` meta was injected (every test harness in this repo —
+   see `Masthead.tsx`'s own doc); a real daemon populates it with volatile
+   version/build-hash text the parity extractor normalizes before it ever
+   reaches a golden (`tests/parity/lib/extract-lens.js`'s
+   `extractTopbarText`). */
+.masthead__ver {
+  font: 11px/1 ui-monospace, SFMono-Regular, monospace;
+  color: var(--dim);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.masthead__refresh {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  border-radius: 4px;
+  cursor: pointer;
+  font: 13px ui-monospace, SFMono-Regular, monospace;
+  padding: 2px 7px;
+  line-height: 1.4;
+}
+.masthead__refresh:hover {
+  color: var(--fg);
+}
+.masthead__refresh.spin {
+  animation: masthead-refresh-spin 0.8s linear infinite;
+}
+@keyframes masthead-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .masthead__refresh.spin {
+    animation: none;
+    opacity: 0.5;
+  }
+}
+.masthead__nav {
+  margin-left: auto;
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.masthead__nav a {
+  color: var(--dim);
+  text-decoration: none;
+  font: 600 12px ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 0.04em;
+}
+.masthead__nav a:hover {
+  color: var(--accent);
+}
+/* The catalog toggle (`<CatalogPanel>`, now mounted inside the masthead —
+   see that component's own doc) sits between the ver chip and the live
+   badge, same relative order as legacy's `#srcbadge` before `#modebadge`. */
+.masthead .catalog-anchor {
+  position: relative;
+  /* The base `.catalog-anchor` sets `align-self: flex-start`, which is right
+     inside `.app-shell` (a VERTICAL flex column, where it stops the anchor
+     stretching full width) and wrong here, inside the masthead's HORIZONTAL
+     row, where it overrides the row's `align-items: center`. Measured: every
+     other masthead child centered at y=27, this one at y=33 — six pixels low,
+     which is exactly the sort of thing that reads as "off" long before anyone
+     can say why.
+
+     `align-self: center` alone does NOT fix it: the base rule also carries
+     `margin: 12px 0 0 16px` from its old placement, and centering centers the
+     MARGIN BOX — so a 12px top margin displaces the visible content by
+     exactly the 6px measured. The margin has to go too, and the masthead's
+     own `gap` already provides the horizontal spacing. */
+  align-self: center;
+  margin: 0;
+}
+
+@media (max-width: 768px) {
+  .masthead {
+    gap: 8px 10px;
+    padding: 8px 12px;
+  }
+  .masthead__nav {
+    order: 1;
+    flex: 1 1 100%;
+    margin-left: 0;
+    gap: 12px;
+  }
+  /* Touch targets (mobile-only — desktop keeps its compact chrome). Every
+     interactive masthead control grows to >=44x44 via padding/min-height,
+     never font-size, so the rendered TEXT (parity-checked for `.top`'s
+     brand string) stays byte-identical — only the box around it grows. */
+  .masthead__brand a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  .catalog-toggle {
+    display: inline-flex;
+    align-items: center;
+    /* NOT `min-height` on a PAINTED control: a filled 44px slab around 11px
+       text reads as a big empty block (operator, on the phone). The box keeps
+       its natural size; `::after` extends only the invisible TAP region to
+       Apple's 44pt minimum. Hit area and visual weight are different things
+       and were wrongly fused here. */
+    position: relative;
+  }
+  .catalog-toggle::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 44px;
+    transform: translateY(-50%);
+  }
+
+  .masthead__nav a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 4px 8px;
+  }
+}
+
+/* (Mobile fix pass) Below ~560px the masthead's non-negotiable content
+   (brand + the catalog/live status group) plus the topnav no longer fit in
+   4 rows worth of wrapping — measured at 402px CSS width: brand alone /
+   ver+TODAY+LIVE / refresh alone / nav, 119px tall. Two controls drop here:
+
+   - `.masthead__refresh` (operator-approved): the view already polls every
+     5s, the SSE tail pushes live changes, and iOS Safari provides
+     pull-to-refresh natively — the button has no job on a phone. Desktop
+     (>560px) is untouched; the `live` conditional in Masthead.tsx still
+     mounts it there.
+   - `.masthead__ver` (an addition beyond the operator's explicit list,
+     named here rather than done quietly): the build-identifier chip
+     (`v<semver> (<sha>) · schema <n>  ⓘ`) measures 200-225px wide on a
+     real daemon — wider than the brand text itself, and ALONE it already
+     exceeds the ~354px content budget left after the brand + TODAY badge +
+     live badge share a row. It is the single blocker standing between 3
+     rows and the 2-row target: with it gone, brand + TODAY + live-badge
+     fit on one line and nav owns the other. It is informational only
+     (never interactive, no touch-target concern) and untested by every
+     parity golden today (`Masthead.tsx`'s own doc: no harness in this repo
+     injects `darkmux-version`, so `#verbadge` renders empty in every
+     recorded golden) — hiding it here changes zero committed text. A build
+     check on the phone is a real, if occasional, want; a tap-to-reveal (or
+     folding it into an about surface) is the natural follow-up if the
+     operator wants it back, not reproduced here. */
+@media (max-width: 560px) {
+  .masthead__refresh {
+    display: none;
+  }
+  .masthead__ver {
+    display: none;
+  }
+  .masthead {
+    gap: 8px 6px;
+  }
+}
+
+/* ── Content row (Chrome packet) — `#stage` beside the event-log column,
+   the port of legacy's `.wrap` (viewer.html:822-847: `.stage` then `.log`,
+   siblings). Stacks on phone width, matching legacy's own mobile-first
+   `.wrap{display:block}` rule (viewer.html:672-680). */
+.app-shell__content {
+  display: flex;
+  /* `stretch`, not `flex-start`: the event-log column fills the row's height
+     (see `.eventlog`). `flex-start` left it at its own intrinsic height with
+     dead space beneath. */
+  align-items: stretch;
+  flex: 1;
+  min-width: 0;
+}
+
+@media (max-width: 768px) {
+  .app-shell__content {
+    display: block;
+  }
+}
+
+/* ── Event-log column (Chrome packet) — port of legacy's `.log`
+   (viewer.html:321) + `.detail`/`.split`/`.loglist`/`.loghead`/`.logsearch`/
+   `#logbody`/`.rec` (viewer.html:321-372). Only mounted (never just
+   CSS-hidden) when `lib/route.ts`'s `showsEventLog(route)` is true — see
+   that function's own doc for the verified visibility rule.
+
+   HEIGHT: stretches to fill the content row, rather than the fixed `70vh`
+   this first shipped with. That fixed height was measured leaving 236px of
+   dead space below the column on a 1143px viewport AND clipping the event
+   list mid-row — the stream visibly "cut off" partway down the page with
+   empty space beneath it, which is what the operator saw. Legacy fills the
+   available height too (`.wrap`'s `calc()` + `.log` as a flex child); the
+   difference is that this port lets the ROW own the height and the column
+   stretch into it, so there is no viewport arithmetic to keep in sync.
+   The inner `.loglist` still scrolls. */
+.eventlog {
+  width: 380px;
+  flex: none;
+  /* VIEWPORT-bounded and sticky, NOT stretched to the row.
+     History, because this has now been wrong twice in opposite directions:
+     it shipped as a fixed `70vh`, which left dead space below the column on
+     a tall window; `align-self: stretch` fixed that and introduced a worse
+     bug, because the row's height is driven by the STAGE's content, not the
+     viewport — with a real fleet the stage is ~2300px, so the column became
+     2345px, its 38% detail panel became 862px holding a 255px card, and the
+     event list was pushed 600px of blank space down the page. (Measured. The
+     stretch fix looked correct only because it was verified against a
+     data-less harness where the stage is short.)
+     Legacy bounds the whole `.wrap` to the viewport and scrolls `#stage`
+     internally; sticky gets the same bound without changing how the page
+     scrolls. */
+  position: sticky;
+  top: var(--chrome-h, 97px);
+  align-self: flex-start;
+  /* DEFINITE height, not `max-height`. This is the third time this property
+     has been wrong, and the reason is subtle enough to be worth writing down:
+     the detail panel sizes itself with a percentage `flex-basis` (the split
+     resizer's state). A percentage resolves against the CONTAINER'S height —
+     and `max-height` alone leaves that height INDEFINITE, so the percentage
+     silently falls back to content size. Two symptoms, one cause: the detail
+     panel grew and shrank with whichever event you clicked (and could run
+     off the bottom of the screen on a large one), and the drag handle did
+     nothing visible because the percentage it was updating no longer
+     resolved against anything. A definite height fixes both and bounds the
+     column to the viewport at the same time. */
+  height: calc(100vh - var(--chrome-h, 97px));
+  min-height: 320px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: #10141f;
+}
+/* (operator, on the phone) The detail panel's height is an INLINE
+   `flex-basis` driven by the split-resizer's state — 38% by default. On
+   desktop that is legacy's draggable split and the operator can change it.
+   On mobile the resizer is hidden, so 38% becomes a permanent RESERVATION:
+   a short selected event leaves most of it blank, and the log list — the
+   thing you opened the panel to read — gets pushed below a screenful of
+   nothing. Measured at 402x844: a 192px detail holding 163px of body, with
+   the list starting 1279px down the page.
+
+   `flex-basis: auto` makes it size to CONTENT instead, capped so a large
+   event can still not swallow the column. `!important` is deliberate and is
+   the correct tool here: it exists to override an inline style, which is
+   exactly what this is doing. */
+@media (max-width: 768px) {
+  .eventlog__detail {
+    flex-basis: auto !important;
+    max-height: 45vh;
+  }
+}
+
+@media (max-width: 768px) {
+  .eventlog {
+    width: 100%;
+    height: 60vh;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+}
+/* `runs`/`console`/`machine` — port of legacy's `body.runs-mode .log,
+   body.machine-mode .log{display:none}` (viewer.html:106/258), applied here
+   as a class on the column itself (this app conditionally SETS the class
+   per route in `App.tsx` rather than toggling a body class) instead of
+   unmounting it — see `EventLogColumn.tsx`'s own `visible` doc for why
+   unmounting was tried first and is wrong (it drops `#logscope`'s real
+   text, which `next-parity.spec.ts`'s byte-parity goldens for the machine
+   lens actually need present, just not painted). */
+.eventlog--hidden {
+  display: none;
+}
+.eventlog__detail {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 60px;
+  padding: 10px 12px 0;
+  overflow: hidden;
+}
+.eventlog__detailhead {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+  flex: none;
+}
+.eventlog__detailtitle {
+  font: 600 11px ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.eventlog__detailbody {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+  padding-bottom: 10px;
+}
+.eventlog__none {
+  color: var(--dim);
+  font: 11px ui-monospace, SFMono-Regular, monospace;
+  padding: 8px 0;
+}
+.eventlog__detailcard {
+  font: 11px/1.5 ui-monospace, SFMono-Regular, monospace;
+}
+.eventlog__detailsummary {
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+.eventlog__detailpre {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.5 ui-monospace, SFMono-Regular, monospace;
+}
+.eventlog__split {
+  height: 7px;
+  flex: none;
+  background: var(--border);
+  cursor: row-resize;
+  touch-action: none;
+}
+.eventlog__split:hover {
+  background: var(--accent);
+  opacity: 0.6;
+}
+@media (max-width: 768px) {
+  /* the row-resize handle isn't useful when stacked, matching legacy's own
+     `.split{display:none}` mobile rule (viewer.html:679). */
+  .eventlog__split {
+    display: none;
+  }
+}
+.eventlog__list {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.eventlog__head {
+  flex: none;
+  padding: 8px 12px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.eventlog__head h3 {
+  margin: 0;
+  font: 600 11px/1 ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dim);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.eventlog__headbtns {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.eventlog__follow,
+.eventlog__fbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  background: none;
+  font-size: 12px;
+  line-height: 1;
+}
+.eventlog__follow:hover,
+.eventlog__fbtn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.eventlog__follow.on,
+.eventlog__fbtn.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+/* (Mobile fix pass) Measured 23x22 each — mobile-only growth to 44x44.
+   `.eventlog__fbtn` also carries a wider visible "MODEL" label now (see
+   `EventLogColumn.tsx`'s doc for why) which already pushes its width past
+   44 unaided; `min-width` here is belt-and-suspenders for narrower labels
+   a future edit might introduce. */
+@media (max-width: 768px) {
+  .eventlog__follow,
+  .eventlog__fbtn {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 4px 10px;
+  }
+}
+.eventlog__search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.eventlog__searchbox {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.eventlog__sicon {
+  position: absolute;
+  left: 8px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--dim);
+  pointer-events: none;
+}
+.eventlog__searchbox input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  /* 16px, not 12px — iOS Safari zooms the whole page on focus of a text
+     input under 16px; same rationale as legacy's own `.searchbox input`
+     rule (viewer.html:341-347). */
+  padding: 6px 26px;
+  font: 16px ui-monospace, SFMono-Regular, monospace;
+}
+/* (Mobile fix pass) Measured 354x32 — width already clears 44, height
+   didn't. Mobile-only padding bump; the 16px font (iOS zoom-avoidance
+   rule above) stays untouched. */
+@media (max-width: 768px) {
+  .eventlog__searchbox input {
+    padding: 13px 26px;
+  }
+}
+.eventlog__searchbox input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+}
+.eventlog__searchbox input::placeholder {
+  color: var(--dim);
+  font-style: italic;
+}
+.eventlog__sclear {
+  position: absolute;
+  right: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--dim);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.eventlog__sclear:hover {
+  color: var(--fg);
+}
+.eventlog__qcount {
+  flex: none;
+  font: 600 10px/1 ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+  white-space: nowrap;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  opacity: 0;
+}
+.eventlog__qcount.show {
+  opacity: 1;
+}
+.eventlog__qcount.zero {
+  color: var(--error);
+  border-color: var(--error);
+}
+.eventlog__body {
+  flex: 1;
+  overflow: auto;
+  padding: 6px 12px 8px;
+}
+.eventlog__rec {
+  font: 11px/1.5 ui-monospace, SFMono-Regular, monospace;
+  color: var(--dim);
+  padding: 5px 6px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+.eventlog__rec:hover {
+  background: #161b28;
+}
+.eventlog__rec.sel {
+  background: #1a2030;
+  border-left: 2px solid var(--accent);
+  color: var(--fg);
+}
+.eventlog__rectime {
+  color: var(--accent);
+}
+.eventlog__ractivity {
+  color: var(--fg);
+}
+.eventlog__empty {
+  color: var(--dim);
+  font: 11px ui-monospace, SFMono-Regular, monospace;
+  padding: 10px 2px;
+}
+
+/* Fleet strip — three visibly distinct data states. */
+.fleet-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.fleet-strip--pending .fleet-skeleton {
+  width: 220px;
+  height: 64px;
+  border-radius: 8px;
+  background: linear-gradient(90deg, #1a1f2e 25%, #232941 37%, #1a1f2e 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.4s ease infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+.fleet-strip--error {
+  border: 1px solid var(--error);
+  background: rgba(245, 101, 101, 0.08);
+  border-radius: 8px;
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--error);
+}
+
+.fleet-strip--empty {
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  color: var(--dim);
+}
+
+.fleet-strip--data .fleet-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  min-width: 200px;
+  background: #131826;
+}
+
+.fleet-card__name {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.fleet-card__specs,
+.fleet-card__models {
+  font-size: 12px;
+  color: var(--dim);
+  margin-top: 4px;
+}
+
+.lens-placeholder {
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  color: var(--dim);
+}
+
+.lens-placeholder__title {
+  font-size: 16px;
+  color: var(--fg);
+  margin: 0 0 8px;
+}
+
+.lens-placeholder__hash,
+.lens-placeholder__note {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 13px;
+  margin: 4px 0;
+}
+
+/* ── Runs lens (Packet 3) — ported nearly verbatim from viewer.html's own
+   <style> block (search that file for `.lablist`/`.runchip`/`.labrunmain`)
+   so the SAME class names produce the SAME DOM/CSS shape, which is what
+   makes `next-parity-runs.spec.ts`'s stage-text byte-comparison possible at
+   all: Chromium's `innerText()` treats each direct child of a `display:flex`
+   container as its own line, REGARDLESS of visual wrapping (verified
+   empirically — see the packet's own report) — so `.labrunmain`/`.runsbar`/
+   `.labtaskhdr` being `display:flex` (not just visually similar) is
+   load-bearing for parity, not a styling nicety. Likewise `text-transform:
+   uppercase` on `.labbadge`/`.runkind`/`.labtaskcount` is what turns the
+   wire's lowercase `status`/`kind` strings into the goldens' UPPERCASE
+   text — innerText reflects CSS text-transform. Don't "clean up" either
+   property without re-running the parity spec. */
+.lablist {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 10px;
+}
+.stagehdr {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  margin-bottom: 14px;
+}
+.labnotice {
+  font: 12px/1.5 "JetBrains Mono", monospace;
+  color: #ffb86b;
+  border: 1px solid #ffb86b;
+  border-radius: 6px;
+  padding: 9px 12px;
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+.runsbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 4px;
+}
+.runchip {
+  font: 600 11px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.04em;
+  padding: 6px 10px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: #131826;
+  color: var(--dim);
+  cursor: pointer;
+}
+.runchip:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.runchip.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: #1c1c22;
+}
+.runchipn {
+  opacity: 0.7;
+  font-weight: 400;
+}
+.runkind {
+  display: inline-block;
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  flex: 0 0 auto;
+}
+.runkind.mission {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.runkind.dispatch {
+  color: var(--fg);
+}
+.runkind.lab {
+  color: #5af0a3;
+  border-color: #5af0a3;
+}
+.labrunrow {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #131826;
+  cursor: pointer;
+  margin-bottom: 6px;
+}
+.labrunrow:last-child {
+  margin-bottom: 0;
+}
+.labrunrow.flat {
+  cursor: default;
+}
+.labrunmain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.labruncrew {
+  font: 600 12px "JetBrains Mono", monospace;
+  color: var(--fg);
+}
+.labrundir {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.labrunmeta {
+  font: 11px/1.4 "JetBrains Mono", monospace;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.labrunmeta.dim {
+  color: var(--dim);
+}
+.labdegenerate {
+  color: var(--error);
+  font-weight: 600;
+}
+.labdiffline {
+  font: 11px/1.4 "JetBrains Mono", monospace;
+  color: #5af0a3;
+  padding: 2px 0 8px 6px;
+  border-left: 2px solid #5af0a3;
+  margin: -2px 0 6px 4px;
+  overflow-wrap: anywhere;
+}
+.labdiffline.warn {
+  color: #ffb86b;
+  border-left-color: #ffb86b;
+}
+.labdiffline.dim {
+  color: var(--dim);
+  border-left-color: var(--border);
+}
+.labbadge {
+  display: inline-block;
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.labbadge.finished,
+.labbadge.complete {
+  color: #5af0a3;
+  border-color: #5af0a3;
+}
+.labbadge.live,
+.labbadge.running {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.labbadge.error {
+  color: var(--error);
+  border-color: var(--error);
+}
+.labbadge.planned,
+.labbadge.abandoned {
+  color: var(--dim);
+}
+.rununtracked {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  color: var(--dim);
+  letter-spacing: 0.04em;
+}
+.runmore {
+  font: 12px "JetBrains Mono", monospace;
+  color: var(--dim);
+  margin-top: 10px;
+  cursor: pointer;
+  text-align: center;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+}
+.labtaskcard {
+  background: #1c1c22;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.labtaskhdr {
+  font: 600 13px "JetBrains Mono", monospace;
+  color: var(--accent);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.labtaskcount {
+  font: 600 10px "JetBrains Mono", monospace;
+  color: var(--dim);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.none {
+  color: var(--dim);
+  font: 11px "JetBrains Mono", monospace;
+  padding: 10px 0;
+}
+
+/* ── Console lens (Packet 6) — ported from viewer.html's own <style> block
+   (search that file for `.panelwrap`/`.panelchrome`/`.panelout`). Same
+   load-bearing-CSS caveat as the runs lens block above: `.panelchrome` is
+   `display:flex;flex-wrap:wrap` so each chrome span (`$ darkmux …`,
+   `captured …`, the optional stale/manual badges, `· <n>ms`, the button)
+   lands on its OWN innerText line, matching the goldens exactly — collapsing
+   it to inline would merge them onto one line and break parity. `.panelout`
+   is rendered on a real `<pre>` element (not a styled `<div>`), so
+   `white-space:pre` here is belt-and-suspenders with the tag's own UA
+   default, not the only thing providing it — don't swap the tag for a `div`
+   without re-adding the rule's effect. Colors are approximated against this
+   port's own root palette (`--accent`/`--error`/`--dim`/`--border`) rather
+   than reproducing legacy's separate `--bg2`/`--panel`/`--line`/`--muted`/
+   `--good`/`--warn`/`--bad`/`--run`/`--accent-dim` tokens verbatim — `
+   innerText()` (what parity actually checks) never reads color, so this is a
+   deliberate simplification, not a parity risk. */
+.panelwrap {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #131826;
+  margin-top: 10px;
+  overflow: hidden;
+}
+.panelchrome {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: #1c1c22;
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+.panelchrome .pc-cmd {
+  color: var(--fg);
+  font-weight: 600;
+}
+.panelchrome .pc-spacer {
+  flex: 1 1 auto;
+}
+.panelchrome .pc-stale {
+  color: #ffb86b;
+}
+.panelchrome .pc-manual {
+  color: #2a8a96;
+}
+.pcbtn {
+  font: 600 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  background: #131826;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+.pcbtn:hover {
+  color: var(--accent);
+  border-color: #2a8a96;
+}
+.pcbtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.pcbtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.panelout {
+  margin: 0;
+  padding: 12px;
+  overflow-x: auto;
+  white-space: pre;
+  font:
+    12px/1.5 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace,
+    "Apple Color Emoji";
+  color: var(--fg);
+}
+.panelerr {
+  padding: 12px;
+  font: 12px/1.5 "JetBrains Mono", monospace;
+  color: var(--error);
+  white-space: pre-wrap;
+}
+/* ANSI SGR -> palette. Only what darkmux's own output emits is mapped with
+   intent; the rest fall back to sane terminal-ish values — same scope as
+   `ANSI_SGR_CLASS` in `lib/ansi.ts`. */
+.panelout .a-bold {
+  font-weight: 700;
+}
+.panelout .a-dim {
+  opacity: 0.62;
+}
+.panelout .a-ital {
+  font-style: italic;
+}
+.panelout .a-underline {
+  text-decoration: underline;
+}
+.panelout .a-fg1,
+.panelout .a-fg9 {
+  color: var(--error);
+}
+.panelout .a-fg2,
+.panelout .a-fg10 {
+  color: #5af0a3;
+}
+.panelout .a-fg3,
+.panelout .a-fg11 {
+  color: #ffd166;
+}
+.panelout .a-fg4,
+.panelout .a-fg12 {
+  color: #7aa2f7;
+}
+.panelout .a-fg5,
+.panelout .a-fg13 {
+  color: #c39cf7;
+}
+.panelout .a-fg6,
+.panelout .a-fg14 {
+  color: var(--accent);
+}
+.panelout .a-fg0,
+.panelout .a-fg8 {
+  color: var(--dim);
+}
+.panelout .a-fg7,
+.panelout .a-fg15 {
+  color: var(--fg);
+}
+.panelout .a-link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: #2a8a96;
+  padding: 2px 0;
+}
+@media (max-width: 700px) {
+  .panelout {
+    font-size: 11px;
+    padding: 10px;
+  }
+  .panelchrome {
+    font-size: 10px;
+    padding: 7px 10px;
+  }
+}
+
+/* ── Catalog picker (Packet 4) — ported from viewer.html's own <style>
+   block (search that file for `.catpanel`/`.catrow`/`.cathdr`/`.catempty`).
+   `.catrow`'s explicit `display:block` (overriding <button>'s UA-stylesheet
+   `inline-block` default) is load-bearing for `next-parity-catalog.spec.ts`'s
+   byte-comparison against goldens/catalog-open.txt — same load-bearing-CSS
+   note as the runs lens above, don't "clean up" it without re-running that
+   spec. Colors/fonts below use THIS file's own custom-property names
+   (--dim/--fg/--accent/--border), not viewer.html's (--muted/--text/--line)
+   — only the box-generation properties need to match, not the palette.
+
+   `.catalog-anchor` is the positioning context for `.catpanel` (QA
+   must-fix): the panel used to sit at a page-level `top:48px;left:16px`,
+   which overlapped the toggle BUTTON once `#meta` landed above it (QA
+   measured `elementFromPoint` at the button's center returning the panel,
+   and a real click timing out — the toggle was structurally unclickable
+   while open, so the panel couldn't be closed that way). Anchoring the
+   panel to the toggle's OWN wrapper — `top: calc(100% + 6px)`, directly
+   below it — means the panel can never cover the button again, regardless
+   of what other App-level chrome sits above this component. */
+.catalog-anchor {
+  position: relative;
+  /* `.app-shell` is `display:flex; flex-direction:column` (default
+     `align-items:stretch`) — without this, the anchor (and the button
+     inside it) stretches to the shell's full cross-axis width instead of
+     sizing to its own content, the same way legacy's `#srcbadge` is a
+     small corner badge, not a full-width bar. */
+  align-self: flex-start;
+  margin: 12px 0 0 16px;
+}
+.catalog-toggle {
+  font: 600 11px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--bg);
+  background: var(--accent);
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.catalog-toggle:hover {
+  box-shadow: 0 0 0 2px rgba(79, 209, 197, 0.35);
+}
+.catpanel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 60;
+  background: #131826;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px;
+  min-width: 300px;
+  max-width: min(420px, 92vw);
+  max-height: 60vh;
+  overflow: auto;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+.catpanel .cathdr {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  padding: 7px 8px 4px;
+}
+.catrow {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: var(--fg);
+  padding: 7px 9px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.catrow:hover {
+  background: rgba(79, 209, 197, 0.12);
+}
+.catrow .cd {
+  font: 600 13px/1.2 -apple-system, sans-serif;
+}
+.catrow .cs {
+  color: var(--dim);
+  font: 11px/1.3 -apple-system, sans-serif;
+  margin-top: 2px;
+}
+.catrow.live .cd {
+  color: var(--accent);
+}
+.catempty {
+  color: var(--dim);
+  font: 12px/1.4 -apple-system, sans-serif;
+  padding: 8px 9px;
+}
+
+/* (Chrome packet) `.catalog-anchor`'s desktop positioning assumed the
+   toggle sits near the LEFT edge of its containing block (true when this
+   component was a body-level sibling at `margin-left:16px`; the QA
+   `next-parity-catalog.spec.ts`'s render-sanity check for 390px + panel
+   open PASSED under that layout). Moving the toggle INTO `<Masthead>`'s
+   flex row (this packet) puts it wherever the brand/ver text pushes it —
+   often past 390px minus `.catpanel`'s own `min-width:300px`, so
+   `left:0` (anchor-relative) overflows the viewport. Caught by that exact
+   spec going red after the move; fixed by pinning the panel to the
+   VIEWPORT (not the anchor) at phone width — `top: 56px` clears the
+   masthead's own height at this breakpoint (`padding:8px 12px` + ~20px
+   line height), a fixed value rather than `calc(100% + 6px)` because
+   `position:fixed` escapes the anchor's containing block entirely, so
+   that formula's "% of the anchor" has nothing to resolve against. */
+/* (QA gate) 480px was chosen as "phone width", but the actual trigger is
+   `anchor-x + 300px min-width > viewport`, which starts failing around
+   560px. Worse, `html,body{overflow-x:hidden}` CLIPS the overflow with no
+   scrollbar and no `scrollWidth` signal — so at ~520px every mission row
+   was silently truncated at the right edge and the overflow probes still
+   passed. A bug you cannot see and cannot measure is the worst kind this
+   viewer ships; the breakpoint now covers the whole failing band. */
+@media (max-width: 560px) {
+  .catpanel {
+    position: fixed;
+    top: 56px;
+    left: 8px;
+    right: 8px;
+    width: auto;
+    max-width: none;
+  }
+}
+
+/* ── Fleet lens (Packet 8) — the savings hero + machine cards + recent-
+   activity timeline, ported nearly verbatim from viewer.html's own <style>
+   block (search that file for `.savings`/`.mach`/`.fleettl`). Same
+   load-bearing-CSS caveat as the runs/console/catalog blocks above:
+   `.savrow`/`.savclasses`/`.name`/`.tlhdr`/`.twin`/`.lane`/`.tlaxis` are all
+   `display:flex` (or `inline-flex`) — Chromium's `innerText()` puts each
+   DIRECT CHILD of a flex container on its OWN line regardless of visual
+   wrapping (verified empirically against the recorded goldens — see the
+   runs-lens block's own comment for the same finding), which is what turns
+   the hero's number/label PAIRS and the timeline header's two spans into
+   the exact line breaks `goldens/fleet.txt` expects. `text-transform:
+   uppercase` on `.saveyebrow`/`.savlbl`/`.savc .scl`/`.tlhdr`/`.twinb` is
+   what turns the lowercase source strings ("by your fleet", "local
+   tokens", "recent activity") into the golden's UPPERCASE text — don't
+   "clean up" either property without re-running the parity spec. Colors
+   are approximated against this port's own root palette rather than
+   reproducing legacy's separate token set verbatim (`innerText()` never
+   reads color). */
+.savings {
+  margin: 0 0 18px;
+  padding: 16px 22px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(74, 222, 128, 0.06), rgba(74, 222, 128, 0.01));
+}
+.saveyebrow {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  margin-bottom: 12px;
+}
+.savrow {
+  display: flex;
+  align-items: center;
+  gap: 14px 40px;
+  flex-wrap: wrap;
+}
+.savlead {
+  flex: 0 0 auto;
+}
+.savnum {
+  font: 700 48px/1 "JetBrains Mono", monospace;
+  color: #5af0a3;
+  letter-spacing: 0.01em;
+}
+.savlead.cloud .savnum {
+  color: var(--accent);
+}
+.savlead.unknown .savnum {
+  color: var(--dim);
+}
+.savlbl {
+  font: 600 12px/1 "JetBrains Mono", monospace;
+  color: var(--fg);
+  margin-top: 7px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.savclasses {
+  display: flex;
+  gap: 10px 30px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  flex: 1 1 auto;
+}
+/* (Mobile fix pass) At 402px the 4 chips (generated/fresh input/re-read/
+   dispatches) wrapped 3-then-1, stranding "1 DISPATCH" alone under
+   "RE-READ". Forcing exactly 2-per-row via `flex-basis` — NOT switching to
+   `display:grid` — is deliberate: this block's own module doc documents
+   that Chromium's `innerText()` puts each DIRECT CHILD of a `display:flex`
+   container on its own line REGARDLESS of visual wrapping, which is what
+   the fleet golden's chip-per-line shape depends on. That rule is also why
+   this fix is parity-safe in the first place: innerText already treated
+   each `.savc` as its own line under the OLD 3-then-1 wrap, so changing
+   which chips share a visual row changes nothing byte-parity checks. */
+@media (max-width: 480px) {
+  .savclasses {
+    justify-content: flex-start;
+    gap: 12px 16px;
+  }
+  .savc {
+    flex: 0 0 calc(50% - 8px);
+  }
+}
+.savc .scv {
+  font: 600 23px/1.1 "JetBrains Mono", monospace;
+  color: var(--fg);
+}
+.savc.gen .scv {
+  color: #5af0a3;
+}
+.savc.uncls .scv {
+  color: var(--dim);
+}
+.savc .scl {
+  font: 10px/1.5 "JetBrains Mono", monospace;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 3px;
+}
+.hybnote {
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font: 12px "JetBrains Mono", monospace;
+  color: #5af0a3;
+}
+.hybnote .hybpre {
+  color: var(--fg);
+  font-weight: 700;
+}
+.hybts {
+  color: var(--dim);
+  font-size: 10px;
+}
+.hyblink {
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 11px;
+  margin-left: 4px;
+}
+.hyblink:hover {
+  text-decoration: underline;
+}
+
+.fleet {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: stretch;
+}
+.mach {
+  width: 248px;
+  display: flex;
+  flex-direction: column;
+  background: #131826;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  /* NO `cursor: pointer` and no hover affordance until the machine drill-in
+     is ported. Legacy's `.mach` navigates (`drillMachine`); this port has no
+     click handler behind it, so a pointer cursor + hover highlight is a TRAP
+     CONTROL — it advertises an interaction that silently does nothing, on the
+     card an operator is most likely to try first. Same call as the
+     `history →` link. Restore both when the drill-in lands. */
+  transition: border-color 0.15s;
+}
+.mach:hover {
+  /* intentionally inert — see `.mach` */
+}
+.mach.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.mach .name {
+  font: 600 15px/1 "JetBrains Mono", monospace;
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mico {
+  display: inline-flex;
+  color: var(--accent);
+}
+.mico svg {
+  width: 19px;
+  height: 19px;
+  display: block;
+}
+.mach .spec {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  margin-top: 3px;
+}
+.mach .specdim {
+  opacity: 0.5;
+  font-style: italic;
+}
+.mach .stat {
+  margin-top: 12px;
+  font: 12px "JetBrains Mono", monospace;
+}
+.mach .runs {
+  margin-top: 5px;
+  font: 12px "JetBrains Mono", monospace;
+  color: var(--fg);
+}
+.mach .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 7px;
+  vertical-align: middle;
+}
+.mach.absent {
+  opacity: 0.45;
+}
+.mach.absent .dot {
+  background: var(--dim);
+  box-shadow: none;
+}
+
+/* (Mobile fix pass) `.mach`'s fixed 248px width left 122px of dead space to
+   its right inside a 370px `.fleet` row at 402px viewport (a single card
+   can never reach `.fleet`'s own `flex-wrap` — there's nothing to wrap
+   against). Sizing-only change (`.fleet` stays `display:flex`, `.mach`
+   stays a direct child) — the same "don't touch display type, only size"
+   discipline the `.savc` fix above uses, so the flex-line innerText
+   invariant this block's own module doc warns about is untouched. */
+@media (max-width: 560px) {
+  .mach {
+    width: 100%;
+  }
+}
+
+.fleettl {
+  margin-top: 30px;
+  border-top: 1px solid var(--border);
+  padding-top: 18px;
+}
+/* (operator) The preset control goes LEFT, the range label RIGHT.
+   `clkrange` returns `HH:MM–HH:MM` when both ends fall on the same day and
+   `Aug 8 18:45–Aug 9 18:45` when they do not — so ONLY the 24h preset spans
+   two days and renders the long form. With the label first, switching away
+   from 24h collapsed it and the buttons JUMPED LEFT out from under the
+   pointer mid-click. Controls must not move when neighbouring text changes
+   width.
+
+   Done with `order`, not by reordering the JSX: `innerText` follows DOM
+   order, so the parity goldens are untouched by a purely visual swap. (Run
+   the suites after touching this — that assumption is the whole reason this
+   is safe, and it is worth re-proving rather than trusting.) */
+.tlhdr > :first-child {
+  order: 2;
+}
+.tlhdr .twin {
+  order: 1;
+}
+
+.tlhdr {
+  font: 600 11px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.twin {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.twinb {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  padding: 4px 8px;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  text-transform: uppercase;
+}
+.twinb + .twinb {
+  border-left: 1px solid var(--border);
+}
+.twinb:hover {
+  color: var(--fg);
+}
+.twinb.on {
+  background: var(--accent);
+  color: var(--bg);
+}
+/* (Mobile fix pass) Measured 30-37px wide, 18px tall — worst of the
+   touch-target sweep along with TODAY's 58x21. Mobile-only. `.twin`'s own
+   `overflow:hidden` + shared border still frame the group the same way at
+   the larger size. */
+@media (max-width: 768px) {
+  .twinb {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    /* NOT `min-height` on a PAINTED control: a filled 44px slab around 11px
+       text reads as a big empty block (operator, on the phone). The box keeps
+       its natural size; `::after` extends only the invisible TAP region to
+       Apple's 44pt minimum. Hit area and visual weight are different things
+       and were wrongly fused here. */
+    position: relative;
+  }
+  .twinb::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 44px;
+    transform: translateY(-50%);
+  }
+
+}
+/* (operator) The machine name is a CAPTION ABOVE its track, not a gutter
+   beside it. Legacy reserved `--lname-w` (150px default) as a fixed
+   flex-none column, so every track lost that width no matter how much room
+   there was — at 402px that is 150 of ~370, roughly 40% of the screen spent
+   on two machine names, and the bars compressed into what was left.
+   Vertical space is the cheap axis here (a lane is ~20px tall on a page
+   that scrolls); horizontal space is the scarce one, especially on a phone.
+   Stacking spends the cheap axis to buy back the scarce one.
+
+   `--lname-w` and `timeline.labelWidthPx` had ONE remaining consumer after
+   the labels moved: `.tlaxis`'s indent, which is why the axis drifted out of
+   alignment until the operator spotted it. Both are genuinely unused now. */
+.lane {
+  display: block;
+  margin-bottom: 14px;
+}
+.lname {
+  width: auto;
+  margin-bottom: 4px;
+  font: 12px "JetBrains Mono", monospace;
+  color: var(--fg);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tltrack {
+  position: relative;
+  flex: 1;
+  height: 28px;
+  background: #131826;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.sbar {
+  position: absolute;
+  top: 5px;
+  height: 18px;
+  background: var(--dim);
+  border-radius: 3px;
+  min-width: 2px;
+}
+.sbar.run {
+  background-color: #ffd166;
+  box-shadow: 0 0 6px #ffd166;
+}
+.sbar.done {
+  background-color: #5af0a3;
+}
+.sbar.canceled {
+  background-color: #ffb86b;
+}
+.sbar.err {
+  background-color: var(--error);
+}
+.tltrack .ph {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--fg);
+  opacity: 0.32;
+}
+.tlaxis {
+  /* No offset. This used to indent by the label gutter so the axis lined up
+     with tracks that started after it — but the labels became captions ABOVE
+     their tracks, the tracks went full-width, and this was left behind,
+     shifting every tick ~162px right of the bar it labels. Removing the
+     gutter without its partner is the whole bug; they were one layout. */
+  display: flex;
+  justify-content: space-between;
+  font: 9px "JetBrains Mono", monospace;
+  color: var(--dim);
+  margin-top: 7px;
+}
+.tlempty {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+
+/* (#1729) Fleet-coverage marker on the default view — shown ONLY when the
+   presence substrate could not be read (or is stale). An unconfigured fleet
+   is not a degradation, so a standalone machine never sees this. */
+.fleetcov{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:9px 14px;border:1px solid var(--warn);border-radius:8px;color:var(--warn);font:600 12px/1.4 'JetBrains Mono',monospace}
+.fleetcov__icon{flex:none}
+
+/* ── Record view — a flow record rendered for a person (see RecordView.tsx
+   for why this is name/type-driven rather than 26 per-action templates). */
+.rv { font: 12px/1.5 "JetBrains Mono", monospace; }
+.rv__head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
+.rv__action { font-weight: 700; font-size: 13px; color: var(--accent); }
+.rv__handle { color: var(--fg); }
+.rv__when { color: var(--dim); font-size: 11px; margin-bottom: 10px; }
+.rv__dim { color: var(--dim); }
+
+.rv__group { margin: 0 0 10px; padding: 8px 10px; background: rgba(255,255,255,.025);
+             border: 1px solid var(--border); border-radius: 6px; }
+.rv__grouphd { font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+               color: var(--dim); margin-bottom: 6px; }
+
+.rv__row { display: flex; gap: 10px; align-items: baseline; padding: 1px 0; }
+.rv__key { flex: none; width: 116px; color: var(--dim); font-size: 11px;
+           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv__val { flex: 1; min-width: 0; word-break: break-word; }
+
+.rv__num  { color: #e6c07b; }
+.rv__str  { color: var(--fg); }
+.rv__id   { color: var(--fg); opacity: .85; }
+.rv__nil  { color: var(--dim); }
+.rv__time { color: var(--fg); }
+.rv__bool { color: var(--dim); }
+.rv__bool.on { color: var(--good, #4ade80); }
+.rv__chip { display: inline-block; padding: 0 6px; border-radius: 4px;
+            background: rgba(255,255,255,.06); color: var(--fg); font-size: 11px; }
+
+.rv__ctx { margin-bottom: 8px; }
+.rv__constants { margin-bottom: 8px; }
+.rv__toggle, .rv__more {
+  background: none; border: none; padding: 2px 0; color: var(--accent);
+  font: 11px "JetBrains Mono", monospace; cursor: pointer; text-align: left;
+}
+.rv__toggle:hover, .rv__more:hover { text-decoration: underline; }
+.rv__rawtoggle { display: block; margin-top: 4px; }
+
+/* `#meta`'s ready headline — ported from viewer.html (`.rdot`, `.mco`). All
+   four rules were MISSING from this port: the dot rendered uncoloured and the
+   machine icon was absent entirely, invisible to the goldens because neither
+   a class nor an SVG contributes text. See ReadyHeadline.tsx. */
+.rdot { font-weight: 700; }
+.rdot.ok { color: var(--good, #4ade80); }
+.mco { white-space: nowrap; }
+.mco svg { width: 13px; height: 13px; vertical-align: -2px; margin-left: 2px; color: var(--accent-dim, var(--accent)); }
+
+/* (#238, ported) Reduced-motion drops the pulse. Live stays distinguishable
+   WITHOUT motion — the badge keeps its colour, the ● glyph and the word. */
+#modebadge.pb.live .pbdot {
+  animation: lpulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #modebadge.pb.live .pbdot { animation: none; }
+}

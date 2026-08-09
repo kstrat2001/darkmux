@@ -1,0 +1,18 @@
+# BuildKit picks this up automatically for tests/flatsat/Dockerfile (a
+# `<dockerfile>.dockerignore` at the same relative path under the build
+# context root — the context is the repo root, see docker-compose.yml).
+# Keeps the build context small; the Dockerfile only COPYs the paths it
+# actually needs anyway, but this avoids Docker hashing multi-GB
+# directories (.git, target/) before it even gets there.
+.git
+target
+node_modules
+test-results
+mutants.out
+mutants.out.old
+docs
+tests/e2e/node_modules
+tests/parity/node_modules
+tests/flatsat/.state
+tests/flatsat/node_modules
+tests/flatsat/test-results

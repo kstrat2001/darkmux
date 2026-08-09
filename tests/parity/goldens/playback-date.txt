@@ -1,0 +1,46 @@
+=== topbar ===
+darkmux
+FLOW · 2026-08-07
+▣ PLAYBACK
+home
+guide
+articles
+github
+
+=== crumb ===
+◆ review-1786068582-93f404
+
+=== meta ===
+◆ review-1786068582-93f404, review-1786070274-89d50b +33 more · flow · 2026-08-07 · 8/7/2026 02:09:42–18:28:15
+2008 records · 1 machines
+
+=== logscope ===
+fleet
+
+=== stage ===
+TOKENS
+577,442
+LOCAL TOKENS
+0
+CLOUD TOKENS
+289k
+GENERATED
+12k
+FRESH INPUT
+0
+RE-READ
+277k
+UNCLASSIFIED
+21
+DISPATCHES
+Orchestrator note: First editor-embedded review shipped tonight — the crew reviewed a real ticket inside Zed, end to end on local models, and the report rendered beautifully. Four feature findings captured for the real integration. Great night. · 03:06:54 history →
+MacBook-Pro
+hardware not reported
+idle
+48 specialists
+ACTIVITY · 02:09:42–18:28:15
+MacBook-Pro
+02:09
+10:18
+18:28
+

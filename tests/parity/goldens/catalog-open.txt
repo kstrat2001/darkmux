@@ -1,0 +1,322 @@
+=== topbar ===
+darkmux
+TODAY
+◌ RECONNECTING
+⟳
+home
+guide
+articles
+github
+
+=== crumb ===
+(empty)
+
+=== meta ===
+2  · last dispatch 2h ago
+
+=== logscope ===
+fleet
+
+=== stage ===
+TOKENS · LAST 24H
+0
+LOCAL TOKENS
+396,926
+CLOUD TOKENS
+89k
+GENERATED
+0
+FRESH INPUT
+0
+RE-READ
+308k
+UNCLASSIFIED
+3
+DISPATCHES
+Orchestrator note: 3 dispatches via cloud — the right brain for the job. keep it up.
+MacBook-Pro
+Apple M5 Max · 128 GB
+idle
+0 running
+m1-max-32gb-studio
+hardware not reported
+idle
+0 running
+RECENT ACTIVITY · AUG 7 16:40:59–AUG 8 16:40:59
+10M
+1H
+4H
+24H
+MacBook-Pro
+m1-max-32gb-studio
+16:40
+04:40
+16:40
+
+=== catalog ===
+PLAYBACK CATALOG
+● live · today
+now-ish on present machines
+MISSIONS · NEWEST 50 OF 155
+▣ acp-ephemeral-pr-ship-1786152707367180000-5
+0 dispatches · 10 records · 2026-08-08
+▣ acp-ephemeral-pr-comments-list-1786152519941013000-4
+0 dispatches · 4 records · 2026-08-08
+▣ acp-ephemeral-pr-list-1786152504805583000-3
+0 dispatches · 4 records · 2026-08-08
+▣ review-1786150410-209398
+3 dispatches · 868 records · 2026-08-08
+▣ acp-ephemeral-pr-view-1786150088844151000-2
+0 dispatches · 4 records · 2026-08-08
+▣ acp-ephemeral-pr-list-1786150055695736000-1
+0 dispatches · 4 records · 2026-08-08
+▣ acp-ephemeral-pr-list-1786121191309511000-1
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786121158195620000-0
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786121058517076000-0
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786118526256603000-1
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786118523229280000-0
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786114632381137000-0
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786112866553668000-0
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786112149864218000-0
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786111634440410000-3
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-merge-1786111093969402000-2
+0 dispatches · 6 records · 2026-08-07
+▣ acp-ephemeral-pr-approve-1786110758707741000-1
+0 dispatches · 6 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786110732765195000-0
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786096374062061000-12
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-merge-1786096346020539000-11
+0 dispatches · 6 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786096335940154000-10
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-merge-1786096304195656000-9
+0 dispatches · 5 records · 2026-08-07
+▣ acp-ephemeral-pr-approve-1786096233364710000-8
+0 dispatches · 6 records · 2026-08-07
+▣ acp-ephemeral-pr-comments-list-1786096216607360000-7
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-view-1786096184556928000-6
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786096163987015000-5
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-approve-1786095848295749000-4
+0 dispatches · 5 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786095828927395000-3
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-approve-1786095190336606000-2
+0 dispatches · 6 records · 2026-08-07
+▣ acp-ephemeral-pr-merge-1786095174518836000-1
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786095161284735000-0
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786091297730112000-2
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-comments-list-1786091178187633000-0
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786091112370460000-0
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-view-1786089463406811000-1
+0 dispatches · 4 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786089430627298000-0
+0 dispatches · 2 records · 2026-08-07
+▣ acp-ephemeral-pr-list-1786088208704943000-0
+0 dispatches · 2 records · 2026-08-07
+▣ review-1786081556-0eea32
+5 dispatches · 1183 records · 2026-08-07
+▣ review-1786071434-f6d2f5
+5 dispatches · 232 records · 2026-08-07
+▣ review-1786070274-89d50b
+5 dispatches · 226 records · 2026-08-07
+▣ review-1786068582-93f404
+1 dispatch · 49 records · 2026-08-07
+▣ dispatch-pr-reviewer-1785977775-901a-0
+0 dispatches · 4 records · 2026-08-06
+▣ review-1785977466-1d3e70
+1 dispatch · 101 records · 2026-08-06
+▣ review-1785946022-8d2715
+1 dispatch · 10 records · 2026-08-05
+▣ review-1785942965-0eaca3
+1 dispatch · 10 records · 2026-08-05
+▣ review-1785885677-5ec5e0
+1 dispatch · 10 records · 2026-08-04
+▣ review-1785851756-6042a4
+1 dispatch · 10 records · 2026-08-04
+▣ review-1785847613-b140c0
+1 dispatch · 10 records · 2026-08-04
+▣ review-1785843516-483ebb
+1 dispatch · 10 records · 2026-08-04
+▣ review-1785771277-054756
+1 dispatch · 10 records · 2026-08-03
+DAYS
+2026-08-08 · today
+8 dispatches · 54 records · missions acp-ephemeral-pr-comments-list-1786152519941013000-4, acp-ephemeral-pr-list-1786150055695736000-1, acp-ephemeral-pr-list-1786152504805583000-3 +2
+2026-08-07
+28 dispatches · 1993 records · missions acp-ephemeral-pr-approve-1786095190336606000-2, acp-ephemeral-pr-approve-1786095848295749000-4, acp-ephemeral-pr-approve-1786096233364710000-8 +32
+2026-08-06
+3 dispatches · 354 records · missions dispatch-pr-reviewer-1785977775-901a-0, review-1785977466-1d3e70
+2026-08-04
+0 dispatches · 1 record
+2026-08-03
+4 dispatches · 5033 records · missions review-1785753634-47ed19, review-1785759617-f38841, review-1785760749-4f1703
+2026-08-02
+0 dispatches · 27 records
+2026-08-01
+2 dispatches · 154 records · missions dispatch-code-reviewer-1785570518-17301-0, dispatch-code-reviewer-1785589698-5d6a-0
+2026-07-31
+0 dispatches · 2 records
+2026-07-30
+17 dispatches · 2927 records · missions dispatch-code-reviewer-1785371423-bb1f-0, dispatch-code-reviewer-1785379738-ad36-0, dispatch-code-reviewer-1785380025-c60c-0 +14
+2026-07-29
+5 dispatches · 583 records · missions dispatch-code-reviewer-1785337256-5b72-0, dispatch-code-reviewer-1785339733-16dff-0, dispatch-code-reviewer-1785340728-7167-0 +2
+2026-07-28
+6 dispatches · 1079 records · missions review-1785207179-e6071c, review-1785207257-ec8779, review-1785207492-f044bc +5
+2026-07-26
+0 dispatches · 2 records
+2026-07-25
+1 dispatch · 33 records · mission review-1784949740-727afc
+2026-07-24
+1 dispatch · 67 records · mission dispatch-code-reviewer-1784864820-f2c9-0
+2026-07-23
+4 dispatches · 173 records · missions dispatch-code-reviewer-1784808029-12b28-0, dispatch-code-reviewer-1784808083-12e7b-0, dispatch-code-reviewer-1784808704-1588e-0 +1
+2026-07-22
+1 dispatch · 66 records · missions dispatch-code-reviewer-1784705852-930b-0, sanity-parallel-1784699884-009600, sanity-review-shape-1784702742-76e0c1 +1
+2026-07-21
+1 dispatch · 24 records · mission dispatch-code-reviewer-1784655359-10f41-0
+2026-07-20
+0 dispatches · 6 records
+2026-07-19
+0 dispatches · 1 record
+2026-07-18
+7 dispatches · 6039 records · missions review-1e47c34023, review-3049b0d2ec, review-96b3c8a3e4 +4
+2026-07-17
+6 dispatches · 437 records · missions review-2b657bf5e8, review-34b6ae1d4f, review-6b4f936487 +4
+2026-07-16
+7 dispatches · 2034 records · missions p5-gate-coder-72deee644b, p5-gate-coder-bc2206a259, pr-review--var-folders-92-pj7y333940181t2blq0969wm0000gn-T--tmpMobsRe-wt-1783880106 +12
+2026-07-15
+0 dispatches · 19 records · missions draft-blog-post, draft-blog-post-6e46dd10de, future-kind +6
+2026-07-13
+6 dispatches · 2714 records · missions pr-review-kstrat2001-darkmux-f91d72cf962da36597b24759851416fe6955867a, pr-review-kstrat2001-darkmux-8ae41076d84b24c5ef27e06a93a4ac5f1b82f9f8, pr-review-kstrat2001-darkmux-0a50ae80342fe2fa681ce293e58038d703caa1c0
+2026-07-12
+6 dispatches · 329 records
+2026-07-11
+1 dispatch · 86 records
+2026-07-10
+2 dispatches · 137 records
+2026-07-09
+6 dispatches · 122 records
+2026-07-08
+13 dispatches · 5919 records
+2026-07-07
+29 dispatches · 8969 records
+2026-07-06
+66 dispatches · 6580 records
+2026-07-05
+297 dispatches · 8652 records
+2026-07-04
+45 dispatches · 1983 records
+2026-07-03
+56 dispatches · 4975 records
+2026-07-02
+137 dispatches · 2413 records
+2026-07-01
+12 dispatches · 3349 records
+2026-06-30
+2 dispatches · 18 records
+2026-06-29
+32 dispatches · 2525 records
+2026-06-28
+38 dispatches · 2237 records
+2026-06-27
+42 dispatches · 512 records
+2026-06-26
+67 dispatches · 711 records
+2026-06-23
+5 dispatches · 139 records
+2026-06-22
+3 dispatches · 1561 records · mission doom-loop-m4
+2026-06-21
+11 dispatches · 532 records
+2026-06-19
+0 dispatches · 54 records
+2026-06-18
+0 dispatches · 23 records
+2026-06-17
+0 dispatches · 28 records
+2026-06-15
+0 dispatches · 21 records
+2026-06-14
+27 dispatches · 8064 records · missions cli-styling-foundation, cli-styling-rollout, dispatch-boundary-hardening +5
+2026-06-13
+4 dispatches · 629 records · missions vzi-5545-revoke-client-form-authoring, kko-1576-submissions-retirement
+2026-06-12
+22 dispatches · 3292 records · missions 756-live-diff, fix-apim-subscription-copy, vzi-5545-revoke-client-form-authoring
+2026-06-11
+23 dispatches · 1749 records · missions cli-styling-foundation, cli-styling-rollout
+2026-06-10
+7 dispatches · 272 records
+2026-06-09
+8 dispatches · 1537 records
+2026-06-08
+4 dispatches · 533 records
+2026-06-07
+9 dispatches · 773 records · mission pre-1.0-compat-sweep
+2026-06-06
+6 dispatches · 399 records
+2026-06-05
+3 dispatches · 307 records
+2026-06-04
+1 dispatch · 86 records
+2026-06-03
+8 dispatches · 304 records
+2026-06-02
+3 dispatches · 1540 records
+2026-06-01
+1 dispatch · 307 records
+2026-05-31
+0 dispatches · 82 records
+2026-05-30
+4 dispatches · 640 records
+2026-05-29
+0 dispatches · 90 records
+2026-05-28
+27 dispatches · 3635 records
+2026-05-27
+25 dispatches · 4583 records
+2026-05-26
+32 dispatches · 5633 records · mission darkmux-independence-runtime
+2026-05-25
+31 dispatches · 7929 records
+2026-05-24
+9 dispatches · 185 records
+2026-05-23
+2 dispatches · 133 records
+2026-05-22
+0 dispatches · 14 records
+2026-05-21
+0 dispatches · 78 records
+2026-05-20
+0 dispatches · 58 records
+2026-05-19
+2 dispatches · 17 records · mission cbdfvh-qg-lyrrqq-4320-10
+2026-05-17
+0 dispatches · 1 record · mission test-mission
+2026-05-16
+15 dispatches · 35 records · mission smoke-mission
+2026-05-15
+8 dispatches · 18 records
+2026-05-14
+6 dispatches · 41 records
+2026-05-13
+7 dispatches · 41 records
+

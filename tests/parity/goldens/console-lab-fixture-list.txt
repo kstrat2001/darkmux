@@ -1,0 +1,41 @@
+=== topbar ===
+darkmux
+TODAY
+◌ RECONNECTING
+⟳
+home
+guide
+articles
+github
+
+=== crumb ===
+(empty)
+
+=== meta ===
+2  · last dispatch 2h ago
+
+=== logscope ===
+console
+
+=== stage ===
+mission status
+all missions
+machine
+flow
+roles
+config
+fixtures
+doctor
+$ darkmux lab fixture list
+captured 20:54:23
+· 3ms
+re-run
+Lab registry: /Users/kain/.darkmux/lab-registry.json (1 fixture)
+
+  pepper-grinder
+    path:       /Users/kain/de-projects/darkmux-lab-fixtures/pepper-grinder
+    version:    1.0
+    satisfies:  node-refresh-token-rotation@1.0
+    hash:       blake3:6f31a20b6a9a6e130afd7b0de438399d8157428f26a50b014de736884a989a1e
+    hashed_at:  2026-06-02T14:11:19Z
+

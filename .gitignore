@@ -5,7 +5,12 @@ Cargo.lock.bak
 
 # darkmux runtime state (project-local + defense-in-depth)
 .darkmux/
-runs/
+# Root-scoped only (not `runs/`, unqualified) — an unqualified pattern here
+# matched ANY directory literally named `runs` anywhere in the tree, which
+# silently swallowed `ui/src/lenses/runs/` (the Packet 3 runs-lens source)
+# from `git status`/`git add` with zero error output. Found live: `git
+# status` showed every other new file in this packet except that directory.
+/runs/
 sandboxes/
 *.trajectory.jsonl
 qa-reply.json
@@ -45,8 +50,34 @@ target-review/
 # against); only the build/run scratch below is ignored.
 tests/parity/node_modules/
 tests/parity/.served/
+tests/parity/.served-next/
+tests/parity/.served-next-chrome/
+tests/parity/.served-next-console/
+tests/parity/.served-next-live/
+tests/parity/.gallery/
 tests/parity/.determinism-run1/
 tests/parity/.verify-snapshot/
 tests/parity/corpus.tmp-*/
 tests/parity/test-results/
 tests/parity/playwright-report/
+
+# Flatsat (Packet 0b) — local artifacts. .state/ is the seeded/bind-mounted
+# DARKMUX_HOME for each container (regenerated every `up` by seed.mjs from
+# the parity corpus + a hand-authored peer fixture); never committed.
+tests/flatsat/node_modules/
+tests/flatsat/.state/
+tests/flatsat/test-results/
+tests/flatsat/playwright-report/
+tests/flatsat/.gallery/
+
+# UI port scaffold (Packet 1) — local artifacts. `ui/dist/index.html` is
+# copied to the COMMITTED `crates/darkmux-serve/assets/next.html` by
+# `bun run build`'s `copy-artifact` step; `dist/` itself is scratch.
+# `src/types/generated/` IS committed (ts-rs output; see ui/README.md).
+ui/node_modules/
+ui/dist/
+ui/test-results/
+ui/playwright-report/
+ui/verify/test-results/
+ui/verify/playwright-report/
+ui/verify/.gallery/

@@ -1,0 +1,93 @@
+name: darkmux-flatsat
+
+# Two-machine darkmux fleet on the bench, so the viewer port can be tested
+# against LIVE daemons + real Redis + injected failures, not just the
+# static parity corpus. See README.md.
+#
+# Ports (never 8765 — that's the operator's real daemon):
+#   hub   -> host 18765 -> container 8765
+#   peer  -> host 18766 -> container 8765
+#   redis -> host 16379 -> container 6379
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: flatsat-redis
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    networks: [flatsat]
+
+  hub:
+    image: darkmux-flatsat:local
+    container_name: flatsat-hub
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "18765:8765"
+    environment:
+      DARKMUX_HOME: /state
+      # (finding, see README) DARKMUX_HOME relocates crew state (missions/
+      # phases/roles — darkmux_types::paths::resolve honors it) but NOT the
+      # flows dir, which has its OWN dedicated env var per its documented
+      # precedence (`env(DARKMUX_FLOWS_DIR) > config.dirs.flows >
+      # ~/.darkmux/flows` — never DARKMUX_HOME). Without this, the daemon
+      # silently read/wrote `/root/.darkmux/flows` (always empty) instead of
+      # the seeded `/state/flows` — every flow-record endpoint went quietly
+      # empty while missions/phases loaded fine, which is exactly the kind
+      # of gap this packet exists to surface before it hides inside a
+      # container in production.
+      DARKMUX_FLOWS_DIR: /state/flows
+      DARKMUX_MACHINE_ID: flatsat-hub
+      DARKMUX_REDIS_URL: redis://redis:6379
+      DARKMUX_FLEET_MODE: hub
+      DARKMUX_ORCHESTRATOR: flatsat
+      # The daemon refuses to bind a non-loopback address (0.0.0.0 — required
+      # here so the container's port-mapped host side can reach it at all)
+      # without a token configured. Fixed, non-secret bench token — this
+      # compose network is never exposed beyond localhost port-forwards.
+      DARKMUX_SERVE_TOKEN: flatsat-bench-token
+    volumes:
+      - ./.state/hub:/state
+    command: ["serve", "--bind", "0.0.0.0", "--port", "8765"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks: [flatsat]
+
+  peer:
+    image: darkmux-flatsat:local
+    container_name: flatsat-peer
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "18766:8765"
+    environment:
+      DARKMUX_HOME: /state
+      DARKMUX_FLOWS_DIR: /state/flows
+      DARKMUX_MACHINE_ID: flatsat-peer
+      DARKMUX_REDIS_URL: redis://redis:6379
+      DARKMUX_FLEET_MODE: peer
+      DARKMUX_ORCHESTRATOR: flatsat
+      DARKMUX_SERVE_TOKEN: flatsat-bench-token
+    volumes:
+      - ./.state/peer:/state
+    command: ["serve", "--bind", "0.0.0.0", "--port", "8765"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks: [flatsat]
+
+networks:
+  flatsat:
+    name: darkmux-flatsat

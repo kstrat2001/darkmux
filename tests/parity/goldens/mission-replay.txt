@@ -1,0 +1,36 @@
+=== topbar ===
+darkmux
+NO RECORDS · 2026-08-08
+▣ PLAYBACK
+home
+guide
+articles
+github
+
+=== crumb ===
+(empty)
+
+=== meta ===
+◆ — · no records · 2026-08-08 · 8/8/2026 16:40:59–16:40:59
+0 records · 0 machines
+
+=== logscope ===
+fleet
+
+=== stage ===
+TOKENS
+0
+LOCAL TOKENS
+0
+CLOUD TOKENS
+0
+GENERATED
+0
+FRESH INPUT
+0
+RE-READ
+0
+DISPATCHES
+Orchestrator note: going hybrid takes nerve. the fleet is ready when you are.
+waiting for the first flow record…
+

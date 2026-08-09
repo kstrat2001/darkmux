@@ -154,28 +154,37 @@ one's vocabulary.
 | Lens | Hash route | Golden(s) |
 |---|---|---|
 | fleet (default) | `#` (no hash) | `fleet.txt` |
-| console | `#lens=console` (`&panel=<id>`) | `console.txt` (default panel: `mission-status`) |
-| runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-lab.txt` (kind=lab — a genuinely different render, the series/knob-diff view) |
-| machine | `#lens=machine` | `machine.txt` |
+| console | `#lens=console` (`&panel=<id>`) | `console.txt` (default panel: `mission-status`, Packet 0a), plus one golden per remaining allowlisted panel (Packet 6): `console-mission-status-all.txt`, `console-machine-status.txt`, `console-flow-status.txt`, `console-role-list.txt`, `console-config-list.txt`, `console-lab-fixture-list.txt`, `console-doctor-not-run.txt` (the manual-only "not yet run" placeholder — selecting the tab must never auto-fetch, #1286) and `console-doctor.txt` (after clicking "run") |
+| runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-kind-lab.txt` (all four filter chips, Packet 3), `runs-series.txt` (kind=lab + the `◧ series` toggle — the ONE thing `/lab/runs` actually feeds, see the correction below; Packet 3), `runs-lens-boot.txt` (a FRESH `#lens=runs` boot, exercising `boot()`'s own `lq` deep-link branch rather than a click-through — content is byte-identical to `runs.txt` by design, since both land on kind=all over the same corpus; the golden's value is proving the boot mechanism independently, Packet 3) |
+| machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
 | session drill-in | `#session=<id>` | `session-task-list.txt` |
+| catalog picker | `#catpanel` (toggled via `#srcbadge`, not a hash route — global chrome, Packet 4) | `catalog-open.txt` (six regions: topbar/crumb/meta/logscope/stage + the `=== catalog ===` section — see "Extraction target" below) |
+| mission replay-by-query | `#mission=<id>` (Packet 4) | `mission-replay.txt` (the unknown-id in-page path only — see the note below) |
+| bare-date playback | `#<date>` (Packet 4) | `playback-date.txt` |
 
-**Out of scope for this packet: `#mission=<id>`.** On a live daemon (exactly
-this harness's setup — `darkmux-mode` present, no `darkmux-flow-src`),
-`missionGraphReachable()` is true and the mission click/deep-link path does
-`location.href = "/mission/<id>/graph"` — a full navigation to
+**`#mission=<id>` (Packet 4 — was "out of scope" through Packet 3, see git
+history for the prior wording).** On a live daemon (exactly this harness's
+setup — `darkmux-mode` present, no `darkmux-flow-src`), `missionGraphReachable()`
+is true, so a POPULATED `/flow-mission/<id>` response would still navigate
+`boot()` straight to `/mission/<id>/graph` — a full navigation to
 `mission-graph.html`, a SEPARATE asset with its own vendored React Flow
-bundle. That page is a different render target with a different rendering
-model (canvas/DOM graph nodes, not the `#stage` text this harness extracts)
-and belongs to a later packet, not this one. `renderMissionStatic()` (the
-daemon-less static-context fallback for the same click) is likewise
-untouched by this harness for the same reason — it never runs when a daemon
-is present.
+bundle, which remains genuinely out of scope for a `#stage`-text extractor
+(different render target, canvas/DOM graph nodes). What Packet 4 actually
+closes is the OTHER branch: this corpus's `/flow-mission/:id` mock answers
+every id with an honest `{records:[],count:0}` (see `lib/mock-routes.js`'s
+own comment for why, and why it's a NO-OP for every prior golden), so
+`mission-replay.txt` captures the in-page empty-fleet render this specific
+corpus can actually produce — not a stand-in for the populated/navigates-away
+case, which would need real per-mission record fixtures this corpus doesn't
+have.
 
 `runs-kind-lab` and `session-task-list` are folded into the same suite as
 bonus goldens rather than being separately catalogued lenses: the former is
 a client-side re-filter of the runs lens's already-loaded data (no new
 fetch), the latter is a drill-in state within the fleet render machinery,
-not a distinct top-level nav destination.
+not a distinct top-level nav destination. `mission-replay.txt` and
+`playback-date.txt` (Packet 4) are similar bonus goldens: fresh boots over
+the same fleet render machinery, not new top-level lenses.
 
 ## Endpoints recorded
 
@@ -206,18 +215,56 @@ required to reach it honestly:
   golden. `task-list` was chosen specifically because it carries no client
   identifiers, avoiding URL-encoding a sanitized compound id in route
   matching.
+- `/panel/mission-status-all`, `/panel/machine-status`, `/panel/flow-status`,
+  `/panel/role-list`, `/panel/config-list`, `/panel/lab-fixture-list`,
+  `/panel/doctor` (Packet 6) — the seven console panels 0a didn't record
+  (only `/panel/mission-status`, the default tab, was recorded there). Each
+  is a real `x-darkmux-panel: 1` GET against the live daemon, sanitized
+  through the same `lib/sanitize.mjs` field policy as every other fixture.
+  `doctor` was recorded exactly ONCE (its `auto_refresh: false`/manual-run-
+  only semantics mean an operator, not a poll, decided when it ran — see
+  `panel.rs`'s own module doc for the #1286 rationale); it takes ~2s to
+  gather (it probes the machine) but that's a one-time recording cost, not a
+  test-suite cost — the extraction/parity specs replay the RECORDED body,
+  they never re-invoke the real command.
 
 ## Extraction target
 
-Each golden is four labeled regions, joined: `#crumb` (breadcrumb), `#meta`
-(the badge line), `#logscope` (event-log scope label), and `#stage` — the
-actual output target of every `render*()` function in viewer.html. The full
-scrolling event log (`#logbody`, inside the `.loglist` wrapper) is
-deliberately NOT captured: it's a per-record stream, not lens-specific
-content, and would make goldens huge and timestamp-heavy for little parity
-value beyond what `#stage` already covers. Text is whitespace-normalized
-(trailing space stripped per line, runs of 3+ blank lines collapsed to one)
-for stability, not screenshots.
+Each golden is five labeled regions, joined: `=== topbar ===` (the
+masthead — `.top`, brand/build-chip/catalog-trigger/live-badge/refresh/
+topnav), `#crumb` (breadcrumb), `#meta` (the badge line), `#logscope`
+(event-log scope label), and `#stage` — the actual output target of every
+`render*()` function in viewer.html. The full scrolling event log
+(`#logbody`, inside the `.loglist` wrapper) is deliberately NOT captured:
+it's a per-record stream, not lens-specific content, and would make goldens
+huge and timestamp-heavy for little parity value beyond what `#stage`
+already covers. Text is whitespace-normalized (trailing space stripped per
+line, runs of 3+ blank lines collapsed to one) for stability, not
+screenshots.
+
+**Chrome packet addition: `=== topbar ===`, folded directly into the base
+extraction (not a sixth opt-in region like catalog below).** `.top` is
+global chrome — a body-level sibling of `#stage` — that the original
+four-region extractor structurally could not see AT ALL: the masthead could
+go missing, or grow a stray element, and every golden would stay
+byte-identical. That gap is exactly how a stray unscoped `#logscope`
+("FLEET" floating above the hero on `/next`) shipped invisibly — see
+`lib/extract-lens.js`'s `extractTopbarText` for the full story and
+`normalizeVerbadge` for how the one genuinely volatile piece (the
+`#verbadge` build-identifier chip — a version + git SHA that changes on
+every release) is handled: normalized to a fixed placeholder, not excluded,
+so a real regression inside the chip still shows up as a diff. Folded in
+(not opt-in) because `.top`'s content doesn't depend on `state.level` — it
+renders identically on every lens — so every existing golden gained this
+section on rebaseline rather than one dedicated golden growing it, unlike
+catalog below.
+
+**Packet 4 addition: an optional `=== catalog ===` region** (see
+`lib/extract-lens.js`'s `extractCatalogText`/`extractLensTextWithCatalog`).
+`#catpanel` (the playback-catalog day/mission picker) is a modal overlay —
+a body-level sibling of `#stage`, never part of it — so the base extraction
+structurally can't see it. This is composed on TOP of the base extraction,
+not folded into it: only `catalog-open.txt` carries this section.
 
 ## KNOWN COVERAGE GAPS
 
@@ -227,26 +274,58 @@ scope:
 
 - **Lab-run detail level** (`state.level==="lab-run"`, reached by clicking
   a `kind=lab` run row — either the flat list's or the `◧ series` view's) —
-  not exercised.
+  **still not exercised (Packet 3 checked and deliberately did not chase
+  this).** It needs `/lab/run/detail?dir=<dir>` and `/lab/run/events?dir=<dir>`
+  fixtures, and NEITHER is in the corpus — `lib/mock-routes.js` explicitly
+  404s both (`"lab-run drill-down not recorded in this corpus"`). Recording
+  them for real needs a daemon with a resolvable lab-run dir at `record.mjs`
+  time; fabricating them would violate the "never fabricate a fixture"
+  discipline (`record.mjs`'s own doc: "Refuses to write anything if the
+  daemon is unreachable... no fabricated fixtures"). Clicking a lab row
+  against today's corpus doesn't hang or crash — `LAB_DETAIL` stays `null`,
+  and `drillLabRun` falls back to the run list with a one-line notice — but
+  that fallback state is not the same thing as the real detail render, so it
+  isn't captured as a stand-in golden either. Follow-up: re-record with
+  `/lab/run/detail` + `/lab/run/events` for one real `dir` included.
 - **The `loose` level** (`drillLoose()` — a machine's session-less/unscoped
   records, reached by clicking a link inside the machine lens, not a
-  documented hash route) — not exercised.
-- **The catalog day-picker** (`#catpanel`, the history browser reached by
-  clicking the source/date badge) — the extractor doesn't capture it at all;
-  it's a modal overlay, not part of `#stage`.
-- **7 of the 8 console panels** — only the default `mission-status` panel is
-  exercised. `mission-status-all`, `role-list`, `machine-status`,
-  `config-list`, `flow-status`, `lab-fixture-list`, and `doctor` are
-  reachable via `data-act="setpanel"` clicks but none are golden-tested.
-- **Runs lens kinds `mission` and `dispatch`** — only `kind=all` and
-  `kind=lab` are golden-tested; the other two filter chips are unexercised.
-- **The `◧ series` sub-view within kind=lab** (`state.runsSeries===true`) —
-  see the `/lab/runs` correction above; this is the one thing that endpoint
-  actually feeds, and it's recorded but not rendered into any golden.
-- **Deep-link boot paths other than `#session=<id>`** — `#lens=console&panel=<id>`,
-  a bare `#<date>` hash (playback-by-date, daemon-only), and `#mission=<id>`
-  (out of scope entirely — see the lens inventory above) are none of them
-  golden-tested.
+  documented hash route) — not exercised (machine-lens territory, not
+  runs-lens; left for the machine-lens packet).
+- ~~The catalog day-picker (`#catpanel`...) — the extractor doesn't capture
+  it at all~~ **CLOSED (Packet 4)** — see the new `=== catalog ===` region
+  and `catalog-open.txt`.
+- ~~7 of the 8 console panels~~ **CLOSED (Packet 6).** All eight allowlisted
+  panels (`crates/darkmux-serve/src/panel.rs::PANEL_IDS`) now have a golden —
+  see the lens inventory table above. `doctor` specifically has TWO
+  (`console-doctor-not-run.txt`, `console-doctor.txt`) since it's the one
+  manual-only panel and both states are real, distinct, reachable behavior.
+- **Deep-link boot paths other than `#session=<id>`, `#lens=runs`,
+  `#lens=machine`, `#mission=<id>`, and a bare `#<date>`** (`#lens=runs` and
+  `#lens=machine` closed by Packets 3 and 2 — `runs-lens-boot.txt` /
+  `machine-deeplink.txt`) — `#lens=console&panel=<id>` AS A FRESH BOOT is
+  still not exercised on the LEGACY side specifically
+  (`extract.spec.ts`/`redprove.spec.ts` only reach every console panel via a
+  CLICK sequence starting from the fleet default, same shape every OTHER
+  lens's click-through used before its own deep-link-boot golden landed —
+  see the file's own comments). Precedent (`runs-lens-boot.txt` vs `runs.txt`,
+  Packet 3; `machine-deeplink.txt` vs `machine.txt`, Packet 2) is that
+  `#stage` content is identical whichever way a lens is reached, so this is
+  believed-safe rather than a real content gap — a future packet wanting to
+  CLOSE it on the legacy side would add one more `page.goto("#lens=console
+  &panel=<id>")` + `extractAndWrite` per panel and diff the result against
+  the click-reached golden byte-for-byte. `/next`'s OWN parity spec
+  (`next-parity-console.spec.ts`) DOES boot every panel via a fresh deep-link
+  (that's its whole point — the CLI emits these links, see
+  `panel_deep_link`), so the PORT'S deep-link mechanism is proven even though
+  the legacy reference-golden's provenance is click-based.
+  `#lens=runs&kind=<mission|dispatch|lab>` specifically as a boot (only
+  plain `#lens=runs` is golden-tested as a boot) also remains untested.
+  ~~a bare `#<date>` hash (playback-by-date, daemon-only)~~ **CLOSED
+  (Packet 4)** — see `playback-date.txt`. ~~`#mission=<id>` (out of scope
+  entirely)~~ **PARTIALLY CLOSED (Packet 4)** — see the lens inventory's
+  `#mission=<id>` note above: the unknown-id in-page path is now
+  golden-tested (`mission-replay.txt`); the populated/navigates-away case
+  still needs real per-mission record fixtures this corpus doesn't have.
 - **`fleet-sessions-live.json` was recorded empty** (`[]`) — no session was
   live on the operator's daemon at record time, so this corpus fixture has
   never actually exercised the viewer's non-empty rendering path for that

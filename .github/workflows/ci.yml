@@ -38,7 +38,15 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    # `ui/port` is here deliberately. It is a long-lived INTEGRATION branch
+    # that accumulated eight packets' worth of PRs, and because this filter
+    # named only `main`, every one of those merged with ZERO CI — the whole
+    # port was reviewed by hand and by local runs alone, and a stale
+    # committed bundle or a cross-packet type collision would have been
+    # caught only at the eventual `ui/port` → main PR, if at all. The
+    # paths-filters below mean a UI-only PR into `ui/port` still skips the
+    # heavy Rust jobs, so this costs little and closes a real hole.
+    branches: [main, ui/port]
   push:
     branches: [main]
   # Daily advisory sweep: catches a newly-disclosed RUSTSEC advisory against an
@@ -514,3 +522,124 @@ jobs:
             exit 1
           fi
           echo "demo in sync with the canonical viewer"
+
+  # ────────────────────────────────────────────────────────────────────────
+  # The React viewer (`ui/`) + the parity harness that grades it.
+  #
+  # Added because the port had NO CI at all: `ui/` is a committed BUNDLE
+  # (`crates/darkmux-serve/assets/next.html`, `include_str!`'d into the
+  # binary), so a packet could commit a stale artifact — source and shipped
+  # page disagreeing — and every existing job would still report green. The
+  # freshness step below is the load-bearing one; it is the same
+  # regenerate-and-diff shape the demo-sync guard already uses for the
+  # legacy viewer, and for the same reason.
+  #
+  # Ubuntu, not macOS: this job is node/bun + headless chromium, none of
+  # which needs Apple hardware, and the Linux runner is markedly cheaper
+  # than the macOS one the Rust jobs are pinned to.
+  ui:
+    name: ui bundle + tests + parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect UI-relevant changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ui:
+              - 'ui/**'
+              - 'tests/parity/**'
+              - 'crates/darkmux-serve/assets/**'
+              - '.github/workflows/ci.yml'
+
+      - name: Install bun
+        if: steps.filter.outputs.ui == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Install ui dependencies
+        if: steps.filter.outputs.ui == 'true'
+        working-directory: ui
+        run: bun install --frozen-lockfile
+
+      # `bun run build` runs `tsc --noEmit` first, so this covers the
+      # typecheck as well as the bundle. Deliberately ONE command: a
+      # separate typecheck step invites a future "done when the tests pass"
+      # brief that quietly excludes it.
+      - name: Build the bundle (includes tsc --noEmit)
+        if: steps.filter.outputs.ui == 'true'
+        working-directory: ui
+        run: bun run build
+
+      # THE point of this job. `bun run build` above rewrote the committed
+      # artifact from source; if that produces a diff, the artifact in the
+      # commit did not match the source it claims to be built from — the
+      # shipped page and the reviewed code are different programs.
+      - name: Committed bundle is in sync with ui/ source
+        if: steps.filter.outputs.ui == 'true'
+        run: |
+          if ! git diff --exit-code -- crates/darkmux-serve/assets/next.html; then
+            echo "::error::crates/darkmux-serve/assets/next.html is stale. Run 'cd ui && bun run build' and commit the regenerated bundle."
+            exit 1
+          fi
+          echo "committed bundle matches ui/ source"
+
+      - name: UI unit tests
+        if: steps.filter.outputs.ui == 'true'
+        working-directory: ui
+        run: bun run test
+
+      - name: Install parity harness dependencies
+        if: steps.filter.outputs.ui == 'true'
+        working-directory: tests/parity
+        run: bun install --frozen-lockfile
+
+      - name: Install chromium
+        if: steps.filter.outputs.ui == 'true'
+        working-directory: tests/parity
+        run: bunx playwright install --with-deps chromium
+
+      # The LEGACY goldens: verify (extraction reproduces them byte-for-
+      # byte), redprove (a blank page must FAIL every golden — the guard
+      # against a comparison that cannot fail), determinism (two runs
+      # byte-identical), tripwire (no sanitizer sentinel ever reaches a
+      # committed fixture).
+      - name: Legacy parity goldens
+        if: steps.filter.outputs.ui == 'true'
+        working-directory: tests/parity
+        run: bun run check
+
+      # The port's own acceptance: each ported lens against those goldens.
+      # Run SERIALLY and each with its own config — the suites bind fixed
+      # ports and share the goldens/ directory, so running them
+      # concurrently makes them flake for reasons that have nothing to do
+      # with the code under test.
+      - name: Next-parity suites (per lens, serial)
+        if: steps.filter.outputs.ui == 'true'
+        working-directory: tests/parity
+        run: |
+          set -e
+          for suite in next-parity next-parity-chrome next-parity-runs next-parity-catalog next-parity-console; do
+            echo "── $suite ──"
+            bun run "$suite"
+          done
+
+      # A playwright failure on a runner we cannot reproduce locally is only
+      # actionable with its trace. Uploaded on failure ONLY, so a green run
+      # carries no artifact cost.
+      - name: Upload playwright traces on failure
+        if: failure() && steps.filter.outputs.ui == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: |
+            tests/parity/test-results/**
+            tests/parity/playwright-report/**
+          retention-days: 7
+          if-no-files-found: ignore

@@ -1,9 +1,18 @@
+=== topbar ===
+darkmux
+TODAY
+◌ RECONNECTING
+⟳
+home
+guide
+articles
+github
+
 === crumb ===
 (empty)
 
 === meta ===
-● ready · 2  · last run 2h ago
-952 records · last 24h
+2  · last dispatch 2h ago
 
 === logscope ===
 runs

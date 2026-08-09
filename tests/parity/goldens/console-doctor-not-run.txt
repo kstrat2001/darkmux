@@ -1,0 +1,32 @@
+=== topbar ===
+darkmux
+TODAY
+◌ RECONNECTING
+⟳
+home
+guide
+articles
+github
+
+=== crumb ===
+(empty)
+
+=== meta ===
+2  · last dispatch 2h ago
+
+=== logscope ===
+console
+
+=== stage ===
+mission status
+all missions
+machine
+flow
+roles
+config
+fixtures
+doctor
+$ darkmux doctor
+run
+not run yet — this panel probes the machine, so it runs only when you ask.
+

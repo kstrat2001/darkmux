@@ -398,6 +398,10 @@
      playback), so the neutral boot state is the correct one. */
   /* (#1480) Refetch control + a visible connection state. `stale` is the
      honest middle: the page is rendering real data that has stopped updating. */
+  /* (operator) The refetch control contradicts the `● live` badge beside
+     it — if the view is live there is nothing to refresh. It survives
+     only for the reconnecting/stale case, where a manual retry helps. */
+  #modebadge.live ~ #refreshbtn{display:none}
   .rfbtn{background:none;border:1px solid var(--line);color:var(--muted);border-radius:4px;
          cursor:pointer;font:12px 'JetBrains Mono',monospace;padding:2px 7px;line-height:1.4}
   .rfbtn:hover{color:var(--text)}
@@ -807,7 +811,7 @@
 </head>
 <body class="booting">
 <div class="top">
-  <span class="brand"><a href="https://darkmux.com/" target="_blank" rel="noopener"><b>darkmux</b></a> · observability</span>
+  <span class="brand"><a href="https://darkmux.com/" target="_blank" rel="noopener"><b>darkmux</b></a></span>
   <span class="ver" id="verbadge"></span>
   <span class="badge" id="srcbadge">Loading…</span>
   <span class="pb" id="modebadge">▣ playback</span>
@@ -838,7 +842,7 @@
     <div class="split" id="split" title="drag to resize"></div>
     <div class="loglist">
       <div class="loghead">
-        <h3><span>event log · <span id="logscope">fleet</span></span>
+        <h3><span>events last 24h<span id="logscope" hidden></span></span>
             <span class="logbtns"><button class="follow on" id="follow" title="following the latest events" aria-label="following the latest events"></button><button class="fbtn" id="fbtn" data-act="filters" title="filters" aria-label="filters"></button></span></h3>
         <div class="logsearch">
           <div class="searchbox">
@@ -1273,8 +1277,23 @@ function idleStatus(){
   // (#1105) No "fleet" wording — it reads wrong for a solo local machine
   // ("fleet (1)"). Waiting = no machine has checked in yet.
   if(!n) return '<span class="rdot">○</span> waiting for a machine';
-  const closes=DATA.filter(r=>r.action==="dispatch.complete"||r.action==="dispatch.error");
-  const last=closes.length?Math.max(...closes.map(r=>T(r.ts))):null;
+  // (operator) LAST EVENT, not last run. Two reasons it changed: "last run"
+  // could not say WHICH machine it belonged to, and it sat above an event log
+  // it was not actually describing. The newest record in the window is a
+  // property of the STREAM — unambiguous by definition, no attribution
+  // needed — and reads as "when did anything last happen", which is exactly
+  // the question you ask before opening the log beneath it.
+  // LAST DISPATCH, measured at its START.
+  //
+  // Three iterations to get here, each wrong for a different reason.
+  // "last run" used dispatch COMPLETION — so a dispatch still running was
+  // invisible, and the line aged while work was actively happening.
+  // "last event" used the newest record of any kind — useless, because
+  // heartbeats stream continuously and it would read "just now" forever.
+  // A dispatch START is the honest activity signal: it says when work last
+  // BEGAN, counts in-flight work, and cannot be kept warm by telemetry.
+  const starts=DATA.filter(r=>r.action==="dispatch.start");
+  const last=starts.length?Math.max(...starts.map(r=>T(r.ts))):null;
   // (#1103) "last run" measured from real wall-clock now, NOT state.t (=tMax, the
   // newest record): an idle machine's playhead sits on its last record, so the old
   // reference made every idle headline read "just now". The count is PRESENCE
@@ -1286,7 +1305,11 @@ function idleStatus(){
   const now=Date.now();
   const known=last!=null&&(now-last)>=0;
   const ago=known?relAgoFrom(now,last):'';
-  return `<span class="rdot ok">●</span> ready · <span class="mco" title="${n} machine${n===1?'':'s'} online">${n} ${ICON.machine}</span>${ago?` · last run ${ago}`:''}`;
+  // No `● ready`: the machine CARDS below state health per machine, and a
+  // single green dot cannot represent two machines in different states. It
+  // also collided with the `● live` badge a few pixels away — two green dots
+  // asserting different things with nothing to tell them apart.
+  return `<span class="mco" title="${n} machine${n===1?'':'s'} online">${n} ${ICON.machine}</span>${ago?` · last dispatch ${ago}`:''}`;
 }
 function renderMeta(){
   // (#789) Activity-driven headline. Running → the live subject (mission-scoped
@@ -1311,8 +1334,12 @@ function renderMeta(){
   // machine presence is on the headline — so records stand alone here. Playback is
   // a specific day: its date + span are meaningful when scrubbing, so keep them.
   if(document.body.classList.contains('live-mode')){
-    const hrs=Math.round(LIVE_WINDOW_MS/3600000);
-    $("meta").innerHTML=`${head}<br>${DATA.length} records · last ${hrs}h`;
+    // (operator) The record count moved INTO the event pane, beside the
+    // records it counts. It was stated twice — here and on the log's own
+    // counter chip — and the duplicate cost the status a whole second line
+    // for information the pane already carries. Playback (the else branch)
+    // keeps its own line: a specific day's span IS the context there.
+    $("meta").innerHTML=head;
   } else {
     $("meta").innerHTML=`${head} · <b>${esc(DATA_SOURCE)}</b> · ${lday(tMin)} `+
       `${clk(tMin)}–${clk(tMax)}<br>${DATA.length} records · ${machines().length} machines`;
@@ -1645,7 +1672,7 @@ function savingsHero(){
   // passive discovery that the capability exists). The window suffix lives
   // on the eyebrow once, not repeated per label.
   return `<div class="savings">
-    <div class="saveyebrow">by your fleet${win}</div>
+    <div class="saveyebrow">tokens${win||' '}</div>
     <div class="savrow">
       <div class="savlead">
         <div class="savnum">${fmtN(t.local)}</div>

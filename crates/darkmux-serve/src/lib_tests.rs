@@ -462,6 +462,70 @@
         );
     }
 
+    /// (UI port Packet 1, #1717) `GET /next` serves the committed React
+    /// build artifact, same live-mode-meta injection posture as `GET /`
+    /// (`root_serves_viewer_html` above) — additive-only: this must not
+    /// disturb `/`'s own behavior, which the OTHER tests in this module
+    /// already cover unchanged.
+    #[tokio::test]
+    async fn next_route_serves_the_react_build_artifact() {
+        let app = build_router_local(PathBuf::new());
+        let response = app
+            .oneshot(Request::builder().uri("/next").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(ct.starts_with("text/html"), "content-type was `{ct}`");
+
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let lower = body.to_lowercase();
+        assert!(
+            lower.contains("<!doctype") || lower.contains("<html"),
+            "GET /next body is not HTML"
+        );
+        assert!(
+            body.contains(r#"<meta name="darkmux-mode" content="live">"#),
+            "live meta absent from GET /next body"
+        );
+        // The singlefile build inlines its JS as a <script type="module">
+        // with no external src — this is the artifact's own self-contained
+        // contract (no CDN, no separate chunk file to 404 on).
+        assert!(
+            !lower.contains("src=\"/assets/") && !lower.contains("src='./assets/"),
+            "GET /next body references an external asset — the singlefile build should have inlined it"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_route_does_not_disturb_the_legacy_root_route() {
+        // (#1717) Additive-only per the packet brief: adding /next must not
+        // change what / serves.
+        let app = build_router_local(PathBuf::new());
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("id=\"stage\"") || body.contains("id='stage'"),
+            "GET / no longer looks like the legacy viewer"
+        );
+    }
+
     #[tokio::test]
     async fn play_serves_viewer_html_with_playback_meta() {
         // #624 follow-up: GET /play/<date> serves the same viewer HTML with

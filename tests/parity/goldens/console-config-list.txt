@@ -1,0 +1,68 @@
+=== topbar ===
+darkmux
+TODAY
+◌ RECONNECTING
+⟳
+home
+guide
+articles
+github
+
+=== crumb ===
+(empty)
+
+=== meta ===
+2  · last dispatch 2h ago
+
+=== logscope ===
+console
+
+=== stage ===
+mission status
+all missions
+machine
+flow
+roles
+config
+fixtures
+doctor
+$ darkmux config list
+captured 20:54:23
+· 3ms
+re-run
+{
+  "audit": {
+    "dir": "~/.darkmux/audit",
+    "enabled": false
+  },
+  "dirs": {
+    "notebook": "/Users/kain/Documents/de-data/darkmux-notebook"
+  },
+  "lms_bin": "lms",
+  "lmstudio_url": "http://localhost:1234",
+  "machine_id": "MacBook-Pro",
+  "orchestrator": "claude-code",
+  "redis": {
+    "enabled": true,
+    "host": "100.158.129.76",
+    "maxlen": 10000,
+    "port": 6379,
+    "stream": "darkmux:flow"
+  },
+  "role_profiles": {
+    "review-judge": "deep",
+    "review-probe-high": "probe-gptoss",
+    "review-probe-low": "probe-4b",
+    "review-probe-mid": "diff-review",
+    "review-verify": "deep",
+    "radio-router": "radio"
+  },
+  "runtime": {
+    "check_updates": true,
+    "feedback_injection": true,
+    "inactivity_timeout_seconds": 600,
+    "strict_selection": false
+  },
+  "schema_version": "1.0"
+}
+

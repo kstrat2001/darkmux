@@ -132,6 +132,18 @@ fn is_valid_date(date: &str) -> Option<&str> {
 /// (operator's localhost or tailnet). See #624.
 const VIEWER_HTML: &str = include_str!("../assets/viewer.html");
 
+/// (UI port Packet 1, #1717) The committed React + TanStack Query build
+/// artifact — a SINGLE self-contained HTML file (inlined JS/CSS, no separate
+/// chunks; see `ui/vite.config.ts`'s `vite-plugin-singlefile` config) built
+/// from `ui/` by `bun run build` and committed here so the release binary
+/// stays self-contained and node-free, same posture as `VIEWER_HTML` above.
+/// Served at `GET /next` — a SEPARATE route from `GET /`, additive-only: the
+/// legacy viewer keeps serving `/` until the last lens moves (see
+/// `ui/README.md`'s port-status note and the plan's Rule 2). Regenerate:
+/// `cd ui && bun run build` (writes `assets/next.html` directly; see that
+/// package's `copy-artifact` script).
+const NEXT_HTML: &str = include_str!("../assets/next.html");
+
 /// Mission graph lens page (#1284 Packet 5) — a SEPARATE file from
 /// `VIEWER_HTML` by design; see `assets/mission-graph.html`'s own header
 /// comment for why the two rendering models (flow-record timeline vs.
@@ -213,6 +225,17 @@ fn inject_mode_meta(html: &str, mode: &str, date: Option<&str>) -> String {
 /// separate fork.
 async fn root_html(headers: axum::http::HeaderMap) -> impl IntoResponse {
     html_response(&headers, inject_mode_meta(VIEWER_HTML, "live", None))
+}
+
+/// Serve the NEXT (in-progress React port) viewer at `GET /next` (UI port
+/// Packet 1, #1717). Same mode-meta injection + ETag/cache posture as
+/// `root_html` — `inject_mode_meta` is generic over the HTML body, so reusing
+/// it here cost nothing (the brief's "IF cheap to reuse" — it was). Live-mode
+/// only for now: the React shell doesn't have a playback route yet (that's a
+/// lens-packet concern once `/play/:date` grows a `/next` counterpart), so
+/// this always injects `mode="live"`, matching `/`'s own default arm.
+async fn next_html(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    html_response(&headers, inject_mode_meta(NEXT_HTML, "live", None))
 }
 
 /// Strong validator for an HTML document, so a browser can revalidate
@@ -361,6 +384,7 @@ pub(crate) fn build_router_full(
     // slow/hung request.
     let timed = Router::new()
         .route("/", get(root_html))
+        .route("/next", get(next_html))
         .route("/play/:date", get(play_html))
         .route("/health", get(health))
         .route("/flow/:date", get(flow_handler))
