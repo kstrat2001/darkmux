@@ -3716,7 +3716,9 @@ async function pollLiveSessions(){
     // The endpoint returns {sessions,meta}; tolerate a bare array so a viewer
     // served from a cache alongside an older daemon still resolves live seats.
     const arr=Array.isArray(body)?body:(body&&body.sessions)||[];
-    if(!Array.isArray(body)) noteCoverage("sessions",body&&body.meta);
+    // Unconditional: a success must CLEAR any previously-noted failure, so
+    // the bare-array arm cannot pin the marker on after one transient blip.
+    noteCoverage("sessions",Array.isArray(body)?null:body&&body.meta);
     const next=arr.map(b=>b&&b.session_id).filter(Boolean);
     LIVE_SESSIONS.clear(); next.forEach(s=>LIVE_SESSIONS.add(s));
     applyLive();   // re-renders only if the live set changed the stage signature
@@ -3732,7 +3734,7 @@ async function pollLiveMachines(){
     if(!r.ok){noteUnreachable("machines");return;}
     const body=await r.json();
     const arr=Array.isArray(body)?body:(body&&body.machines)||[];   // {machines,meta}; bare array tolerated
-    if(!Array.isArray(body)) noteCoverage("machines",body&&body.meta);
+    noteCoverage("machines",Array.isArray(body)?null:body&&body.meta);   // unconditional — see pollLiveSessions
     LIVE_MACHINES.clear();
     arr.forEach(b=>{ if(b&&b.machine_uid)LIVE_MACHINES.set(b.machine_uid,b); });
     applyLive();   // machines() unions LIVE_MACHINES → a new present machine re-renders

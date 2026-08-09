@@ -576,6 +576,13 @@
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    // MUST be serial: the guard below reads `DARKMUX_REDIS_URL`, and other
+    // tests in this binary `set_var` it mid-run. `#[serial]` only excludes
+    // OTHER serial tests, so as a plain test this would race them — either
+    // silently early-returning (a probe that passes without executing, on
+    // exactly the CI machines it was written for) or failing spuriously when
+    // the var appears between the guard and the handler's own live re-read.
     async fn live_endpoints_report_off_not_degraded_when_redis_is_unconfigured() {
         // The inverted case, and the one a naive implementation gets wrong:
         // with no Redis configured (CI, and every single-machine install),
