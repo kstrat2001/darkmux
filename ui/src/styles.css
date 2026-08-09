@@ -1561,18 +1561,28 @@ body {
     min-height: 44px;
   }
 }
+/* (operator) The machine name is a CAPTION ABOVE its track, not a gutter
+   beside it. Legacy reserved `--lname-w` (150px default) as a fixed
+   flex-none column, so every track lost that width no matter how much room
+   there was — at 402px that is 150 of ~370, roughly 40% of the screen spent
+   on two machine names, and the bars compressed into what was left.
+   Vertical space is the cheap axis here (a lane is ~20px tall on a page
+   that scrolls); horizontal space is the scarce one, especially on a phone.
+   Stacking spends the cheap axis to buy back the scarce one.
+
+   `--lname-w` and `timeline.labelWidthPx` that feeds it are now unused —
+   left in place rather than ripped out mid-change; removing them is a
+   trivial follow-up once this has been looked at on a real screen. */
 .lane {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 7px;
+  display: block;
+  margin-bottom: 14px;
 }
 .lname {
-  width: var(--lname-w, 150px);
-  flex: none;
+  width: auto;
+  margin-bottom: 4px;
   font: 12px "JetBrains Mono", monospace;
   color: var(--fg);
-  text-align: right;
+  text-align: left;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
