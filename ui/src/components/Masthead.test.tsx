@@ -4,11 +4,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Masthead } from "./Masthead";
 import type { Route } from "../lib/route";
 
-function renderMasthead(route: Route) {
+function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <Masthead route={route} liveStatus="live" />
+      <Masthead route={route} liveStatus={liveStatus} />
     </QueryClientProvider>,
   );
 }
@@ -62,9 +62,12 @@ describe("Masthead", () => {
     vi.unstubAllGlobals();
   });
 
-  it("shows the refresh control on a live route", () => {
+  it("shows the refresh control on a live route when the stream has dropped", () => {
+    // Was "on a live route" unconditionally. The control now appears only
+    // while the stream is NOT live — beside a `● LIVE` badge it contradicts
+    // itself, and there is nothing to refresh.
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
-    renderMasthead({ kind: "fleet" });
+    renderMasthead({ kind: "fleet" }, "reconnecting");
     expect(screen.getByTitle("Refetch now")).toBeInTheDocument();
     vi.unstubAllGlobals();
   });
@@ -81,5 +84,18 @@ describe("Masthead", () => {
     renderMasthead({ kind: "fleet" });
     expect(screen.getByRole("button", { name: /browse history/i })).toBeInTheDocument();
     vi.unstubAllGlobals();
+  });
+
+  // The parity goldens CANNOT cover this: the static harness has no working
+  // stream, so its badge is permanently `reconnecting` and the button always
+  // shows there. This is the state the goldens can never reach.
+  it("hides the refresh control while the stream is live — it contradicts the badge", () => {
+    const { container } = renderMasthead({ kind: "fleet" } as Route, "live");
+    expect(container.querySelector(".masthead__refresh")).toBeNull();
+  });
+
+  it("shows it again when the stream drops, where a manual retry actually helps", () => {
+    const { container } = renderMasthead({ kind: "fleet" } as Route, "reconnecting");
+    expect(container.querySelector(".masthead__refresh")).toBeTruthy();
   });
 });

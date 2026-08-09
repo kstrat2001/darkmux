@@ -398,6 +398,10 @@
      playback), so the neutral boot state is the correct one. */
   /* (#1480) Refetch control + a visible connection state. `stale` is the
      honest middle: the page is rendering real data that has stopped updating. */
+  /* (operator) The refetch control contradicts the `● live` badge beside
+     it — if the view is live there is nothing to refresh. It survives
+     only for the reconnecting/stale case, where a manual retry helps. */
+  #modebadge.live ~ #refreshbtn{display:none}
   .rfbtn{background:none;border:1px solid var(--line);color:var(--muted);border-radius:4px;
          cursor:pointer;font:12px 'JetBrains Mono',monospace;padding:2px 7px;line-height:1.4}
   .rfbtn:hover{color:var(--text)}
@@ -838,7 +842,7 @@
     <div class="split" id="split" title="drag to resize"></div>
     <div class="loglist">
       <div class="loghead">
-        <h3><span>event log · <span id="logscope">fleet</span></span>
+        <h3><span>events last 24h<span id="logscope" hidden></span></span>
             <span class="logbtns"><button class="follow on" id="follow" title="following the latest events" aria-label="following the latest events"></button><button class="fbtn" id="fbtn" data-act="filters" title="filters" aria-label="filters"></button></span></h3>
         <div class="logsearch">
           <div class="searchbox">
@@ -1649,7 +1653,7 @@ function savingsHero(){
   // passive discovery that the capability exists). The window suffix lives
   // on the eyebrow once, not repeated per label.
   return `<div class="savings">
-    <div class="saveyebrow">by your fleet${win}</div>
+    <div class="saveyebrow">tokens${win||' '}</div>
     <div class="savrow">
       <div class="savlead">
         <div class="savnum">${fmtN(t.local)}</div>

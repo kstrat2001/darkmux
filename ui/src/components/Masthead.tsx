@@ -138,7 +138,15 @@ export function Masthead({ route, liveStatus }: { route: Route; liveStatus: Live
       )}
       <CatalogPanel label={srcbadgeText(route)} />
       {live ? <LiveStatusBadge status={liveStatus} /> : null}
-      {live ? (
+      {/* (operator: "a reload button next to 'live' is absurd") — and it is:
+          a refresh control beside a badge reading `● LIVE` contradicts
+          itself. If the view is live there is nothing to refresh; if you
+          need to refresh, it is not live. The one state where a manual retry
+          genuinely helps is `◌ RECONNECTING`, so the button and the badge
+          are now mutually exclusive by MEANING rather than by screen width
+          (the earlier mobile-only hide was the same instinct, argued from
+          the wrong premise). */}
+      {live && liveStatus !== "live" ? (
         <button
           type="button"
           className={`masthead__refresh${spinning ? " spin" : ""}`}

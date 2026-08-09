@@ -48,7 +48,11 @@ function SavingsHero({ tokens: t, note }: { tokens: ReturnType<typeof tokensOffM
   const hours = Math.round(LIVE_WINDOW_MS / 3600000);
   return (
     <div className="savings">
-      <div className="saveyebrow">by your fleet · last {hours}h</div>
+      {/* (operator) "tokens · last 24h" rather than "by your fleet · last 24h",
+          to match the event pane's "events last 24h". Two panels counting two
+          things over the same window should say so the same way; "by your
+          fleet" named the SOURCE where its neighbour named the SUBJECT. */}
+      <div className="saveyebrow">tokens · last {hours}h</div>
       <div className="savrow">
         <div className="savlead">
           <div className="savnum">{fmtN(t.local)}</div>

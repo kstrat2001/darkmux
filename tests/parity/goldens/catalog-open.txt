@@ -15,10 +15,10 @@ github
 ● ready · 2  · last run 2h ago
 
 === logscope ===
-FLEET
+fleet
 
 === stage ===
-BY YOUR FLEET · LAST 24H
+TOKENS · LAST 24H
 0
 LOCAL TOKENS
 396,926

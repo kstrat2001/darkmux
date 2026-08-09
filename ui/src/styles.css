@@ -136,6 +136,21 @@ body {
   text-transform: uppercase;
 }
 
+/* (operator: "should live be pulsing like it did before?") — it should, and
+   it was MISSING: legacy has `@keyframes lpulse` + `.pb.live{animation:…}`
+   and this port had neither. Another purely visual element the text goldens
+   could not see, alongside the machine icon and the status dot's colour.
+
+   Worth knowing what it does and does not mean: the pulse is a fixed 1.6s
+   loop gated only on the badge being live. It does NOT track record arrival
+   or connection health — so it says "live" a second time rather than adding
+   information. An arrival-driven pulse would genuinely signal a stream going
+   quiet; that is new behaviour, not a port, and is left as its own call. */
+@keyframes lpulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
 #modebadge.pb.live {
   color: var(--accent);
 }
@@ -1597,9 +1612,9 @@ body {
    that scrolls); horizontal space is the scarce one, especially on a phone.
    Stacking spends the cheap axis to buy back the scarce one.
 
-   `--lname-w` and `timeline.labelWidthPx` that feeds it are now unused —
-   left in place rather than ripped out mid-change; removing them is a
-   trivial follow-up once this has been looked at on a real screen. */
+   `--lname-w` and `timeline.labelWidthPx` had ONE remaining consumer after
+   the labels moved: `.tlaxis`'s indent, which is why the axis drifted out of
+   alignment until the operator spotted it. Both are genuinely unused now. */
 .lane {
   display: block;
   margin-bottom: 14px;
@@ -1653,7 +1668,11 @@ body {
   opacity: 0.32;
 }
 .tlaxis {
-  margin-left: calc(var(--lname-w, 150px) + 12px);
+  /* No offset. This used to indent by the label gutter so the axis lined up
+     with tracks that started after it — but the labels became captions ABOVE
+     their tracks, the tracks went full-width, and this was left behind,
+     shifting every tick ~162px right of the bar it labels. Removing the
+     gutter without its partner is the whole bug; they were one layout. */
   display: flex;
   justify-content: space-between;
   font: 9px "JetBrains Mono", monospace;
@@ -1717,3 +1736,13 @@ body {
 .rdot.ok { color: var(--good, #4ade80); }
 .mco { white-space: nowrap; }
 .mco svg { width: 13px; height: 13px; vertical-align: -2px; margin-left: 2px; color: var(--accent-dim, var(--accent)); }
+
+/* (#238, ported) Reduced-motion drops the pulse. Live stays distinguishable
+   WITHOUT motion — the badge keeps its colour, the ● glyph and the word. */
+#modebadge.pb.live .pbdot {
+  animation: lpulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #modebadge.pb.live .pbdot { animation: none; }
+}

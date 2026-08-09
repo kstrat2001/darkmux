@@ -119,6 +119,14 @@ export function App() {
   const ready = useMemo(() => readyParts(flowWindow.data, liveMachines, nowMs), [flowWindow.data, liveMachines, nowMs]);
   const metaLines = useMemo(() => computeMetaLines(flowWindow.data, liveMachines, nowMs), [flowWindow.data, liveMachines, nowMs]);
 
+  // `logscope` is no longer SHOWN — the outer UI owns context (see
+  // EventLogColumn's header). It is still computed and still rendered into a
+  // HIDDEN span, because legacy's own span keeps its text and `innerText`
+  // falls back to `textContent` for an unrendered element: if this port
+  // emitted nothing, the two would disagree in the parity extraction. The
+  // values are lowercase now for the same reason — CSS `text-transform`
+  // never applies to text that is not rendered, so legacy's raw text is what
+  // both sides must match. All of this dies with legacy at the flip.
   const { crumb, logscope } = routeChrome(route, localName);
 
   useSyncHash(route);
@@ -172,7 +180,7 @@ export function App() {
         <main className="app-shell__stage" id="stage">
           {renderRoute(route)}
         </main>
-        <EventLogColumn records={flowWindow.data} scopeLabel={logscope} visible={showsEventLog(route)} />
+        <EventLogColumn scopeLabel={logscope} records={flowWindow.data} visible={showsEventLog(route)} />
       </div>
     </div>
   );
@@ -216,7 +224,7 @@ function routeChrome(route: Route, localMachineName: string | null): { crumb: st
     // — same discipline as `lib/format.ts`'s "uppercase the STRING
     // directly" helpers — the string here is ALREADY uppercase rather than
     // leaning on a CSS rule this port doesn't have.
-    return { crumb: "", logscope: "FLEET" };
+    return { crumb: "", logscope: "fleet" };
   }
   // (Chrome packet) `#logscope`'s CASE depends on VISIBILITY, not just its
   // raw JS-set value — a real, verified legacy quirk, not an assumption:
@@ -242,7 +250,7 @@ function routeChrome(route: Route, localMachineName: string | null): { crumb: st
   if (route.kind === "session") {
     // `$("logscope").textContent=sid` (viewer.html:2042,
     // `renderSubsystem()`) — a VISIBLE-log route, so uppercased.
-    return { crumb: "", logscope: route.sessionId.toUpperCase() };
+    return { crumb: "", logscope: route.sessionId };
   }
   if (route.kind === "playback") {
     // A bare-date hash never reassigns `state.level` away from its `"fleet"`
@@ -251,7 +259,7 @@ function routeChrome(route: Route, localMachineName: string | null): { crumb: st
     // same read), so legacy's `renderFleet()` sets the same `"fleet"`
     // logscope (viewer.html:1668) it does on a live fleet view — VISIBLE,
     // already uppercase.
-    return { crumb: "", logscope: "FLEET" };
+    return { crumb: "", logscope: "fleet" };
   }
   if (route.kind === "mission-redirect") {
     // `$("logscope").textContent="mission"` (viewer.html:2730,
@@ -260,7 +268,7 @@ function routeChrome(route: Route, localMachineName: string | null): { crumb: st
     // before this would paint — see `MissionReplay`'s own doc), named for
     // completeness. A VISIBLE-log route (`mission` isn't in `showsEventLog`'s
     // hidden set), so uppercased.
-    return { crumb: "", logscope: "MISSION" };
+    return { crumb: "", logscope: "mission" };
   }
   if (route.kind === "console") {
     // `$("logscope").textContent="console"` (viewer.html:4513) — a HIDDEN-

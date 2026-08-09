@@ -15,7 +15,7 @@ github
 48 records · 1 machines
 
 === logscope ===
-TASK-LIST
+task-list
 
 === stage ===
 RUNNING RUN · FETCH-RENDER (task-list on )

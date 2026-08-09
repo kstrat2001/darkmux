@@ -14,9 +14,21 @@ function rec(overrides: Partial<FlowRecord>): FlowRecord {
 }
 
 describe("EventLogColumn", () => {
-  it("renders #logscope inside the log header with the scope label passed in", () => {
-    render(<EventLogColumn records={[]} scopeLabel="FLEET" visible />);
-    expect(document.getElementById("logscope")?.textContent).toBe("FLEET");
+  it("names the WINDOW in the header, and keeps #logscope present but empty", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    // (operator) The outer UI owns context now: the active tab or the crumb
+    // already establishes it, and `#logscope` repeated that in six of its
+    // eight legacy states. The element stays in the DOM, empty, so this
+    // port's parity extraction agrees with legacy's; it dies with legacy at
+    // the flip.
+    // Present, HIDDEN, and still carrying its text: legacy's own span keeps
+    // its text and `innerText` falls back to `textContent` when unrendered,
+    // so emitting nothing here would make the two disagree in the parity
+    // extraction. What changed is that it is no longer SHOWN.
+    const scope = document.getElementById("logscope")!;
+    expect(scope.hasAttribute("hidden")).toBe(true);
+    expect(scope.textContent).toBe("fleet");
+    expect(document.querySelector(".eventlog__head h3")?.textContent).toMatch(/events last \d+h/i);
   });
 
   it("renders every record (up to the cap) as a row, newest first", () => {
@@ -24,7 +36,7 @@ describe("EventLogColumn", () => {
       rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-old" }),
       rec({ ts: "2026-08-08T12:05:00.000Z", session_id: "s-new" }),
     ];
-    render(<EventLogColumn records={records} scopeLabel="fleet" visible />);
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     const rows = document.querySelectorAll('[data-act="rec"]');
     expect(rows.length).toBe(2);
     // newest first (viewer.html:2443's `slice(-50).reverse()`)
@@ -33,7 +45,7 @@ describe("EventLogColumn", () => {
   });
 
   it("shows the empty-log message when there are no records", () => {
-    render(<EventLogColumn records={[]} scopeLabel="fleet" visible />);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
     expect(screen.getByText("no events yet")).toBeInTheDocument();
   });
 
@@ -47,7 +59,7 @@ describe("EventLogColumn", () => {
       rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-alpha" }),
       rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.tool", session_id: "s-beta" }),
     ];
-    render(<EventLogColumn records={records} scopeLabel="fleet" visible />);
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "s-alpha" } });
     const rows = document.querySelectorAll('[data-act="rec"]');
     expect(rows.length).toBe(1);
@@ -55,7 +67,7 @@ describe("EventLogColumn", () => {
   });
 
   it("shows 'no match' in the query count when the search matches nothing", () => {
-    render(<EventLogColumn records={[rec({})]} scopeLabel="fleet" visible />);
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({})]} visible />);
     fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "nothing-matches-this" } });
     expect(screen.getByText("no match")).toBeInTheDocument();
   });
@@ -65,7 +77,7 @@ describe("EventLogColumn", () => {
       rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-old" }),
       rec({ ts: "2026-08-08T12:05:00.000Z", session_id: "s-new" }),
     ];
-    render(<EventLogColumn records={records} scopeLabel="fleet" visible />);
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     // Default (follow=on) shows the newest record in the detail panel.
     expect(document.getElementById("detailbody")!.textContent).toContain("s-new");
 
@@ -81,7 +93,7 @@ describe("EventLogColumn", () => {
       rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-old" }),
       rec({ ts: "2026-08-08T12:05:00.000Z", session_id: "s-new" }),
     ];
-    render(<EventLogColumn records={records} scopeLabel="fleet" visible />);
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.click(document.querySelectorAll('[data-act="rec"]')[1]); // select the older one
     expect(document.getElementById("detailbody")!.textContent).toContain("s-old");
 
@@ -91,7 +103,7 @@ describe("EventLogColumn", () => {
   });
 
   it("shows the 'select an event' placeholder when nothing is selected and there are no records", () => {
-    render(<EventLogColumn records={[]} scopeLabel="fleet" visible />);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
     expect(screen.getByText("select an event from the log to inspect it")).toBeInTheDocument();
   });
 
@@ -100,7 +112,7 @@ describe("EventLogColumn", () => {
       rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-reasoning" }),
       rec({ ts: "2026-08-08T12:05:00.000Z", action: "machine.online", session_id: "s-machine" }),
     ];
-    render(<EventLogColumn records={records} scopeLabel="fleet" visible />);
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.click(document.getElementById("fbtn")!);
     const rows = document.querySelectorAll('[data-act="rec"]');
     expect(rows.length).toBe(1);

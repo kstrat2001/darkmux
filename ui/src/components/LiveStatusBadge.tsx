@@ -19,7 +19,13 @@ export function LiveStatusBadge({ status }: { status: LiveTailStatus }) {
   const live = status === "live";
   return (
     <span id="modebadge" className={`pb${live ? " live" : " stale"}`} data-state={status}>
-      {live ? "● live" : "◌ reconnecting"}
+      {/* (operator) The DOT pulses, not the whole string — a heartbeat
+          rather than the entire badge breathing, which reads as noise at the
+          top of every screen. Text is split so the animation has something
+          small to attach to; `innerText` is unchanged either way, so the
+          parity goldens do not move. */}
+      <span className="pbdot">{live ? "●" : "◌"}</span>
+      {live ? " live" : " reconnecting"}
     </span>
   );
 }

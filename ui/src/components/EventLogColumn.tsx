@@ -121,12 +121,14 @@ const DEFAULT_DETAIL_PCT = 38;
  */
 export function EventLogColumn({
   records,
-  scopeLabel,
   visible,
+  scopeLabel,
 }: {
   records: FlowRecord[];
-  scopeLabel: string;
   visible: boolean;
+  /** Not shown — written into a hidden span purely so this port's parity
+   *  extraction matches legacy's. See App's `routeChrome` note. */
+  scopeLabel: string;
 }) {
   const [query, setQuery] = useState("");
   const [modelOnly, setModelOnly] = useState(false);
@@ -202,15 +204,20 @@ export function EventLogColumn({
     // this port adds is SAYING so. Legacy hides 684 records in silence; the
     // label is the honest half and worth keeping.
     : capped
-      ? `${LOG_CAP} of ${filtered.length} · last ${WINDOW_HOURS}h`
-      : `${filtered.length} · last ${WINDOW_HOURS}h`;
+      ? `${LOG_CAP} of ${filtered.length} events`
+      : `${filtered.length} events`;
 
   return (
     <div className={`eventlog${visible ? "" : " eventlog--hidden"}`} ref={columnRef}>
       <div className="eventlog__detail" id="detail" style={{ flexBasis: `${detailPct}%` }}>
-        <div className="eventlog__detailhead">
-          <span className="eventlog__detailtitle">selected event</span>
-        </div>
+        {/* (operator) No "selected event" title. It was static chrome
+            competing with the record's own headline — `RecordView` already
+            leads with the action in accent colour, so the label was a second
+            heading fighting the real one, and one more thing to read before
+            reaching the content. The empty-state line below still explains
+            the panel when nothing is selected, which is the only moment a
+            title would have earned its place. Free to remove: this panel sits
+            outside every extracted golden region. */}
         <div id="detailbody" className="eventlog__detailbody">
           {selected ? <EventDetail record={selected} /> : <div className="eventlog__none">select an event from the log to inspect it</div>}
         </div>
@@ -226,8 +233,15 @@ export function EventLogColumn({
       <div className="eventlog__list">
         <div className="eventlog__head">
           <h3>
+            {/* (operator) The header names the WINDOW; the outer UI owns
+                context. `#logscope` repeated what the active tab or the crumb
+                had already established in six of its eight states — and in
+                two of those it was VAGUER than the crumb beside it ("mission"
+                against `◆ <mission id>"). Kept in the DOM, empty and hidden,
+                so legacy's extraction and this port's agree; the element
+                itself is legacy's and dies with it at the flip. */}
             <span>
-              event log · <span id="logscope">{scopeLabel}</span>
+              events last {WINDOW_HOURS}h<span id="logscope" hidden>{scopeLabel}</span>
             </span>
             <span className="eventlog__headbtns">
               <button

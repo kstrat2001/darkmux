@@ -15,10 +15,10 @@ github
 0 records · 0 machines
 
 === logscope ===
-FLEET
+fleet
 
 === stage ===
-BY YOUR FLEET
+TOKENS
 0
 LOCAL TOKENS
 0
