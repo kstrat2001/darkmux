@@ -59,8 +59,13 @@ function normalizeAction(a: string | undefined): string | undefined {
   return a;
 }
 
-/** `recKey()` — viewer.html:3390. Dedup key for the two-day fetch overlap. */
-function recKey(r: FlowRecord): string {
+/** `recKey()` — viewer.html:3390/3397. Dedup key for the two-day fetch
+ * overlap AND (Packet 5) the live tail's SSE-append / reconcile-backstop
+ * dedup (`SEEN_KEYS`, viewer.html:3396-3398) — exported so `useLiveTail`
+ * can dedup against the exact same identity `buildFlowWindow` itself uses,
+ * rather than inventing a second key shape that could silently drift from
+ * this one. */
+export function recKey(r: FlowRecord): string {
   return [
     r.ts,
     r.machine_uid || "",
@@ -72,6 +77,46 @@ function recKey(r: FlowRecord): string {
     r.stage || "",
     r.payload != null ? JSON.stringify(r.payload) : "",
   ].join("\x1f");
+}
+
+/** A `/flow/<date>` response body is EITHER a bare array or one of two
+ * wrapper shapes — `loadLiveWindow()`, viewer.html:3502:
+ * `Array.isArray(body)?body:(body.records||body.flow||[])`. The recorded
+ * corpus is always a bare array; this stays loose for parity with the
+ * legacy tolerance rather than assuming the shape never changes. Shared by
+ * `useFlowWindow` (the day-fetch) and `useLiveTail` (the reconcile
+ * backstop's `?since=` fetch, which hits the SAME `/flow/<date>` handler). */
+export function asRecordArray(body: unknown): FlowRecord[] {
+  if (Array.isArray(body)) return body as FlowRecord[];
+  if (body && typeof body === "object") {
+    const obj = body as { records?: FlowRecord[]; flow?: FlowRecord[] };
+    return obj.records ?? obj.flow ?? [];
+  }
+  return [];
+}
+
+/** The tail-cache-side counterpart to `buildFlowWindow`'s own dedup+window
+ * filter — used by `useLiveTail`'s reconcile backstop (viewer.html's
+ * `reconcileLiveWindow`, 3758-3782) so repeated `?since=` polls with a
+ * deliberate overlap window (`RECONCILE_OVERLAP_MS`) don't grow the tail
+ * cache's stored array by the overlap on every single poll. `buildFlowWindow`
+ * itself ALSO dedups the final merged (day-fetch + tail) result, so this
+ * isn't required for display correctness — duplicates would render
+ * correctly either way — it's what keeps the underlying cache entry bounded
+ * across a long-lived tab, the same thing `applyLive()`'s RAW age-out prunes
+ * for (viewer.html:3522-3539). */
+export function mergeTailRecords(existing: FlowRecord[], incoming: FlowRecord[], cutMs: number): FlowRecord[] {
+  const seen = new Set(existing.map(recKey));
+  const merged = existing.slice();
+  for (const r of incoming) {
+    if (!r || !r.ts) continue;
+    if (T(r.ts) < cutMs) continue;
+    const k = recKey(r);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    merged.push(r);
+  }
+  return merged.filter((r) => T(r.ts) >= cutMs);
 }
 
 /** `loadLiveWindow()` + the dispatch-action slice of `flowToRenderModel()` —

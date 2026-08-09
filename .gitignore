@@ -53,6 +53,7 @@ tests/parity/.served/
 tests/parity/.served-next/
 tests/parity/.served-next-chrome/
 tests/parity/.served-next-console/
+tests/parity/.served-next-live/
 tests/parity/.gallery/
 tests/parity/.determinism-run1/
 tests/parity/.verify-snapshot/

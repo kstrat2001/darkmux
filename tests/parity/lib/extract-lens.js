@@ -144,6 +144,24 @@ async function installFrozenClock(page, ms) {
   await page.clock.setFixedTime(ms);
 }
 
+// The other clock need, kept SEPARATE on purpose.
+//
+// `installFrozenClock` above pins what the page reads as `now` and leaves the
+// event loop alone — right for golden extraction, which wants a stable
+// timestamp and a live scheduler. But it is `setFixedTime`, which does not
+// install a controllable clock: `runFor`, `fastForward` and `setSystemTime`
+// all require `install()`, and silently do nothing useful without it.
+//
+// A test that must SIMULATE time passing — crossing UTC midnight, say — needs
+// the controllable clock instead, and must then PUMP it (`runFor`) rather
+// than waiting on wall time. Pumping is what flushes React's scheduler here,
+// so such a test does not hit the render-wedge that made `pauseAt` wrong as a
+// global default.
+async function installControllableClock(page, ms) {
+  await page.clock.install({ time: ms });
+  await page.clock.pauseAt(ms);
+}
+
 module.exports = {
   normalize,
   regionText,
@@ -152,4 +170,5 @@ module.exports = {
   extractLensTextWithCatalog,
   waitSettled,
   installFrozenClock,
+  installControllableClock,
 };

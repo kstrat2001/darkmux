@@ -80,6 +80,20 @@ export type Route =
   | { kind: "playback"; date: string }
   | { kind: "unknown"; hash: string };
 
+/** (Packet 5) Should the live tail (`hooks/useLiveTail.ts` — SSE + reconcile
+ * backstop) be running for this route? Mirrors legacy's `wantsPlayback`
+ * (viewer.html:3853: `injectedMode==="play" || !!flowSrc || !!cq`, where
+ * `cq` is a mission/session catalog query) — `playback`/`session`/
+ * `mission-redirect` are all requests for a SPECIFIC historical slice, not
+ * the rolling live window, so `boot()` never starts `startLiveTail` for any
+ * of them. `fleet`/`runs`/`machine`/`console`/`unknown` are the live routes
+ * — every one of them renders the SAME rolling `useFlowWindow` this app has
+ * no separate playback data pipeline for yet (see `PlaybackLens`'s own
+ * module doc). */
+export function isLiveRoute(route: Route): boolean {
+  return route.kind !== "playback" && route.kind !== "session" && route.kind !== "mission-redirect";
+}
+
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function hashParams(): URLSearchParams {
