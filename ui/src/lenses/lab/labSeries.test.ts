@@ -210,6 +210,17 @@ describe("labKnobDiff", () => {
     expect(labKnobDiff(run({ crew: null }), run({ crew: "b" }))).toEqual(["crew —→b"]);
   });
 
+  it("treats an ABSENT field and an explicit null as the same value", () => {
+    // Legacy compares `(prev.crew || null) !== (curr.crew || null)`, so
+    // undefined and null are one state. A port that compares the raw fields
+    // emits a phantom `crew —→—` — a change line reporting no change, in the
+    // one view whose job is making single-variable changes legible. Caught by
+    // differential-testing a candidate port against the legacy function;
+    // the whole rest of this suite passed while it was wrong.
+    expect(labKnobDiff(run({ crew: undefined }), run({ crew: null }))).toEqual([]);
+    expect(labKnobDiff(run({ exec_mode: undefined }), run({ exec_mode: null }))).toEqual([]);
+  });
+
   it("reports each changed probe field, matched by seat NAME not position", () => {
     const prev = run({ staffing: { probes: [{ name: "a", k: 1 }, { name: "b", k: 2 }] } });
     const curr = run({ staffing: { probes: [{ name: "b", k: 2 }, { name: "a", k: 9 }] } });
