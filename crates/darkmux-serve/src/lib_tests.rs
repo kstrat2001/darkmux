@@ -551,12 +551,13 @@
     }
 
     #[tokio::test]
-    async fn fleet_sessions_live_returns_json_array() {
-        // GET /fleet/sessions/live (#638) must always answer 200 with a JSON
-        // array — `[]` when Redis is unset/unreachable (CI), the live-session
-        // beats when it is. The live viewer keys "running" on this, so it must
-        // never 500 on a Redis blip. Asserting "200 + is_array" is robust in
-        // both environments (content depends on whether a dispatch is live).
+    async fn fleet_sessions_live_carries_sessions_plus_a_coverage_state() {
+        // GET /fleet/sessions/live (#638) must always answer 200 and never
+        // 500 on a Redis blip — the live viewer keys "running" on this.
+        // It now answers with an OBJECT so an empty `sessions` can be
+        // distinguished from an unreadable substrate: the viewer used to
+        // render both as "nothing live", which is what turned a dead Redis
+        // into fleet-wide dead-looking seats (#1483).
         let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
@@ -570,16 +571,54 @@
         assert_eq!(response.status(), 200);
         let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(body.is_array(), "live-sessions response must be a JSON array");
+        assert!(body["sessions"].is_array(), "live sessions must be a JSON array under `sessions`");
+        assert!(body["meta"]["sources"]["fleet"]["state"].is_string(), "coverage state must be reported");
     }
 
     #[tokio::test]
-    async fn fleet_machines_live_returns_json_array() {
-        // GET /fleet/machines/live (#638) — the same robust contract as the
-        // sessions endpoint: always 200 + JSON array (`[]` when Redis is
-        // unset/unreachable, the presence beats when it is). The live viewer
-        // unions this into machines(), so a Redis blip must degrade to "no
-        // live machines", never a 500.
+    #[serial_test::serial]
+    // MUST be serial: the guard below reads `DARKMUX_REDIS_URL`, and other
+    // tests in this binary `set_var` it mid-run. `#[serial]` only excludes
+    // OTHER serial tests, so as a plain test this would race them — either
+    // silently early-returning (a probe that passes without executing, on
+    // exactly the CI machines it was written for) or failing spuriously when
+    // the var appears between the guard and the handler's own live re-read.
+    async fn live_endpoints_report_off_not_degraded_when_redis_is_unconfigured() {
+        // The inverted case, and the one a naive implementation gets wrong:
+        // with no Redis configured (CI, and every single-machine install),
+        // the empty result is CORRECT — `off`, `complete: true`. If this ever
+        // reports `unavailable`/`complete: false`, every standalone operator
+        // gets a permanent false warning about a fleet they never had.
+        //
+        // Guarded on the environment rather than asserted blindly: a
+        // developer box with a live Redis legitimately answers `ok` here, and
+        // a test that passes for the wrong reason is worse than no test.
+        if darkmux_flow::redis_url().is_some() {
+            eprintln!("skipping: this machine has Redis configured, so `off` is not the expected state");
+            return;
+        }
+        for uri in ["/fleet/sessions/live", "/fleet/machines/live"] {
+            let app = build_router_local(PathBuf::new());
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["meta"]["sources"]["fleet"]["state"], "off",
+                "{uri}: an unconfigured fleet is not a degradation"
+            );
+            assert_eq!(body["meta"]["complete"], true, "{uri}: `off` must still read as complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_machines_live_carries_machines_plus_a_coverage_state() {
+        // GET /fleet/machines/live (#638) — the same contract as the sessions
+        // endpoint: always 200, never a 500 on a Redis blip, and now an
+        // object whose `meta` says whether the empty case was observed or
+        // merely assumed.
         let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
@@ -593,7 +632,8 @@
         assert_eq!(response.status(), 200);
         let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(body.is_array(), "live-machines response must be a JSON array");
+        assert!(body["machines"].is_array(), "live machines must be a JSON array under `machines`");
+        assert!(body["meta"]["sources"]["fleet"]["state"].is_string(), "coverage state must be reported");
     }
 
     #[tokio::test]

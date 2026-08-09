@@ -164,7 +164,7 @@
       "http_status": 200,
       "ok": true,
       "extra": null,
-      "bytes": 344,
+      "bytes": 497,
       "sanitized": {
         "identifiers": 0,
         "tickets": 0,
@@ -184,7 +184,7 @@
       "http_status": 200,
       "ok": true,
       "extra": null,
-      "bytes": 3,
+      "bytes": 130,
       "sanitized": {
         "identifiers": 0,
         "tickets": 0,

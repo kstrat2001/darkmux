@@ -310,6 +310,12 @@
   .lens.on{background:var(--accent-dim);color:#0a0f17}
   .crumb .sep{color:var(--accent-dim);margin:0 6px}
   .meta{margin-left:auto;font:11px/1.4 'JetBrains Mono',monospace;color:var(--muted);text-align:right}.meta b{color:var(--text)}
+  /* Fleet-coverage marker: shown ONLY when a source could not be read (or is
+     being served stale). An unconfigured fleet is NOT a degradation, so a
+     standalone machine never sees this. Lives in the crumbbar, outside
+     #stage, so it repaints independently of the stageSig() machinery. */
+  .cov{font:600 11px/1.4 'JetBrains Mono',monospace;color:var(--warn);border:1px solid var(--warn);border-radius:4px;padding:1px 7px;white-space:nowrap}
+  .cov[hidden]{display:none}
   .wrap{display:flex;height:calc(100vh - 46px - 40px - 64px)}
   .stage{flex:1;position:relative;overflow:auto;padding:24px}
   .log{width:380px;border-left:1px solid var(--line);background:var(--bg2);display:flex;flex-direction:column}
@@ -815,6 +821,7 @@
 <div class="crumbbar">
   <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-console" data-act="console">console</a><a class="lens" id="lens-runs" data-act="runs">runs</a><a class="lens" id="lens-machine" data-act="machine">machine</a></span>
   <span class="crumb" id="crumb"></span>
+  <span class="cov" id="cov" hidden></span>
   <span class="meta" id="meta"></span>
 </div>
 <div class="wrap">
@@ -3661,15 +3668,55 @@ function ensureWtSumPoll(sid){
 }
 // live mode; playback keeps LIVE_SESSIONS empty so nothing reads "running".
 let LIVE_SESS_TIMER=null;
+// Per-source coverage, keyed by the endpoint that reported it. A source is
+// "degraded" only when it could not be read (`unavailable`) or is being served
+// from a stale snapshot — an `off` source (no Redis configured) is a correct
+// standalone machine, never a warning.
+const COVERAGE={};
+function noteCoverage(key,meta){
+  const s=meta&&meta.sources&&meta.sources.fleet;
+  COVERAGE[key]=(s&&s.state)||null;
+  renderCoverage();
+}
+// (#1665 item 5) The sibling failure, and the more severe one: the poll itself
+// could not reach the DAEMON. Both polls keep their last known set on failure —
+// correct, since stale data still beats a blank screen — but silently, so the
+// headline and every running pill freeze at their last value indefinitely. The
+// data stays; the CLAIM that it is current does not.
+function noteUnreachable(key){ COVERAGE[key]="daemon"; renderCoverage(); }
+// The render half of the three-state contract for this (legacy) viewer: an
+// empty live set caused by an unreadable substrate must not look like a quiet
+// fleet. Deliberately a plain marker, not a modal — the data on screen is
+// still worth reading; it is just no longer claimed to be complete.
+function renderCoverage(){
+  const el=document.getElementById("cov"); if(!el)return;
+  const states=Object.values(COVERAGE);
+  // Worst-first: a dead daemon subsumes anything the daemon would have said
+  // about Redis, and an unavailable source is worse than a stale one.
+  const worst=["daemon","unavailable","stale"].find(s=>states.includes(s));
+  if(!worst){ el.hidden=true; el.textContent=""; return; }
+  const copy={
+    daemon:["⚠ daemon unreachable","The daemon stopped answering. Everything on screen is the last known state, not current — running work may have finished or died since."],
+    unavailable:["⚠ fleet unreachable","Redis could not be read and nothing was cached. This view shows THIS MACHINE only — other machines' work is missing, not absent."],
+    stale:["⚠ fleet data stale","Redis could not be read; showing the last known fleet snapshot. Live seats may be missing."],
+  }[worst];
+  el.textContent=copy[0]; el.title=copy[1]; el.hidden=false;
+}
 async function pollLiveSessions(){
   try{
     const r=await fetch("/fleet/sessions/live",{headers:{accept:"application/json"}});
-    if(!r.ok)return;
-    const arr=await r.json();
-    const next=(Array.isArray(arr)?arr:[]).map(b=>b&&b.session_id).filter(Boolean);
+    if(!r.ok){noteUnreachable("sessions");return;}
+    const body=await r.json();
+    // The endpoint returns {sessions,meta}; tolerate a bare array so a viewer
+    // served from a cache alongside an older daemon still resolves live seats.
+    const arr=Array.isArray(body)?body:(body&&body.sessions)||[];
+    // Unconditional: a success must CLEAR any previously-noted failure, so
+    // the bare-array arm cannot pin the marker on after one transient blip.
+    noteCoverage("sessions",Array.isArray(body)?null:body&&body.meta);
+    const next=arr.map(b=>b&&b.session_id).filter(Boolean);
     LIVE_SESSIONS.clear(); next.forEach(s=>LIVE_SESSIONS.add(s));
     applyLive();   // re-renders only if the live set changed the stage signature
-  }catch(_){/* best-effort — keep the last known live set */}
+  }catch(_){ noteUnreachable("sessions"); /* keep the last known set, but stop claiming it is current */ }
 }
 // (#638) Poll the live-machine set (presence beats) on the same cadence. A
 // machine shows in the fleet view because it's BROADCASTING PRESENCE, not
@@ -3678,12 +3725,14 @@ async function pollLiveSessions(){
 async function pollLiveMachines(){
   try{
     const r=await fetch("/fleet/machines/live",{headers:{accept:"application/json"}});
-    if(!r.ok)return;
-    const arr=await r.json();
+    if(!r.ok){noteUnreachable("machines");return;}
+    const body=await r.json();
+    const arr=Array.isArray(body)?body:(body&&body.machines)||[];   // {machines,meta}; bare array tolerated
+    noteCoverage("machines",Array.isArray(body)?null:body&&body.meta);   // unconditional — see pollLiveSessions
     LIVE_MACHINES.clear();
-    (Array.isArray(arr)?arr:[]).forEach(b=>{ if(b&&b.machine_uid)LIVE_MACHINES.set(b.machine_uid,b); });
+    arr.forEach(b=>{ if(b&&b.machine_uid)LIVE_MACHINES.set(b.machine_uid,b); });
     applyLive();   // machines() unions LIVE_MACHINES → a new present machine re-renders
-  }catch(_){/* best-effort — keep the last known live machines */}
+  }catch(_){ noteUnreachable("machines"); /* keep the last known machines, but stop claiming they are current */ }
 }
 // (#1008) Fetch the local machine's specs + utility-model state. Polled so the
 // utility card's "resident / registered-not-loaded / not-configured" tracks a
