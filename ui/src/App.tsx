@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { useHashRoute } from "./lib/useHashRoute";
 import { useSyncHash } from "./lib/hashSync";
-import { FleetStrip } from "./components/FleetStrip";
+import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
 import { LiveStatusBadge } from "./components/LiveStatusBadge";
@@ -26,9 +26,12 @@ import type { Route } from "./lib/route";
 
 /**
  * The app shell. A `switch` over the parsed [[Route]] (see `lib/route.ts` for
- * the hash-grammar port) drives `#stage`; `fleet` (`FleetStrip`), `runs`
- * (`RunsBoard`, Packet 3), and `machine` (`MachineLens`, Packet 2) are real
- * regions driven by `useQuery`; `session`/`mission-redirect`/`playback`
+ * the hash-grammar port) drives `#stage`; `fleet` (`FleetLens`, Packet 8 —
+ * the savings hero + machine cards + activity timeline; supersedes the
+ * scaffold's original `FleetStrip` presence-only proof region, still tested
+ * standalone in `components/FleetStrip.test.tsx` but no longer mounted
+ * here), `runs` (`RunsBoard`, Packet 3), and `machine` (`MachineLens`,
+ * Packet 2) are real regions driven by `useQuery`; `session`/`mission-redirect`/`playback`
  * (Packet 4) do REAL fetches/navigation wiring per the catalog+replay
  * lens's own doc comments; every other lens renders [[LensPlaceholder]]
  * naming what still needs to be built, per the render-sanity contract
@@ -154,14 +157,15 @@ export function App() {
 
 /** `renderCrumb()` (viewer.html:2476-2568) + each lens's own
  * `$("logscope").textContent=` assignment, folded into one lookup keyed on
- * [[Route]]. Only `machine` has a real (non-empty) mapping ported so far —
- * every other route's crumb/logscope stays empty, matching legacy's actual
- * default for most levels (see e.g. `goldens/fleet.txt`'s `(empty)` crumb)
- * rather than a placeholder string invented for scaffold navigability.
- * `session`/`mission-redirect`/`playback` (Packet 4) fall through to the
- * same empty default — none of them are byte-parity targets for `#crumb`
- * (see each component's own doc for why), so inventing crumb text for them
- * would be UX decoration, not a port. */
+ * [[Route]]. Only `machine` and `fleet` have a real (non-empty) `logscope`
+ * mapping ported so far — every other route's crumb/logscope stays empty,
+ * matching legacy's actual default for most levels (see e.g.
+ * `goldens/fleet.txt`'s `(empty)` crumb) rather than a placeholder string
+ * invented for scaffold navigability. `session`/`mission-redirect`/
+ * `playback` (Packet 4) fall through to the same empty default — none of
+ * them are byte-parity targets for `#crumb` (see each component's own doc
+ * for why), so inventing crumb text for them would be UX decoration, not a
+ * port. */
 function routeChrome(route: Route, localMachineName: string | null): { crumb: string; logscope: string } {
   if (route.kind === "machine") {
     // `$("crumb").innerHTML = state.machine!=null ? escN(state.machine) :
@@ -169,13 +173,26 @@ function routeChrome(route: Route, localMachineName: string | null): { crumb: st
     // m!=null?nameOf(m):"machine"` (viewer.html:1799).
     return { crumb: localMachineName ?? "this machine", logscope: localMachineName ?? "machine" };
   }
+  if (route.kind === "fleet") {
+    // `$("logscope").textContent="fleet"` (viewer.html:1668) — legacy's
+    // literal string is lowercase; `goldens/fleet.txt` shows it UPPERCASE
+    // because `#logscope` sits inside `.loglist h3`, which carries
+    // `text-transform:uppercase` (that whole event-log sidebar isn't ported
+    // yet — see `ui/README.md`'s deferred list). This port has no
+    // `.app-shell__logscope` CSS rule at all (the machine lens's real
+    // machine-name `logscope` above must render mixed-case, unchanged), so
+    // — same discipline as `lib/format.ts`'s "uppercase the STRING
+    // directly" helpers — the string here is ALREADY uppercase rather than
+    // leaning on a CSS rule this port doesn't have.
+    return { crumb: "", logscope: "FLEET" };
+  }
   return { crumb: "", logscope: "" };
 }
 
 function renderRoute(route: Route) {
   switch (route.kind) {
     case "fleet":
-      return <FleetStrip />;
+      return <FleetLens />;
     case "runs":
       return <RunsBoard initialKind={route.runsKind} />;
     case "machine":

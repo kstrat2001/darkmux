@@ -699,3 +699,302 @@ body {
   font: 12px/1.4 -apple-system, sans-serif;
   padding: 8px 9px;
 }
+
+/* ── Fleet lens (Packet 8) — the savings hero + machine cards + recent-
+   activity timeline, ported nearly verbatim from viewer.html's own <style>
+   block (search that file for `.savings`/`.mach`/`.fleettl`). Same
+   load-bearing-CSS caveat as the runs/console/catalog blocks above:
+   `.savrow`/`.savclasses`/`.name`/`.tlhdr`/`.twin`/`.lane`/`.tlaxis` are all
+   `display:flex` (or `inline-flex`) — Chromium's `innerText()` puts each
+   DIRECT CHILD of a flex container on its OWN line regardless of visual
+   wrapping (verified empirically against the recorded goldens — see the
+   runs-lens block's own comment for the same finding), which is what turns
+   the hero's number/label PAIRS and the timeline header's two spans into
+   the exact line breaks `goldens/fleet.txt` expects. `text-transform:
+   uppercase` on `.saveyebrow`/`.savlbl`/`.savc .scl`/`.tlhdr`/`.twinb` is
+   what turns the lowercase source strings ("by your fleet", "local
+   tokens", "recent activity") into the golden's UPPERCASE text — don't
+   "clean up" either property without re-running the parity spec. Colors
+   are approximated against this port's own root palette rather than
+   reproducing legacy's separate token set verbatim (`innerText()` never
+   reads color). */
+.savings {
+  margin: 0 0 18px;
+  padding: 16px 22px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(74, 222, 128, 0.06), rgba(74, 222, 128, 0.01));
+}
+.saveyebrow {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  margin-bottom: 12px;
+}
+.savrow {
+  display: flex;
+  align-items: center;
+  gap: 14px 40px;
+  flex-wrap: wrap;
+}
+.savlead {
+  flex: 0 0 auto;
+}
+.savnum {
+  font: 700 48px/1 "JetBrains Mono", monospace;
+  color: #5af0a3;
+  letter-spacing: 0.01em;
+}
+.savlead.cloud .savnum {
+  color: var(--accent);
+}
+.savlead.unknown .savnum {
+  color: var(--dim);
+}
+.savlbl {
+  font: 600 12px/1 "JetBrains Mono", monospace;
+  color: var(--fg);
+  margin-top: 7px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.savclasses {
+  display: flex;
+  gap: 10px 30px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  flex: 1 1 auto;
+}
+.savc .scv {
+  font: 600 23px/1.1 "JetBrains Mono", monospace;
+  color: var(--fg);
+}
+.savc.gen .scv {
+  color: #5af0a3;
+}
+.savc.uncls .scv {
+  color: var(--dim);
+}
+.savc .scl {
+  font: 10px/1.5 "JetBrains Mono", monospace;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 3px;
+}
+.hybnote {
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font: 12px "JetBrains Mono", monospace;
+  color: #5af0a3;
+}
+.hybnote .hybpre {
+  color: var(--fg);
+  font-weight: 700;
+}
+.hybts {
+  color: var(--dim);
+  font-size: 10px;
+}
+.hyblink {
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 11px;
+  margin-left: 4px;
+}
+.hyblink:hover {
+  text-decoration: underline;
+}
+
+.fleet {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: stretch;
+}
+.mach {
+  width: 248px;
+  display: flex;
+  flex-direction: column;
+  background: #131826;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.mach:hover {
+  border-color: var(--accent);
+}
+.mach.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.mach .name {
+  font: 600 15px/1 "JetBrains Mono", monospace;
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mico {
+  display: inline-flex;
+  color: var(--accent);
+}
+.mico svg {
+  width: 19px;
+  height: 19px;
+  display: block;
+}
+.mach .spec {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  margin-top: 3px;
+}
+.mach .specdim {
+  opacity: 0.5;
+  font-style: italic;
+}
+.mach .stat {
+  margin-top: 12px;
+  font: 12px "JetBrains Mono", monospace;
+}
+.mach .runs {
+  margin-top: 5px;
+  font: 12px "JetBrains Mono", monospace;
+  color: var(--fg);
+}
+.mach .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 7px;
+  vertical-align: middle;
+}
+.mach.absent {
+  opacity: 0.45;
+}
+.mach.absent .dot {
+  background: var(--dim);
+  box-shadow: none;
+}
+
+.fleettl {
+  margin-top: 30px;
+  border-top: 1px solid var(--border);
+  padding-top: 18px;
+}
+.tlhdr {
+  font: 600 11px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.twin {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.twinb {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  padding: 4px 8px;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  text-transform: uppercase;
+}
+.twinb + .twinb {
+  border-left: 1px solid var(--border);
+}
+.twinb:hover {
+  color: var(--fg);
+}
+.twinb.on {
+  background: var(--accent);
+  color: var(--bg);
+}
+.lane {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 7px;
+}
+.lname {
+  width: var(--lname-w, 150px);
+  flex: none;
+  font: 12px "JetBrains Mono", monospace;
+  color: var(--fg);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tltrack {
+  position: relative;
+  flex: 1;
+  height: 28px;
+  background: #131826;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.sbar {
+  position: absolute;
+  top: 5px;
+  height: 18px;
+  background: var(--dim);
+  border-radius: 3px;
+  min-width: 2px;
+}
+.sbar.run {
+  background-color: #ffd166;
+  box-shadow: 0 0 6px #ffd166;
+}
+.sbar.done {
+  background-color: #5af0a3;
+}
+.sbar.canceled {
+  background-color: #ffb86b;
+}
+.sbar.err {
+  background-color: var(--error);
+}
+.tltrack .ph {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--fg);
+  opacity: 0.32;
+}
+.tlaxis {
+  margin-left: calc(var(--lname-w, 150px) + 12px);
+  display: flex;
+  justify-content: space-between;
+  font: 9px "JetBrains Mono", monospace;
+  color: var(--dim);
+  margin-top: 7px;
+}
+.tlempty {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+
+/* (#1729) Fleet-coverage marker on the default view — shown ONLY when the
+   presence substrate could not be read (or is stale). An unconfigured fleet
+   is not a degradation, so a standalone machine never sees this. */
+.fleetcov{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:9px 14px;border:1px solid var(--warn);border-radius:8px;color:var(--warn);font:600 12px/1.4 'JetBrains Mono',monospace}
+.fleetcov__icon{flex:none}
