@@ -41,8 +41,17 @@ describe("labFieldVal", () => {
   it("shortens a darkmux-namespaced string value", () => {
     expect(labFieldVal("darkmux:foo")).toBe("foo");
   });
-  it("stringifies a non-string value verbatim", () => {
-    expect(labFieldVal(4)).toBe("4");
+  it("passes a non-string value through unchanged (a number stays a number)", () => {
+    // Pre-reconciliation, this file's OWN `labFieldVal` stringified every
+    // non-`darkmux:` value (`String(v)`) — a real divergence from legacy
+    // (`crates/darkmux-serve/assets/viewer.html`: `... : v`, no `String()`)
+    // that `../lab/labSeries.ts`'s differential-tested port caught (see its
+    // own `labFieldVal` test: "renders zero as zero, NOT as the em dash —
+    // 0 is a real knob value"). Invisible in the rendered DOM either way
+    // (template-literal interpolation stringifies a number regardless), but
+    // a real behavioral difference for any caller reading the return value
+    // directly — fixed here by reconciling onto the canonical function.
+    expect(labFieldVal(4)).toBe(4);
   });
 });
 
@@ -181,7 +190,9 @@ describe("labKnobSummary", () => {
 
 describe("labKnobDiff", () => {
   it("returns null when either side is missing", () => {
-    expect(labKnobDiff(undefined, labRun({ dir: "a", mtime_ms: 1 }))).toBeNull();
+    // The canonical `labKnobDiff` (`../lab/labSeries.ts`, re-exported below)
+    // types "missing" as `| null`, not `| undefined` — matches `null`.
+    expect(labKnobDiff(null, labRun({ dir: "a", mtime_ms: 1 }))).toBeNull();
   });
   it("reports 'no change' as an empty array when nothing differs", () => {
     const a = labRun({ dir: "a", mtime_ms: 1, crew: "c1" });

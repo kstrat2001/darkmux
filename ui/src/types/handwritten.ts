@@ -138,34 +138,50 @@ export interface MachineResourcesModel {
  * `labKnobDiff` in the legacy viewer). `SeatStaffingSnapshot` carries more
  * (`role_id`, `remote`, `endpoint`, `passes`, `selector`, `provenance`) —
  * widen this as a lens actually consumes more of it, per this file's own
- * convention. Source: `crates/darkmux-lab/src/lab/review.rs::SeatStaffingSnapshot`. */
+ * convention. `model`/`k` are optional (not `| null` — the real payload
+ * omits rather than nulls an absent seat field) so a seat missing either one
+ * mid-diff (the "+probe"/"-probe" appear/disappear case `labKnobDiff` in
+ * `ui/src/lenses/lab/labSeries.ts` exercises) still type-checks; a run's own
+ * REAL emitted seats always carry both. Source:
+ * `crates/darkmux-lab/src/lab/review.rs::SeatStaffingSnapshot`. */
 export interface SeatStaffing {
   name: string;
-  model: string;
-  k: number;
+  model?: string;
+  k?: number;
   n_ctx?: number;
   max_tokens?: number;
 }
 
 /** Source: `crates/darkmux-lab/src/lab/review.rs::StaffingSnapshot` (the
  * `verify`/`request_changes` fields exist on the real struct but are unread
- * by the runs lens's series view — same widen-when-consumed note as above). */
+ * by the runs lens's series view — same widen-when-consumed note as above).
+ * `probes` is optional here (the real struct always sends the array, even
+ * empty) to match `labKnobSummary`'s own `st.probes || []` null-guard and
+ * the lab-series test spec's minimal fixtures (`{ judge: {...} }` alone). */
 export interface StaffingSnapshot {
-  probes: SeatStaffing[];
+  probes?: SeatStaffing[];
   judge?: SeatStaffing;
 }
 
 /** One row of `GET /lab/runs`'s `runs` array — the SAME on-disk scan `/runs`
  * folds lab-bench runs from (see `Run`'s own doc), but carrying the lab-only
  * extras (`staffing` snapshot, bundle/flag counts) the flat `Run` shape
- * doesn't. Source: `crates/darkmux-serve/src/lib.rs::LabRunSummary`. */
+ * doesn't. `crew`/`exec_mode`/`staffing` accept an explicit `null` in
+ * addition to `undefined` — `labKnobDiff`'s `(prev.crew || null) !==
+ * (curr.crew || null)` comparison treats the two as the same "absent" value
+ * (see `labSeries.test.ts`'s differential-tested case for why that matters:
+ * comparing the RAW fields instead emits a phantom no-op diff line).
+ * `has_funnels`/`has_events` are always present on a real payload (see
+ * `tests/parity/corpus/lab-runs.json`) but stay optional here because the
+ * runs-lens's own test fixtures predate the field. Source:
+ * `crates/darkmux-serve/src/lib.rs::LabRunSummary`. */
 export interface LabRun {
   dir: string;
   mtime_ms: number;
   case_ids: string[];
-  crew?: string;
-  exec_mode?: string;
-  staffing?: StaffingSnapshot;
+  crew?: string | null;
+  exec_mode?: string | null;
+  staffing?: StaffingSnapshot | null;
   bundles: number;
   raw_flags: number;
   deduped_flags: number;
@@ -174,6 +190,8 @@ export interface LabRun {
   archived: number;
   degenerate: boolean;
   finished: boolean;
+  has_funnels?: boolean;
+  has_events?: boolean;
 }
 
 /** `GET /lab/runs` itself. `configured: false` (with an empty `runs`) means
