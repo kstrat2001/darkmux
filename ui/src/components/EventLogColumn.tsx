@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import type { FlowRecord } from "../types/handwritten";
 import { recKey } from "../lib/flow";
 import { clk } from "../lib/format";
+import { RecordView } from "./RecordView";
 
 /** `activityOf()` — viewer.html:1014-1038, the subset this column's "model
  * only" quick filter and row tags need (reasoning/tool-call/turn/dispatch
@@ -311,11 +312,7 @@ export function EventLogColumn({
 function EventDetail({ record }: { record: FlowRecord }) {
   return (
     <div className="eventlog__detailcard">
-      <div className="eventlog__detailsummary">
-        {activityOf(record)} · {clk(Date.parse(record.ts))}
-        {record.machine_id ? ` · ${record.machine_id}` : ""}
-      </div>
-      <pre className="eventlog__detailpre">{JSON.stringify(record, null, 2)}</pre>
+      <RecordView record={record as unknown as Record<string, unknown>} />
     </div>
   );
 }

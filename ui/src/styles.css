@@ -391,7 +391,23 @@ body {
 .eventlog {
   width: 380px;
   flex: none;
-  align-self: stretch;
+  /* VIEWPORT-bounded and sticky, NOT stretched to the row.
+     History, because this has now been wrong twice in opposite directions:
+     it shipped as a fixed `70vh`, which left dead space below the column on
+     a tall window; `align-self: stretch` fixed that and introduced a worse
+     bug, because the row's height is driven by the STAGE's content, not the
+     viewport — with a real fleet the stage is ~2300px, so the column became
+     2345px, its 38% detail panel became 862px holding a 255px card, and the
+     event list was pushed 600px of blank space down the page. (Measured. The
+     stretch fix looked correct only because it was verified against a
+     data-less harness where the stage is short.)
+     Legacy bounds the whole `.wrap` to the viewport and scrolls `#stage`
+     internally; sticky gets the same bound without changing how the page
+     scrolls. */
+  position: sticky;
+  top: var(--chrome-h, 97px);
+  align-self: flex-start;
+  max-height: calc(100vh - var(--chrome-h, 97px));
   min-height: 320px;
   display: flex;
   flex-direction: column;
@@ -1643,3 +1659,41 @@ body {
    is not a degradation, so a standalone machine never sees this. */
 .fleetcov{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:9px 14px;border:1px solid var(--warn);border-radius:8px;color:var(--warn);font:600 12px/1.4 'JetBrains Mono',monospace}
 .fleetcov__icon{flex:none}
+
+/* ── Record view — a flow record rendered for a person (see RecordView.tsx
+   for why this is name/type-driven rather than 26 per-action templates). */
+.rv { font: 12px/1.5 "JetBrains Mono", monospace; }
+.rv__head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
+.rv__action { font-weight: 700; font-size: 13px; color: var(--accent); }
+.rv__handle { color: var(--fg); }
+.rv__when { color: var(--dim); font-size: 11px; margin-bottom: 10px; }
+.rv__dim { color: var(--dim); }
+
+.rv__group { margin: 0 0 10px; padding: 8px 10px; background: rgba(255,255,255,.025);
+             border: 1px solid var(--border); border-radius: 6px; }
+.rv__grouphd { font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+               color: var(--dim); margin-bottom: 6px; }
+
+.rv__row { display: flex; gap: 10px; align-items: baseline; padding: 1px 0; }
+.rv__key { flex: none; width: 116px; color: var(--dim); font-size: 11px;
+           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv__val { flex: 1; min-width: 0; word-break: break-word; }
+
+.rv__num  { color: #e6c07b; }
+.rv__str  { color: var(--fg); }
+.rv__id   { color: var(--fg); opacity: .85; }
+.rv__nil  { color: var(--dim); }
+.rv__time { color: var(--fg); }
+.rv__bool { color: var(--dim); }
+.rv__bool.on { color: var(--good, #4ade80); }
+.rv__chip { display: inline-block; padding: 0 6px; border-radius: 4px;
+            background: rgba(255,255,255,.06); color: var(--fg); font-size: 11px; }
+
+.rv__ctx { margin-bottom: 8px; }
+.rv__constants { margin-bottom: 8px; }
+.rv__toggle, .rv__more {
+  background: none; border: none; padding: 2px 0; color: var(--accent);
+  font: 11px "JetBrains Mono", monospace; cursor: pointer; text-align: left;
+}
+.rv__toggle:hover, .rv__more:hover { text-decoration: underline; }
+.rv__rawtoggle { display: block; margin-top: 4px; }
