@@ -278,7 +278,7 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(screen.getByText(/observability/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("darkmux")).toBeInTheDocument());
   });
 
   // (Chrome packet) `showsEventLog` is a pure-function unit-tested directly

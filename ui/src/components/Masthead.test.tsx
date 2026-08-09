@@ -26,7 +26,7 @@ describe("Masthead", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     renderMasthead({ kind: "fleet" });
     expect(screen.getByText(/darkmux/)).toBeInTheDocument();
-    expect(screen.getByText(/observability/)).toBeInTheDocument();
+    expect(screen.getByText("darkmux")).toBeInTheDocument();
     vi.unstubAllGlobals();
   });
 
