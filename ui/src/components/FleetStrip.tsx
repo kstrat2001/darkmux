@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
-import type { PresenceBeat } from "../types/handwritten";
+import type { FleetMachinesLiveResponse, PresenceBeat } from "../types/handwritten";
 
 /**
  * The scaffold's ONE real region (per the packet brief): a live strip over
@@ -18,7 +18,7 @@ import type { PresenceBeat } from "../types/handwritten";
 export function FleetStrip() {
   const query = useQuery({
     queryKey: queryKeys.fleetMachinesLive(),
-    queryFn: () => fetchJson<PresenceBeat[]>("/fleet/machines/live"),
+    queryFn: () => fetchJson<FleetMachinesLiveResponse>("/fleet/machines/live"),
     refetchInterval: PRESENCE_POLL_MS,
   });
 
@@ -46,7 +46,37 @@ export function FleetStrip() {
     );
   }
 
-  const machines = query.data.data;
+  const machines = query.data.data.machines ?? [];
+  const coverage = query.data.data.meta?.sources?.fleet;
+
+  // (#1729) An empty strip has two very different causes, and the daemon now
+  // tells us which. `off`/`ok` mean we LOOKED: a standalone machine, or a
+  // genuinely quiet fleet. `unavailable`/`stale` mean we COULDN'T look — the
+  // machines are missing from the answer, not absent from the world. This is
+  // the distinction the whole marker exists for; rendering both as the
+  // reassuring "no machines present" copy below is the original defect.
+  //
+  // `stale` is unreachable from THIS endpoint today (the presence handlers
+  // emit only ok/unavailable/off; only the fleet-flow cache in #1707 can go
+  // stale). It is handled because the type says it can arrive, not because
+  // it does — so the copy describes what this component would actually show
+  // rather than promising a last-known set it does not render here.
+  if (coverage && (coverage.state === "unavailable" || coverage.state === "stale")) {
+    const stale = coverage.state === "stale";
+    return (
+      <div className="fleet-strip fleet-strip--degraded" data-state="degraded" role="status">
+        <span className="fleet-strip__icon">⚠</span>
+        <span>
+          {stale
+            ? `Fleet presence is stale${
+                "age_ms" in coverage ? ` (${Math.round(coverage.age_ms / 1000)}s old)` : ""
+              } — machines may have come or gone since.`
+            : "Fleet presence could not be read — other machines are missing from the answer, not absent."}
+        </span>
+        {machines.length > 0 ? <span className="fleet-strip__count">{machines.length} last known</span> : null}
+      </div>
+    );
+  }
 
   if (machines.length === 0) {
     return (

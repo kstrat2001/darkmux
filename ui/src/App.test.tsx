@@ -19,6 +19,15 @@ afterEach(() => {
   window.location.hash = "";
 });
 
+/** (#1729) The presence endpoints answer an ENVELOPE, not a bare array. The
+ *  hooks tolerate a bare array via `?? []`, which means a stale stub goes
+ *  silently empty instead of failing — the exact trap that let the real
+ *  breakage sit behind 222 green tests. Stubs speak the real shape. */
+const FLEET_OFF = (key: "machines" | "sessions") => ({
+  [key]: [],
+  meta: { sources: { fleet: { state: "off" } }, complete: true },
+});
+
 describe("App", () => {
   it("mounts without an infinite update-depth error and renders the fleet lens by default", async () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
@@ -157,6 +166,10 @@ describe("App", () => {
       const path = String(url);
       if (path.includes("/lab/runs")) return Promise.resolve(new Response(JSON.stringify({ configured: true, dir: "", exists: true, runs: [] }), { status: 200 }));
       if (path.includes("/runs")) return Promise.resolve(new Response(JSON.stringify({ runs: [] }), { status: 200 }));
+      if (path.includes("/fleet/machines/live"))
+        return Promise.resolve(new Response(JSON.stringify(FLEET_OFF("machines")), { status: 200 }));
+      if (path.includes("/fleet/sessions/live"))
+        return Promise.resolve(new Response(JSON.stringify(FLEET_OFF("sessions")), { status: 200 }));
       if (path.includes("/fleet/") || path.includes("/flow")) return Promise.resolve(new Response("[]", { status: 200 }));
       return Promise.resolve(new Response("not recorded in this mock\n", { status: 404 }));
     });

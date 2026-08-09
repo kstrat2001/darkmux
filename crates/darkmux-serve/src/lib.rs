@@ -43,6 +43,7 @@ pub mod mission_graph;
 /// pins against) — `runs_handler` below is this module's only caller.
 mod panel;
 mod runs;
+mod source_state;
 // (#1637) Golden-file generation for the wire types the browser specs consume.
 // Test-only: it exists so a Playwright fixture cannot drift from the shape the
 // server actually emits.
@@ -630,24 +631,66 @@ re-run. Or bind to 127.0.0.1 (the default) for a loopback-only daemon."
 /// record-derived machines so a present machine appears (and a machine that
 /// stops beating drops off) regardless of work.
 ///
-/// Returns `[]` when `DARKMUX_REDIS_URL` is unset or unreachable — a
-/// single-machine, file-only fleet has no shared presence substrate, so the
-/// viewer falls back to record-derived machines. Never 500s on a Redis blip.
+/// Never 500s on a Redis blip. But an empty machine list means one of two
+/// very different things, and this endpoint used to answer both with the
+/// same bare `[]`: either **no machine is beating** (an unconfigured or
+/// genuinely quiet fleet), or **the presence substrate could not be read**
+/// (a hub whose Redis just died — every machine still alive and working).
+/// The response is now an object whose `meta.sources.fleet` says which,
+/// per [`source_state`]; `machines` holds the beats as before.
 async fn fleet_machines_live_handler() -> impl IntoResponse {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     let redis_url = darkmux_flow::redis_url();
-    let beats: Vec<darkmux_flow::presence::PresenceBeat> = match redis_url {
-        Some(url) => tokio::task::spawn_blocking(move || {
-            redis::Client::open(url.expose_for_probe())
-                .ok()
-                .and_then(|c| darkmux_flow::presence::read_live(&c).ok())
-                .unwrap_or_default()
-        })
-        .await
-        .unwrap_or_default(),
-        None => Vec::new(),
+    let (beats, state) = match redis_url {
+        Some(url) => tokio::task::spawn_blocking(move || read_presence_beats(&url, "machines", darkmux_flow::presence::read_live))
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("darkmux serve: GET /fleet/machines/live task failed ({e})");
+                (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED })
+            }),
+        None => (Vec::new(), source_state::SourceState::Off),
     };
-    axum::Json(beats)
+    axum::Json(serde_json::json!({
+        "machines": beats,
+        "meta": source_state::coverage_meta(&state),
+    }))
+}
+
+/// The literal every presence failure reports on the wire. Never the
+/// underlying error — see [`source_state`] on why `detail` excludes it.
+const PRESENCE_READ_FAILED: &str = "could not read presence beats from Redis";
+
+/// Read one presence key-space, classifying the outcome instead of
+/// flattening it.
+///
+/// Both live endpoints previously ran `.ok().and_then(…).ok().unwrap_or_default()`,
+/// which swallowed the client-open error AND the read error AND logged
+/// neither — the most silent instance of the empty-on-failure class in the
+/// daemon. `kind` names the key-space for the log line only.
+fn read_presence_beats<T, F>(
+    url: &darkmux_flow::RawRedisUrl,
+    kind: &str,
+    read: F,
+) -> (Vec<T>, source_state::SourceState)
+where
+    F: FnOnce(&redis::Client) -> Result<Vec<T>, anyhow::Error>,
+{
+    // Never interpolate the url into a log (#661 Slice 5) — it can carry an
+    // inline password. `kind` is the non-secret context.
+    let client = match redis::Client::open(url.expose_for_probe()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("darkmux serve: live-{kind} presence — opening the Redis client failed ({e})");
+            return (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED });
+        }
+    };
+    match read(&client) {
+        Ok(beats) => (beats, source_state::SourceState::Ok),
+        Err(e) => {
+            eprintln!("darkmux serve: live-{kind} presence — reading the beats failed ({e})");
+            (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED })
+        }
+    }
 }
 
 /// GET /fleet/sessions/live — the sessions with a live heartbeat right now
@@ -658,25 +701,32 @@ async fn fleet_machines_live_handler() -> impl IntoResponse {
 /// dispatch ages out of the live set instead of showing "running" forever
 /// for want of a `dispatch.complete` record.
 ///
-/// Returns `[]` when `DARKMUX_REDIS_URL` is unset or unreachable —
-/// single-machine, file-only fleets have no live-session substrate, so the
-/// viewer shows terminal status only. Never 500s on a Redis blip (the live
-/// signal is best-effort; degraded == "nothing live", not an error).
+/// Never 500s on a Redis blip. The old doc for this handler asserted that
+/// "degraded == nothing live, not an error" — which is precisely the
+/// conflation being removed: for a viewer that keys "running" on membership
+/// here, an unreadable substrate rendered as *nothing live* turns every
+/// in-flight dispatch on the fleet into a dead-looking seat (#1483). The
+/// response is now an object carrying `sessions` plus a
+/// `meta.sources.fleet` state, so "no live sessions" and "could not look"
+/// are distinguishable by the client.
 async fn fleet_sessions_live_handler() -> impl IntoResponse {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     let redis_url = darkmux_flow::redis_url();
-    let beats: Vec<darkmux_flow::session_presence::SessionBeat> = match redis_url {
+    let (beats, state) = match redis_url {
         Some(url) => tokio::task::spawn_blocking(move || {
-            redis::Client::open(url.expose_for_probe())
-                .ok()
-                .and_then(|c| darkmux_flow::session_presence::read_live_sessions(&c).ok())
-                .unwrap_or_default()
+            read_presence_beats(&url, "sessions", darkmux_flow::session_presence::read_live_sessions)
         })
         .await
-        .unwrap_or_default(),
-        None => Vec::new(),
+        .unwrap_or_else(|e| {
+            eprintln!("darkmux serve: GET /fleet/sessions/live task failed ({e})");
+            (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED })
+        }),
+        None => (Vec::new(), source_state::SourceState::Off),
     };
-    axum::Json(beats)
+    axum::Json(serde_json::json!({
+        "sessions": beats,
+        "meta": source_state::coverage_meta(&state),
+    }))
 }
 
 /// CORS layer for the daemon's browser-facing endpoints. **Default**:
@@ -1519,13 +1569,21 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<serde_json::V
     // row against local + fleet together.
     let result = tokio::task::spawn_blocking(move || {
         let fleet = fleet_flow_records();
-        runs::build_runs(&flows_dir, lab_dir.as_deref(), &fleet)
+        (runs::build_runs(&flows_dir, lab_dir.as_deref(), &fleet.records), fleet.state)
     })
     .await;
-    let runs = result.unwrap_or_default();
+    let (runs, fleet_state) = result.unwrap_or_else(|e| {
+        // A join failure means NOTHING was aggregated — the empty array below
+        // is a total failure, not an idle fleet. Previously this was a bare
+        // `unwrap_or_default()`: silent on stderr and indistinguishable on the
+        // wire from "no runs".
+        eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
+        (Vec::new(), source_state::SourceState::Unavailable { detail: "the run aggregation failed" })
+    });
     axum::Json(serde_json::json!({
         "runs": runs,
         "generated_at_ms": current_millis(),
+        "meta": source_state::coverage_meta(&fleet_state),
     }))
 }
 
@@ -2813,15 +2871,26 @@ async fn flow_missions_handler(State(state): State<AppState>) -> impl IntoRespon
     let dir = state.flows_dir.clone();
     // (#1705) The fleet read happens INSIDE the same blocking task as the
     // day-file walk — one `spawn_blocking`, not two round trips.
-    let missions = tokio::task::spawn_blocking(move || {
+    let (missions, fleet_state) = tokio::task::spawn_blocking(move || {
         let fleet = fleet_flow_records();
-        scan_flow_missions(&dir, &fleet)
+        (scan_flow_missions(&dir, &fleet.records), fleet.state)
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        // As in `/runs`: an empty catalog here would otherwise read as "this
+        // fleet has never run a mission".
+        eprintln!(
+            "darkmux serve: GET /flow-missions aggregation task failed ({e}); serving no missions"
+        );
+        (
+            Vec::new(),
+            source_state::SourceState::Unavailable { detail: "the mission aggregation failed" },
+        )
+    });
     axum::Json(serde_json::json!({
         "missions": missions,
         "generated_at_ms": current_millis(),
+        "meta": source_state::coverage_meta(&fleet_state),
     }))
 }
 
@@ -2980,21 +3049,32 @@ async fn catalog_records_response(
             .into_response();
     }
     let dir = state.flows_dir.clone();
-    let (records, truncated) = tokio::task::spawn_blocking(move || {
+    let (records, truncated, fleet_state) = tokio::task::spawn_blocking(move || {
         // (#1707 gate CONSIDER 5) The fleet half too — otherwise the
         // missions lens now LISTS a peer's mission (#1705) and clicking
         // through to replay it returns zero records: a dead end created by
         // making the mission visible in the first place.
         let fleet = fleet_flow_records();
-        collect_records_by_field(&dir, &fleet, field, &id)
+        let (records, truncated) = collect_records_by_field(&dir, &fleet.records, field, &id);
+        (records, truncated, fleet.state)
     })
     .await
-    .unwrap_or_else(|_| (Vec::new(), false));
+    .unwrap_or_else(|e| {
+        // The replay of a PEER's mission lives entirely in the fleet half, so
+        // a degraded read here empties the exact view the operator opened.
+        eprintln!("darkmux serve: catalog record collection failed ({e}); serving no records");
+        (
+            Vec::new(),
+            false,
+            source_state::SourceState::Unavailable { detail: "the record collection failed" },
+        )
+    });
     axum::Json(serde_json::json!({
         "records": records,
         "count": records.len(),
         "truncated": truncated,
         "generated_at_ms": current_millis(),
+        "meta": source_state::coverage_meta(&fleet_state),
     }))
     .into_response()
 }
@@ -3183,7 +3263,22 @@ pub(crate) fn flow_record_identity(r: &serde_json::Value) -> String {
 /// The cached fleet snapshot: when it was read, and what it held.
 type FleetCache = Option<(std::time::Instant, Vec<serde_json::Value>)>;
 
-pub(crate) fn fleet_flow_records() -> Vec<serde_json::Value> {
+/// What one fleet read produced: the records, AND how completely they cover
+/// the source.
+///
+/// The state travels WITH the records deliberately. The predecessor of this
+/// type was a bare `Vec<serde_json::Value>`, which had nowhere to put the bad
+/// news — so every caller silently published a degraded read as a complete
+/// one, and no reviewer could see the omission because there was nothing to
+/// see. Returning the pair makes a caller that drops the state do so
+/// visibly, and makes the next aggregation added here confront the question
+/// at compile time rather than by remembering to.
+pub(crate) struct FleetRead {
+    pub(crate) records: Vec<serde_json::Value>,
+    pub(crate) state: source_state::SourceState,
+}
+
+pub(crate) fn fleet_flow_records() -> FleetRead {
     // (#1705) Short-TTL shared cache. The read costs ~344ms over a tailnet
     // (measured: `XREVRANGE … COUNT 10000` against the hub), and the viewer
     // polls `/runs` and `/flow-missions` on a timer — so without this the
@@ -3204,23 +3299,29 @@ pub(crate) fn fleet_flow_records() -> Vec<serde_json::Value> {
     let cache = FLEET_CACHE.get_or_init(|| std::sync::Mutex::new(None));
     // A stale entry is deliberately RETAINED rather than cleared: the
     // failure path below serves it if the refresh fails.
+    // A hit inside the TTL is a SUCCESSFUL read at most `FLEET_CACHE_TTL`
+    // old, never a fallback: the failure path below deliberately leaves the
+    // cache instant untouched, so a stale entry can only be served after the
+    // TTL has already expired — i.e. through the `Stale` arm, never here.
     if let Ok(guard) = cache.lock() {
         if let Some((at, records)) = guard.as_ref() {
             if at.elapsed() < FLEET_CACHE_TTL {
-                return records.clone();
+                return FleetRead { records: records.clone(), state: source_state::SourceState::Ok };
             }
         }
     }
 
     let Some(url) = darkmux_flow::redis_url() else {
-        return Vec::new();
+        // Not a degradation — a single-machine install has no fleet
+        // substrate by design, and warning about it would be the bug.
+        return FleetRead { records: Vec::new(), state: source_state::SourceState::Off };
     };
     match read_flow_records_from_redis(url.expose_for_probe(), None) {
         Ok(records) => {
             if let Ok(mut guard) = cache.lock() {
                 *guard = Some((std::time::Instant::now(), records.clone()));
             }
-            records
+            FleetRead { records, state: source_state::SourceState::Ok }
         }
         Err(e) => {
             // (#1707 gate) Serve the LAST-KNOWN-GOOD snapshot rather than
@@ -3237,23 +3338,40 @@ pub(crate) fn fleet_flow_records() -> Vec<serde_json::Value> {
             let stale = cache
                 .lock()
                 .ok()
-                .and_then(|guard| guard.as_ref().map(|(_, records)| records.clone()));
+                .and_then(|guard| guard.as_ref().map(|(at, records)| (*at, records.clone())));
+            // `detail` is one of OUR literals, never `{e}` — a Redis error can
+            // embed the connection URL, and the env tier of `redis_url()`
+            // carries an inline password. The full error goes to stderr (this
+            // process's own log); the wire gets the classification only.
+            const DETAIL: &str = "could not read the fleet stream from Redis";
             match stale {
-                Some(records) => {
+                Some((at, records)) => {
                     eprintln!(
                         "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
                          serving the last-known-good fleet snapshot ({} records) plus this \
                          machine's own",
                         records.len()
                     );
-                    records
+                    FleetRead {
+                        records,
+                        state: source_state::SourceState::Stale {
+                            // Saturating: `Instant::elapsed` is monotonic, so
+                            // this cannot overflow in practice, but a cast is
+                            // not the place to find out.
+                            age_ms: u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            detail: DETAIL,
+                        },
+                    }
                 }
                 None => {
                     eprintln!(
                         "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
                          no previous snapshot — serving this machine's records only"
                     );
-                    Vec::new()
+                    FleetRead {
+                        records: Vec::new(),
+                        state: source_state::SourceState::Unavailable { detail: DETAIL },
+                    }
                 }
             }
         }
