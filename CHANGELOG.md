@@ -11,6 +11,39 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-08-10
+
+**A PR review could tell you code was missing when it was right there.** The
+review bundler mapped every changed line to its enclosing function and used
+that function's extent as the excerpt shown to AI review seats. Top-level
+statements — imports, consts, a trailing `main().then(...).catch(...)` — have
+no enclosing function, so they hit a silent `continue` and never reached a
+seat at all. Nothing recorded the loss: the file still yielded bundles for
+its functions, so `BundleSkipReport` looked clean. Seats then judged a
+truncated window with full confidence and produced false "this code is
+missing" findings. Patch release; no schema changes (FLOW `1.18.0`, CONFIG
+`1.5`, MISSION_CONFIG `1.3`).
+
+### Fixed
+- **Unenclosed top-level lines now reach a seat.** `build_bundles` collects
+  changed lines with no enclosing function into maximal contiguous runs and
+  bundles each as its own `"toplevel"`-family excerpt (a top-of-file import
+  block and a tail invocation chain become two separate, locally-scoped
+  bundles rather than a span stretching across everything in between). A run
+  over the existing 300-line function-cap is declined via a new
+  `SkipReason::TopLevelOverSizeCap`, so any remaining decline is recorded
+  instead of silent.
+- **Unchanged context lines no longer masquerade as top-level code.** A diff
+  hunk mixes added lines with unchanged context lines by design, so the first
+  fix above initially bundled unchanged imports/statements pulled in by
+  `-U3` context alongside a genuinely changed line elsewhere in the same
+  file — inflating probe draws and letting seats anchor findings on lines
+  the diff never touched. `Hunk` now carries `added_line_numbers`, the
+  strict `+`-prefixed subset of its lines; only unenclosed lines that are
+  actually added become their own bundle, while unenclosed context lines are
+  dropped exactly as they silently were before either fix (correct, since
+  nothing changed there).
+
 ## [2.5.0] - 2026-08-06
 
 The honesty release. Nearly every fix here is one defect wearing different
@@ -294,6 +327,7 @@ schema changes (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`).
   "ready" with no time reference at all, indistinguishable from a fleet that
   had never dispatched.
 
+[2.5.1]: https://github.com/kstrat2001/darkmux/releases/tag/v2.5.1
 [2.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.5.0
 [2.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.4.0
 [2.3.1]: https://github.com/kstrat2001/darkmux/releases/tag/v2.3.1
