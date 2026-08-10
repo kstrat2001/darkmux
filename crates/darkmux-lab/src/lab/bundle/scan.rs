@@ -113,10 +113,24 @@ pub fn is_noise(name: &str) -> bool {
 /// keywords etc. that also happen to look like `ident(` at a line start).
 /// NOTE: this filter applies ONLY to method-style candidates in the
 /// reference — arrow/`function`-keyword candidates are never checked
-/// against it (ported faithfully, not "fixed").
+/// against it (ported faithfully, not "fixed"). This is `KEYWORD_NAMES`'
+/// ONLY use site (see `is_keyword_name` below and its single call in
+/// `find_all_functions_in_text`) — it does not double as a call-noise
+/// vocabulary (that's the separate `NOISE_WORDS`/`ORM_NOISE_WORDS`/
+/// `is_noise` above), so removing an entry here has exactly one effect:
+/// whether that name can be LOCATED as a function.
+///
+/// (#1756) `"constructor"` REMOVED: unlike every other entry here, it is
+/// not a language keyword at all — it's a valid, extremely common class
+/// method name. Filtering it out here meant `constructor(...) { ... }`
+/// was never located as its own function project-wide (it still reached
+/// a seat via the coarser toplevel fallback, but with zero per-function
+/// callee/sibling/param-flow enrichment). Every remaining entry is a
+/// genuine reserved word that can never legally be a method name, so
+/// this list still does exactly the job its doc describes.
 const KEYWORD_NAMES: &[&str] = &[
-    "if", "for", "while", "switch", "catch", "else", "constructor", "function", "return",
-    "typeof", "new", "await", "yield", "case",
+    "if", "for", "while", "switch", "catch", "else", "function", "return", "typeof", "new",
+    "await", "yield", "case",
 ];
 
 fn is_keyword_name(name: &str) -> bool {

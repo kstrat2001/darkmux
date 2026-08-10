@@ -1594,6 +1594,14 @@ main()
     //
     // ── RANKED FINDINGS (worst first) ───────────────────────────────────
     //
+    // STATUS (branch: bundler/coverage-gaps-fix, off this audit branch):
+    // all six confirmed findings below (#1751, #1753, #1752, #1756,
+    // #1754, #1755) were triaged and fixed. This section is left as
+    // WRITTEN — a historical record of what was found and how — rather
+    // than rewritten to match the fixed code; each fix's own commit and
+    // the updated tests next to each finding's own test name are the
+    // living, current documentation.
+    //
     // 1. CONFIRMED, WORST — Mixed-file over-cap silent loss
     //    (`build_bundles_silently_drops_an_over_cap_function_when_a_
     //    sibling_function_in_the_same_file_bundles`). A file with TWO
@@ -1786,10 +1794,11 @@ main()
     //   static methods (`get value()`, `static create()`) ARE matched by
     //   `scan::match_name_method`'s modifier loop (`get`/`set`/`static`
     //   are explicit `METHOD_MODIFIERS` entries) and found as real,
-    //   individually-named functions. Constructors are NOT — see finding
-    //   #6 above; this test's coverage assertion still passes (toplevel
-    //   fallback), only its original "found as a named function" premise
-    //   for constructors was wrong, corrected after running it.
+    //   individually-named functions. Constructors were NOT, at the time
+    //   of this audit — see finding #6 above — but ARE as of the #1756
+    //   fix (`"constructor"` removed from `scan::KEYWORD_NAMES`); this
+    //   test's assertion was inverted to match. Left here as a record of
+    //   what the audit originally found, not current behavior.
     // - `github_api_source_still_bundles_every_changed_file_beyond_the_
     //   repo_index_cap` — `FileSource::MAX_API_FILES` (30) bounds
     //   `candidate_files()` (the repo-wide index used for callee/sibling
@@ -2095,23 +2104,19 @@ rename to src/new_name.ts\n\
             set.bundles.iter().map(|b| b.id.split('@').next().unwrap().to_string()).collect();
         // Getters and static methods ARE recognized as their own named
         // function (`METHOD_MODIFIERS` covers `get`/`static` explicitly).
-        for want in ["value", "create"] {
+        // (#1756 fix) `constructor` now joins them — it was previously
+        // filtered OUT by `scan::KEYWORD_NAMES` (which lumped it in with
+        // genuine control-flow keywords like `if`/`for`/`switch`), so
+        // every class's constructor was invisible to the function scanner
+        // and only ever reached a seat via the coarse toplevel fallback —
+        // losing per-function callee/sibling/param-flow enrichment for
+        // constructors, project-wide, every time.
+        for want in ["value", "create", "constructor"] {
             assert!(
                 found_names.contains(want),
                 "expected {want} to be scanned as its own function, found: {found_names:?}"
             );
         }
-        // Finding #6 (unpredicted, confirmed only by running this test):
-        // `constructor` is filtered OUT by `scan::KEYWORD_NAMES` — it is
-        // NEVER recognized as its own function, class-wide, project-wide.
-        // It still reaches a seat (via the toplevel fallback swallowing
-        // it into a coarser blob alongside the class's other unenclosed
-        // lines) but never as an individually-enriched function bundle.
-        assert!(
-            !found_names.contains("constructor"),
-            "if this now fails, `constructor` has been removed from `KEYWORD_NAMES` and finding #6 is \
-             fixed — update this assertion (and the report above) to expect it found: {found_names:?}"
-        );
     }
 
     #[test]
