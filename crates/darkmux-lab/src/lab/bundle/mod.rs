@@ -125,10 +125,17 @@ pub enum SkipReason {
     /// in the new-side file at all (e.g. a function deleted in its
     /// entirety). There is no post-image content left to bundle.
     NoSurvivingLines,
-    /// Every changed new-side line in this file fell outside any function
-    /// `scan::find_all_functions_in_text` could locate (e.g. a diff that
-    /// only touches top-level statements/imports). Nothing changed-and-
-    /// function-shaped for the bundler to anchor on.
+    /// Historical: every changed new-side line in this file fell outside any
+    /// function `scan::find_all_functions_in_text` could locate. Left in
+    /// place for schema stability, but unreachable through the normal
+    /// `build_bundles` flow as of the top-level-statement fix (#1605
+    /// follow-up) — a changed line outside every function now becomes its
+    /// own `"toplevel"`-family bundle (see [`SkipReason::TopLevelOverSizeCap`]
+    /// for the one way that can still decline) rather than being dropped
+    /// with nothing changed-and-function-shaped for the bundler to anchor
+    /// on. Kept as a defensive variant, not removed, in case a future
+    /// change reintroduces a path where `build_bundles` finds changed lines
+    /// with genuinely nowhere to put them.
     NoEnclosingFunction,
     /// Every function the scanner found for this file's changed lines
     /// exceeded the bundler's per-function size cap
@@ -136,6 +143,15 @@ pub enum SkipReason {
     /// benign "nothing here" (the issue's "diff exceeded some internal
     /// bound" case, distinct from both of the above).
     OverSizeCap,
+    /// (#1605 follow-up) A contiguous run of changed lines with no enclosing
+    /// function — see [`SkipReason::NoEnclosingFunction`] — exceeded the
+    /// same size cap functions are held to (`run_end - run_start > 300`
+    /// lines). Unlike the other reasons here, this one can coexist with a
+    /// file that ALSO contributed bundles (from its functions, or from a
+    /// smaller top-level run elsewhere in the same file) — see
+    /// [`BundleSkipReport`]'s doc for what that means for the "not skipped
+    /// implies fully covered" reading.
+    TopLevelOverSizeCap,
 }
 
 /// One file the diff touched that ended up contributing zero bundles, with
@@ -148,13 +164,20 @@ pub struct SkippedFile {
 
 /// The bundler's full per-file decline accounting for one `build_bundles`
 /// run (#1605). `files_considered` is every file `diff::parse_diff` found in
-/// the diff (before any filtering); `files_skipped` names each one that
-/// contributed zero bundles, with why. A file NOT in `files_skipped`
-/// contributed at least one bundle. `bundles: 0` with an EMPTY
-/// `files_skipped` (only possible when `files_considered == 0`, i.e. the
-/// diff itself parsed to no files) is the one case this report can't
-/// explain further — see [`BundleSet::skip`]'s own doc for why an external
-/// bundler's zero-bundle result stays in that same unexplained state.
+/// the diff (before any filtering); `files_skipped` names each declined
+/// portion, with why. A file NOT in `files_skipped` at all contributed at
+/// least one bundle covering every one of its changed lines. A file that
+/// DOES appear can still have contributed bundles too — as of
+/// [`SkipReason::TopLevelOverSizeCap`] (#1605 follow-up), a decline is
+/// recorded per over-cap top-level run the moment it's found, independent
+/// of whether the same file's functions (or a different top-level run in
+/// that file) succeeded — so "in `files_skipped`" now means "at least this
+/// much was declined," not "nothing from this file made it into `bundles`."
+/// `bundles: 0` with an EMPTY `files_skipped` (only possible when
+/// `files_considered == 0`, i.e. the diff itself parsed to no files) is the
+/// one case this report can't explain further — see [`BundleSet::skip`]'s
+/// own doc for why an external bundler's zero-bundle result stays in that
+/// same unexplained state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BundleSkipReport {
     pub files_considered: usize,
@@ -411,6 +434,31 @@ fn build_manifest(
     Ok(manifest)
 }
 
+/// Group ascending, already-deduped 1-indexed line numbers into maximal
+/// runs of consecutive integers: `[1,2,3,7,8,12]` -> `[(1,3),(7,8),(12,12)]`.
+/// (#1605 follow-up) Used to bundle changed lines with no enclosing function
+/// as locally-scoped units — a top-of-file import block and a tail
+/// invocation chain shouldn't collapse into one span stretching across
+/// everything an enclosing function already covers in between.
+fn contiguous_runs(sorted: &[u32]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut iter = sorted.iter().copied();
+    let Some(first) = iter.next() else { return out };
+    let mut start = first;
+    let mut prev = first;
+    for ln in iter {
+        if ln == prev + 1 {
+            prev = ln;
+        } else {
+            out.push((start, prev));
+            start = ln;
+            prev = ln;
+        }
+    }
+    out.push((start, prev));
+    out
+}
+
 /// Build the full `BundleSet` for `diff` read against `source`. Direct
 /// port of `build_bundles(worktree, diff_text)`, generalized over
 /// `FileSource` fidelity and extended with the manifest + truncation
@@ -475,8 +523,17 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
         sorted_lines.sort_unstable();
         let mut found_fns: Vec<(usize, usize, String, String)> = Vec::new();
         let mut found_keys: HashSet<(usize, usize)> = HashSet::new();
+        // (#1605 follow-up) A changed line with no enclosing function used to
+        // hit this `continue` and vanish: it reached no seat, and nothing
+        // recorded the loss (the file still yielded a bundle for whatever
+        // functions it DID have, so `bundles > 0` and `skip` stayed clean).
+        // Collected here instead — bundled as its own unit below (a
+        // top-level statement is real changed code; it just has no function
+        // to anchor on) rather than dropped.
+        let mut unenclosed_lines: Vec<u32> = Vec::new();
         for ln in sorted_lines {
             let Some(fndef) = scan::enclosing_fn_for_line(&all_fns, ln) else {
+                unenclosed_lines.push(ln);
                 continue;
             };
             let key = (fndef.start0, fndef.end0);
@@ -484,21 +541,29 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
                 found_fns.push((fndef.start0, fndef.end0, fndef.header.clone(), fndef.name.clone()));
             }
         }
-        if found_fns.is_empty() {
+        if found_fns.is_empty() && unenclosed_lines.is_empty() {
+            // Unreachable today: `sorted_lines` is non-empty here (the
+            // `NoSurvivingLines` check above already handled the empty
+            // case), and every line in it lands in exactly one of
+            // `found_fns`/`unenclosed_lines`. Kept as a defensive decline —
+            // see `SkipReason::NoEnclosingFunction`'s doc — rather than a
+            // silent fallthrough if that invariant ever changes.
             skip.files_skipped
                 .push(SkippedFile { path: rel.clone(), reason: SkipReason::NoEnclosingFunction });
             continue;
         }
 
-        // (#1605) Did THIS file contribute at least one bundle? Every
-        // function that survives the size cap below unconditionally pushes
-        // at least one `Bundle` (the "hunk" fallback family at the bottom of
-        // this loop fires whenever none of param-flow/differential/siblings
+        // (#1605) Did THIS file's FUNCTIONS contribute at least one bundle
+        // between them? Every function that survives the size cap below
+        // unconditionally pushes at least one `Bundle` (the "hunk" fallback
+        // family fires whenever none of param-flow/differential/siblings
         // did) — so the only way a non-empty `found_fns` ends with zero new
-        // bundles for this file is every one of its functions hitting the
-        // size cap (or, vanishingly rarely, colliding with a function
-        // already bundled from an earlier file in this same run).
+        // bundles is every one of its functions hitting the size cap (or,
+        // vanishingly rarely, colliding with a function already bundled
+        // from an earlier file in this same run). Scoped to functions only;
+        // the top-level-run loop below does its own, separate accounting.
         let bundles_before_file = bundles.len();
+        let had_functions = !found_fns.is_empty();
         for (start0, end0, _header, name) in found_fns {
             let seen_key = (rel.clone(), start0, end0);
             if seen_fns.contains(&seen_key) {
@@ -639,12 +704,61 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
                 });
             }
         }
-        // (#1605) `found_fns` was non-empty (checked above) but nothing got
-        // pushed for this file — every candidate function hit the size cap
-        // (see this block's own doc, just above the `bundles_before_file`
-        // snapshot).
-        if bundles.len() == bundles_before_file {
+        // (#1605) `had_functions` (snapshotted before the loop above moved
+        // `found_fns`) was true but nothing got pushed for this file — every
+        // candidate function hit the size cap. Checked HERE, before the
+        // top-level-run loop below, so this stays scoped to functions only —
+        // `SkipReason::OverSizeCap`'s doc says "every function", and it
+        // should stay true even on a file where a top-level run separately
+        // succeeds (or separately declines with its own
+        // `TopLevelOverSizeCap` entry just below).
+        if had_functions && bundles.len() == bundles_before_file {
             skip.files_skipped.push(SkippedFile { path: rel.clone(), reason: SkipReason::OverSizeCap });
+        }
+
+        // (#1605 follow-up) `unenclosed_lines` is every changed line that
+        // fell outside a function above — grouped into maximal runs of
+        // consecutive line numbers so a top-of-file import block and a tail
+        // invocation chain (two unrelated regions separated by the function
+        // the earlier loop already bundled) become two separate, locally-
+        // scoped bundles rather than one span swallowing everything between
+        // them. Same size cap as a function (`end0 - start0 > 300`); a run
+        // over the cap is declined per-run, immediately, regardless of
+        // whether this file's functions (or another run) already
+        // contributed bundles — see `SkipReason::TopLevelOverSizeCap`'s doc
+        // for why that's a deliberate departure from the file-level
+        // "produced nothing at all" accounting the size-cap check below
+        // still does for functions.
+        for (run_start, run_end) in contiguous_runs(&unenclosed_lines) {
+            if run_end - run_start > 300 {
+                skip.files_skipped
+                    .push(SkippedFile { path: rel.clone(), reason: SkipReason::TopLevelOverSizeCap });
+                continue;
+            }
+            let code_refs = vec![BundleRef { path: rel.clone(), start: run_start, end: run_end }];
+            let own_file_content = lines.join("\n");
+            let mut manifest = build_manifest(source, &code_refs, &repo_index, &own_file_content)?;
+            let unscanned = source.unscanned_file_count();
+            if unscanned > 0 {
+                manifest.push(format!("file budget exceeded: {unscanned} files not scanned"));
+            }
+            bundles.push(Bundle {
+                // Deliberately not `"<fn>@<path>"` — there is no function
+                // name here. The `start-end` suffix keeps ids unique across
+                // multiple runs in the same file and can't collide with a
+                // real function id (a TS/JS identifier can't contain `:`).
+                id: format!("toplevel:{run_start}-{run_end}@{rel}"),
+                code: code_refs,
+                facts: Vec::new(),
+                fact_family: "toplevel".to_string(),
+                manifest,
+                // Not `truncated_extent`-checked: that helper answers "does
+                // this ref show less than an enclosing function/callee's
+                // full extent" — a category error for a ref whose span IS
+                // by definition its full declared extent (the changed-line
+                // run itself, not a stub of something longer).
+                truncated: false,
+            });
         }
     }
 
@@ -956,10 +1070,14 @@ mod tests {
     }
 
     #[test]
-    fn build_bundles_reports_no_enclosing_function_skip_reason() {
+    fn build_bundles_bundles_a_top_level_only_change_instead_of_dropping_it() {
         // Every changed line sits at top level (no function wraps it) — the
-        // scanner finds functions in the file, but none of them enclose a
-        // changed line.
+        // scanner finds functions in the file, but none of them enclose the
+        // changed line. This used to hit `SkipReason::NoEnclosingFunction`
+        // with zero bundles (the exact defect the `toplevel::tests` fixture
+        // pins at a larger scale, #1605 follow-up); the fix bundles the
+        // unenclosed line as its own `"toplevel"`-family unit instead, so
+        // this is the smallest possible reproduction of the same fix.
         let dir = TempDir::new().unwrap();
         write(
             dir.path(),
@@ -971,9 +1089,17 @@ mod tests {
 +export const A = 2;\n";
         let source = FileSource::worktree(dir.path());
         let set = build_bundles(&source, diff).unwrap();
-        assert!(set.bundles.is_empty());
-        assert_eq!(set.skip.files_skipped.len(), 1);
-        assert_eq!(set.skip.files_skipped[0].reason, SkipReason::NoEnclosingFunction);
+        assert_eq!(set.bundles.len(), 1, "the top-level line must reach a seat, got: {:?}", set.bundles);
+        assert_eq!(set.bundles[0].fact_family, "toplevel");
+        assert_eq!(
+            set.bundles[0].code,
+            vec![BundleRef { path: "src/consts.ts".to_string(), start: 1, end: 1 }]
+        );
+        assert!(
+            set.skip.files_skipped.is_empty(),
+            "a successfully-bundled top-level line must not ALSO be recorded as declined: {:?}",
+            set.skip
+        );
     }
 
     #[test]
@@ -1271,6 +1397,34 @@ main()
              the loss is invisible to every consumer. Missing: {missing:?}",
             missing.len()
         );
+    }
+
+    /// Companion to `build_bundles_reports_over_size_cap_skip_reason`
+    /// (functions) — the same cap, applied to a top-level run: a changed
+    /// line with no enclosing function still doesn't reach a seat when its
+    /// contiguous run is over 300 lines, but unlike the pre-fix behavior
+    /// that decline is now RECORDED (#1605 follow-up) rather than silent.
+    #[test]
+    fn build_bundles_reports_top_level_over_size_cap_skip_reason() {
+        let dir = TempDir::new().unwrap();
+        // 320 top-level `const` lines — no function anywhere in the file, so
+        // every one of them is an unenclosed changed line in a single
+        // contiguous run over the 300-line cap.
+        let mut content = String::new();
+        for i in 0..320 {
+            content.push_str(&format!("const c{i} = {i};\n"));
+        }
+        write(dir.path(), "src/huge_toplevel.ts", &content);
+        let diff = new_file_diff("src/huge_toplevel.ts", &content);
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, &diff).unwrap();
+        assert!(
+            set.bundles.is_empty(),
+            "an over-cap top-level run must yield zero bundles, got: {:?}",
+            set.bundles
+        );
+        assert_eq!(set.skip.files_skipped.len(), 1, "got: {:?}", set.skip);
+        assert_eq!(set.skip.files_skipped[0].reason, SkipReason::TopLevelOverSizeCap);
     }
 }
 

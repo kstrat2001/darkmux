@@ -840,6 +840,7 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
             SkipReason::NoSurvivingLines => "no surviving lines",
             SkipReason::NoEnclosingFunction => "no enclosing function",
             SkipReason::OverSizeCap => "over the bundler's size cap",
+            SkipReason::TopLevelOverSizeCap => "top-level run over the bundler's size cap",
         };
         *by_reason.entry(label).or_insert(0) += 1;
     }
