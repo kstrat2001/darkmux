@@ -1494,5 +1494,562 @@ main()
         assert_eq!(set.skip.files_skipped.len(), 1, "got: {:?}", set.skip);
         assert_eq!(set.skip.files_skipped[0].reason, SkipReason::TopLevelOverSizeCap);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // (branch: bundler/coverage-gap-audit) COVERAGE-GAP AUDIT — WRITTEN
+    // REPORT
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // Audited against the invariant `every_changed_line_is_either_covered_
+    // or_accounted_for` (above): for any diff, every changed line either
+    // appears within some bundle's code refs, or is named in
+    // `BundleSkipReport`. This report also covers two adjacent classes the
+    // brief asked for: (a) a seat shown the WRONG code with no signal
+    // (mis-resolved same-named callees), and (b) a mechanically-computed
+    // SIGNAL (manifest/truncation) that never reaches the seat meant to
+    // use it, even though the code itself does.
+    //
+    // Companion tests for (b) live in `crates/darkmux-lab/src/lab/
+    // review_tests.rs` (`probe_seat_never_sees_the_truncation_marker_the_
+    // judge_seat_gets_inline`, `manifest_never_reaches_the_probe_user_
+    // message`) because they exercise `review.rs`'s prompt builders, which
+    // this module doesn't depend on.
+    //
+    // ── RANKED FINDINGS (worst first) ───────────────────────────────────
+    //
+    // 1. CONFIRMED, WORST — Mixed-file over-cap silent loss
+    //    (`build_bundles_silently_drops_an_over_cap_function_when_a_
+    //    sibling_function_in_the_same_file_bundles`). A file with TWO
+    //    changed functions, one under the 300-line cap and one over it:
+    //    the small one bundles normally; the huge one's changed lines are
+    //    dropped by the `if end0 - start0 > 300 { continue; }` in
+    //    `build_bundles`'s function loop — and because the FILE still
+    //    produced a bundle (from the small function), the `had_functions
+    //    && bundles.len() == bundles_before_file` check that would record
+    //    `SkipReason::OverSizeCap` is false, so NOTHING records the loss.
+    //    This is exactly the gap `BundleSkipReport`'s own doc comment
+    //    (lines ~174-191 above) already names as suspected-but-unverified
+    //    ("That gap is pre-existing and NOT closed by
+    //    `SkipReason::TopLevelOverSizeCap`... a mixed file isn't
+    //    distinguished from a fully-covered one today") — this test is
+    //    the first execution that confirms it. A reviewer investigating
+    //    the huge function's change sees NO excerpt, NO skip reason, and
+    //    a `bundles: N > 0` result that reads as "this file was
+    //    reviewed." Fix direction: record a `SkipReason` variant (or an
+    //    addition to the existing `OverSizeCap`/manifest) per DROPPED
+    //    function, independent of whether the file's other functions
+    //    succeeded.
+    //    Python reference: bundler.py has the identical per-function
+    //    300-line cap and (per its own description as a line-span-pointer
+    //    emitter with no reporting layer at all) almost certainly shares
+    //    this exact gap — the Rust `BundleSkipReport` structure is a
+    //    packet-3/1605 addition with NO Python precedent, so there is
+    //    nothing in the reference to have caught this either way. Not a
+    //    port regression; a gap in a Rust-only feature that was already
+    //    self-diagnosed as incomplete.
+    //
+    // 2. CONFIRMED — darkmux's own repository is unreviewable by this
+    //    bundler (`build_bundles_treats_darkmuxs_own_rust_source_as_non_
+    //    code`, `build_bundles_treats_common_non_ts_languages_as_non_
+    //    code`). `scan::ts_file` accepts only `.ts`/`.tsx`; every other
+    //    language — including the `.rs` files this very crate is written
+    //    in, plus `.py`/`.go`/`.sh`/`.sql`/`.yml` — is classified
+    //    `SkipReason::NonCodeExtension`. That variant's own doc comment
+    //    frames the common case as "a diff dominated by JSON config,
+    //    lockfiles, or fixture data" — true for those, but FALSE for a
+    //    500-line Rust/Python/Go change, which is real code that
+    //    genuinely needed review and got none. A PR to darkmux's own
+    //    `crates/`/`src/`/`runtime/` trees gets a `bundles: 0` result
+    //    that reads as benign no-op, identical in shape to a pure
+    //    lockfile bump. Fix direction: at minimum, split
+    //    `NonCodeExtension` (as `TestFileExcluded` was already split out,
+    //    #1605 QA finding) into "genuinely non-code" vs. "code in a
+    //    language this bundler doesn't parse" — the comment for the
+    //    latter should say so honestly, the way `TestFileExcluded`'s does.
+    //    Python reference: `bundler.py`'s `ts_file`/`iter_ts_files` gate
+    //    on the identical `.ts`/`.tsx` extension pair (module doc: "A
+    //    Rust port of the reference bundler.py... TypeScript-native"), so
+    //    the reference shares the exact same blind spot — this is a
+    //    property of the tool's scope (TS-only), not a port defect. What
+    //    IS Rust-only is the misleading label on `NonCodeExtension`
+    //    itself (a #1605 addition), which is where the fix belongs.
+    //
+    // 3. CONFIRMED — Ambiguous same-named callee resolution ignores the
+    //    caller's own import and can silently attach the WRONG function
+    //    body (`resolve_callees_ignores_the_explicit_import_and_can_
+    //    attach_the_wrong_function_body`). `facts::resolve_callees`
+    //    matches a call site to the repo-wide function index purely by
+    //    NAME — it never consults `source::parse_import_bindings` (which
+    //    the bundler already computes, just for the SEPARATE manifest
+    //    feature) to check which file the caller actually imports the
+    //    symbol from. When two files export a same-named function, the
+    //    repo index's insertion order (for `Worktree`, `iter_ts_files`'
+    //    alphabetical directory walk) silently picks one — and the test
+    //    below confirms it is NOT necessarily the one the call site
+    //    imports. The reviewer is shown a plausible, syntactically valid
+    //    function body under the right name that the code never actually
+    //    calls, while the REAL callee never reaches any seat at all. This
+    //    is the "wrong content, not missing content" failure mode the
+    //    brief calls out ("does anything verify those refs point at
+    //    real, current content?") — the answer is no. Fix direction: when
+    //    `parse_import_bindings` names a specific module for the call
+    //    name, prefer the repo-index def whose path resolves from that
+    //    binding before falling back to first-non-own-path.
+    //    Python reference: near-certainly shares this — `bundler.py`'s
+    //    `resolve_callees` is described as the direct ancestor of this
+    //    function (facts.rs module doc: "Port of `resolve_callees`") and
+    //    there is no mention anywhere in this codebase of the reference
+    //    ever consulting import bindings for callee resolution (the
+    //    binding-aware `parse_import_bindings` is itself a Rust-only,
+    //    packet-3 addition built for the unrelated manifest feature).
+    //    Likely a reference-inherited limitation, not a port regression —
+    //    but a real one, and now on a fresh Rust-only piece of context
+    //    (`parse_import_bindings`) that makes the fix cheap.
+    //
+    // 4. CONFIRMED — The PROBE seat (the seat that actually ORIGINATES a
+    //    finding) never sees the truncation marker the JUDGE seat gets
+    //    inline (`probe_seat_never_sees_the_truncation_marker_the_judge_
+    //    seat_gets_inline`, in review_tests.rs). `bundle_inputs_from_set`
+    //    renders the SAME code refs through two formatters: `slice_code`
+    //    (-> `BundleInput.code`, the judge's rendering) embeds an
+    //    explicit "excerpt truncated" marker as inline text when a callee
+    //    ref is a header-only stub; `slice_code_probe` (->
+    //    `BundleInput.probe_code`, the probe's rendering) never does —
+    //    confirmed both by this new test and by the EXISTING golden
+    //    `slice_code_probe_skips_unreadable_and_past_eof_refs_entirely`
+    //    above ("no placeholder, no header"). So the seat most likely to
+    //    raise a "this looks incomplete" finding has zero textual signal
+    //    that its excerpt is a stub — the exact structural shape of the
+    //    #1605 top-level-drop defect this audit was commissioned over,
+    //    just for a DIFFERENT input (a truncated callee body instead of
+    //    an unenclosed top-level statement), and pre-existing rather than
+    //    newly introduced.
+    //    Python reference: SHARED, and documented as such — `slice_code_
+    //    probe`'s own doc comment says it is a byte-for-byte port of
+    //    `probe-runner.py`'s `read_code_excerpt`, "Golden provenance:
+    //    every expected string below was captured by RUNNING probe-
+    //    runner.py's real `read_code_excerpt`." The Python probe seat has
+    //    the identical blind spot. Not a port regression — but also not
+    //    something any existing test frames as a REVIEW-QUALITY finding;
+    //    the golden tests pin it as a formatting fact, not as "the
+    //    finding-originating seat is blind to truncation."
+    //
+    // 5. CONFIRMED — The PROBE seat also never sees the external-symbol
+    //    manifest (`manifest_never_reaches_the_probe_user_message`, in
+    //    review_tests.rs). The JUDGE side of this exact exclusion is
+    //    ALREADY known, documented, and pinned by an existing test
+    //    (`manifest_never_reaches_the_dispatched_judge_prompt`, #1256,
+    //    "match Phase A exactly" operator decision) — so that half is not
+    //    a new finding. The PROBE side has the identical observable
+    //    behavior (`probe_user_message` never reads `bundle.manifest`)
+    //    but, unlike the judge's, it has NO doc paragraph and NO test
+    //    anywhere pinning it as deliberate. Ranked below #4 because the
+    //    judge precedent makes "deliberate, Phase-A-parity" the likely
+    //    explanation here too — but nothing currently guards it, so a
+    //    future edit could change it in either direction with zero
+    //    signal either way.
+    //    Python reference: `probe-runner.py`'s `build_prompt` has no
+    //    manifest input to drop in the first place (`bundler.py`'s
+    //    bundles carry no such field) — same story as the judge side.
+    //
+    // 6. CONFIRMED, UNPREDICTED — Class constructors are never recognized
+    //    as functions at all (`class_member_shapes_are_recognized_by_
+    //    the_scanner`). Reading `scan.rs` predicted `constructor(...) {`
+    //    would match `match_name_method` (bare `ident(`, no modifier
+    //    needed) — running the test instead showed `"constructor"` is
+    //    filtered OUT by `KEYWORD_NAMES` (`scan.rs`'s own list, which
+    //    includes `"constructor"` alongside `if`/`for`/`switch`/etc.) at
+    //    the exact point `find_all_functions_in_text` checks
+    //    `is_keyword_name`. So every class's constructor is invisible to
+    //    the function scanner — not a syntax miss like the anonymous-
+    //    export shapes above, but a NAME the scanner explicitly rejects.
+    //    Consequence, also executed: the toplevel fallback still catches
+    //    the change (this audit's core invariant holds — nothing is
+    //    silently lost), but it merges the constructor's body into ONE
+    //    coarse blob with the class's opening line and EVERY OTHER
+    //    unenclosed line preceding the next recognized method (in the
+    //    fixture: the class header, a private-field declaration, AND the
+    //    full constructor body all collapse into a single `toplevel:1-7`
+    //    ref) — losing per-function callee/sibling/param-flow enrichment
+    //    specifically for constructors, project-wide, every time. This is
+    //    exactly the kind of misprediction-from-reading-alone the audit
+    //    brief warned about ("reading the scanner mispredicts which stage
+    //    fires") — caught only by running the positive-control test.
+    //    Python reference: near-certain to share this — `KEYWORD_NAMES`
+    //    is described as ported ("Names `NAME_METHOD_RE` candidates are
+    //    filtered against"), and `"constructor"` sits in the list
+    //    unremarked among genuine language keywords, reading like an
+    //    intentional (if undocumented) reference decision rather than a
+    //    port slip. Fix direction (if desired): special-case `constructor`
+    //    out of `KEYWORD_NAMES` (it is a valid method name in a class
+    //    body, unlike every other entry in that list, which are all
+    //    actual reserved words).
+    //
+    // ── PROBED AND CLEAN (no silent-loss gap found) ─────────────────────
+    //
+    // - `renamed_file_with_edits_still_bundles_under_the_new_path` — a
+    //   git rename-with-content-change hunk (`+++ b/<new path>`) bundles
+    //   correctly under the NEW path. `diff::parse_diff` only ever reads
+    //   the `+++ b/` line, so this was never actually at risk, but it was
+    //   explicitly in scope ("deletions and moves... a rename") and is
+    //   now executed, not just reasoned about.
+    // - `scanner_missed_function_shapes_still_reach_a_seat_via_toplevel_
+    //   fallback` — `scan::find_all_functions_in_text`'s three matchers
+    //   all require a syntactic NAME, so a fully anonymous `export
+    //   default function () {}` / `export default () => {}`, and an
+    //   object-literal arrow-valued property (`{ onClick: () => {} }`),
+    //   are ALL scanner misses (zero `FnDef`s found). But every line in
+    //   each fixture is still an ADDED line with no enclosing function,
+    //   so the #1605-follow-up top-level fallback catches all three as a
+    //   `"toplevel"` bundle. The code reaches a seat; it just loses
+    //   function-shaped enrichment (no callee/sibling facts) — a real
+    //   quality gap, but NOT a silent-loss coverage gap under this
+    //   audit's invariant.
+    // - `class_member_shapes_are_recognized_by_the_scanner` — getters and
+    //   static methods (`get value()`, `static create()`) ARE matched by
+    //   `scan::match_name_method`'s modifier loop (`get`/`set`/`static`
+    //   are explicit `METHOD_MODIFIERS` entries) and found as real,
+    //   individually-named functions. Constructors are NOT — see finding
+    //   #6 above; this test's coverage assertion still passes (toplevel
+    //   fallback), only its original "found as a named function" premise
+    //   for constructors was wrong, corrected after running it.
+    // - `github_api_source_still_bundles_every_changed_file_beyond_the_
+    //   repo_index_cap` — `FileSource::MAX_API_FILES` (30) bounds
+    //   `candidate_files()` (the repo-wide index used for callee/sibling
+    //   resolution), NOT `build_bundles`'s own per-file loop, which walks
+    //   `diff::parse_diff`'s full file list unconditionally. A 35-file
+    //   GithubApi-sourced diff still bundles all 35 changed files. The
+    //   incomplete-index condition IS self-reported into every affected
+    //   bundle's manifest (`"file budget exceeded: N files not
+    //   scanned"`) — but per finding #5, that self-report never reaches
+    //   any seat either way, so an operator reading the JSON artifact
+    //   directly is the only consumer who currently sees it.
+    //
+    // ── SUSPECTED, NOT EXECUTED (could not construct a case, or judged
+    //    out of this audit's scope) ────────────────────────────────────
+    //
+    // - Pure rename with NO content change (`rename from`/`rename to`,
+    //   100% similarity, no `+++ b/` line at all) never enters
+    //   `files_considered` — `diff::parse_diff` only recognizes a file via
+    //   its `+++ b/` line. Not executed: there is no content to lose in
+    //   this case (nothing changed), so it is very unlikely to be a
+    //   review-quality gap, just a `files_considered` undercount. Would
+    //   need a live `git diff -M` capture to confirm the exact line shape
+    //   git emits for this case rather than a hand-built one.
+    // - Decorated class methods (`@Injectable() foo() {}`), overloaded
+    //   TS signatures, and async generators were reasoned through against
+    //   `scan.rs`'s matchers (all plausibly caught by `match_name_method`
+    //   or the top-level fallback, same as the confirmed-clean shapes
+    //   above) but NOT executed — cut for time after the ranked findings
+    //   above; the fallback's existence makes a full silent-loss unlikely
+    //   for any of them, so this is a low-priority follow-up, not a
+    //   suspected defect.
+
+    #[test]
+    fn build_bundles_silently_drops_an_over_cap_function_when_a_sibling_function_in_the_same_file_bundles(
+    ) {
+        let dir = TempDir::new().unwrap();
+        let mut content = String::from("export function small(x) {\n  return x + 1;\n}\n\nexport function huge(x) {\n");
+        for i in 0..320 {
+            content.push_str(&format!("  console.log({i});\n"));
+        }
+        content.push_str("  return x;\n}\n");
+        write(dir.path(), "src/mixed.ts", &content);
+        let diff = new_file_diff("src/mixed.ts", &content);
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, &diff).unwrap();
+
+        // The small function must have bundled — otherwise this fixture
+        // doesn't actually exercise the "file already produced a bundle"
+        // condition the gap depends on.
+        assert!(!set.bundles.is_empty(), "the small function must bundle, or this test proves nothing");
+        let covered = covered_lines(&set, "src/mixed.ts");
+        let total = content.lines().count() as u32;
+        let huge_start = content
+            .lines()
+            .position(|l| l.contains("export function huge"))
+            .map(|i| i as u32 + 1)
+            .expect("fixture line missing");
+
+        // `huge`'s changed lines are NOT covered by any bundle...
+        let huge_missing: Vec<u32> = (huge_start..=total).filter(|ln| !covered.contains(ln)).collect();
+        assert!(
+            !huge_missing.is_empty(),
+            "expected `huge`'s lines to be dropped by the size cap (fixture assumption failed): {:?}",
+            set.bundles
+        );
+
+        // ...AND the file is not recorded as declined at all — this is
+        // the invisible-loss defect. `set.skip.files_skipped` is checked
+        // for ANY entry naming this file, matching whatever reason a
+        // future fix might use.
+        let declined = set.skip.files_skipped.iter().any(|s| s.path == "src/mixed.ts");
+        assert!(
+            !declined,
+            "if this now fails, the gap has been fixed — a skip entry for src/mixed.ts now records \
+             the dropped `huge` function: {:?}",
+            set.skip
+        );
+    }
+
+    #[test]
+    fn build_bundles_treats_darkmuxs_own_rust_source_as_non_code() {
+        // darkmux's OWN repository is Rust. A `.rs` PR through this
+        // bundler gets `SkipReason::NonCodeExtension` — whose doc comment
+        // frames the common case as "content such as fixtures,
+        // lockfiles, or generated config," which is not true of this
+        // fixture (a real, small, syntactically valid Rust function).
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n");
+        let diff = "+++ b/src/lib.rs\n\
+@@ -0,0 +1,3 @@\n\
++pub fn add(a: i32, b: i32) -> i32 {\n\
++    a + b\n\
++}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(
+            set.bundles.is_empty(),
+            "a real Rust source change must currently yield zero bundles \
+             (documenting the gap, not asserting it as desired): {:?}",
+            set.bundles
+        );
+        assert_eq!(set.skip.files_skipped.len(), 1, "got: {:?}", set.skip);
+        assert_eq!(set.skip.files_skipped[0].reason, SkipReason::NonCodeExtension);
+    }
+
+    #[test]
+    fn build_bundles_treats_common_non_ts_languages_as_non_code() {
+        // Same class as the Rust case above, across several other
+        // common languages a real-world PR might touch. Each is real,
+        // syntactically valid source code — none is a lockfile or
+        // generated config, the case `NonCodeExtension`'s doc comment
+        // actually describes.
+        let cases: &[(&str, &str, &str)] = &[
+            ("src/helper.py", "def add(a, b):\n    return a + b\n", "+def add(a, b):\n+    return a + b\n"),
+            (
+                "cmd/main.go",
+                "func add(a, b int) int {\n\treturn a + b\n}\n",
+                "+func add(a, b int) int {\n+\treturn a + b\n+}\n",
+            ),
+            (
+                "scripts/deploy.sh",
+                "#!/bin/sh\necho \"deploying\"\n",
+                "+#!/bin/sh\n+echo \"deploying\"\n",
+            ),
+            (
+                "migrations/001_up.sql",
+                "CREATE TABLE widgets (id INT PRIMARY KEY);\n",
+                "+CREATE TABLE widgets (id INT PRIMARY KEY);\n",
+            ),
+            (
+                "src/styles.css",
+                ".widget { color: red; }\n",
+                "+.widget { color: red; }\n",
+            ),
+        ];
+        for (path, content, added) in cases {
+            let dir = TempDir::new().unwrap();
+            write(dir.path(), path, content);
+            let n = content.lines().count();
+            let diff = format!("+++ b/{path}\n@@ -0,0 +1,{n} @@\n{added}");
+            let source = FileSource::worktree(dir.path());
+            let set = build_bundles(&source, &diff).unwrap();
+            assert!(set.bundles.is_empty(), "{path}: expected zero bundles, got: {:?}", set.bundles);
+            assert_eq!(
+                set.skip.files_skipped.first().map(|s| s.reason),
+                Some(SkipReason::NonCodeExtension),
+                "{path}: got: {:?}",
+                set.skip
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_callees_ignores_the_explicit_import_and_can_attach_the_wrong_function_body() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "src/a.ts",
+            "export function validate(x) {\n  return x > 0; // WRONG callee — caller.ts never imports this one\n}\n",
+        );
+        write(
+            dir.path(),
+            "src/b.ts",
+            "export function validate(x) {\n  return x < 0; // the REAL callee — explicitly imported below\n}\n",
+        );
+        write(
+            dir.path(),
+            "src/caller.ts",
+            "import { validate } from './b';\nfunction useIt(y) {\n  return validate(y);\n}\n",
+        );
+        let diff = "+++ b/src/caller.ts\n\
+@@ -0,0 +1,4 @@\n\
++import { validate } from './b';\n\
++function useIt(y) {\n\
++  return validate(y);\n\
++}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(!set.bundles.is_empty(), "expected at least one bundle for useIt");
+        let callee_paths: Vec<&str> = set.bundles[0]
+            .code
+            .iter()
+            .map(|r| r.path.as_str())
+            .filter(|p| *p != "src/caller.ts")
+            .collect();
+        assert!(
+            !callee_paths.is_empty(),
+            "expected a resolved callee ref for `validate` (fixture assumption failed): {:?}",
+            set.bundles[0].code
+        );
+        assert!(
+            !callee_paths.contains(&"src/b.ts"),
+            "documents CURRENT behavior: the caller's explicit `import ... from './b'` is ignored by \
+             name-only resolution, so the REAL callee (b.ts) never reaches a seat. If this now fails, \
+             import-aware resolution has been added and this test should be rewritten to assert b.ts \
+             IS chosen: {:?}",
+            set.bundles[0].code
+        );
+        assert!(
+            callee_paths.contains(&"src/a.ts"),
+            "documents CURRENT behavior: the WRONG same-named function (a.ts) is silently attached as \
+             the callee instead: {:?}",
+            set.bundles[0].code
+        );
+    }
+
+    #[test]
+    fn renamed_file_with_edits_still_bundles_under_the_new_path() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "src/new_name.ts", "export function greet(name) {\n  return `hi ${name}`;\n}\n");
+        let diff = "diff --git a/src/old_name.ts b/src/new_name.ts\n\
+similarity index 88%\n\
+rename from src/old_name.ts\n\
+rename to src/new_name.ts\n\
+--- a/src/old_name.ts\n\
++++ b/src/new_name.ts\n\
+@@ -1,3 +1,3 @@\n\
+ export function greet(name) {\n\
+-  return name;\n\
++  return `hi ${name}`;\n\
+ }\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(!set.bundles.is_empty(), "a renamed-with-edits file must still bundle under its NEW path: {:?}", set.skip);
+        assert!(
+            set.bundles.iter().any(|b| b.id.contains("src/new_name.ts")),
+            "got: {:?}",
+            set.bundles
+        );
+    }
+
+    #[test]
+    fn scanner_missed_function_shapes_still_reach_a_seat_via_toplevel_fallback() {
+        for (label, content) in [
+            (
+                "anonymous default export function",
+                "export default function (x: number) {\n  return x * 2;\n}\n",
+            ),
+            (
+                "anonymous default export arrow",
+                "export default (x: number) => {\n  return x * 2;\n};\n",
+            ),
+            (
+                "object-literal arrow-valued property",
+                "export const handlers = {\n  onClick: () => {\n    return 1;\n  },\n};\n",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            write(dir.path(), "src/anon.ts", content);
+            let diff = new_file_diff("src/anon.ts", content);
+            let source = FileSource::worktree(dir.path());
+            let set = build_bundles(&source, &diff).unwrap();
+            let covered = covered_lines(&set, "src/anon.ts");
+            let total = content.lines().count() as u32;
+            let missing: Vec<u32> = (1..=total).filter(|ln| !covered.contains(ln)).collect();
+            assert!(
+                missing.is_empty(),
+                "{label}: lines missing from every bundle: {missing:?}, bundles: {:?}",
+                set.bundles
+            );
+        }
+    }
+
+    #[test]
+    fn class_member_shapes_are_recognized_by_the_scanner() {
+        let dir = TempDir::new().unwrap();
+        let content = "export class Widget {\n  private count: number;\n\n  constructor(start: number) {\n    this.count = start;\n  }\n\n  get value(): number {\n    return this.count;\n  }\n\n  static create(): Widget {\n    return new Widget(0);\n  }\n}\n";
+        write(dir.path(), "src/widget.ts", content);
+        let diff = new_file_diff("src/widget.ts", content);
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, &diff).unwrap();
+
+        // No silent loss overall — every line still reaches a seat, one
+        // way or another (this audit's core invariant).
+        let covered = covered_lines(&set, "src/widget.ts");
+        let total = content.lines().count() as u32;
+        let missing: Vec<u32> = (1..=total).filter(|ln| !covered.contains(ln)).collect();
+        assert!(missing.is_empty(), "lines missing from every bundle: {missing:?}, bundles: {:?}", set.bundles);
+
+        let found_names: std::collections::HashSet<String> =
+            set.bundles.iter().map(|b| b.id.split('@').next().unwrap().to_string()).collect();
+        // Getters and static methods ARE recognized as their own named
+        // function (`METHOD_MODIFIERS` covers `get`/`static` explicitly).
+        for want in ["value", "create"] {
+            assert!(
+                found_names.contains(want),
+                "expected {want} to be scanned as its own function, found: {found_names:?}"
+            );
+        }
+        // Finding #6 (unpredicted, confirmed only by running this test):
+        // `constructor` is filtered OUT by `scan::KEYWORD_NAMES` — it is
+        // NEVER recognized as its own function, class-wide, project-wide.
+        // It still reaches a seat (via the toplevel fallback swallowing
+        // it into a coarser blob alongside the class's other unenclosed
+        // lines) but never as an individually-enriched function bundle.
+        assert!(
+            !found_names.contains("constructor"),
+            "if this now fails, `constructor` has been removed from `KEYWORD_NAMES` and finding #6 is \
+             fixed — update this assertion (and the report above) to expect it found: {found_names:?}"
+        );
+    }
+
+    #[test]
+    fn github_api_source_still_bundles_every_changed_file_beyond_the_repo_index_cap() {
+        let mut diff = String::new();
+        for i in 0..35 {
+            diff.push_str(&format!(
+                "+++ b/src/f{i}.ts\n@@ -0,0 +1,3 @@\n+export function fn{i}(x) {{\n+  return x + {i};\n+}}\n"
+            ));
+        }
+        let source = FileSource::github_api("owner/repo", "deadbeef");
+        if let FileSource::GithubApi { cache, .. } = &source {
+            let mut c = cache.borrow_mut();
+            for i in 0..35 {
+                c.insert(
+                    format!("src/f{i}.ts"),
+                    Some(format!("export function fn{i}(x) {{\n  return x + {i};\n}}\n")),
+                );
+            }
+        } else {
+            panic!("expected a GithubApi source");
+        }
+        let set = build_bundles(&source, &diff).unwrap();
+        let bundled_files: HashSet<String> =
+            set.bundles.iter().flat_map(|b| b.code.iter().map(|r| r.path.clone())).collect();
+        for i in 0..35 {
+            let f = format!("src/f{i}.ts");
+            assert!(
+                bundled_files.contains(&f),
+                "{f} must reach a seat despite the 30-file repo-index cap; bundled: {bundled_files:?}"
+            );
+        }
+        assert!(
+            set.bundles.iter().all(|b| b.manifest.iter().any(|m| m.contains("file budget exceeded"))),
+            "every bundle must self-report the incomplete repo index: {:?}",
+            set.bundles.iter().map(|b| &b.manifest).collect::<Vec<_>>()
+        );
+    }
 }
 
