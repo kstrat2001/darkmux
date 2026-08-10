@@ -539,6 +539,11 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
             continue;
         };
         let lines: Vec<String> = content.lines().map(str::to_string).collect();
+        // (#1753) This file's OWN import bindings (`name -> module
+        // specifier`), parsed once from the WHOLE file text — not just a
+        // changed function's body — so `resolve_callees` below can prefer
+        // a callee the caller actually imports over a same-named guess.
+        let import_bindings = source::parse_import_bindings(&content);
 
         let mut changed_new_lines: HashSet<u32> = HashSet::new();
         // (#1605 follow-up, QA finding) `new_lines` deliberately mixes
@@ -665,7 +670,7 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
             // `resolve_callees` returns the same insertion order the
             // Python reference's dict iterates in, so ref ordering
             // matches the reference (and is deterministic).
-            let callees = facts::resolve_callees(&fn_lines, &repo_index, rel);
+            let callees = facts::resolve_callees(&fn_lines, &repo_index, rel, &import_bindings);
             for (_cname, cdef) in &callees {
                 let clen = cdef.end0 - cdef.start0 + 1;
                 if clen <= facts::MAX_CALLEE_BODY_LINES {
@@ -1911,7 +1916,12 @@ main()
     }
 
     #[test]
-    fn resolve_callees_ignores_the_explicit_import_and_can_attach_the_wrong_function_body() {
+    fn resolve_callees_prefers_the_callers_explicit_import_binding_over_name_only_guessing() {
+        // (#1753 fix) `resolve_callees` now consults the caller's own
+        // `import ... from './b'` binding before falling back to
+        // name-only matching — the REAL callee (b.ts, the one the code
+        // actually calls) is attached, not a same-named decoy from an
+        // unrelated file the caller never imports.
         let dir = TempDir::new().unwrap();
         write(
             dir.path(),
@@ -1949,17 +1959,15 @@ main()
             set.bundles[0].code
         );
         assert!(
-            !callee_paths.contains(&"src/b.ts"),
-            "documents CURRENT behavior: the caller's explicit `import ... from './b'` is ignored by \
-             name-only resolution, so the REAL callee (b.ts) never reaches a seat. If this now fails, \
-             import-aware resolution has been added and this test should be rewritten to assert b.ts \
-             IS chosen: {:?}",
+            callee_paths.contains(&"src/b.ts"),
+            "the caller's explicit `import {{ validate }} from './b'` must resolve to the REAL \
+             callee (b.ts): {:?}",
             set.bundles[0].code
         );
         assert!(
-            callee_paths.contains(&"src/a.ts"),
-            "documents CURRENT behavior: the WRONG same-named function (a.ts) is silently attached as \
-             the callee instead: {:?}",
+            !callee_paths.contains(&"src/a.ts"),
+            "the WRONG same-named function (a.ts, never imported by caller.ts) must NOT be \
+             attached as the callee: {:?}",
             set.bundles[0].code
         );
     }
