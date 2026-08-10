@@ -1346,6 +1346,35 @@ main()
     /// The INVERTED CASE, asserted first: the fixture really does bundle.
     /// Without this, the next test could pass trivially on a fixture that
     /// produced no bundles at all — a green that proves nothing.
+
+    /// (QA gate finding) A hunk's `new_lines` includes unchanged CONTEXT
+    /// lines, not only added ones — `diff.rs`'s own doc and its
+    /// `parses_single_file_single_hunk` test both say so. Pre-fix that was
+    /// harmless (an unenclosed line was dropped). Post-fix every unenclosed
+    /// line becomes a bundle, so ordinary `-U3` context bleeding past a
+    /// function boundary bundles UNCHANGED code and hands it to every seat
+    /// as code under review.
+    #[test]
+    fn context_lines_do_not_become_toplevel_bundles() {
+        let dir = TempDir::new().unwrap();
+        let rel = "src/a.ts";
+        write(dir.path(), rel,
+            "import { x } from \"./x.js\"\n\nexport function foo() {\n  return x + 1\n}\n");
+        // Edit one line INSIDE foo. Context (lines 1-2) is top-level and
+        // unchanged; only line 4 is actually added.
+        let diff = format!(
+            "diff --git a/{rel} b/{rel}\n--- a/{rel}\n+++ b/{rel}\n@@ -1,5 +1,5 @@\n import {{ x }} from \"./x.js\"\n \n export function foo() {{\n+  return x + 2\n }}\n"
+        );
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, &diff).unwrap();
+        let toplevel: Vec<&str> =
+            set.bundles.iter().filter(|b| b.fact_family == "toplevel").map(|b| b.id.as_str()).collect();
+        assert!(
+            toplevel.is_empty(),
+            "unchanged context lines were bundled as changed code under review: {toplevel:?}"
+        );
+    }
+
     #[test]
     fn toplevel_control_the_function_body_is_bundled() {
         let (_dir, _source, rel, set) = toplevel_fixture();
