@@ -2286,19 +2286,19 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     // prompt` just above, which is an EXISTING, deliberate, #1256-cited
     // exclusion on the JUDGE side).
 
-    /// Finding #4. `bundle_inputs_from_set` renders the SAME code refs
-    /// through two formatters: `slice_code` (-> `BundleInput.code`, what
-    /// the judge sees) embeds an explicit "excerpt truncated" marker
-    /// inline when a callee ref is a header-only stub of a longer body;
-    /// `slice_code_probe` (-> `BundleInput.probe_code`, what the probe
-    /// sees) never does — confirmed here over a REAL bundler-produced
-    /// fixture (not a hand-built `BundleInput`), and consistent with the
-    /// EXISTING `slice_code_probe_skips_unreadable_and_past_eof_refs_
-    /// entirely` golden in `bundle::tests` ("no placeholder, no header").
-    /// The seat most likely to raise a "this looks incomplete" finding
-    /// has zero textual signal that its excerpt is a stub.
+    /// Finding #4 (#1754 fix). `bundle_inputs_from_set` renders the SAME
+    /// code refs through two formatters: `slice_code` (-> `BundleInput.
+    /// code`, what the judge sees) embeds an explicit "excerpt truncated"
+    /// marker inline when a callee ref is a header-only stub of a longer
+    /// body; `slice_code_probe` (-> `BundleInput.probe_code`, what the
+    /// probe sees) now does too — a DELIBERATE DIVERGENCE from
+    /// `probe-runner.py`'s `read_code_excerpt` (which has no notion of a
+    /// truncated stub at all), not a port correction. The seat most
+    /// likely to raise a "this looks incomplete" finding now gets the
+    /// same textual signal the judge seat already had that its excerpt is
+    /// a stub, not the whole function.
     #[test]
-    fn probe_seat_never_sees_the_truncation_marker_the_judge_seat_gets_inline() {
+    fn probe_seat_now_sees_the_truncation_marker_the_judge_seat_already_got_inline() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut long_body = String::from("export function longHelper(x) {\n");
         for i in 0..50 {
@@ -2335,11 +2335,10 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             b.code
         );
         assert!(
-            !b.probe_code.to_lowercase().contains("truncat"),
-            "documents CURRENT behavior: the probe's rendering (`BundleInput.probe_code`) never shows a \
-             truncation marker — the probe seat that raises the finding never learns the excerpt is a \
-             stub. If this now fails, `slice_code_probe` has grown a truncation marker and finding #4 is \
-             fixed: {}",
+            b.probe_code.to_lowercase().contains("truncat"),
+            "the probe's rendering (`BundleInput.probe_code`) must ALSO carry a truncation marker — \
+             the probe seat that raises the finding must learn the excerpt is a stub, same as the \
+             judge seat: {}",
             b.probe_code
         );
     }

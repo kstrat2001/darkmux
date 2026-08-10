@@ -303,11 +303,26 @@ pub fn slice_code(source: &FileSource, refs: &[BundleRef]) -> Result<String> {
 /// the ref verbatim). A ref whose file is unreadable, or whose clamped
 /// start exceeds the file's line count, is SKIPPED entirely (Python
 /// returns `None` and `build_prompt` drops it) — no `(unreadable: ...)`
-/// placeholder, no truncation marker, and no trailing newline after the
-/// last block. This is deliberately a SEPARATE renderer from
-/// [`slice_code`] (the judge seat's format, matching `judge-runner.py`'s
-/// own `slice_code`): Phase A formatted the two seats' code differently,
-/// and per-seat parity means porting both formats, not unifying them.
+/// placeholder, and no trailing newline after the last block. This is
+/// deliberately a SEPARATE renderer from [`slice_code`] (the judge
+/// seat's format, matching `judge-runner.py`'s own `slice_code`): Phase A
+/// formatted the two seats' code differently, and per-seat parity means
+/// porting both formats, not unifying them.
+///
+/// (#1754 — a DELIBERATE DIVERGENCE from `probe-runner.py`'s
+/// `read_code_excerpt`, not a port correction) A truncation marker IS now
+/// emitted, inside the fence as a trailing `//` comment, when a ref shows
+/// less than its enclosing function's full extent (a header-only stub —
+/// same [`truncated_extent`] check [`slice_code`] uses). Phase A's probe
+/// format has no notion of a truncated stub at all; this bundler adds one
+/// so the PROBE seat — the seat that actually originates a finding — gets
+/// the same "this is a stub, not the whole function" signal the JUDGE
+/// seat already got inline, instead of confidently reasoning about a
+/// callee body that silently stops mid-function. Every existing golden
+/// fixture in `bundle::tests` is unaffected: none of them exercises a ref
+/// whose `truncated_extent` returns `Some` (verified by rerunning them
+/// after this change), so the marker only ever appears on refs that
+/// didn't have byte-exact goldens to begin with.
 pub fn slice_code_probe(source: &FileSource, refs: &[BundleRef]) -> Result<String> {
     let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
     let mut blocks: Vec<String> = Vec::new();
@@ -327,7 +342,15 @@ pub fn slice_code_probe(source: &FileSource, refs: &[BundleRef]) -> Result<Strin
         // Python's `lines[s-1:e]` yields [] when e < s (a degenerate ref);
         // the block is still emitted, with an empty snippet — mirror that
         // rather than panicking on a backwards range.
-        let snippet = if e >= s { lines[s - 1..e].join("\n") } else { String::new() };
+        let mut snippet = if e >= s { lines[s - 1..e].join("\n") } else { String::new() };
+        if let Some(full_end) = truncated_extent(source, r)? {
+            if !snippet.is_empty() {
+                snippet.push('\n');
+            }
+            snippet.push_str(&format!(
+                "// … excerpt truncated — full function continues to line {full_end} …"
+            ));
+        }
         blocks.push(format!(
             "### `{}` (lines {}-{})\n```typescript\n{}\n```",
             r.path, s, e, snippet
