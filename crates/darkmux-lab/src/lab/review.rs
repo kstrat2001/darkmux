@@ -835,6 +835,13 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
     for f in &report.files_skipped {
         let label = match f.reason {
             SkipReason::NonCodeExtension => "non-code extension",
+            // (#1752) Deliberately NOT grouped with `NonCodeExtension` —
+            // this is real source code in a language the bundler doesn't
+            // parse, not benign data. Kept out of the `benign` match
+            // above too, so a diff dominated by this reason correctly
+            // stays `DegenerateKind::Error` (loud), never the neutral
+            // no-op treatment.
+            SkipReason::SourceLanguageUnsupported => "real source in an unsupported language",
             SkipReason::TestFileExcluded => "test file (excluded by the bundler)",
             SkipReason::UnreadableInWorktree => "unreadable in worktree",
             SkipReason::NoSurvivingLines => "no surviving lines",

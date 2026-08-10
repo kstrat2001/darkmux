@@ -105,11 +105,27 @@ pub struct BundleSet {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
-    /// `scan::ts_file(rel)` is false — the file isn't one of the extensions
-    /// the (TypeScript-only) built-in bundler understands at all. The most
-    /// common real-world cause (darkmux#1605): a diff dominated by JSON
-    /// config, lockfiles, or fixture data never had a chance to bundle.
+    /// The file is genuinely non-code data — JSON config, a lockfile, or
+    /// similar generated/fixture content (`scan::ts_file(rel)` is false
+    /// AND the extension is a recognized data/config one). (#1752) Split
+    /// from [`SkipReason::SourceLanguageUnsupported`] because a REAL
+    /// source file the bundler simply can't parse (a `.rs`/`.py`/`.go`
+    /// change, say) is not benign the way a lockfile bump is — this
+    /// variant is now reserved for the case its own name and doc
+    /// actually describe: a diff dominated by JSON config, lockfiles, or
+    /// fixture data that never had a chance to bundle.
     NonCodeExtension,
+    /// (#1752) The file is real, syntactically valid source code — just
+    /// in a language this (TypeScript-only) built-in bundler doesn't
+    /// parse (`.rs`, `.py`, `.go`, `.sh`, `.sql`, `.css`, …). Distinct
+    /// from [`SkipReason::NonCodeExtension`]: this means "not looked at,"
+    /// not "benign, nothing here" — darkmux's own `.rs` source is the
+    /// motivating case (a PR to `crates/`/`src/`/`runtime/` previously
+    /// got `SkipReason::NonCodeExtension`, reading identically to a pure
+    /// lockfile bump). No language support is implied or added by this
+    /// variant; it only makes the REPORTING honest about what wasn't
+    /// reviewed and why.
+    SourceLanguageUnsupported,
     /// A source file the bundler deliberately EXCLUDES rather than fails to
     /// understand: `scan::ts_file` rejects `tests/` and any basename
     /// containing "test". Split from [`SkipReason::NonCodeExtension`]
@@ -488,6 +504,28 @@ fn contiguous_runs(sorted: &[u32]) -> Vec<(u32, u32)> {
     out
 }
 
+/// (#1752) Extensions the bundler recognizes as genuinely non-code
+/// content — JSON config, lockfiles, and similar generated/fixture data,
+/// the case [`SkipReason::NonCodeExtension`]'s doc actually describes.
+/// Deliberately a small, conservative allowlist rather than an attempt to
+/// enumerate every "not code" shape: anything NOT `.ts`/`.tsx` and NOT in
+/// this list is treated as real source code in a language this bundler
+/// doesn't parse ([`SkipReason::SourceLanguageUnsupported`]) — the safer
+/// default, since silently calling a real `.rs`/`.py`/`.go` change
+/// "benign" is the exact misreporting #1752 exists to fix, while calling
+/// a genuinely-data file "unsupported source" is merely a slightly odd
+/// label with no honesty problem. No language support is added anywhere
+/// by this function; it only decides which of the two existing "we
+/// didn't bundle this" labels is the honest one.
+fn is_non_code_data_extension(rel: &str) -> bool {
+    const NON_CODE_EXTENSIONS: &[&str] =
+        &["json", "lock", "yml", "yaml", "toml", "md", "txt", "xml", "csv", "ini", "env"];
+    match rel.rsplit_once('.') {
+        Some((_, ext)) => NON_CODE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()),
+        None => false,
+    }
+}
+
 /// Build the full `BundleSet` for `diff` read against `source`. Direct
 /// port of `build_bundles(worktree, diff_text)`, generalized over
 /// `FileSource` fidelity and extended with the manifest + truncation
@@ -519,13 +557,19 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
 
     for (rel, hunks) in &files {
         if !scan::ts_file(rel) {
-            // (#1605 QA finding) Distinguish "not code I understand" from
-            // "code I deliberately exclude" — a `.ts`/`.tsx` file rejected
-            // here was rejected for being a TEST, not for being data.
+            // (#1605 QA finding, #1752) Distinguish "not code I
+            // understand" from "code I deliberately exclude" — a
+            // `.ts`/`.tsx` file rejected here was rejected for being a
+            // TEST, not for being data. And among the rest: distinguish
+            // genuinely non-code data from real source in a language this
+            // bundler doesn't parse — see `is_non_code_data_extension`'s
+            // doc for the reasoning.
             let reason = if rel.ends_with(".ts") || rel.ends_with(".tsx") {
                 SkipReason::TestFileExcluded
-            } else {
+            } else if is_non_code_data_extension(rel) {
                 SkipReason::NonCodeExtension
+            } else {
+                SkipReason::SourceLanguageUnsupported
             };
             skip.files_skipped.push(SkippedFile { path: rel.clone(), reason, function: None });
             continue;
@@ -1843,12 +1887,14 @@ main()
     }
 
     #[test]
-    fn build_bundles_treats_darkmuxs_own_rust_source_as_non_code() {
-        // darkmux's OWN repository is Rust. A `.rs` PR through this
-        // bundler gets `SkipReason::NonCodeExtension` — whose doc comment
-        // frames the common case as "content such as fixtures,
-        // lockfiles, or generated config," which is not true of this
-        // fixture (a real, small, syntactically valid Rust function).
+    fn build_bundles_reports_darkmuxs_own_rust_source_as_unsupported_language_not_non_code() {
+        // (#1752 fix) darkmux's OWN repository is Rust. A `.rs` PR through
+        // this bundler still yields zero bundles (no language support was
+        // added — the bundler still can't parse Rust), but the REASON is
+        // now `SourceLanguageUnsupported`, not `NonCodeExtension` — honest
+        // about "not looked at" instead of misleadingly implying "benign,
+        // nothing here" the way `NonCodeExtension`'s wording does for a
+        // real 3-line Rust function.
         let dir = TempDir::new().unwrap();
         write(dir.path(), "src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n");
         let diff = "+++ b/src/lib.rs\n\
@@ -1860,21 +1906,21 @@ main()
         let set = build_bundles(&source, diff).unwrap();
         assert!(
             set.bundles.is_empty(),
-            "a real Rust source change must currently yield zero bundles \
-             (documenting the gap, not asserting it as desired): {:?}",
+            "a real Rust source change still yields zero bundles — no language support was added, \
+             only honest reporting: {:?}",
             set.bundles
         );
         assert_eq!(set.skip.files_skipped.len(), 1, "got: {:?}", set.skip);
-        assert_eq!(set.skip.files_skipped[0].reason, SkipReason::NonCodeExtension);
+        assert_eq!(set.skip.files_skipped[0].reason, SkipReason::SourceLanguageUnsupported);
     }
 
     #[test]
-    fn build_bundles_treats_common_non_ts_languages_as_non_code() {
-        // Same class as the Rust case above, across several other
-        // common languages a real-world PR might touch. Each is real,
-        // syntactically valid source code — none is a lockfile or
-        // generated config, the case `NonCodeExtension`'s doc comment
-        // actually describes.
+    fn build_bundles_reports_common_non_ts_languages_as_unsupported_not_non_code() {
+        // (#1752 fix) Same class as the Rust case above, across several
+        // other common languages a real-world PR might touch. Each is
+        // real, syntactically valid source code — none is a lockfile or
+        // generated config, so none of them should be classified with the
+        // same reason as `package-lock.json`.
         let cases: &[(&str, &str, &str)] = &[
             ("src/helper.py", "def add(a, b):\n    return a + b\n", "+def add(a, b):\n+    return a + b\n"),
             (
@@ -1908,7 +1954,7 @@ main()
             assert!(set.bundles.is_empty(), "{path}: expected zero bundles, got: {:?}", set.bundles);
             assert_eq!(
                 set.skip.files_skipped.first().map(|s| s.reason),
-                Some(SkipReason::NonCodeExtension),
+                Some(SkipReason::SourceLanguageUnsupported),
                 "{path}: got: {:?}",
                 set.skip
             );
