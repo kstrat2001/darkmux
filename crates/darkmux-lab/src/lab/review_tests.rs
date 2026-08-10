@@ -6720,7 +6720,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             files_considered: entries.len(),
             files_skipped: entries
                 .into_iter()
-                .map(|(path, reason)| SkippedFile { path: path.to_string(), reason })
+                .map(|(path, reason)| SkippedFile { path: path.to_string(), reason, function: None })
                 .collect(),
         }
     }
@@ -6740,10 +6740,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 SkippedFile {
                     path: "src/foo.test.ts".to_string(),
                     reason: SkipReason::TestFileExcluded,
+                    function: None,
                 },
                 SkippedFile {
                     path: "tests/bar.ts".to_string(),
                     reason: SkipReason::TestFileExcluded,
+                    function: None,
                 },
             ],
         };

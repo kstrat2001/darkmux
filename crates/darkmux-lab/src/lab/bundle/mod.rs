@@ -142,11 +142,17 @@ pub enum SkipReason {
     /// function. There is genuinely no changed-and-function-shaped (or
     /// changed-at-all) code for the bundler to anchor on in that case.
     NoEnclosingFunction,
-    /// Every function the scanner found for this file's changed lines
-    /// exceeded the bundler's per-function size cap
-    /// (`end0 - start0 > 300` lines) — a real, internal-limit decline, NOT a
-    /// benign "nothing here" (the issue's "diff exceeded some internal
-    /// bound" case, distinct from both of the above).
+    /// A changed function's body exceeded the bundler's per-function size
+    /// cap (`end0 - start0 > 300` lines) — a real, internal-limit decline,
+    /// NOT a benign "nothing here" (the issue's "diff exceeded some
+    /// internal bound" case, distinct from both of the above). (#1751)
+    /// Recorded PER FUNCTION, the instant it's skipped — independent of
+    /// whether a sibling function (or a top-level run) in the same file
+    /// bundled successfully. Before #1751 this only fired when EVERY
+    /// function in the file hit the cap (inferred after the fact from
+    /// "the file produced zero new bundles"), which silently dropped a
+    /// mixed file's over-cap function — see [`SkippedFile::function`] for
+    /// how the entry names which function was dropped.
     OverSizeCap,
     /// (#1605 follow-up) A contiguous run of changed lines with no enclosing
     /// function — see [`SkipReason::NoEnclosingFunction`] — exceeded the
@@ -165,30 +171,42 @@ pub enum SkipReason {
 pub struct SkippedFile {
     pub path: String,
     pub reason: SkipReason,
+    /// (#1751) The specific function name and 1-indexed line span this
+    /// decline is scoped to, when `reason` names a decline that can fire
+    /// per-function within an otherwise-successful file (currently
+    /// `SkipReason::OverSizeCap`, recorded the moment a function is
+    /// skipped rather than only when EVERY function in the file hit the
+    /// cap) — e.g. `"huge (lines 5-330)"`. `None` for a file-scoped
+    /// reason (`NonCodeExtension`, `UnreadableInWorktree`, etc.), where
+    /// there is no single function to name. Additive field — a consumer
+    /// built against the pre-#1751 two-field shape still deserializes
+    /// fine (`#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
 }
 
 /// The bundler's full per-file decline accounting for one `build_bundles`
 /// run (#1605). `files_considered` is every file `diff::parse_diff` found in
 /// the diff (before any filtering); `files_skipped` names each declined
 /// portion, with why. A file NOT in `files_skipped` at all contributed at
-/// least one bundle — but that is NOT a full-coverage guarantee: when a
-/// file has MULTIPLE functions and only SOME of them exceed the 300-line
-/// cap, the capped ones are dropped with no accounting (`SkipReason::
-/// OverSizeCap` only fires when the file's functions ALL hit the cap —
-/// see the `had_functions && bundles.len() == bundles_before_file` check
-/// in `build_bundles`; a mixed file isn't distinguished from a
-/// fully-covered one today). That gap is pre-existing and NOT closed by
-/// [`SkipReason::TopLevelOverSizeCap`] (#1605 follow-up) below, which only
-/// covers the analogous case for top-level (unenclosed) runs — a decline
-/// IS recorded there per over-cap run the moment it's found, independent
-/// of whether the same file's functions (or another top-level run in that
-/// file) succeeded. So today: "in `files_skipped`" means "at least this
-/// much was declined"; "NOT in `files_skipped`" means "at least one bundle
-/// came out of this file," neither more nor less. `bundles: 0` with an
-/// EMPTY `files_skipped` (only possible when `files_considered == 0`, i.e.
-/// the diff itself parsed to no files) is the one case this report can't
-/// explain further — see [`BundleSet::skip`]'s own doc for why an external
-/// bundler's zero-bundle result stays in that same unexplained state.
+/// least one bundle. (#1751) A file WITH some functions bundling and OTHERS
+/// over the size cap now shows up in `files_skipped` too — one
+/// `SkippedFile { reason: OverSizeCap, function: Some(...) }` entry per
+/// dropped function, alongside the bundles its surviving functions
+/// produced — so "in `files_skipped`" no longer means "this file
+/// contributed nothing"; it means "at least this much was declined," which
+/// can coexist with real bundles from the same file. (Same shape
+/// [`SkipReason::TopLevelOverSizeCap`] (#1605 follow-up) already had for
+/// top-level runs — #1751 brought function declines up to the same
+/// per-decline-point recording instead of an after-the-fact,
+/// whole-file-only inference.) So today: "in `files_skipped`" means "at
+/// least this much was declined"; "NOT in `files_skipped`" means "at least
+/// one bundle came out of this file, and nothing from it was dropped,"
+/// neither more nor less. `bundles: 0` with an EMPTY `files_skipped` (only
+/// possible when `files_considered == 0`, i.e. the diff itself parsed to no
+/// files) is the one case this report can't explain further — see
+/// [`BundleSet::skip`]'s own doc for why an external bundler's zero-bundle
+/// result stays in that same unexplained state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BundleSkipReport {
     pub files_considered: usize,
@@ -509,12 +527,15 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
             } else {
                 SkipReason::NonCodeExtension
             };
-            skip.files_skipped.push(SkippedFile { path: rel.clone(), reason });
+            skip.files_skipped.push(SkippedFile { path: rel.clone(), reason, function: None });
             continue;
         }
         let Some(content) = source.read_file(rel)? else {
-            skip.files_skipped
-                .push(SkippedFile { path: rel.clone(), reason: SkipReason::UnreadableInWorktree });
+            skip.files_skipped.push(SkippedFile {
+                path: rel.clone(),
+                reason: SkipReason::UnreadableInWorktree,
+                function: None,
+            });
             continue;
         };
         let lines: Vec<String> = content.lines().map(str::to_string).collect();
@@ -535,8 +556,11 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
             added_new_lines.extend(h.added_line_numbers.iter().copied());
         }
         if changed_new_lines.is_empty() {
-            skip.files_skipped
-                .push(SkippedFile { path: rel.clone(), reason: SkipReason::NoSurvivingLines });
+            skip.files_skipped.push(SkippedFile {
+                path: rel.clone(),
+                reason: SkipReason::NoSurvivingLines,
+                function: None,
+            });
             continue;
         }
 
@@ -588,22 +612,19 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
             // kept as a defensive decline for this last combination, see
             // `SkipReason::NoEnclosingFunction`'s doc, rather than a silent
             // fallthrough if that invariant ever changes.
-            skip.files_skipped
-                .push(SkippedFile { path: rel.clone(), reason: SkipReason::NoEnclosingFunction });
+            skip.files_skipped.push(SkippedFile {
+                path: rel.clone(),
+                reason: SkipReason::NoEnclosingFunction,
+                function: None,
+            });
             continue;
         }
 
-        // (#1605) Did THIS file's FUNCTIONS contribute at least one bundle
-        // between them? Every function that survives the size cap below
-        // unconditionally pushes at least one `Bundle` (the "hunk" fallback
-        // family fires whenever none of param-flow/differential/siblings
-        // did) — so the only way a non-empty `found_fns` ends with zero new
-        // bundles is every one of its functions hitting the size cap (or,
-        // vanishingly rarely, colliding with a function already bundled
-        // from an earlier file in this same run). Scoped to functions only;
-        // the top-level-run loop below does its own, separate accounting.
-        let bundles_before_file = bundles.len();
-        let had_functions = !found_fns.is_empty();
+        // (#1751) Each over-cap function records its OWN decline the
+        // instant it's skipped, below — no file-level "did anything come
+        // out of this file's functions at all" inference needed anymore
+        // (the top-level-run loop just below does its own, separate,
+        // per-run accounting the same way).
         for (start0, end0, _header, name) in found_fns {
             let seen_key = (rel.clone(), start0, end0);
             if seen_fns.contains(&seen_key) {
@@ -611,6 +632,21 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
             }
             seen_fns.insert(seen_key);
             if end0 - start0 > 300 {
+                // (#1751) Recorded PER FUNCTION, immediately — independent
+                // of whether a sibling function in this same file (or a
+                // top-level run) already bundled successfully. Previously
+                // this loss was only recorded when EVERY function in the
+                // file hit the cap (inferred after the loop from "zero new
+                // bundles came out of this file"), so a file with one
+                // small function and one huge one silently dropped the
+                // huge one's changed lines with no skip entry at all —
+                // the file still "worked" because its small function
+                // bundled.
+                skip.files_skipped.push(SkippedFile {
+                    path: rel.clone(),
+                    reason: SkipReason::OverSizeCap,
+                    function: Some(format!("{name} (lines {}-{})", start0 as u32 + 1, end0 as u32 + 1)),
+                });
                 continue;
             }
 
@@ -744,17 +780,6 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
                 });
             }
         }
-        // (#1605) `had_functions` (snapshotted before the loop above moved
-        // `found_fns`) was true but nothing got pushed for this file — every
-        // candidate function hit the size cap. Checked HERE, before the
-        // top-level-run loop below, so this stays scoped to functions only —
-        // `SkipReason::OverSizeCap`'s doc says "every function", and it
-        // should stay true even on a file where a top-level run separately
-        // succeeds (or separately declines with its own
-        // `TopLevelOverSizeCap` entry just below).
-        if had_functions && bundles.len() == bundles_before_file {
-            skip.files_skipped.push(SkippedFile { path: rel.clone(), reason: SkipReason::OverSizeCap });
-        }
 
         // (#1605 follow-up) `unenclosed_lines` is every changed line that
         // fell outside a function above — grouped into maximal runs of
@@ -766,13 +791,16 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
         // over the cap is declined per-run, immediately, regardless of
         // whether this file's functions (or another run) already
         // contributed bundles — see `SkipReason::TopLevelOverSizeCap`'s doc
-        // for why that's a deliberate departure from the file-level
-        // "produced nothing at all" accounting the size-cap check below
-        // still does for functions.
+        // (#1751 brought the function-cap check just above to this exact
+        // same per-decline-point recording, so both loops now behave the
+        // same way here).
         for (run_start, run_end) in contiguous_runs(&unenclosed_lines) {
             if run_end - run_start > 300 {
-                skip.files_skipped
-                    .push(SkippedFile { path: rel.clone(), reason: SkipReason::TopLevelOverSizeCap });
+                skip.files_skipped.push(SkippedFile {
+                    path: rel.clone(),
+                    reason: SkipReason::TopLevelOverSizeCap,
+                    function: Some(format!("toplevel (lines {run_start}-{run_end})")),
+                });
                 continue;
             }
             let code_refs = vec![BundleRef { path: rel.clone(), start: run_start, end: run_end }];
@@ -1779,16 +1807,33 @@ main()
             set.bundles
         );
 
-        // ...AND the file is not recorded as declined at all — this is
-        // the invisible-loss defect. `set.skip.files_skipped` is checked
-        // for ANY entry naming this file, matching whatever reason a
-        // future fix might use.
+        // ...AND (#1751 fix) the file MUST now be recorded as declined —
+        // the huge function's drop is no longer invisible. Checked for ANY
+        // entry naming this file, matching whatever reason the fix uses
+        // (today: `SkipReason::OverSizeCap`, recorded per function at the
+        // point of skip rather than inferred from a file-level bundle
+        // count — see the removed `had_functions` check in git history).
         let declined = set.skip.files_skipped.iter().any(|s| s.path == "src/mixed.ts");
         assert!(
-            !declined,
-            "if this now fails, the gap has been fixed — a skip entry for src/mixed.ts now records \
-             the dropped `huge` function: {:?}",
+            declined,
+            "the over-cap `huge` function's decline must be recorded even though the sibling `small` \
+             function bundled successfully — a mixed file must not silently swallow one function's loss: \
+             {:?}",
             set.skip
+        );
+        // The recorded entry must name WHICH function was dropped, not just
+        // the file — the whole point of the fix is that an operator reading
+        // `files_skipped` can tell `huge` was the casualty, not `small`.
+        let huge_entry = set
+            .skip
+            .files_skipped
+            .iter()
+            .find(|s| s.path == "src/mixed.ts")
+            .expect("checked above");
+        assert_eq!(huge_entry.reason, SkipReason::OverSizeCap);
+        assert!(
+            huge_entry.function.as_deref().is_some_and(|f| f.contains("huge")),
+            "the skip entry must name the dropped function (`huge`), got: {huge_entry:?}"
         );
     }
 
