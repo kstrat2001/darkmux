@@ -2343,27 +2343,52 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         );
     }
 
-    /// Finding #5. Unlike the judge side (tested and cited above, #1256),
-    /// nothing pins `probe_user_message`'s exclusion of `bundle.manifest`
-    /// as deliberate — this is the first test to assert it either way.
+    /// Finding #5 (#1755 — DECIDED). Unlike the judge side (tested and
+    /// cited above, #1256's "match Phase A exactly" operator decision),
+    /// nothing previously pinned `probe_user_message`'s exclusion of
+    /// `bundle.manifest` as deliberate — a future edit could have added
+    /// it in one seat and not the other with zero signal either way.
+    ///
+    /// DECISION: the probe seat does NOT get the manifest either. Phase
+    /// A's `probe-runner.py` never had a manifest field to drop in the
+    /// first place (`bundler.py`'s bundles carry no such field), so this
+    /// isn't quite "parity" the way the judge's exclusion is — but the
+    /// practical effect the operator cares about is the same: the
+    /// manifest is a Rust-only addition (#1222 packet 3) with no Phase A
+    /// precedent, and it stays out of every model-facing prompt, not just
+    /// the judge's, until a real consumer needs it. Kept conservative on
+    /// purpose: injecting new content into a probe prompt is a
+    /// model-facing-prompt change (see this repo's AI-convention/term-
+    /// provenance doctrine), not something to do as a side effect of an
+    /// audit finding with no operator request behind it.
+    ///
+    /// Pinned as a STRUCTURAL contract, not just a substring check:
+    /// `probe_user_message`'s output must be byte-identical whether
+    /// `bundle.manifest` is empty or populated — so this test fails if a
+    /// future edit reads the field for ANYTHING, not only if it happens
+    /// to leak the exact word "manifest" or a specific symbol name.
     #[test]
     fn manifest_never_reaches_the_probe_user_message() {
-        let bundle = BundleInput {
+        let mut bundle = BundleInput {
             id: "billing.ts".to_string(),
             fact_family: "unscoped".to_string(),
             code: "const end = start.plus(30)".to_string(),
             probe_code: "### `billing.ts` (lines 1-1)\n```typescript\nconst end = start.plus(30)\n```"
                 .to_string(),
             facts: vec![],
-            manifest: vec!["referenced but not defined in bundle: helperFn <- unknown".to_string()],
+            manifest: vec![],
         };
-        let msg = probe_user_message("prior text", &bundle);
-        assert!(!msg.contains("helperFn"), "the bundle's manifest entry must not leak into the probe prompt: {msg}");
-        assert!(
-            !msg.to_lowercase().contains("manifest"),
-            "no manifest section at all in the probe prompt (documenting CURRENT, previously-unpinned \
-             behavior): {msg}"
+        let without_manifest = probe_user_message("prior text", &bundle);
+        bundle.manifest = vec!["referenced but not defined in bundle: helperFn <- unknown".to_string()];
+        let with_manifest = probe_user_message("prior text", &bundle);
+        assert_eq!(
+            without_manifest, with_manifest,
+            "the probe prompt must be byte-identical regardless of `bundle.manifest` — this is a \
+             DECIDED contract (#1755), not an accident: a populated manifest must never leak into, \
+             or otherwise affect, the dispatched probe prompt"
         );
+        assert!(!with_manifest.contains("helperFn"), "{with_manifest}");
+        assert!(!with_manifest.to_lowercase().contains("manifest"), "{with_manifest}");
     }
 
     // ═══════════════════════════════════════════════════════════════

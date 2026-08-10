@@ -2272,6 +2272,13 @@ pub fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Va
 /// `build_prompt` never saw one; `ReviewInputs::intent_title`/
 /// `intent_body` are dropped here on purpose (kept for [`judge_prompt`]
 /// only), not silently threaded through.
+///
+/// (#1755 — DECIDED) Also deliberately NO `bundle.manifest` anywhere in
+/// this prompt, matching [`judge_prompt`]'s own #1256 exclusion of the
+/// same field. Pinned by
+/// `manifest_never_reaches_the_probe_user_message` in `review_tests.rs`
+/// as a structural contract (byte-identical output regardless of
+/// `bundle.manifest`'s content), not merely an absence nobody checked.
 fn probe_user_message(prior: &str, bundle: &BundleInput) -> String {
     let mut parts: Vec<String> =
         vec![prior.to_string(), String::new(), "Code:".to_string(), String::new(), bundle.probe_code.clone()];
