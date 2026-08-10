@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/darkmux
-#   brew install darkmux                # stable release (v2.5.0)
+#   brew install darkmux                # stable release (v2.5.1)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -26,8 +26,8 @@ class Darkmux < Formula
   # `brew install darkmux` builds from this source tarball; `brew install
   # --HEAD darkmux` builds from main instead. The sha256 is of the
   # GitHub-generated source tarball for the tag (`shasum -a 256`).
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v2.5.0.tar.gz"
-  sha256 "b1bcf0b10401ea23eeff0961dcc4d407b09049aa5c404942cf41663d7e01230d"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v2.5.1.tar.gz"
+  sha256 "0c10d39143c02582e7d59abbeaeca434048ae3b29b6a12040549cf671d3c1077"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
