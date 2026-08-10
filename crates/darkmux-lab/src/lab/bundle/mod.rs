@@ -58,8 +58,13 @@ pub struct BundleRef {
 /// are additive fields (packet 3), safe for an older consumer to ignore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bundle {
-    /// `"<fn>@<path>"` — shared across a function's family-variant
-    /// bundles so a probe-runner can group them.
+    /// `"<fn>@<path>"` for a function bundle — shared across a function's
+    /// family-variant bundles so a probe-runner can group them. A
+    /// top-level (unenclosed-line) bundle instead uses
+    /// `"toplevel:<start>-<end>@<path>"` (#1605 follow-up) — there is no
+    /// function name to key on, and the `start-end` span keeps the id
+    /// unique across multiple top-level runs in the same file; a consumer
+    /// grouping by id should not assume the `"<name>@<path>"` shape alone.
     pub id: String,
     pub code: Vec<BundleRef>,
     pub facts: Vec<String>,
@@ -125,17 +130,17 @@ pub enum SkipReason {
     /// in the new-side file at all (e.g. a function deleted in its
     /// entirety). There is no post-image content left to bundle.
     NoSurvivingLines,
-    /// Historical: every changed new-side line in this file fell outside any
-    /// function `scan::find_all_functions_in_text` could locate. Left in
-    /// place for schema stability, but unreachable through the normal
-    /// `build_bundles` flow as of the top-level-statement fix (#1605
-    /// follow-up) — a changed line outside every function now becomes its
-    /// own `"toplevel"`-family bundle (see [`SkipReason::TopLevelOverSizeCap`]
-    /// for the one way that can still decline) rather than being dropped
-    /// with nothing changed-and-function-shaped for the bundler to anchor
-    /// on. Kept as a defensive variant, not removed, in case a future
-    /// change reintroduces a path where `build_bundles` finds changed lines
-    /// with genuinely nowhere to put them.
+    /// Every ADDED new-side line in this file fell outside any function
+    /// `scan::find_all_functions_in_text` could locate, AND no context
+    /// line inside a hunk's span found one either. As of the top-level-
+    /// statement fix (#1605 follow-up), an unenclosed line that was
+    /// actually added now becomes its own `"toplevel"`-family bundle (see
+    /// [`SkipReason::TopLevelOverSizeCap`] for the one way that can still
+    /// decline) instead of landing here — so this reason is now specific
+    /// to files with NO added lines at all (a pure deletion, or a
+    /// context-only hunk) whose surviving context also sits outside every
+    /// function. There is genuinely no changed-and-function-shaped (or
+    /// changed-at-all) code for the bundler to anchor on in that case.
     NoEnclosingFunction,
     /// Every function the scanner found for this file's changed lines
     /// exceeded the bundler's per-function size cap
@@ -166,18 +171,24 @@ pub struct SkippedFile {
 /// run (#1605). `files_considered` is every file `diff::parse_diff` found in
 /// the diff (before any filtering); `files_skipped` names each declined
 /// portion, with why. A file NOT in `files_skipped` at all contributed at
-/// least one bundle covering every one of its changed lines. A file that
-/// DOES appear can still have contributed bundles too — as of
-/// [`SkipReason::TopLevelOverSizeCap`] (#1605 follow-up), a decline is
-/// recorded per over-cap top-level run the moment it's found, independent
-/// of whether the same file's functions (or a different top-level run in
-/// that file) succeeded — so "in `files_skipped`" now means "at least this
-/// much was declined," not "nothing from this file made it into `bundles`."
-/// `bundles: 0` with an EMPTY `files_skipped` (only possible when
-/// `files_considered == 0`, i.e. the diff itself parsed to no files) is the
-/// one case this report can't explain further — see [`BundleSet::skip`]'s
-/// own doc for why an external bundler's zero-bundle result stays in that
-/// same unexplained state.
+/// least one bundle — but that is NOT a full-coverage guarantee: when a
+/// file has MULTIPLE functions and only SOME of them exceed the 300-line
+/// cap, the capped ones are dropped with no accounting (`SkipReason::
+/// OverSizeCap` only fires when the file's functions ALL hit the cap —
+/// see the `had_functions && bundles.len() == bundles_before_file` check
+/// in `build_bundles`; a mixed file isn't distinguished from a
+/// fully-covered one today). That gap is pre-existing and NOT closed by
+/// [`SkipReason::TopLevelOverSizeCap`] (#1605 follow-up) below, which only
+/// covers the analogous case for top-level (unenclosed) runs — a decline
+/// IS recorded there per over-cap run the moment it's found, independent
+/// of whether the same file's functions (or another top-level run in that
+/// file) succeeded. So today: "in `files_skipped`" means "at least this
+/// much was declined"; "NOT in `files_skipped`" means "at least one bundle
+/// came out of this file," neither more nor less. `bundles: 0` with an
+/// EMPTY `files_skipped` (only possible when `files_considered == 0`, i.e.
+/// the diff itself parsed to no files) is the one case this report can't
+/// explain further — see [`BundleSet::skip`]'s own doc for why an external
+/// bundler's zero-bundle result stays in that same unexplained state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BundleSkipReport {
     pub files_considered: usize,
@@ -509,8 +520,19 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
         let lines: Vec<String> = content.lines().map(str::to_string).collect();
 
         let mut changed_new_lines: HashSet<u32> = HashSet::new();
+        // (#1605 follow-up, QA finding) `new_lines` deliberately mixes
+        // added lines AND unchanged context lines (so a changed function
+        // can be located via either) — that's still exactly what we want
+        // for `sorted_lines` below, which feeds `enclosing_fn_for_line`.
+        // But a line with no enclosing function only belongs in a
+        // top-level bundle if it was ACTUALLY ADDED — an unchanged import
+        // line that merely fell inside a hunk's context window is not
+        // "changed code" and must not be handed to a seat as if it were.
+        // `added_new_lines` is that narrower set, checked below.
+        let mut added_new_lines: HashSet<u32> = HashSet::new();
         for h in hunks {
             changed_new_lines.extend(h.new_lines.iter().copied());
+            added_new_lines.extend(h.added_line_numbers.iter().copied());
         }
         if changed_new_lines.is_empty() {
             skip.files_skipped
@@ -529,11 +551,19 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
         // functions it DID have, so `bundles > 0` and `skip` stayed clean).
         // Collected here instead — bundled as its own unit below (a
         // top-level statement is real changed code; it just has no function
-        // to anchor on) rather than dropped.
+        // to anchor on) rather than dropped. Gated on `added_new_lines`
+        // (QA finding): `sorted_lines` walks `new_lines`, which — on
+        // purpose, see its doc — mixes added lines with unchanged CONTEXT
+        // lines so a changed function can be located via either. An
+        // unenclosed CONTEXT line is not itself changed code (it merely
+        // fell inside a hunk's span); only an unenclosed line that was
+        // actually ADDED belongs in a top-level bundle.
         let mut unenclosed_lines: Vec<u32> = Vec::new();
         for ln in sorted_lines {
             let Some(fndef) = scan::enclosing_fn_for_line(&all_fns, ln) else {
-                unenclosed_lines.push(ln);
+                if added_new_lines.contains(&ln) {
+                    unenclosed_lines.push(ln);
+                }
                 continue;
             };
             let key = (fndef.start0, fndef.end0);
@@ -542,12 +572,22 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
             }
         }
         if found_fns.is_empty() && unenclosed_lines.is_empty() {
-            // Unreachable today: `sorted_lines` is non-empty here (the
+            // Reachable in one narrow case: a hunk with NO added lines at
+            // all (a pure deletion, or a context-only hunk) whose context
+            // lines all fall outside every function — there is no
+            // actually-added code to bundle, so `unenclosed_lines` stays
+            // empty even though `sorted_lines` (context included) was not.
+            // That's correct, not a gap: an unenclosed CONTEXT line was
+            // never changed code, so silently excluding it from
+            // `unenclosed_lines` above loses nothing worth recording.
+            // Otherwise defensive: `sorted_lines` is non-empty here (the
             // `NoSurvivingLines` check above already handled the empty
-            // case), and every line in it lands in exactly one of
-            // `found_fns`/`unenclosed_lines`. Kept as a defensive decline —
-            // see `SkipReason::NoEnclosingFunction`'s doc — rather than a
-            // silent fallthrough if that invariant ever changes.
+            // case), and every line in it either lands in `found_fns`, or
+            // is unenclosed-and-added (landing in `unenclosed_lines`), or
+            // is unenclosed-and-context (correctly dropped, per above) —
+            // kept as a defensive decline for this last combination, see
+            // `SkipReason::NoEnclosingFunction`'s doc, rather than a silent
+            // fallthrough if that invariant ever changes.
             skip.files_skipped
                 .push(SkippedFile { path: rel.clone(), reason: SkipReason::NoEnclosingFunction });
             continue;
@@ -1343,10 +1383,6 @@ main()
         (dir, source, rel.to_string(), set)
     }
 
-    /// The INVERTED CASE, asserted first: the fixture really does bundle.
-    /// Without this, the next test could pass trivially on a fixture that
-    /// produced no bundles at all — a green that proves nothing.
-
     /// (QA gate finding) A hunk's `new_lines` includes unchanged CONTEXT
     /// lines, not only added ones — `diff.rs`'s own doc and its
     /// `parses_single_file_single_hunk` test both say so. Pre-fix that was
@@ -1375,6 +1411,9 @@ main()
         );
     }
 
+    /// The INVERTED CASE, asserted first: the fixture really does bundle.
+    /// Without this, the next test could pass trivially on a fixture that
+    /// produced no bundles at all — a green that proves nothing.
     #[test]
     fn toplevel_control_the_function_body_is_bundled() {
         let (_dir, _source, rel, set) = toplevel_fixture();

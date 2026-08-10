@@ -19,8 +19,21 @@ pub struct Hunk {
     /// hunk — added lines AND unchanged context lines (matches the
     /// reference: context lines advance `new_ln` and land in
     /// `new_lines` too, since a changed function can be located via a
-    /// context line inside it just as well as an added one).
+    /// context line inside it just as well as an added one). Do NOT
+    /// narrow this to "actually changed" lines — locating the enclosing
+    /// function is exactly the case that needs context lines included.
+    /// For "was this specific line actually added" (as opposed to merely
+    /// present in the hunk's span), see `added_lines` below.
     pub new_lines: BTreeSet<u32>,
+    /// Subset of `new_lines`: just the line numbers that were actually
+    /// ADDED (`+` prefix) — no context lines (#1605 follow-up, QA
+    /// finding). `new_lines` deliberately mixes added and context so a
+    /// changed function can be located via either; a caller that needs to
+    /// know whether a specific line was really touched by the diff (e.g.
+    /// deciding whether an unenclosed line is real changed code worth
+    /// bundling, vs. unchanged context that merely fell inside a hunk's
+    /// span) wants this set instead.
+    pub added_line_numbers: BTreeSet<u32>,
     /// Every line of the pre-image within this hunk's span: removed
     /// lines AND unchanged context lines, in order.
     pub old_block: Vec<String>,
@@ -81,6 +94,7 @@ pub fn parse_diff(diff_text: &str) -> Vec<(String, Vec<Hunk>)> {
             h.added.push(content.to_string());
             h.new_block.push(content.to_string());
             h.new_lines.insert(new_ln);
+            h.added_line_numbers.insert(new_ln);
             new_ln += 1;
         } else if ln.starts_with('-') && !ln.starts_with("---") {
             let content = &ln[1..];
@@ -164,6 +178,13 @@ mod tests {
         assert_eq!(
             h.new_lines,
             [1, 2, 3, 4].into_iter().collect::<BTreeSet<u32>>()
+        );
+        // (#1605 follow-up) `added_line_numbers` is the STRICT subset of
+        // `new_lines` that was actually added — lines 1 and 4 are context
+        // (unchanged), only 2 and 3 ("new line"/"added line") carry a `+`.
+        assert_eq!(
+            h.added_line_numbers,
+            [2, 3].into_iter().collect::<BTreeSet<u32>>()
         );
     }
 
