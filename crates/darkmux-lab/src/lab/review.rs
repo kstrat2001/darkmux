@@ -311,6 +311,37 @@ pub struct JudgedFlag {
     /// the tier is then `Archived`, with this flag recording why.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub demoted_by_verify: bool,
+    /// (#1748) Present iff the mechanical, zero-token absence-claim
+    /// backstop ([`apply_absence_backstop`]) found the claimed-absent
+    /// token in the WHOLE FILE and demoted this flag from `Confirmed` to
+    /// `NeedsCheck`. Distinct from `demoted_by_pass2`/`demoted_by_verify`
+    /// (both AI-driven demotions) — this one is a plain substring check
+    /// against `FileSource`, run BEFORE the (optional, costlier) verify
+    /// stage even sees the flag. Absent (and never serialized) whenever
+    /// the check never fired or agreed with the finding — a flag the
+    /// backstop left untouched serializes byte-identically to today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absence_backstop: Option<AbsenceBackstopNote>,
+}
+
+/// (#1748) The mechanical absence-claim backstop's per-flag outcome —
+/// present on a [`JudgedFlag`] only when the check actually demoted it.
+/// See [`apply_absence_backstop`] for the full check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbsenceBackstopNote {
+    /// The token the finding claimed was absent (`process.exitCode`,
+    /// `.catch`) — the single backtick-quoted span
+    /// [`extract_claimed_absent_token`] pulled from the decisive judge
+    /// record's `note_for_author`/`decisive_evidence`.
+    pub token: String,
+    /// The repo-relative file the token was found in.
+    pub file: String,
+    /// 1-indexed line number the token was found on, when the token is
+    /// confined to a single line (`None` when `content.contains(token)`
+    /// held but no single line matched — e.g. the token spans a wrap —
+    /// still a real contradiction, just without a precise line to cite).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
 }
 
 // ─── telemetry ────────────────────────────────────────────────────────────
@@ -2287,6 +2318,13 @@ pub struct ReviewInputs<'a> {
     /// max_tokens_per_execution > 500000`) — injected here, not read in the
     /// driver, so the pipeline stays config-free and unit-testable.
     pub remote_max_tokens_per_execution: u64,
+    /// (#1748) The SAME `FileSource` the bundler read from — threaded
+    /// through so [`apply_absence_backstop`] can check a confirmed
+    /// finding's absence claim against the WHOLE FILE, not just the
+    /// (possibly truncated) bundle excerpt the AI seats saw. `None` means
+    /// the backstop is a no-op (never a hard error) — most of this
+    /// module's own tests have no real file tree to check against.
+    pub source: Option<&'a FileSource>,
 }
 
 pub fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Value {
@@ -3124,6 +3162,211 @@ fn judge_gate_outcome(
     }
 }
 
+// ─── absence-claim backstop (#1748) — a cheap, zero-token mechanical gate ──
+//
+// Production incident: a `confirmed` finding claimed a line of code was
+// ABSENT ("does not assign process.exitCode", "there is no .catch") when
+// both were present in the file. The judge seat had been shown a
+// TRUNCATED bundle excerpt and reported honestly about its own window;
+// the pipeline then promoted that into a claim about the WHOLE FILE. The
+// pipeline already has the whole file available via `FileSource` — this
+// check costs zero tokens and would have caught it.
+//
+// Deliberately conservative at every step: a phrase-match predicate
+// (never a fuzzy heuristic), single-token extraction that ABSTAINS on any
+// ambiguity, and a plain substring check against real file content. A
+// false POSITIVE here (flagging a non-absence claim) costs one wasted
+// file read; a false NEGATIVE just leaves the AI seats' own ruling
+// standing — either way, `apply_absence_backstop` never invents a
+// finding and never deletes one, only demotes a contradicted `Confirmed`
+// to `NeedsCheck` with a note (#1748's "aggregate, never discard" spirit,
+// same as #1299's dedup safety net).
+
+/// The literal vocabulary [`is_absence_claim`] matches (case-insensitively,
+/// as a plain substring) to decide a finding's text is asserting something
+/// is MISSING. Kept in ONE named, auditable list — never scattered regexes
+/// — so the phrase set is reviewable and testable on its own. Narrow and
+/// literal on purpose: the real precision guard is downstream
+/// ([`extract_claimed_absent_token`] additionally requires exactly one
+/// confident backtick-quoted token before the check acts at all), so this
+/// list can afford to name the common phrasings without needing to be
+/// exhaustive or clever.
+pub const ABSENCE_CLAIM_PHRASES: &[&str] = &[
+    "does not call",
+    "does not assign",
+    "does not invoke",
+    "does not check",
+    "does not handle",
+    "does not catch",
+    "does not set",
+    "does not use",
+    "doesn't call",
+    "doesn't assign",
+    "doesn't invoke",
+    "doesn't check",
+    "doesn't handle",
+    "doesn't catch",
+    "doesn't set",
+    "never calls",
+    "never assigns",
+    "never invokes",
+    "never checks",
+    "never sets",
+    "never catches",
+    "there is no ",
+    "there's no ",
+    "no call to ",
+    "not present in",
+    "not found in",
+    "is missing",
+    "is not present",
+    "is absent",
+    "absent from",
+    "missing from",
+    "lacks a call to",
+    "fails to call",
+    "fails to check",
+    "fails to invoke",
+];
+
+/// True iff `text` contains one of [`ABSENCE_CLAIM_PHRASES`], matched
+/// case-insensitively. Pure string work — no model call, no regex crate
+/// (matches the codebase's existing hand-rolled-parsing convention, see
+/// `bundle/source.rs`'s `extract_from_specifier`).
+pub fn is_absence_claim(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ABSENCE_CLAIM_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// The claimed-absent token, when exactly ONE backtick-quoted span exists
+/// in `text` — the confident case. Zero spans (nothing quoted to check
+/// against the file) or two-or-more spans (which one is "the thing that's
+/// missing"? ambiguous) both return `None`, per the brief: a guess here is
+/// worse than no check at all. Reuses `dialectic::backtick_spans` — the
+/// SAME single-backtick-outside-fence scanner [`extract_new_side_anchor`]
+/// already uses, so this stays one parsing discipline, not a second one.
+/// Deliberately does NOT apply `dialectic::MIN_EVIDENCE_SPAN` (the anchor
+/// matcher's 8-char floor) — a real claimed-absent token can be short and
+/// still fully confident (`.catch`, `id`), and the single-span requirement
+/// above is already the precision guard for this use, not a length floor.
+pub fn extract_claimed_absent_token(text: &str) -> Option<String> {
+    use super::dialectic::backtick_spans;
+    let mut spans = backtick_spans(text);
+    if spans.len() != 1 {
+        return None;
+    }
+    let token = spans.remove(0);
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// The repo-relative file path a bundle's `id` names. Production bundle
+/// ids follow `"<fn>@<path>"` (see `Bundle::id`'s doc) — the substring
+/// after the LAST `@` is the path. The provisional test-only bundler
+/// (`bundles_from_diff`) sets `id` to the bare changed-file path with no
+/// `@` at all; treating an `@`-less id as already being the path keeps
+/// this working against both bundlers. Returns `None` only for an empty
+/// id — never fails, just means the caller has nothing to check.
+fn bundle_file_path(bundle_id: &str) -> Option<&str> {
+    let path = match bundle_id.rfind('@') {
+        Some(idx) => &bundle_id[idx + 1..],
+        None => bundle_id,
+    };
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// (#1748) The mechanical, zero-token backstop: for every flag the judge
+/// left `Confirmed`, check whether its decisive record's text is an
+/// ABSENCE claim naming a confident token, and if so, whether that token
+/// is actually present anywhere in the WHOLE FILE (via `source`, never the
+/// bundle's own — possibly truncated — excerpt). A contradiction demotes
+/// the flag to `NeedsCheck` (never deletes it — a true finding with sloppy
+/// wording must not vanish) and attaches a short machine-generated note
+/// naming what was found and where, both structurally
+/// ([`JudgedFlag::absence_backstop`]) and in the human-facing
+/// `note_for_author` text the posted review renders (`pr_review.rs` always
+/// reads `pass2.unwrap_or(pass1)`, mutated here to match).
+///
+/// Applied BEFORE the optional AI verify stage — a mechanically-contradicted
+/// claim never spends a verify dispatch adjudicating it. `source: None`
+/// (no `FileSource` available — most of this module's own tests) makes the
+/// whole pass a no-op; per-flag, any abstain condition (non-absence claim,
+/// no confident token, an unresolvable bundle path, or an unreadable file)
+/// leaves that flag completely untouched. Never errors and never touches
+/// the run's overall `Result` — a `FileSource` read failure is exactly the
+/// "doesn't exist / unreadable" case `FileSource::read_file` already
+/// reports as `Ok(None)`, not a hard error, and this function treats a rare
+/// `Err` (e.g. a `GithubApi` source whose `gh` shell-out itself failed to
+/// spawn) the same way: abstain, never fail the run over an observability
+/// nicety.
+pub fn apply_absence_backstop(judged: &mut [JudgedFlag], bundles: &[BundleInput], source: Option<&FileSource>) {
+    let Some(source) = source else {
+        return;
+    };
+    for j in judged.iter_mut() {
+        if j.tier != Tier::Confirmed {
+            continue;
+        }
+        let (note, evidence) = {
+            let record = j.pass2.as_ref().unwrap_or(&j.pass1);
+            (record.note_for_author.clone(), record.decisive_evidence.clone())
+        };
+        let text = format!("{note} {evidence}");
+        if !is_absence_claim(&text) {
+            continue;
+        }
+        let Some(token) = extract_claimed_absent_token(&text) else {
+            continue;
+        };
+        let Some(bundle) = bundles.iter().find(|b| b.id == j.flag.bundle_id) else {
+            continue;
+        };
+        let Some(path) = bundle_file_path(&bundle.id) else {
+            continue;
+        };
+        let Ok(Some(content)) = source.read_file(path) else {
+            continue;
+        };
+        if !content.contains(token.as_str()) {
+            // Genuinely absent from the whole file too — the claim holds.
+            // Leave the flag exactly as the judge left it (the mandatory
+            // inverted case: this backstop must not demote everything).
+            continue;
+        }
+        let line = content.lines().position(|l| l.contains(token.as_str())).map(|i| i as u32 + 1);
+        let mechanical_note = match line {
+            Some(n) => format!(
+                "mechanical backstop: `{token}` was found in {path} at line {n} — this absence \
+                 claim does not hold against the whole file (the AI seat may have seen only a \
+                 truncated excerpt); demoted for a human double check"
+            ),
+            None => format!(
+                "mechanical backstop: `{token}` was found in {path} — this absence claim does \
+                 not hold against the whole file (the AI seat may have seen only a truncated \
+                 excerpt); demoted for a human double check"
+            ),
+        };
+        j.absence_backstop = Some(AbsenceBackstopNote { token: token.clone(), file: path.to_string(), line });
+        j.tier = Tier::NeedsCheck;
+        let record = match j.pass2.as_mut() {
+            Some(r) => r,
+            None => &mut j.pass1,
+        };
+        record.note_for_author = if record.note_for_author.trim().is_empty() {
+            mechanical_note
+        } else {
+            format!("{}\n\n{mechanical_note}", record.note_for_author.trim())
+        };
+    }
+}
+
 // ─── shared finish (probe→dedup→judge→envelope), reused by run_judge_only ─
 
 #[allow(clippy::too_many_arguments)]
@@ -3248,6 +3491,7 @@ fn finish_review(
             demoted_by_pass2: outcome.demoted_by_pass2,
             verify: None,
             demoted_by_verify: false,
+            absence_backstop: None,
         });
     }
     if !judge.pm.is_remote() {
@@ -3337,6 +3581,13 @@ fn finish_review(
         env.degenerate = gate.degenerate_reason;
         env.degenerate_kind = Some(DegenerateKind::Error);
     }
+
+    // (#1748) The mechanical, zero-token absence-claim backstop — runs
+    // BEFORE the optional (AI, costlier) verify stage, so a
+    // mechanically-contradicted claim never spends a verify dispatch
+    // adjudicating it. `inputs.source` is `None` for most of this module's
+    // own tests, making this a no-op; see `apply_absence_backstop`'s doc.
+    apply_absence_backstop(&mut judged, bundles, inputs.source);
 
     // (#1260) The optional verify stage — one adjudication per confirmed
     // flag, AFTER the double-confirm judge and BEFORE the tier counts so a
@@ -4016,12 +4267,36 @@ pub struct BundleBuildSpec {
     pub diff_file: PathBuf,
 }
 
-/// Reconstruct the [`FileSource`] `review-bundle-step`'s own `Step.config`
-/// declares (stamped by `build_review_graph_from_config` from a
-/// [`BundleBuildSpec`] — see that type's doc). A malformed shape here is a
-/// BUILD-TIME bug (the launcher/bench caller mis-stamped the config), not an
-/// operator input mistake, so this errors loudly rather than defaulting —
-/// contract 7 (loud validation at the consumption point).
+/// `BundleSourceSpec` -> the `"source"` JSON block both `review-bundle-step`
+/// AND (#1748) `review-judge-step` stamp onto their own `Step.config` — the
+/// SAME shape, so ONE reader ([`file_source_from_step_config`]) reconstructs
+/// a [`FileSource`] for either step. Extracted so the two stamp sites (see
+/// `build_review_graph_from_config`) can't drift from each other.
+fn bundle_source_spec_json(source: &BundleSourceSpec) -> serde_json::Value {
+    match source {
+        BundleSourceSpec::Worktree { path } => {
+            json!({ "kind": "worktree", "path": path.display().to_string() })
+        }
+        BundleSourceSpec::Github { repo, head_sha } => {
+            json!({ "kind": "github", "repo": repo, "head_sha": head_sha })
+        }
+    }
+}
+
+/// Reconstruct a [`FileSource`] from a `Step.config` that carries a
+/// `"source"` block in [`bundle_source_spec_json`]'s shape — originally
+/// `review-bundle-step`'s own contract (stamped by
+/// `build_review_graph_from_config` from a [`BundleBuildSpec`] — see that
+/// type's doc), and (#1748) reused verbatim by `review-judge-step`'s
+/// [`apply_absence_backstop`] wiring, which stamps the SAME block onto its
+/// own config. A malformed shape here is a BUILD-TIME bug (the launcher/
+/// bench caller mis-stamped the config), not an operator input mistake, so
+/// this errors loudly rather than defaulting — contract 7 (loud validation
+/// at the consumption point). Callers for whom a missing `"source"` is a
+/// legitimate, tolerable case (the judge step's backstop, on a hand-built
+/// `Step.config` with no source at all) use `.ok()` at the call site rather
+/// than this function silently defaulting — the function stays one honest
+/// contract either way.
 fn file_source_from_step_config(config: &serde_json::Value) -> Result<FileSource> {
     let source = config
         .get("source")
@@ -5176,6 +5451,7 @@ impl StepKind for ReviewJudgeStepKind {
                                 demoted_by_pass2: outcome.demoted_by_pass2,
                                 verify: None,
                                 demoted_by_verify: false,
+                                absence_backstop: None,
                             },
                         });
                     });
@@ -5201,7 +5477,25 @@ impl StepKind for ReviewJudgeStepKind {
         let pass1_wall_ms: u64 = results.iter().map(|r| r.pass1_ms).sum();
         let pass2_wall_ms: u64 = results.iter().map(|r| r.pass2_ms).sum();
 
-        let judged: Vec<JudgedFlag> = results.into_iter().map(|r| r.judged).collect();
+        let mut judged: Vec<JudgedFlag> = results.into_iter().map(|r| r.judged).collect();
+
+        // (#1748) The mechanical, zero-token absence-claim backstop — see
+        // `apply_absence_backstop`'s doc. Runs single-threaded, AFTER the
+        // concurrent judge dispatches above have all joined (no `FileSource`
+        // Send/Sync concern), and BEFORE `judged` is serialized as this
+        // step's output — so a demotion here is visible to every downstream
+        // step (the optional verify stage skips an already-demoted flag;
+        // `ReviewSynthesisStepKind`'s tier counts see it too), the exact
+        // same ordering `finish_review` (the sequential path) applies.
+        // `file_source_from_step_config` errors loudly when `step.config`
+        // has no `"source"` key at all (the bundle step's contract) — here
+        // that's tolerated as "no FileSource available" via `.ok()`, not
+        // promoted to a hard failure: a hand-built `Step.config` (this
+        // module's own `run_streaming`-level tests, or an older persisted
+        // graph from before this packet) simply gets a no-op backstop,
+        // never a broken judge step.
+        let file_source = file_source_from_step_config(&step.config).ok();
+        apply_absence_backstop(&mut judged, &bundles, file_source.as_ref());
 
         // (#1373 gates a/b/c) The SAME honesty-gate decision `finish_review`
         // applies, via the shared `judge_gate_outcome` helper — see its own
@@ -6402,16 +6696,8 @@ pub fn build_review_graph_from_config(
         let bundle_step = steps
             .get_mut("review-bundle-step")
             .expect("interpreted \"review\" graph must have a review-bundle-step");
-        let source = match &bundle_spec.source {
-            BundleSourceSpec::Worktree { path } => {
-                json!({ "kind": "worktree", "path": path.display().to_string() })
-            }
-            BundleSourceSpec::Github { repo, head_sha } => {
-                json!({ "kind": "github", "repo": repo, "head_sha": head_sha })
-            }
-        };
         bundle_step.config = json!({
-            "source": source,
+            "source": bundle_source_spec_json(&bundle_spec.source),
             "bundler": bundle_spec.bundler,
             "diff_file": bundle_spec.diff_file.display().to_string(),
         });
@@ -6639,6 +6925,13 @@ pub fn build_review_graph_from_config(
         config_obj.insert("passes".to_string(), json!(judge.passes));
         config_obj.insert("max_tokens".to_string(), json!(judge_max_tokens));
         config_obj.insert("endpoint_host".to_string(), json!(judge_endpoint_host));
+        // (#1748) The SAME `"source"` block `review-bundle-step` carries —
+        // `ReviewJudgeStepKind::run_streaming` reconstructs its own
+        // `FileSource` from it (via the SAME reader,
+        // `file_source_from_step_config`) so the mechanical absence-claim
+        // backstop can check a confirmed finding against the whole file,
+        // not just the bundle excerpt the AI seats saw.
+        config_obj.insert("source".to_string(), bundle_source_spec_json(&bundle_spec.source));
         if let Some(ep) = judge_endpoint {
             config_obj.insert(
                 "endpoint".to_string(),

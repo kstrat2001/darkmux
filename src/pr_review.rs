@@ -1242,6 +1242,7 @@ mod tests {
             demoted_by_pass2: false,
                 verify: None,
                 demoted_by_verify: false,
+                absence_backstop: None,
         }
     }
 
@@ -1260,6 +1261,7 @@ mod tests {
                 demoted_by_pass2: true,
                     verify: None,
                     demoted_by_verify: false,
+                    absence_backstop: None,
             }
         } else {
             JudgedFlag {
@@ -1270,6 +1272,7 @@ mod tests {
                 demoted_by_pass2: false,
                     verify: None,
                     demoted_by_verify: false,
+                    absence_backstop: None,
             }
         }
     }
@@ -1283,6 +1286,7 @@ mod tests {
             demoted_by_pass2: false,
                 verify: None,
                 demoted_by_verify: false,
+                absence_backstop: None,
         }
     }
 
@@ -1968,6 +1972,7 @@ mod tests {
             demoted_by_pass2: false,
                 verify: None,
                 demoted_by_verify: false,
+                absence_backstop: None,
         }]);
         env.degenerate =
             Some("judge produced no usable ruling on any of 1 flags (all errored/unparsed)".to_string());

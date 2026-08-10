@@ -865,6 +865,7 @@
             demoted_by_pass2: false,
             verify: None,
             demoted_by_verify: false,
+            absence_backstop: None,
         }
     }
 

@@ -1032,6 +1032,11 @@ fn run_dispatch(
                 "charges_bundles is always Some when input `charges_file` is set (computed above)",
             )),
             remote_max_tokens_per_execution,
+            // (#1748) The same `FileSource` bundling used above — lets the
+            // mechanical absence-claim backstop check a confirmed finding
+            // against the whole file on the `--charges-file` re-judge path
+            // too, not just the graph path.
+            source: Some(&source),
         };
         let timeout = timeout_seconds;
         let mut chat = move |call: &ChatCall| -> Result<SingleShotReply> {
