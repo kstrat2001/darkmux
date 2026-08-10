@@ -1135,4 +1135,142 @@ mod tests {
             "only the file's 3 real lines may render despite end=100 (no fabricated/panicking OOB read), got:\n{oob_text}"
         );
     }
+
+    // ── Top-level statements are dropped from every bundle ────────────────
+    //
+    // `build_bundles` maps each changed line to its ENCLOSING FUNCTION and
+    // makes that function's extent the excerpt handed to the seats. A changed
+    // line with no enclosing function hits the `continue` above and reaches
+    // no seat at all — and because the file still yields a bundle for its
+    // functions, nothing in `BundleSkipReport` records the loss either.
+    //
+    // The shape below is the one that made this visible in production: a
+    // script whose only function is `main`, invoked by a top-level
+    // `main().then(...).catch(...)` chain. A reviewer seat asked about that
+    // chain answers from a window that does not contain it, and answers
+    // confidently, because nothing marks the excerpt as partial.
+    //
+    // Written as a synthetic reproduction on purpose — the production case
+    // was proprietary, and the defect needs none of it.
+
+    const TOPLEVEL_TAIL_TS: &str = r#"import { AppDataSource } from "./data-source.js"
+
+const LIMIT = 10
+
+async function main(): Promise<number> {
+  await AppDataSource.initialize()
+  if (LIMIT > 0) {
+    return 0
+  }
+  return 1
 }
+
+main()
+  .then((code) => {
+    // exitCode, never exit() — stdout is non-blocking on a pipe and
+    // exit() truncates it.
+    process.exitCode = code
+  })
+  .catch((err) => {
+    process.stderr.write(`could not run: ${String(err)}\n`)
+    process.exitCode = 2
+  })
+"#;
+
+    /// Build a `new file` diff for `content` — every line added, one hunk,
+    /// exactly what a PR that introduces a script produces.
+    fn new_file_diff(rel: &str, content: &str) -> String {
+        let n = content.lines().count();
+        let mut d = format!(
+            "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{n} @@\n"
+        );
+        for l in content.lines() {
+            d.push('+');
+            d.push_str(l);
+            d.push('\n');
+        }
+        d
+    }
+
+    /// 1-indexed line numbers covered by any ref in any bundle.
+    fn covered_lines(set: &BundleSet, rel: &str) -> std::collections::HashSet<u32> {
+        let mut out = std::collections::HashSet::new();
+        for b in &set.bundles {
+            for r in &b.code {
+                if r.path == rel {
+                    for ln in r.start..=r.end {
+                        out.insert(ln);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn toplevel_fixture() -> (TempDir, FileSource, String, BundleSet) {
+        let dir = TempDir::new().unwrap();
+        let rel = "src/scripts/audit.ts";
+        write(dir.path(), rel, TOPLEVEL_TAIL_TS);
+        let source = FileSource::worktree(dir.path());
+        let diff = new_file_diff(rel, TOPLEVEL_TAIL_TS);
+        let set = build_bundles(&source, &diff).unwrap();
+        (dir, source, rel.to_string(), set)
+    }
+
+    /// The INVERTED CASE, asserted first: the fixture really does bundle.
+    /// Without this, the next test could pass trivially on a fixture that
+    /// produced no bundles at all — a green that proves nothing.
+    #[test]
+    fn toplevel_control_the_function_body_is_bundled() {
+        let (_dir, _source, rel, set) = toplevel_fixture();
+        assert!(!set.bundles.is_empty(), "fixture produced no bundles at all — the test below would be vacuous");
+        let covered = covered_lines(&set, &rel);
+        let body = TOPLEVEL_TAIL_TS
+            .lines()
+            .position(|l| l.contains("await AppDataSource.initialize()"))
+            .map(|i| i as u32 + 1)
+            .expect("fixture line missing");
+        assert!(covered.contains(&body), "a line inside `main` must be covered; covered = {covered:?}");
+    }
+
+    /// The defect. Every line of a new file is a changed line, so the
+    /// top-level chain is in the diff — it is the BUNDLER that drops it.
+    #[test]
+    fn toplevel_statements_after_a_function_reach_a_seat() {
+        let (_dir, _source, rel, set) = toplevel_fixture();
+        let covered = covered_lines(&set, &rel);
+
+        for needle in ["process.exitCode = code", ".catch((err) => {"] {
+            let ln = TOPLEVEL_TAIL_TS
+                .lines()
+                .position(|l| l.contains(needle))
+                .map(|i| i as u32 + 1)
+                .expect("fixture line missing");
+            assert!(
+                covered.contains(&ln),
+                "line {ln} ({needle:?}) reaches no seat — it is in the diff but no bundle ref covers it. \
+                 Covered lines: {covered:?}"
+            );
+        }
+    }
+
+    /// The general form: a changed line must either be shown to a seat or be
+    /// accounted for as declined. Silent loss is the property that lets a
+    /// seat rule confidently on code it was never given.
+    #[test]
+    fn every_changed_line_is_either_covered_or_accounted_for() {
+        let (_dir, _source, rel, set) = toplevel_fixture();
+        let covered = covered_lines(&set, &rel);
+        let total = TOPLEVEL_TAIL_TS.lines().count() as u32;
+        let declined = set.skip.files_skipped.iter().any(|s| s.path == rel);
+
+        let missing: Vec<u32> = (1..=total).filter(|ln| !covered.contains(ln)).collect();
+        assert!(
+            missing.is_empty() || declined,
+            "{} of {total} changed lines are in no bundle and the file records no decline — \
+             the loss is invisible to every consumer. Missing: {missing:?}",
+            missing.len()
+        );
+    }
+}
+
