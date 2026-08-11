@@ -2137,6 +2137,71 @@ main()
     }
 
     #[test]
+    fn resolve_callees_resolves_an_esm_js_suffixed_relative_specifier() {
+        // (#1753 MUST-FIX regression) `source::resolve_relative_import_
+        // candidates` only ever emits `{spec}.ts`/`{spec}.tsx`/
+        // `{spec}/index.ts`/`{spec}/index.tsx` — it never strips a
+        // trailing `.js`/`.jsx`/`.mjs`/`.cjs` from the specifier. An
+        // ESM/NodeNext-style import (`import { loadData } from
+        // './data-source.js'`, where the real file on disk is
+        // `data-source.ts`) resolves to `data-source.js.ts`, which
+        // matches nothing — so the caller's own import binding never
+        // confirms, EVEN THOUGH the caller unambiguously imports this
+        // name from this file. With no binding confirmed AND a same-named
+        // decoy present elsewhere in the repo, #1753's omit-guard
+        // (`defs.len() > 1 && import_bindings.contains_key(&name)`) then
+        // fires and drops the callee entirely — a caller that names its
+        // import exactly gets NOTHING, which is worse than the pre-#1753
+        // heuristic it replaced (that heuristic at least attached SOME
+        // same-named function). `.js`-suffixed relative specifiers are
+        // pervasive in the ESM/NodeNext repos this bundler reviews in
+        // production.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "src/data-source.ts",
+            "export function loadData(x) {\n  return x; // the REAL callee — explicitly imported below\n}\n",
+        );
+        write(
+            dir.path(),
+            "src/decoy.ts",
+            "export function loadData(x) {\n  return -x; // a same-named decoy elsewhere in the repo\n}\n",
+        );
+        write(
+            dir.path(),
+            "src/caller.ts",
+            "import { loadData } from './data-source.js';\nfunction useIt(y) {\n  return loadData(y);\n}\n",
+        );
+        let diff = "+++ b/src/caller.ts\n\
+@@ -0,0 +1,4 @@\n\
++import { loadData } from './data-source.js';\n\
++function useIt(y) {\n\
++  return loadData(y);\n\
++}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(!set.bundles.is_empty(), "expected at least one bundle for useIt");
+        let callee_paths: Vec<&str> = set.bundles[0]
+            .code
+            .iter()
+            .map(|r| r.path.as_str())
+            .filter(|p| *p != "src/caller.ts")
+            .collect();
+        assert!(
+            callee_paths.contains(&"src/data-source.ts"),
+            "the caller's explicit `import {{ loadData }} from './data-source.js'` must resolve \
+             to the REAL callee (data-source.ts) despite the trailing `.js`, got: {:?}",
+            set.bundles[0].code
+        );
+        assert!(
+            !callee_paths.contains(&"src/decoy.ts"),
+            "the unrelated same-named decoy (decoy.ts, never imported by caller.ts) must NOT be \
+             attached as the callee: {:?}",
+            set.bundles[0].code
+        );
+    }
+
+    #[test]
     fn renamed_file_with_edits_still_bundles_under_the_new_path() {
         let dir = TempDir::new().unwrap();
         write(dir.path(), "src/new_name.ts", "export function greet(name) {\n  return `hi ${name}`;\n}\n");
