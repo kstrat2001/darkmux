@@ -11,15 +11,72 @@ import { utilityLines, healthLines } from "./memoryLedgerLines";
 import { machineRunLines } from "./runLines";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
+/** The health region's state vocabulary, verbatim from `/machine/resources`
+ * (`machine.state` and each model's `state`), uppercased for display by
+ * `memoryLedgerLines.ts`. Legacy carries the same three
+ * (`.memstate.green/.amber/.red`, viewer.html). "RED" also arrives on its
+ * own from the pressure block, which is why it maps to the same severity. */
+const STATE_SEVERITY: Record<string, string> = {
+  GREEN: " is-ok",
+  AMBER: " is-warn",
+  RED: " is-bad",
+  UNKNOWN: "",
+};
+
+/** `model.owner` uppercased — the darkmux-namespace marker (see the namespace
+ * convention in CLAUDE.md), NOT a health state. Legacy styles it as
+ * `.memowner`: muted, not colored. */
+const OWNER_WORDS = new Set(["DARKMUX", "USER"]);
+
+/** Classify a health line by CONTENT PATTERN so the region can be styled
+ * without the builders having to emit structure.
+ *
+ * Rules over per-case templates, the same call `RecordView` makes: the
+ * health region's length and composition vary by machine state, so
+ * positional selectors would be guesswork that happens to fit whatever data
+ * was on screen when they were written. These four markers are all authored
+ * deliberately in `memoryLedgerLines.ts` — `↳` for hints, `⚠` for warnings,
+ * an uppercased state string, and ` · ` joining meta fields — so they are
+ * load-bearing content, not incidental formatting.
+ *
+ * This does NOT re-pair the flattened key/value lines ("pressure" then
+ * "RED"). CSS can't, and neither can a per-line classifier; that needs the
+ * builders to emit pairs. See the stylesheet's machine-lens header. */
+export function lineClass(line: string): string | undefined {
+  if (line.startsWith("↳")) return "mline--hint";
+  if (line.startsWith("⚠")) return "mline--warn";
+  // Two different uppercase tokens land in this stream and they mean
+  // opposite things, so match the VOCABULARY rather than the shape. An
+  // earlier cut keyed off "is it uppercase" with an assumed OK/RED
+  // vocabulary; the real states are green/amber/red (`/machine/resources`,
+  // uppercased for display by `modelLines`), so every healthy model rendered
+  // in the warning color and the owner tag rendered as a health state. A
+  // status color that lies about status is the same defect as the coverage
+  // banner that rendered colorless — hence the closed sets below.
+  const state = STATE_SEVERITY[line];
+  if (state !== undefined) return `mline--state${state}`;
+  if (OWNER_WORDS.has(line)) return "mline--owner";
+  if (line.includes(" · ")) return "mline--meta";
+  if (/^[a-z][a-z ]{2,18}$/.test(line)) return "mline--label";
+  return undefined;
+}
+
 /** One `<div>` per line. `innerText` puts each block-level sibling on its
  * own line regardless of stylesheet — see `runLines.ts`'s module doc for
  * why this port represents content as line arrays rather than leaning on
- * legacy's CSS-flex-dependent `innerText` line-break behavior. */
-function Lines({ lines }: { lines: string[] }) {
+ * legacy's CSS-flex-dependent `innerText` line-break behavior.
+ *
+ * `classify` is opt-in per region: the util/run/loose blocks have
+ * deterministic array shapes and are styled positionally in CSS, so only the
+ * variable-length health region pays for pattern matching. Adding a class
+ * changes no `innerText`, so the parity goldens are unaffected either way. */
+function Lines({ lines, classify = false }: { lines: string[]; classify?: boolean }) {
   return (
     <>
       {lines.map((line, i) => (
-        <div key={i}>{line}</div>
+        <div key={i} className={classify ? lineClass(line) : undefined}>
+          {line}
+        </div>
       ))}
     </>
   );
@@ -108,6 +165,7 @@ export function MachineLens() {
           data, never during the loading/error placeholder text branches. */}
       <div className="machine-lens__health" data-state={resources ? "loaded" : resourcesErrored ? "error" : "loading"}>
         <Lines
+          classify
           lines={healthLines({
             isLocalMach,
             machineName: label,

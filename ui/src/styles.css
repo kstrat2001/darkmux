@@ -6,6 +6,19 @@
   --accent: #4fd1c5;
   --error: #f56565;
   --border: #232838;
+  /* Semantic status colors, carried over from legacy's palette
+     (viewer.html `:root`). These were USED before they were DEFINED — a
+     `var(--warn)` with no fallback is invalid at computed-value time, so the
+     property silently unsets rather than erroring. `.fleetcov` (the
+     coverage-degraded banner, #1729) therefore rendered with inherited body
+     color and a colorless border: the one surface whose whole job is to look
+     alarming was the one rendering as ordinary text. Defining them here is
+     the fix; the fallbacks already present at other call sites stay as
+     belt-and-braces. */
+  --good: #4ade80;
+  --warn: #f0b429;
+  --bad: #f56565;
+  --accent-dim: #3aa89f;
 }
 
 * {
@@ -1790,4 +1803,214 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   #modebadge.pb.live .pbdot { animation: none; }
+}
+
+/* ── Machine lens (Tuesday-list item 1) ─────────────────────────────────────
+   All twelve of this lens's class names existed in the TSX and matched
+   nothing in the stylesheet, so the machine tab rendered as an undifferentiated
+   wall of default-serif text. The parity harness never caught it: goldens
+   compare `innerText`, and unstyled text has exactly the same innerText as
+   styled text.
+
+   Why this doesn't reuse legacy's `.memcard`/`.memrow`/`.k`/`.v` rules: the
+   port deliberately represents this lens's content as LINE ARRAYS (one `<div>`
+   per line, see `runLines.ts`'s module doc) so `innerText` line breaks don't
+   depend on flex behavior. Legacy's rules assume structured markup that no
+   longer exists here, so the visual language is reproduced rather than the
+   selectors.
+
+   Consequence worth naming: the health region flattened genuine key/value
+   pairs ("pressure" then "RED"; "swap used" then a byte count) into sibling
+   strings. CSS cannot re-pair them — proper k/v rows need the builders to emit
+   structure, which is a follow-up, not a stylesheet change. What's here makes
+   the region legible and hierarchical; it does not make it a table. */
+
+.machine-lens {
+  font: 12px/1.6 "JetBrains Mono", monospace;
+  max-width: min(1200px, 92vw);
+}
+
+.machine-lens__hdr {
+  font: 600 13px/1.4 "JetBrains Mono", monospace;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+  margin-bottom: 12px;
+}
+
+/* Shared card treatment. Matches `.rv__group`'s panel idiom so the machine
+   tab and the record panel read as the same product. */
+.machine-lens__util,
+.machine-lens__health,
+.machine-lens__loosenode {
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* `utilityLines` returns a FIXED four-element array — [name, state, caps,
+   pill] (memoryLedgerLines.ts) — so positional selectors are safe here in a
+   way they would not be for the health region's variable-length output. */
+.machine-lens__util > div:first-child {
+  font-weight: 600;
+  color: var(--accent);
+}
+.machine-lens__util > div:nth-child(2),
+.machine-lens__util > div:nth-child(3) {
+  color: var(--dim);
+  font-size: 11px;
+}
+.machine-lens__util > div:last-child {
+  display: block;
+  width: fit-content;
+  margin-top: 6px;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  /* NO text-transform. `innerText` is layout-aware and applies it, so
+     uppercasing here rewrote `resident` to `RESIDENT` and broke the parity
+     golden. Legacy renders this pill lowercase; only `.memstate`/`.memowner`
+     are uppercased there, and this port already uppercases those STRINGS
+     directly (see memoryLedgerLines.ts). */
+  color: var(--accent-dim);
+}
+
+/* The health region's length varies by machine state, so its lines are
+   classified by CONTENT PATTERN at render time (see `Lines` in
+   MachineLens.tsx) rather than by position. */
+.machine-lens__health .mline--state {
+  /* `block` + `fit-content`, NOT `inline-block`: adjacent inline-level
+     siblings merge onto ONE `innerText` line, which collapsed the owner tag
+     and the health state into `DARKMUXGREEN`. This keeps the chip's shrink-
+     to-fit box while preserving the line break the goldens pin. */
+  display: block;
+  width: fit-content;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  margin: 2px 0;
+}
+.machine-lens__health .mline--state.is-ok { color: var(--good); border-color: var(--good); }
+.machine-lens__health .mline--state.is-warn { color: var(--warn); border-color: var(--warn); }
+.machine-lens__health .mline--state.is-bad { color: var(--bad); border-color: var(--bad); }
+
+/* `model.owner` — legacy's `.memowner`. Deliberately muted: it says which
+   namespace loaded the model, not whether anything is wrong. */
+.machine-lens__health .mline--owner {
+  /* See `.mline--state` — block + fit-content, never inline-block. */
+  display: block;
+  width: fit-content;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  margin: 2px 6px 2px 0;
+}
+
+.machine-lens .mline--label {
+  color: var(--fg);
+  font-weight: 600;
+  margin-top: 8px;
+}
+.machine-lens .mline--meta {
+  color: var(--dim);
+  font-size: 11px;
+}
+.machine-lens .mline--hint {
+  color: var(--dim);
+  font-size: 11px;
+  border-left: 2px solid var(--border);
+  padding: 2px 0 2px 8px;
+  margin: 4px 0;
+}
+.machine-lens .mline--warn {
+  color: var(--warn);
+  font-size: 11px;
+  border-left: 2px solid var(--warn);
+  padding: 2px 0 2px 8px;
+  margin: 4px 0;
+}
+
+.machine-lens__runshdr,
+.machine-lens__loosehdr {
+  font: 600 10px/1.4 "JetBrains Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin: 18px 0 8px;
+}
+
+.machine-lens__run {
+  padding: 7px 10px;
+  border-left: 3px solid var(--border);
+  background: rgba(255, 255, 255, 0.015);
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+}
+/* Each run's first line is always its `handle · model` main line
+   (runLines.ts pushes it unconditionally, before the optional meta/time
+   lines), so first-child is deterministic here too. */
+.machine-lens__run > div:first-child {
+  color: var(--fg);
+}
+.machine-lens__run > div:not(:first-child) {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.machine-lens__runsmore {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+  /* 44px touch target without inflating the painted control — the same
+     `::after` technique the chrome controls use. */
+  position: relative;
+}
+.machine-lens__runsmore::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 44px;
+  transform: translateY(-50%);
+}
+.machine-lens__runsmore:hover,
+.machine-lens__runsmore:focus-visible {
+  border-color: var(--accent);
+}
+
+.machine-lens__loosenode > div:first-child {
+  font-weight: 600;
+  color: var(--fg);
+}
+.machine-lens__loosenode > div:not(:first-child) {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+/* `.hint` is used by this lens's empty state and was likewise undefined —
+   legacy defines it at viewer.html:455. */
+.hint {
+  display: block;
+  color: var(--dim);
+  font: 11px "JetBrains Mono", monospace;
+  margin-top: 10px;
 }
