@@ -71,6 +71,12 @@ function envelope(machines: unknown[], fleet: Record<string, unknown> = { state:
     const { container } = renderWithClient();
     await waitFor(() => expect(container.querySelector('[data-state="degraded"]')).toBeTruthy());
     expect(screen.queryByText(/no machines currently present/i)).toBeNull();
+    // `.fleet-strip--degraded`/`.fleet-strip__icon` shipped matching nothing
+    // in styles.css (default sans-serif text) — assert the classes, not just
+    // the data-state hook, so a future regression to unstyled can't hide
+    // behind this test still passing on the attribute alone.
+    expect(container.querySelector(".fleet-strip--degraded")).toBeInTheDocument();
+    expect(container.querySelector(".fleet-strip__icon")).toBeInTheDocument();
   });
 
   it("an UNCONFIGURED fleet still reads as the plain empty state, never a warning", async () => {
@@ -91,6 +97,10 @@ function envelope(machines: unknown[], fleet: Record<string, unknown> = { state:
     const { container } = renderWithClient();
     await waitFor(() => expect(container.querySelector('[data-state="degraded"]')).toBeTruthy());
     expect(screen.getByText(/41s old/)).toBeInTheDocument();
+    // `.fleet-strip__count` ("N last known") is the OTHER unstyled className
+    // this state carries alongside `.fleet-strip--degraded` above.
+    expect(container.querySelector(".fleet-strip__count")).toBeInTheDocument();
+    expect(container.querySelector(".fleet-strip__count")!.textContent).toMatch(/1 last known/);
   });
 
   it("the three states are visually distinct (different data-state attributes)", async () => {

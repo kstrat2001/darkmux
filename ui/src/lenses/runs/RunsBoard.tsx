@@ -311,7 +311,13 @@ export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; 
               <RunRow key={r.id} run={r} showMachine={showMachine} onActivate={() => activateRun(r)} />
             ))}
             {more > 0 && (
-              <div className="runmore" role="button" tabIndex={0} onClick={() => setShowAll(true)}>
+              <div
+                className="runmore"
+                role="button"
+                tabIndex={0}
+                onClick={() => setShowAll(true)}
+                onKeyDown={onActivateKeyDown(() => setShowAll(true))}
+              >
                 show all {rows.length} — {more} more
               </div>
             )}
@@ -356,13 +362,21 @@ function RunsBar({
           role="button"
           tabIndex={0}
           onClick={() => onKind(k)}
+          onKeyDown={onActivateKeyDown(() => onKind(k))}
         >
           {k}
           <span className="runchipn"> {counts[k] ?? 0}</span>
         </span>
       ))}
       {kind === "lab" && (
-        <span className={`runchip${series ? " on" : ""}`} data-arg="series" role="button" tabIndex={0} onClick={onSeries}>
+        <span
+          className={`runchip${series ? " on" : ""}`}
+          data-arg="series"
+          role="button"
+          tabIndex={0}
+          onClick={onSeries}
+          onKeyDown={onActivateKeyDown(onSeries)}
+        >
           ◧ series
         </span>
       )}

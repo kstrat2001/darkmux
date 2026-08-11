@@ -1,7 +1,6 @@
 {
-  "schema_version": "1.7",
+  "schema_version": "1.8",
   "machine_id": "my-machine",
-  "orchestrator": "",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
   "redis": {

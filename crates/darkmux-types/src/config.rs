@@ -61,7 +61,14 @@ use std::path::Path;
 // answerer_profile / humor — the radio interpreter's own staffing + persona
 // knobs) plus `runtime.acp_idle_exit_minutes` (the `darkmux acp` process's
 // idle self-exit budget). Minor bump, same lenient-read reasoning.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.7";
+// 1.8 (#1758): REMOVED `orchestrator` — write-only, machine-scoped
+// provenance stamped at record-write time to describe an invocation-scoped
+// fact (which frontier orchestrator drove the work), so every record on a
+// machine carried the same value regardless of what actually drove that
+// invocation. Nothing ever read it. An older binary's `~/.darkmux/config.json`
+// still carrying the key loads fine — `extras` overflow absorbs the now-
+// unknown top-level key, same lenient-read guarantee as an additive bump.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.8";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -74,8 +81,6 @@ pub struct DarkmuxConfig {
     // ── Provenance / identity ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub orchestrator: Option<String>,
 
     // ── External tooling ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -458,8 +463,6 @@ impl DarkmuxConfig {
     /// - caps (`max_turns`/`max_tokens`/`max_tokens_per_call`), `default_role`,
     ///   `daemon_cors_origins` — absent is a real behavior (uncapped / the
     ///   runtime's built-in per-call default), not a value to default.
-    /// - `orchestrator` is written as `""` (visible but unset; empty config
-    ///   strings are treated as unset, so the per-session env override drives).
     ///
     /// Single source of truth for the written defaults: `init` writes this and
     /// `config.example.json` is asserted equal to its pretty form (a drift
@@ -469,7 +472,6 @@ impl DarkmuxConfig {
         DarkmuxConfig {
             schema_version: Some(CONFIG_SCHEMA_VERSION.to_string()),
             machine_id: Some("my-machine".to_string()),
-            orchestrator: Some(String::new()),
             lms_bin: Some("lms".to_string()),
             lmstudio_url: Some("http://localhost:1234".to_string()),
             dirs: None,
@@ -640,7 +642,6 @@ mod tests {
         assert_eq!(cfg.audit.as_ref().unwrap().enabled, Some(false));
         // Scalar defaults written explicitly (not hidden in code).
         assert_eq!(cfg.lms_bin.as_deref(), Some("lms"));
-        assert_eq!(cfg.orchestrator.as_deref(), Some(""), "visible but unset");
         // Fields where a written literal would be wrong stay absent.
         assert!(cfg.dirs.is_none(), "dirs are derived → surfaced by doctor, not frozen");
         assert!(cfg.runtime.as_ref().unwrap().max_turns.is_none(), "uncapped, not defaulted");
@@ -762,7 +763,6 @@ mod tests {
         let json = r#"{
             "schema_version": "1.0",
             "machine_id": "studio",
-            "orchestrator": "claude-code",
             "lms_bin": "/usr/local/bin/lms",
             "lmstudio_url": "http://localhost:1234",
             "dirs": { "flows": "~/dm/flows", "audit": "~/dm/audit" },
@@ -783,6 +783,29 @@ mod tests {
         let back: DarkmuxConfig = serde_json::from_str(&round).unwrap();
         assert_eq!(back.machine_id, cfg.machine_id);
         assert_eq!(back.redis.as_ref().unwrap().port, Some(6379));
+    }
+
+    /// (#1758) An existing `~/.darkmux/config.json` written by a pre-1.8
+    /// binary still carries `"orchestrator": "<value>"` on disk. Loading it
+    /// on THIS binary must not error or brick the rest of the file — the
+    /// now-unknown key lands in `extras` (the same forward-compat overflow
+    /// a genuinely-future key would use) and every other field still parses.
+    #[test]
+    fn old_config_with_removed_orchestrator_field_still_loads() {
+        let json = r#"{
+            "schema_version": "1.7",
+            "machine_id": "studio",
+            "orchestrator": "claude-code",
+            "lms_bin": "lms"
+        }"#;
+        let cfg: DarkmuxConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.machine_id.as_deref(), Some("studio"), "sibling fields still parse");
+        assert_eq!(cfg.lms_bin.as_deref(), Some("lms"), "sibling fields still parse");
+        assert_eq!(
+            cfg.extras.get("orchestrator").and_then(|v| v.as_str()),
+            Some("claude-code"),
+            "the removed field lands in extras, not a typed slot or a parse error"
+        );
     }
 
     /// Unknown top-level keys land in `extras` and re-serialize flat (a newer

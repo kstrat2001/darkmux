@@ -61,7 +61,11 @@
         "model": "darkmux:judge-model",
         "model_key": "judge-model",
         "n_ctx": 32000,
-        "passes": 2
+        "passes": 2,
+        "source": {
+          "kind": "worktree",
+          "path": "/nonexistent-test-worktree"
+        }
       },
       "id": "review-judge-step",
       "kind": "review.judge",
