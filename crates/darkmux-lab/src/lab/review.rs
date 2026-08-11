@@ -801,6 +801,18 @@ pub enum DegenerateKind {
     /// review" (today: every skip is [`SkipReason::NonCodeExtension`]) —
     /// posted as a neutral no-op comment, never a red/failed run.
     BenignEmpty,
+    /// (#1757) Every touched file declined for a benign reason OR because
+    /// it's real source in a language the built-in (TypeScript-only)
+    /// bundler doesn't parse ([`SkipReason::SourceLanguageUnsupported`]),
+    /// with at least one file in the latter bucket and NO genuine error
+    /// reason mixed in. Distinct from [`DegenerateKind::BenignEmpty`]:
+    /// there IS real code here, just not in a language darkmux's built-in
+    /// bundler reads — so the run stays neutral (never fails the check),
+    /// but the posted note names what went unreviewed and points at the
+    /// `--bundler` escape hatch instead of reading as "nothing to see
+    /// here." A `.sql`-only or `.css`-only PR is the motivating case: it
+    /// used to read identically to a real bundler failure.
+    UnsupportedLanguage,
     /// Anything else: a bundler bug candidate, an internal limit
     /// (`OverSizeCap`), an unreadable file, every probe draw erroring, or a
     /// judge phase with no usable ruling. Stays the existing loud,
@@ -814,15 +826,24 @@ pub enum DegenerateKind {
 /// distinguish "diff was entirely non-code" from "bundler bug" from "diff
 /// exceeded some internal bound" (darkmux#1605).
 ///
-/// Benign iff every skipped file's reason is deliberate-and-expected —
-/// [`SkipReason::NonCodeExtension`] or [`SkipReason::TestFileExcluded`]
-/// (#1605 QA finding: the bundler EXCLUDES test files rather than failing
-/// to understand them; both are benign, but they must be named differently
-/// or the no-op comment calls real test code "fixtures and lockfiles") —
-/// AND at least one file WAS skipped — an empty `files_skipped` (no skip
-/// data at all, e.g. `bundle_override`/an external bundler) stays `Error`:
-/// the honest "can't explain this" default, never a guessed benign
-/// classification.
+/// Three buckets, in priority order:
+///
+/// - **Benign** iff every skipped file's reason is deliberate-and-expected —
+///   [`SkipReason::NonCodeExtension`] or [`SkipReason::TestFileExcluded`]
+///   (#1605 QA finding: the bundler EXCLUDES test files rather than failing
+///   to understand them; both are benign, but they must be named differently
+///   or the no-op comment calls real test code "fixtures and lockfiles") —
+///   AND at least one file WAS skipped.
+/// - **Unsupported-language** (#1757) iff every skipped file's reason is one
+///   of the two benign ones above OR [`SkipReason::SourceLanguageUnsupported`],
+///   AND at least one is the latter. Real source the bundler simply can't
+///   parse is not the same finding as "nothing here" — it gets its own
+///   neutral (non-failing) outcome that names the escape hatch, rather than
+///   collapsing into either the benign no-op or the loud error treatment.
+/// - **Error** is the fallback: an empty `files_skipped` (no skip data at
+///   all, e.g. `bundle_override`/an external bundler) or any genuine error
+///   reason mixed in stays `Error` — the honest "can't explain this"
+///   default, never a guessed benign or unsupported-language classification.
 pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -> (String, DegenerateKind) {
     let Some(report) = skip else {
         return ("no bundles produced from the diff".to_string(), DegenerateKind::Error);
@@ -831,6 +852,19 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
         && report.files_skipped.iter().all(|f| {
             matches!(f.reason, SkipReason::NonCodeExtension | SkipReason::TestFileExcluded)
         });
+    // (#1757) A diff whose declines are entirely explained by the two benign
+    // reasons plus real-but-unparseable source, with at least one of the
+    // latter — never a mix that also carries a genuine error reason (an
+    // `OverSizeCap`/`UnreadableInWorktree`/etc. entry keeps this `false`,
+    // same as it already keeps `benign` above `false`).
+    let unsupported_language = !report.files_skipped.is_empty()
+        && report.files_skipped.iter().any(|f| f.reason == SkipReason::SourceLanguageUnsupported)
+        && report.files_skipped.iter().all(|f| {
+            matches!(
+                f.reason,
+                SkipReason::NonCodeExtension | SkipReason::TestFileExcluded | SkipReason::SourceLanguageUnsupported
+            )
+        });
     let mut by_reason: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
     for f in &report.files_skipped {
         let label = match f.reason {
@@ -838,9 +872,11 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
             // (#1752) Deliberately NOT grouped with `NonCodeExtension` —
             // this is real source code in a language the bundler doesn't
             // parse, not benign data. Kept out of the `benign` match
-            // above too, so a diff dominated by this reason correctly
-            // stays `DegenerateKind::Error` (loud), never the neutral
-            // no-op treatment.
+            // above too, so this reason alone never reads as "nothing to
+            // review." (#1757) It's classified separately from `benign`
+            // into its own `unsupported_language` bucket below, which
+            // stays neutral (never fails the run) but names the
+            // `--bundler` escape hatch instead of a bare no-op.
             SkipReason::SourceLanguageUnsupported => "real source in an unsupported language",
             SkipReason::TestFileExcluded => "test file (excluded by the bundler)",
             SkipReason::UnreadableInWorktree => "unreadable in worktree",
@@ -861,7 +897,13 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
         report.files_considered,
         report.files_skipped.len()
     );
-    let kind = if benign { DegenerateKind::BenignEmpty } else { DegenerateKind::Error };
+    let kind = if benign {
+        DegenerateKind::BenignEmpty
+    } else if unsupported_language {
+        DegenerateKind::UnsupportedLanguage
+    } else {
+        DegenerateKind::Error
+    };
     (msg, kind)
 }
 

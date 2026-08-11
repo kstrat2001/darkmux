@@ -6824,6 +6824,69 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(msg.contains("over the bundler's size cap"), "{msg}");
     }
 
+    // ── (#1757) classify_zero_bundle_degenerate: unsupported-language ──
+
+    #[test]
+    fn a_sql_only_diff_is_unsupported_language_not_benign_and_not_error() {
+        // The motivating case: a `.sql`-only PR is real source code, not
+        // "nothing to review" — but the built-in TypeScript-only bundler
+        // has no way to read it. This must NOT fail the check (it's not
+        // `Error`) and must NOT read as benign (it's not `BenignEmpty`).
+        let skip = skip_report(vec![("migrations/001_add_users.sql", SkipReason::SourceLanguageUnsupported)]);
+        let (msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(
+            kind,
+            DegenerateKind::UnsupportedLanguage,
+            "real source in an unsupported language must classify neutrally, not benign and not error"
+        );
+        assert!(msg.contains("real source in an unsupported language"), "{msg}");
+    }
+
+    #[test]
+    fn unsupported_language_mixed_with_benign_reasons_stays_unsupported_language() {
+        // A `.css`-only PR alongside a lockfile bump: the benign file
+        // doesn't change the classification once real unparseable source
+        // is present — the run is still "bring your own bundler," not
+        // "nothing here."
+        let skip = skip_report(vec![
+            ("package-lock.json", SkipReason::NonCodeExtension),
+            ("src/styles/app.css", SkipReason::SourceLanguageUnsupported),
+        ]);
+        let (_msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(kind, DegenerateKind::UnsupportedLanguage);
+    }
+
+    #[test]
+    fn unsupported_language_mixed_with_a_real_error_reason_stays_error() {
+        // A genuine bundler-limit decline (`OverSizeCap`) alongside an
+        // unsupported-language file must NOT be swallowed into the neutral
+        // outcome — a real error mixed in keeps the run loud.
+        let skip = skip_report(vec![
+            ("src/huge.ts", SkipReason::OverSizeCap),
+            ("migrations/001_add_users.sql", SkipReason::SourceLanguageUnsupported),
+        ]);
+        let (_msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(kind, DegenerateKind::Error, "a real error reason mixed in must stay Error, never neutral");
+    }
+
+    #[test]
+    fn a_genuinely_benign_diff_stays_benign_never_unsupported_language() {
+        // Inverted case: a diff whose ONLY skips are the deliberately
+        // benign reasons (no unsupported-language file at all) must keep
+        // reading as `BenignEmpty` — the new `UnsupportedLanguage` bucket
+        // must never widen to swallow the existing benign classification.
+        let skip = skip_report(vec![
+            ("package-lock.json", SkipReason::NonCodeExtension),
+            ("fixtures/sample.json", SkipReason::NonCodeExtension),
+        ]);
+        let (_msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(
+            kind,
+            DegenerateKind::BenignEmpty,
+            "a lockfile/json-only diff must stay benign, never reclassified as unsupported language"
+        );
+    }
+
     #[test]
     fn classify_zero_bundle_degenerate_no_skip_data_stays_error_never_guesses_benign() {
         // `bundle_override`/an external `--bundler` plugin carries no skip
