@@ -18,7 +18,7 @@ describe("NavChrome", () => {
   it.each<[Route, string]>([
     [{ kind: "fleet" }, "lens-fleet"],
     [{ kind: "runs", runsKind: "all", run: null }, "lens-runs"],
-    [{ kind: "machine" }, "lens-machine"],
+    [{ kind: "machine", uid: null }, "lens-machine"],
     [{ kind: "console", panelId: "" }, "lens-console"],
     // Legacy: `state.level==="subsystem"` (a session drill-in) leaves the
     // fleet tab lit — see `NavChrome.tsx`'s own `isActive` doc.
@@ -58,7 +58,7 @@ describe("NavChrome", () => {
 
   it("clicking the fleet tab from elsewhere clears the hash", () => {
     window.location.hash = "#lens=machine";
-    render(<NavChrome route={{ kind: "machine" }} />);
+    render(<NavChrome route={{ kind: "machine", uid: null }} />);
     fireEvent.click(screen.getByRole("link", { name: "fleet" }));
     expect(window.location.hash).toBe("");
   });

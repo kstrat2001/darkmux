@@ -38,6 +38,13 @@ export const RECONCILE_BACKSTOP_MS = 20_000;
 export const MACHINE_RESOURCES_CACHE_MS = 2_000;
 export const MACHINE_MEM_POLL_MS = 5_000;
 export const PANEL_CACHE_MS = 3_000;
+/** `LAB_POLL_STEADY_MS`/`LAB_POLL_BACKFILL_MS` (viewer.html:4020-4021) — the
+ * lab-run detail's event-feed poll cadence (`LabRunDetail.tsx`): steady
+ * once caught up, rapid while draining a backlog (a big historical run's
+ * playback). Not wired to a `refetchInterval` query — see that component's
+ * own doc for why the poll is a manual self-rescheduling loop instead. */
+export const LAB_POLL_STEADY_MS = 3_000;
+export const LAB_POLL_BACKFILL_MS = 150;
 
 export const queryKeys = {
   fleetMachinesLive: () => ["fleet", "machines", "live"] as const,
@@ -59,6 +66,10 @@ export const queryKeys = {
   flowMissions: () => ["flow", "missions"] as const,
   flowMission: (id: string) => ["flow", "mission", id] as const,
   flowSession: (id: string) => ["flow", "session", id] as const,
+  /** `GET /lab/run/detail?dir=` — the lab-run detail view's one-shot fetch
+   * (`LabRunDetail.tsx`). The event-feed poll (`/lab/run/events`) is NOT a
+   * react-query key — see that component's own doc. */
+  labRunDetail: (dir: string) => ["lab", "run", "detail", dir] as const,
 };
 
 /** How often a live view re-checks whether the UTC day has rolled over.

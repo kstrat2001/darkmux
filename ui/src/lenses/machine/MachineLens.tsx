@@ -6,7 +6,7 @@ import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { buildMachineRuns, localMachineUid, looseRecords, nameOf, RECENT_CAP } from "../../lib/flow";
-import { ramGiB } from "../../lib/format";
+import { specOf } from "../fleet/cards";
 import { utilityLines, healthLines } from "./memoryLedgerLines";
 import { machineRunLines } from "./runLines";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
@@ -84,24 +84,29 @@ function Lines({ lines, classify = false }: { lines: string[]; classify?: boolea
 
 /**
  * The unified machine page — `renderMachine()` (viewer.html:1796-1991).
- * ONLY the nav-tab/deep-link entry (`goMachine`, always "the local
- * machine") is ported; the fleet-card drill-in to a REMOTE machine
- * (`drillMachine(uid, false)`) has no route in this scaffold's `Route` type
- * yet (`lib/route.ts`'s `{kind:"machine"}` carries no uid) — so
- * `isLocalMach` is always `true` here, unlike legacy's
- * `state.machineIsLocal || isLocalMachine(state.machine)` OR-gate. A future
- * packet that wires a remote drill-in needs to widen the route and restore
- * that OR — ledgered rather than silently narrowed (see the packet
- * report's deviations section).
+ * Reached by THREE entry points, same as legacy (viewer.html:1827-1829):
+ * the nav tab / `#lens=machine` deep-link (`uid: null` — always "the local
+ * machine"), and a fleet-card drill (`uid: <uid>` — local OR remote,
+ * `drillMachine(uid, false)`). `isLocalMach` restores legacy's
+ * `state.machineIsLocal || isLocalMachine(state.machine)` OR-gate now that
+ * `lib/route.ts`'s widened `{kind:"machine",uid}` gives a fleet-card drill
+ * somewhere to carry its uid (this OR was narrowed to an unconditional
+ * `true` before that widening existed — see the drill-in packet's report
+ * for the restore).
  *
  * Data sources (read the code, not the plan's assumption): `/machine/specs`
- * + `/machine/resources` (the plan's named pair) PLUS `/flow/<today>` +
- * `/flow/<yesterday>` (the runs-on-this-machine list is derived from RAW
- * flow records, not `/runs` — see `lib/flow.ts`'s module doc) PLUS
- * `/fleet/machines/live` + `/fleet/sessions/live` (machine presence +
- * session liveness fallback).
+ * + `/machine/resources` (the plan's named pair — resources is fetched ONLY
+ * for the local machine, matching legacy's `pollMachineMem` guard: a
+ * remote machine's page never reads THIS daemon's own probe under the
+ * wrong name) PLUS `/flow/<today>` + `/flow/<yesterday>` (the
+ * runs-on-this-machine list is derived from RAW flow records, not `/runs`
+ * — see `lib/flow.ts`'s module doc) PLUS `/fleet/machines/live` +
+ * `/fleet/sessions/live` (machine presence + session liveness fallback,
+ * ALSO the source of a remote machine's own `specs` string — `specOf()`,
+ * viewer.html:1124-1129 — since a remote machine's hardware line comes
+ * from its presence beat, not this daemon's local `/machine/specs` probe).
  */
-export function MachineLens() {
+export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   const nowMs = Date.now();
   const [recentAll, setRecentAll] = useState(false);
 
@@ -113,36 +118,54 @@ export function MachineLens() {
     queryKey: queryKeys.machineSpecs(),
     queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
   });
-  const resourcesQuery = useQuery({
-    queryKey: queryKeys.machineResources(),
-    queryFn: () => fetchJson<MachineResources>("/machine/resources"),
-    refetchInterval: MACHINE_MEM_POLL_MS,
-  });
 
   const specs = specsQuery.data?.ok ? specsQuery.data.data : null;
-  const resourcesErrored = resourcesQuery.data ? !resourcesQuery.data.ok : false;
-  const resources = resourcesQuery.data?.ok ? resourcesQuery.data.data : null;
 
   const localUid = useMemo(
     () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null),
     [flowWindow.data, liveMachines, specs],
   );
-  const isLocalSpecs = !!(specs && localUid != null && nameOf(flowWindow.data, liveMachines, localUid) === specs.machine_id);
-  // This route is always "the local machine" (see the module doc above) —
-  // `isLocalMach` in legacy also ORs in the explicit nav-tab/deep-link
-  // intent, which this port's single always-local route makes trivially
-  // true regardless of whether `isLocalSpecs` has confirmed yet.
-  const isLocalMach = true;
+  // The machine THIS page is showing — the route's explicit uid (a
+  // fleet-card drill, local or remote) or, absent one, the local machine
+  // (the nav-tab/deep-link entry — legacy's `goMachine`).
+  const targetUid = routeUid ?? localUid;
+  const isLocalSpecs = !!(specs && targetUid != null && nameOf(flowWindow.data, liveMachines, targetUid) === specs.machine_id);
+  // `state.machineIsLocal` — the explicit nav-tab/deep-link intent
+  // (`goMachine` always passes `local=true`; a fleet-card drill always
+  // passes `local=false`, even when it happens to BE the local machine —
+  // `isLocalSpecs` is what self-corrects that case once specs resolve).
+  const machineIsLocal = routeUid == null;
+  const isLocalMach = machineIsLocal || isLocalSpecs;
 
-  const label = localUid != null ? nameOf(flowWindow.data, liveMachines, localUid) : "this machine";
-  const spec = isLocalSpecs && specs?.cpu_brand ? specs.cpu_brand + (specs.ram_total_bytes ? ` · ${ramGiB(specs.ram_total_bytes)} GB` : "") : "";
+  // The resources probe is LOCAL-ONLY data (`/machine/resources` always
+  // describes THIS daemon's own host) — legacy's `pollMachineMem` never
+  // even fetches it for a remote machine's page (viewer.html:4906-4907:
+  // `if(state.level!=="machine"||!machineIsLocalNow())... return`). Gating
+  // the query itself (not just the render) matches that: a remote page
+  // never issues the request at all.
+  const resourcesQuery = useQuery({
+    queryKey: queryKeys.machineResources(),
+    queryFn: () => fetchJson<MachineResources>("/machine/resources"),
+    refetchInterval: MACHINE_MEM_POLL_MS,
+    enabled: isLocalMach,
+  });
+  const resourcesErrored = isLocalMach && resourcesQuery.data ? !resourcesQuery.data.ok : false;
+  const resources = isLocalMach && resourcesQuery.data?.ok ? resourcesQuery.data.data : null;
+
+  const label = targetUid != null ? nameOf(flowWindow.data, liveMachines, targetUid) : "this machine";
+  // `specOf()` (viewer.html:1124-1129, ported in `lenses/fleet/cards.ts` —
+  // reused rather than re-derived here) — the local daemon's own
+  // `/machine/specs` probe (cpu + RAM) when this page IS that machine;
+  // otherwise the machine's own presence-beat `specs` string (a remote
+  // machine's hardware line, as broadcast by ITS heartbeat).
+  const spec = targetUid != null ? specOf(flowWindow.data, liveMachines, specs, targetUid) : "";
 
   const runs = useMemo(() => {
-    if (localUid == null) return [];
-    return buildMachineRuns(flowWindow.data, liveMachines, liveSessionIds, flowWindow.tMax, nowMs, localUid);
-  }, [flowWindow.data, flowWindow.tMax, liveMachines, liveSessionIds, localUid, nowMs]);
+    if (targetUid == null) return [];
+    return buildMachineRuns(flowWindow.data, liveMachines, liveSessionIds, flowWindow.tMax, nowMs, targetUid);
+  }, [flowWindow.data, flowWindow.tMax, liveMachines, liveSessionIds, targetUid, nowMs]);
 
-  const loose = useMemo(() => (localUid != null ? looseRecords(flowWindow.data, localUid) : []), [flowWindow.data, localUid]);
+  const loose = useMemo(() => (targetUid != null ? looseRecords(flowWindow.data, targetUid) : []), [flowWindow.data, targetUid]);
 
   const total = runs.length;
   const shown = recentAll ? runs : runs.slice(0, RECENT_CAP);
@@ -150,7 +173,18 @@ export function MachineLens() {
   return (
     <div className="machine-lens">
       <div className="machine-lens__hdr">
-        fleet › machine · {label}
+        {/* `<a data-act="fleet">fleet</a> › machine · ${label}` — the
+            `.stagehdr` back-link (viewer.html:2021), distinct from `#crumb`
+            (which carries no such link for the machine page — see
+            `App.tsx`'s `routeChrome` doc). A real `<button>` (not an
+            anchor with no href) so it never offers a tooltip/status-bar
+            URL; navigation is the same direct hash-write NavChrome's tabs
+            use for a cross-lens hop. */}
+        <button type="button" className="machine-lens__back" onClick={() => { location.hash = ""; }}>
+          fleet
+        </button>
+        {" › machine · "}
+        {label}
         {spec ? ` — ${spec}` : ""}
       </div>
 

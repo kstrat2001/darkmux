@@ -3,13 +3,45 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RunsBoard } from "./RunsBoard";
 
-function renderBoard(initialKind: "all" | "mission" | "dispatch" | "lab" = "all") {
+function renderBoard(initialKind: "all" | "mission" | "dispatch" | "lab" = "all", initialRun: string | null = null) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <RunsBoard initialKind={initialKind} />
+      <RunsBoard initialKind={initialKind} initialRun={initialRun} />
     </QueryClientProvider>,
   );
+}
+
+/**
+ * jsdom throws "Not implemented: navigation" on a real `location.href`
+ * assignment (same gotcha `MissionReplay.test.tsx` documents for the
+ * identical mission-graph redirect) — stub JUST the `href` setter for the
+ * duration of `fn`, scoped to the one test that needs it, then restore the
+ * real jsdom `location` so every OTHER test keeps its real
+ * `history.replaceState`/`location.hash` behavior (`writeHash` — the
+ * kind-chip/lab-run-open/lab-run-close writes — depends on that still
+ * working, so this is deliberately NOT a blanket `beforeEach` override).
+ */
+async function withHrefStub<T>(fn: (hrefSets: string[]) => Promise<T>): Promise<T> {
+  const original = window.location;
+  const hrefSets: string[] = [];
+  Object.defineProperty(window, "location", {
+    configurable: true,
+    value: {
+      ...original,
+      set href(v: string) {
+        hrefSets.push(v);
+      },
+      get href() {
+        return "http://localhost/";
+      },
+    },
+  });
+  try {
+    return await fn(hrefSets);
+  } finally {
+    Object.defineProperty(window, "location", { configurable: true, value: original });
+  }
 }
 
 const RUNS = [
@@ -128,28 +160,52 @@ describe("RunsBoard", () => {
     await waitFor(() => expect(screen.getByText(/no runs recorded yet/i)).toBeInTheDocument());
   });
 
-  it("clicking a still-interactive row surfaces a visible 'not ported yet' notice, not a silent no-op", async () => {
+  it("clicking a tracked mission row navigates to /mission/<id>/graph when a real daemon is behind the page", async () => {
+    mockFetch();
+    await withHrefStub(async (hrefSets) => {
+      // No <meta name="darkmux-mode"> is injected by this test harness, so
+      // `missionGraphReachable()` defaults false — inject it, matching what
+      // a REAL `darkmux serve`-served page does (see `Masthead.tsx`'s own
+      // `injectedMeta` doc).
+      const meta = document.createElement("meta");
+      meta.name = "darkmux-mode";
+      meta.content = "live";
+      document.head.appendChild(meta);
+      try {
+        renderBoard();
+        await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+        fireEvent.click(screen.getByText("m1").closest(".labrunrow")!);
+        expect(hrefSets).toEqual(["/mission/m1/graph"]);
+      } finally {
+        meta.remove();
+      }
+    });
+  });
+
+  it("clicking a tracked mission row with NO daemon behind the page surfaces a visible, honest notice — not a silent no-op or a broken nav", async () => {
     mockFetch();
     renderBoard();
     // "m1" (mission, tracked:true) is interactive — a real `data-act` target
-    // in legacy (`gomission`). Its detail page doesn't exist in `/next` yet.
+    // in legacy (`gomission`). No <meta name="darkmux-mode"> is injected
+    // here (matching every automated harness — see `injectedMeta`'s doc),
+    // so there is genuinely no daemon behind this page to navigate to.
     await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
-    expect(screen.queryByText(/isn't in \/next yet/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByText("m1").closest(".labrunrow")!);
 
-    const notice = screen.getByText(/isn't in \/next yet/i);
+    const notice = screen.getByText(/needs a running daemon/i);
     expect(notice).toBeInTheDocument();
     expect(notice).toHaveAttribute("role", "status");
     expect(notice.textContent).toMatch(/open it in the classic viewer at \//i);
   });
 
-  it("the not-ported notice also fires from a keyboard Enter activation", async () => {
+  it("the daemon-less notice also fires from a keyboard Enter activation", async () => {
     mockFetch();
     renderBoard();
     await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
     fireEvent.keyDown(screen.getByText("m1").closest(".labrunrow")!, { key: "Enter" });
-    expect(screen.getByText(/isn't in \/next yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/needs a running daemon/i)).toBeInTheDocument();
   });
 
   it("an untracked ghost row has no click affordance and never shows the notice", async () => {
@@ -173,18 +229,60 @@ describe("RunsBoard", () => {
     renderBoard();
     await waitFor(() => expect(screen.getByText("ghost2")).toBeInTheDocument());
     fireEvent.click(screen.getByText("ghost2").closest(".labrunrow")!);
-    expect(screen.queryByText(/isn't in \/next yet/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
   });
 
-  it("switching kind chips clears a lingering not-ported notice", async () => {
+  it("switching kind chips clears a lingering row-click notice", async () => {
     mockFetch();
     const { container } = renderBoard();
     await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
     fireEvent.click(screen.getByText("m1").closest(".labrunrow")!);
-    expect(screen.getByText(/isn't in \/next yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/needs a running daemon/i)).toBeInTheDocument();
 
     fireEvent.click(container.querySelector('[data-arg="dispatch"]')!);
-    expect(screen.queryByText(/isn't in \/next yet/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
+  });
+
+  it("clicking a lab row opens the lab-run detail pane, and its back link returns to the list", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url === "/runs") return Promise.resolve(new Response(JSON.stringify({ runs: RUNS, generated_at_ms: 1 }), { status: 200 }));
+        if (url === "/lab/runs")
+          return Promise.resolve(new Response(JSON.stringify({ configured: true, dir: "/lab", exists: true, runs: [] }), { status: 200 }));
+        if (url.startsWith("/lab/run/detail")) return Promise.resolve(new Response(JSON.stringify({ dir: "l1", funnels: [], scores: null }), { status: 200 }));
+        if (url.startsWith("/lab/run/events")) return Promise.resolve(new Response(JSON.stringify({ lines: [], next_offset: 0, finished: false }), { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    const { container } = renderBoard();
+    await waitFor(() => expect(screen.getByText("l1")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("l1").closest(".labrunrow")!);
+    await waitFor(() => expect(screen.getByText("‹ runs")).toBeInTheDocument());
+    expect(screen.getByText(/· l1/)).toBeInTheDocument();
+    expect(container.querySelector('[data-arg="all"]')).toBeNull(); // the kind chips are gone in this view
+
+    fireEvent.click(screen.getByText("‹ runs"));
+    await waitFor(() => expect(screen.getByText("l1")).toBeInTheDocument());
+    expect(screen.queryByText("‹ runs")).not.toBeInTheDocument();
+  });
+
+  it("a deep-link into kind=lab with a run= param opens the lab-run detail pane directly, on first render", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.startsWith("/lab/run/detail")) return Promise.resolve(new Response(JSON.stringify({ dir: "live/gate-1", funnels: [], scores: null }), { status: 200 }));
+        if (url.startsWith("/lab/run/events")) return Promise.resolve(new Response(JSON.stringify({ lines: [], next_offset: 0, finished: false }), { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    renderBoard("lab", "live/gate-1");
+    await waitFor(() => expect(screen.getByText(/· live\/gate-1/)).toBeInTheDocument());
+    // Never fetched /runs or /lab/runs's list-only data path before landing
+    // here — the detail pane doesn't wait on it (matches legacy: drillLabRun
+    // never blocks on loadRuns()/loadLabRuns()).
+    expect(screen.getByText("‹ runs")).toBeInTheDocument();
   });
 
   // (#1585's bug class) `/lab/runs` distinguishes THREE reasons the lab tab

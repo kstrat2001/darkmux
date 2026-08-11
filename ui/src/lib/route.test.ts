@@ -29,9 +29,14 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "runs", runsKind: "all", run: null });
   });
 
-  it("parses #lens=machine", () => {
+  it("parses #lens=machine with no uid as the local machine (uid: null)", () => {
     setHash("#lens=machine");
-    expect(parseRoute()).toEqual({ kind: "machine" });
+    expect(parseRoute()).toEqual({ kind: "machine", uid: null });
+  });
+
+  it("parses #lens=machine&uid=<uid> as a specific (possibly remote) machine drill-in", () => {
+    setHash("#lens=machine&uid=some-remote-uid");
+    expect(parseRoute()).toEqual({ kind: "machine", uid: "some-remote-uid" });
   });
 
   it("parses #lens=console&panel=<id>", () => {

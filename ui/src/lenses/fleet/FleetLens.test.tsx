@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
 import { todayUTC, prevDateUTC } from "../../lib/flow";
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  window.location.hash = "";
 });
 
 function renderFleetLens() {
@@ -110,5 +111,47 @@ describe("FleetLens", () => {
     // Local tokens must NOT have absorbed it — it's excluded, not credited.
     const localBlock = screen.getByText("local tokens").previousSibling;
     expect(localBlock?.textContent).toBe("0");
+  });
+
+  // (drill-in packet) The fleet-card click — `data-act="machine" data-arg`
+  // in legacy (`ACTIONS.machine`, `drillMachine(uid)`) — was previously a
+  // plain, non-interactive `<div>`. This is the fleet-lens half of the
+  // drill-in; `MachineLens.test.tsx` covers what the destination page does
+  // with a REMOTE uid.
+  it("clicking a machine card navigates to that machine's page via a real hash write", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      ],
+    });
+    renderFleetLens();
+    // "MacBook-Pro" renders TWICE — the machine card AND the activity-
+    // timeline lane label (see the earlier test's own comment) — find the
+    // CARD specifically via its ancestor class, not the singular query.
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("MacBook-Pro");
+    expect(card).toHaveAttribute("role", "button");
+    fireEvent.click(card);
+    expect(window.location.hash).toBe("#lens=machine&uid=u1");
+  });
+
+  it("Enter/Space also activates the fleet-card drill-in (keyboard parity with the click)", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      ],
+    });
+    renderFleetLens();
+    // "MacBook-Pro" renders TWICE — the machine card AND the activity-
+    // timeline lane label (see the earlier test's own comment) — find the
+    // CARD specifically via its ancestor class, not the singular query.
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("MacBook-Pro");
+    fireEvent.keyDown(card, { key: "Enter" });
+    expect(window.location.hash).toBe("#lens=machine&uid=u1");
   });
 });

@@ -1,7 +1,18 @@
+// See `sessionRun.test.ts`'s identical note: `clk()` reads the process
+// timezone, and the real-corpus test below asserts on a `clk()`-derived
+// value — pin it before anything runs.
+process.env.TZ = "UTC";
+
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SessionReplay } from "./SessionReplay";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(__dirname, "../../../..");
 
 function renderReplay(sessionId: string) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -39,21 +50,22 @@ describe("SessionReplay", () => {
     await waitFor(() => expect(screen.getByText(/no records found for session s1/i)).toBeInTheDocument());
   });
 
-  it("renders the not-ported notice, naming the real record count, when data is found", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(() =>
-        Promise.resolve(
-          new Response(JSON.stringify({ records: [{ ts: "x" }, { ts: "y" }], count: 2, truncated: false, generated_at_ms: 0 }), {
-            status: 200,
-          }),
-        ),
-      ),
-    );
+  it("renders the real run view — header, brief, metrics, detections — against the recorded corpus fixture", async () => {
+    const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-session-task-list.json"), "utf8"));
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
     renderReplay("task-list");
-    await waitFor(() => expect(screen.getByText(/lens not ported yet/i)).toBeInTheDocument());
-    expect(screen.getByText(/task-list/)).toBeInTheDocument();
-    expect(screen.getByText(/2 records loaded/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/RUNNING/)).toBeInTheDocument());
+    expect(screen.getByText(/FETCH-RENDER/)).toBeInTheDocument();
+    expect(screen.getByText(/task-list on/)).toBeInTheDocument();
+    expect(screen.getByText("LMStudio · local · this machine")).toBeInTheDocument();
+    expect(screen.getByText(/07:36:48 · running/)).toBeInTheDocument();
+    expect(screen.getByText("1071:54 so far")).toBeInTheDocument();
+    expect(screen.getByText("TURNS")).toBeInTheDocument();
+    expect(screen.getByText("model (lms)")).toBeInTheDocument();
+    expect(screen.getByText(/no telemetry yet/i)).toBeInTheDocument();
+    expect(screen.getByText("detections")).toBeInTheDocument();
+    expect(screen.getByText("✓ clean")).toBeInTheDocument();
+    expect(screen.getByText(/no behavioral flags/i)).toBeInTheDocument();
   });
 
   it("URL-encodes the session id in the fetch path", async () => {
