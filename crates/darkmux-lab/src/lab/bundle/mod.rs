@@ -42,6 +42,25 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// The per-unit size cap, in lines: a changed function (or a contiguous run
+/// of unenclosed top-level lines) longer than this is declined rather than
+/// bundled.
+///
+/// **This is a backstop against pathological input, not a quality judgment.**
+/// It exists so a generated or minified file cannot blow a model's context;
+/// it is deliberately NOT a statement that a long function is unreviewable.
+///
+/// Raised from 300 to 2000 (operator, 2026-08-11). The original 300 was
+/// inherited from the Python reference with no recorded rationale, and at
+/// that value it declined ordinary real functions — a changed function over
+/// the cap reached NO seat at all, which is the same silent-loss class this
+/// module spent #1751-#1756 eliminating. 2000 is high enough that only
+/// genuinely pathological input trips it.
+///
+/// If this ever needs tuning again, MEASURE how often it fires on real
+/// diffs first; do not pick another number by feel.
+pub const MAX_BUNDLE_LINES: usize = 2000;
+
 /// A single (path, line-span) pointer into a source file. 1-indexed,
 /// inclusive on both ends — matches the reference's `{"path", "start",
 /// "end"}` shape exactly.
@@ -159,7 +178,7 @@ pub enum SkipReason {
     /// changed-at-all) code for the bundler to anchor on in that case.
     NoEnclosingFunction,
     /// A changed function's body exceeded the bundler's per-function size
-    /// cap (`end0 - start0 > 300` lines) — a real, internal-limit decline,
+    /// cap ([`MAX_BUNDLE_LINES`]) — a real, internal-limit decline,
     /// NOT a benign "nothing here" (the issue's "diff exceeded some
     /// internal bound" case, distinct from both of the above). (#1751)
     /// Recorded PER FUNCTION, the instant it's skipped — independent of
@@ -172,7 +191,7 @@ pub enum SkipReason {
     OverSizeCap,
     /// (#1605 follow-up) A contiguous run of changed lines with no enclosing
     /// function — see [`SkipReason::NoEnclosingFunction`] — exceeded the
-    /// same size cap functions are held to (`run_end - run_start > 300`
+    /// same size cap functions are held to ([`MAX_BUNDLE_LINES`]
     /// lines). Unlike the other reasons here, this one can coexist with a
     /// file that ALSO contributed bundles (from its functions, or from a
     /// smaller top-level run elsewhere in the same file) — see
@@ -719,7 +738,7 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
                 continue;
             }
             seen_fns.insert(seen_key);
-            if end0 - start0 > 300 {
+            if end0 - start0 > MAX_BUNDLE_LINES {
                 // (#1751) Recorded PER FUNCTION, immediately — independent
                 // of whether a sibling function in this same file (or a
                 // top-level run) already bundled successfully. Previously
@@ -875,7 +894,7 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
         // invocation chain (two unrelated regions separated by the function
         // the earlier loop already bundled) become two separate, locally-
         // scoped bundles rather than one span swallowing everything between
-        // them. Same size cap as a function (`end0 - start0 > 300`); a run
+        // them. Same size cap as a function ([`MAX_BUNDLE_LINES`]); a run
         // over the cap is declined per-run, immediately, regardless of
         // whether this file's functions (or another run) already
         // contributed bundles — see `SkipReason::TopLevelOverSizeCap`'s doc
@@ -883,7 +902,7 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
         // same per-decline-point recording, so both loops now behave the
         // same way here).
         for (run_start, run_end) in contiguous_runs(&unenclosed_lines) {
-            if run_end - run_start > 300 {
+            if (run_end - run_start) as usize > MAX_BUNDLE_LINES {
                 skip.files_skipped.push(SkippedFile {
                     path: rel.clone(),
                     reason: SkipReason::TopLevelOverSizeCap,
@@ -1330,12 +1349,12 @@ mod tests {
 
     #[test]
     fn build_bundles_reports_over_size_cap_skip_reason() {
-        // A single changed function whose body exceeds the 300-line cap —
+        // A single changed function whose body exceeds `MAX_BUNDLE_LINES` —
         // real code, mechanically declined for an internal size limit, not
         // a benign "nothing here".
         let dir = TempDir::new().unwrap();
         let mut body = String::from("export function hugeFn(x) {\n");
-        for i in 0..320 {
+        for i in 0..(MAX_BUNDLE_LINES + 20) {
             body.push_str(&format!("  console.log({i});\n"));
         }
         body.push_str("  return x;\n}\n");
@@ -1656,16 +1675,17 @@ main()
     /// Companion to `build_bundles_reports_over_size_cap_skip_reason`
     /// (functions) — the same cap, applied to a top-level run: a changed
     /// line with no enclosing function still doesn't reach a seat when its
-    /// contiguous run is over 300 lines, but unlike the pre-fix behavior
+    /// contiguous run is over `MAX_BUNDLE_LINES`, but unlike the pre-fix behavior
     /// that decline is now RECORDED (#1605 follow-up) rather than silent.
     #[test]
     fn build_bundles_reports_top_level_over_size_cap_skip_reason() {
         let dir = TempDir::new().unwrap();
-        // 320 top-level `const` lines — no function anywhere in the file, so
+        // Enough top-level `const` lines to exceed `MAX_BUNDLE_LINES`; no
+        // function anywhere in the file, so
         // every one of them is an unenclosed changed line in a single
-        // contiguous run over the 300-line cap.
+        // contiguous run over the cap.
         let mut content = String::new();
-        for i in 0..320 {
+        for i in 0..(MAX_BUNDLE_LINES + 20) {
             content.push_str(&format!("const c{i} = {i};\n"));
         }
         write(dir.path(), "src/huge_toplevel.ts", &content);
@@ -1714,9 +1734,9 @@ main()
     // 1. CONFIRMED, WORST — Mixed-file over-cap silent loss
     //    (`build_bundles_silently_drops_an_over_cap_function_when_a_
     //    sibling_function_in_the_same_file_bundles`). A file with TWO
-    //    changed functions, one under the 300-line cap and one over it:
+    //    changed functions, one under `MAX_BUNDLE_LINES` and one over it:
     //    the small one bundles normally; the huge one's changed lines are
-    //    dropped by the `if end0 - start0 > 300 { continue; }` in
+    //    dropped by the `if end0 - start0 > MAX_BUNDLE_LINES { continue; }` in
     //    `build_bundles`'s function loop — and because the FILE still
     //    produced a bundle (from the small function), the `had_functions
     //    && bundles.len() == bundles_before_file` check that would record
@@ -1734,7 +1754,7 @@ main()
     //    function, independent of whether the file's other functions
     //    succeeded.
     //    Python reference: bundler.py has the identical per-function
-    //    300-line cap and (per its own description as a line-span-pointer
+    //    size cap and (per its own description as a line-span-pointer
     //    emitter with no reporting layer at all) almost certainly shares
     //    this exact gap — the Rust `BundleSkipReport` structure is a
     //    packet-3/1605 addition with NO Python precedent, so there is
@@ -1945,7 +1965,7 @@ main()
     ) {
         let dir = TempDir::new().unwrap();
         let mut content = String::from("export function small(x) {\n  return x + 1;\n}\n\nexport function huge(x) {\n");
-        for i in 0..320 {
+        for i in 0..(MAX_BUNDLE_LINES + 20) {
             content.push_str(&format!("  console.log({i});\n"));
         }
         content.push_str("  return x;\n}\n");

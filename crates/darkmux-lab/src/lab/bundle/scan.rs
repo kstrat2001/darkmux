@@ -543,7 +543,21 @@ pub fn find_all_functions_in_text(lines: &[String]) -> Vec<FnDef> {
         let start_line = line_of(start_off);
         let end_line = line_of(close_pos);
         let key = (start_line, end_line);
-        if seen.contains(&key) || end_line.saturating_sub(start_line) > 400 {
+        // (2026-08-11) The SECOND size cap, and the one that actually bit.
+        // A function longer than this is never recorded as a function at
+        // all, so `build_bundles`'s own `MAX_BUNDLE_LINES` cap never sees
+        // it — raising that one alone was a silent no-op for anything in
+        // between. The lines are not lost (they fall through to the
+        // top-level path), but they arrive without function context,
+        // facts, or resolved callees.
+        //
+        // Kept slightly above `MAX_BUNDLE_LINES` so the BUNDLER's cap is
+        // the one that decides, and the decline is reported through
+        // `SkipReason::OverSizeCap` rather than vanishing into a scanner
+        // heuristic nothing surfaces.
+        if seen.contains(&key)
+            || end_line.saturating_sub(start_line) > crate::lab::bundle::MAX_BUNDLE_LINES + 100
+        {
             continue;
         }
         seen.insert(key);
