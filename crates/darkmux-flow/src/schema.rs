@@ -681,4 +681,32 @@ mod forward_compat_tests {
         .unwrap();
         assert!(!known.has_unknown_enum());
     }
+
+    /// (#1758) A record written by a pre-1.19.0 binary carries an
+    /// `orchestrator` key this struct no longer has. It must still parse:
+    /// `FlowRecord` has no `deny_unknown_fields`, so serde drops the key.
+    ///
+    /// The PR removing the field claimed this compatibility; it was true
+    /// only BY CONSTRUCTION, with nothing pinning it. The existing
+    /// forward-compat tests cover unknown enum VALUES, not unknown KEYS, so
+    /// a future `deny_unknown_fields` would silently break every archived
+    /// record and no test would notice. This is that pin.
+    #[test]
+    fn a_pre_1_19_record_carrying_the_removed_orchestrator_key_still_parses() {
+        let old = r#"{
+            "ts": "2026-08-01T00:00:00Z",
+            "level": "info",
+            "category": "dispatch",
+            "tier": "local",
+            "stage": "run",
+            "action": "dispatch.start",
+            "handle": "h1",
+            "orchestrator": "claude-code",
+            "machine_id": "studio"
+        }"#;
+        let rec: FlowRecord = serde_json::from_str(old)
+            .expect("a record with the removed `orchestrator` key must still deserialize");
+        assert_eq!(rec.handle, "h1");
+        assert_eq!(rec.machine_id.as_deref(), Some("studio"));
+    }
 }
