@@ -19,6 +19,28 @@ afterEach(() => {
   window.location.hash = "";
 });
 
+/**
+ * `.machine-lens__hdr`'s "fleet › machine · <label>" line (drill-in
+ * packet) — its LEADING "fleet" segment is now a real `<button>` (the
+ * back-link, see `MachineLens.tsx`'s own doc), so the line is no longer
+ * one flat run of sibling text nodes the way it was pre-drill-in.
+ * `screen.getByText`'s DEFAULT matcher (`getNodeText`, `@testing-library/
+ * dom`) deliberately reads only an element's OWN DIRECT text-node
+ * children, never a nested element's — a documented RTL behavior (not a
+ * bug), and exactly why a regex spanning "fleet" + " › machine" no longer
+ * matches either the button (whose own text is just "fleet") or the outer
+ * div (whose own direct-text-node content is now " › machine · <label>",
+ * missing "fleet"). A REAL browser's `innerText` (what the parity harness
+ * actually compares) has no such limitation — this is a jsdom/RTL query
+ * mechanics gotcha, not a behavior change goldens would catch. Fixed by
+ * matching against the CONTAINER's real `textContent` (which, like
+ * `innerText`, recurses through nested elements) instead of relying on
+ * `getByText`'s element-scoped default. */
+function machineHeaderMatches(re: RegExp): boolean {
+  const hdr = document.querySelector(".machine-lens__hdr");
+  return !!hdr && re.test(hdr.textContent || "");
+}
+
 /** (#1729) The presence endpoints answer an ENVELOPE, not a bare array. The
  *  hooks tolerate a bare array via `?? []`, which means a stale stub goes
  *  silently empty instead of failing — the exact trap that let the real
@@ -93,24 +115,32 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("no missions")).toBeInTheDocument());
   });
 
-  it("renders a named placeholder once SessionReplay's real fetch resolves populated (Packet 4 completed the fetch wiring, not the render)", async () => {
+  it("renders the real session run view for #session=<id> (drill-in packet — SessionReplay is no longer a placeholder)", async () => {
     // `#lens=console` was this test's original target before Packet 6 ported
-    // the console lens for real, then briefly `#session=<id>` (Packet 4
-    // still rendered a bare `LensPlaceholder` there at the time) before
-    // Packet 4 landed `SessionReplay` — a REAL fetch to `/flow-session/<id>`
-    // that only falls through to `LensPlaceholder` once the fetch resolves
-    // with a non-empty count (see that component's own doc). Mock the
-    // session endpoint with a populated response so the assertion still
-    // exercises the placeholder-mechanism end state, not SessionReplay's own
-    // loading/error branches (which is Packet 4's concern to test, not this
-    // file's App-routing regression guard).
+    // the console lens for real, then `#session=<id>` rendered a bare
+    // `LensPlaceholder` before the drill-in packet landed `SessionReplay`'s
+    // REAL render (`runRegions()`, see that component's own doc) — this is
+    // the App-routing regression guard for that path: a session route
+    // reaches a genuine rendered view, not a placeholder or a blank page.
+    // The DETAILED derivation (brief rows, metrics, detections) is
+    // `sessionRun.test.ts`'s job (including a byte-parity check against a
+    // real recorded legacy golden); this test only proves App wires the
+    // route to the real component.
     window.location.hash = "#session=abc-123";
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
         if (typeof url === "string" && url.startsWith("/flow-session/")) {
           return Promise.resolve(
-            new Response(JSON.stringify({ records: [{}], count: 1, truncated: false, generated_at_ms: Date.now() }), { status: 200 }),
+            new Response(
+              JSON.stringify({
+                records: [{ ts: "2026-01-01T00:00:00Z", session_id: "abc-123", action: "dispatch.start", handle: "coder" }],
+                count: 1,
+                truncated: false,
+                generated_at_ms: Date.now(),
+              }),
+              { status: 200 },
+            ),
           );
         }
         return Promise.resolve(new Response("[]", { status: 200 }));
@@ -122,7 +152,15 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(screen.getByText(/lens not ported yet: session drill-in abc-123/i)).toBeInTheDocument());
+    expect(screen.queryByText(/lens not ported yet/i)).not.toBeInTheDocument();
+    await waitFor(() => expect(document.querySelector('.session-run[data-state="data"]')).not.toBeNull());
+    // "CODER" is one of several sibling text nodes inside `.session-run__header`
+    // (alongside the pill `<span>` and the meta `<span>`) — `getByText`'s
+    // default matcher reads only an element's OWN direct text-node children
+    // (see `machineHeaderMatches`'s own doc for the same gotcha), so a plain
+    // textContent check on the header is the reliable form here too.
+    expect(document.querySelector(".session-run__header")?.textContent).toContain("CODER");
+    expect(screen.getByText("detections")).toBeInTheDocument();
   });
 
   it("renders the machine lens (Packet 2) instead of a placeholder", async () => {
@@ -138,7 +176,7 @@ describe("App", () => {
     // The stagehdr line renders immediately (synchronous, no fetch needed
     // for its fallback text) even before the specs/flow-window queries
     // settle — see `MachineLens`'s `label` fallback ("this machine").
-    await waitFor(() => expect(screen.getByText(/fleet › machine/)).toBeInTheDocument());
+    expect(machineHeaderMatches(/fleet › machine/)).toBe(true);
   });
 
   it("renders a named placeholder (with the raw hash) for an unrecognized route, never a blank page", () => {
@@ -190,12 +228,12 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    expect(screen.queryByText(/fleet › machine/)).not.toBeInTheDocument();
+    expect(machineHeaderMatches(/fleet › machine/)).toBe(false);
 
     fireEvent.click(document.getElementById("lens-machine")!);
 
     expect(window.location.hash).toBe("#lens=machine");
-    await waitFor(() => expect(screen.getByText(/fleet › machine/)).toBeInTheDocument());
+    await waitFor(() => expect(machineHeaderMatches(/fleet › machine/)).toBe(true));
     expect(document.getElementById("lens-machine")!.className).toMatch(/\bon\b/);
   });
 
@@ -314,7 +352,7 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(screen.getByText(/fleet › machine/)).toBeInTheDocument());
+    await waitFor(() => expect(machineHeaderMatches(/fleet › machine/)).toBe(true));
     expect(document.getElementById("logbody")).toBeTruthy();
     // `#logscope` stays PRESENT (so this port's parity extraction matches
     // legacy's) but is now EMPTY everywhere: the outer UI owns context. What

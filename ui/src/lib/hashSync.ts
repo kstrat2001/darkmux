@@ -34,32 +34,24 @@ import type { Route } from "./route";
  *   parses to the canonical `Route` (`route.runsKind === "lab"`) and this
  *   effect just names it in the address bar.
  *
- * Scope: only the params THIS packet's lenses actually drive
- * (`lens`/`kind`/`panel`/`session`) are written. `run` (the lab-run-detail
- * deep link) and `mission` (the mission-graph full-navigation) are both
- * genuinely out of scope this packet — see `route.ts`'s own module doc.
+ * Scope: the params every ported lens drives (`lens`/`kind`/`panel`/
+ * `session`/`uid`) are written. `mission` (the mission-graph
+ * full-navigation) stays out of scope for this write-back path: legacy does
+ * a full navigation away when it fires, so there's nothing left to write
+ * back to.
  *
- * QA correction (2026-08-09): an earlier version of this doc claimed a
- * `run` param survives untouched. It does NOT — `canonicalHash`'s `"runs"`
- * branch never reads `route.run`, so booting on `#lens=runs&run=/x/y`
- * gets REWRITTEN to the bare `#lens=runs` the moment `useSyncHash`'s
- * effect fires (which includes the very first render, mount included) —
- * the `run` param is silently dropped, not preserved. QA measured that
- * this is actually the FAITHFUL analog of legacy's own behavior, not a
- * deviation from it: legacy's `syncLabHash` only WRITES `run` when
- * `state.level==="lab-run"` — i.e. when `drillLabRun` actually resolved
- * the dir and the operator is genuinely looking at a lab-run detail pane;
- * for an unresolvable `run` (the dir doesn't match anything, or — as
- * here — the drill-down code path doesn't exist at all) legacy's `else`
- * branch deletes the param too. Since this port never implements
- * `state.level==="lab-run"` at all (lab-run detail is out of scope — see
- * `route.ts`'s module doc), EVERY `run=` this port receives is
- * structurally in legacy's "unresolvable" bucket, so always dropping it
- * reproduces legacy's actual behavior for the only case this port can
- * ever hit — it isn't an omission, it's the faithful mapping. Revisit
- * this comment (and add `run` to `canonicalHash`'s `"runs"` branch) the
- * day a lab-run-detail packet lands.
+ * `run` (the lab-run-detail deep link, drill-in packet): now WRITTEN, once
+ * `LabRunDetail` (`lenses/runs/LabRunDetail.tsx`) gave `run` a real
+ * destination to point at — matching legacy's own `syncLabHash`, which
+ * writes `run` only when `state.level==="lab-run"` (a `drillLabRun` that
+ * actually resolved a dir). An earlier version of this doc (pre-drill-in)
+ * recorded that `run` was dropped on purpose, reasoning that every `run=`
+ * this port could receive was structurally unresolvable since the
+ * drill-down didn't exist yet — that reasoning no longer applies now that
+ * it does; this paragraph replaces it rather than leaving a stale account
+ * of a since-closed gap.
  *
+
  * `mission-redirect` and `unknown` routes are likewise never
  * canonicalized: legacy does a full navigation away for the former
  * (nothing left to write back to), and rewriting an `unknown` hash would
@@ -75,11 +67,31 @@ export function canonicalHash(route: Route): string | null {
       const p = new URLSearchParams();
       p.set("lens", "runs");
       if (route.runsKind && route.runsKind !== "all") p.set("kind", route.runsKind);
+      // (drill-in packet) `run` now HAS a real destination — the lab-run
+      // detail view (`LabRunDetail`) — so it earns a place in the canonical
+      // hash again, matching legacy's own `state.level==="lab-run"` write
+      // (`if(state.level==="lab-run"&&state.labRunDir!=null)p.set("run",...)`
+      // in `syncLabHash`). Written whenever `route.run` is set, INDEPENDENT
+      // of `runsKind` — legacy's own gate is `state.level==="lab-run"`, not
+      // `state.runsKind==="lab"`: a lab row is visible (and clickable) under
+      // BOTH kind=all and kind=lab (any OTHER kind filter excludes lab rows
+      // entirely — see `runsFiltered`), so the reachable hash forms are
+      // `run=` alone (kind=all, no `kind=` param at all) and
+      // `kind=lab&run=`, both real. See this file's module doc for why this
+      // REVERSES the prior QA correction, now that the drill-in exists to
+      // preserve `run` for.
+      if (route.run) p.set("run", route.run);
       return p.toString();
     }
     case "machine": {
       const p = new URLSearchParams();
       p.set("lens", "machine");
+      // (drill-in packet) `uid` — see `route.ts`'s own doc on the widened
+      // `machine` route: a genuine widening beyond legacy's own address bar
+      // (which never named the drilled uid), written only for a REMOTE/
+      // explicit drill (`uid` non-null); the local nav-tab/deep-link entry
+      // stays exactly `#lens=machine`, unchanged from before this packet.
+      if (route.uid) p.set("uid", route.uid);
       return p.toString();
     }
     case "console": {

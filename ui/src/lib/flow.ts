@@ -355,3 +355,78 @@ export function lastTs(data: FlowRecord[], sid: string): number {
   }
   return m;
 }
+
+function compKey(sessionId: string | undefined, ts: string | undefined): string {
+  return `${sessionId || ""}\x1f${ts || ""}`;
+}
+
+/** `flowToRenderModel()` — viewer.html:3171-3242. Normalizes a raw record
+ * array (the `/flow-session/<id>` or `/flow-mission/<id>` "replay this
+ * thing" payload — the session drill-in's data source, `lenses/session/
+ * sessionRun.ts`) into the shape `runRegions()` reads:
+ *
+ * - action dotting (`normalizeAction`, already used by `buildFlowWindow`
+ *   above — reused here, not re-derived)
+ * - `fields` ALIASED from `payload` when a record carries the latter but
+ *   not the former (schema 1.6+ carries type-specific data under `fields`
+ *   on the wire; older/synthesized records only have `payload`) — this is
+ *   the piece `buildFlowWindow` above does NOT do (that pipeline's own doc
+ *   notes its normalization is deliberately narrower, scoped to what the
+ *   machine lens's runs-list needs), so a session-view consumer reading
+ *   `r.fields` uniformly needs THIS pass, not that one
+ * - a `dispatch.compaction` record retagged as compaction telemetry, UNLESS
+ *   a dedicated `telemetry.compaction` sibling already covers the same
+ *   `(session_id, ts)` (the #1122 double-count guard)
+ * - a category default (`work` absent a `source`, else `telemetry`)
+ * - a SYNTHESIZED per-session "runtime" telemetry record carrying the max
+ *   `dispatch.turn` `turn_seq` — the ONLY source for the session view's
+ *   TURNS metric
+ *
+ * Sorted by ts at the end (the synthesized runtime records are appended out
+ * of order, and the whole point of this pass is a temporally-ordered
+ * array). NOT the same pipeline `buildFlowWindow` runs for the fleet/
+ * machine lenses' live window — see that function's own doc for why the
+ * two stay separate rather than one growing to cover both call sites'
+ * needs. */
+export function flowToRenderModel(records: FlowRecord[]): FlowRecord[] {
+  const compTelemetryKeys = new Set<string>();
+  for (const r of records) {
+    if (r && r.action === "telemetry.compaction") {
+      compTelemetryKeys.add(compKey(r.session_id, r.ts));
+    }
+  }
+
+  const out: FlowRecord[] = records
+    .filter((r): r is FlowRecord => !!r && !r._type)
+    .map((r) => {
+      const o: FlowRecord = { ...r, action: normalizeAction(r.action) };
+      if (o.payload && !o.fields) o.fields = o.payload;
+      if (o.action === "dispatch.compaction" && !compTelemetryKeys.has(compKey(o.session_id, o.ts))) {
+        const p = (o.payload || {}) as { before_messages?: number; after_messages?: number };
+        o.category = "telemetry";
+        o.source = "compaction";
+        o.fields = { from: p.before_messages || 0, to: p.after_messages || 0 };
+      }
+      if (!o.category) o.category = o.source ? "telemetry" : "work";
+      return o;
+    });
+
+  const perSession = new Map<string, { turns: number; ts: string }>();
+  for (const r of records) {
+    if (r.action === "dispatch.turn" && r.session_id) {
+      const seq = Number((r.payload as { turn_seq?: number } | undefined)?.turn_seq) || 0;
+      const existing = perSession.get(r.session_id);
+      if (existing) {
+        existing.turns = Math.max(existing.turns, seq);
+        existing.ts = r.ts;
+      } else {
+        perSession.set(r.session_id, { turns: seq, ts: r.ts });
+      }
+    }
+  }
+  for (const [sid, agg] of perSession) {
+    out.push({ ts: agg.ts, category: "telemetry", source: "runtime", session_id: sid, fields: { turns: agg.turns } });
+  }
+
+  return out.sort((a, b) => T(a.ts) - T(b.ts));
+}

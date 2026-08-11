@@ -52,7 +52,23 @@ export type PanelId = (typeof PANEL_IDS)[number];
 export type Route =
   | { kind: "fleet" }
   | { kind: "runs"; runsKind: RunsKind; run: string | null }
-  | { kind: "machine" }
+  /** `uid` — widened this packet (the drill-in packet) to carry a SPECIFIC
+   * machine uid: `null` for the nav-tab/deep-link entry (`goMachine` in
+   * legacy — always "the local machine"), a real uid for a fleet-card
+   * drill (`drillMachine(uid, false)` — local OR remote). Legacy itself has
+   * NO deep-link form for the remote-uid case (`syncLabHash`'s `inMachine`
+   * branch writes only `lens=machine`, never the drilled uid — a real gap,
+   * not a design this port narrows further) — the `uid=` param below is a
+   * genuine, deliberate WIDENING beyond legacy's own address-bar behavior,
+   * so a fleet-card drill into a remote machine is bookmarkable/pasteable
+   * (the hard deep-link requirement this packet's brief sets), where legacy
+   * would silently drop you back to the local machine on reload. `uid` is
+   * an open string (not from `PANEL_IDS`/`RUNS_KINDS`'s closed sets) —
+   * machine uids are arbitrary hardware-derived identifiers, matching
+   * `session.sessionId`'s existing open-string precedent below. An
+   * unrecognized/stale uid degrades gracefully (see `MachineLens`'s own
+   * doc) rather than needing its own validation here. */
+  | { kind: "machine"; uid: string | null }
   /** `panelId` is `""` for "no explicit panel requested" AND for "an
    * unrecognized id" — both fall back to the console lens's own default
    * (`mission-status`), matching legacy's `consoleQuery()`:
@@ -157,7 +173,8 @@ export function parseRoute(): Route {
   }
 
   if (lens === "machine") {
-    return { kind: "machine" };
+    const uid = get("uid");
+    return { kind: "machine", uid: uid ? uid : null };
   }
 
   if (lens === "console") {

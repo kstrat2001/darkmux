@@ -180,7 +180,34 @@ export function FleetLens() {
       <FleetCoverageNotice />
       <div className="fleet">
         {cards.map((card) => (
-          <div key={card.uid} className={`mach${card.active && !card.absent ? " active" : ""}${card.absent ? " absent" : ""}`}>
+          // `<div class="mach ..." data-act="machine" data-arg="${uid}">`
+          // (viewer.html:1711) — the fleet-card drill-in this packet wires:
+          // `ACTIONS.machine` (viewer.html:2991) calls `drillMachine(uid)`
+          // for an explicit arg, local OR remote. Ported as a real
+          // cross-lens navigation (a literal `location.hash` write, firing
+          // `hashchange` so `useHashRoute` actually swaps the rendered
+          // component — the SAME mechanism `NavChrome`'s tab clicks use,
+          // see that component's own doc for why replaceState alone can't
+          // do this), not a `history.replaceState` (legacy's OWN
+          // `syncLabHash` never even names the drilled uid in the address
+          // bar at all — see `route.ts`'s widened-route doc for why this
+          // port's `uid=` param is a deliberate improvement, not a replay
+          // of legacy's own mechanism).
+          <div
+            key={card.uid}
+            className={`mach${card.active && !card.absent ? " active" : ""}${card.absent ? " absent" : ""}`}
+            role="button"
+            tabIndex={0}
+            onClick={() => {
+              location.hash = `lens=machine&uid=${encodeURIComponent(card.uid)}`;
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                location.hash = `lens=machine&uid=${encodeURIComponent(card.uid)}`;
+              }
+            }}
+          >
             <div className="name">
               <span className="mico">
                 <MachineIcon />

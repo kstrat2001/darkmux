@@ -2078,3 +2078,204 @@ body {
   font: 11px "JetBrains Mono", monospace;
   margin-top: 10px;
 }
+
+/* ── Drill-in packet: back-links ─────────────────────────────────────────
+   `.machine-lens__back` (the "fleet" segment of the machine page's header)
+   and `.labrun-back` (the "‹ runs" segment of the lab-run-detail's header)
+   are real `<button>` elements now (see each component's own doc for why —
+   a real interactive control, not a styled span pretending to be one).
+   Reset to read as plain inline text/links, not a boxed native button —
+   the box-model difference from a bare span would be a visual regression
+   even though it changes no `innerText`. */
+.machine-lens__back,
+.labrun-back {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+}
+.machine-lens__back:hover,
+.labrun-back:hover,
+.machine-lens__back:focus-visible,
+.labrun-back:focus-visible {
+  text-decoration: underline;
+}
+
+/* ── Lab-run detail (drill-in packet) ────────────────────────────────────
+   `LabRunDetail.tsx` — reached from a `kind==="lab"` row in the runs
+   board. Legacy's own `.labpipe`/`.labstage`/`.labcli`/`.labfeed*` classes
+   (viewer.html) assume flex-row markup this port doesn't reproduce
+   verbatim (see the machine-lens block's own note on why "line arrays,
+   not legacy's structured markup" is this port's convention) — reused
+   HERE by NAME since this is a genuinely new render surface (no existing
+   golden pins its exact markup), but restyled for the line-array shape
+   `labRun.ts` actually emits. */
+.labpipe {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 14px 0;
+}
+.labstage {
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.025);
+  overflow-wrap: anywhere;
+}
+.labstagename {
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.04em;
+}
+.labstagemeta {
+  color: var(--dim);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.labcli {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+  margin-bottom: 14px;
+  overflow-wrap: anywhere;
+}
+.labclilbl {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+}
+.labcli code {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--fg);
+}
+
+.labfeedhdr {
+  font-size: 11px;
+  color: var(--dim);
+  margin-bottom: 6px;
+}
+.labfeed {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.labfeedrow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font: 11px/1.4 "JetBrains Mono", monospace;
+}
+.labfeedrow:nth-child(odd) {
+  background: rgba(255, 255, 255, 0.02);
+}
+.labfeedts {
+  color: var(--dim);
+  flex: 0 0 auto;
+}
+.labfeedtag {
+  color: var(--accent-dim, var(--accent));
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+.labfeedtext {
+  color: var(--fg);
+}
+
+/* ── Session run (drill-in packet) ───────────────────────────────────────
+   `SessionReplay.tsx`'s populated render — `runRegions()`'s port of
+   `renderSubsystem()`. `.pill`/`.track`/`.metrics`/`.met` are reused NAMES
+   from legacy for the same reason `.labpipe` etc. are above: a genuinely
+   new render surface, restyled for this port's own line-array shape
+   rather than legacy's flex markup. */
+.session-run {
+  font: 12px/1.6 "JetBrains Mono", monospace;
+  max-width: min(1200px, 92vw);
+}
+.session-run__header {
+  font: 600 13px/1.4 "JetBrains Mono", monospace;
+  color: var(--accent);
+  margin-bottom: 10px;
+  overflow-wrap: anywhere;
+  /* NO text-transform — `pillLabel`/`role` are already uppercased in
+     `sessionRun.ts` (the "uppercase the STRING directly" discipline this
+     port uses throughout, see `lib/format.ts`'s module doc), so a CSS
+     transform here would be redundant at best and a future drift risk at
+     worst if the JS ever stops pre-uppercasing. */
+}
+.session-run__meta {
+  color: var(--dim);
+  font-weight: 400;
+}
+.session-run .pill {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  vertical-align: middle;
+}
+.session-run .pill--run { color: var(--run, var(--accent)); border-color: var(--run, var(--accent)); }
+.session-run .pill--done { color: var(--good); border-color: var(--good); }
+.session-run .pill--err { color: var(--bad); border-color: var(--bad); }
+.session-run .pill--canceled { color: var(--warn); border-color: var(--warn); }
+
+.session-run .track {
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+/* `briefLines`' first element is always the "run" label (see
+   `sessionRun.ts`'s own doc) — positionally safe the same way
+   `.machine-lens__util`'s fixed-shape array is. */
+.session-run .track:first-of-type > div:first-child {
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: 4px;
+}
+.session-run .track > div:not(:first-child) {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.session-run .metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.session-run .met {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.session-run .mv {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.session-run .ml {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  margin-top: 3px;
+  /* Labels are already uppercased directly in `sessionRun.ts` — no
+     text-transform here, same reasoning as `.session-run__header` above. */
+}
