@@ -3191,6 +3191,21 @@ fn judge_gate_outcome(
 /// confident backtick-quoted token before the check acts at all), so this
 /// list can afford to name the common phrasings without needing to be
 /// exhaustive or clever.
+///
+/// A handful of these ("does not check", "does not handle", "does not
+/// catch", "never checks", "fails to check") are OPERAND-VERB phrases: in
+/// a sentence like "does not check the return value of `X`", the
+/// backticked span is the SUBJECT of the missing operation, not the
+/// absent thing itself — and `X` is present in the file by construction
+/// of the finding (it's the thing being called). Left unguarded, that
+/// shape systematically demoted TRUE findings (PR #1765 merge-gate
+/// finding). The vocabulary is kept as-is rather than pruned: the guard
+/// is [`apply_absence_backstop`]'s adjacency requirement (the extracted
+/// token must IMMEDIATELY follow the matched phrase, only whitespace
+/// between) — "does not assign `process.exitCode`" keeps working, "does
+/// not check the return value of `X`" does not, because real-world
+/// operand-verb phrasing always has intervening words ("the return value
+/// of", "the error from") between the verb and the subject.
 pub const ABSENCE_CLAIM_PHRASES: &[&str] = &[
     "does not call",
     "does not assign",
@@ -3235,7 +3250,32 @@ pub const ABSENCE_CLAIM_PHRASES: &[&str] = &[
 /// `bundle/source.rs`'s `extract_from_specifier`).
 pub fn is_absence_claim(text: &str) -> bool {
     let lower = text.to_lowercase();
-    ABSENCE_CLAIM_PHRASES.iter().any(|p| lower.contains(p))
+    ABSENCE_CLAIM_PHRASES.iter().any(|p| phrase_occurs(&lower, p))
+}
+
+/// True iff `phrase` genuinely occurs in `lower` (an already-lowercased
+/// copy of the finding text). Only one exclusion today (PR #1765
+/// merge-gate finding): `"there is no "` / `"there's no "` must NOT fire
+/// on `"...there is no longer..."` — that phrasing is a SUPERSESSION
+/// claim ("the old thing is gone now"), not a claim that something is
+/// missing from the file, and the two share a prefix by coincidence of
+/// English grammar.
+fn phrase_occurs(lower: &str, phrase: &str) -> bool {
+    let mut start = 0;
+    while let Some(rel) = lower[start..].find(phrase) {
+        let idx = start + rel;
+        let end = idx + phrase.len();
+        let is_supersession =
+            matches!(phrase, "there is no " | "there's no ") && lower[end..].starts_with("longer");
+        if !is_supersession {
+            return true;
+        }
+        // Every phrase in ABSENCE_CLAIM_PHRASES is plain ASCII, so `idx`
+        // is a one-byte-per-char match and `idx + 1` is always a valid
+        // UTF-8 boundary to resume scanning from.
+        start = idx + 1;
+    }
+    false
 }
 
 /// The claimed-absent token, when exactly ONE backtick-quoted span exists
@@ -3261,6 +3301,152 @@ pub fn extract_claimed_absent_token(text: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+/// The char-index of the OPENING backtick of the one confident span in
+/// `text`, mirroring `dialectic::backtick_spans`' own fence-aware
+/// single-backtick scanning — but tracking WHERE the span starts, which
+/// `backtick_spans` itself discards. Returns `None` on zero or 2+ spans,
+/// kept in lockstep with [`extract_claimed_absent_token`]'s own abstain
+/// rule (this is only ever called after that function already confirmed
+/// exactly one span exists, so the "not exactly one" branch here is
+/// belt-and-suspenders, not a load-bearing distinct code path).
+fn single_backtick_span_start(text: &str) -> Option<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans_seen = 0usize;
+    let mut only_start: Option<usize> = None;
+    let mut in_fence = false;
+    let mut span_start: Option<usize> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < chars.len() && chars[j] == '`' {
+            j += 1;
+        }
+        if j - i >= 2 {
+            in_fence = !in_fence;
+            span_start = None;
+        } else if !in_fence {
+            match span_start.take() {
+                None => span_start = Some(j),
+                Some(start) => {
+                    let inner: String = chars[start..i].iter().collect();
+                    if !inner.trim().is_empty() {
+                        spans_seen += 1;
+                        // `start` is the char index right AFTER the opening
+                        // backtick (it was set to `j == i + 1` when that
+                        // backtick was seen), so `start - 1` is the
+                        // backtick's own position.
+                        only_start = Some(start - 1);
+                    }
+                }
+            }
+        }
+        i = j;
+    }
+    if spans_seen == 1 { only_start } else { None }
+}
+
+/// (PR #1765 merge-gate finding, MUST FIX 1) True iff the claimed-absent
+/// token's backtick span IMMEDIATELY follows (only whitespace between)
+/// an occurrence of one of [`ABSENCE_CLAIM_PHRASES`] in `text`. This is
+/// the guard that distinguishes "does not assign `X`" — where `X` IS the
+/// claimed-absent thing — from "does not check the return value of `X`"
+/// — where `X` is the SUBJECT of the missing operation, several words
+/// from the verb, and is present in the file by construction of the
+/// finding. Works in char space throughout (never slices `text` at a
+/// byte offset derived from a lowercased copy) so a non-ASCII finding
+/// text can never panic on a UTF-8 boundary; if lowercasing changed the
+/// char count (rare non-ASCII case-folding), this abstains rather than
+/// risk comparing misaligned indices.
+fn claimed_token_immediately_follows_absence_phrase(text: &str) -> bool {
+    let Some(span_start) = single_backtick_span_start(text) else {
+        return false;
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let lower_chars: Vec<char> = text.to_lowercase().chars().collect();
+    if lower_chars.len() != chars.len() {
+        return false;
+    }
+    for phrase in ABSENCE_CLAIM_PHRASES {
+        let phrase_chars: Vec<char> = phrase.chars().collect();
+        if phrase_chars.is_empty() || phrase_chars.len() > lower_chars.len() {
+            continue;
+        }
+        for start in 0..=(lower_chars.len() - phrase_chars.len()) {
+            if lower_chars[start..start + phrase_chars.len()] != phrase_chars[..] {
+                continue;
+            }
+            let mut end = start + phrase_chars.len();
+            while end < chars.len() && chars[end].is_whitespace() {
+                end += 1;
+            }
+            if end == span_start {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True iff a non-empty identifier character — the boundary predicate
+/// [`contains_token_at_boundary`] uses to reject a bare substring match
+/// like `id` inside `identifier`.
+fn is_identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// (PR #1765 merge-gate finding, MUST FIX 2) True iff `token` occurs in
+/// `content` at a genuine boundary — the characters immediately before
+/// and after the match (when they exist) are not themselves identifier
+/// characters. A bare `content.contains(token)` matched `id` inside
+/// `identifier`, `err` inside `error`, `on` inside almost anything —
+/// wrong tier AND fabricated evidence (the cited line has nothing to do
+/// with the claim). Extraction still allows any non-empty token (no
+/// minimum length, per [`extract_claimed_absent_token`]'s doc), so a
+/// short real token like `.catch` keeps working: its own leading `.` is
+/// itself a non-identifier character, so a boundary check that lands on
+/// it needs no special-casing — the rule is symmetric on both sides of
+/// the match, not about the token's own first/last character.
+fn contains_token_at_boundary(content: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let content_chars: Vec<char> = content.chars().collect();
+    let token_chars: Vec<char> = token.chars().collect();
+    if token_chars.len() > content_chars.len() {
+        return false;
+    }
+    for start in 0..=(content_chars.len() - token_chars.len()) {
+        let end = start + token_chars.len();
+        if content_chars[start..end] != token_chars[..] {
+            continue;
+        }
+        let left_ok = start == 0 || !is_identifier_char(content_chars[start - 1]);
+        let right_ok = end == content_chars.len() || !is_identifier_char(content_chars[end]);
+        if left_ok && right_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// The 1-based line number of the FIRST line in `content` where `token`
+/// occurs at a genuine boundary (see [`contains_token_at_boundary`]) —
+/// the line the demotion note cites as evidence. A bare `line.contains`
+/// would cite a line whose only relationship to the token is an
+/// incidental substring (e.g. citing the `identifier` line as "evidence"
+/// for a claimed-absent `id`), which is fabricated evidence on top of
+/// the wrong tier.
+fn line_of_token_at_boundary(content: &str, token: &str) -> Option<u32> {
+    content
+        .lines()
+        .position(|l| contains_token_at_boundary(l, token))
+        .map(|i| i as u32 + 1)
 }
 
 /// The repo-relative file path a bundle's `id` names. Production bundle
@@ -3325,6 +3511,12 @@ pub fn apply_absence_backstop(judged: &mut [JudgedFlag], bundles: &[BundleInput]
         let Some(token) = extract_claimed_absent_token(&text) else {
             continue;
         };
+        // (PR #1765 merge-gate finding, MUST FIX 1) The token must be the
+        // claimed-absent THING, not the subject of a missing operation —
+        // see `claimed_token_immediately_follows_absence_phrase`'s doc.
+        if !claimed_token_immediately_follows_absence_phrase(&text) {
+            continue;
+        }
         let Some(bundle) = bundles.iter().find(|b| b.id == j.flag.bundle_id) else {
             continue;
         };
@@ -3334,23 +3526,32 @@ pub fn apply_absence_backstop(judged: &mut [JudgedFlag], bundles: &[BundleInput]
         let Ok(Some(content)) = source.read_file(path) else {
             continue;
         };
-        if !content.contains(token.as_str()) {
+        // (PR #1765 merge-gate finding, MUST FIX 2) A boundary-aware
+        // check, never a bare substring — `content.contains(token)` would
+        // match `id` inside `identifier`.
+        if !contains_token_at_boundary(&content, &token) {
             // Genuinely absent from the whole file too — the claim holds.
             // Leave the flag exactly as the judge left it (the mandatory
             // inverted case: this backstop must not demote everything).
             continue;
         }
-        let line = content.lines().position(|l| l.contains(token.as_str())).map(|i| i as u32 + 1);
+        let line = line_of_token_at_boundary(&content, &token);
+        // Wording is deliberately narrow: the check knows the token is
+        // PRESENT somewhere in the file, not that the claim is FALSE (a
+        // scope-qualified finding — "not assigned on the error path" when
+        // it IS assigned on the happy path — is true but still gets
+        // demoted here, since whole-file presence is all this mechanical
+        // check can see; PR #1765 merge-gate finding).
         let mechanical_note = match line {
             Some(n) => format!(
-                "mechanical backstop: `{token}` was found in {path} at line {n} — this absence \
-                 claim does not hold against the whole file (the AI seat may have seen only a \
-                 truncated excerpt); demoted for a human double check"
+                "mechanical backstop: `{token}` found elsewhere in {path} at line {n} (the AI \
+                 seat may have seen only a truncated excerpt, or this may be a different scope \
+                 than the one claimed); demoted for a human double check"
             ),
             None => format!(
-                "mechanical backstop: `{token}` was found in {path} — this absence claim does \
-                 not hold against the whole file (the AI seat may have seen only a truncated \
-                 excerpt); demoted for a human double check"
+                "mechanical backstop: `{token}` found elsewhere in {path} (the AI seat may have \
+                 seen only a truncated excerpt, or this may be a different scope than the one \
+                 claimed); demoted for a human double check"
             ),
         };
         j.absence_backstop = Some(AbsenceBackstopNote { token: token.clone(), file: path.to_string(), line });

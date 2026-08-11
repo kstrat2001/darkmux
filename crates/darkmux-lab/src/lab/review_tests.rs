@@ -1421,6 +1421,187 @@
         assert!(judged[0].absence_backstop.is_none());
     }
 
+    // ── MUST FIX 1 (PR #1765 merge-gate finding): operand-verb phrases ──
+    //
+    // "does not check `X`" / "does not handle `X`" name X as the SUBJECT
+    // of the missing operation when the sentence reads "does not check
+    // the return value of `X`" — X is guaranteed present (it's the thing
+    // being called), so a bare presence check demoted a TRUE finding
+    // every time. Fix: the claimed-absent token must IMMEDIATELY follow
+    // the matched phrase (only whitespace between) — "does not assign
+    // `process.exitCode`" keeps working; "does not check the return
+    // value of `spawn_worker`" does not.
+
+    /// This must STAY `Confirmed` — `spawn_worker` is the SUBJECT of the
+    /// missing check, not the absent thing, and it's present in the file
+    /// by construction of the finding (the file calls it). Before the
+    /// fix, `content.contains("spawn_worker")` mechanically demoted this
+    /// TRUE finding and attached a note asserting the absence claim
+    /// "does not hold", which was false.
+    #[test]
+    fn absence_backstop_leaves_operand_verb_finding_confirmed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("worker.ts"), "async function run() {\n  spawn_worker();\n}\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("worker.ts");
+        let mut judged = vec![confirmed_flag_with_text(
+            "worker.ts",
+            "does not check the return value of `spawn_worker` before using it",
+        )];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(
+            judged[0].tier,
+            Tier::Confirmed,
+            "the token is the SUBJECT of the missing check, not the absent thing — must not demote"
+        );
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    // ── MUST FIX 2 (PR #1765 merge-gate finding): word-boundary containment ──
+    //
+    // `content.contains(token)` was a bare substring check with no word
+    // boundary — it matched `id` inside `identifier`, `err` inside
+    // `error`. That both mis-demoted a TRUE finding AND cited a line that
+    // has nothing to do with the claim as fabricated evidence.
+
+    /// `id` must NOT be considered present just because `identifier` is —
+    /// a genuinely-absent `id` token must stay `Confirmed`.
+    #[test]
+    fn absence_backstop_word_boundary_rejects_substring_only_match() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("record.ts"),
+            "function createRecord() {\n  return { identifier: makeId() };\n}\n",
+        )
+        .unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("record.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("record.ts", "does not set `id` on the created record")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(
+            judged[0].tier,
+            Tier::Confirmed,
+            "`id` only occurs as a substring of `identifier` — that is not a real match"
+        );
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    /// THE REGRESSION GUARD: MUST FIX 1 and MUST FIX 2 must not blunt the
+    /// backstop's whole reason for existing — the production incident's
+    /// own shape (`does not assign process.exitCode`, token immediately
+    /// follows a SAFE verb, present as a genuine boundary match) must
+    /// still demote. If this test fails, the whole feature is inert.
+    #[test]
+    fn absence_backstop_still_demotes_the_production_incident_shape() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("cli.ts"),
+            "function main() {\n  doWork();\n}\nprocess.exitCode = 1;\n",
+        )
+        .unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("cli.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("cli.ts", "does not assign `process.exitCode` on the error path")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(
+            judged[0].tier,
+            Tier::NeedsCheck,
+            "the production incident's own shape must still demote, or the whole feature is inert"
+        );
+        assert!(judged[0].absence_backstop.is_some());
+    }
+
+    /// `.catch` (short, leading-dot token) must still work as a
+    /// claimed-absent token after the word-boundary fix — the PR
+    /// deliberately waives a minimum-length floor for exactly this shape.
+    #[test]
+    fn absence_backstop_dot_catch_token_still_demotes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("billing.ts"), "fetchThing().catch(handleError);\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("billing.ts");
+        let mut judged = vec![confirmed_flag_with_text("billing.ts", "there is no `.catch` around this call")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(judged[0].tier, Tier::NeedsCheck, "`.catch` is present and must still demote");
+        let note = judged[0].absence_backstop.as_ref().expect("backstop note attached");
+        assert_eq!(note.token, ".catch");
+    }
+
+    // ── cheap findings (same area) ──────────────────────────────────
+
+    /// "there is no longer" is a SUPERSESSION claim ("the old thing is
+    /// gone"), not an absence claim — the "there is no " phrase must not
+    /// prefix-match into "there is no longer" and pull an unrelated
+    /// finding into the backstop's scope.
+    #[test]
+    fn absence_backstop_ignores_there_is_no_longer() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("legacy.ts"), "setLegacyMode(true);\nlegacy_mode = true;\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("legacy.ts");
+        let mut judged = vec![confirmed_flag_with_text(
+            "legacy.ts",
+            "there is no longer any writer that sets `legacy_mode`",
+        )];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(
+            judged[0].tier,
+            Tier::Confirmed,
+            "a supersession claim must never be treated as an absence claim"
+        );
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    #[test]
+    fn is_absence_claim_does_not_match_there_is_no_longer() {
+        assert!(
+            !is_absence_claim("there is no longer any writer that sets `legacy_mode`"),
+            "a supersession claim is not an absence claim"
+        );
+        // The un-prefixed phrasing must still be caught.
+        assert!(is_absence_claim("there is no writer that sets `legacy_mode`"));
+    }
+
+    /// The demotion note must say only what the mechanical check actually
+    /// knows (presence, not scope) — "this absence claim does not hold"
+    /// over-claims when the real situation could be e.g. "assigned on a
+    /// different path than the one claimed". The check cannot tell those
+    /// apart, so the wording must not pretend it can.
+    #[test]
+    fn absence_backstop_note_does_not_overclaim_the_finding_is_false() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("cli.ts"),
+            "function main() {\n  doWork();\n}\nprocess.exitCode = 1;\n",
+        )
+        .unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("cli.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("cli.ts", "does not assign `process.exitCode` on the error path")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        let note = &judged[0].pass1.note_for_author;
+        assert!(
+            !note.contains("does not hold"),
+            "the check knows presence, not scope — must not claim the finding is false: {note}"
+        );
+        assert!(note.contains("process.exitCode"), "still names the token: {note}");
+    }
+
     // ── pipeline wiring: run_judge_only (sequential path) ─────────────
 
     /// End-to-end: the sequential `--charges-file` path (`run_judge_only`
