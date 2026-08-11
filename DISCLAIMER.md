@@ -65,7 +65,7 @@ darkmux is developed and tested on Apple Silicon Macs, specifically on the autho
 
 darkmux involves two distinct legal personas, and the MIT license addresses only one of them.
 
-**The distributor** (the author of darkmux, Darkly Energized LLC) ships the binary and the prompts under MIT with no warranty. If darkmux corrupts a config, returns a wrong benchmark number, or produces an unexpected output, the author owes you nothing beyond the source you already have. The MIT "AS IS" clause is the contract.
+**The distributor** (the author of darkmux, Kain Osterholt / Darkly Energized LLC) ships the binary and the prompts under MIT with no warranty. If darkmux corrupts a config, returns a wrong benchmark number, or produces an unexpected output, the author owes you nothing beyond the source you already have. The MIT "AS IS" clause is the contract.
 
 **The operator** (anyone running darkmux on their own machine) is subject to the law of their own jurisdiction independently of the MIT grant. The license does NOT insulate the operator from: unauthorized practice of law or medicine if they re-publish licensed-adjacent role outputs as a service to third parties; HIPAA if they are a covered entity processing PHI through a local LLM; their professional ethics rules if they are a licensed attorney, physician, RD, PT, or trainer using the tool on client/patient work; data-protection rules (GDPR, PDPA, CCPA, subject to each regime's own thresholds) if they process personal data of others. These are operator-side obligations. The audit sink can support such a posture by making tampering detectable, but it does not satisfy any of these obligations on its own. darkmux makes no representation that running it makes you compliant with anything.
 
