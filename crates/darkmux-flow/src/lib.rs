@@ -3788,4 +3788,56 @@ mod tests {
         let report = crate::integrity::integrity_check_file(&path).unwrap();
         assert!(report.chain_valid, "header-only recovery must produce a valid chain");
     }
+
+    /// (#1768 threat model, FN-1) THE EXPLOIT, executed rather than argued.
+    ///
+    /// `integrity_check_file` SKIPS content verification for any record whose
+    /// enum fields carry a spelling this binary does not know
+    /// (`has_unknown_enum`), and then advances the chain using that record's
+    /// STORED hash verbatim. The stored hash is therefore trusted without ever
+    /// being tied to the record's bytes.
+    ///
+    /// An attacker with write access needs only to flip ONE enum field to a
+    /// garbage value; they may then rewrite every other field freely and the
+    /// chain still reports valid. This test edits `reasoning` — the field
+    /// carrying what the operator was told — and asserts the tool notices.
+    ///
+    /// If this test FAILS, the audit chain does not detect content tampering,
+    /// which is the one thing it exists to do.
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "#1769: RED ON PURPOSE — this exploit currently SUCCEEDS. Un-ignore when the byte-hash fix lands; it is that fix's acceptance test."]
+    fn fn1_an_unknown_enum_must_not_buy_a_free_content_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+
+        // A legitimate two-record chain, written by the real sink path.
+        for i in 0..2 {
+            let mut rec = minimal_record();
+            rec.reasoning = Some(format!("original reasoning {i}"));
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+        let clean = integrity_check_file(&path).unwrap();
+        assert!(clean.chain_valid, "the untampered chain must validate first, else this test proves nothing: {clean:?}");
+
+        // The attack: rewrite the SECOND record's content, and flip one enum
+        // field to an unknown spelling. prev_hash and hash are left exactly
+        // as written, so linkage still lines up.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+        let last = lines.len() - 1;
+        let mut v: serde_json::Value = serde_json::from_str(&lines[last]).unwrap();
+        v["reasoning"] = serde_json::json!("TAMPERED — this is not what the operator was told");
+        v["tier"] = serde_json::json!("x");
+        lines[last] = serde_json::to_string(&v).unwrap();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let after = integrity_check_file(&path).unwrap();
+        assert!(
+            !after.chain_valid,
+            "FN-1 CONFIRMED: a record's content was rewritten and the chain still reports VALID. \
+             One unknown enum value bought a free edit of every other field. Report: {after:?}"
+        );
+    }
+
 }
