@@ -23,7 +23,6 @@
 #
 # Operator env vars passed through from the launchd plist environment:
 #   DARKMUX_MACHINE_ID     — operator-named fleet identity
-#   DARKMUX_ORCHESTRATOR   — frontier AI driving sessions
 #   DARKMUX_AUDIT_DIR      — opt-in audit substrate; see /darkmux-enable-audit
 #   DARKMUX_FLOWS_DIR      — override default ~/.darkmux/flows
 #   DARKMUX_REDIS_STREAM   — override default darkmux:flow

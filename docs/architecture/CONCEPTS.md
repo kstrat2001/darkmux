@@ -336,9 +336,11 @@ and coordination substrate. The schema version is **`1.9.0`**
   `action`, `handle`.
 - **Correlation:** `phase_id`, `session_id`, `mission_id`, `source`.
 - **Provenance (env-stamped at write time):** `model`, `machine_id` (from
-  `DARKMUX_MACHINE_ID`), `orchestrator` (from `DARKMUX_ORCHESTRATOR`). *(The
-  `machine_tier` provenance field was removed in schema 1.9.0, #587: the
-  {inference/hub/client} machine-capacity tier is retired; see #590.)*
+  `DARKMUX_MACHINE_ID`). *(The `machine_tier` provenance field was removed in
+  schema 1.9.0, #587: the {inference/hub/client} machine-capacity tier is
+  retired; see #590. The `orchestrator` provenance field was removed in
+  schema 1.19.0, #1758: it was machine-scoped config describing an
+  invocation-scoped fact, and nothing ever read it.)*
 - **Audit chain (`AuditFileSink` only):** `prev_hash` and `hash`, a BLAKE3 hash
   chain whose post-hoc edits are detectable via `darkmux flow integrity-check`
   (#163). Deliberately *not* "chain-of-custody": that claim needs external

@@ -151,7 +151,6 @@ pub fn run() -> DoctorReport {
         check_crew_role_prompt_coverage(),
         check_flow_sink_health(),
         check_machine_id_resolution(),
-        check_orchestrator_declared(),
         check_fleet_mode(),
         check_openai_base_url_conflict(),
         check_redis_config(),
@@ -1076,27 +1075,6 @@ fn check_machine_id_resolution() -> Check {
     }
 }
 
-/// Surface whether the operator has declared an orchestrator for flow
-/// records. Warns when absent — the field is operator-explicit by design
-/// (#167 + #49) but the operator needs to know it exists.
-fn check_orchestrator_declared() -> Check {
-    match darkmux_flow::resolve_orchestrator() {
-        Some(name) => Check {
-            name: "orchestrator".into(),
-            status: Status::Pass,
-            message: format!("`{name}` (from DARKMUX_ORCHESTRATOR env)"),
-            hint: None,
-        },
-        None => Check {
-            name: "orchestrator".into(),
-            status: Status::Warn,
-            message: "not declared — flow records won't carry orchestrator provenance".into(),
-            hint: Some(
-                "Export DARKMUX_ORCHESTRATOR=<harness-name> in the shell driving darkmux (e.g. `claude-code`, `antigravity`, `cursor`). Operator-explicit by design (#49 cultivation discipline).".into(),
-            ),
-        },
-    }
-}
 
 /// Surface the machine's declared fleet position (#933) with provenance, and
 /// flag an unrecognized `fleet.mode`. `standalone` (default), `hub`, and `peer`
@@ -1481,18 +1459,18 @@ fn check_env_masks_config() -> Check {
 /// Testable core: the env tier is read live, the config tier is the passed
 /// `cfg` — so a serial test drives it with `set_var` + a constructed cfg.
 ///
-/// **Why only Redis** (and not machine_id / orchestrator / lmstudio_url /
-/// fleet.mode): a useful masking warning needs a signal that the operator
-/// *intentionally* configured the field, else it fires on every post-`init`
-/// machine (init writes a default for nearly every field, so "config has a
-/// value" is always true). `config.redis.enabled == Some(true)` is that signal —
+/// **Why only Redis** (and not machine_id / lmstudio_url / fleet.mode): a
+/// useful masking warning needs a signal that the operator *intentionally*
+/// configured the field, else it fires on every post-`init` machine (init
+/// writes a default for nearly every field, so "config has a value" is
+/// always true). `config.redis.enabled == Some(true)` is that signal —
 /// the operator turned the block ON — and it matches `redis_url()`'s Tier-2
 /// condition exactly (the default `init` config is `enabled:false` + a default
 /// host → assembles NO config Redis → not masked). The other fields lack such a
-/// signal: machine_id / orchestrator are env-PRIMARY by design (the docs
-/// recommend setting them via env — env-over-config is intended, not a trap),
-/// and lmstudio_url / fleet.mode would need default-comparison to tell an
-/// operator value from the init default (a later refinement).
+/// signal: machine_id is env-PRIMARY by design (the docs recommend setting
+/// it via env — env-over-config is intended, not a trap), and lmstudio_url /
+/// fleet.mode would need default-comparison to tell an operator value from
+/// the init default (a later refinement).
 fn env_masks_config_check(cfg: &darkmux_types::config::DarkmuxConfig) -> Check {
     let name = "env vs config";
     let env_set = std::env::var("DARKMUX_REDIS_URL")
@@ -4624,11 +4602,12 @@ mod tests {
         // 32 static checks via run() (#1405 removed the 4 openclaw-gated
         // checks; #1426 removed recommendation-drift +
         // recommended-profile-not-shadowed with the retired recommendations
-        // family), incl. build-identity [#1129] + docker-runtime [#680] +
+        // family; #1758 removed orchestrator-declared, a write-only field's
+        // check), incl. build-identity [#1129] + docker-runtime [#680] +
         // load projection + daemon reachable +
         // darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
-        // machine_id + orchestrator [#167] + openai-base-url-conflict [#5] +
+        // machine_id [#167] + openai-base-url-conflict [#5] +
         // audit-integrity [#163] + utility-model-binding
         // [#590] + legacy-mission-layout [#148] + beat-33-crew-dir [Beat 33
         // directory flatten] + role-tool-vocab [#340] +
@@ -4641,7 +4620,7 @@ mod tests {
         // [#1475]) + one per active eureka rule. Every check should appear
         // regardless of environment — even if the underlying probe couldn't
         // read state.
-        let expected = 36 + darkmux_eureka::all_rules().len();
+        let expected = 35 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

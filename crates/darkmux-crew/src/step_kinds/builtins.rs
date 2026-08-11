@@ -458,7 +458,6 @@ impl StepKind for DispatchInternalStepKind {
                     mission_id: None,
                     machine_id: None,
                     machine_uid: None,
-                    orchestrator: None,
                     prev_hash: None,
                     hash: None,
                     payload: Some(serde_json::json!({
@@ -620,7 +619,6 @@ impl StepKind for DispatchSingleShotStepKind {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: Some(serde_json::json!({
@@ -971,7 +969,6 @@ impl DispatchMapStepKind {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: Some(serde_json::json!({
@@ -1051,7 +1048,6 @@ impl DispatchMapStepKind {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: Some(payload),
@@ -1090,7 +1086,6 @@ impl DispatchMapStepKind {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: Some(serde_json::json!({
@@ -1127,7 +1122,6 @@ impl DispatchMapStepKind {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: Some(serde_json::json!({

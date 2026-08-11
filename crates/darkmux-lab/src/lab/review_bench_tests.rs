@@ -1102,7 +1102,6 @@
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: Some(serde_json::json!({"status": "started"})),

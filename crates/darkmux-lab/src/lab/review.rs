@@ -3929,7 +3929,6 @@ fn review_step_result_record(
         mission_id: mission_id.map(String::from),
         machine_id: None,
         machine_uid: None,
-        orchestrator: None,
         prev_hash: None,
         hash: None,
         payload: Some(full),

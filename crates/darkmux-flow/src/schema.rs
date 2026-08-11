@@ -2,7 +2,7 @@
 //!
 //! The `FlowRecord` shape, its enum fields (`Level`, `Category`, `Tier`,
 //! `Stage`), the per-day file/timestamp helpers, and the env-driven
-//! provenance resolvers (`resolve_machine_id` / `resolve_orchestrator`).
+//! machine-provenance resolver (`resolve_machine_id`).
 //! Split out of the crate's sink/record core (#508).
 
 use clap::ValueEnum;
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.18.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.19.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -187,6 +187,27 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.18.0";
 //           actions, same `payload` blob — additive optional fields only;
 //           older readers ignore them; new records only, so prior AuditFileSink
 //           chains survive without rotation.
+//   1.19.0 — REMOVED `orchestrator` (#1758). It was stamped from
+//           `config.json` — MACHINE scope — to describe which frontier
+//           orchestrator drove the work — INVOCATION scope — so every
+//           record on a machine carried the same value regardless of
+//           whether it came from an orchestrator session, a hand-typed
+//           CLI command, a cron job, or the CI runner. Grepped every
+//           consumer: nothing ever READ it (no viewer lens, no CLI verb,
+//           no aggregation; `darkmux doctor` only checked "is it
+//           declared"). A field that lies is worse than an absent one.
+//           Same shape of removal as 1.9.0's `machine_tier`. Casual
+//           LocalFileSink readers are unaffected (unknown keys ignored
+//           on read; `#[serde(flatten)] extras` on `DarkmuxConfig`
+//           absorbs an old `config.json`'s `"orchestrator"` key the same
+//           way). Pre-1.19.0 AuditFileSink hash-chains cannot be
+//           re-verified after this canonical-form change — rotate to a
+//           fresh chain (no-compat-baggage; small known audience). If
+//           the want comes back, it comes back differently: a truthful
+//           version would stamp per-invocation from process environment
+//           (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, …), not from
+//           machine-scoped config — build that when a real consumer
+//           needs it.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -385,14 +406,6 @@ pub struct FlowRecord {
     /// back to the (unprovable) name. Schema 1.11 addition.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_uid: Option<String>,
-    /// Frontier orchestrator driving this record's session — e.g.,
-    /// `"claude-code"`, `"antigravity"`, `"cursor"`. Auto-populated from
-    /// `DARKMUX_ORCHESTRATOR` env at write time. Operator-explicit by
-    /// design: there's no reliable way to auto-detect the frontier-tier
-    /// AI from inside darkmux. None when the operator hasn't declared.
-    /// Schema 1.4 addition (#167).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub orchestrator: Option<String>,
     /// BLAKE3 hash of the previous record in this audit file's chain.
     /// `None` on records written through LocalFileSink (the casual sink);
     /// AuditFileSink (the compliance-strength sibling) populates this
@@ -559,18 +572,6 @@ pub fn resolve_machine_id() -> Option<String> {
         .clone()
 }
 
-/// Resolve the orchestrator identifier for new flow records.
-///
-/// **Operator-explicit by design** — there's no reliable way to detect
-/// the frontier-tier AI driving the operator's session from inside
-/// darkmux. The operator declares it via `DARKMUX_ORCHESTRATOR`; absent
-/// declaration, records carry no orchestrator field and the doctor
-/// surfaces a warn so the operator knows the field exists.
-pub fn resolve_orchestrator() -> Option<String> {
-    // env(DARKMUX_ORCHESTRATOR) > config.orchestrator (#661 Slice 4), read live.
-    darkmux_types::config_access::orchestrator()
-}
-
 
 #[cfg(test)]
 mod forward_compat_tests {
@@ -679,5 +680,33 @@ mod forward_compat_tests {
         )
         .unwrap();
         assert!(!known.has_unknown_enum());
+    }
+
+    /// (#1758) A record written by a pre-1.19.0 binary carries an
+    /// `orchestrator` key this struct no longer has. It must still parse:
+    /// `FlowRecord` has no `deny_unknown_fields`, so serde drops the key.
+    ///
+    /// The PR removing the field claimed this compatibility; it was true
+    /// only BY CONSTRUCTION, with nothing pinning it. The existing
+    /// forward-compat tests cover unknown enum VALUES, not unknown KEYS, so
+    /// a future `deny_unknown_fields` would silently break every archived
+    /// record and no test would notice. This is that pin.
+    #[test]
+    fn a_pre_1_19_record_carrying_the_removed_orchestrator_key_still_parses() {
+        let old = r#"{
+            "ts": "2026-08-01T00:00:00Z",
+            "level": "info",
+            "category": "dispatch",
+            "tier": "local",
+            "stage": "run",
+            "action": "dispatch.start",
+            "handle": "h1",
+            "orchestrator": "claude-code",
+            "machine_id": "studio"
+        }"#;
+        let rec: FlowRecord = serde_json::from_str(old)
+            .expect("a record with the removed `orchestrator` key must still deserialize");
+        assert_eq!(rec.handle, "h1");
+        assert_eq!(rec.machine_id.as_deref(), Some("studio"));
     }
 }
