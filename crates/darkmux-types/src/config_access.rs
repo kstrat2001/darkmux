@@ -68,8 +68,8 @@ pub(crate) fn env_str(key: &str) -> Option<String> {
 /// from the global) so precedence is unit-tested without the load-once
 /// `CONFIG`. An **empty/whitespace config string is treated as unset** (falls
 /// through), mirroring `env_str` — so a visible-but-blank field like
-/// `"orchestrator": ""` the operator hasn't filled in defers to the env/
-/// built-in tier rather than stamping an empty value.
+/// `"radio": { "router_profile": "" }` the operator hasn't filled in defers
+/// to the env/built-in tier rather than stamping an empty value.
 fn pick_string(env_key: &str, cfg: Option<&str>, default: Option<&str>) -> Option<String> {
     env_str(env_key)
         .or_else(|| cfg.filter(|s| !s.trim().is_empty()).map(str::to_string))
@@ -118,10 +118,6 @@ fn pick_dir(
 /// neither layer is set.
 pub fn machine_id() -> Option<String> {
     pick_string("DARKMUX_MACHINE_ID", config().machine_id.as_deref(), None)
-}
-/// `DARKMUX_ORCHESTRATOR > config.orchestrator`. `None` → field omitted.
-pub fn orchestrator() -> Option<String> {
-    pick_string("DARKMUX_ORCHESTRATOR", config().orchestrator.as_deref(), None)
 }
 
 // ── Fleet position (#933) ──
@@ -823,8 +819,9 @@ mod tests {
         unsafe { std::env::set_var(k, "   "); }
         assert_eq!(pick_string(k, Some("c"), Some("d")), Some("c".to_string()));
         unsafe { std::env::remove_var(k); }
-        // empty/whitespace cfg is treated as unset (falls through) — the
-        // "visible but blank" field (`"orchestrator": ""`) defers to default.
+        // empty/whitespace cfg is treated as unset (falls through) — a
+        // "visible but blank" field (e.g. `"radio": { "router_profile": "" }`)
+        // defers to default.
         assert_eq!(pick_string(k, Some("   "), Some("d")), Some("d".to_string()));
         assert_eq!(pick_string(k, Some(""), None), None);
         // nothing set anywhere

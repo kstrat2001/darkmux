@@ -118,7 +118,6 @@ explicit:
 
 - **`DARKMUX_AUDIT_DIR`** — opt-in hash-chained audit sink; operator runs the
   `/darkmux-enable-audit` skill.
-- **`DARKMUX_ORCHESTRATOR`** — frontier-specific; operator's call.
 - **Log rotation** (newsyslog) — formula sets log paths under
   `var/log/darkmux/` but rotation policy is operator preference.
 - **Daily integrity-check launchd plist** — too specific to the audit

@@ -97,8 +97,15 @@ pub struct WorkJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_by_machine: Option<String>,
 
-    /// Orchestrator that published the job (the dispatching session's
-    /// `DARKMUX_ORCHESTRATOR`). Read-only provenance.
+    /// Orchestrator that published the job. Always `None` from every
+    /// producer since #1758 removed `resolve_orchestrator()` (its former
+    /// source, `DARKMUX_ORCHESTRATOR` / `config.orchestrator`, was
+    /// write-only, machine-scoped provenance for an invocation-scoped
+    /// fact — nothing ever read this field either). Kept as a wire field
+    /// rather than removed to avoid a hard `WORK_JOB_SCHEMA_VERSION` break
+    /// (this struct is `deny_unknown_fields`, unlike the lenient-read
+    /// flow/config schemas); remove it for real in its own follow-up if a
+    /// second reason to touch the wire shape shows up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_by_orchestrator: Option<String>,
 

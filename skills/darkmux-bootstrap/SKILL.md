@@ -1,6 +1,6 @@
 ---
 name: darkmux-bootstrap
-description: First-time darkmux setup walkthrough. Detects the operator's hardware tier, helps author + confirm the profile registry and orchestrator declaration, and validates end state with `darkmux doctor`. Read + propose pattern — operator runs the commands; the skill confirms each step took effect. Run this once on a fresh machine, or any time `darkmux doctor` surfaces structural drift.
+description: First-time darkmux setup walkthrough. Detects the operator's hardware tier, helps author + confirm the profile registry, and validates end state with `darkmux doctor`. Read + propose pattern — operator runs the commands; the skill confirms each step took effect. Run this once on a fresh machine, or any time `darkmux doctor` surfaces structural drift.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*),Bash(lms:*),Read"
 ---
@@ -93,19 +93,7 @@ Three outcomes:
 
 **C. It errors on RAM headroom.** Trim the profile's context length so the loadout fits the resident budget, then re-run.
 
-## Step 5 — Optional: declare the orchestrator
-
-Flow records carry an `orchestrator` field that names the frontier session driving the work (e.g., `claude-code`, `antigravity`). Declaring it gives provenance to every flow record. Propose:
-
-> Want flow records to carry the orchestrator name? It's operator-explicit by design — no auto-detection. Export this in your shell rc:
->
-> ```bash
-> export DARKMUX_ORCHESTRATOR=claude-code
-> ```
->
-> Replace `claude-code` with the harness driving this session (e.g. `claude-code`, `antigravity`, `cursor`). Doctor will surface a warning until it's declared.
-
-## Step 6 — Optional: enable the audit and coordination substrates
+## Step 5 — Optional: enable the audit and coordination substrates
 
 Two opt-in environment variables enable the heavier substrates:
 
@@ -119,7 +107,7 @@ These are out of scope for first-time bootstrap. **Sibling skills:**
 
 After bootstrap, point the operator at `/darkmux-enable-audit` for the audit substrate, and at the README's environment-variables table plus #178 for Redis coordination. Don't suggest invoking `/darkmux-enable-redis` yet; it isn't installed and won't be found.
 
-## Step 7 — Final validation
+## Step 6 — Final validation
 
 ```bash
 darkmux doctor

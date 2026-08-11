@@ -156,7 +156,6 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
 {
   "schema_version": "1.2",
   "machine_id": "studio",
-  "orchestrator": "",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
   "redis":   { "enabled": false, "host": "127.0.0.1", "port": 6379, "stream": "darkmux:flow", "maxlen": 10000 },
@@ -185,7 +184,6 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | Variable | Default | Effect |
 |---|---|---|
 | `DARKMUX_MACHINE_ID` | hostname | Logical fleet name **stamped at record-write time** on every new flow record. Operator-named (`studio`, `mini-1`) reads better in the topology view than DNS-style hostnames. Pre-1.4.0 records lack the field (which the viewer renders as `unknown`). |
-| `DARKMUX_ORCHESTRATOR` | unset → field omitted | Frontier orchestrator driving this session (e.g. `claude-code`, `antigravity`, `cursor`), **stamped at record-write time**. **Operator-explicit by design** — there's no reliable way to auto-detect the frontier model from inside darkmux. Doctor warns when unset. |
 | `DARKMUX_FLEET_MODE` | `standalone` | The machine's declared fleet position — `standalone` (single machine), `hub` (the always-on coordinator; supervises its own Redis per #936), or `peer` (points at a hub). Operator-**declared** under `config.fleet.mode`; detection is only a doctor cross-check (declared ≠ observed), never the source of truth. `darkmux doctor` shows it with provenance and flags an unrecognized value (treated as `standalone`). Downstream fleet features key on it (#933). |
 | `DARKMUX_FLOWS_DIR` | `~/.darkmux/flows` | Where the per-day JSONL files live (LocalFileSink — casual write target). |
 | `DARKMUX_AUDIT_DIR` | unset → AuditFileSink off | When set, flow records ALSO write to a hash-chained per-day JSONL under this directory (AuditFileSink, #163). **POSIX-only** (Linux/macOS — Windows is unsupported; the env var is recognized but the sink is skipped). Cross-process safe via `flock(2)`. `darkmux flow integrity-check` walks the chain and **exits with status 2 on any chain break** so cron/CI can flag tampering. `darkmux doctor` rolls up the same result. A DETECTION substrate: `flow integrity-check` recomputes each chain and reports the first divergence, which catches in-place edits, reordering, insertion and deletion within a file. It does **not** catch every edit — see SECURITY.md for the known gaps. It does not prevent alteration, and running it does not make an operator compliant with any regulatory framework. |
@@ -202,7 +200,6 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | Env var | `config.json` field |
 |---|---|
 | `DARKMUX_MACHINE_ID` | `machine_id` |
-| `DARKMUX_ORCHESTRATOR` | `orchestrator` |
 | `DARKMUX_FLEET_MODE` | `fleet.mode` |
 | `DARKMUX_LMS_BIN` / `DARKMUX_LMSTUDIO_URL` | `lms_bin` / `lmstudio_url` (base URL; callers append `/v1/...`) |
 | `DARKMUX_FLOWS_DIR` / `DARKMUX_NOTEBOOK_DIR` / `DARKMUX_CREW_DIR` / … | `dirs.flows` / `dirs.notebook` / `dirs.crew` / … |
@@ -225,7 +222,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 
 The internal runtime is the only dispatch path and needs no external binary. (Historical: a `DARKMUX_RUNTIME_CMD` env var, then a per-dispatch `--runtime-cmd <path>` flag, once let operators point `dispatch` / `lab run` at an external openclaw/Aider/Cline shell-out. That whole path — the flag, the openclaw runtime, and the `crew sync` verb — was removed on the 2.0 track; see [#1405](https://github.com/kstrat2001/darkmux/issues/1405).)
 
-When working on darkmux from a Claude Code (or other frontier) session, export `DARKMUX_ORCHESTRATOR=<harness-name>` in the shell so flow records carry orchestrator provenance. This is part of the cultivation discipline tracked in [#130](https://github.com/kstrat2001/darkmux/issues/130).
+(Historical: a `DARKMUX_ORCHESTRATOR` env var + `config.orchestrator` field once stamped flow records with the name of the frontier harness driving the session. Removed in #1758 — it was stamped from MACHINE-scoped config to describe an INVOCATION-scoped fact, so every record on a machine carried the same value regardless of what actually drove that invocation, and nothing ever read it. The cultivation discipline tracked in [#130](https://github.com/kstrat2001/darkmux/issues/130) continues without it.)
 
 ## Where things live
 
