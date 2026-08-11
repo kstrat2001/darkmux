@@ -329,11 +329,17 @@ body {
     gap: 8px 10px;
     padding: 8px 12px;
   }
+  /* The site links (home/guide/articles/github) are desktop-browsing
+     affordances — on a monitoring screen this narrow, the operator wants
+     lens content, not a row spent on outbound links. CSS-hide only (never
+     removed from the DOM): the parity harness's `extractTopbarText`
+     (tests/parity/lib/extract-lens.js) reads `.top`'s `innerText`, which
+     already excludes anything `display:none` — but every recorded golden is
+     extracted at the Desktop Chrome default viewport (well above 768px, see
+     `next-parity.playwright.config.js`), so this rule never applies while a
+     golden is captured and no golden needed updating for it. */
   .masthead__nav {
-    order: 1;
-    flex: 1 1 100%;
-    margin-left: 0;
-    gap: 12px;
+    display: none;
   }
   /* Touch targets (mobile-only — desktop keeps its compact chrome). Every
      interactive masthead control grows to >=44x44 via padding/min-height,
@@ -363,15 +369,6 @@ body {
     height: 44px;
     transform: translateY(-50%);
   }
-
-  .masthead__nav a {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 44px;
-    min-height: 44px;
-    padding: 4px 8px;
-  }
 }
 
 /* (Mobile fix pass) Below ~560px the masthead's non-negotiable content
@@ -398,7 +395,15 @@ body {
      recorded golden) — hiding it here changes zero committed text. A build
      check on the phone is a real, if occasional, want; a tap-to-reveal (or
      folding it into an about surface) is the natural follow-up if the
-     operator wants it back, not reproduced here. */
+     operator wants it back, not reproduced here.
+
+   Update: the topnav itself is now hidden at the 768px breakpoint above
+   (not just wrapped onto its own row), so the "nav owns the other [row]"
+   line is historical — the row-count math that justified dropping
+   `.masthead__refresh`/`.masthead__ver` below 560px was measured with the
+   topnav still present and wrapping, and still holds on its own terms
+   (ver+today+live alone already exceeds the 354px budget), but there is no
+   longer a nav row competing for space at this width either. */
 @media (max-width: 560px) {
   .masthead__refresh {
     display: none;
