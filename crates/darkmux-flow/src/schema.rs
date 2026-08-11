@@ -363,7 +363,7 @@ pub struct FlowRecord {
     pub machine_uid: Option<String>,
     /// BLAKE3 hash of the previous record in this audit file's chain.
     /// `None` on records written through LocalFileSink (the casual sink);
-    /// AuditFileSink (the compliance-strength sibling) populates this
+    /// AuditFileSink (the detection-substrate sibling) populates this
     /// with the prior LINE's hash so tampering with any single record is
     /// detectable via a linear walk. The first record in a file points to
     /// the hash of the schema-header line. Schema 1.5 addition (#163).

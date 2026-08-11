@@ -73,8 +73,8 @@ pub enum FlowCmd {
     ///
     /// Tier-decision records form the audit substrate's *why* layer.
     /// Where dispatch records show *what* ran, tier-decision records
-    /// show *why this layer was chosen* — the missing provenance step
-    /// for compliance-bearing AI orchestration.
+    /// show *why this layer was chosen* — the routing rationale that
+    /// dispatch records alone don't capture.
     ///
     /// Typical use: the frontier orchestrator runs this verb before
     /// dispatching (or before deciding to hold work in frontier) and
@@ -122,9 +122,10 @@ pub enum FlowCmd {
     },
     /// Walk every audit file under `DARKMUX_AUDIT_DIR` (or the default
     /// `~/.darkmux/audit/`), recompute the hash chain, and report the
-    /// first divergence per file. Compliance verb (#163): proves the
-    /// AuditFileSink output hasn't been edited since write. Exits with
-    /// status 2 when any chain is broken so CI/cron can flag tampering.
+    /// first divergence per file (#163). A clean walk means no divergence
+    /// was found at this check — not that the file is unaltered; see
+    /// SECURITY.md for the chain's known gaps. Exits with status 2 when
+    /// any chain is broken so CI/cron can flag tampering.
     #[command(name = "integrity-check")]
     IntegrityCheck {
         /// Restrict the walk to a single file path. Useful when the

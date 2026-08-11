@@ -182,7 +182,7 @@ impl FlowSink for LocalFileSink {
 
 // ─── AuditFileSink (#163) ────────────────────────────────────────────
 //
-// Compliance-strength sibling of LocalFileSink. Same per-day JSONL append
+// Detection-substrate sibling of LocalFileSink. Same per-day JSONL append
 // format, plus:
 //   - BLAKE3 hash chain — each record carries the prior record's hash,
 //     making any after-the-fact edit detectable via a linear walk.
@@ -192,7 +192,7 @@ impl FlowSink for LocalFileSink {
 //     might mistake for tampering).
 //   - Separate directory (default `~/.darkmux/audit/`, overridable via
 //     `DARKMUX_AUDIT_DIR`) — keeps casual flow records visually
-//     distinct from compliance-strength records and lets the operator
+//     distinct from audited records and lets the operator
 //     mount the audit dir on different storage (encrypted volume,
 //     read-only mirror, etc.).
 //
@@ -202,9 +202,9 @@ impl FlowSink for LocalFileSink {
 // "audit sink is unix-only on this platform". Cross-platform support
 // would need `LockFileEx` and a separate code path — out of scope here.
 //
-// Tamper-evident, NOT tamper-proof. OS-level append-only flags
+// Edit-detecting, NOT tamper-proof. OS-level append-only flags
 // (`chflags uappend` / `chattr +a`) are a follow-up; this PR ships the
-// chain layer. Operators in regulated environments compose this with
+// chain layer. Operators who need stronger guarantees compose this with
 // disk encryption + filesystem-level immutability for layered defense.
 
 /// Resolve the audit directory from env override (`DARKMUX_AUDIT_DIR`)
@@ -296,7 +296,7 @@ impl FlowSink for AuditFileSink {
 //
 // Live-coordination sink: XADD to a Redis Stream. Coexists with
 // LocalFileSink via TeeSink — Redis is the coordination substrate,
-// files are the audit substrate (see #163 for the compliance-strength
+// files are the audit substrate (see #163 for the detection-substrate
 // AuditFileSink and #162's refinement comment on the split).
 //
 // Opt-in via `DARKMUX_REDIS_URL` env var. When set, the default sink
@@ -1055,7 +1055,7 @@ impl RedisSink {
 // is degraded. Per the operator-sovereignty contract: surface failures
 // loudly via stderr; don't silently lose the audit record.
 
-/// `SinkInfo.kind` of the AuditFileSink — the compliance-strength child whose
+/// `SinkInfo.kind` of the AuditFileSink — the detection-substrate child whose
 /// write failures must be made DETECTABLE rather than vanish into stderr (#877).
 pub(crate) const AUDIT_SINK_KIND: &str = "AuditFile";
 /// `SinkInfo.kind` of the LocalFileSink — the durable casual sink the
@@ -2233,7 +2233,7 @@ mod tests {
     #[test]
     fn tee_sink_writes_to_all_children() {
         // #162 Phase 3: TeeSink composes N sinks. Each child receives
-        // the record. This is the canonical compliant deployment shape
+        // the record. This is the canonical full-composition deployment shape
         // ([LocalFileSink, RedisSink] in production); the test uses
         // two InMemorySink test doubles to verify the trait contract.
         let a = Arc::new(InMemorySink::new());

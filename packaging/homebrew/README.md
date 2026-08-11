@@ -116,7 +116,7 @@ The hub guide [always-on-hub.html](../../docs/guide/always-on-hub.html)
 spells these out in detail — repeated here so the formula's scope is
 explicit:
 
-- **`DARKMUX_AUDIT_DIR`** — opt-in compliance posture; operator runs the
+- **`DARKMUX_AUDIT_DIR`** — opt-in hash-chained audit sink; operator runs the
   `/darkmux-enable-audit` skill.
 - **Log rotation** (newsyslog) — formula sets log paths under
   `var/log/darkmux/` but rotation policy is operator preference.
