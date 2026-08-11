@@ -52,7 +52,7 @@
 //! module to `mission launch review` in #1284 Packet 4b.
 
 use anyhow::{Context, Result};
-use darkmux_lab::lab::bundle::SkipReason;
+use darkmux_lab::lab::bundle::{SkipReason, SkippedFile};
 use darkmux_lab::lab::review::{DegenerateKind, JudgeRecord, ReviewEnvelope, Tier, VerifyRecord, VerifyRuling};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -696,6 +696,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
             lines.extend(needs_check_section.iter().cloned());
         }
         lines.extend(run_warnings_block(env));
+        lines.extend(size_cap_notice_lines(env));
         return Rendered {
             mode: "comment",
             review: None,
@@ -731,6 +732,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
         body.extend(needs_check_section);
     }
     body.extend(run_warnings_block(env));
+    body.extend(size_cap_notice_lines(env));
 
     // (#1583) The summary-only fallback body, assembled from the same parts
     // but with EVERY confirmed finding as a prose bullet carrying its own
@@ -760,6 +762,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
         fallback.extend(needs_check_section_fallback);
     }
     fallback.extend(run_warnings_block(env));
+    fallback.extend(size_cap_notice_lines(env));
 
     // (#1302) Confirmed findings default to a NON-blocking `COMMENT`-event
     // formal review: it keeps the formal-review structure and the inline
@@ -804,6 +807,102 @@ fn run_warnings_block(env: &ReviewEnvelope) -> Vec<String> {
     let mut lines = vec![String::new(), "**⚠ Run warnings**".to_string()];
     lines.extend(env.warnings.iter().map(|w| format!("- {w}")));
     lines
+}
+
+/// The over-cap decline disclosure, appended to every posted review/comment
+/// alongside [`run_warnings_block`] (#1605 established `env.bundle_skip` as
+/// the bundler's own per-file decline accounting; this reads it for the ONE
+/// reason it never covered outside the `bundles == 0` degenerate gate:
+/// `SkipReason::OverSizeCap`/`TopLevelOverSizeCap`).
+///
+/// `env.bundle_skip` already reaches this function — it's a plain field on
+/// `ReviewEnvelope`, stamped by `ReviewBundleStepKind::run_streaming`
+/// alongside `bundles` itself, regardless of whether bundling produced any
+/// bundles at all. But before this, nothing in the NORMAL render path (a
+/// review with real findings, or a clean "none confirmed" pass) ever read
+/// it: only `classify_zero_bundle_degenerate` looked at `bundle_skip`, and
+/// only when `env.bundles == 0`. A PR that produced confirmed findings AND
+/// had a function declined for size posted nothing about the decline — the
+/// reviewer read a review that covered less than they thought, with no
+/// marker at all.
+///
+/// Empty (and so a no-op on the caller's `lines.extend(...)`) when nothing
+/// was declined for size — the common case, and what keeps this from
+/// becoming noise on an ordinary review. Most `files_skipped` entries are
+/// benign exclusions (`NonCodeExtension`, `TestFileExcluded`,
+/// `SourceLanguageUnsupported`, …) that already have their own honest
+/// framing elsewhere (`render_benign_noop_comment` /
+/// `render_unsupported_language_comment`) or are simply not news on a
+/// review that otherwise succeeded; only the two size-cap reasons mean
+/// "part of the diff was too large to hand to a reviewer at all," which is
+/// the one loss this disclosure exists to surface. This is disclosure, not
+/// a gate — it never changes `mode`, `event`, or the confirmed/needs-check
+/// counts.
+fn size_cap_notice_lines(env: &ReviewEnvelope) -> Vec<String> {
+    let Some(report) = &env.bundle_skip else {
+        return Vec::new();
+    };
+    let mut declines: Vec<&SkippedFile> = report
+        .files_skipped
+        .iter()
+        .filter(|f| matches!(f.reason, SkipReason::OverSizeCap | SkipReason::TopLevelOverSizeCap))
+        .collect();
+    if declines.is_empty() {
+        return Vec::new();
+    }
+    declines.sort_by(|a, b| (a.path.as_str(), a.function.as_deref()).cmp(&(b.path.as_str(), b.function.as_deref())));
+    let mut lines = vec![String::new(), "**⚠ Not reviewed — over the size limit**".to_string()];
+    lines.extend(declines.iter().map(|f| format!("- {}", size_cap_decline_sentence(f))));
+    lines
+}
+
+/// One decline as a sentence, e.g. `"Not reviewed: processOrder
+/// (`src/orders.ts`, lines 88-2400) exceeds the size limit the review
+/// system can process."` — see [`size_cap_notice_lines`].
+///
+/// `SkippedFile::function` is always `Some` for these two reasons (the
+/// bundler records it the instant the function/run is skipped — see that
+/// field's own doc), in the shape `"<label> (lines <a>-<b>)"` (both
+/// `build_bundles` call sites use that exact `format!`). This splits the
+/// line-span suffix off so it can be worded differently per reason, rather
+/// than re-deriving the span from scratch — but falls back to a bare
+/// "exceeds the size limit" sentence if that shape ever changes, instead of
+/// panicking on a malformed report.
+///
+/// `TopLevelOverSizeCap`'s label is the literal `"toplevel"` — bundler-
+/// internal jargon (see [`SkipReason::TopLevelOverSizeCap`]'s doc) that
+/// must never leak verbatim into a comment posted on a public PR. This
+/// reason has no enclosing function to name, so the sentence names the
+/// file and line span only, with a plain-English note that it was a
+/// top-level run rather than a single function.
+fn size_cap_decline_sentence(f: &SkippedFile) -> String {
+    let raw = f.function.as_deref().unwrap_or("");
+    let span = raw
+        .split_once(" (lines ")
+        .map(|(_, rest)| format!("lines {}", rest.trim_end_matches(')')));
+    match (f.reason, &span) {
+        (SkipReason::TopLevelOverSizeCap, Some(span)) => format!(
+            "Not reviewed: `{}` ({span}) exceeds the size limit the review system can process — \
+             a run of top-level code, not inside a single function.",
+            f.path
+        ),
+        (SkipReason::TopLevelOverSizeCap, None) => format!(
+            "Not reviewed: `{}` exceeds the size limit the review system can process — a run of \
+             top-level code, not inside a single function.",
+            f.path
+        ),
+        (_, Some(span)) => {
+            let name = raw.split_once(" (lines ").map(|(n, _)| n).unwrap_or(raw);
+            format!(
+                "Not reviewed: {name} (`{}`, {span}) exceeds the size limit the review system can process.",
+                f.path
+            )
+        }
+        (_, None) => format!(
+            "Not reviewed: `{}` exceeds the size limit the review system can process.",
+            f.path
+        ),
+    }
 }
 
 /// (#1260) The frontier-verified line a `verified` adjudication earns —
@@ -1647,6 +1746,199 @@ mod tests {
             lower.contains("neutral") || lower.contains("not an approval"),
             "must explicitly disclaim this is not an approval: {c}"
         );
+    }
+
+    // ─── size-cap decline disclosure — the normal review path ─────────────
+    //
+    // `env.bundle_skip` already reaches `synthesize_review` (it's a plain
+    // field on `ReviewEnvelope`, stamped by `ReviewBundleStepKind::
+    // run_streaming` alongside `bundles` itself — see that field's own
+    // doc in review.rs). But before this, NOTHING in the normal render
+    // path ever read it for a size-cap decline: only
+    // `classify_zero_bundle_degenerate` looked at `bundle_skip`, and only
+    // when `env.bundles == 0`. A review that produced real findings (or a
+    // clean "none confirmed" result) alongside a
+    // `SkipReason::OverSizeCap`/`TopLevelOverSizeCap` decline posted
+    // NOTHING about it — the human reviewer read a review that covered
+    // less than they thought, with no marker at all. These tests pin the
+    // fix at the render layer; no envelope plumbing was needed.
+
+    fn over_cap_skip(considered: usize, path: &str, function_label: &str) -> BundleSkipReport {
+        BundleSkipReport {
+            files_considered: considered,
+            files_skipped: vec![SkippedFile {
+                path: path.to_string(),
+                reason: SkipReason::OverSizeCap,
+                function: Some(function_label.to_string()),
+            }],
+        }
+    }
+
+    #[test]
+    fn synthesize_review_with_findings_names_an_over_cap_decline() {
+        let j = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "shadows the config default",
+            "the clamp is bypassed",
+        );
+        let mut env = healthy_envelope(vec![j]);
+        env.bundle_skip = Some(over_cap_skip(2, "src/orders.ts", "processOrder (lines 88-2400)"));
+
+        let r = synthesize_review(&env, DIFF, None);
+        assert_eq!(r.mode, "review", "a size decline must not change the pass/fail outcome");
+
+        let body = r.review.as_ref().unwrap()["body"].as_str().unwrap().to_string();
+        assert!(body.contains("processOrder"), "must name the dropped function: {body}");
+        assert!(body.contains("src/orders.ts"), "must name the file: {body}");
+        assert!(body.contains("88") && body.contains("2400"), "must name the line span: {body}");
+        assert!(
+            body.to_lowercase().contains("size limit") || body.to_lowercase().contains("size cap"),
+            "must say the reason was size: {body}"
+        );
+        assert!(body.contains("Not reviewed"), "{body}");
+
+        // The summary-only fallback (posted when GitHub rejects the inline
+        // anchors) is an alternate rendering of the SAME run — it must
+        // carry the same disclosure, not just the formal review body.
+        let fallback = r.comment.unwrap();
+        assert!(fallback.contains("processOrder"), "{fallback}");
+        assert!(fallback.contains("src/orders.ts"), "{fallback}");
+    }
+
+    /// The inverted case: a `bundle_skip` report that carries declines, but
+    /// NONE of them are size-related, must add nothing to the render — same
+    /// output as no `bundle_skip` at all. This is what stops the notice
+    /// from becoming noise on an ordinary review (most declines are benign
+    /// non-code/test-file exclusions, not size drops).
+    #[test]
+    fn synthesize_review_with_findings_and_no_size_declines_renders_unchanged() {
+        let j = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "shadows the config default",
+            "the clamp is bypassed",
+        );
+
+        let env_no_skip = healthy_envelope(vec![j.clone()]);
+        let r_no_skip = synthesize_review(&env_no_skip, DIFF, None);
+
+        let mut env_benign_skip = healthy_envelope(vec![j]);
+        env_benign_skip.bundle_skip = Some(BundleSkipReport {
+            files_considered: 2,
+            files_skipped: vec![SkippedFile {
+                path: "package-lock.json".to_string(),
+                reason: SkipReason::NonCodeExtension,
+                function: None,
+            }],
+        });
+        let r_benign_skip = synthesize_review(&env_benign_skip, DIFF, None);
+
+        assert_eq!(
+            r_no_skip.review.as_ref().unwrap()["body"],
+            r_benign_skip.review.as_ref().unwrap()["body"],
+            "a bundle_skip report with no size-cap declines must render byte-identically \
+             to no bundle_skip at all"
+        );
+        assert_eq!(
+            r_no_skip.comment, r_benign_skip.comment,
+            "...and so must the fallback comment"
+        );
+        let body = r_no_skip.review.unwrap()["body"].as_str().unwrap().to_string();
+        assert!(!body.to_lowercase().contains("not reviewed"), "no size decline: {body}");
+    }
+
+    #[test]
+    fn synthesize_review_names_a_top_level_over_cap_decline_without_a_function_name() {
+        let j = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "shadows the config default",
+            "the clamp is bypassed",
+        );
+        let mut env = healthy_envelope(vec![j]);
+        env.bundle_skip = Some(BundleSkipReport {
+            files_considered: 1,
+            files_skipped: vec![SkippedFile {
+                path: "src/imports.ts".to_string(),
+                reason: SkipReason::TopLevelOverSizeCap,
+                function: Some("toplevel (lines 1-2500)".to_string()),
+            }],
+        });
+
+        let r = synthesize_review(&env, DIFF, None);
+        let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
+        assert!(body.contains("src/imports.ts"), "must name the file: {body}");
+        assert!(body.contains('1') && body.contains("2500"), "must name the line span: {body}");
+        assert!(
+            body.to_lowercase().contains("size limit") || body.to_lowercase().contains("size cap"),
+            "{body}"
+        );
+        // No enclosing function exists for a top-level run — the bundler's
+        // internal "toplevel" label (`SkippedFile::function`'s own doc)
+        // must never leak verbatim into a comment posted on a public PR.
+        assert!(!body.contains("toplevel"), "must not leak the internal label: {body}");
+    }
+
+    #[test]
+    fn synthesize_review_renders_multiple_size_declines_readably() {
+        let j = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "shadows the config default",
+            "the clamp is bypassed",
+        );
+        let mut env = healthy_envelope(vec![j]);
+        env.bundle_skip = Some(BundleSkipReport {
+            files_considered: 3,
+            files_skipped: vec![
+                SkippedFile {
+                    path: "src/orders.ts".to_string(),
+                    reason: SkipReason::OverSizeCap,
+                    function: Some("processOrder (lines 88-2400)".to_string()),
+                },
+                SkippedFile {
+                    path: "src/imports.ts".to_string(),
+                    reason: SkipReason::TopLevelOverSizeCap,
+                    function: Some("toplevel (lines 1-2500)".to_string()),
+                },
+            ],
+        });
+
+        let r = synthesize_review(&env, DIFF, None);
+        let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
+        assert!(body.contains("processOrder") && body.contains("src/orders.ts"), "{body}");
+        assert!(body.contains("src/imports.ts"), "{body}");
+        let notice_lines: Vec<&str> =
+            body.lines().filter(|l| l.starts_with("- Not reviewed")).collect();
+        assert_eq!(
+            notice_lines.len(),
+            2,
+            "each decline gets its own line, not merged into one: {body}\n{notice_lines:?}"
+        );
+    }
+
+    /// Requirement 1's "or a clean result" half — a zero-confirmed run
+    /// (`mode: "comment"`) with a size decline must also disclose it, not
+    /// just the `mode: "review"` findings path.
+    #[test]
+    fn synthesize_zero_confirms_clean_result_also_names_an_over_cap_decline() {
+        let env = ReviewEnvelope {
+            deduped_flags: 3,
+            bundles: 2,
+            judged: vec![archived_flag("computeEnd@src/x.ts")],
+            members: vec![
+                MemberRecord { model: "darkmux:probe-a".into(), seat: "review-probe".into(), ..Default::default() },
+                MemberRecord { model: "darkmux:judge-b".into(), seat: "review-judge".into(), ..Default::default() },
+            ],
+            bundle_skip: Some(over_cap_skip(2, "src/orders.ts", "processOrder (lines 88-2400)")),
+            ..Default::default()
+        };
+        let r = synthesize_review(&env, DIFF, None);
+        assert_eq!(r.mode, "comment");
+        let c = r.comment.unwrap();
+        assert!(c.contains("processOrder") && c.contains("src/orders.ts"), "{c}");
+        assert!(c.to_lowercase().contains("size limit") || c.to_lowercase().contains("size cap"), "{c}");
     }
 
     #[test]
