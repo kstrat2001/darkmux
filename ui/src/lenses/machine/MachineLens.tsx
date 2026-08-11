@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
@@ -59,6 +59,19 @@ export function lineClass(line: string): string | undefined {
   if (line.includes(" · ")) return "mline--meta";
   if (/^[a-z][a-z ]{2,18}$/.test(line)) return "mline--label";
   return undefined;
+}
+
+/** Enter/Space activates a `role="button"` `<div>` the same way a native
+ * `<button>` would — this element has a click handler and no other keyboard
+ * path to it (matching `RunsBoard.tsx`'s own `onActivateKeyDown`, ported
+ * here rather than shared since the two modules have no other coupling). */
+function onActivateKeyDown(onActivate: () => void) {
+  return (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onActivate();
+    }
+  };
 }
 
 /** One `<div>` per line. `innerText` puts each block-level sibling on its
@@ -188,6 +201,7 @@ export function MachineLens() {
             role="button"
             tabIndex={0}
             onClick={() => setRecentAll((v) => !v)}
+            onKeyDown={onActivateKeyDown(() => setRecentAll((v) => !v))}
           >
             {recentAll ? "show fewer" : `show all ${total} →`}
           </div>

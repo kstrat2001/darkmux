@@ -118,4 +118,53 @@ describe("EventLogColumn", () => {
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain("s-reasoning");
   });
+
+  // `.eventlog__rec` was a click-only div — no `role`, no `tabIndex`, no
+  // key handler — so a keyboard user could not even TAB to a record, let
+  // alone select one. Text-only assertions can't see this: the click
+  // handler already worked and already produced the right text.
+  describe("keyboard operability of a log row", () => {
+    it("every row is a real role=button reachable by Tab", () => {
+      const records = [rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-1" })];
+      render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+      const row = document.querySelector('[data-act="rec"]')!;
+      expect(row).toHaveAttribute("role", "button");
+      expect(row).toHaveAttribute("tabIndex", "0");
+    });
+
+    it("Enter selects the row, the same as a click", () => {
+      const records = [
+        rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-old" }),
+        rec({ ts: "2026-08-08T12:05:00.000Z", session_id: "s-new" }),
+      ];
+      render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+      const rows = document.querySelectorAll('[data-act="rec"]');
+      fireEvent.keyDown(rows[1], { key: "Enter" }); // the older row
+      expect(document.getElementById("detailbody")!.textContent).toContain("s-old");
+      expect(document.getElementById("follow")!.className).not.toMatch(/\bon\b/);
+    });
+
+    it("Space selects the row, the same as a click", () => {
+      const records = [
+        rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-old" }),
+        rec({ ts: "2026-08-08T12:05:00.000Z", session_id: "s-new" }),
+      ];
+      render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+      const rows = document.querySelectorAll('[data-act="rec"]');
+      fireEvent.keyDown(rows[1], { key: " " });
+      expect(document.getElementById("detailbody")!.textContent).toContain("s-old");
+    });
+  });
+
+  // Structural coverage for the two classNames that shipped matching
+  // nothing in styles.css (rendered as default sans-serif text, invisible
+  // to the innerText-based parity goldens).
+  it("renders the machine/session meta spans with their styling classes", () => {
+    const records = [rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-1", machine_id: "MacBook-Pro" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    expect(document.querySelector(".eventlog__recmachine")).toBeInTheDocument();
+    expect(document.querySelector(".eventlog__recsession")).toBeInTheDocument();
+    expect(document.querySelector(".eventlog__recmachine")!.textContent).toContain("MacBook-Pro");
+    expect(document.querySelector(".eventlog__recsession")!.textContent).toContain("s-1");
+  });
 });
