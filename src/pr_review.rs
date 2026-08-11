@@ -52,6 +52,7 @@
 //! module to `mission launch review` in #1284 Packet 4b.
 
 use anyhow::{Context, Result};
+use darkmux_lab::lab::bundle::SkipReason;
 use darkmux_lab::lab::review::{DegenerateKind, JudgeRecord, ReviewEnvelope, Tier, VerifyRecord, VerifyRuling};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -265,6 +266,66 @@ fn render_benign_noop_comment(env: &ReviewEnvelope, footer: &str) -> String {
          darkmux-reviewable bundle. The bundler covers TypeScript source and deliberately \
          excludes data (fixtures, lockfiles, generated config) and test files, so there was \
          nothing here for an automated code review to read.\n\n\
+         **This is a neutral note, not an approval** — it reflects what the diff contained, \
+         not a judgment on the change.{footer}"
+    )
+}
+
+/// (#1757) The neutral note for a run whose zero-bundle result is real
+/// source code the built-in bundler can't parse
+/// ([`darkmux_lab::lab::review::DegenerateKind::UnsupportedLanguage`] —
+/// see `classify_zero_bundle_degenerate`'s doc for exactly which skip
+/// mixes qualify). Deliberately NOT [`render_benign_noop_comment`]'s
+/// wording: that comment says "nothing here to review," which is false
+/// about a `.sql`-only or `.css`-only PR — there IS code here, darkmux's
+/// TypeScript-only built-in bundler just doesn't read it. Names the file
+/// count and extensions that went unreviewed and points at the
+/// `--bundler` escape hatch's own guide page, so the requester's next
+/// step is a link, not a guess. Posted via `mode: "noop"` (same as the
+/// benign case) — a real neutral outcome, never a failed check and never
+/// a green approval.
+fn render_unsupported_language_comment(env: &ReviewEnvelope, footer: &str) -> String {
+    let (considered, unsupported_paths) = match &env.bundle_skip {
+        Some(report) => {
+            let mut paths: Vec<&str> = report
+                .files_skipped
+                .iter()
+                .filter(|f| f.reason == SkipReason::SourceLanguageUnsupported)
+                .map(|f| f.path.as_str())
+                .collect();
+            paths.sort_unstable();
+            (report.files_considered, paths)
+        }
+        None => (0, Vec::new()),
+    };
+    let mut extensions: Vec<String> = unsupported_paths
+        .iter()
+        .filter_map(|p| p.rsplit_once('.').map(|(_, ext)| format!(".{ext}")))
+        .collect();
+    extensions.sort_unstable();
+    extensions.dedup();
+    let ext_list = if extensions.is_empty() { "unknown extension".to_string() } else { extensions.join(", ") };
+    const MAX_NAMED: usize = 8;
+    let listing = if unsupported_paths.is_empty() {
+        "no files".to_string()
+    } else if unsupported_paths.len() <= MAX_NAMED {
+        unsupported_paths.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+    } else {
+        format!(
+            "{}, and {} more",
+            unsupported_paths[..MAX_NAMED].iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", "),
+            unsupported_paths.len() - MAX_NAMED
+        )
+    };
+    let n = unsupported_paths.len();
+    format!(
+        "### 🤖 PR review — unsupported source language\n\n\
+         **The bundler ran and worked as expected. This is not a failure, and re-running will \
+         produce the same result.**\n\n\
+         This diff touched {considered} file(s). {n} of them ({ext_list}) are real source code \
+         that darkmux's built-in bundler can't parse — it reads TypeScript only: {listing}.\n\n\
+         darkmux parses TypeScript natively. To review other languages, bring your own bundler: \
+         see the [bundler guide](https://darkmux.com/guide/bundlers.html).\n\n\
          **This is a neutral note, not an approval** — it reflects what the diff contained, \
          not a judgment on the change.{footer}"
     )
@@ -494,6 +555,13 @@ fn public_safe_note(note: &str) -> String {
 ///   NEUTRAL comment naming what the diff contained and why there's nothing
 ///   to review. Not a green approval, not a red failure — see
 ///   [`render_benign_noop_comment`].
+/// - A degenerate envelope whose `degenerate_kind` is
+///   [`DegenerateKind::UnsupportedLanguage`] (#1757 — real source code in a
+///   language the built-in, TypeScript-only bundler can't parse) -> also
+///   `"noop"`, but with different wording: there IS code here, so the
+///   comment names the file count + extensions that went unreviewed and
+///   points at the `--bundler` escape hatch's guide page instead of saying
+///   "nothing to review" — see [`render_unsupported_language_comment`].
 /// - Any OTHER degenerate envelope (`env.degenerate.is_some()`, `degenerate_kind`
 ///   absent or [`DegenerateKind::Error`]) -> `"degraded"`, the same contract
 ///   [`degraded_fallback`] (#1113) uses elsewhere in this module — no review
@@ -507,6 +575,16 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
             mode: "noop",
             review: None,
             comment: Some(render_benign_noop_comment(env, &review_footer(env, attribution))),
+        };
+    }
+    if env.degenerate_kind == Some(DegenerateKind::UnsupportedLanguage) {
+        // (#1757) Real source the built-in bundler can't parse is not the
+        // same finding as "nothing here" — stay neutral (never fail the
+        // run) but name what went unreviewed and point at `--bundler`.
+        return Rendered {
+            mode: "noop",
+            review: None,
+            comment: Some(render_unsupported_language_comment(env, &review_footer(env, attribution))),
         };
     }
     if let Some(note) = &env.degenerate {
@@ -1501,6 +1579,73 @@ mod tests {
                 || lower.contains("re-run"),
             "the comment must tell a waiting session NOT to retry — an unbounded retry loop \
              on a permanently-empty diff is the failure mode this wording exists to prevent: {c}"
+        );
+    }
+
+    /// (#1757) A diff whose zero-bundle result is real source in a
+    /// language the built-in bundler can't parse posts a NEUTRAL noop
+    /// comment too (never fails the check), but with different wording
+    /// than the benign-empty case: it names the file count + extensions
+    /// and points at the `--bundler` guide, rather than saying "nothing to
+    /// review" about real code.
+    #[test]
+    fn synthesize_unsupported_language_envelope_is_a_noop_naming_the_bundler_escape_hatch() {
+        let env = ReviewEnvelope {
+            degenerate: Some(
+                "no bundles produced from the diff — 2 file(s) considered, 2 skipped \
+                 (1 non-code extension, 1 real source in an unsupported language)"
+                    .to_string(),
+            ),
+            degenerate_kind: Some(DegenerateKind::UnsupportedLanguage),
+            bundle_skip: Some(BundleSkipReport {
+                files_considered: 2,
+                files_skipped: vec![
+                    SkippedFile {
+                        path: "package-lock.json".to_string(),
+                        reason: SkipReason::NonCodeExtension,
+                        function: None,
+                    },
+                    SkippedFile {
+                        path: "migrations/001_add_users.sql".to_string(),
+                        reason: SkipReason::SourceLanguageUnsupported,
+                        function: None,
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let r = synthesize_review(&env, DIFF, None);
+        assert_eq!(r.mode, "noop", "must never fail the check — a neutral outcome, not degraded");
+        assert!(r.review.is_none(), "never a formal review payload for a no-op");
+        let c = r.comment.expect("a noop run still posts a comment");
+        // Names the unsupported-language file, its extension, and the count
+        // — never lumped in with the benign lockfile skip.
+        assert!(c.contains("migrations/001_add_users.sql"), "{c}");
+        assert!(c.contains(".sql"), "the extension must be named: {c}");
+        assert!(c.contains('1'), "the unsupported-language file count is named: {c}");
+        // Points at the escape hatch's own guide page.
+        assert!(
+            c.contains("darkmux.com/guide/bundlers.html"),
+            "must point at the bundler guide so the requester's next step is a link: {c}"
+        );
+        assert!(
+            c.to_lowercase().contains("--bundler") || c.to_lowercase().contains("bring your own bundler"),
+            "must name the escape hatch itself, not just link to it: {c}"
+        );
+        // Must NOT read as the benign "nothing to review" case — there IS
+        // real code here.
+        let lower = c.to_lowercase();
+        assert!(
+            !lower.contains("nothing here for an automated code review to read"),
+            "an unsupported-language diff has REAL code — must not use the benign-empty wording: {c}"
+        );
+        assert!(
+            !lower.contains("no signal") && !lower.contains("degraded"),
+            "must never read like the loud degraded failure comment: {c}"
+        );
+        assert!(
+            lower.contains("neutral") || lower.contains("not an approval"),
+            "must explicitly disclaim this is not an approval: {c}"
         );
     }
 
