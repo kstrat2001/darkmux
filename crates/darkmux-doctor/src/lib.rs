@@ -649,25 +649,25 @@ fn check_audit_integrity() -> Check {
         };
     }
 
+    summarize_audit_reports(&reports)
+}
+
+/// Turn a set of `flow integrity-check` reports into one doctor `Check`.
+/// Pure (no I/O), split out of `check_audit_integrity` so the three-way
+/// split — a genuine chain break, a legacy-format file (#1769), or a fully
+/// verified walk — is unit-testable without touching the filesystem or
+/// `DARKMUX_AUDIT_DIR`.
+///
+/// The three statuses map to doctor's own exit code (`main.rs`: `Fail` → 1,
+/// everything else → 0): a genuine break is the only thing that flips it.
+/// A legacy-format file is readable but was NOT content-verified at all
+/// (see `IntegrityReport::legacy_format`) — that is neither "everything
+/// verified" (Pass would overclaim) nor "tampering" (Fail would be a false
+/// accusation), so it gets its own `Warn`.
+fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
     let broken: Vec<&darkmux_flow::IntegrityReport> =
         reports.iter().filter(|r| !r.chain_valid).collect();
-    if broken.is_empty() {
-        let total_records: u64 = reports.iter().map(|r| r.records_checked).sum();
-        Check {
-            name: "audit integrity".into(),
-            status: Status::Pass,
-            // "verified at this check" makes the point-in-time nature
-            // explicit — bare "verified" reads as a stronger claim than
-            // the implementation supports (#189). Verification is per
-            // `flow integrity-check` walk, not a continuous property
-            // of the artifact.
-            message: format!(
-                "{} file(s), {total_records} record(s), all chains pass the integrity walk at this check",
-                reports.len()
-            ),
-            hint: None,
-        }
-    } else {
+    if !broken.is_empty() {
         let first = broken[0];
         let summary = format!(
             "{}/{} file(s) BROKEN — {} at line {} ({})",
@@ -680,7 +680,7 @@ fn check_audit_integrity() -> Check {
                 .clone()
                 .unwrap_or_else(|| "no reason captured".into()),
         );
-        Check {
+        return Check {
             name: "audit integrity".into(),
             status: Status::Fail,
             message: summary,
@@ -688,7 +688,55 @@ fn check_audit_integrity() -> Check {
                 "Audit log has been edited or a write was interleaved. Run `darkmux flow integrity-check` for the full per-file breakdown. If tampering is suspected, the chain break locates the affected line; older records before that line are still trustworthy."
                     .into(),
             ),
-        }
+        };
+    }
+
+    // (#1769) Every chain either links cleanly or is a legacy-format file
+    // this binary does not attempt to content-verify (recomputing a
+    // struct-hash would repeat the exact lossy round trip #1768/#1769
+    // exploited). That's a format boundary, not tampering, so it stays out
+    // of the `Fail` branch above — but it's also not the same claim as
+    // "everything verified", so it doesn't fold silently into `Pass`
+    // either. `Warn` is the honest middle: exit code stays 0 (doctor only
+    // flips to 1 on `Fail`), and the caveat is loud.
+    let legacy: Vec<&darkmux_flow::IntegrityReport> =
+        reports.iter().filter(|r| r.legacy_format).collect();
+    if !legacy.is_empty() {
+        let total_unverified: u64 = legacy.iter().map(|r| r.records_checked).sum();
+        let note = legacy[0]
+            .note
+            .clone()
+            .unwrap_or_else(|| "written in a legacy format this binary cannot re-verify".into());
+        return Check {
+            name: "audit integrity".into(),
+            status: Status::Warn,
+            message: format!(
+                "{}/{} file(s) in the legacy pre-2.6.0 format — {total_unverified} record(s) \
+                 NOT content-verified (readable only). {note}",
+                legacy.len(),
+                reports.len(),
+            ),
+            hint: Some(
+                "Rotate legacy audit files (move/rename so a fresh chain starts under the byte-hash format, #1769) if you want them re-verifiable. This is not evidence of tampering — run `darkmux flow integrity-check` for the full per-file breakdown."
+                    .into(),
+            ),
+        };
+    }
+
+    let total_records: u64 = reports.iter().map(|r| r.records_checked).sum();
+    Check {
+        name: "audit integrity".into(),
+        status: Status::Pass,
+        // "verified at this check" makes the point-in-time nature
+        // explicit — bare "verified" reads as a stronger claim than
+        // the implementation supports (#189). Verification is per
+        // `flow integrity-check` walk, not a continuous property
+        // of the artifact.
+        message: format!(
+            "{} file(s), {total_records} record(s), all chains pass the integrity walk at this check",
+            reports.len()
+        ),
+        hint: None,
     }
 }
 
@@ -3768,6 +3816,89 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── (#1769) summarize_audit_reports — Fail / Warn / Pass split ────────
+    //
+    // Pure-function tests: no filesystem, no `DARKMUX_AUDIT_DIR`. Each test
+    // constructs the `IntegrityReport`(s) `flow integrity-check` would have
+    // produced and checks which doctor `Status` (and therefore which exit
+    // code, per `main.rs`'s `Fail => 1, _ => 0`) they map to.
+
+    fn mk_clean_report(records_checked: u64) -> darkmux_flow::IntegrityReport {
+        darkmux_flow::IntegrityReport {
+            path: "2026-08-11.jsonl".into(),
+            records_checked,
+            chain_valid: true,
+            break_at_line: None,
+            break_reason: None,
+            legacy_format: false,
+            note: None,
+            writer_schema_version: Some("1.19.0".into()),
+        }
+    }
+
+    #[test]
+    fn summarize_audit_reports_broken_chain_is_fail() {
+        let broken = darkmux_flow::IntegrityReport {
+            chain_valid: false,
+            break_at_line: Some(4),
+            break_reason: Some(
+                "hash mismatch: stored `a` != recomputed `b` (record content has been edited)"
+                    .into(),
+            ),
+            ..mk_clean_report(3)
+        };
+        let check = summarize_audit_reports(&[mk_clean_report(2), broken]);
+        assert_eq!(
+            check.status,
+            Status::Fail,
+            "a genuine chain break must FAIL the check — this is the only status that flips \
+             doctor's exit code to 1, and it must not be softened by the legacy-format case"
+        );
+        assert!(check.message.contains("BROKEN"));
+    }
+
+    #[test]
+    fn summarize_audit_reports_legacy_format_is_warn_not_fail() {
+        let legacy = darkmux_flow::IntegrityReport {
+            chain_valid: true,
+            legacy_format: true,
+            note: Some(
+                "written in the legacy struct-hash format (pre-2.6.0); not re-verifiable under \
+                 byte-hash verification (#1769) — the stored hash was computed over a \
+                 re-serialization of the parsed record, which this binary cannot reproduce \
+                 byte-for-byte. This is a format boundary, not evidence of editing."
+                    .into(),
+            ),
+            writer_schema_version: Some("1.18.0".into()),
+            ..mk_clean_report(5)
+        };
+        let check = summarize_audit_reports(&[legacy]);
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "#1769: a legacy-format file was never content-verified — it must never reach \
+             Fail (doctor's only exit-code-flipping status), but it also must not silently \
+             fold into Pass, or the caveat disappears"
+        );
+        assert!(
+            !check.message.to_lowercase().contains("edited") && !check.message.contains("BROKEN"),
+            "wording must not assert editing; got {:?}",
+            check.message
+        );
+        assert!(
+            check.message.contains("5 record"),
+            "the unverified count must be surfaced; got {:?}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn summarize_audit_reports_clean_chain_is_pass() {
+        let check = summarize_audit_reports(&[mk_clean_report(3), mk_clean_report(7)]);
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("10 record"));
+    }
 
     // ─── (#1569 packet A) viewer_link_base routing ─────────────────────────
     //
