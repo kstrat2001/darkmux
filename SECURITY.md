@@ -21,6 +21,13 @@ Please do not open a public issue or PR that describes an exploit before a fix
 is available. This is a solo-maintained project; fixes ship on the maintainer's
 schedule, but security reports are triaged first.
 
+This request applies to issues someone else finds. It does not bind the
+maintainer's own self-disclosure: when a published claim about darkmux turns
+out to be wrong, the maintainer may correct the record immediately, because
+correcting a claim he made outranks an embargo he would only be keeping from
+himself (see [darkmux#1769](https://github.com/kstrat2001/darkmux/issues/1769)
+for the case that established this).
+
 ## Supported versions
 
 As of v1.0.0, darkmux follows semver. The current `1.x` line receives security
@@ -90,13 +97,14 @@ frame:
   with any regulatory framework. darkmux makes no compliance claim: producing
   evidence and being compliant are different things, and only the second one
   needs a lawyer.
-- **Known gaps in the audit chain, stated plainly.** As of this writing the
-  chain does NOT detect every edit — see darkmux#1769, a confirmed bypass where
-  a record carrying an unrecognized enum value skips content verification
-  entirely, so its other fields can be rewritten and the chain still validates.
-  A fix (hashing the stored bytes rather than a re-serialization) is in
-  progress. Two further limits are structural rather than bugs: whole-file
-  deletion is undetectable, because each per-day file seeds its own chain and
+- **Known gaps in the audit chain, stated plainly.** As of 2026-08-11 the
+  chain does NOT detect every edit — tracked at
+  [darkmux#1769](https://github.com/kstrat2001/darkmux/issues/1769), a
+  confirmed bypass where a record carrying an unrecognized enum value skips
+  content verification entirely, so its other fields can be rewritten and
+  the chain still validates. Two further limits are structural rather than
+  bugs: whole-file deletion is undetectable, because each per-day file seeds
+  its own chain and
   nothing records which files should exist; and the chain root is
   **un-anchored**, computed and stored locally, so an attacker with write
   access who rewrites a file wholesale produces one that validates. Treat this

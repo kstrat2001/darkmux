@@ -644,7 +644,7 @@ fn check_audit_integrity() -> Check {
             status: Status::Warn,
             message: format!("no audit files under {dir}"),
             hint: Some(
-                "AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log whose edits `darkmux flow integrity-check` detects (absent a full re-chain — the chain is un-anchored), alongside the casual LocalFile sink. Useful for compliance deployments (ISO 27001, AI Act, etc.)."
+                "AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log whose edits `darkmux flow integrity-check` detects (absent a full re-chain — the chain is un-anchored), alongside the casual LocalFile sink."
                     .into(),
             ),
         };
@@ -686,7 +686,7 @@ fn check_audit_integrity() -> Check {
             status: Status::Fail,
             message: summary,
             hint: Some(
-                "Audit log has been edited or a write was interleaved. Run `darkmux flow integrity-check` for the full per-file breakdown. If tampering is suspected, the chain break locates the affected line; older records before that line are still trustworthy."
+                "Audit log has been edited or a write was interleaved. Run `darkmux flow integrity-check` for the full per-file breakdown. If tampering is suspected, the chain break locates the affected line; records before that line link consistently, which is evidence they are unmodified — not proof."
                     .into(),
             ),
         }

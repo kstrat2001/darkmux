@@ -105,16 +105,16 @@ Flow records carry an `orchestrator` field that names the frontier session drivi
 >
 > Replace `claude-code` with the harness driving this session (e.g. `claude-code`, `antigravity`, `cursor`). Doctor will surface a warning until it's declared.
 
-## Step 6 — Optional: enable the compliance substrates
+## Step 6 — Optional: enable the audit and coordination substrates
 
 Two opt-in environment variables enable the heavier substrates:
 
-- `DARKMUX_AUDIT_DIR` → enables AuditFileSink (hash-chained tamper-evident log; #163)
+- `DARKMUX_AUDIT_DIR` → enables AuditFileSink (hash-chained detection log; #163)
 - `DARKMUX_REDIS_URL` → enables RedisSink (coordination substrate for cross-machine work; #162 Phase 3)
 
 These are out of scope for first-time bootstrap. **Sibling skills:**
 
-- `/darkmux-enable-audit` (shipped, #177): walks through the compliance/audit posture. The operator can invoke it directly after bootstrap.
+- `/darkmux-enable-audit` (shipped, #177): walks through the audit posture. The operator can invoke it directly after bootstrap.
 - `/darkmux-enable-redis`: tracked in #178; not yet implemented.
 
 After bootstrap, point the operator at `/darkmux-enable-audit` for the audit substrate, and at the README's environment-variables table plus #178 for Redis coordination. Don't suggest invoking `/darkmux-enable-redis` yet; it isn't installed and won't be found.

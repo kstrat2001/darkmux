@@ -202,9 +202,9 @@ impl FlowSink for LocalFileSink {
 // "audit sink is unix-only on this platform". Cross-platform support
 // would need `LockFileEx` and a separate code path — out of scope here.
 //
-// Tamper-evident, NOT tamper-proof. OS-level append-only flags
+// Edit-detecting, NOT tamper-proof. OS-level append-only flags
 // (`chflags uappend` / `chattr +a`) are a follow-up; this PR ships the
-// chain layer. Operators in regulated environments compose this with
+// chain layer. Operators who need stronger guarantees compose this with
 // disk encryption + filesystem-level immutability for layered defense.
 
 /// Resolve the audit directory from env override (`DARKMUX_AUDIT_DIR`)

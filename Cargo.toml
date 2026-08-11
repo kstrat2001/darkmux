@@ -72,7 +72,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # the bigger dep surface (async runtimes etc.) we don't need.
 redis = { version = "0.27", default-features = false, features = ["streams"] }
 
-# #163 — AuditFileSink: hash-chained tamper-evident sink.
+# #163 — AuditFileSink: hash-chained edit-detection sink.
 # BLAKE3: fast cryptographic hash for the per-record chain. Audited
 # reference impl; ~120 lines of public API. Used here for content
 # hashing — the chain check is a linear walk recomputing each hash

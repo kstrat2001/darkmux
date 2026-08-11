@@ -7,7 +7,7 @@ allowed-tools: "Bash(darkmux:*),Bash(lms:*),Bash(echo:*),Bash(ls:*),Bash(env:*),
 
 # Darkmux enable audit
 
-This skill walks an operator through turning on **AuditFileSink** alongside the casual `LocalFileSink`. AuditFileSink writes a BLAKE3 hash-chained append-only JSONL log to a separate directory; `darkmux flow integrity-check` walks the chain and **any post-write modification is detectable**. The sink is opt-in via `DARKMUX_AUDIT_DIR`.
+This skill walks an operator through turning on **AuditFileSink** alongside the casual `LocalFileSink`. AuditFileSink writes a BLAKE3 hash-chained append-only JSONL log to a separate directory; `darkmux flow integrity-check` walks the chain and reports where it diverges — most post-write modifications are caught this way, but not all of them (see the limits below). The sink is opt-in via `DARKMUX_AUDIT_DIR`.
 
 The skill is read-and-propose throughout — operator runs every state-mutating command. The decision to enable audit is context-bearing (use case + retention strategy + recovery options); the skill surfaces the options and lets the operator pick.
 
