@@ -66,6 +66,25 @@ impl RepoIndex {
     }
 }
 
+/// (#1756 MUST-FIX follow-up) `"constructor"` is never indexed here, even
+/// though `scan::find_all_functions_in_text` locates it (that location fix
+/// is correct and stays — see `scan::KEYWORD_NAMES`'s doc). Unlike every
+/// other function name, `constructor` carries NO distinguishing signal: it
+/// is the one method name every class in a multi-class file/repo shares,
+/// so a repo-wide index keyed by name turns it into "one entry per class,
+/// all indistinguishable by name" — exactly the shape `resolve_callees`'s
+/// same-name heuristic and `find_siblings`'s same-name match assume can't
+/// happen for a real identifier. A constructor is also never CALLED by its
+/// bare name in real TS/JS (`new Foo()`, not `constructor()`), so it has
+/// no legitimate callee/sibling relationship for those two families to
+/// resolve in the first place — omitting it from the index is a correction
+/// to what should count as an indexable name, not a loss of real cross-
+/// reference data. A changed constructor is still located, still bundled,
+/// and still gets its own param-flow/differential facts (that path scans
+/// the file directly via `scan::find_all_functions_in_text`, independent
+/// of this index).
+const NON_INDEXABLE_NAMES: &[&str] = &["constructor"];
+
 /// Port of `build_repo_function_index`, generalized over `FileSource`:
 /// scans every file in `candidate_files` (the source's own fidelity
 /// boundary — full tree for `Worktree`, bounded diff+import-hop set for
@@ -82,6 +101,9 @@ pub fn build_repo_index(source: &FileSource, candidate_files: &[String]) -> Resu
             continue;
         }
         for f in scan::find_all_functions_in_text(&lines) {
+            if NON_INDEXABLE_NAMES.contains(&f.name.as_str()) {
+                continue;
+            }
             let params = scan::extract_params(&lines, f.start0);
             let body_text = lines[f.start0..=f.end0].join("\n");
             index.push(

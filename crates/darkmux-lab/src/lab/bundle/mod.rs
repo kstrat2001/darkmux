@@ -410,6 +410,19 @@ fn is_word_byte(b: u8) -> bool {
 /// `candidate_files`, the first call-site line to `name` (outside the
 /// function's own definition span) becomes a `+-3`-line excerpt, capped
 /// at `facts::MAX_CALLERS`.
+///
+/// (#1756 MUST-FIX follow-up) `name == "constructor"` short-circuits to
+/// empty, same reasoning as `facts::NON_INDEXABLE_NAMES`: `line_has_call`
+/// is a naive text scan (`"<name>("` followed eventually by `(`) with no
+/// declaration-vs-call-site awareness, so a DIFFERENT class's own
+/// `constructor(...) {` line reads exactly like a call to `constructor` —
+/// and because every class shares this one declaration shape, that false
+/// positive isn't an occasional near-miss (the way a coincidental same-name
+/// function collision would be for any other identifier), it fires on
+/// every OTHER class's constructor in every candidate file. Constructors
+/// are invoked via `new ClassName()`, never by the bare name `constructor`,
+/// so there is no real caller reference this search could legitimately
+/// find for this one name.
 fn find_caller_refs(
     source: &FileSource,
     candidate_files: &[String],
@@ -417,6 +430,9 @@ fn find_caller_refs(
     own_path: &str,
     own_span: (usize, usize),
 ) -> Result<Vec<BundleRef>> {
+    if name == "constructor" {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     let mut found = 0usize;
     for crel in candidate_files {
@@ -1071,6 +1087,76 @@ mod tests {
             code_text.contains("excerpt truncated"),
             "expected a truncation marker in slice_code output:\n{code_text}"
         );
+    }
+
+    #[test]
+    fn constructor_bundle_never_attaches_a_foreign_classs_constructor() {
+        // (#1756 MUST-FIX regression) #1756 removed "constructor" from
+        // scan::KEYWORD_NAMES so constructors could be located as
+        // functions — but `facts::build_repo_index` has no name filter, so
+        // the repo index now holds ONE "constructor" ENTRY PER CLASS PER
+        // FILE. `build_bundles` passes a changed function's body INCLUDING
+        // its own header line (`lines[start0..=end0]`), and that header
+        // line — `constructor(x: number) {` — itself reads as a call site
+        // to `extract_calls` (lowercase identifier directly followed by
+        // `(`, not in NOISE). `resolve_callees` then looks up
+        // `"constructor"` in the repo index: no file ever imports a
+        // binding literally named `constructor`, so #1753's import-binding
+        // guard never fires, and the old same-name heuristic
+        // (`find(|d| d.path != own_path).or_else(|| defs.first())`)
+        // attaches the FIRST OTHER file's constructor as if it were a
+        // real callee. Two unrelated classes, two files, each with its own
+        // constructor; only Foo's constructor changed. No code ref (and no
+        // manifest line) should ever point at Bar's constructor in
+        // src/bar.ts.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "src/foo.ts",
+            "export class Foo {\n\
+             \u{20}\u{20}x: number;\n\
+             \u{20}\u{20}constructor(x: number) {\n\
+             \u{20}\u{20}\u{20}\u{20}this.x = x;\n\
+             \u{20}\u{20}}\n\
+             }\n",
+        );
+        write(
+            dir.path(),
+            "src/bar.ts",
+            "export class Bar {\n\
+             \u{20}\u{20}y: number;\n\
+             \u{20}\u{20}constructor(y: number) {\n\
+             \u{20}\u{20}\u{20}\u{20}this.y = y;\n\
+             \u{20}\u{20}}\n\
+             }\n",
+        );
+        let diff = "+++ b/src/foo.ts\n\
+@@ -1,6 +1,6 @@\n\
+ export class Foo {\n\
+ \u{20}\u{20}x: number;\n\
+ \u{20}\u{20}constructor(x: number) {\n\
+-\u{20}\u{20}\u{20}\u{20}this.x = 0;\n\
++\u{20}\u{20}\u{20}\u{20}this.x = x;\n\
+ \u{20}\u{20}}\n\
+ }\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(!set.bundles.is_empty(), "expected at least one bundle for Foo's changed constructor");
+        for b in &set.bundles {
+            for r in &b.code {
+                assert_ne!(
+                    r.path, "src/bar.ts",
+                    "Foo's constructor bundle must never carry a code ref into Bar's file — \
+                     a foreign class's constructor was attached as a callee/sibling, bundle: {b:?}"
+                );
+            }
+            for m in &b.manifest {
+                assert!(
+                    !m.contains("src/bar.ts"),
+                    "Foo's constructor bundle's manifest must never reference Bar's file, got: {m}"
+                );
+            }
+        }
     }
 
     #[test]
