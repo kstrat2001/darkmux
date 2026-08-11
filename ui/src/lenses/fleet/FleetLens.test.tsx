@@ -90,6 +90,21 @@ describe("FleetLens", () => {
     expect(screen.getByText("idle")).toBeInTheDocument(); // no live session -> idle, not "dispatch in flight"
   });
 
+  it("renders the '(older notes exist)' marker with its styling class when notes history exists", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T09:00:00.000Z`, action: "note", source: "orchestrator", handle: "shipped the thing" },
+        { ts: `${today}T10:00:00.000Z`, action: "note", source: "orchestrator", handle: "shipped another thing" },
+      ],
+    });
+    const { container } = renderFleetLens();
+    await waitFor(() => expect(screen.getByText(/shipped another thing/)).toBeInTheDocument());
+    const marker = container.querySelector(".hybmore");
+    expect(marker).toBeInTheDocument();
+    expect(marker!.textContent).toMatch(/older notes exist/i);
+  });
+
   it("honesty about incomplete data: a session with no dispatch bookend renders as 'unattributed', not silently local", async () => {
     const today = todayUTC();
     mockFleetFetch({

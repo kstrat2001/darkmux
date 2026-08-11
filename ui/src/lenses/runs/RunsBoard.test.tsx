@@ -222,4 +222,73 @@ describe("RunsBoard", () => {
     await waitFor(() => expect(screen.getByText(/no lab runs found under the configured lab dir/i)).toBeInTheDocument());
     expect(screen.queryByText(/no lab-run source wired/i)).toBeNull();
   });
+
+  // Keyboard-accessibility structure — the runs-lens `role="button"` chips
+  // (RunsBar's kind filter + series toggle) and the `.runmore` "show all"
+  // row are click-only divs/spans with tabIndex but no key handler prior to
+  // this fix: reachable by Tab, unactivatable by keyboard. Text-only
+  // assertions can't see either defect (the click handler still exists and
+  // still produces the right text) — these assert on the STRUCTURE (the
+  // attributes) and on Enter/Space actually firing the handler.
+  describe("keyboard operability", () => {
+    it("every runchip in the filter bar is a real role=button with tabIndex", async () => {
+      mockFetch();
+      const { container } = renderBoard();
+      await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+      const chips = container.querySelectorAll(".runchip");
+      expect(chips.length).toBeGreaterThan(0);
+      chips.forEach((chip) => {
+        expect(chip).toHaveAttribute("role", "button");
+        expect(chip).toHaveAttribute("tabIndex", "0");
+      });
+    });
+
+    it("a kind chip re-filters on Enter, the same as a click", async () => {
+      mockFetch();
+      const { container } = renderBoard();
+      await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+      fireEvent.keyDown(container.querySelector('[data-arg="dispatch"]')!, { key: "Enter" });
+      await waitFor(() => expect(screen.queryByText("m1")).not.toBeInTheDocument());
+      expect(screen.getByText("d1")).toBeInTheDocument();
+    });
+
+    it("a kind chip re-filters on Space, the same as a click", async () => {
+      mockFetch();
+      const { container } = renderBoard();
+      await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+      fireEvent.keyDown(container.querySelector('[data-arg="dispatch"]')!, { key: " " });
+      await waitFor(() => expect(screen.queryByText("m1")).not.toBeInTheDocument());
+      expect(screen.getByText("d1")).toBeInTheDocument();
+    });
+
+    it("the ◧ series toggle switches to the grouped view on Enter", async () => {
+      mockFetch();
+      renderBoard("lab");
+      await waitFor(() => expect(screen.getByText("l1")).toBeInTheDocument());
+      fireEvent.keyDown(screen.getByText("◧ series"), { key: "Enter" });
+      await waitFor(() => expect(screen.getByText(/lab series/)).toBeInTheDocument());
+    });
+
+    it("'show all N more' is a real role=button and expands on Enter/Space", async () => {
+      const manyRuns = Array.from({ length: 30 }, (_, i) => ({
+        id: `r${i}`,
+        kind: "dispatch",
+        status: "complete",
+        tracked: true,
+        updated_ts: 30 - i,
+      }));
+      mockFetch(true, true, {}, manyRuns);
+      const { container } = renderBoard();
+      await waitFor(() => expect(screen.getByText("r0")).toBeInTheDocument());
+
+      const more = container.querySelector(".runmore")!;
+      expect(more).toHaveAttribute("role", "button");
+      expect(more).toHaveAttribute("tabIndex", "0");
+      expect(more.textContent).toMatch(/show all 30/);
+
+      fireEvent.keyDown(more, { key: " " });
+      await waitFor(() => expect(container.querySelector(".runmore")).not.toBeInTheDocument());
+      expect(screen.getByText("r29")).toBeInTheDocument();
+    });
+  });
 });
