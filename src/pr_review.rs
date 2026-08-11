@@ -1448,10 +1448,15 @@ mod tests {
             bundle_skip: Some(BundleSkipReport {
                 files_considered: 2,
                 files_skipped: vec![
-                    SkippedFile { path: "package-lock.json".to_string(), reason: SkipReason::NonCodeExtension },
+                    SkippedFile {
+                        path: "package-lock.json".to_string(),
+                        reason: SkipReason::NonCodeExtension,
+                        function: None,
+                    },
                     SkippedFile {
                         path: "fixtures/sample.json".to_string(),
                         reason: SkipReason::NonCodeExtension,
+                        function: None,
                     },
                 ],
             }),

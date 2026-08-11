@@ -2275,6 +2275,122 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         );
     }
 
+    // ── (branch: bundler/coverage-gap-audit) the PROBE seat's blind spots
+    //    ────────────────────────────────────────────────────────────────
+    //
+    // See `crates/darkmux-lab/src/lab/bundle/mod.rs`'s coverage-gap audit
+    // report (findings #4 and #5) for the full writeup. Both tests below
+    // are the review.rs half of that audit — they exercise the PROBE
+    // seat's prompt builder directly, the seat that actually ORIGINATES a
+    // finding (as opposed to `manifest_never_reaches_the_dispatched_judge_
+    // prompt` just above, which is an EXISTING, deliberate, #1256-cited
+    // exclusion on the JUDGE side).
+
+    /// Finding #4 (#1754 fix). `bundle_inputs_from_set` renders the SAME
+    /// code refs through two formatters: `slice_code` (-> `BundleInput.
+    /// code`, what the judge sees) embeds an explicit "excerpt truncated"
+    /// marker inline when a callee ref is a header-only stub of a longer
+    /// body; `slice_code_probe` (-> `BundleInput.probe_code`, what the
+    /// probe sees) now does too — a DELIBERATE DIVERGENCE from
+    /// `probe-runner.py`'s `read_code_excerpt` (which has no notion of a
+    /// truncated stub at all), not a port correction. The seat most
+    /// likely to raise a "this looks incomplete" finding now gets the
+    /// same textual signal the judge seat already had that its excerpt is
+    /// a stub, not the whole function.
+    #[test]
+    fn probe_seat_now_sees_the_truncation_marker_the_judge_seat_already_got_inline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut long_body = String::from("export function longHelper(x) {\n");
+        for i in 0..50 {
+            long_body.push_str(&format!("  console.log({i});\n"));
+        }
+        long_body.push_str("  return x;\n}\n");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/helpers.ts"), &long_body).unwrap();
+        std::fs::write(
+            dir.path().join("src/caller.ts"),
+            "import { longHelper } from './helpers';\nfunction useIt(x) {\n  return longHelper(x);\n}\n",
+        )
+        .unwrap();
+        let diff = "+++ b/src/caller.ts\n\
+@@ -0,0 +1,3 @@\n\
++import { longHelper } from './helpers';\n\
++function useIt(x) {\n\
++  return longHelper(x);\n\
++}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).expect("build_bundles over the truncation fixture");
+        assert!(!set.bundles.is_empty(), "expected at least one bundle for useIt");
+        assert!(
+            set.bundles[0].truncated,
+            "fixture must actually exercise a truncated callee, or this test proves nothing: {:?}",
+            set.bundles[0]
+        );
+        let inputs =
+            bundle_inputs_from_set(&set, &source).expect("bundle_inputs_from_set over the truncation fixture");
+        let b = &inputs[0];
+        assert!(
+            b.code.contains("excerpt truncated"),
+            "the judge's rendering (`BundleInput.code`) must carry the truncation marker inline: {}",
+            b.code
+        );
+        assert!(
+            b.probe_code.to_lowercase().contains("truncat"),
+            "the probe's rendering (`BundleInput.probe_code`) must ALSO carry a truncation marker — \
+             the probe seat that raises the finding must learn the excerpt is a stub, same as the \
+             judge seat: {}",
+            b.probe_code
+        );
+    }
+
+    /// Finding #5 (#1755 — DECIDED). Unlike the judge side (tested and
+    /// cited above, #1256's "match Phase A exactly" operator decision),
+    /// nothing previously pinned `probe_user_message`'s exclusion of
+    /// `bundle.manifest` as deliberate — a future edit could have added
+    /// it in one seat and not the other with zero signal either way.
+    ///
+    /// DECISION: the probe seat does NOT get the manifest either. Phase
+    /// A's `probe-runner.py` never had a manifest field to drop in the
+    /// first place (`bundler.py`'s bundles carry no such field), so this
+    /// isn't quite "parity" the way the judge's exclusion is — but the
+    /// practical effect the operator cares about is the same: the
+    /// manifest is a Rust-only addition (#1222 packet 3) with no Phase A
+    /// precedent, and it stays out of every model-facing prompt, not just
+    /// the judge's, until a real consumer needs it. Kept conservative on
+    /// purpose: injecting new content into a probe prompt is a
+    /// model-facing-prompt change (see this repo's AI-convention/term-
+    /// provenance doctrine), not something to do as a side effect of an
+    /// audit finding with no operator request behind it.
+    ///
+    /// Pinned as a STRUCTURAL contract, not just a substring check:
+    /// `probe_user_message`'s output must be byte-identical whether
+    /// `bundle.manifest` is empty or populated — so this test fails if a
+    /// future edit reads the field for ANYTHING, not only if it happens
+    /// to leak the exact word "manifest" or a specific symbol name.
+    #[test]
+    fn manifest_never_reaches_the_probe_user_message() {
+        let mut bundle = BundleInput {
+            id: "billing.ts".to_string(),
+            fact_family: "unscoped".to_string(),
+            code: "const end = start.plus(30)".to_string(),
+            probe_code: "### `billing.ts` (lines 1-1)\n```typescript\nconst end = start.plus(30)\n```"
+                .to_string(),
+            facts: vec![],
+            manifest: vec![],
+        };
+        let without_manifest = probe_user_message("prior text", &bundle);
+        bundle.manifest = vec!["referenced but not defined in bundle: helperFn <- unknown".to_string()];
+        let with_manifest = probe_user_message("prior text", &bundle);
+        assert_eq!(
+            without_manifest, with_manifest,
+            "the probe prompt must be byte-identical regardless of `bundle.manifest` — this is a \
+             DECIDED contract (#1755), not an accident: a populated manifest must never leak into, \
+             or otherwise affect, the dispatched probe prompt"
+        );
+        assert!(!with_manifest.contains("helperFn"), "{with_manifest}");
+        assert!(!with_manifest.to_lowercase().contains("manifest"), "{with_manifest}");
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // Remote (endpoint-staffed) seats (#1260/#1177) — routing,
     // provenance, per-execution token buckets, failure semantics
@@ -6628,7 +6744,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             files_considered: entries.len(),
             files_skipped: entries
                 .into_iter()
-                .map(|(path, reason)| SkippedFile { path: path.to_string(), reason })
+                .map(|(path, reason)| SkippedFile { path: path.to_string(), reason, function: None })
                 .collect(),
         }
     }
@@ -6648,10 +6764,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 SkippedFile {
                     path: "src/foo.test.ts".to_string(),
                     reason: SkipReason::TestFileExcluded,
+                    function: None,
                 },
                 SkippedFile {
                     path: "tests/bar.ts".to_string(),
                     reason: SkipReason::TestFileExcluded,
+                    function: None,
                 },
             ],
         };

@@ -835,11 +835,19 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
     for f in &report.files_skipped {
         let label = match f.reason {
             SkipReason::NonCodeExtension => "non-code extension",
+            // (#1752) Deliberately NOT grouped with `NonCodeExtension` —
+            // this is real source code in a language the bundler doesn't
+            // parse, not benign data. Kept out of the `benign` match
+            // above too, so a diff dominated by this reason correctly
+            // stays `DegenerateKind::Error` (loud), never the neutral
+            // no-op treatment.
+            SkipReason::SourceLanguageUnsupported => "real source in an unsupported language",
             SkipReason::TestFileExcluded => "test file (excluded by the bundler)",
             SkipReason::UnreadableInWorktree => "unreadable in worktree",
             SkipReason::NoSurvivingLines => "no surviving lines",
             SkipReason::NoEnclosingFunction => "no enclosing function",
             SkipReason::OverSizeCap => "over the bundler's size cap",
+            SkipReason::TopLevelOverSizeCap => "top-level run over the bundler's size cap",
         };
         *by_reason.entry(label).or_insert(0) += 1;
     }
@@ -2264,6 +2272,13 @@ pub fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Va
 /// `build_prompt` never saw one; `ReviewInputs::intent_title`/
 /// `intent_body` are dropped here on purpose (kept for [`judge_prompt`]
 /// only), not silently threaded through.
+///
+/// (#1755 — DECIDED) Also deliberately NO `bundle.manifest` anywhere in
+/// this prompt, matching [`judge_prompt`]'s own #1256 exclusion of the
+/// same field. Pinned by
+/// `manifest_never_reaches_the_probe_user_message` in `review_tests.rs`
+/// as a structural contract (byte-identical output regardless of
+/// `bundle.manifest`'s content), not merely an absence nobody checked.
 fn probe_user_message(prior: &str, bundle: &BundleInput) -> String {
     let mut parts: Vec<String> =
         vec![prior.to_string(), String::new(), "Code:".to_string(), String::new(), bundle.probe_code.clone()];
