@@ -68,7 +68,6 @@ enum Ty {
 /// empty `{}` (no leaves), so the settable-keys drift guard is unaffected.
 const KEYS: &[(&str, Ty)] = &[
     ("machine_id", Ty::Str),
-    ("orchestrator", Ty::Str),
     ("lms_bin", Ty::Str),
     ("lmstudio_url", Ty::Str),
     ("redis.enabled", Ty::Bool),

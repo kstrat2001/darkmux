@@ -1295,20 +1295,20 @@ pub fn record_via(sink: &dyn FlowSink, record: &FlowRecord) -> Result<()> {
 /// `FlowSink`. The default sink is `LocalFileSink`, which preserves
 /// the original behavior. No callers should see a behavior change.
 ///
-/// **Schema 1.4 refactor (#167):** `machine_id` + `orchestrator` are
-/// auto-populated here if the caller left them `None`. Callers that
-/// pre-set the fields (e.g., a remote ingest path forwarding records
-/// from another machine) win — auto-populate fills the absent ones only.
+/// **Schema 1.4 refactor (#167):** `machine_id` is auto-populated here if
+/// the caller left it `None`. Callers that pre-set the field (e.g., a
+/// remote ingest path forwarding records from another machine) win —
+/// auto-populate fills it only when absent.
 pub fn record(record: FlowRecord) -> Result<()> {
     record_to(default_sink().as_ref(), record)
 }
 
-/// Stamp provenance (machine_id / orchestrator when the
-/// caller left them `None`) and write to an explicit sink. `record()` is
-/// `record_to(default_sink(), …)`. Split out (#507) so callers — and
-/// tests — can target a sink built against an explicit dir instead of
-/// depending on the process-global default sink + live env. The
-/// provenance auto-populate is identical to the pre-split `record()`.
+/// Stamp provenance (machine_id when the caller left it `None`) and write
+/// to an explicit sink. `record()` is `record_to(default_sink(), …)`.
+/// Split out (#507) so callers — and tests — can target a sink built
+/// against an explicit dir instead of depending on the process-global
+/// default sink + live env. The provenance auto-populate is identical to
+/// the pre-split `record()`.
 pub(crate) fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
     let mut rec = record;
     if rec.machine_id.is_none() {
@@ -1318,9 +1318,6 @@ pub(crate) fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
         // (#640) Stamp the stable hardware identity at write time, like the
         // machine_id label above. Cached, so the ioreg shell-out runs once.
         rec.machine_uid = darkmux_hardware::machine_uid().map(str::to_string);
-    }
-    if rec.orchestrator.is_none() {
-        rec.orchestrator = resolve_orchestrator();
     }
     sink.write(&rec)
 }
@@ -1480,7 +1477,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1586,7 +1582,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1629,7 +1624,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1733,7 +1727,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1801,7 +1794,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: None,
@@ -1848,7 +1840,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1904,7 +1895,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2052,7 +2042,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2229,7 +2218,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2271,7 +2259,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2327,7 +2314,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2371,7 +2357,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2479,7 +2464,11 @@ mod tests {
         //           dispatch.tool (authoritative running counts). Minor +
         //           additive — older readers ignore the new payload fields; see
         //           schema.rs's fuller changelog entry.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.18.0");
+        //   1.19.0 — REMOVED `orchestrator` (#1758) — write-only, machine-scoped
+        //           provenance describing an invocation-scoped fact; nothing ever
+        //           read it. Same shape of removal as 1.9.0's `machine_tier`; see
+        //           schema.rs's fuller changelog entry.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.19.0");
     }
 
     #[test]
@@ -2537,7 +2526,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2573,7 +2561,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: None,
@@ -2709,36 +2696,13 @@ mod tests {
         // the OnceLock-cached hostname makes the per-test outcome
         // depend on suite ordering. The trim assertion above is the
         // load-bearing behavior; the fall-through is covered indirectly
-        // by `resolve_orchestrator_resolves_from_env_only` and the
-        // doctor check's source labeling.
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn orchestrator_resolves_from_env_only() {
-        let prev = env::var("DARKMUX_ORCHESTRATOR").ok();
-        unsafe { env::remove_var("DARKMUX_ORCHESTRATOR"); }
-        // No env → None. Operator-explicit by design (#49).
-        assert_eq!(resolve_orchestrator(), None);
-
-        unsafe { env::set_var("DARKMUX_ORCHESTRATOR", "claude-code"); }
-        assert_eq!(resolve_orchestrator().as_deref(), Some("claude-code"));
-
-        unsafe { env::set_var("DARKMUX_ORCHESTRATOR", "   "); }
-        assert_eq!(resolve_orchestrator(), None);
-
-        unsafe {
-            match prev {
-                Some(v) => env::set_var("DARKMUX_ORCHESTRATOR", v),
-                None => env::remove_var("DARKMUX_ORCHESTRATOR"),
-            }
-        }
+        // by the doctor check's source labeling.
     }
 
     #[test]
     fn schema_1_4_fields_omit_when_none() {
-        // Both new optional fields must be skip-serialized when None so
-        // older viewers can keep parsing without seeing unexpected `null`s.
+        // machine_id must be skip-serialized when None so older viewers
+        // can keep parsing without seeing an unexpected `null`.
         let rec = FlowRecord {
             ts: "2026-05-17T00:00:00Z".to_string(),
             level: Level::Info,
@@ -2755,7 +2719,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2764,7 +2727,6 @@ mod tests {
         };
         let s = serde_json::to_string(&rec).unwrap();
         assert!(!s.contains("machine_id"), "machine_id should omit when None: {s}");
-        assert!(!s.contains("orchestrator"), "orchestrator should omit when None: {s}");
     }
 
     #[test]
@@ -2785,7 +2747,6 @@ mod tests {
             mission_id: None,
             machine_id: Some("studio".to_string()),
             machine_uid: None,
-            orchestrator: Some("claude-code".to_string()),
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2795,25 +2756,22 @@ mod tests {
         let s = serde_json::to_string(&rec).unwrap();
         let parsed: FlowRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.machine_id.as_deref(), Some("studio"));
-        assert_eq!(parsed.orchestrator.as_deref(), Some("claude-code"));
     }
 
     #[serial_test::serial]
     #[test]
-    fn record_auto_populates_machine_id_and_orchestrator() {
-        // record() should fill machine_id + orchestrator at write time
-        // when the caller leaves them None. The operator-set env values
-        // win over auto-detection so the test can assert deterministic
-        // values regardless of hostname.
+    fn record_auto_populates_machine_id() {
+        // record() should fill machine_id at write time when the caller
+        // leaves it None. The operator-set env value wins over
+        // auto-detection so the test can assert a deterministic value
+        // regardless of hostname.
         isolate_test_env_once();
         let tmp = TempDir::new().unwrap();
         let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
         let prev_machine = env::var("DARKMUX_MACHINE_ID").ok();
-        let prev_orch = env::var("DARKMUX_ORCHESTRATOR").ok();
         unsafe {
             env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
             env::set_var("DARKMUX_MACHINE_ID", "test-machine");
-            env::set_var("DARKMUX_ORCHESTRATOR", "test-orchestrator");
         }
 
         let rec = FlowRecord {
@@ -2832,7 +2790,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2848,7 +2805,6 @@ mod tests {
         let record_line = content.lines().nth(1).expect("record line");
         let parsed: serde_json::Value = serde_json::from_str(record_line).unwrap();
         assert_eq!(parsed["machine_id"], "test-machine");
-        assert_eq!(parsed["orchestrator"], "test-orchestrator");
 
         unsafe {
             match prev_flows {
@@ -2858,10 +2814,6 @@ mod tests {
             match prev_machine {
                 Some(v) => env::set_var("DARKMUX_MACHINE_ID", v),
                 None => env::remove_var("DARKMUX_MACHINE_ID"),
-            }
-            match prev_orch {
-                Some(v) => env::set_var("DARKMUX_ORCHESTRATOR", v),
-                None => env::remove_var("DARKMUX_ORCHESTRATOR"),
             }
         }
     }
@@ -2889,7 +2841,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: Some("seed".to_string()),
             hash: None,
             payload: None,
@@ -2923,7 +2874,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: Some("seed".to_string()),
             hash: None,
             payload: None,
@@ -2997,7 +2947,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: None,
@@ -3063,7 +3012,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None, // sink stamps this
                 hash: None,      // sink stamps this
                 payload: None,
@@ -3113,7 +3061,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: None,
@@ -3185,7 +3132,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: None,
@@ -3305,7 +3251,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -3371,7 +3316,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -3731,7 +3675,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,

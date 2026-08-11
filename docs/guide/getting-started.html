@@ -104,7 +104,7 @@ darkmux init</code></pre>
 
     <p><strong>Claude Code</strong> gets a head start: open a session in your working directory and run the guided setup skill (installed by <code>darkmux init</code>):</p>
     <pre><code>/darkmux-bootstrap</code></pre>
-    <p>It walks the whole setup interactively: detecting your hardware tier, downloading the recommended models, registering profiles, declaring the orchestrator for flow-record provenance, and validating the end state with <code>darkmux doctor</code>. The skill <strong>reads and proposes; you run the commands</strong>, so you stay in the loop with provenance on every step. On any other frontier, point the session at the docs above and ask it to do the same; the steps below are exactly what it follows.</p>
+    <p>It walks the whole setup interactively: detecting your hardware tier, downloading the recommended models, registering profiles, and validating the end state with <code>darkmux doctor</code>. The skill <strong>reads and proposes; you run the commands</strong>, so you stay in the loop with provenance on every step. On any other frontier, point the session at the docs above and ask it to do the same; the steps below are exactly what it follows.</p>
 
     <div class="callout good">
       <strong>Why orchestrator-first?</strong>
@@ -116,7 +116,7 @@ darkmux init</code></pre>
 <section>
   <div class="wrap">
     <h2>Verify your setup</h2>
-    <p><code>darkmux doctor</code> runs pre-flight checks across the substrate: profile registry, <code>lms</code> binary, models loaded, RAM headroom, power state, role prompt coverage, mission-config registry, daemon reachability, flow-sink health, audit integrity, machine_id resolution, orchestrator declaration, and bundled-skill freshness (it flags any stale <code>darkmux-*</code> skill and points you at <code>darkmux init</code>), plus a battery of empirical rules from the <code>eureka</code> set.</p>
+    <p><code>darkmux doctor</code> runs pre-flight checks across the substrate: profile registry, <code>lms</code> binary, models loaded, RAM headroom, power state, role prompt coverage, mission-config registry, daemon reachability, flow-sink health, audit integrity, machine_id resolution, and bundled-skill freshness (it flags any stale <code>darkmux-*</code> skill and points you at <code>darkmux init</code>), plus a battery of empirical rules from the <code>eureka</code> set.</p>
     <pre><code>darkmux doctor</code></pre>
     <p>Each check returns Pass, Warn, or Fail. Fail-level lines include actionable hints; the exit code is 0 on all-pass-or-warn, 1 if anything Fails.</p>
 
@@ -126,7 +126,6 @@ darkmux init</code></pre>
     <ul>
       <li><strong><code>daemon: reachable</code> Warn</strong>: the daemon isn't running yet. That's fine; you start it in <a href="#see-it-work">See it work</a> below (one command on Homebrew). Non-fatal: it only affects live viewing.</li>
       <li><strong><code>profile match</code> Warn</strong>: your <code>~/.darkmux/profiles.json</code> doesn't yet reference what's loaded in LMStudio. That's also fine; we fix it next.</li>
-      <li><strong><code>orchestrator</code> Warn</strong>: you haven't declared which frontier is driving darkmux, so flow records won't carry orchestrator provenance. Export <code>DARKMUX_ORCHESTRATOR=claude-code</code> (or your harness) in the shell to clear it. Fine to ignore while you're just kicking the tires.</li>
     </ul>
   </div>
 </section>
@@ -248,7 +247,7 @@ darkmux lab run inspect &lt;run-id&gt;      <span class="comment"># quick look a
 <section>
   <div class="wrap">
     <h2>What's next</h2>
-    <p>If you set up via <a href="#orchestrator"><code>/darkmux-bootstrap</code></a> (or had your orchestrator follow the steps above), your profiles, models, and orchestrator declaration are already in place. Pick a direction:</p>
+    <p>If you set up via <a href="#orchestrator"><code>/darkmux-bootstrap</code></a> (or had your orchestrator follow the steps above), your profiles and models are already in place. Pick a direction:</p>
     <ul>
       <li>For the deeper tour of the live viewer (reading the timeline, managing the daemon, the HTTP endpoints): <a href="observability.html">Observability: daemon + viewer</a>.</li>
       <li>If you want to benchmark / characterize your hardware against a workload: <a href="lab.html">The lab harness</a>.</li>

@@ -1055,7 +1055,6 @@ fn cmd_mission_dispatch(
     //    Loop-index suffix on session_id defeats microsecond collisions
     //    under sub-microsecond loop iterations (review M-session-id).
     let local_machine = flow::resolve_machine_id();
-    let local_orchestrator = flow::resolve_orchestrator();
     let dispatch_micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros())
@@ -1074,7 +1073,10 @@ fn cmd_mission_dispatch(
             None, // image (#703 Slice 4) — mission dispatch uses the runner's default
             timeout_seconds,
             local_machine.clone(),
-            local_orchestrator.clone(),
+            // (#1758) `resolve_orchestrator()` removed — see routing.rs's
+            // `dispatch_routed` for why `None` (not field removal) is the
+            // right fix at this call site.
+            None,
         );
         // Pre-validate. Surfaces oversize/charset failures BEFORE any
         // partial publish lands on the queue.
