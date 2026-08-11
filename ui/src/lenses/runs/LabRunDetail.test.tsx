@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LabRunDetail } from "./LabRunDetail";
+import { LAB_POLL_STEADY_MS } from "../../lib/queryKeys";
 
 function renderDetail(dir: string, onBack: () => void = () => {}) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -135,5 +136,97 @@ describe("LabRunDetail", () => {
     expect(screen.getByText(/· d2/)).toBeInTheDocument();
     expect(screen.getByText("pipeline")).toBeInTheDocument();
     expect(screen.getByText("not started")).toBeInTheDocument();
+  });
+
+  /**
+   * The merge-gate MUST FIX finding: a raw `fetch` outside `fetchJson`'s
+   * discriminated-result contract meant a thrown fetch or a non-2xx
+   * response was swallowed by a silent `catch`, rescheduling forever with
+   * no state change — a dead daemon rendered byte-identical to an idle
+   * live run ("● live", "no events yet."). This is the regression test
+   * that would have caught it: after `LAB_POLL_FAILURE_THRESHOLD` (3)
+   * CONSECUTIVE poll failures, the badge/header must surface a
+   * distinguishable "daemon unreachable" state, then clear it on the next
+   * successful poll.
+   */
+  it("surfaces a daemon-unreachable state after repeated events-poll failures, and clears it on the next success", async () => {
+    vi.useFakeTimers();
+    let eventsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.startsWith("/lab/run/detail")) {
+          return Promise.resolve(new Response(JSON.stringify({ dir: "d1", funnels: [], scores: null }), { status: 200 }));
+        }
+        if (url.startsWith("/lab/run/events")) {
+          eventsCalls += 1;
+          // First 3 ticks fail (a non-2xx response); the 4th recovers.
+          if (eventsCalls <= 3) return Promise.resolve(new Response("boom", { status: 500 }));
+          return Promise.resolve(new Response(JSON.stringify({ lines: [], next_offset: 0, finished: false }), { status: 200 }));
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+
+    renderDetail("d1");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("● live")).toBeInTheDocument();
+
+    // Two more failed ticks at the steady cadence — still under threshold.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LAB_POLL_STEADY_MS);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LAB_POLL_STEADY_MS);
+    });
+    expect(eventsCalls).toBe(3);
+    expect(screen.getByText(/daemon unreachable — retrying/i)).toBeInTheDocument();
+    expect(screen.queryByText("● live")).not.toBeInTheDocument();
+
+    // The next tick succeeds — the state clears.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LAB_POLL_STEADY_MS);
+    });
+    expect(eventsCalls).toBe(4);
+    expect(screen.getByText("● live")).toBeInTheDocument();
+    expect(screen.queryByText(/daemon unreachable/i)).not.toBeInTheDocument();
+  });
+
+  /**
+   * Secondary MUST FIX 1 finding: a garbage `run=` deep link renders the
+   * detail error page, but the events poll kept hitting
+   * `/lab/run/events` every 3s indefinitely behind it. The poll must stop
+   * once the detail fetch is known-bad.
+   */
+  it("stops polling /lab/run/events once the detail fetch has errored", async () => {
+    vi.useFakeTimers();
+    let eventsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.startsWith("/lab/run/detail")) {
+          return Promise.resolve(new Response("boom", { status: 500 }));
+        }
+        if (url.startsWith("/lab/run/events")) {
+          eventsCalls += 1;
+          return Promise.resolve(new Response(JSON.stringify({ lines: [], next_offset: 0, finished: false }), { status: 200 }));
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+
+    renderDetail("d1");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+
+    const callsAtError = eventsCalls;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LAB_POLL_STEADY_MS * 5);
+    });
+    expect(eventsCalls).toBe(callsAtError);
   });
 });

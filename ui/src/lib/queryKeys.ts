@@ -45,6 +45,17 @@ export const PANEL_CACHE_MS = 3_000;
  * own doc for why the poll is a manual self-rescheduling loop instead. */
 export const LAB_POLL_STEADY_MS = 3_000;
 export const LAB_POLL_BACKFILL_MS = 150;
+/** How many CONSECUTIVE `/lab/run/events` poll failures (thrown fetch or a
+ * non-2xx response — see `fetchJson`'s discriminated result) before
+ * `LabRunDetail` flips its badge/header to a visible "daemon unreachable"
+ * state, per the merge-gate finding that a raw silent-catch made a dead
+ * daemon byte-identical to an idle run. N=3: at the steady 3s cadence
+ * that's ~9s of confirmed silence — long enough that one dropped request
+ * (a transient blip) doesn't flap the UI, short enough that an operator
+ * watching a live run over the tailnet notices within a couple of refresh
+ * cycles rather than staring at a frozen "● live" feed. Resets to 0 on the
+ * next successful poll. */
+export const LAB_POLL_FAILURE_THRESHOLD = 3;
 
 export const queryKeys = {
   fleetMachinesLive: () => ["fleet", "machines", "live"] as const,

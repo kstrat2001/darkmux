@@ -7,6 +7,8 @@ import {
   labFeedTs,
   labFeedRowLines,
   labFeedLines,
+  labFeedCountText,
+  labFeedStatusSuffix,
   labCliHint,
   labBadgeText,
   LAB_FEED_CAP,
@@ -164,6 +166,35 @@ describe("labFeedLines", () => {
   });
 });
 
+describe("labFeedCountText", () => {
+  it("names the raw total under the cap", () => {
+    expect(labFeedCountText(0)).toBe("0 records");
+    expect(labFeedCountText(1)).toBe("1 record");
+    expect(labFeedCountText(10)).toBe("10 records");
+    expect(labFeedCountText(LAB_FEED_CAP)).toBe(`${LAB_FEED_CAP} records`);
+  });
+
+  it("discloses the truncation once the raw total exceeds the cap, matching legacy's #1640 wording", () => {
+    expect(labFeedCountText(LAB_FEED_CAP + 1)).toBe(`newest ${LAB_FEED_CAP} of ${LAB_FEED_CAP + 1}`);
+    expect(labFeedCountText(900)).toBe(`newest ${LAB_FEED_CAP} of 900`);
+  });
+});
+
+describe("labFeedStatusSuffix", () => {
+  it("is playback once finished, regardless of the unreachable flag", () => {
+    expect(labFeedStatusSuffix(true, false)).toBe(" (playback)");
+    expect(labFeedStatusSuffix(true, true)).toBe(" (playback)");
+  });
+
+  it("is the live-polling suffix when not finished and reachable", () => {
+    expect(labFeedStatusSuffix(false, false)).toBe(" — live, polling");
+  });
+
+  it("names the daemon-unreachable state when not finished and the poll has failed repeatedly", () => {
+    expect(labFeedStatusSuffix(false, true)).toBe(" — daemon unreachable, retrying");
+  });
+});
+
 describe("labCliHint", () => {
   it("prefers the envelope's crew/mode over the scores fallback", () => {
     expect(
@@ -185,5 +216,10 @@ describe("labBadgeText", () => {
   it("names finished vs live", () => {
     expect(labBadgeText(true)).toBe("finished");
     expect(labBadgeText(false)).toBe("● live");
+  });
+
+  it("names the daemon-unreachable state only while live, never overriding finished", () => {
+    expect(labBadgeText(false, true)).toBe("⚠ daemon unreachable — retrying");
+    expect(labBadgeText(true, true)).toBe("finished");
   });
 });

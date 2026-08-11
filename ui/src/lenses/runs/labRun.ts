@@ -154,6 +154,31 @@ export function labFeedLines(events: LabRunEvent[]): string[] {
     .flatMap((r) => labFeedRowLines(r));
 }
 
+/** The event-feed header's count disclosure (#1640, viewer.html:4866):
+ * `labFeedLines` above only ever returns the newest `LAB_FEED_CAP` events,
+ * but the header must print the RAW total truncation happened against — a
+ * 900-event run says "newest 500 of 900", not "900 records" above a list
+ * holding 500. A truncation presented as a bare total is the one thing
+ * CLAUDE.md's no-silent-caps rule forbids; every other cap in this codebase
+ * (RUNS_CAP, RECENT_CAP, CATALOG_MISSION_CAP, the unfiltered-log 50)
+ * already discloses this way. `totalEvents` is the FULL accumulated event
+ * count (`events.length` in the caller), not the capped feed-line count. */
+export function labFeedCountText(totalEvents: number): string {
+  if (totalEvents > LAB_FEED_CAP) return `newest ${LAB_FEED_CAP} of ${totalEvents}`;
+  return `${totalEvents} record${totalEvents === 1 ? "" : "s"}`;
+}
+
+/** The event-feed header's live/playback/unreachable suffix. `unreachable`
+ * (the events-poll's consecutive-failure signal — see `LabRunDetail.tsx`'s
+ * own doc + `LAB_POLL_FAILURE_THRESHOLD`) only overrides the live case:
+ * once `isFinished`, the poll has stopped for a legitimate reason (a
+ * drained playback), so there is nothing left to name as "retrying". */
+export function labFeedStatusSuffix(isFinished: boolean, unreachable: boolean): string {
+  if (isFinished) return " (playback)";
+  if (unreachable) return " — daemon unreachable, retrying";
+  return " — live, polling";
+}
+
 /** `labCliHint()` — viewer.html:4843-4847. `--workdirs`/the cases dir
  * aren't recorded in the artifact (a known gap the legacy comment names),
  * so those two stay explicit placeholders rather than a guess dressed up
@@ -164,7 +189,12 @@ export function labCliHint(env: LabFunnelEnvelope | null, scores: LabScoresDoc |
   return `darkmux lab eval --funnel --roster-profile ${crew} --exec-mode ${mode} --workdirs <workdirs-root> <cases-dir>`;
 }
 
-/** `labBadge()` — viewer.html:4210-4214, text-only. */
-export function labBadgeText(finished: boolean): string {
+/** `labBadge()` — viewer.html:4210-4214, text-only. `unreachable` is new
+ * relative to legacy (the events-poll consecutive-failure signal, see
+ * `LabRunDetail.tsx`'s own doc) — defaulted so every existing caller/test
+ * that only ever passed `finished` keeps its exact prior behavior. Ignored
+ * once `finished`, same reasoning as `labFeedStatusSuffix` above. */
+export function labBadgeText(finished: boolean, unreachable: boolean = false): string {
+  if (!finished && unreachable) return "⚠ daemon unreachable — retrying";
   return finished ? "finished" : "● live";
 }

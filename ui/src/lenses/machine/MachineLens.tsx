@@ -196,8 +196,16 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
           the React-port twin of legacy's `.memcard` selector (see
           `tests/parity/extract.spec.ts`'s machine-lens comment): "loaded"
           appears ONLY once `/machine/resources` has resolved with real
-          data, never during the loading/error placeholder text branches. */}
-      <div className="machine-lens__health" data-state={resources ? "loaded" : resourcesErrored ? "error" : "loading"}>
+          data, never during the loading/error placeholder text branches.
+          A REMOTE page never issues that fetch at all (`enabled:
+          isLocalMach` gates the query off — see the resourcesQuery doc
+          above), so without its own branch it would sit at "loading"
+          forever even though the not-reported placeholder had already
+          rendered correctly — a marker documented as a SETTLED signal
+          that never settles. "remote" is that page's own settled value,
+          distinct from "loaded"/"error" so a future remote parity test
+          waiting on this marker doesn't hang (#1770 merge-gate finding). */}
+      <div className="machine-lens__health" data-state={!isLocalMach ? "remote" : resources ? "loaded" : resourcesErrored ? "error" : "loading"}>
         <Lines
           classify
           lines={healthLines({

@@ -71,14 +71,30 @@ export interface SessionHeader {
   /** Pre-uppercased, same reason. */
   role: string;
   sid: string;
-  /** `escN(state.machine)` in legacy. Left "" here — see this module's own
-   * top doc: `state.machine` is never actually set on ANY reachable path
-   * into a session drill-in (`drillSession`/the `open →` action both omit
-   * it), so legacy's own real output for this slot is empty on every path
-   * this port can exercise too (confirmed against the golden: "(task-list
-   * on )" — nothing after "on "). Deriving a machine name from the
-   * session's OWN records instead would be adding information legacy
-   * itself doesn't show here, not a port. */
+  /** `escN(state.machine)` in legacy. Left "" here — NOT because
+   * `state.machine` is never set on a real path (an earlier version of
+   * this comment claimed that; it's false — `drillMachine`/`goMachine`
+   * both set `state.machine=m`, `drillSession` never clears it, so legacy's
+   * PRIMARY path into a session drill-in — the machine page's own run-row
+   * "open →" link, `data-act="session"` → `drillSession(sid)` — carries
+   * that machine context forward and DOES render the machine link there).
+   * The golden this module is checked against (`session-task-list.txt`)
+   * was captured via the OTHER real entry point — a bare `#session=<id>`
+   * catalog deep-link, which never touches `state.machine` at all — so its
+   * "(task-list on )" (nothing after "on ") is genuinely empty on THAT
+   * path, but not evidence the field is dead everywhere.
+   *
+   * This port's own output is still correct empty, for an unrelated
+   * reason: this port's machine-run-row rendering (`runLines.ts`) never
+   * emits an "open →" link at all — the row stays a collapsed
+   * `<summary>` with no click-through — so nothing in this port can reach
+   * a session drill-in carrying machine context in the first place. The
+   * real residual gap this leaves: an operator viewing a machine's page
+   * cannot open any of that machine's runs from there. Not built here —
+   * ledgered as a follow-up, not a silent narrowing. Deriving a machine
+   * name from the session's OWN records instead (rather than building the
+   * "open →" link) would be adding information legacy itself doesn't show
+   * on this path, not a port. */
   machineName: string;
 }
 

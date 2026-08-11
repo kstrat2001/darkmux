@@ -126,6 +126,33 @@ describe("MachineLens", () => {
     expect(screen.getByText(/not reported from here/i)).toBeInTheDocument();
   });
 
+  /**
+   * The merge-gate CONSIDER 5 finding: `data-state` is documented (see
+   * `MachineLens.tsx`'s own comment above the health region) as the parity
+   * harness's post-fetch SETTLED signal — but on a remote page `resources`
+   * never fetches at all (`enabled: isLocalMach` gates the query off), so
+   * the marker sat at "loading" forever even though the not-reported
+   * placeholder had already rendered correctly. A future remote parity
+   * test waiting on "loaded"/"error" would hang. A remote page must settle
+   * on its own distinct value instead.
+   */
+  it("a remote machine page settles on data-state=\"remote\", never stuck at \"loading\"", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
+    });
+    renderMachine("remote-uid");
+    await waitFor(() => expect(screen.getByText(/residency \/ RAM not reported from here/i)).toBeInTheDocument());
+    expect(document.querySelector(".machine-lens__health")).toHaveAttribute("data-state", "remote");
+  });
+
+  it("the local machine page still settles on data-state=\"loaded\" once /machine/resources resolves", async () => {
+    mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 } });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    expect(document.querySelector(".machine-lens__health")).toHaveAttribute("data-state", "loaded");
+  });
+
   it("the 'fleet' back-link writes an empty hash", async () => {
     mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" } });
     renderMachine(null);

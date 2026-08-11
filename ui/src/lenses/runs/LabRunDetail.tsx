@@ -1,8 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
-import { queryKeys, LAB_POLL_STEADY_MS, LAB_POLL_BACKFILL_MS } from "../../lib/queryKeys";
-import { computeLabPipeline, labPipelineLines, labCliHint, labFeedLines, labBadgeText } from "./labRun";
+import { queryKeys, LAB_POLL_STEADY_MS, LAB_POLL_BACKFILL_MS, LAB_POLL_FAILURE_THRESHOLD } from "../../lib/queryKeys";
+import {
+  computeLabPipeline,
+  labPipelineLines,
+  labCliHint,
+  labFeedLines,
+  labFeedCountText,
+  labFeedStatusSuffix,
+  labBadgeText,
+} from "./labRun";
 import type { LabRunDetailResponse, LabRunEvent, LabRunEventsResponse } from "../../types/handwritten";
 
 /**
@@ -27,6 +35,22 @@ import type { LabRunDetailResponse, LabRunEvent, LabRunEventsResponse } from "..
  *   forward between polls, so this stays a manual `useEffect` + timer,
  *   mirroring the legacy control flow rather than fighting react-query's
  *   shape to force it in).
+ *
+ *   The poll goes through `fetchJson` (the same discriminated-result
+ *   contract every other data path in this app uses), not a raw `fetch` —
+ *   a merge-gate finding on an earlier cut of this component caught a raw
+ *   `fetch` outside that contract whose thrown-error/non-2xx cases were
+ *   both swallowed by a silent `catch`, rescheduling forever with no state
+ *   change: a dead daemon rendered byte-identical to an idle live run.
+ *   Transient failures still just retry at the steady cadence (a single
+ *   dropped request shouldn't flap the UI), but `LAB_POLL_FAILURE_THRESHOLD`
+ *   CONSECUTIVE failures flips `pollUnreachable`, which the badge/header
+ *   surface as a visible "daemon unreachable — retrying" state (cleared on
+ *   the next success) — see `queryKeys.ts`'s doc on the constant for why
+ *   N=3. The poll also stops entirely once the detail fetch is known to
+ *   have errored (a garbage `run=` deep link) rather than hitting
+ *   `/lab/run/events` every tick behind an error page nothing will ever
+ *   resolve.
  */
 export function LabRunDetail({ dir, onBack }: { dir: string; onBack: () => void }) {
   const detailQuery = useQuery({
@@ -36,11 +60,23 @@ export function LabRunDetail({ dir, onBack }: { dir: string; onBack: () => void 
 
   const [events, setEvents] = useState<LabRunEvent[]>([]);
   const [finished, setFinished] = useState(false);
+  // Consecutive-failure signal for the events poll below — see this
+  // component's own doc + `LAB_POLL_FAILURE_THRESHOLD`'s doc in
+  // `queryKeys.ts`. Real state (not a ref): it drives the visible
+  // badge/header text.
+  const [pollUnreachable, setPollUnreachable] = useState(false);
   // `useRef` for the offset (not state) — a poll reads/advances it between
-  // renders without itself triggering one; only `setEvents`/`setFinished`
-  // (real content changes) do, matching legacy's `renderLabRun()` firing
-  // only when `gotLines` is truthy (viewer.html:4064).
+  // renders without itself triggering one; only `setEvents`/`setFinished`/
+  // `setPollUnreachable` (real content/status changes) do, matching
+  // legacy's `renderLabRun()` firing only when `gotLines` is truthy
+  // (viewer.html:4064).
   const offsetRef = useRef(0);
+  const failCountRef = useRef(0);
+
+  // The detail fetch's own error state, gating the events poll below (the
+  // secondary MUST FIX: a garbage `run=` deep link must not keep hitting
+  // `/lab/run/events` every tick behind a page that will never resolve).
+  const detailErrored = detailQuery.data ? !detailQuery.data.ok : false;
 
   useEffect(() => {
     // Fresh entry into a (possibly different) run dir: legacy resets
@@ -51,32 +87,43 @@ export function LabRunDetail({ dir, onBack }: { dir: string; onBack: () => void 
     offsetRef.current = 0;
     setEvents([]);
     setFinished(false);
+    failCountRef.current = 0;
+    setPollUnreachable(false);
+
+    // The detail fetch already errored — nothing under this dir is ever
+    // going to resolve, so don't start (or continue) polling behind it.
+    if (detailErrored) return;
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     async function poll() {
       if (cancelled) return;
-      let body: LabRunEventsResponse | null = null;
-      try {
-        const res = await fetch(`/lab/run/events?dir=${encodeURIComponent(dir)}&offset=${offsetRef.current}`, {
-          headers: { accept: "application/json" },
-        });
-        if (res.ok) body = await res.json();
-      } catch {
-        // transient — retry next tick, matching legacy's own silent catch.
-      }
+      const result = await fetchJson<LabRunEventsResponse>(
+        `/lab/run/events?dir=${encodeURIComponent(dir)}&offset=${offsetRef.current}`,
+        { headers: { accept: "application/json" } },
+      );
       if (cancelled) return;
 
       let gotLines = 0;
-      if (body) {
+      if (result.ok) {
+        failCountRef.current = 0;
+        setPollUnreachable(false);
+        const body = result.data;
         if (Array.isArray(body.lines) && body.lines.length) {
-          setEvents((prev) => prev.concat(body!.lines));
+          setEvents((prev) => prev.concat(body.lines));
           gotLines = body.lines.length;
         }
         if (typeof body.next_offset === "number") offsetRef.current = body.next_offset;
         if (body.finished) setFinished(true);
         if (body.finished && gotLines === 0) return; // fully drained a finished run — stop polling
+      } else {
+        // Transient retry either way — but after `LAB_POLL_FAILURE_THRESHOLD`
+        // CONSECUTIVE misses, surface it: a dead daemon must not stay
+        // byte-identical to an idle live run (the merge-gate finding this
+        // fixes).
+        failCountRef.current += 1;
+        if (failCountRef.current >= LAB_POLL_FAILURE_THRESHOLD) setPollUnreachable(true);
       }
       timer = setTimeout(poll, gotLines ? LAB_POLL_BACKFILL_MS : LAB_POLL_STEADY_MS);
     }
@@ -87,7 +134,7 @@ export function LabRunDetail({ dir, onBack }: { dir: string; onBack: () => void 
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [dir]);
+  }, [dir, detailErrored]);
 
   if (!detailQuery.data) {
     return (
@@ -141,7 +188,9 @@ export function LabRunDetail({ dir, onBack }: { dir: string; onBack: () => void 
           ‹ runs
         </button>
         {` · ${dir} `}
-        <span className={`labbadge ${isFinished ? "finished" : "live"}`}>{labBadgeText(isFinished)}</span>
+        <span className={`labbadge ${isFinished ? "finished" : pollUnreachable ? "error" : "live"}`}>
+          {labBadgeText(isFinished, pollUnreachable)}
+        </span>
       </div>
 
       <div className="labpipe">
@@ -160,7 +209,7 @@ export function LabRunDetail({ dir, onBack }: { dir: string; onBack: () => void 
 
       <div className="labfeedwrap">
         <div className="labfeedhdr">
-          event feed{isFinished ? " (playback)" : " — live, polling"} · {events.length} record{events.length === 1 ? "" : "s"}
+          event feed{labFeedStatusSuffix(isFinished, pollUnreachable)} · {labFeedCountText(events.length)}
         </div>
         <div className="labfeed">
           {feedLines.length ? (
