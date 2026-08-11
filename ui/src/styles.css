@@ -1863,14 +1863,19 @@ body {
   font-size: 11px;
 }
 .machine-lens__util > div:last-child {
-  display: inline-block;
+  display: block;
+  width: fit-content;
   margin-top: 6px;
   padding: 2px 7px;
   border: 1px solid var(--border);
   border-radius: 3px;
   font-size: 10px;
   letter-spacing: 0.06em;
-  text-transform: uppercase;
+  /* NO text-transform. `innerText` is layout-aware and applies it, so
+     uppercasing here rewrote `resident` to `RESIDENT` and broke the parity
+     golden. Legacy renders this pill lowercase; only `.memstate`/`.memowner`
+     are uppercased there, and this port already uppercases those STRINGS
+     directly (see memoryLedgerLines.ts). */
   color: var(--accent-dim);
 }
 
@@ -1878,7 +1883,12 @@ body {
    classified by CONTENT PATTERN at render time (see `Lines` in
    MachineLens.tsx) rather than by position. */
 .machine-lens__health .mline--state {
-  display: inline-block;
+  /* `block` + `fit-content`, NOT `inline-block`: adjacent inline-level
+     siblings merge onto ONE `innerText` line, which collapsed the owner tag
+     and the health state into `DARKMUXGREEN`. This keeps the chip's shrink-
+     to-fit box while preserving the line break the goldens pin. */
+  display: block;
+  width: fit-content;
   padding: 1px 7px;
   border: 1px solid var(--border);
   border-radius: 3px;
@@ -1895,7 +1905,9 @@ body {
 /* `model.owner` — legacy's `.memowner`. Deliberately muted: it says which
    namespace loaded the model, not whether anything is wrong. */
 .machine-lens__health .mline--owner {
-  display: inline-block;
+  /* See `.mline--state` — block + fit-content, never inline-block. */
+  display: block;
+  width: fit-content;
   padding: 1px 7px;
   border: 1px solid var(--border);
   border-radius: 3px;
