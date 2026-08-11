@@ -84,11 +84,25 @@ frame:
   makes *post-hoc tampering detectable*, but nothing makes the live stream
   unforgeable.
 - **The audit sink is a detection substrate, not a prevention one.** The opt-in
-  `DARKMUX_AUDIT_DIR` sink writes records into a BLAKE3 hash chain;
-  `darkmux flow integrity-check` walks the chain and exits non-zero if it is
-  broken, so a later edit to an audited record is **detectable at the next
-  check**. It does not make records impossible to alter, and running it does not
-  by itself make you compliant with any regulation.
+  `DARKMUX_AUDIT_DIR` sink writes records into a BLAKE3 hash chain, and
+  `darkmux flow integrity-check` walks that chain. It does not make records
+  impossible to alter, and running it does not by itself make you compliant
+  with any regulatory framework. darkmux makes no compliance claim: producing
+  evidence and being compliant are different things, and only the second one
+  needs a lawyer.
+- **Known gaps in the audit chain, stated plainly.** As of this writing the
+  chain does NOT detect every edit — see darkmux#1769, a confirmed bypass where
+  a record carrying an unrecognized enum value skips content verification
+  entirely, so its other fields can be rewritten and the chain still validates.
+  A fix (hashing the stored bytes rather than a re-serialization) is in
+  progress. Two further limits are structural rather than bugs: whole-file
+  deletion is undetectable, because each per-day file seeds its own chain and
+  nothing records which files should exist; and the chain root is
+  **un-anchored**, computed and stored locally, so an attacker with write
+  access who rewrites a file wholesale produces one that validates. Treat this
+  as a supporting detective control composed with disk encryption and
+  filesystem permissions, not as a standalone guarantee against a local
+  attacker.
 - **Model behavior is not policed.** darkmux faithfully executes what the model
   produces. Review agent output before it touches anything you care about.
 
